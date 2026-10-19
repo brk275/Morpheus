@@ -47,20 +47,34 @@ impl TimelineModel {
             )
         };
 
-        if removed == added && removed > MAX_ROW_NOTIFICATIONS {
-            *self.rows.borrow_mut() = next;
-            self.notify.reset();
-        } else if removed == added {
+        if removed == added {
+            // A wide changed span can contain only a few actual edits. Keep
+            // unchanged delegates and payloads intact, with bounded tracking
+            // even when every row in a long history changes.
+            let changed: Vec<_> = {
+                let rows = self.rows.borrow();
+                rows[prefix..prefix + removed]
+                    .iter()
+                    .zip(&next[prefix..prefix + added])
+                    .enumerate()
+                    .filter_map(|(offset, (old, new))| {
+                        (!same_row(old, new)).then_some(prefix + offset)
+                    })
+                    .take(MAX_ROW_NOTIFICATIONS + 1)
+                    .collect()
+            };
+            if changed.len() > MAX_ROW_NOTIFICATIONS {
+                *self.rows.borrow_mut() = next;
+                self.notify.reset();
+                return;
+            }
             {
                 let mut rows = self.rows.borrow_mut();
-                for (slot, value) in rows[prefix..prefix + removed]
-                    .iter_mut()
-                    .zip(next.into_iter().skip(prefix).take(added))
-                {
-                    *slot = value;
+                for &row in &changed {
+                    rows[row] = next[row].clone();
                 }
             }
-            for row in prefix..prefix + added {
+            for row in changed {
                 self.notify.row_changed(row);
             }
         } else {
@@ -356,6 +370,53 @@ pub(crate) mod tests {
             projection_count(&model),
             3,
             "only two reentrant observer reads and one explicit read project text"
+        );
+    }
+
+    #[test]
+    fn sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows() {
+        let original: Vec<_> = (0..10_000).map(|i| Arc::new(fixture(i))).collect();
+        let model = update_shared(ModelRc::default(), original.clone());
+        let observer = Box::pin(ModelChangeListenerContainer::new(Observer {
+            model: model.clone(),
+            changes: RefCell::new(Vec::new()),
+        }));
+        model
+            .model_tracker()
+            .attach_peer(observer.as_ref().model_peer());
+
+        let mut next = original.clone();
+        let edited_rows = [37, 9_876];
+        for &row in &edited_rows {
+            Arc::make_mut(&mut next[row]).send_state = MessageSendState::Failed;
+        }
+        // Value-equal rebuilt payloads between the edits must also retain the
+        // existing allocation rather than replace an unchanged delegate's data.
+        next[5_000] = Arc::new(original[5_000].as_ref().clone());
+        assert!(!Arc::ptr_eq(&next[5_000], &original[5_000]));
+
+        assert_eq!(update_shared(model.clone(), next.clone()), model);
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        {
+            let rows = stored.rows.borrow();
+            assert_eq!(rows.len(), 10_000);
+            for (index, row) in rows.iter().enumerate() {
+                assert_eq!(row.as_ref(), next[index].as_ref());
+                if edited_rows.contains(&index) {
+                    assert!(Arc::ptr_eq(row, &next[index]));
+                } else {
+                    assert!(Arc::ptr_eq(row, &original[index]));
+                }
+            }
+        }
+        assert_eq!(
+            *observer.as_ref().get().changes.borrow(),
+            [Change::Changed(37, 10_000), Change::Changed(9_876, 10_000)]
+        );
+        assert_eq!(
+            projection_count(&model),
+            2,
+            "only the two reentrant observer reads project data"
         );
     }
 
