@@ -1,13 +1,13 @@
 # TEMPORARY narrowly scoped customization expansion verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
 name: Reviewed customization expansion
-run-name: Customization native UI diagnosis - 7492df3
+run-name: Customization native UI diagnosis - 62b90fc
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: customization-native-ui-7492df3
+  group: customization-native-ui-62b90fc
   cancel-in-progress: false
 jobs:
   native:
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 7492df3e533bc3095ef8ed0902552e99b122f7a9
+          ref: 62b90fc9aa8f3b011251b25aed8def4cbadbb69c
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -125,7 +125,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='7492df3e533bc3095ef8ed0902552e99b122f7a9'
+          source='62b90fc9aa8f3b011251b25aed8def4cbadbb69c'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -307,7 +307,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='7492df3e533bc3095ef8ed0902552e99b122f7a9'
+          source='62b90fc9aa8f3b011251b25aed8def4cbadbb69c'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -394,7 +394,7 @@ jobs:
           checks=(
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-                  '--','--exact','--test-threads=1'],40*60,needed_app,set()),
+                  '--','--exact','--test-threads=1','--show-output'],40*60,needed_app,set()),
           )
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
@@ -484,6 +484,7 @@ jobs:
                       'native_error_codes':sorted(set(re.findall(r'\b(?:LNK[0-9]{4}|C[0-9]{4})\b',normalized))),
                       'os_error_codes':sorted(set(int(code) for code in re.findall(r'os error ([0-9]{1,5})\b',output))),
                   }
+              record['ui_scenario_elapsed_ms']=sorted({int(value) for value in re.findall(r'(?m)^morpheus-ui-scenario-ms=([0-9]{1,6})$', output) if 0<=int(value)<=120000})
               loops=len(re.findall(r'part of a binding loop',output))
               passed=passed and loops==0
               record.update({'status':'passed' if passed else 'failed','ui_binding_loop_warnings':loops})
