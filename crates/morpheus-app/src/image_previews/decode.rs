@@ -2,8 +2,10 @@
 //! decoder construction; metadata is discarded without decompression. Still
 //! decoding deliberately excludes animation, progressive JPEG, ICC/EXIF and
 //! WebP; `animation` plays GIF, WebP and APNG through `png_animation_input`.
+//! The one EXIF value read is a JPEG's orientation, taken from the first Exif
+//! segment before that segment is discarded, so camera photos show upright.
 use super::{Pixels, PreviewError};
-use image::{ColorType, ImageDecoder, Limits};
+use image::{ColorType, ImageDecoder, Limits, metadata::Orientation};
 use std::io::Cursor;
 use zeroize::Zeroizing;
 
@@ -157,10 +159,13 @@ fn png_input_with(bytes: &[u8], animation: bool) -> Result<Zeroizing<Vec<u8>>, P
     Ok(output)
 }
 
-fn jpeg_input(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, PreviewError> {
+/// The sanitized decoder input and the orientation of the first Exif segment
+/// (upright when absent or unreadable).
+fn jpeg_input(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Orientation), PreviewError> {
     let mut output = Zeroizing::new(vec![0xff, 0xd8]);
     let mut position = 2usize;
     let mut components = None;
+    let mut orientation = None;
     for _ in 0..1024 {
         let start = position;
         if bytes.get(position) != Some(&0xff) {
@@ -225,7 +230,8 @@ fn jpeg_input(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, PreviewError> {
                         Some(0x00 | 0xd0..=0xd7) => cursor += 1,
                         Some(0xd9) if cursor + 1 == bytes.len() => {
                             output.extend_from_slice(&bytes[end..]);
-                            return Ok(output);
+                            let orientation = orientation.unwrap_or(Orientation::NoTransforms);
+                            return Ok((output, orientation));
                         }
                         _ => return Err(PreviewError::Unsupported), // No later scans/headers/metadata.
                     }
@@ -234,6 +240,17 @@ fn jpeg_input(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, PreviewError> {
             }
             0xdb | 0xc4 | 0xdd => {} // Quantization, Huffman and restart tables.
             0xe0 | 0xee if payload.len() <= 32 => {} // Small JFIF/Adobe colour hints.
+            // Only the first Exif segment's orientation tag is read (a bounded
+            // IFD0 scan of at most one 64 KiB segment); the segment itself is
+            // discarded like any other metadata.
+            0xe1 if orientation.is_none() && payload.starts_with(b"Exif\0\0") => {
+                orientation = Some(
+                    Orientation::from_exif_chunk(&payload[6..])
+                        .unwrap_or(Orientation::NoTransforms),
+                );
+                position = end;
+                continue;
+            }
             0xe0..=0xef | 0xfe => {
                 position = end;
                 continue;
@@ -291,7 +308,7 @@ pub(super) fn decode(bytes: Zeroizing<Vec<u8>>) -> Result<Pixels, PreviewError> 
             rgba,
         })
     } else if bytes.starts_with(b"\xff\xd8") {
-        let input = jpeg_input(&bytes)?;
+        let (input, orientation) = jpeg_input(&bytes)?;
         let options = zune_core::options::DecoderOptions::default()
             .set_max_width(MAX_SIDE as usize)
             .set_max_height(MAX_SIDE as usize)
@@ -314,13 +331,60 @@ pub(super) fn decode(bytes: Zeroizing<Vec<u8>>) -> Result<Pixels, PreviewError> 
         decoder
             .decode_into(&mut rgba)
             .map_err(|_| PreviewError::Invalid)?;
-        Ok(Pixels {
+        let pixels = Pixels {
             width: width as u32,
             height: height as u32,
             rgba,
-        })
+        };
+        Ok(orient(pixels, orientation))
     } else {
         Err(PreviewError::Unsupported)
+    }
+}
+
+/// Turn decoded RGBA rows upright for an Exif orientation. The copy goes to a
+/// fresh zeroizing buffer of the same size, so the pixel bounds still hold;
+/// the quarter turns swap width and height.
+fn orient(pixels: Pixels, orientation: Orientation) -> Pixels {
+    if orientation == Orientation::NoTransforms {
+        return pixels;
+    }
+    let (w, h) = (pixels.width as usize, pixels.height as usize);
+    let swap = matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    let out_w = if swap { h } else { w };
+    let mut rgba = Zeroizing::new(vec![0; pixels.rgba.len()]);
+    for (index, pixel) in pixels.rgba.chunks_exact(4).enumerate() {
+        let (x, y) = (index % w, index / w);
+        let (dx, dy) = match orientation {
+            Orientation::NoTransforms => (x, y),
+            Orientation::FlipHorizontal => (w - 1 - x, y),
+            Orientation::Rotate180 => (w - 1 - x, h - 1 - y),
+            Orientation::FlipVertical => (x, h - 1 - y),
+            // Clockwise quarter turn: the left column becomes the top row.
+            Orientation::Rotate90 => (h - 1 - y, x),
+            Orientation::Rotate270 => (y, w - 1 - x),
+            // A quarter turn, then a horizontal flip: transpose and transverse.
+            Orientation::Rotate90FlipH => (y, x),
+            Orientation::Rotate270FlipH => (h - 1 - y, w - 1 - x),
+        };
+        let target = (dy * out_w + dx) * 4;
+        rgba[target..target + 4].copy_from_slice(pixel);
+    }
+    let (width, height) = if swap {
+        (pixels.height, pixels.width)
+    } else {
+        (pixels.width, pixels.height)
+    };
+    Pixels {
+        width,
+        height,
+        rgba,
     }
 }
 
@@ -437,13 +501,77 @@ mod tests {
             assert!(decode(Zeroizing::new(bytes)).is_err());
         }
     }
+    fn pixels(width: u32, height: u32, values: &[u8]) -> Pixels {
+        Pixels {
+            width,
+            height,
+            rgba: Zeroizing::new(values.iter().flat_map(|&v| [v, v, v, 255]).collect()),
+        }
+    }
+    fn values(pixels: &Pixels) -> Vec<u8> {
+        pixels.rgba.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+    #[test]
+    fn every_exif_orientation_turns_pixels_upright() {
+        // a b / c d, stored row by row.
+        for (orientation, expected) in [
+            (Orientation::NoTransforms, [1, 2, 3, 4]),
+            (Orientation::FlipHorizontal, [2, 1, 4, 3]),
+            (Orientation::Rotate180, [4, 3, 2, 1]),
+            (Orientation::FlipVertical, [3, 4, 1, 2]),
+            (Orientation::Rotate90, [3, 1, 4, 2]),
+            (Orientation::Rotate270, [2, 4, 1, 3]),
+            (Orientation::Rotate90FlipH, [1, 3, 2, 4]),
+            (Orientation::Rotate270FlipH, [4, 2, 3, 1]),
+        ] {
+            let turned = orient(pixels(2, 2, &[1, 2, 3, 4]), orientation);
+            assert_eq!(values(&turned), expected, "{orientation:?}");
+        }
+        // Quarter turns swap the dimensions of a wide image.
+        let tall = orient(pixels(3, 1, &[1, 2, 3]), Orientation::Rotate90);
+        assert_eq!((tall.width, tall.height, values(&tall)), (1, 3, vec![1, 2, 3]));
+        let tall = orient(pixels(3, 1, &[1, 2, 3]), Orientation::Rotate270);
+        assert_eq!((tall.width, tall.height, values(&tall)), (1, 3, vec![3, 2, 1]));
+    }
+    #[test]
+    fn only_the_first_exif_orientation_is_read_and_metadata_still_removed() {
+        let exif = |value: u8| {
+            // "Exif\0\0", big-endian TIFF header, IFD0 at 8 with one SHORT
+            // orientation entry, no next IFD.
+            let mut payload = b"Exif\0\0MM\0*\0\0\0\x08\0\x01".to_vec();
+            payload.extend_from_slice(&[0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, value, 0, 0]);
+            payload.extend_from_slice(&[0, 0, 0, 0]);
+            let mut segment = vec![0xff, 0xe1];
+            segment.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+            segment.extend_from_slice(&payload);
+            segment
+        };
+        let frame = [
+            &[0xff, 0xc0, 0, 11, 8, 0, 1, 0, 1, 1, 1, 0x11, 0][..],
+            &[0xff, 0xda, 0, 8, 1, 1, 0, 0, 63, 0, 0xff, 0xd9][..],
+        ]
+        .concat();
+        let mut source = vec![0xff, 0xd8];
+        source.extend_from_slice(&exif(6));
+        source.extend_from_slice(&exif(3));
+        source.extend_from_slice(&frame);
+        let (bounded, orientation) = jpeg_input(&source).unwrap();
+        assert_eq!(orientation, Orientation::Rotate90);
+        assert!(!bounded.windows(4).any(|w| w == b"Exif"));
+        // An unknown value leaves the image as stored.
+        let mut source = vec![0xff, 0xd8];
+        source.extend_from_slice(&exif(9));
+        source.extend_from_slice(&frame);
+        assert_eq!(jpeg_input(&source).unwrap().1, Orientation::NoTransforms);
+    }
     #[test]
     fn jpeg_metadata_is_removed_and_later_header_injection_rejected() {
         let mut source = vec![0xff, 0xd8, 0xff, 0xe1, 0, 6, 1, 2, 3, 4];
         source.extend_from_slice(&[0xff, 0xc0, 0, 11, 8, 0, 1, 0, 1, 1, 1, 0x11, 0]);
         source.extend_from_slice(&[0xff, 0xda, 0, 8, 1, 1, 0, 0, 63, 0, 0xff, 0xd9]);
-        let bounded = jpeg_input(&source).unwrap();
+        let (bounded, orientation) = jpeg_input(&source).unwrap();
         assert!(!bounded.windows(4).any(|w| w == [1, 2, 3, 4]));
+        assert_eq!(orientation, Orientation::NoTransforms);
         source.truncate(source.len() - 2);
         source.extend_from_slice(&[0xff, 0xe1, 0, 6, 1, 2, 3, 4, 0xff, 0xd9]);
         assert!(jpeg_input(&source).is_err());
