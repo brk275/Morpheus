@@ -7,11 +7,20 @@
 
 use std::{future::Future, pin::Pin};
 
+use matrix_sdk_ui::timeline::TimelineEventFocusThreadMode;
+
 use super::*;
 
 /// Most history pages one reveal may read, and the events per page.
 const MAX_REVEAL_PAGES: u8 = 8;
 const REVEAL_PAGE_EVENTS: u16 = 50;
+/// Most events a focused conversation view loads around its event.
+const MAX_FOCUS_CONTEXT: u16 = 50;
+
+/// Cache key of a room's focused conversation view; one per room.
+fn focus_key(room_id: &str) -> String {
+    format!("focus:{room_id}")
+}
 
 /// How far a bounded backward reveal through history got.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -129,6 +138,82 @@ impl AccountManager {
                 found,
                 start_reached,
             })
+        })
+        .await
+    }
+
+    /// A conversation view of one room focused on `event_id`, with up to
+    /// `num_context_events` around it, for showing an older message in
+    /// context. It replaces the room's previous focused view and is kept
+    /// until released; its feed has the same ownership rules as live feeds.
+    pub async fn focused_message_feed_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        event_id: &str,
+        num_context_events: u16,
+    ) -> Result<MessageFeed> {
+        let target = parse_event_id(event_id)?;
+        self.read_selected_timeline(selection, |loaded| async move {
+            let id = RoomId::parse(room_id)
+                .map_err(|error| MatrixCoreError::InvalidRoomId(error.to_string()))?;
+            let room = loaded
+                .client
+                .get_room(&id)
+                .ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.into()))?;
+            let timeline = room
+                .timeline_builder()
+                .with_focus(TimelineFocus::Event {
+                    target,
+                    num_context_events: num_context_events.min(MAX_FOCUS_CONTEXT),
+                    thread_mode: TimelineEventFocusThreadMode::Automatic {
+                        hide_threaded_events: true,
+                    },
+                })
+                .build()
+                .await
+                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+            let timeline = Arc::new(timeline);
+            let key = focus_key(room_id);
+            loaded.timelines.lock().await.insert(key, timeline.clone());
+            let account_id = selection.account_id().to_owned();
+            Ok(message_feed_from_timeline(account_id, room_id, timeline).await)
+        })
+        .await
+    }
+
+    /// Page a room's focused conversation view to older (`backwards`) or
+    /// newer messages. Returns true when that end of the room was reached.
+    pub async fn paginate_focused_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        backwards: bool,
+        count: u16,
+    ) -> Result<bool> {
+        self.read_selected_timeline(selection, |loaded| async move {
+            let key = focus_key(room_id);
+            let focused = loaded.timelines.lock().await.get(&key).cloned();
+            let timeline = focused.ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.into()))?;
+            let reached = if backwards {
+                timeline.paginate_backwards(count).await
+            } else {
+                timeline.paginate_forwards(count).await
+            };
+            reached.map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+        })
+        .await
+    }
+
+    /// Drop a room's focused conversation view, ending its feed's updates.
+    pub async fn release_focused_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+    ) -> Result<()> {
+        self.read_selected_timeline(selection, |loaded| async move {
+            loaded.timelines.lock().await.remove(&focus_key(room_id));
+            Ok(())
         })
         .await
     }

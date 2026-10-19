@@ -2216,6 +2216,9 @@ export component AppWindow inherits Window {
     in-out property <int> timeline-jump-index: -1;
     in-out property <int> timeline-jump-request: 0;
     property <int> timeline-jump-passes: 0;
+    // The conversation shows the messages around an opened search hit
+    // instead of the latest ones, until Return to live or a room change.
+    in-out property <bool> conversation-focused: false;
     // Older replies of the open thread; reset whenever the thread changes.
     in-out property <bool> thread-history-loading: false;
     in-out property <bool> thread-history-at-start: false;
@@ -2430,6 +2433,7 @@ export component AppWindow inherits Window {
     // Room ID and event ID of one listed hit.
     callback open-search-result(string, string);
     callback load-older-thread-replies();
+    callback return-to-live();
     callback join-discovery-target(string, string, string, string, bool);
     callback toggle-native-microphone();
     callback toggle-native-deafen();
@@ -3513,6 +3517,34 @@ export component AppWindow inherits Window {
                         font-size: 11px * root.text-scale;
                         accessible-live-region: polite;
                         overflow: elide;
+                    }
+                    // The conversation is showing an older message in its
+                    // context instead of the latest messages.
+                    if root.live-session && root.active-room-id != "" && root.conversation-focused : Rectangle {
+                        height: max(42px, 32px * root.text-scale + 10px);
+                        background: root.elevated;
+                        accessible-role: groupbox;
+                        accessible-label: "Viewing earlier messages";
+                        HorizontalLayout {
+                            padding-left: 24px;
+                            padding-right: 24px;
+                            padding-top: 5px;
+                            padding-bottom: 5px;
+                            spacing: 10px;
+                            Text {
+                                text: "Viewing messages around a search result. New messages appear in the live conversation.";
+                                color: root.muted; font-size: 11px * root.text-scale;
+                                vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                                accessible-live-region: polite;
+                            }
+                            TextAction {
+                                ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
+                                outline: root.accent; text-scale: root.text-scale;
+                                text: "Return to live";
+                                accessible-label: "Return to the latest messages in this room";
+                                activated => { root.return-to-live(); }
+                            }
+                        }
                     }
                     if root.live-session && root.active-room-id != "" : HorizontalLayout {
                         height: max(36px, 32px * root.text-scale);

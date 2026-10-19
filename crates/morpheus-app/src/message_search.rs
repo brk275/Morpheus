@@ -24,7 +24,10 @@ use morpheus_matrix::{
 use slint::{ComponentHandle, Model, ModelRc, Timer, VecModel, Weak};
 use tokio::{runtime::Handle, task::JoinHandle};
 
-use crate::{AppWindow, MessageItem, MessageSearchItem, live::LiveUi};
+use crate::{
+    AppWindow, MessageItem, MessageSearchItem,
+    live::{LiveUi, NavigationAuthority},
+};
 
 /// Hits requested per page.
 const PAGE_SIZE: usize = 25;
@@ -40,13 +43,16 @@ const CONTEXT_EVENTS: u16 = 6;
 const CONTEXT_BEFORE: usize = 2;
 const CONTEXT_AFTER: usize = 5;
 const MAX_QUERY_BYTES: usize = 256;
-/// History pages (of 50 events) loaded at most to reach an older hit.
+/// Thread history pages (of 50 events) loaded at most to reach an older
+/// thread reply.
 const REVEAL_PAGES: u8 = 4;
 const REVEAL_TIMEOUT: Duration = Duration::from_secs(30);
-/// The conversation feed applies loaded history asynchronously; a revealed
-/// row is looked for this often, this many times.
+const FOCUS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Feeds apply loaded rows asynchronously; a row is looked for this often,
+/// this many times, before the conversation around it is opened instead.
 const JUMP_RETRY: Duration = Duration::from_millis(120);
 const JUMP_ATTEMPTS: u8 = 10;
+const ARRIVAL_ATTEMPTS: u8 = 5;
 
 // Fixed wording only: SDK error text is never shown, since it could echo
 // the query or an identifier.
@@ -60,12 +66,14 @@ const ROOM_NOT_OPENED: &str = "This room could not be opened. It may no longer b
 const CONTEXT_FAILED: &str = "Nearby messages could not be loaded.";
 const CONTEXT_SLOW: &str = "Nearby messages took too long to load.";
 const CONTEXT_MISSING: &str = "The matched message is no longer available in this conversation.";
-const CONTEXT_OLDER: &str =
-    "Older than the loaded conversation, so it is shown here. Load earlier messages to reach it.";
+const NOT_SHOWN: &str = "This message could not be shown in the conversation; it is shown here.";
 const THREAD_OLDER: &str =
     "This reply is older than the loaded thread. Use Load earlier replies to reach it.";
-const FINDING: &str = "Loading earlier messages to reach this one…";
-const REVEAL_FAILED: &str = "Earlier messages could not be loaded to reach this one.";
+const FINDING: &str = "Loading earlier replies to reach this one…";
+const REVEAL_FAILED: &str = "Earlier replies could not be loaded to reach this one.";
+const FOCUSING: &str = "Opening the conversation around this message…";
+const FOCUS_FAILED: &str =
+    "The conversation around this message could not be opened, so it is shown here.";
 const KEEP_COMPOSER: &str =
     "Send or cancel the reply or edit in this room before opening a result in another room.";
 // Keep in step with MAX_RESULTS.
@@ -134,12 +142,15 @@ impl Hit {
 }
 
 /// One open request: the query it came from, the hit and its context
-/// operation. Every later step re-checks all three.
+/// operation, which every later step re-checks, and the authority of the
+/// navigation it started, which a newer query, scope, open or reset
+/// withdraws.
 #[derive(Clone)]
 struct Opening {
     ticket: Ticket,
     hit: Hit,
     operation: i32,
+    authority: NavigationAuthority,
 }
 
 impl Opening {
@@ -163,13 +174,20 @@ struct Controller {
     query_task: Option<JoinHandle<()>>,
     context_task: Option<JoinHandle<()>>,
     reveal_task: Option<JoinHandle<()>>,
+    /// The navigation of the opened hit. It is withdrawn rather than
+    /// aborted: an abort could stop it between its commit and rollback.
+    navigation: Option<NavigationAuthority>,
 }
 
 impl Controller {
-    /// End the work of the opened hit: its nearby context and history reveal.
+    /// End the work of the opened hit: its nearby context, history reveal
+    /// and room or focus navigation.
     fn abort_opening(&mut self) {
         abort(self.context_task.take());
         abort(self.reveal_task.take());
+        if let Some(navigation) = self.navigation.take() {
+            navigation.withdraw();
+        }
     }
 }
 
@@ -289,6 +307,15 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) {
     ui.on_load_more_room_search(move || {
         if let Some(window) = weak.upgrade() {
             load_more(&window, &more_live, &more_runtime);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let return_live = live.clone();
+    let return_runtime = runtime.clone();
+    ui.on_return_to_live(move || {
+        if let Some(window) = weak.upgrade() {
+            return_to_live(&window, &return_live, &return_runtime);
         }
     });
 
@@ -612,14 +639,19 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
     window.set_room_search_context_error("".into());
     window.set_room_search_context_notice("".into());
     window.set_room_search_context(ModelRc::new(VecModel::<MessageSearchItem>::default()));
-    with(Controller::abort_opening);
+    let authority = NavigationAuthority::default();
+    with(|controller| {
+        controller.abort_opening();
+        controller.navigation = Some(authority.clone());
+    });
     let opening = Opening {
         ticket,
         hit,
         operation,
+        authority,
     };
     if !elsewhere {
-        arrived(window, live, runtime, &opening);
+        arrived(window, live, runtime, &opening, false);
         return;
     }
     // Leave the open room the way a room-list click does. Its drafts stay in
@@ -633,8 +665,9 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
     runtime.spawn(async move {
         let account = opening.ticket.account.as_str();
         let room = opening.hit.room_id.clone();
+        let authority = opening.authority.clone();
         let outcome = task_live
-            .reveal_room_for(account, room, epoch, weak.clone())
+            .reveal_room_for(account, room, epoch, authority, weak.clone())
             .await;
         let _ = weak.upgrade_in_event_loop(move |window| {
             navigated(&window, &task_live, &handle, &opening, epoch, outcome);
@@ -656,9 +689,9 @@ fn navigated(
     let here = opening.here(window);
     match outcome {
         Ok(true) if here && live.navigation_is_current(epoch) => {
-            arrived(window, live, runtime, opening);
+            arrived(window, live, runtime, opening, true);
         }
-        // Another navigation replaced this one; the hit stays listed.
+        // Withdrawn or replaced by another navigation; the hit stays listed.
         Ok(_) => window.set_room_search_context_loading(false),
         Err(_) => {
             window.set_room_search_context_loading(false);
@@ -667,18 +700,24 @@ fn navigated(
     }
 }
 
-/// The hit's room is open: show the event (loading a bounded amount of
-/// earlier history when it is older than what is loaded), then load its
-/// nearby messages.
-fn arrived(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Opening) {
+/// The hit's room is open: show the event, then load its nearby messages.
+/// A hit that is not among the loaded messages opens the conversation
+/// around it (after a short wait when the room was just opened and its
+/// latest messages may still be arriving); a thread hit opens its thread.
+fn arrived(
+    window: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+    opening: &Opening,
+    moved: bool,
+) {
     let hit = &opening.hit;
-    if hit.thread_root.is_empty() {
-        if !jump_timeline(window, &hit.event_id) {
-            reveal(window, live, runtime, opening);
-        }
-    } else {
+    if !hit.thread_root.is_empty() {
         open_thread(window, &hit.room_id, &hit.thread_root);
         reveal(window, live, runtime, opening);
+    } else if !jump_timeline(window, &hit.event_id) {
+        let attempts = if moved { ARRIVAL_ATTEMPTS } else { 0 };
+        jump_or_focus(window.as_weak(), live, runtime, opening, attempts);
     }
     let manager = live.manager.clone();
     let opening = opening.clone();
@@ -697,8 +736,75 @@ fn arrived(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &O
     });
 }
 
-/// Page back through the hit's conversation or thread, a bounded number of
-/// pages, until the hit is loaded. The visible feed shows what was loaded.
+/// Jump to the hit once its row is loaded, checking `attempts` more times;
+/// then open the conversation around it instead.
+fn jump_or_focus(
+    weak: Weak<AppWindow>,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+    opening: &Opening,
+    attempts: u8,
+) {
+    let Some(window) = weak.upgrade() else {
+        return;
+    };
+    if !opening.current(&window) || !opening.here(&window) {
+        return;
+    }
+    if jump_timeline(&window, &opening.hit.event_id) {
+        return;
+    }
+    if attempts == 0 {
+        focus(&window, live, runtime, opening);
+        return;
+    }
+    let (live, runtime, opening) = (live.clone(), runtime.clone(), opening.clone());
+    Timer::single_shot(JUMP_RETRY, move || {
+        jump_or_focus(weak, &live, &runtime, &opening, attempts - 1);
+    });
+}
+
+/// Show the conversation around the hit in place of the latest messages,
+/// with Return to live (LiveUi::focus_event_for). The room and its drafts
+/// are unchanged; the opening's authority stops it before it replaces the
+/// live conversation.
+fn focus(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Opening) {
+    window.set_room_search_context_notice(FOCUSING.into());
+    let task_live = live.clone();
+    let opening = opening.clone();
+    let weak = window.as_weak();
+    runtime.spawn(async move {
+        let account = opening.ticket.account.as_str();
+        let (room, event) = (opening.hit.room_id.clone(), opening.hit.event_id.as_str());
+        let authority = opening.authority.clone();
+        let focus = task_live.focus_event_for(account, room, event, authority, weak.clone());
+        let outcome = tokio::time::timeout(FOCUS_TIMEOUT, focus).await;
+        let _ = weak.upgrade_in_event_loop(move |window| focused(&window, &opening, outcome));
+    });
+}
+
+fn focused(
+    window: &AppWindow,
+    opening: &Opening,
+    outcome: Result<Result<bool, MatrixCoreError>, tokio::time::error::Elapsed>,
+) {
+    if !opening.current(window) || !opening.here(window) {
+        return;
+    }
+    match outcome {
+        Ok(Ok(true)) => {
+            reset_history(window);
+            window.set_room_search_context_notice("".into());
+            jump_when_loaded(window.as_weak(), opening.clone(), JUMP_ATTEMPTS);
+        }
+        // Withdrawn, or the room or account changed meanwhile.
+        Ok(Ok(false)) => window.set_room_search_context_notice("".into()),
+        Ok(Err(_)) | Err(_) => window.set_room_search_context_notice(FOCUS_FAILED.into()),
+    }
+}
+
+/// Page back through the hit's thread, a bounded number of pages, until
+/// the reply is loaded. The thread panel shows what was loaded.
 fn reveal(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Opening) {
     window.set_room_search_context_notice(FINDING.into());
     let manager = live.manager.clone();
@@ -719,7 +825,7 @@ fn reveal(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Op
 async fn reveal_hit(manager: &AccountManager, opening: &Opening) -> Option<HistoryReveal> {
     let selection = &opening.ticket.selection;
     let hit = &opening.hit;
-    let thread = (!hit.thread_root.is_empty()).then_some(hit.thread_root.as_str());
+    let thread = Some(hit.thread_root.as_str());
     let (room, event) = (hit.room_id.as_str(), hit.event_id.as_str());
     let reveal = manager.reveal_event_selected(selection, room, thread, event, REVEAL_PAGES);
     let outcome = tokio::time::timeout(REVEAL_TIMEOUT, reveal).await;
@@ -730,31 +836,20 @@ fn revealed(window: &AppWindow, opening: &Opening, outcome: Option<HistoryReveal
     if !opening.current(window) || !opening.here(window) {
         return;
     }
-    let hit = &opening.hit;
-    let threaded = !hit.thread_root.is_empty();
-    let thread_open = window.get_thread_root_id().as_str() == hit.thread_root;
-    // The reveal read the same history the load-earlier controls page.
-    let start_reached = outcome.is_some_and(|reveal| reveal.start_reached);
-    if start_reached && !threaded {
-        window.set_history_at_start(true);
-    } else if start_reached && thread_open {
+    let thread_open = window.get_thread_root_id().as_str() == opening.hit.thread_root;
+    if thread_open && outcome.is_some_and(|reveal| reveal.start_reached) {
+        // The reveal read the same history Load earlier replies pages.
         window.set_thread_history_at_start(true);
     }
     let notice = match outcome {
-        Some(reveal) if reveal.found => {
-            if !threaded {
-                jump_when_loaded(window.as_weak(), opening.clone(), JUMP_ATTEMPTS);
-            }
-            ""
-        }
-        Some(_) if threaded => THREAD_OLDER,
-        Some(_) => CONTEXT_OLDER,
+        Some(reveal) if reveal.found => "",
+        Some(_) => THREAD_OLDER,
         None => REVEAL_FAILED,
     };
     window.set_room_search_context_notice(notice.into());
 }
 
-/// Jump once the revealed row reaches the conversation model.
+/// Jump once the hit's row reaches the conversation model.
 fn jump_when_loaded(weak: Weak<AppWindow>, opening: Opening, attempts: u8) {
     Timer::single_shot(JUMP_RETRY, move || {
         let Some(window) = weak.upgrade() else {
@@ -769,9 +864,37 @@ fn jump_when_loaded(weak: Weak<AppWindow>, opening: Opening, attempts: u8) {
         if attempts > 1 {
             jump_when_loaded(weak, opening, attempts - 1);
         } else {
-            window.set_room_search_context_notice(CONTEXT_OLDER.into());
+            window.set_room_search_context_notice(NOT_SHOWN.into());
         }
     });
+}
+
+/// Leave a focused conversation view for the room's latest messages. A
+/// pending open of a hit cannot focus the conversation again afterwards.
+fn return_to_live(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    let account = window.get_active_account_local_id().to_string();
+    let room = window.get_active_room_id().to_string();
+    if !window.get_conversation_focused() || account.is_empty() || room.is_empty() {
+        return;
+    }
+    with(|controller| {
+        if let Some(navigation) = controller.navigation.take() {
+            navigation.withdraw();
+        }
+    });
+    reset_history(window);
+    let live = live.clone();
+    let weak = window.as_weak();
+    runtime.spawn(async move { live.return_to_live_for(&account, room, weak).await });
+}
+
+/// Load earlier messages pages whichever view is shown, live or focused; a
+/// result for the other view no longer applies.
+fn reset_history(window: &AppWindow) {
+    window.set_history_operation(window.get_history_operation().wrapping_add(1));
+    window.set_history_loading(false);
+    window.set_history_at_start(false);
+    window.set_history_error("".into());
 }
 
 fn unsent_reply_or_edit(window: &AppWindow) -> bool {

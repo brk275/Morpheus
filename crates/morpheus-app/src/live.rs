@@ -44,6 +44,9 @@ use crate::{
     SpaceItem,
 };
 
+/// Events loaded around a message opened in a focused conversation view.
+const FOCUS_CONTEXT_EVENTS: u16 = 24;
+
 pub enum MessageTarget {
     Room,
     Reply(String),
@@ -67,6 +70,29 @@ struct MemberRequest {
     room_id: String,
     started: Instant,
     epoch: u64,
+}
+
+/// Authority of one navigation its requester may withdraw, such as opening
+/// a search result. Withdrawal and the navigation's commit take the same
+/// lock, so once `withdraw` returns the navigation commits nothing more.
+/// Withdrawing never touches the shared navigation epoch, so it cannot
+/// cancel a newer navigation of anyone else.
+#[derive(Clone, Default)]
+pub(crate) struct NavigationAuthority(Arc<std::sync::Mutex<bool>>);
+
+impl NavigationAuthority {
+    pub(crate) fn withdraw(&self) {
+        *self.state() = true;
+    }
+
+    fn withdrawn(&self) -> bool {
+        *self.state()
+    }
+
+    /// True once withdrawn. Held only around synchronous commits.
+    fn state(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
 }
 
 pub struct LiveUi {
@@ -1398,6 +1424,7 @@ impl LiveUi {
             ui.set_unsorted_channels(ModelRc::new(VecModel::<RoomItem>::default()));
             ui.set_unsorted_direct_messages(ModelRc::new(VecModel::<RoomItem>::default()));
             ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+            ui.set_conversation_focused(false);
             ui.set_thread_messages(ModelRc::new(VecModel::<MessageItem>::default()));
             ui.set_members(ModelRc::new(VecModel::<MemberItem>::default()));
             ui.set_composer_text("".into());
@@ -1683,54 +1710,110 @@ impl LiveUi {
     /// Open a room chosen from search results, revealing it first: the
     /// current Space when it lists the room, otherwise the Space that does,
     /// otherwise Home. Account and navigation checks match select_room_for.
-    pub async fn reveal_room_for(
+    /// The requester may withdraw `authority` at any time: before the commit
+    /// nothing changes, and a commit withdrawn before its room is shown is
+    /// rolled back. Only this navigation is affected; a newer room-list
+    /// navigation keeps its own epoch.
+    pub(crate) async fn reveal_room_for(
         self: &Arc<Self>,
         account_id: &str,
         room_id: String,
         navigation_epoch: u64,
+        authority: NavigationAuthority,
         ui: Weak<AppWindow>,
     ) -> Result<bool, MatrixCoreError> {
+        let _transition = self.account_transition.lock().await;
+        if authority.withdrawn()
+            || !self.navigation_is_current(navigation_epoch)
+            || self.require_active_account(account_id).await.is_err()
         {
-            let _transition = self.account_transition.lock().await;
-            if !self.navigation_is_current(navigation_epoch)
-                || self.require_active_account(account_id).await.is_err()
-            {
-                return Ok(false);
+            return Ok(false);
+        }
+        let rooms = self.manager.rooms_snapshot().await?;
+        let Some(room) = rooms.iter().find(|room| room.room_id == room_id) else {
+            return Err(MatrixCoreError::RoomNotFound(room_id));
+        };
+        if room.is_space || room.membership != RoomMembership::Joined {
+            return Err(MatrixCoreError::RoomNotFound(room_id));
+        }
+        // The same visibility rule as refresh: Home lists direct rooms and
+        // rooms outside every scanned Space.
+        let space_children = self.space_children.lock().await.clone();
+        let spaces = space_children
+            .iter()
+            .filter(|(_, children)| children.contains(&room_id))
+            .map(|(space, _)| space.clone())
+            .collect::<Vec<_>>();
+        let in_home = room.is_direct || spaces.is_empty();
+        let committed =
+            self.commit_reveal(&room_id, &spaces, in_home, navigation_epoch, &authority);
+        let Some(previous) = committed.await else {
+            return Ok(false);
+        };
+        self.clear_feed().await;
+        // Withdrawn or replaced after committing: restore the previous room
+        // and Space before anything of this navigation is shown.
+        if authority.withdrawn() || !self.navigation_is_current(navigation_epoch) {
+            self.restore_reveal(&room_id, previous).await;
+            if self.navigation_is_current(navigation_epoch) {
+                self.refresh(ui).await?;
             }
-            let rooms = self.manager.rooms_snapshot().await?;
-            let Some(room) = rooms.iter().find(|room| room.room_id == room_id) else {
-                return Err(MatrixCoreError::RoomNotFound(room_id));
-            };
-            if room.is_space || room.membership != RoomMembership::Joined {
-                return Err(MatrixCoreError::RoomNotFound(room_id));
-            }
-            // The same visibility rule as refresh: Home lists direct rooms and
-            // rooms outside every scanned Space.
-            let space_children = self.space_children.lock().await.clone();
-            let listing = space_children
-                .iter()
-                .filter(|(_, children)| children.contains(&room_id))
-                .map(|(space, _)| space.clone())
-                .collect::<Vec<_>>();
-            let in_home = room.is_direct || listing.is_empty();
-            let mut selected_space = self.selected_space.lock().await;
-            let visible = match &*selected_space {
-                Some(space) => listing.contains(space),
-                None => in_home,
-            };
-            if !self.navigation_is_current(navigation_epoch) {
-                return Ok(false);
-            }
-            if !visible {
-                *selected_space = if in_home {
-                    None
-                } else {
-                    listing.into_iter().min()
-                };
+            return Ok(false);
+        }
+        self.refresh(ui.clone()).await?;
+        if let Some(selection) = self.manager.account_selection(account_id) {
+            let room_id = self.selected_room.lock().await.clone();
+            if let Some(room_id) = room_id {
+                self.complete_room_recovery(selection, room_id, ui).await;
             }
         }
-        self.select_room_for(account_id, room_id, navigation_epoch, ui)
-            .await
+        Ok(true)
+    }
+
+    /// Select `room_id` and, when the current Space does not list it, the
+    /// lowest-ID Space that does (or Home), in one step, only while
+    /// `authority` holds and the navigation is current. Withdrawal takes the
+    /// same lock, so a withdrawn reveal changes nothing. Returns the previous
+    /// Space and room.
+    async fn commit_reveal(
+        &self,
+        room_id: &str,
+        spaces: &[String],
+        in_home: bool,
+        navigation_epoch: u64,
+        authority: &NavigationAuthority,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let mut space = self.selected_space.lock().await;
+        let mut room = self.selected_room.lock().await;
+        let withdrawn = authority.state();
+        if *withdrawn || !self.navigation_is_current(navigation_epoch) {
+            return None;
+        }
+        let previous = (space.clone(), room.clone());
+        let visible = match &*space {
+            Some(current) => spaces.contains(current),
+            None => in_home,
+        };
+        if !visible {
+            *space = if in_home {
+                None
+            } else {
+                spaces.iter().min().cloned()
+            };
+        }
+        *room = Some(room_id.to_owned());
+        Some(previous)
+    }
+
+    /// Undo a committed reveal whose room has not been shown.
+    async fn restore_reveal(&self, room_id: &str, previous: (Option<String>, Option<String>)) {
+        let mut space = self.selected_space.lock().await;
+        let mut room = self.selected_room.lock().await;
+        if room.as_deref() == Some(room_id) {
+            let (previous_space, previous_room) = previous;
+            *space = previous_space;
+            *room = previous_room;
+        }
     }
 
     pub async fn select_space_for(
@@ -2215,6 +2298,11 @@ impl LiveUi {
                 return;
             }
         }
+        // A live feed ends this room's focused view, if one was kept.
+        let _ = self
+            .manager
+            .release_focused_selected(&selection, &room_id)
+            .await;
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let feed = match self
             .manager
@@ -2287,6 +2375,10 @@ impl LiveUi {
                                     ui.get_messages(),
                                     messages.as_ref().clone(),
                                 ));
+                                // Live rows replace any focused view.
+                                if ui.get_conversation_focused() {
+                                    ui.set_conversation_focused(false);
+                                }
                             }
                         })
                         .is_err()
@@ -2319,6 +2411,129 @@ impl LiveUi {
         }
         *self.feed_key.lock().await = None;
         self.clear_thread().await;
+    }
+
+    /// Show the open room's conversation around `event_id` in place of its
+    /// latest messages, until the user returns to live or leaves the room.
+    /// Its rows are published under the live feed's account, room, feed
+    /// generation and navigation checks; while it runs, refreshes keep it
+    /// (open_room sees a running feed for the room). `authority` can be
+    /// withdrawn until the view replaces the live feed.
+    pub(crate) async fn focus_event_for(
+        self: &Arc<Self>,
+        account_id: &str,
+        room_id: String,
+        event_id: &str,
+        authority: NavigationAuthority,
+        ui: Weak<AppWindow>,
+    ) -> Result<bool, MatrixCoreError> {
+        let Some(selection) = self.manager.account_selection(account_id) else {
+            return Ok(false);
+        };
+        let navigation_epoch = self.current_navigation_epoch();
+        // Load without the transition lock: account controls never wait on
+        // the homeserver. Revocation of the selection ends the load.
+        let feed = self
+            .manager
+            .focused_message_feed_selected(&selection, &room_id, event_id, FOCUS_CONTEXT_EVENTS)
+            .await?;
+        let _transition = self.account_transition.lock().await;
+        if !selection.is_current()
+            || !self.navigation_is_current(navigation_epoch)
+            || self.require_active_account(account_id).await.is_err()
+            || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
+        {
+            return Ok(false);
+        }
+        // The commit: from here the live feed is stale and this view owns
+        // the conversation.
+        let generation = {
+            let withdrawn = authority.state();
+            if *withdrawn {
+                return Ok(false);
+            }
+            self.generation.fetch_add(1, Ordering::AcqRel) + 1
+        };
+        if let Some(previous) = self.feed.lock().await.take() {
+            previous.abort();
+        }
+        *self.feed_key.lock().await = Some((account_id.to_owned(), room_id.clone()));
+        let mut updates = feed.subscribe();
+        let current_generation = self.generation.clone();
+        let navigation_now = self.navigation_epoch.clone();
+        let is_live = self.is_live.clone();
+        let feed_account_id = account_id.to_owned();
+        let handle = tokio::spawn(async move {
+            let _feed = feed;
+            let delivery = Arc::new(crate::timeline_delivery::Latest::new());
+            loop {
+                if delivery.submit(updates.borrow_and_update().clone()) {
+                    let pending = delivery.clone();
+                    let selected_account = selection.clone();
+                    let current_generation = current_generation.clone();
+                    let navigation_now = navigation_now.clone();
+                    let live_flag = is_live.clone();
+                    let account_id = feed_account_id.clone();
+                    let room_id = room_id.clone();
+                    let queued = ui.upgrade_in_event_loop(move |ui| {
+                        let Some(messages) = pending.take() else {
+                            return;
+                        };
+                        if selected_account.is_current()
+                            && live_flag.load(Ordering::Acquire)
+                            && current_generation.load(Ordering::Acquire) == generation
+                            && navigation_now.load(Ordering::Acquire) == navigation_epoch
+                            && visible_feed_target(
+                                ui.get_active_account_local_id().as_str(),
+                                ui.get_active_room_id().as_str(),
+                                &account_id,
+                                &room_id,
+                            )
+                        {
+                            ui.set_messages(crate::timeline_model::update_shared(
+                                ui.get_messages(),
+                                messages.as_ref().clone(),
+                            ));
+                            ui.set_conversation_focused(true);
+                        }
+                    });
+                    if queued.is_err() {
+                        break;
+                    }
+                }
+                if !matches!(selection.guard(updates.changed()).await, Some(Ok(()))) {
+                    break;
+                }
+            }
+        });
+        *self.feed.lock().await = Some(handle);
+        Ok(true)
+    }
+
+    /// Leave a focused conversation view: end its feed and show the open
+    /// room's latest messages again. Drafts and an open thread are kept.
+    pub(crate) async fn return_to_live_for(
+        self: &Arc<Self>,
+        account_id: &str,
+        room_id: String,
+        ui: Weak<AppWindow>,
+    ) {
+        {
+            let _transition = self.account_transition.lock().await;
+            if self.require_active_account(account_id).await.is_err()
+                || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
+            {
+                return;
+            }
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            if let Some(task) = self.feed.lock().await.take() {
+                task.abort();
+            }
+            *self.feed_key.lock().await = None;
+        }
+        let navigation_epoch = self.current_navigation_epoch();
+        self.open_room(account_id, room_id, navigation_epoch, ui)
+            .await;
     }
 
     pub async fn open_thread(
@@ -2847,6 +3062,8 @@ fn apply_snapshot(
         // All-room results stay with their account across rooms, which is
         // how opening a hit in another room keeps the list it came from.
         crate::message_search::room_changed(ui, account_changed);
+        // A focused view belongs to the room that was left.
+        ui.set_conversation_focused(false);
         ui.set_room_call_mode(0);
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
         ui.set_composer_markdown(drafts.markdown(&view.active.id, next_room_id));
@@ -3544,6 +3761,52 @@ mod account_presentation_tests {
         ));
         assert_feed_cancelled(feed_cancelled).await;
         assert_feed_cancelled(thread_cancelled).await;
+        close_profile(directory, live).await;
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_search_navigation_held_at_its_commit_changes_nothing() {
+        let (directory, live) = empty_profile();
+        live.is_live.store(true, Ordering::Release);
+        let (old_room, old_space) = ("!old-room:example.org", "!old-space:example.org");
+        let (hit_room, hit_space) = ("!hit-room:example.org", "!hit-space:example.org");
+        *live.selected_room.lock().await = Some(old_room.into());
+        *live.selected_space.lock().await = Some(old_space.into());
+        let spaces = vec![hit_space.to_owned()];
+        let epoch = live.invalidate_navigation();
+        let authority = NavigationAuthority::default();
+
+        // Hold the reveal at its commit, withdraw it there, then release it.
+        let held = live.selected_room.lock().await;
+        let commit = {
+            let (live, spaces, authority) = (live.clone(), spaces.clone(), authority.clone());
+            tokio::spawn(async move {
+                let commit = live.commit_reveal(hit_room, &spaces, false, epoch, &authority);
+                commit.await
+            })
+        };
+        tokio::task::yield_now().await;
+        authority.withdraw();
+        drop(held);
+        assert_eq!(commit.await.unwrap(), None);
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(old_room));
+        assert_eq!(live.selected_space.lock().await.as_deref(), Some(old_space));
+
+        // Withdrawing the old search navigation never revokes a newer one.
+        let newer = live.invalidate_navigation();
+        authority.withdraw();
+        assert!(live.navigation_is_current(newer));
+
+        // A held authority commits the room and its Space together; a
+        // rollback before the room is shown restores both.
+        let authority = NavigationAuthority::default();
+        let commit = live.commit_reveal(hit_room, &spaces, false, newer, &authority);
+        let previous = commit.await.expect("a current reveal commits");
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(hit_room));
+        assert_eq!(live.selected_space.lock().await.as_deref(), Some(hit_space));
+        live.restore_reveal(hit_room, previous).await;
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(old_room));
+        assert_eq!(live.selected_space.lock().await.as_deref(), Some(old_space));
         close_profile(directory, live).await;
     }
 

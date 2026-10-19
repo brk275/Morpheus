@@ -2628,13 +2628,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window.set_history_operation(operation);
         window.set_history_loading(true);
         window.set_history_error("".into());
+        // A conversation focused on an older message pages its own view.
+        let focused = window.get_conversation_focused();
         let live = history_live.clone();
         let weak = weak.clone();
         history_handle.spawn(async move {
-            let result = live
-                .manager
-                .paginate_backwards_selected(&selection, &room_id, 50)
-                .await;
+            let manager = &live.manager;
+            let result = if focused {
+                manager
+                    .paginate_focused_selected(&selection, &room_id, true, 50)
+                    .await
+            } else {
+                manager
+                    .paginate_backwards_selected(&selection, &room_id, 50)
+                    .await
+            };
             let _ = weak.upgrade_in_event_loop(move |window| {
                 if !selection.is_current()
                     || window.get_active_account_local_id().as_str() != account_id
@@ -3534,6 +3542,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_composer_operation(operation);
         ui.set_composer_busy(true);
         if send_live.is_live.load(Ordering::Acquire) {
+            // A sent message appears in the live conversation.
+            ui.invoke_return_to_live();
             send_composers.send(&ui, &send_live, &send_handle, false);
             return;
         }
