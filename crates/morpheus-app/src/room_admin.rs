@@ -54,6 +54,10 @@ const CUSTOM_HISTORY: &str = "Custom history setting";
 const HISTORY_BODY: &str = "Messages already sent keep the visibility they were sent with.";
 const GUESTS_ALLOW: &str = "Guest accounts can join whenever the room's join rules let them in.";
 const GUESTS_FORBID: &str = "Guest accounts can no longer join. Guests already here stay.";
+const ENCRYPT_BODY: &str = "From now on only members' devices can read new messages. It cannot be \
+     turned off again, and bots or bridges without encryption support stop reading new messages. \
+     Messages already sent stay as they are.";
+const ENCRYPTION_ON: &str = "Encryption is on. Matrix rooms cannot turn it off again.";
 const SETTING_CHANGED: &str = "This setting changed on the server. Review it again.";
 
 pub(crate) const KICK: i32 = 1;
@@ -63,9 +67,11 @@ pub(crate) const SET_LEVEL: i32 = 4;
 pub(crate) const APPROVE: i32 = 5;
 pub(crate) const DENY: i32 = 6;
 
-/// Access rows in the permissions view: history visibility and guest access.
+/// Access rows in the permissions view: history visibility, guest access and
+/// end-to-end encryption.
 pub(crate) const ACCESS_HISTORY: i32 = 1;
 pub(crate) const ACCESS_GUESTS: i32 = 2;
+pub(crate) const ACCESS_ENCRYPTION: i32 = 3;
 /// History options in the panel's order, narrowest first. The Slint option
 /// labels follow the same order.
 pub(crate) const HISTORY_CHOICES: [HistoryChoice; 4] = [
@@ -343,7 +349,8 @@ fn history_rank(choice: HistoryChoice) -> i32 {
 /// Display state of one access row in the permissions view.
 pub(crate) struct AccessRow {
     pub(crate) kind: i32,
-    /// History: index in `HISTORY_CHOICES`. Guests: 1 allowed, 0 not. -1 custom.
+    /// History: index in `HISTORY_CHOICES`. Guests: 1 allowed, 0 not.
+    /// Encryption: 1 on, 0 off. -1 custom.
     pub(crate) choice: i32,
     pub(crate) label: &'static str,
     pub(crate) description: &'static str,
@@ -359,6 +366,8 @@ fn access_lock(kind: i32, access: AccessSettings, snapshot: &RoomAdminSnapshot) 
             let known = access.history.is_some();
             (known, access.history_editable, access.history_level)
         }
+        ACCESS_ENCRYPTION if access.encrypted => return ENCRYPTION_ON.to_owned(),
+        ACCESS_ENCRYPTION => (true, access.encryption_editable, access.encryption_level),
         _ => {
             let known = access.guests_can_join.is_some();
             (known, access.guests_editable, access.guests_level)
@@ -401,6 +410,16 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
             editable: access.guests_editable,
             restriction: access_lock(ACCESS_GUESTS, access, snapshot),
         },
+        AccessRow {
+            kind: ACCESS_ENCRYPTION,
+            choice: i32::from(access.encrypted),
+            label: "End-to-end encryption",
+            description: "Whether only members' devices can read new messages. Once on, it \
+                stays on.",
+            summary: if access.encrypted { "On" } else { "Off" },
+            editable: access.encryption_editable,
+            restriction: access_lock(ACCESS_ENCRYPTION, access, snapshot),
+        },
     ]
 }
 
@@ -414,11 +433,13 @@ fn access_current(change: AccessChange, access: AccessSettings) -> bool {
     match change {
         AccessChange::History { from, .. } => access.history == Some(from),
         AccessChange::Guests { allow } => access.guests_can_join == Some(!allow),
+        AccessChange::Encrypt => !access.encrypted,
     }
 }
 
 /// Change history visibility (`ACCESS_HISTORY`, choice indexes
-/// `HISTORY_CHOICES`) or guest access (`ACCESS_GUESTS`, choice 1 allows).
+/// `HISTORY_CHOICES`), guest access (`ACCESS_GUESTS`, choice 1 allows) or
+/// turn on encryption (`ACCESS_ENCRYPTION`, choice 1).
 pub(crate) fn access_intent(
     kind: i32,
     choice: i32,
@@ -453,6 +474,18 @@ pub(crate) fn access_intent(
                 return Err("The room already uses that guest setting.".to_owned());
             }
             (AccessChange::Guests { allow }, "Guest access")
+        }
+        ACCESS_ENCRYPTION => {
+            if access.encrypted {
+                return Err(ENCRYPTION_ON.to_owned());
+            }
+            if !access.encryption_editable {
+                return Err(access_restriction(access.encryption_level, snapshot));
+            }
+            if choice != 1 {
+                return Err("Encryption is already off.".to_owned());
+            }
+            (AccessChange::Encrypt, "End-to-end encryption")
         }
         _ => return Err(UNKNOWN_RULES.to_owned()),
     };
@@ -777,6 +810,12 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
             action: "Stop guests",
             destructive: false,
         },
+        AdminAction::SetAccess(AccessChange::Encrypt) => Confirmation {
+            title: "Turn on end-to-end encryption?".to_owned(),
+            body: ENCRYPT_BODY.to_owned(),
+            action: "Turn on encryption",
+            destructive: true,
+        },
     };
     if let Some(reason) = &intent.reason {
         confirmation.body.push_str("\n\nReason, visible to the room: ");
@@ -865,6 +904,9 @@ fn access_outcome_text(change: AccessChange, confirmed: bool) -> String {
         AccessChange::Guests { allow: false } => {
             "Guests can no longer join. The homeserver confirmed it.".to_owned()
         }
+        AccessChange::Encrypt => {
+            "End-to-end encryption is on. The homeserver confirmed it.".to_owned()
+        }
     }
 }
 
@@ -879,6 +921,7 @@ pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot)
         let level = match change {
             AccessChange::History { .. } => access.history_level,
             AccessChange::Guests { .. } => access.guests_level,
+            AccessChange::Encrypt => access.encryption_level,
         };
         return access_restriction(level, snapshot);
     }
@@ -1278,6 +1321,9 @@ mod tests {
             guests_can_join: Some(false),
             guests_level: 50,
             guests_editable: editable,
+            encrypted: false,
+            encryption_level: 50,
+            encryption_editable: editable,
         });
         snapshot
     }
@@ -1312,10 +1358,35 @@ mod tests {
         assert!(access_intent(ACCESS_HISTORY, 3, &custom).is_err());
 
         let rows = access_rows(&snapshot);
-        assert_eq!(rows.len(), 2);
-        assert_eq!((rows[0].choice, rows[1].choice), (0, 0));
+        assert_eq!(rows.len(), 3);
+        assert_eq!((rows[0].choice, rows[1].choice, rows[2].choice), (0, 0, 0));
         let unlocked = |row: &AccessRow| row.editable && row.restriction.is_empty();
         assert!(rows.iter().all(unlocked));
+    }
+
+    #[test]
+    fn encryption_only_turns_on_after_a_destructive_review() {
+        let snapshot = with_access(true);
+        let encrypt = access_intent(ACCESS_ENCRYPTION, 1, &snapshot).unwrap();
+        assert_eq!(encrypt.action, AdminAction::SetAccess(AccessChange::Encrypt));
+        let review = confirmation(&encrypt, &snapshot).unwrap();
+        assert!(review.destructive && review.body.contains("cannot be turned off"));
+        assert!(encrypt.still_matches(&snapshot));
+        assert!(access_intent(ACCESS_ENCRYPTION, 0, &snapshot).is_err());
+        let locked = access_intent(ACCESS_ENCRYPTION, 1, &with_access(false));
+        assert!(locked.is_err_and(|text| text.contains("needs level 50")));
+
+        // Once on, it stays on: no action, and a stale review is withdrawn.
+        let mut on = snapshot.clone();
+        if let Some(access) = on.access.as_mut() {
+            access.encrypted = true;
+            access.encryption_editable = false;
+        }
+        assert!(!encrypt.still_matches(&on));
+        assert_eq!(access_intent(ACCESS_ENCRYPTION, 1, &on), Err(ENCRYPTION_ON.to_owned()));
+        let row = &access_rows(&on)[2];
+        assert_eq!((row.choice, row.summary, row.editable), (1, "On", false));
+        assert_eq!(row.restriction, ENCRYPTION_ON);
     }
 
     #[test]

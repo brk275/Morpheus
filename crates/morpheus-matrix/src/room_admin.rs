@@ -38,6 +38,7 @@ use matrix_sdk::{
             AnyStateEventContent, EmptyStateKey, StateEventType,
             room::{
                 create::RoomCreateEventContent,
+                encryption::RoomEncryptionEventContent,
                 guest_access::{GuestAccess, RoomGuestAccessEventContent},
                 history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
                 member::{MembershipState, RoomMemberEventContent},
@@ -258,8 +259,9 @@ impl HistoryChoice {
     }
 }
 
-/// History visibility and guest access from fresh state. A value is `None`
-/// when the room uses content a typed rewrite would lose; it stays read-only.
+/// History visibility, guest access and encryption from fresh state. A value
+/// is `None` when the room uses content a typed rewrite would lose; it stays
+/// read-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccessSettings {
     pub history: Option<HistoryChoice>,
@@ -268,6 +270,12 @@ pub struct AccessSettings {
     pub guests_can_join: Option<bool>,
     pub guests_level: i64,
     pub guests_editable: bool,
+    /// The room has an `m.room.encryption` state event. Matrix offers no way
+    /// to turn encryption off again.
+    pub encrypted: bool,
+    pub encryption_level: i64,
+    /// Encryption is off and the account may turn it on.
+    pub encryption_editable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +286,8 @@ pub enum AccessChange {
         to: HistoryChoice,
     },
     Guests { allow: bool },
+    /// Turn on end-to-end encryption; it cannot be turned off again.
+    Encrypt,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -546,8 +556,11 @@ impl RoomAdminSession {
         if let Some(levels) = &levels {
             let history = self.optional_state(StateEventType::RoomHistoryVisibility).await?;
             let guests = self.optional_state(StateEventType::RoomGuestAccess).await?;
+            let encryption = self.optional_state(StateEventType::RoomEncryption).await?;
             self.check()?;
-            let access = access_settings(levels, &self.own_user, history.as_ref(), guests.as_ref());
+            let (history, guests) = (history.as_ref(), guests.as_ref());
+            let encrypted = encryption.is_some();
+            let access = access_settings(levels, &self.own_user, history, guests, encrypted);
             snapshot.access = Some(access);
         }
         Ok(snapshot)
@@ -1129,11 +1142,13 @@ fn access_settings(
     own: &UserId,
     history: Option<&StateEnvelope>,
     guests: Option<&StateEnvelope>,
+    encrypted: bool,
 ) -> AccessSettings {
     let history = history_choice(history);
     let guests_can_join = guests_can_join(guests);
     let history_kind = StateEventType::RoomHistoryVisibility;
     let guests_kind = StateEventType::RoomGuestAccess;
+    let encryption_kind = StateEventType::RoomEncryption;
     AccessSettings {
         history,
         history_level: levels.for_state(history_kind.clone()).into(),
@@ -1141,6 +1156,9 @@ fn access_settings(
         guests_can_join,
         guests_level: levels.for_state(guests_kind.clone()).into(),
         guests_editable: guests_can_join.is_some() && levels.user_can_send_state(own, guests_kind),
+        encrypted,
+        encryption_level: levels.for_state(encryption_kind.clone()).into(),
+        encryption_editable: !encrypted && levels.user_can_send_state(own, encryption_kind),
     }
 }
 
@@ -1148,6 +1166,7 @@ fn access_kind(change: AccessChange) -> StateEventType {
     match change {
         AccessChange::History { .. } => StateEventType::RoomHistoryVisibility,
         AccessChange::Guests { .. } => StateEventType::RoomGuestAccess,
+        AccessChange::Encrypt => StateEventType::RoomEncryption,
     }
 }
 
@@ -1155,6 +1174,9 @@ fn access_matches(change: AccessChange, current: Option<&StateEnvelope>) -> bool
     match change {
         AccessChange::History { from, .. } => history_choice(current) == Some(from),
         AccessChange::Guests { allow } => guests_can_join(current) == Some(!allow),
+        // Any encryption event, even one this client cannot read, means it
+        // is on already; it is never replaced.
+        AccessChange::Encrypt => current.is_none(),
     }
 }
 
@@ -1162,6 +1184,7 @@ fn access_applied(change: AccessChange, access: AccessSettings) -> bool {
     match change {
         AccessChange::History { to, .. } => access.history == Some(to),
         AccessChange::Guests { allow } => access.guests_can_join == Some(allow),
+        AccessChange::Encrypt => access.encrypted,
     }
 }
 
@@ -1179,6 +1202,10 @@ fn access_request(room: &RoomId, change: AccessChange) -> Result<send_state_even
                 GuestAccess::Forbidden
             };
             let content = RoomGuestAccessEventContent::new(access);
+            send_state_event::v3::Request::new(room, &EmptyStateKey, &content)
+        }
+        AccessChange::Encrypt => {
+            let content = RoomEncryptionEventContent::with_recommended_defaults();
             send_state_event::v3::Request::new(room, &EmptyStateKey, &content)
         }
     };
@@ -1936,12 +1963,29 @@ mod tests {
 
         let levels = levels("11", json!({"@mod:example.org": 50}));
         let own = user_id!("@mod:example.org");
-        let access = access_settings(&levels, own, Some(&joined), None);
+        let access = access_settings(&levels, own, Some(&joined), None, false);
         assert!(access.history_editable && access.guests_editable);
+        assert!(access.encryption_editable && !access.encrypted);
         assert_eq!(access.history_level, 50);
         let member = user_id!("@member:example.org");
-        let locked = access_settings(&levels, member, Some(&joined), None);
+        let locked = access_settings(&levels, member, Some(&joined), None, false);
         assert!(!locked.history_editable && !locked.guests_editable);
+        assert!(!locked.encryption_editable);
+
+        // Encryption only ever turns on, and only in a room without it.
+        let on = access_settings(&levels, own, Some(&joined), None, true);
+        assert!(on.encrypted && !on.encryption_editable);
+        assert!(access_matches(AccessChange::Encrypt, None));
+        let encryption = envelope(
+            "m.room.encryption",
+            "@casey:example.org",
+            json!({"algorithm": "m.megolm.v1.aes-sha2"}),
+        );
+        assert!(!access_matches(AccessChange::Encrypt, Some(&encryption)));
+        assert!(access_applied(AccessChange::Encrypt, on));
+        let room = room_id!("!admin:example.org");
+        let request = access_request(room, AccessChange::Encrypt).unwrap();
+        assert!(request.body.json().get().contains("m.megolm.v1.aes-sha2"));
     }
 
     #[test]

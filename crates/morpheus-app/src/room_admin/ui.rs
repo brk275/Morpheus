@@ -859,6 +859,7 @@ fn access_row(row: super::AccessRow, pending: Option<AccessChange>) -> RosterPer
     let pending = match pending {
         Some(AccessChange::History { .. }) => row.kind == super::ACCESS_HISTORY,
         Some(AccessChange::Guests { .. }) => row.kind == super::ACCESS_GUESTS,
+        Some(AccessChange::Encrypt) => row.kind == super::ACCESS_ENCRYPTION,
         None => false,
     };
     RosterPermission {

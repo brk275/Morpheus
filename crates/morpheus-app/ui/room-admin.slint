@@ -31,9 +31,10 @@ export struct RosterMember {
 export struct RosterPermission {
     // A threshold's index, or -1 for an access row.
     key: int,
-    // 0 threshold, 1 history visibility, 2 guest access.
+    // 0 threshold, 1 history visibility, 2 guest access, 3 encryption.
     kind: int,
-    // Access rows: the current option index (guests: 1 allowed), or -1.
+    // Access rows: the current option index (guests: 1 allowed; encryption:
+    // 1 on), or -1.
     choice: int,
     label: string,
     description: string,
@@ -743,6 +744,19 @@ export component RoomMembersPanel inherits VerticalLayout {
                             enabled: !root.busy && root.access-choice >= 0 && root.access-choice != root.chosen.choice;
                             activated => { root.request-access(1, root.access-choice); }
                         }
+                    }
+                }
+                // Encryption only turns on: Matrix rooms cannot turn it off again.
+                if root.chosen.kind == 3 && root.chosen.editable : HorizontalLayout {
+                    alignment: start;
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Turn on encryption…";
+                        label: "Review turning on end-to-end encryption; it cannot be turned off again";
+                        destructive: true;
+                        enabled: !root.busy && root.chosen.choice == 0;
+                        activated => { root.request-access(3, 1); }
                     }
                 }
                 if root.chosen.kind == 2 && root.chosen.editable : HorizontalLayout {
