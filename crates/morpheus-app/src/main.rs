@@ -43,6 +43,7 @@ mod sso;
 #[cfg(not(morpheus_timeline_acceptance))]
 mod startup_error;
 mod stickers;
+mod style_profiles;
 mod thread_history;
 // Instrumented release builds only (see build.rs); unit tests cover its pure checks.
 #[cfg(any(test, morpheus_timeline_acceptance))]
@@ -915,15 +916,38 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 }
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
-    appearance::apply_config(ui, config);
-    appearance::apply_theme(ui, config, theme);
-    // After the theme, so the workspace reads the colors now shown.
-    appearance_editor::project(ui, config, theme);
-    metric_editor::project(ui, config);
-    sender_palette_editor::project(ui, config, theme);
+    apply_appearance(ui, config, theme, true);
+    apply_behavior(ui, config);
+    style_profiles::config_applied(ui);
+}
+
+/// Accepted behavioral settings always take effect, including while a style
+/// preview owns the appearance. Preview/cancel never applies these settings.
+fn apply_behavior(ui: &AppWindow, config: &Config) {
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);
+    apply_notification_settings(ui, config);
+}
+
+/// Everything of `config` that shows the look of the window, and nothing that
+/// changes behavior such as shortcuts, devices or notifications. A style
+/// profile preview applies only this, with `project_editors` false so the
+/// Settings editors and their undo steps stay on the accepted configuration.
+fn apply_appearance(
+    ui: &AppWindow,
+    config: &Config,
+    theme: Option<&ThemePack>,
+    project_editors: bool,
+) {
+    appearance::apply_config(ui, config);
+    appearance::apply_theme(ui, config, theme);
+    if project_editors {
+        // After the theme, so the workspace reads the colors now shown.
+        appearance_editor::project(ui, config, theme);
+        metric_editor::project(ui, config);
+        sender_palette_editor::project(ui, config, theme);
+    }
     // The theme mode follows the window's active account: its configured
     // override, else the global appearance. Only this accepted configuration
     // replaces the remembered preferences.
@@ -952,7 +976,6 @@ fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     ui.set_room_density_choice(layout.room_density.map_or(-1, density_index));
     ui.set_message_density_choice(layout.message_density.map_or(-1, density_index));
     ui.set_sort_unread_first(config.layout.sort_unread_first);
-    apply_notification_settings(ui, config);
     apply_room_sort(ui);
     ui.set_room_list_width(config.layout.room_list_width.into());
     ui.set_details_width(config.layout.details_width.into());
@@ -977,7 +1000,15 @@ fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
 }
 
 fn apply_loaded_config(ui: &AppWindow, loaded: &LoadedConfig) {
-    apply_config(ui, &loaded.config, loaded.theme.as_ref());
+    // A previewed style profile stays while the accepted look is unchanged,
+    // as when the watcher re-reads this window's own save; any other change
+    // ends the preview here, before it is applied.
+    if style_profiles::keeps_preview(ui, loaded) {
+        apply_behavior(ui, &loaded.config);
+        style_profiles::config_applied(ui);
+    } else {
+        apply_config(ui, &loaded.config, loaded.theme.as_ref());
+    }
     ui.set_config_error("".into());
 }
 
@@ -1004,7 +1035,16 @@ fn save_config_edit(
     // Read from disk first so an invalid external edit is never overwritten by a UI action.
     let result = (|| {
         let mut config = store.load()?;
+        let before = style_profiles::previewing().then(|| config.clone());
         if !change(&mut config) {
+            return Ok(None);
+        }
+        // A Settings change ends a style profile preview first. One that
+        // would change the look may have been computed from the preview,
+        // so it is refused rather than saved.
+        if let Some(before) = before
+            && !style_profiles::end_preview_for_save(ui, &before, &config)
+        {
             return Ok(None);
         }
         store.save(&config)?;
@@ -4400,6 +4440,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     appearance_editor::register(&ui, &store);
     metric_editor::register(&ui, &store);
     sender_palette_editor::register(&ui, &store);
+    style_profiles::register(&ui, &store);
     settings_search::register(&ui);
     ui.on_choose_theme(move |index| {
         if let Some(ui) = weak.upgrade() {

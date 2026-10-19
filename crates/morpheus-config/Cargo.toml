@@ -13,3 +13,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3"
 thiserror = "2.0.21"
 toml = "1.1.8"
+
+# Style profiles: anchored, no-follow file operations in the fixed profiles
+# folder (openat, fstatat, renameat, unlinkat). Already locked in Cargo.lock.
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.190"

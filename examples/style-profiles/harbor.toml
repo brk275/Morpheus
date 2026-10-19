@@ -1,0 +1,53 @@
+# Morpheus style profile: Harbor. Roomy and calm, with cool slate surfaces,
+# large rounded controls, circular avatars and gentle opt-in fades.
+# Import it from Settings > Appearance > Style profiles. See docs/STYLE_PROFILES.md.
+profile_version = 1
+name = "Harbor"
+
+[appearance]
+theme = "dark"
+density = "spacious"
+popup_fade_ms = 140
+panel_fade_ms = 180
+
+[typography]
+message_size = 15
+sidebar_size = 14
+composer_size = 15
+
+[geometry]
+corner_radius = 14
+message_gap = 14
+control_radius = 12
+input_radius = 12
+composer_radius = 18
+control_padding = 14
+composer_padding = 12
+icon_size = 20
+avatar_size = 40
+avatar_roundness = 50
+
+[chat]
+color_senders = true
+
+[colors]
+rail = "#10171F"
+sidebar = "#141C25"
+canvas = "#18212B"
+panel = "#1C2631"
+elevated = "#223040"
+hover = "#263546"
+ink = "#E4ECF2"
+muted = "#9AAAB8"
+divider = "#2C3B4B"
+accent = "#6CB4D9"
+accent_ink = "#0C1A24"
+link = "#8CCBEA"
+focus = "#F2C879"
+nav_selected = "#24435A"
+nav_selected_ink = "#F2F7FA"
+composer_surface = "#1F2B38"
+composer_focus = "#6CB4D9"
+
+[senders]
+colors = ["#8CCBEA", "#9AD8B4", "#F2C879", "#E7A1B0", "#B9A7EF", "#F0A77E"]

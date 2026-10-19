@@ -3104,6 +3104,220 @@ async fn assert_shortcut_customization(ui: &AppWindow, directory: &std::path::Pa
     settle(ui).await;
 }
 
+/// Style profiles on the real generated window. Save current look stores the
+/// look only. A preview changes the window and saves nothing; Cancel restores
+/// the look exactly. A newer look, an account switch or a Settings save ends
+/// the preview, and a save that would change the look during it is refused.
+/// Apply saves the profile's look over the re-read file and keeps every other
+/// setting; an invalid settings file is never overwritten; Delete asks first.
+async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::style_profiles::ProfileStore;
+    use morpheus_config::{ConfigStore, LoadedConfig};
+
+    let store = ConfigStore::at(directory.join("style-check").join("config.toml"));
+    let mut config = store.load_or_create().unwrap();
+    // Explicit synthetic opt-in: production message previews default off.
+    // The later live-config regression must exercise a true -> false change.
+    config.notifications.show_message_preview = true;
+    config.notifications.highlight_words = vec!["private-word".into()];
+    config.typography.message_size = 15;
+    store.save(&config).unwrap();
+    apply_config(ui, &config, None);
+    crate::style_profiles::register(ui, &store);
+    // Search must focus the real filter even when Settings does not exist
+    // until this request. Revealing a section must not create or save a look.
+    ui.set_page(0);
+    ui.set_settings_revealed_id("".into());
+    settle(ui).await;
+    let before_reveal = std::fs::read(store.path()).unwrap();
+    assert!(crate::settings_search::reveal(
+        ui,
+        "appearance.style_profiles"
+    ));
+    settle(ui).await;
+    assert_eq!(ui.get_settings_revealed_id(), "appearance.style_profiles");
+    assert!(focused_control_has_label(
+        ui,
+        "Filter style profiles by name or look"
+    ));
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_reveal);
+    let profiles = ProfileStore::for_config(&store).unwrap();
+    assert!(profiles.list().unwrap().entries.is_empty());
+
+    // Save current look: the look only, sparse, never other settings.
+    ui.set_style_profile_name_input("Reading room".into());
+    ui.invoke_style_profile_save_current();
+    settle(ui).await;
+    assert_eq!(profiles.list().unwrap().entries.len(), 1);
+    let raw = std::fs::read_to_string(profiles.dir().join("reading-room.toml")).unwrap();
+    assert!(raw.contains("message_size = 15"), "{raw}");
+    for absent in [
+        "private-word",
+        "highlight",
+        "notifications",
+        "shortcuts",
+        "scale_percent",
+    ] {
+        assert!(!raw.contains(absent), "{absent} leaked into a profile");
+    }
+    let items = ui.get_style_profile_items();
+    assert_eq!(items.row_count(), 1);
+    let item = items.row_data(0).unwrap();
+    assert!(item.valid && item.current);
+    assert!(!item.key.contains("reading"), "list keys are opaque");
+    // The same name asks before replacing.
+    ui.invoke_style_profile_save_current();
+    settle(ui).await;
+    assert_eq!(ui.get_style_profile_state().confirm, 2);
+    ui.invoke_style_profile_dismiss();
+    settle(ui).await;
+    assert_eq!(profiles.list().unwrap().entries.len(), 1);
+
+    // A new accepted look, then a preview of the saved one.
+    let mut larger = store.load().unwrap();
+    larger.typography.message_size = 20;
+    store.save(&larger).unwrap();
+    apply_config(ui, &larger, None);
+    settle(ui).await;
+    assert!(!ui.get_style_profile_items().row_data(0).unwrap().current);
+    ui.invoke_style_profile_chosen(item.key.clone());
+    let preview = |ui: &AppWindow| {
+        ui.invoke_style_profile_preview();
+        assert!(ui.get_style_preview_active());
+        assert_eq!(ui.get_style_preview_name(), "Reading room");
+    };
+    preview(ui);
+    settle(ui).await;
+    assert_eq!(ui.get_message_font_size(), 15);
+    assert_eq!(store.load().unwrap(), larger, "a preview saves nothing");
+    ui.invoke_style_profile_cancel_preview();
+    settle(ui).await;
+    assert!(!ui.get_style_preview_active());
+    assert_eq!(ui.get_message_font_size(), 20);
+
+    // A save that would change the look is refused and ends the preview.
+    preview(ui);
+    let before = std::fs::read_to_string(store.path()).unwrap();
+    let refused = crate::save_config_edit(ui, &store, |config| {
+        config.typography.message_size = 18;
+        true
+    });
+    assert!(refused.is_none());
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), before);
+    assert!(!ui.get_style_preview_active());
+    assert!(ui.get_style_profile_message_error());
+    assert_eq!(ui.get_message_font_size(), 20);
+    // The outcome is also announced on every page until dismissed.
+    assert!(ui.get_style_profile_notice_error());
+    assert!(!ui.get_style_profile_notice().is_empty());
+    ui.invoke_style_profile_notice_dismiss();
+    assert!(ui.get_style_profile_notice().is_empty());
+    // A save that keeps the look ends the preview and is saved.
+    preview(ui);
+    let kept = crate::save_config_edit(ui, &store, |config| {
+        config.notifications.sounds = false;
+        true
+    });
+    assert!(kept.is_some());
+    assert!(!ui.get_style_preview_active());
+    assert!(!store.load().unwrap().notifications.sounds);
+    assert_eq!(ui.get_message_font_size(), 20);
+
+    // Re-reading the same look keeps the preview and shows its other
+    // settings at once; a different look ends it.
+    preview(ui);
+    let mut same = LoadedConfig {
+        config: store.load().unwrap(),
+        theme: None,
+    };
+    same.config.appearance.scale_percent = 150;
+    // A live preview must not hold back an external privacy change. These
+    // settings are deliberately excluded from profile imports and rollback.
+    assert!(ui.get_notifications_enabled());
+    assert!(ui.get_notification_show_preview());
+    same.config.notifications.enabled = false;
+    same.config.notifications.show_message_preview = false;
+    crate::apply_loaded_config(ui, &same);
+    assert!(!ui.get_notifications_enabled());
+    assert!(!ui.get_notification_show_preview());
+    assert!(ui.get_style_preview_active());
+    assert_eq!(ui.get_message_font_size(), 15);
+    assert_eq!(ui.get_font_scale_percent(), 150);
+    ui.invoke_style_profile_cancel_preview();
+    assert!(!ui.get_style_preview_active());
+    assert!(!ui.get_notifications_enabled());
+    assert!(!ui.get_notification_show_preview());
+    preview(ui);
+    let mut external = store.load().unwrap();
+    external.typography.message_size = 22;
+    store.save(&external).unwrap();
+    crate::apply_loaded_config(
+        ui,
+        &LoadedConfig {
+            config: external.clone(),
+            theme: None,
+        },
+    );
+    assert!(!ui.get_style_preview_active());
+    assert_eq!(ui.get_message_font_size(), 22);
+
+    // An account switch cancels a preview started for another account.
+    let account = ui.get_active_account_local_id();
+    preview(ui);
+    ui.set_active_account_local_id("another-account".into());
+    crate::appearance::apply_theme_mode(ui);
+    assert!(!ui.get_style_preview_active());
+    assert_eq!(ui.get_message_font_size(), 22);
+    assert!(ui.get_style_profile_notice().contains("Switching accounts"));
+    ui.set_active_account_local_id(account.clone());
+    crate::appearance::apply_theme_mode(ui);
+
+    // Apply from the bar saves exactly the previewed look, even when the
+    // profile's file changed meanwhile, and keeps other settings.
+    preview(ui);
+    let previewed = profiles.list().unwrap().entries.remove(0);
+    let original = previewed.profile.unwrap();
+    let mut changed = original.clone();
+    changed.typography.message_size = 19;
+    profiles.replace(&previewed.file, &changed).unwrap();
+    ui.invoke_style_preview_apply();
+    settle(ui).await;
+    profiles.replace(&previewed.file, &original).unwrap();
+    ui.invoke_style_profiles_refresh();
+    let applied = store.load().unwrap();
+    assert_eq!(applied.typography.message_size, 15);
+    assert_eq!(applied.notifications.highlight_words, ["private-word"]);
+    assert!(!applied.notifications.sounds);
+    assert!(!ui.get_style_preview_active());
+    assert_eq!(ui.get_message_font_size(), 15);
+    assert!(ui.get_style_profile_items().row_data(0).unwrap().current);
+
+    // An invalid settings file is never overwritten by Apply.
+    let broken = "schema_version = 1\n[typography]\nmessage_size = 999\n";
+    std::fs::write(store.path(), broken).unwrap();
+    ui.invoke_style_profile_apply();
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), broken);
+    assert!(ui.get_style_profile_message_error());
+    store.save(&applied).unwrap();
+    ui.set_config_error("".into());
+
+    // Delete asks first and removes only the profile file.
+    ui.invoke_style_profile_delete();
+    settle(ui).await;
+    assert_eq!(ui.get_style_profile_state().confirm, 1);
+    assert_eq!(profiles.list().unwrap().entries.len(), 1);
+    ui.invoke_style_profile_confirm();
+    settle(ui).await;
+    assert!(profiles.list().unwrap().entries.is_empty());
+    assert_eq!(store.load().unwrap(), applied);
+    assert_eq!(ui.get_style_profile_items().row_count(), 0);
+
+    ui.set_page(0);
+    apply_config(ui, &Config::default(), None);
+    settle(ui).await;
+}
+
 async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell<u8>>) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
@@ -3146,6 +3360,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_account_scoped_appearance(&ui, directory.path()).await;
     phase.set(14);
     assert_shortcut_customization(&ui, directory.path()).await;
+    phase.set(18);
+    assert_style_profiles(&ui, directory.path()).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),

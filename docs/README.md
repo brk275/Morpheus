@@ -8,6 +8,7 @@ implemented and what still needs verification.
 | Guide | Covers |
 | --- | --- |
 | [Customization](CUSTOMIZATION.md) | Themes, fonts, message layouts, navigation and live configuration. |
+| [Style profiles](STYLE_PROFILES.md) | Saved, previewable and shareable appearance-only looks and their file format. |
 | [Theme files](../themes/README.md) | Built-in palettes and your own TOML colors. |
 | [Screenshots](screenshots/README.md) | Real native captures with fictional accounts. |
 | [Account controls](ACCOUNT_ACCESS.md) | Switching, the local app password and account removal. |

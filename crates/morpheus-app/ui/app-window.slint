@@ -166,6 +166,37 @@ export struct MetricEditorState {
     hint: string,
 }
 
+// One saved style profile in the Settings list. `key` is an opaque value of
+// this session, never a file name or path.
+export struct StyleProfileItem {
+    key: string,
+    name: string,
+    detail: string,
+    valid: bool,
+    // The look this profile holds is the look shown now.
+    current: bool,
+}
+
+// The selected style profile and any pending confirmation.
+export struct StyleProfileState {
+    key: string,
+    name: string,
+    summary: string,
+    // Why the file cannot be used; empty when it is valid.
+    problem: string,
+    valid: bool,
+    matches-current: bool,
+    // This profile is the one being previewed.
+    previewed: bool,
+    // Some profile is being previewed.
+    previewing: bool,
+    // More files were in the folder than were listed.
+    truncated: bool,
+    // 0 none, 1 delete the selected profile, 2 replace a profile of the same name.
+    confirm: int,
+    confirm-text: string,
+}
+
 // Runtime geometry shared by small reusable controls and the main view.
 export global StyleTokens {
     in-out property <length> radius: 10px;
@@ -2309,6 +2340,8 @@ component SenderColorActions inherits HorizontalLayout {
     in property <float> text-scale: 1;
     callback moved(int, int);
     callback removed(int);
+    // Fixed-size actions: the hex field or the sample takes the free width.
+    horizontal-stretch: 0;
     spacing: 8px;
     if !root.palette-entry.readable : Text {
         text: "Low contrast"; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center;
@@ -2433,7 +2466,6 @@ component SenderPaletteEditor inherits VerticalLayout {
         spacing: 8px; alignment: start;
         add-color := TextAction {
             text: "Add color"; label: "Add a sender color";
-            wrap-caption: root.stacked;
             enabled: root.rows.length < 16;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
@@ -2441,14 +2473,12 @@ component SenderPaletteEditor inherits VerticalLayout {
         }
         if root.can-undo : TextAction {
             text: "Undo"; label: "Undo the last change to sender colors";
-            wrap-caption: root.stacked;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
             activated => { root.undo(); }
         }
         if root.custom : TextAction {
             text: "Use theme colors"; label: "Remove your sender colors and use the theme's";
-            wrap-caption: root.stacked;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
             activated => { root.reset(); }
@@ -2511,6 +2541,275 @@ component WindowOpacitySetting inherits VerticalLayout {
         Text { text: "%"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
     }
     Text { text: root.status; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+}
+
+// Saved looks: a filter, the list, the one selected profile with its
+// actions, a name field for saving, renaming and copying, and a message.
+// Buttons that disappear once used move focus to the filter first.
+component StyleProfilesEditor inherits VerticalLayout {
+    in property <[StyleProfileItem]> items;
+    in-out property <string> filter;
+    in property <string> selected-key;
+    in property <StyleProfileState> state;
+    in-out property <string> name-input;
+    in property <string> message;
+    in property <bool> message-error;
+    in property <bool> busy;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> accent;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    in property <length> max-list-height: 260px;
+    callback filter-edited(string);
+    callback chosen(string);
+    callback save-current();
+    callback rename();
+    callback duplicate();
+    callback delete-profile();
+    callback confirm();
+    callback dismiss();
+    callback preview();
+    callback apply();
+    callback cancel-preview();
+    callback import-file();
+    callback export-file();
+    callback refresh();
+    out property <bool> has-focus: filter-input.has-focus;
+    forward-focus: filter-input;
+    spacing: 8px;
+    alignment: start;
+    Rectangle {
+        height: max(36px, 30px * root.text-scale);
+        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+        border-width: filter-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+        border-color: filter-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent)
+            : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
+        if root.filter == "" : Text {
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+            text: "Filter profiles by name or look: serif, light, columns…"; color: root.muted;
+            font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
+        }
+        filter-input := ThemedTextInput {
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+            text <=> root.filter; single-line: true;
+            color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+            accessible-label: "Filter style profiles by name or look";
+            edited => { root.filter-edited(self.text); }
+        }
+    }
+    if root.items.length == 0 : Text {
+        text: root.filter == "" ? "No style profiles yet. Type a name below and save your current look, or import a profile file."
+            : "No profiles match. Try another word.";
+        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    if root.items.length > 0 : list-scroll := ScrollView {
+        height: min(list-content.preferred-height, root.max-list-height);
+        horizontal-scrollbar-policy: always-off;
+        accessible-role: list;
+        accessible-label: "Style profiles";
+        list-content := VerticalLayout {
+            width: list-scroll.visible-width;
+            spacing: 2px; alignment: start;
+            for item in root.items : ActionRect {
+                height: max(44px, 30px * root.text-scale + 14px);
+                label: item.name + ", " + item.detail + (item.current ? ", matches your current look" : "")
+                    + (item.key == root.selected-key ? ", selected" : "");
+                background: item.key == root.selected-key ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
+                    : self.has-hover ? root.hover-surface : transparent;
+                border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
+                activated => { root.chosen(item.key); }
+                VerticalLayout {
+                    padding-left: 10px; padding-right: 10px; spacing: 1px; alignment: center;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: item.name;
+                            color: item.key == root.selected-key && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color
+                                : item.valid ? root.ink : root.muted;
+                            font-size: 12px * root.text-scale; font-weight: item.key == root.selected-key ? 700 : 550;
+                            horizontal-stretch: 1; overflow: elide;
+                        }
+                        if item.current : Text { text: "Current look"; color: root.accent; font-size: 10px * root.text-scale; }
+                    }
+                    Text { text: item.detail; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
+                }
+            }
+        }
+    }
+    if root.state.key != "" : Rectangle {
+        height: detail.preferred-height + 20px;
+        background: root.surface;
+        border-radius: StyleTokens.radius * 0.8;
+        border-width: StyleTokens.line-width; border-color: root.outline;
+        detail := VerticalLayout {
+            x: 10px; y: 10px; width: parent.width - 20px;
+            spacing: 6px; alignment: start;
+            Text { text: root.state.name; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; wrap: word-wrap; }
+            if root.state.valid : Text {
+                text: root.state.summary + (root.state.matches-current ? ". This is your current look." : "");
+                color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+            }
+            if !root.state.valid : Text {
+                text: root.state.problem;
+                color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b;
+                font-size: 11px * root.text-scale; wrap: word-wrap;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                if !root.state.previewed : TextAction {
+                    text: "Preview"; wrap-caption: true; enabled: root.state.valid;
+                    label: "Preview " + root.state.name + " without saving it";
+                    ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                    outline: root.outline; text-scale: root.text-scale;
+                    // This button gives way to Cancel preview; keep focus in the card.
+                    activated => { filter-input.focus(); root.preview(); }
+                }
+                if root.state.previewed : TextAction {
+                    text: "Cancel preview"; wrap-caption: true;
+                    label: "Cancel the preview and restore your look";
+                    ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                    outline: root.outline; text-scale: root.text-scale;
+                    activated => { filter-input.focus(); root.cancel-preview(); }
+                }
+                TextAction {
+                    text: "Apply"; wrap-caption: true; enabled: root.state.valid;
+                    label: "Apply " + root.state.name + " and save it as your look";
+                    ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                    outline: root.accent; text-scale: root.text-scale;
+                    activated => { root.apply(); }
+                }
+                TextAction {
+                    text: "Export…"; wrap-caption: true; enabled: root.state.valid && !root.busy;
+                    label: "Export " + root.state.name + " to a file you choose";
+                    ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                    outline: root.outline; text-scale: root.text-scale;
+                    activated => { root.export-file(); }
+                }
+                TextAction {
+                    text: "Delete…"; wrap-caption: true;
+                    label: "Delete " + root.state.name;
+                    ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                    outline: root.outline; text-scale: root.text-scale;
+                    activated => { root.delete-profile(); }
+                }
+            }
+        }
+    }
+    if root.state.confirm != 0 : Rectangle {
+        height: confirm-box.preferred-height + 20px;
+        background: root.surface;
+        border-radius: StyleTokens.radius * 0.8;
+        border-width: StyleTokens.focus-width;
+        border-color: root.state.confirm == 1 ? (StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e58e9b) : root.accent;
+        // The safe choice takes focus; both choices return it to the filter.
+        init => { keep.focus(); }
+        confirm-box := VerticalLayout {
+            x: 10px; y: 10px; width: parent.width - 20px;
+            spacing: 8px; alignment: start;
+            Text {
+                text: root.state.confirm-text; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap;
+                accessible-live-region: polite;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                TextAction {
+                    text: root.state.confirm == 1 ? "Delete" : "Replace"; wrap-caption: true;
+                    label: root.state.confirm == 1 ? "Delete the profile" : "Replace the profile with the same name";
+                    ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                    outline: root.outline; text-scale: root.text-scale;
+                    activated => { filter-input.focus(); root.confirm(); }
+                }
+                keep := TextAction {
+                    text: root.state.confirm == 1 ? "Keep it" : "Cancel"; wrap-caption: true;
+                    label: root.state.confirm == 1 ? "Keep the profile" : "Cancel and keep the existing profile";
+                    ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                    outline: root.accent; text-scale: root.text-scale;
+                    activated => { filter-input.focus(); root.dismiss(); }
+                }
+            }
+        }
+    }
+    Text { text: "Name"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; }
+    Rectangle {
+        height: max(36px, 30px * root.text-scale);
+        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+        border-width: name-field.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+        border-color: name-field.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent)
+            : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
+        if root.name-input == "" : Text {
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+            text: "A name for a saved look, up to 48 characters"; color: root.muted;
+            font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
+        }
+        name-field := ThemedTextInput {
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+            text <=> root.name-input; single-line: true;
+            color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+            accessible-label: "Style profile name, up to 48 characters";
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        TextAction {
+            text: "Save current look"; wrap-caption: true; enabled: !root.state.previewing;
+            label: "Save your current look as a profile with this name";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.accent; text-scale: root.text-scale;
+            activated => { root.save-current(); }
+        }
+        TextAction {
+            text: "Rename"; wrap-caption: true; enabled: root.state.valid;
+            label: "Rename the selected profile to this name";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.rename(); }
+        }
+        TextAction {
+            text: "Duplicate"; wrap-caption: true; enabled: root.state.valid;
+            label: "Save a copy of the selected profile with this name";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.duplicate(); }
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        TextAction {
+            text: root.busy ? "File dialog open…" : "Import…"; wrap-caption: true; enabled: !root.busy;
+            label: "Import a style profile from a file you choose";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.import-file(); }
+        }
+        TextAction {
+            text: "Refresh list"; wrap-caption: true;
+            label: "Reload the list of style profiles";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.refresh(); }
+        }
+    }
+    if root.state.truncated : Text {
+        text: "Only the first 64 profile files are listed. Delete some to see the rest.";
+        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+    if root.message != "" : Text {
+        text: root.message;
+        color: root.message-error ? (StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b)
+            : (StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.ink);
+        font-size: 12px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    Text {
+        text: "A profile holds only your look: theme and theme pack, fonts and sizes, shapes and spacing, message and pane layout, window opacity, colors and sender colors. Text size, Reduce motion, the focus ring, notifications, shortcuts, devices and accounts are never saved in it or changed by it.";
+        color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+    }
 }
 
 // Separate from AppWindow so a blocked account store exposes no sign-in,
@@ -2829,6 +3128,39 @@ export component AppWindow inherits Window {
     callback sender-color-add();
     callback sender-colors-reset();
     callback sender-colors-undo();
+    // Style profiles: saved looks in a fixed folder beside config.toml, and a
+    // transient preview that saves nothing until Apply. See style_profiles.rs.
+    in-out property <[StyleProfileItem]> style-profile-items;
+    in-out property <string> style-profile-filter;
+    in-out property <string> style-profile-selected-key;
+    in-out property <StyleProfileState> style-profile-state;
+    in-out property <string> style-profile-name-input;
+    in-out property <string> style-profile-message;
+    in-out property <bool> style-profile-message-error: false;
+    // A system file dialog for import or export is open.
+    in-out property <bool> style-profile-busy: false;
+    in-out property <bool> style-preview-active: false;
+    in-out property <string> style-preview-name;
+    // How the last preview ended or was applied; shown on every page.
+    in-out property <string> style-profile-notice;
+    in-out property <bool> style-profile-notice-error: false;
+    callback style-profile-notice-dismiss();
+    callback style-profile-filter-changed(string);
+    callback style-profile-chosen(string);
+    callback style-profile-save-current();
+    callback style-profile-rename();
+    callback style-profile-duplicate();
+    callback style-profile-delete();
+    callback style-profile-confirm();
+    callback style-profile-dismiss();
+    callback style-profile-preview();
+    // Apply the selected profile; the preview bar applies the previewed one.
+    callback style-profile-apply();
+    callback style-preview-apply();
+    callback style-profile-cancel-preview();
+    callback style-profile-import();
+    callback style-profile-export();
+    callback style-profiles-refresh();
 
     // Empty alternate clocks identify delivery status or a row with no clock.
     // Keep those labels unchanged even when clocks are hidden or decorated.
@@ -4395,6 +4727,59 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
                 }
+                // A style profile preview stays visible on every page until it
+                // is applied or cancelled; it saves nothing on its own.
+                if root.style-preview-active : Rectangle {
+                    height: max(44px, 32px * root.text-scale + 12px);
+                    background: root.elevated;
+                    border-width: StyleTokens.line-width; border-color: root.accent;
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 12px; padding-top: 6px; padding-bottom: 6px; spacing: 10px;
+                        Text {
+                            text: "Previewing " + root.style-preview-name + ". Nothing is saved until you apply it.";
+                            color: root.ink; font-size: 12px * root.text-scale;
+                            vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                        }
+                        TextAction {
+                            text: "Apply";
+                            label: "Apply the previewed style profile " + root.style-preview-name;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.accent; text-scale: root.text-scale;
+                            // The bar closes: keep keyboard focus in the window.
+                            activated => { shortcut-scope.focus(); root.style-preview-apply(); }
+                        }
+                        TextAction {
+                            text: "Cancel";
+                            label: "Cancel the preview and restore your look";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            activated => { shortcut-scope.focus(); root.style-profile-cancel-preview(); }
+                        }
+                    }
+                }
+                // How a preview ended, on every page, until dismissed.
+                if root.style-profile-notice != "" : Rectangle {
+                    height: max(36px, 32px * root.text-scale + 8px);
+                    background: root.panel;
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 12px; padding-top: 4px; padding-bottom: 4px; spacing: 10px;
+                        Text {
+                            text: root.style-profile-notice;
+                            color: root.style-profile-notice-error && StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.ink;
+                            font-size: 11px * root.text-scale;
+                            vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                            accessible-live-region: polite;
+                        }
+                        TextAction {
+                            text: "Dismiss";
+                            label: "Dismiss the style profile notice";
+                            ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            // The notice closes: keep keyboard focus in the window.
+                            activated => { shortcut-scope.focus(); root.style-profile-notice-dismiss(); }
+                        }
+                    }
+                }
 
                 if root.page == 0 : VerticalLayout {
                     vertical-stretch: 1;
@@ -5322,6 +5707,61 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "0 ms is immediate. Reduce motion overrides this timing without changing your saved value.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+
+                        Text { text: "Style profiles"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        Text {
+                            text: "Save your look under a name, preview a saved look before applying it, and share looks as small text files. A preview saves nothing; Cancel restores your look exactly.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
+                        style-profiles-card := Rectangle {
+                            height: style-profiles.preferred-height + 24px;
+                            background: root.elevated;
+                            border-radius: StyleTokens.radius;
+                            style-profiles := StyleProfilesEditor {
+                                property <int> reveal-request: root.reveal-request("appearance.style_profiles");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                init => { self.reveal-requested-control(); }
+                                changed reveal-request => { self.reveal-requested-control(); }
+                                function reveal-requested-control() {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.style_profiles"; }
+                                    }
+                                }
+                                x: 12px; y: 12px; width: parent.width - 24px;
+                                items: root.style-profile-items;
+                                filter <=> root.style-profile-filter;
+                                selected-key: root.style-profile-selected-key;
+                                state: root.style-profile-state;
+                                name-input <=> root.style-profile-name-input;
+                                message: root.style-profile-message;
+                                message-error: root.style-profile-message-error;
+                                busy: root.style-profile-busy;
+                                ink: root.ink; muted: root.muted; surface: root.canvas; hover-surface: root.hover;
+                                accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                                max-list-height: max(160px, root.height * 0.3);
+                                filter-edited(text) => { root.style-profile-filter-changed(text); }
+                                chosen(key) => { root.style-profile-chosen(key); }
+                                save-current => { root.style-profile-save-current(); }
+                                rename => { root.style-profile-rename(); }
+                                duplicate => { root.style-profile-duplicate(); }
+                                delete-profile => { root.style-profile-delete(); }
+                                confirm => { root.style-profile-confirm(); }
+                                dismiss => { root.style-profile-dismiss(); }
+                                preview => { root.style-profile-preview(); }
+                                apply => { root.style-profile-apply(); }
+                                cancel-preview => { root.style-profile-cancel-preview(); }
+                                import-file => { root.style-profile-import(); }
+                                export-file => { root.style-profile-export(); }
+                                refresh => { root.style-profiles-refresh(); }
+                            }
+                        }
 
                         Text { text: "Colors and window"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         Text {

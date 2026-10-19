@@ -17,6 +17,7 @@ use thiserror::Error;
 pub mod diagnostics;
 mod input;
 pub mod registry;
+pub mod style_profiles;
 
 pub use input::{InputError, MAX_CONFIG_BYTES, MAX_THEME_BYTES, read_bounded};
 

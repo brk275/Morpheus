@@ -29,11 +29,23 @@ pub(crate) fn remember_theme_preferences(config: &Config, theme: Option<&ThemePa
         Some((config.clone(), theme.cloned()));
 }
 
+/// The configuration and theme pack whose look the window shows: the last
+/// accepted one, or a style profile preview while one is shown.
+pub(crate) fn remembered_theme_source() -> Option<(Config, Option<ThemePack>)> {
+    THEME_SOURCE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 /// Show the theme mode configured for the window's active account, or the
 /// global mode when that account has no override or no account is active.
 /// The Settings picker shows the global choice separately, with a notice
 /// while the active account overrides it.
 pub(crate) fn apply_theme_mode(ui: &AppWindow) {
+    // Every account switch or detach publishes here, so a style profile
+    // preview started for another account is cancelled first.
+    crate::style_profiles::check_account(ui);
     let account = ui.get_active_account_local_id();
     let source = THEME_SOURCE
         .lock()

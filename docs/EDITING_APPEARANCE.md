@@ -58,7 +58,9 @@ and remove hand-written comments. Keep a private backup if those matter.
 The [sparse example](../examples/appearance/config.toml) demonstrates a few
 overrides, and [`examples/appearance/styles`](../examples/appearance/styles)
 holds fuller styles that also set typography, geometry, interaction states and
-layout. Merge their keys instead of replacing an existing configuration:
+layout. [Style profiles](STYLE_PROFILES.md) are a separate, appearance-only
+format that Settings can preview, apply, import and export. Merge example keys
+instead of replacing an existing configuration:
 
 ```toml
 [colors]
