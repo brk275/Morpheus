@@ -1,0 +1,167 @@
+// Copyright 2024 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use tantivy::{
+    DateTime, TantivyDocument,
+    schema::{DateOptions, DateTimePrecision, Field, INDEXED, STORED, STRING, Schema, TEXT},
+};
+
+use crate::{
+    error::{IndexError, IndexSchemaError},
+    index::IndexableEvent,
+};
+
+pub(crate) trait MatrixSearchIndexSchema {
+    fn new() -> Self;
+    fn default_search_fields(&self) -> Vec<Field>;
+    fn primary_key(&self) -> Field;
+    fn deletion_key(&self) -> Field;
+    fn get_field_name(&self, field: Field) -> &str;
+    fn as_tantivy_schema(&self) -> Schema;
+    fn make_doc(&self, event: IndexableEvent) -> Result<TantivyDocument, IndexError>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RoomMessageSchema {
+    inner: Schema,
+    /// The event id of this event (primary key).
+    event_id_field: Field,
+    /// The event id of the event that this event affects. Used by edits to
+    /// refer to the event they edited (deletion key).
+    original_event_id_field: Field,
+    body_field: Field,
+    date_field: Field,
+    sender_field: Field,
+    default_search_fields: Vec<Field>,
+}
+
+// Morpheus patch: typed filters read these fields (see RoomIndex::search_filtered).
+impl RoomMessageSchema {
+    pub(crate) fn sender_field(&self) -> Field {
+        self.sender_field
+    }
+
+    pub(crate) fn date_field(&self) -> Field {
+        self.date_field
+    }
+}
+
+impl MatrixSearchIndexSchema for RoomMessageSchema {
+    fn new() -> Self {
+        let mut schema = Schema::builder();
+        let event_id_field = schema.add_text_field("event_id", STORED | STRING);
+        let original_event_id_field = schema.add_text_field("original_event_id", STRING);
+        let body_field = schema.add_text_field("body", TEXT);
+
+        let date_options =
+            DateOptions::from(INDEXED).set_fast().set_precision(DateTimePrecision::Seconds);
+
+        let date_field = schema.add_date_field("date", date_options);
+        let sender_field = schema.add_text_field("sender", STRING);
+
+        let default_search_fields = vec![body_field];
+
+        let schema = schema.build();
+
+        Self {
+            inner: schema,
+            event_id_field,
+            original_event_id_field,
+            body_field,
+            date_field,
+            sender_field,
+            default_search_fields,
+        }
+    }
+
+    fn default_search_fields(&self) -> Vec<Field> {
+        self.default_search_fields.clone()
+    }
+
+    fn primary_key(&self) -> Field {
+        self.event_id_field
+    }
+
+    fn deletion_key(&self) -> Field {
+        self.original_event_id_field
+    }
+
+    fn get_field_name(&self, field: Field) -> &str {
+        self.inner.get_field_name(field)
+    }
+
+    fn as_tantivy_schema(&self) -> Schema {
+        self.inner.clone()
+    }
+
+    /// Given an [`IndexableEvent`] return a [`TantivyDocument`].
+    fn make_doc(&self, event: IndexableEvent) -> Result<TantivyDocument, IndexError> {
+        let mut document = TantivyDocument::default();
+
+        let Self {
+            event_id_field,
+            body_field,
+            date_field,
+            sender_field,
+            original_event_id_field,
+
+            inner: _,
+            default_search_fields: _,
+        } = self;
+
+        let IndexableEvent { event_id, body, timestamp, sender, original_event_id } = event;
+
+        document.add_text(*event_id_field, event_id);
+        document.add_text(*body_field, body);
+        document.add_date(
+            *date_field,
+            DateTime::from_timestamp_millis(
+                timestamp
+                    .map(|timestamp| timestamp.get().into())
+                    // If the timestamp is missing, use 0 as the “no value”.
+                    .unwrap_or(0),
+            ),
+        );
+        document.add_text(*sender_field, sender);
+        document.add_text(*original_event_id_field, original_event_id);
+
+        document.shrink_to_fit();
+
+        Ok(document)
+    }
+}
+
+impl TryFrom<Schema> for RoomMessageSchema {
+    type Error = IndexSchemaError;
+
+    fn try_from(schema: Schema) -> Result<RoomMessageSchema, Self::Error> {
+        let event_id_field = schema.get_field("event_id")?;
+        let original_event_id_field = schema.get_field("original_event_id")?;
+        let body_field = schema.get_field("body")?;
+        let date_field = schema.get_field("date")?;
+        let sender_field = schema.get_field("sender")?;
+
+        let default_search_fields = vec![body_field];
+
+        Ok(Self {
+            inner: schema,
+            event_id_field,
+            original_event_id_field,
+            body_field,
+            date_field,
+            sender_field,
+            default_search_fields,
+        })
+    }
+}

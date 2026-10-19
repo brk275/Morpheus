@@ -11,6 +11,7 @@ provenance and regression tests when updating a dependency.
 | matrix-rtc-core 0.5.0-rc.2 | Bounded encrypted membership renewal for newly joined devices | [Patch notes](matrix-rtc-core/MORPHEUS_PATCH.md) |
 | matrix-sdk-ui 0.19.1 | Required room-state sync and poll end authorization | [Patch notes](matrix-sdk-ui/MORPHEUS_PATCH.md) |
 | matrix-sdk-base 0.19.1 | Preserve bounded encrypted keyless sticky receipts and their revocation | [Patch notes](matrix-sdk-base/MORPHEUS_PATCH.md) |
+| matrix-sdk-search 0.19.1 | Typed sender/date filters and filters-only search (NOT WIRED: no [patch] entry until root review; needs a matching matrix-sdk patch) | [Patch notes](matrix-sdk-search/MORPHEUS_PATCH.md) |
 | livekit-api 0.5.3 | Secure signaling, fallback endpoints, and authenticated redirects | [Patch notes](livekit-api/README.md) |
 | webrtc-sys 0.3.35 | Isolate pinned Linux WebRTC PipeWire stubs from the system PipeWire API | [Patch notes](webrtc-sys/MORPHEUS_PATCH.md) |
 | webrtc-sys-build 0.3.18 | Verify pinned archive downloads and constrain native SDK extraction | [Patch notes](webrtc-sys-build/MORPHEUS_PATCH.md) |
