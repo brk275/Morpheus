@@ -2138,9 +2138,9 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
             );
             if target.id == "files.transfers" {
                 let heading = format!("Transfers: {}", ui.get_transfer_summary());
-                let visible = ElementHandle::find_by_accessible_label(ui, &heading)
-                    .filter(|item| item.is_visible())
-                    .count();
+                // Pinned Slint's descendant query already excludes invisible
+                // items; ElementHandle itself has no is_visible() method.
+                let visible = ElementHandle::find_by_accessible_label(ui, &heading).count();
                 // Numeric/boolean UI state only; never print the summary,
                 // profile, transfer labels or arbitrary assertion text.
                 eprintln!(
