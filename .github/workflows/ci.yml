@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed attachment focused checks
-run-name: Attachment focused checks - 3fef283 - ${{ inputs.platform }}
+run-name: Attachment focused checks - c95a668 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: attachment-focused-3fef283-${{ github.ref }}
+  group: attachment-focused-c95a668-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 3fef283df004a80e4a6d6f692beed9eef2b3b69a
+          ref: c95a6682ee20769d3fa674b5527ab34ede7f7ccb
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='3fef283df004a80e4a6d6f692beed9eef2b3b69a'
+          source='c95a6682ee20769d3fa674b5527ab34ede7f7ccb'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='3fef283df004a80e4a6d6f692beed9eef2b3b69a'
+          source='c95a6682ee20769d3fa674b5527ab34ede7f7ccb'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -453,15 +453,12 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          # Follow-up: reuse 15 media::tests passes from run39236408853 (identical core inputs).
-          # Run the three preview_tests missed by the previous module filter, plus failed app checks.
+          # Reuse 15 core media passes from39236408853 and3 previews from39238160297.
+          # Core inputs unchanged; only failed app checks run after the viewport sizing fix.
           # Only affected media, attachment and real generated-UI checks.
-          needed_core={'media::preview_tests::preview_stream_enforces_smaller_limit_without_declared_size', 'media::preview_tests::preview_requires_image_and_each_encryption_context_opt_in', 'media::preview_tests::preview_decryption_consumes_eof_hash_and_rejects_tampering'}
           needed_attachment={'attachment_workbench::tests::only_unqueued_failures_and_paused_uploads_offer_retry', 'attachments::tests::download_save_replaces_only_after_complete_write', 'attachment_workbench::tests::progress_is_a_bounded_percentage', 'attachment_workbench::tests::rows_belong_to_exactly_one_account_and_room', 'attachments::tests::suggested_save_names_cannot_escape_or_disguise_the_chosen_folder', 'attachments::tests::cancellation_while_waiting_for_a_save_guard_never_writes'}
           needed_ui={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}
           checks=[
-              ('core_media',['cargo','test','--locked','-p','morpheus-matrix','--lib',
-                  'media::preview_tests::','--','--test-threads=1'],4200,needed_core,set()),
               ('app_attachment',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','attachment','--','--test-threads=1'],4200,needed_attachment,set()),
               ('app_attachment_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
