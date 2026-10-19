@@ -341,7 +341,8 @@ pub(crate) fn target_text(target: &SpaceTarget) -> String {
     };
     let membership = membership_text(target.membership);
     let room = crate::directory_plain_text(&target.room_id, 260);
-    format!("{name}\n{kind} · {membership} · {room}\n{}", route_text(target))
+    let route = route_text(target);
+    format!("{name}\n{kind} · {membership} · {room}\n{route}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

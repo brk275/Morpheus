@@ -741,7 +741,9 @@ fn single(confirmed: bool) -> SpaceWriteOutcome {
 }
 
 fn read_config() -> RequestConfig {
-    RequestConfig::new().retry_limit(0).timeout(HIERARCHY_TIMEOUT)
+    RequestConfig::new()
+        .retry_limit(0)
+        .timeout(HIERARCHY_TIMEOUT)
 }
 
 // A fixed category only; never reflected server text. An unknown address is
