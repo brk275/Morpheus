@@ -18,6 +18,9 @@ export struct SettingsResult {
     label: string,
     breadcrumb: string,
     description: string,
+    // The config.toml key the result edits, such as `typography.sender_size`;
+    // empty for a section. Registry text, never a file path.
+    key: string,
 }
 
 export struct ColorGroupItem {
@@ -1574,12 +1577,17 @@ component SettingsSearchBar inherits VerticalLayout {
     in property <color> accent;
     in property <color> outline;
     in property <float> text-scale: 1;
+    in property <string> key-font-family;
     // Results scroll inside this height, so the field and Settings below
     // stay reachable at large text and small windows.
     in property <length> max-results-height: 240px;
     callback search(string);
     callback choose(string);
+    // Show the results of the current query again, keeping the highlight.
+    callback reopen();
     property <bool> open: root.query != "" && !root.dismissed;
+    // A result was chosen; its list can be shown again without retyping.
+    out property <bool> can-return: root.query != "" && root.dismissed;
     forward-focus: input;
     spacing: 4px;
     alignment: start;
@@ -1609,7 +1617,10 @@ component SettingsSearchBar inherits VerticalLayout {
             focus-on-click: false;
             focus-on-tab-navigation: false;
             capture-key-pressed(event) => {
-                if event.text == Key.DownArrow && root.open && root.results.length > 0 {
+                if event.text == Key.DownArrow && root.can-return {
+                    root.reopen();
+                    accept
+                } else if event.text == Key.DownArrow && root.open && root.results.length > 0 {
                     root.index = min(root.index + 1, root.results.length - 1);
                     accept
                 } else if event.text == Key.UpArrow && root.open && root.results.length > 0 {
@@ -1627,10 +1638,23 @@ component SettingsSearchBar inherits VerticalLayout {
                 color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center;
                 accessible-label: "Search settings";
                 accessible-description: root.open && root.results.length > 0 && root.index >= 0 && root.index < root.results.length
-                    ? root.results[root.index].label + ", " + root.results[root.index].breadcrumb : "";
+                    ? root.results[root.index].label + ", " + root.results[root.index].breadcrumb
+                        + (root.results[root.index].key != "" ? ", key " + root.results[root.index].key : "")
+                    : root.can-return ? "Press Down to show the results again" : "";
                 edited => { root.search(self.text); }
                 accepted => { root.pick(); }
             }
+        }
+    }
+    // Choosing a result moves focus to its control; this brings the list back.
+    if root.can-return : HorizontalLayout {
+        alignment: start;
+        TextAction {
+            text: "Back to results";
+            label: "Back to the results for " + root.query;
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.reopen(); }
         }
     }
     if root.open && root.results.length == 0 : Text {
@@ -1657,11 +1681,13 @@ component SettingsSearchBar inherits VerticalLayout {
             changed highlighted => {
                 if self.highlighted { results-scroll.reveal-row(self.y, self.height); }
             }
-            min-height: max(44px, label-text.preferred-height + trail-text.preferred-height + 14px);
-            label: result.label + ", " + result.breadcrumb + ". " + result.description;
+            min-height: max(44px, label-text.preferred-height + trail-text.preferred-height + 14px
+                + (result.key != "" ? key-text.preferred-height + 2px : 0px));
+            label: result.label + ", " + result.breadcrumb + ". " + result.description
+                + (result.key != "" ? " Key " + result.key + " in config.toml." : "");
             background: i == root.index || self.has-hover ? root.hover-surface : transparent;
             border-radius: StyleTokens.radius * 0.6;
-            border-width: i == root.index ? 1px : 0px;
+            border-width: i == root.index ? StyleTokens.line-width : 0px;
             border-color: root.accent;
             focus-color: root.accent;
             activated => { root.index = i; root.choose(result.id); }
@@ -1669,6 +1695,14 @@ component SettingsSearchBar inherits VerticalLayout {
                 padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 6px; spacing: 2px;
                 label-text := Text { text: result.label; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; wrap: word-wrap; }
                 trail-text := Text { text: result.breadcrumb; color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
+                // Shown for exact fields, so the matching config.toml key is discoverable.
+                key-text := Text {
+                    visible: result.key != "";
+                    height: result.key != "" ? self.preferred-height : 0px;
+                    text: result.key;
+                    color: root.muted; font-family: root.key-font-family; font-size: 10px * root.text-scale; wrap: word-wrap;
+                    accessible-role: none;
+                }
             }
         }
         }
@@ -3349,6 +3383,8 @@ export component AppWindow inherits Window {
     public function focus-settings-search() {
         root.settings-search-focus-pending = true;
         root.page = 1;
+        // Searching again returns to the last results instead of hiding them.
+        if root.settings-search-query != "" { root.settings-search-dismissed = false; }
         root.settings-search-focus-request += 1;
     }
     callback submit-login(string, string, string);
@@ -5483,6 +5519,7 @@ export component AppWindow inherits Window {
                         dismissed: root.settings-search-dismissed;
                         ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                         accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                        key-font-family: root.monospace-font-family;
                         // Keep this cap independent of Window.height: this
                         // pinned area's preferred height contributes to the
                         // window's intrinsic layout, so a fraction of its
@@ -5490,6 +5527,10 @@ export component AppWindow inherits Window {
                         max-results-height: 200px;
                         search(query) => { root.settings-search(query); }
                         choose(id) => { root.settings-search-choose(id); }
+                        reopen => {
+                            root.settings-search-dismissed = false;
+                            self.focus();
+                        }
                     }
                 }
                 if root.page == 1 : settings-scroll := ScrollView {

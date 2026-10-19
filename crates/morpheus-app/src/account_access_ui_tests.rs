@@ -2069,11 +2069,14 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     // One color is a direct result: typing its ID or a word of its name, then
     // Down and Enter, selects exactly that token and focuses its hex field.
     // Choosing it saves nothing.
-    for (query, token) in [
+    for (attempt, (query, token)) in [
         ("presence_online", "presence_online"),
         ("online", "presence_online"),
         ("links", "link"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         ui.set_settings_search_query("".into());
         ui.invoke_settings_search("".into());
         settle(ui).await;
@@ -2086,6 +2089,12 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
         let row = (0..results.row_count())
             .find(|row| results.row_data(*row).unwrap().id == id.as_str())
             .unwrap_or_else(|| panic!("{query} does not offer {token}"));
+        // Exact fields name their config.toml key.
+        assert_eq!(
+            results.row_data(row).unwrap().key,
+            format!("colors.{token}").as_str(),
+            "{query}"
+        );
         for _ in 0..row {
             key(ui, Key::DownArrow);
         }
@@ -2102,6 +2111,26 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
             focused_control_has_label(ui, &format!("Hex color for {label}, #RRGGBB or #RRGGBBAA")),
             "{query}: the hex field of {token} is not focused"
         );
+        // The chosen result's list comes back without retyping, with the
+        // same highlight: by its action, by Down in the field, or by the
+        // Search Settings shortcut.
+        assert!(ui.get_settings_search_dismissed(), "{query}");
+        match attempt {
+            0 => click_control_once(ui, &format!("Back to the results for {query}")),
+            1 => {
+                click_control_once(ui, "Search settings");
+                key(ui, Key::DownArrow);
+            }
+            _ => ui.invoke_focus_settings_search(),
+        }
+        settle(ui).await;
+        assert!(!ui.get_settings_search_dismissed(), "{query}: results stay hidden");
+        assert_eq!(ui.get_settings_search_index(), row as i32, "{query}");
+        assert!(
+            focused_control_has_label(ui, "Search settings"),
+            "{query}: the search field is not focused"
+        );
+        assert_eq!(ui.get_color_selected_id(), token, "{query}: returning changed the token");
     }
     assert_eq!(
         std::fs::read_to_string(store.path()).unwrap(),
@@ -2206,9 +2235,17 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
         "the field keeps focus"
     );
     let last = results.row_data(registry::MAX_SEARCH_RESULTS - 1).unwrap();
+    let key_note = if last.key.is_empty() {
+        String::new()
+    } else {
+        format!(" Key {} in config.toml.", last.key)
+    };
     let row = control_with_label(
         ui,
-        &format!("{}, {}. {}", last.label, last.breadcrumb, last.description),
+        &format!(
+            "{}, {}. {}{key_note}",
+            last.label, last.breadcrumb, last.description
+        ),
     );
     let top = row.map_to_window(row.geometry().origin).y;
     let bottom = top + row.geometry().size.height;

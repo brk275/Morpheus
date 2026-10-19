@@ -49,6 +49,8 @@ fn result_item(hit: SearchHit) -> SettingsResult {
             label: target.label.into(),
             breadcrumb: target.breadcrumb.into(),
             description: target.description.into(),
+            // A section can hold several keys; its controls name them.
+            key: SharedString::new(),
         },
         SearchHit::Color(token) => SettingsResult {
             id: hit.id().into(),
@@ -59,6 +61,7 @@ fn result_item(hit: SearchHit) -> SettingsResult {
             )
             .into(),
             description: token.description.into(),
+            key: format!("colors.{}", token.id).into(),
         },
         SearchHit::Metric(field, editor) => SettingsResult {
             id: hit.id().into(),
@@ -69,6 +72,7 @@ fn result_item(hit: SearchHit) -> SettingsResult {
             )
             .into(),
             description: field.description.into(),
+            key: field.key.into(),
         },
     }
 }
