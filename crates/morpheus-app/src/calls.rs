@@ -1635,7 +1635,7 @@ impl CallWorker {
                 Some(&controls),
             );
             let session = {
-                let mut call_events = match rtc.subscribe_call_events(&self.room_id) {
+                let mut call_events = match rtc.take_call_events(&self.room_id) {
                     Ok(events) => events,
                     Err(error) => {
                         let error = CallControllerError::from(error);
