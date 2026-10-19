@@ -1,0 +1,184 @@
+// Reusable themed controls shared by the window, the native screen files and
+// the Settings preview. They read only StyleTokens and caller colors, never
+// a setting store, and report activation through callbacks.
+
+import { StyleTokens } from "style-tokens.slint";
+
+// Animate only the decorative hover layer. Selection colors, content, focus
+// outlines and hit geometry change immediately. The direct reduced-motion
+// branch also hides an in-flight transition as soon as the preference changes.
+export component HoverSurface inherits Rectangle {
+    in property <bool> highlighted;
+    property <float> intensity: root.highlighted ? 1 : 0;
+    animate intensity { duration: StyleTokens.interaction-duration; easing: ease-out; }
+    opacity: StyleTokens.reduced-motion ? (root.highlighted ? 1 : 0) : root.intensity;
+}
+
+// A custom action keeps its visual children while using the same keyboard path as Slint Button.
+export component ActionRect inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <color> focus-color: #a88cff;
+    in property <bool> trap-tab: false;
+    in property <bool> cancel-on-escape: false;
+    // Zero-sized targets can round outside a scroll clip and lose focus on release.
+    in property <bool> reveal-full-control: true;
+    out property <bool> has-hover: hit.has-hover;
+    out property <bool> has-pressed: hit.pressed;
+    out property <bool> has-focus: keyboard-focus.has-focus;
+    callback activated();
+    callback focus-state-changed(bool);
+    callback next-focus();
+    callback previous-focus();
+    callback cancelled();
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: label;
+    accessible-enabled: enabled;
+    accessible-action-default => { if root.enabled { root.activated(); } }
+    @children
+    keyboard-focus := FocusScope {
+        x: 0px;
+        width: root.reveal-full-control ? root.width : 0px;
+        height: root.reveal-full-control ? root.height : 0px;
+        // Accessible focus uses the same reason as a pointer focus request.
+        focus-on-click: true;
+        enabled: root.enabled;
+        focus-gained(reason) => { root.focus-state-changed(true); }
+        focus-lost(reason) => { root.focus-state-changed(false); }
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled { root.activated(); }
+                accept
+            } else if root.trap-tab && event.text == Key.Tab && !event.modifiers.shift {
+                root.next-focus();
+                accept
+            } else if root.trap-tab && (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) {
+                root.previous-focus();
+                accept
+            } else if root.cancel-on-escape && event.text == Key.Escape {
+                if root.enabled { root.cancelled(); }
+                accept
+            } else { reject }
+        }
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { keyboard-focus.focus(); root.activated(); }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: StyleTokens.focus-width;
+        border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.focus-color;
+        background: transparent;
+    }
+}
+
+export component TextAction inherits ActionRect {
+    in property <string> text;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    in property <bool> wrap-caption: false;
+    label: text;
+    // Stacked actions must accept the pane's width rather than exporting an
+    // unbroken caption's intrinsic width into the surrounding layout.
+    min-width: root.wrap-caption ? 32px : max(32px, caption.preferred-width + 2 * StyleTokens.control-padding * root.text-scale);
+    preferred-width: root.wrap-caption ? 32px : self.min-width;
+    min-height: root.wrap-caption ? max(32px * root.text-scale, caption.preferred-height + 16px * root.text-scale) : 32px * root.text-scale;
+    horizontal-stretch: root.wrap-caption ? 1 : 0;
+    border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
+    border-width: StyleTokens.line-width;
+    border-color: outline;
+    background: surface;
+    focus-color: ink;
+    HoverSurface {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        highlighted: root.enabled && root.has-hover;
+        background: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface;
+    }
+    Rectangle {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        background: root.enabled && root.has-pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent;
+    }
+    caption := Text {
+        x: StyleTokens.control-padding * root.text-scale;
+        width: parent.width - 2 * StyleTokens.control-padding * root.text-scale;
+        height: root.wrap-caption ? self.preferred-height : parent.height;
+        y: (parent.height - self.height) / 2;
+        text: root.text;
+        color: root.enabled ? root.ink : StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.muted;
+        font-size: 12px * root.text-scale;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: root.wrap-caption ? word-wrap : no-wrap;
+        overflow: root.wrap-caption ? clip : elide;
+    }
+}
+
+// The resolved colors a TokenButton draws with. Callers pass their own
+// palette's values, so a screen keeps its surfaces while geometry and
+// interaction states follow StyleTokens.
+export struct ControlColors {
+    ink: color,
+    muted: color,
+    surface: color,
+    hover: color,
+    outline: color,
+    accent: color,
+    accent-ink: color,
+}
+
+// A text button drawn from StyleTokens with the window's keyboard path
+// (Tab, Return, Space; a click focuses it). Primary buttons sit on the accent
+// color; their hover and pressed layers tint with the accent ink so the
+// label stays readable whatever control states a theme sets.
+export component TokenButton inherits ActionRect {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    label: root.text;
+    min-width: max(32px, caption.preferred-width + 2 * StyleTokens.control-padding * root.text-scale);
+    min-height: max(30px, 16px * root.text-scale + 12px);
+    preferred-width: self.min-width;
+    preferred-height: self.min-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: StyleTokens.control-corner;
+    border-width: root.primary ? 0px : StyleTokens.line-width;
+    border-color: root.colors.outline;
+    background: root.primary ? (root.enabled ? root.colors.accent : root.colors.accent.transparentize(0.45)) : root.colors.surface;
+    focus-color: root.primary ? root.colors.accent-ink : root.colors.ink;
+    HoverSurface {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        highlighted: root.enabled && root.has-hover;
+        background: root.primary ? root.colors.accent-ink.transparentize(0.85)
+            : StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.colors.hover;
+    }
+    // Drawn only when pressed; a secondary button needs a theme's pressed state.
+    Rectangle {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        background: !root.enabled || !root.has-pressed ? transparent
+            : root.primary ? root.colors.accent-ink.transparentize(0.75)
+            : StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent;
+    }
+    caption := Text {
+        x: StyleTokens.control-padding * root.text-scale;
+        width: parent.width - 2 * StyleTokens.control-padding * root.text-scale;
+        height: parent.height;
+        text: root.text;
+        color: root.primary ? (root.enabled ? root.colors.accent-ink : root.colors.accent-ink.transparentize(0.35))
+            : root.enabled ? root.colors.ink
+            : StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.colors.muted;
+        font-size: 12px * root.text-scale;
+        font-weight: root.primary ? 700 : 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}

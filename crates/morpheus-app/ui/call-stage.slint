@@ -1,10 +1,11 @@
 // Native multi-participant call stage. Rust decides which tiles exist, which
 // one is featured, which streams are decoded and which frame slot each live
 // tile reads; this file only lays tiles out and reports pin, page and focus
-// choices. It cannot import the window's globals, so the window passes its
-// resolved semantic colors and motion duration in.
+// choices. The window passes its resolved semantic colors and motion
+// duration in; geometry and interaction states come from StyleTokens.
 
 import { ListView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
 
 export struct CallParticipantItem {
     name: string,
@@ -56,6 +57,7 @@ component StageAction inherits Rectangle {
     in property <bool> enabled: true;
     in property <color> focus-color;
     out property <bool> has-hover: hit.has-hover;
+    out property <bool> has-pressed: hit.pressed;
     callback activated();
     forward-focus: keyboard-focus;
     accessible-role: button;
@@ -86,7 +88,7 @@ component StageAction inherits Rectangle {
     }
     if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;
-        border-width: 2px;
+        border-width: StyleTokens.focus-width;
         border-color: root.focus-color;
         background: transparent;
     }
@@ -114,6 +116,8 @@ component StageTile inherits Rectangle {
     property <bool> can-pin: root.tile.pinned || !root.tile.is-local;
     property <bool> compact: root.height < 120px;
     property <length> avatar-size: clamp(min(root.width, root.height) * 0.3, 26px, 96px);
+    // Labels and the pin control keep their built-in share of the corner.
+    property <length> label-corner: root.corner * 0.6;
 
     background: root.has-frame ? root.palette.backdrop : root.palette.panel;
     border-radius: root.corner;
@@ -156,7 +160,8 @@ component StageTile inherits Rectangle {
             Rectangle {
                 width: root.avatar-size;
                 height: root.avatar-size;
-                border-radius: self.width / 2;
+                // Avatar roundness, when set, applies to call avatars too.
+                border-radius: StyleTokens.avatar-roundness >= 0 ? self.width * StyleTokens.avatar-roundness / 100 : self.width / 2;
                 background: root.tile.departed ? root.palette.hover : root.tile.accent;
                 Text {
                     text: root.tile.initials;
@@ -186,7 +191,7 @@ component StageTile inherits Rectangle {
         alignment: start;
         Rectangle {
             background: root.palette.panel;
-            border-radius: 6px;
+            border-radius: root.label-corner;
             HorizontalLayout {
                 padding-left: 8px;
                 padding-right: 8px;
@@ -209,7 +214,7 @@ component StageTile inherits Rectangle {
         y: 8px;
         width: pinned-text.preferred-width + 14px;
         height: 22px;
-        border-radius: 6px;
+        border-radius: root.label-corner;
         background: root.palette.accent;
         pinned-text := Text {
             text: "Pinned";
@@ -267,8 +272,10 @@ component StageTile inherits Rectangle {
         y: 8px;
         width: pin-label.preferred-width + 16px;
         height: 24px;
-        border-radius: 6px;
-        background: pin-area.has-hover ? root.palette.hover : root.palette.panel;
+        border-radius: root.label-corner;
+        background: pin-area.pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+            : pin-area.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.palette.hover)
+            : root.palette.panel;
         pin-label := Text {
             text: root.tile.pinned ? "Unpin" : "Pin";
             color: root.palette.ink;
@@ -294,7 +301,7 @@ component StageTile inherits Rectangle {
     }
     if keyboard-focus.has-focus : Rectangle {
         border-radius: root.corner;
-        border-width: 2px;
+        border-width: StyleTokens.focus-width;
         border-color: root.palette.focus;
         background: transparent;
     }
@@ -338,6 +345,13 @@ export component CallStage inherits Rectangle {
     property <length> stage-width: max(0px, root.width - 2 * root.inset - (root.roster-shown ? root.roster-width + root.inset : 0px));
     property <length> stage-height: max(0px, root.height - 2 * root.inset - root.pager-height - root.controls-height);
     property <int> count: root.tiles.length;
+    // Stage buttons: an explicit control radius wins, otherwise each keeps
+    // its built-in share of the stage corner. States follow the window's.
+    property <length> button-corner: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : root.corner * 0.8;
+    property <color> button-hover: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.palette.hover;
+    property <bool> pressed-set: StyleTokens.states.control-pressed.present;
+    property <color> disabled-ink: StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.palette.muted;
+    property <float> glyph-scale: root.text-scale * StyleTokens.icon-size / 18px;
     // The tile that should hold keyboard focus; tiles report focus changes.
     property <int> focus-target: -1;
     // The tile to refocus after a pin change rebuilds the stage.
@@ -510,17 +524,18 @@ export component CallStage inherits Rectangle {
         alignment: center;
         spacing: 8px;
         StageAction {
-            width: 34px;
-            border-radius: 8px;
-            background: self.has-hover && self.enabled ? root.palette.hover : root.palette.panel;
+            width: StyleTokens.icon-button-size;
+            border-radius: root.button-corner;
+            background: self.enabled && self.has-pressed && root.pressed-set ? StyleTokens.states.control-pressed.color
+                : self.has-hover && self.enabled ? root.button-hover : root.palette.panel;
             label: "Previous participants";
             enabled: root.page > 0;
             focus-color: root.palette.focus;
             activated => { root.page-tiles(-1); }
             Text {
                 text: "‹";
-                color: root.page > 0 ? root.palette.ink : root.palette.muted;
-                font-size: 16px * root.text-scale;
+                color: root.page > 0 ? root.palette.ink : root.disabled-ink;
+                font-size: 16px * root.glyph-scale;
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 accessible-role: none;
@@ -534,17 +549,18 @@ export component CallStage inherits Rectangle {
             accessible-live-region: polite;
         }
         StageAction {
-            width: 34px;
-            border-radius: 8px;
-            background: self.has-hover && self.enabled ? root.palette.hover : root.palette.panel;
+            width: StyleTokens.icon-button-size;
+            border-radius: root.button-corner;
+            background: self.enabled && self.has-pressed && root.pressed-set ? StyleTokens.states.control-pressed.color
+                : self.has-hover && self.enabled ? root.button-hover : root.palette.panel;
             label: "Next participants";
             enabled: root.page + 1 < root.pages;
             focus-color: root.palette.focus;
             activated => { root.page-tiles(1); }
             Text {
                 text: "›";
-                color: root.page + 1 < root.pages ? root.palette.ink : root.palette.muted;
-                font-size: 16px * root.text-scale;
+                color: root.page + 1 < root.pages ? root.palette.ink : root.disabled-ink;
+                font-size: 16px * root.glyph-scale;
                 horizontal-alignment: center;
                 vertical-alignment: center;
                 accessible-role: none;
@@ -577,8 +593,9 @@ export component CallStage inherits Rectangle {
             y: 8px;
             width: 48px;
             height: 26px;
-            border-radius: 7px;
-            background: self.has-hover ? root.palette.hover : root.palette.panel;
+            border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : root.corner * 0.7;
+            background: self.has-pressed && root.pressed-set ? StyleTokens.states.control-pressed.color
+                : self.has-hover ? root.button-hover : root.palette.panel;
             label: "Hide participant list";
             focus-color: root.palette.focus;
             activated => { root.show-roster = false; }
@@ -639,8 +656,9 @@ export component CallStage inherits Rectangle {
         y: root.stage-y + root.stage-height + 7px;
         width: people-text.preferred-width + 20px;
         height: 30px;
-        border-radius: 8px;
-        background: self.has-hover ? root.palette.hover : root.palette.panel;
+        border-radius: root.button-corner;
+        background: self.has-pressed && root.pressed-set ? StyleTokens.states.control-pressed.color
+            : self.has-hover ? root.button-hover : root.palette.panel;
         label: "Show participant list, " + root.participants.length + " in call";
         focus-color: root.palette.focus;
         activated => { root.show-roster = true; }
@@ -662,10 +680,10 @@ export component CallStage inherits Rectangle {
         y: root.stage-y + 8px;
         width: min(root.stage-width - 16px, degraded-text.preferred-width + 24px);
         height: 28px;
-        border-radius: 8px;
+        border-radius: root.corner * 0.8;
         background: root.palette.panel;
         border-color: root.palette.divider;
-        border-width: 1px;
+        border-width: StyleTokens.line-width;
         degraded-text := Text {
             text: "Media connection interrupted · reconnecting";
             color: root.palette.ink;
@@ -682,10 +700,11 @@ export component CallStage inherits Rectangle {
         y: root.height - root.inset - 50px;
         width: 176px;
         height: 42px;
-        border-radius: 9px;
-        background: root.palette.hover;
+        border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : root.corner * 0.9;
+        background: self.has-pressed && root.pressed-set ? StyleTokens.states.control-pressed.color
+            : self.has-hover ? root.button-hover : root.palette.hover;
         border-color: root.palette.divider;
-        border-width: 1px;
+        border-width: StyleTokens.line-width;
         focus-color: root.palette.focus;
         label: "Open MatrixRTC call in selected room";
         activated => { root.open-slot(); }

@@ -1,10 +1,12 @@
 // Create a native Matrix poll in the current room. Rust owns the draft and
 // its validation; opening the dialog or editing it never sends anything, only
-// Send does. It cannot import the window's globals, so the window passes
-// resolved colors and surfaces.
+// Send does. The window passes resolved colors and surfaces; geometry and
+// interaction states come from StyleTokens.
 
-import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+import { CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
 import { PollPalette, PollUiState } from "poll-card.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton } from "controls.slint";
 
 export component PollCreateDialog inherits FocusScope {
     in property <PollPalette> palette;
@@ -12,6 +14,15 @@ export component PollCreateDialog inherits FocusScope {
     in property <length> corner: 10px;
     in property <color> surface;
     in property <color> scrim;
+    property <ControlColors> button-colors: {
+        ink: root.palette.ink,
+        muted: root.palette.muted,
+        surface: root.palette.elevated,
+        hover: root.palette.hover,
+        outline: root.palette.divider,
+        accent: root.palette.accent,
+        accent-ink: root.palette.accent-ink,
+    };
 
     focus-on-tab-navigation: false;
     init => { question.focus(); }
@@ -53,7 +64,7 @@ export component PollCreateDialog inherits FocusScope {
             y: (parent.height - self.height) / 2;
             background: root.surface;
             border-radius: root.corner * 1.4;
-            border-width: 1px;
+            border-width: StyleTokens.line-width;
             border-color: root.palette.divider;
             accessible-role: region;
             accessible-label: "Create a poll";
@@ -108,20 +119,24 @@ export component PollCreateDialog inherits FocusScope {
                                 accessible-label: "Poll option " + (index + 1);
                                 edited(text) => { PollUiState.answer-edited(index, text); }
                             }
-                            Button {
+                            TokenButton {
                                 text: "Remove";
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
                                 enabled: !PollUiState.dialog-busy && PollUiState.dialog-answers.length > 2;
-                                accessible-label: "Remove poll option " + (index + 1);
-                                clicked => { PollUiState.remove-answer(index); }
+                                label: "Remove poll option " + (index + 1);
+                                activated => { PollUiState.remove-answer(index); }
                             }
                         }
                         HorizontalLayout {
                             alignment: start;
-                            Button {
+                            TokenButton {
                                 text: "Add option";
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
                                 enabled: !PollUiState.dialog-busy && PollUiState.dialog-answers.length < 20;
-                                accessible-label: "Add a poll option";
-                                clicked => { PollUiState.add-answer(); }
+                                label: "Add a poll option";
+                                activated => { PollUiState.add-answer(); }
                             }
                         }
                         HorizontalLayout {
@@ -133,11 +148,13 @@ export component PollCreateDialog inherits FocusScope {
                                 vertical-alignment: center;
                                 accessible-role: none;
                             }
-                            Button {
+                            TokenButton {
                                 text: "−";
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
                                 enabled: !PollUiState.dialog-busy && PollUiState.dialog-max > 1;
-                                accessible-label: "Allow fewer choices per person";
-                                clicked => { PollUiState.change-max(-1); }
+                                label: "Allow fewer choices per person";
+                                activated => { PollUiState.change-max(-1); }
                             }
                             Text {
                                 text: PollUiState.dialog-max == 1 ? "1 option" : PollUiState.dialog-max + " options";
@@ -147,11 +164,13 @@ export component PollCreateDialog inherits FocusScope {
                                 accessible-label: "People can choose up to " + self.text;
                                 accessible-live-region: polite;
                             }
-                            Button {
+                            TokenButton {
                                 text: "+";
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
                                 enabled: !PollUiState.dialog-busy && PollUiState.dialog-max < PollUiState.dialog-answers.length;
-                                accessible-label: "Allow more choices per person";
-                                clicked => { PollUiState.change-max(1); }
+                                label: "Allow more choices per person";
+                                activated => { PollUiState.change-max(1); }
                             }
                             Rectangle {
                                 horizontal-stretch: 1;
@@ -183,18 +202,22 @@ export component PollCreateDialog inherits FocusScope {
                 HorizontalLayout {
                     alignment: end;
                     spacing: 10px;
-                    cancel := Button {
+                    cancel := TokenButton {
                         text: "Cancel";
+                        colors: root.button-colors;
+                        text-scale: root.text-scale;
                         enabled: !PollUiState.dialog-busy;
-                        accessible-label: "Cancel and close the poll dialog";
-                        clicked => { PollUiState.cancel-poll(); }
+                        label: "Cancel and close the poll dialog";
+                        activated => { PollUiState.cancel-poll(); }
                     }
-                    send := Button {
+                    send := TokenButton {
                         text: PollUiState.dialog-busy ? "Sending…" : "Send poll";
                         primary: true;
+                        colors: root.button-colors;
+                        text-scale: root.text-scale;
                         enabled: !PollUiState.dialog-busy && PollUiState.dialog-ready;
-                        accessible-label: "Send this poll to the room";
-                        clicked => { PollUiState.submit-poll(); }
+                        label: "Send this poll to the room";
+                        activated => { PollUiState.submit-poll(); }
                     }
                 }
             }
