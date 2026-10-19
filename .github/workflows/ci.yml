@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed native poll focused checks
-run-name: Native poll focused checks - 9eb5315 - ${{ inputs.platform }}
+name: Reviewed native poll SDK diagnosis
+run-name: Native poll SDK diagnosis - 9eb5315 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: native-poll-focused-9eb5315-${{ github.ref }}
+  group: native-poll-sdk-diagnosis-9eb5315-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -417,6 +417,12 @@ jobs:
           locked={(package['name'],package['version']) for package in
               tomllib.loads((workspace/'Cargo.lock').read_text())['package']}
           failure_markers={
+              'rustc_sigkill':'signal: 9, SIGKILL',
+              'linux_disk_full':'No space left on device',
+              'allocation_failed':'memory allocation of',
+              'missing_macro':'cannot find macro',
+              'missing_attribute':'cannot find attribute',
+              'fatal_runtime':'fatal runtime error',
               'custom_build_command':'failed to run custom build command',
               'cxx_bridge':'cxxbridge',
               'cc_tool_missing':'ToolNotFound',
@@ -453,16 +459,12 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          # Existing poll suites and actual generated UI privacy/account regression only.
+          # Diagnose only the failed SDK lib-test compilation. Core8/app5/UI1
+          # already passed; do not repeat them. Added fixed process/resource
+          # classifications and known SDK source spans; raw output stays private.
           checks=[
               ('sdk_poll',['cargo', 'test', '--locked', '-p', 'matrix-sdk-ui', '--lib', 'timeline::tests::polls::', '--', '--test-threads=1'],4200,
                   {'timeline::tests::polls::morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes', 'timeline::tests::polls::morpheus_earliest_valid_end_wins_even_when_received_later', 'timeline::tests::polls::morpheus_known_moderator_may_end_another_users_poll', 'timeline::tests::polls::morpheus_pending_invalid_end_does_not_drop_a_pending_vote', 'timeline::tests::polls::morpheus_pending_moderator_end_is_checked_when_start_arrives', 'timeline::tests::polls::morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end', 'timeline::tests::polls::test_a_somewhat_complex_voting_session_yields_the_expected_outcome', 'timeline::tests::polls::test_adding_response_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_edited_poll_is_displayed', 'timeline::tests::polls::test_ending_a_poll_sets_end_time_to_results', 'timeline::tests::polls::test_ending_poll_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_events_received_before_start_are_not_lost', 'timeline::tests::polls::test_multiple_end_events_are_discarded', 'timeline::tests::polls::test_only_the_last_vote_from_a_user_is_counted', 'timeline::tests::polls::test_poll_contains_relations', 'timeline::tests::polls::test_poll_is_displayed', 'timeline::tests::polls::test_votes_after_end_are_discarded', 'timeline::tests::polls::test_voting_adds_the_vote_to_the_results'},set()),
-              ('core_poll',['cargo', 'test', '--locked', '-p', 'morpheus-matrix', '--lib', 'polls::tests::', '--', '--test-threads=1'],4200,
-                  {'polls::tests::drafts_are_cleaned_and_bounded_before_anything_is_built', 'polls::tests::end_text_names_the_leaders_or_no_votes', 'polls::tests::projection_bounds_text_answers_and_selection_limit', 'polls::tests::revoked_poll_actions_release_pending_work_and_report_uncertain_sends', 'polls::tests::start_content_uses_the_aggregated_msc3381_shape', 'polls::tests::undisclosed_results_stay_withheld_until_the_poll_ends', 'polls::tests::unsupported_remote_answer_ids_are_not_truncated_into_vote_targets', 'polls::tests::votes_must_be_known_unique_within_the_limit_and_open'},set()),
-              ('app_poll',['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'polls::', '--', '--test-threads=1'],4200,
-                  {'polls::card::tests::ended_polls_show_final_results_and_offer_no_actions', 'polls::card::tests::only_sent_polls_can_be_voted_on_and_only_their_creator_ends_them', 'polls::card::tests::withheld_results_show_no_counts_or_bars'},set()),
-              ('app_account_ui',['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', '--', '--exact', '--test-threads=1'],4200,
-                  {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'},set()),
           ]
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
@@ -531,7 +533,15 @@ jobs:
                   failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
                   # Only known public production file names and numeric spans.
                   # Never publish compiler text, source snippets or raw paths.
-                  ui_files=('crates/morpheus-app/ui/app-window.slint',
+                  ui_files=('vendor/matrix-sdk-ui/src/timeline/tests/polls.rs',
+                      'vendor/matrix-sdk-ui/src/timeline/tests/mod.rs',
+                      'vendor/matrix-sdk-ui/src/timeline/traits.rs',
+                      'vendor/matrix-sdk-ui/src/timeline/controller/aggregations.rs',
+                      'vendor/matrix-sdk-ui/src/timeline/controller/state.rs',
+                      'vendor/matrix-sdk-ui/src/timeline/controller/state_transaction.rs',
+                      'vendor/matrix-sdk-ui/src/timeline/event_handler.rs',
+                      'vendor/matrix-sdk-ui/src/timeline/event_item/content/polls.rs',
+                      'crates/morpheus-app/ui/app-window.slint',
                       'crates/morpheus-app/ui/message-search.slint',
                       'crates/morpheus-app/src/account_access_ui_tests.rs',
                       'crates/morpheus-app/src/live.rs',
