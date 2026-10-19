@@ -5181,6 +5181,7 @@ export component AppWindow inherits Window {
                                 notice: root.sas-notice;
                                 incoming-pending: root.sas-incoming-flow-id != "";
                                 incoming-loading: root.sas-incoming-loading;
+                                incoming-flow-id: root.encryption-incoming-flow-id;
                                 blocked: root.security-busy;
                                 can-request: !root.security-busy && root.security-recovery-key == "" && root.security-device-status == "Unverified";
                                 poll-incoming => { root.refresh-incoming-verification(); }

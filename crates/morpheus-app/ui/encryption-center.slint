@@ -67,7 +67,7 @@ export component SasVerificationPanel inherits Rectangle {
     in property <EncryptionPalette> palette;
     in property <float> text-scale: 1;
     in property <string> number-font;
-    // Settings is showing; progress checks run only then.
+    // Settings is showing; incoming-request details load only then.
     in property <bool> active;
     in property <int> stage;
     in property <bool> busy;
@@ -80,6 +80,9 @@ export component SasVerificationPanel inherits Rectangle {
     in property <string> notice;
     in property <bool> incoming-pending;
     in property <bool> incoming-loading;
+    // Newest pending request seen by the app-wide watcher (an opaque flow
+    // ID, never shown). Each change reloads the request details here.
+    in property <string> incoming-flow-id;
     // Another security operation owns this account.
     in property <bool> blocked;
     // This device is unverified and no new recovery key is waiting.
@@ -98,9 +101,28 @@ export component SasVerificationPanel inherits Rectangle {
     height: content.preferred-height;
 
     // Flow progress arrives from the SDK's change streams (see
-    // src/verification.rs); only this panel's incoming-request list polls.
+    // src/verification.rs). Incoming requests follow the app-wide watcher:
+    // a change seen while a load runs is replayed when it finishes.
+    property <bool> incoming-stale;
+    function check-incoming() {
+        if root.active && root.stage == 0 && !root.blocked {
+            if root.incoming-loading {
+                root.incoming-stale = true;
+            } else {
+                root.incoming-stale = false;
+                root.poll-incoming();
+            }
+        }
+    }
+    changed incoming-flow-id => { root.check-incoming(); }
+    changed incoming-loading => {
+        if !root.incoming-loading && root.incoming-stale { root.check-incoming(); }
+    }
+    changed stage => { if root.stage == 0 { root.check-incoming(); } }
+    changed blocked => { if !root.blocked { root.check-incoming(); } }
+    // Slow fallback in case the watcher is resubscribing.
     Timer {
-        interval: 3s;
+        interval: 30s;
         running: root.active && root.stage == 0 && !root.incoming-loading && !root.blocked;
         triggered => { root.poll-incoming(); }
     }

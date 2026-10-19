@@ -511,8 +511,9 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                     return;
                 }
                 window.set_sas_incoming_loading(false);
-                if let Ok(requests) = result {
-                    if let Some(request) = requests.into_iter().next() {
+                if let Ok(mut requests) = result {
+                    // The newest request, the same one the app-wide notice shows.
+                    if let Some(request) = requests.pop() {
                         window.set_sas_incoming_flow_id(request.flow_id.into());
                         window.set_sas_incoming_user_id(request.other_user_id.into());
                     } else {
