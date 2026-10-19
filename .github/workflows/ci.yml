@@ -59,14 +59,12 @@ jobs:
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
           mkdir "$RUNNER_TEMP/gitleaks"
           tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          # Never honor candidate-provided rules or suppression files. No
-          # candidate code has executed on this runner before scanning.
-          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/morpheus-gitleaks-default.toml"
-          : > "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore"
-          "$RUNNER_TEMP/gitleaks/gitleaks" git --redact=100 --ignore-gitleaks-allow --no-banner \
-            --config "$RUNNER_TEMP/morpheus-gitleaks-default.toml" \
-            --gitleaks-ignore-path "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore" \
-            --log-opts=--all .
+          # Scanner code and exact fixture manifest come from the reviewed base.
+          # The candidate's ignore files, attributes and config are not trusted.
+          python3 -I ../trusted/scripts/scan_history.py \
+            --candidate "$PWD" --scanner "$RUNNER_TEMP/gitleaks/gitleaks" \
+            --manifest ../trusted/scripts/public-fixtures.json \
+            --evidence "$RUNNER_TEMP/morpheus-history-scan"
       - name: Select checks from changed inputs using reviewed classifier
         id: scope
         working-directory: candidate
