@@ -246,6 +246,13 @@ export component MediaViewer inherits Rectangle {
                     }
                 }
                 stage := Rectangle {
+                    // The viewport is allocated by the dialog, not by the
+                    // zoomed image's intrinsic layout. Otherwise fitting the
+                    // image would feed back into the viewport's own size.
+                    min-width: 0px;
+                    min-height: 0px;
+                    preferred-width: 0px;
+                    preferred-height: 0px;
                     vertical-stretch: 1;
                     background: root.palette.backdrop;
                     border-radius: 9px;
@@ -352,7 +359,9 @@ export component MediaViewer inherits Rectangle {
                         activated => { root.zoom-by(0.8); }
                     }
                     ViewerAction {
-                        text: round(root.zoom * root.fit-scale * 100) + "%";
+                        // Relative to fit, so the caption's intrinsic width never
+                        // depends on the viewport it helps lay out.
+                        text: round(root.zoom * 100) + "% fit";
                         label: "Fit image to the window";
                         enabled: root.loaded && root.zoom != 1;
                         palette: root.palette;
