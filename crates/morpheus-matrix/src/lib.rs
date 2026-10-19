@@ -2472,6 +2472,63 @@ impl AccountManager {
         })
     }
 
+    /// Read a hierarchy under the exact selection captured by its caller.
+    /// A delayed scan never looks up a newer account's client after a switch.
+    pub async fn space_hierarchy_selected(
+        &self,
+        selection: &AccountSelection,
+        space_id: &str,
+        from: Option<&str>,
+        limit: u32,
+    ) -> Result<SpaceHierarchyPage> {
+        let owns = || {
+            selection.is_current()
+                && self
+                    .account_selection(selection.account_id())
+                    .is_some_and(|current| selection.same_epoch(&current))
+        };
+        if !owns() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let client = {
+            let state = selection
+                .guard(self.state.lock())
+                .await
+                .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+            if !owns() {
+                return Err(MatrixCoreError::SelectedAccountChanged);
+            }
+            account_access::ensure_eligible(&state, selection.account_id())?;
+            selected_loaded_for(&state, selection.account_id())?
+                .client
+                .clone()
+        };
+        let id = RoomId::parse(space_id)
+            .map_err(|error| MatrixCoreError::InvalidRoomId(error.to_string()))?;
+        let mut request = get_hierarchy::v1::Request::new(id);
+        request.from = from.map(str::to_owned);
+        request.limit = Some(limit.clamp(1, 100).into());
+        let response = selection
+            .guard(async {
+                if !owns() {
+                    return Err(MatrixCoreError::SelectedAccountChanged);
+                }
+                client
+                    .send(request)
+                    .await
+                    .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+            })
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)??;
+        if !owns() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(SpaceHierarchyPage {
+            nodes: response.rooms.into_iter().map(space_node_info).collect(),
+            next_batch: response.next_batch,
+        })
+    }
+
     pub async fn link_space_child(
         &self,
         space_id: &str,

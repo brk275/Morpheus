@@ -573,6 +573,14 @@ mod tests {
                     .await,
                 Err(MatrixCoreError::SelectedAccountChanged)
             ));
+            // A queued hierarchy scan also cannot reacquire the renewed
+            // account's client, or contact a homeserver for its old selection.
+            assert!(matches!(
+                manager
+                    .space_hierarchy_selected(&stale, room, None, 100)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
             // The current selection searches its own (empty) room set and
             // reports no further page.
             let current = manager.account_selection(&account.id).unwrap();
