@@ -1576,12 +1576,17 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     let _entered = runtime.enter();
     let runtime_handle = runtime.handle().clone();
     slint::spawn_local(async move {
-        tokio::time::timeout(
+        let phase = std::rc::Rc::new(std::cell::Cell::new(0_u8));
+        let outcome = tokio::time::timeout(
             Duration::from_secs(20),
-            exercise_account_ui(runtime_handle.clone()),
+            exercise_account_ui(runtime_handle.clone(), phase.clone()),
         )
-        .await
-        .expect("account UI scenario must finish without network or vault access");
+        .await;
+        if outcome.is_err() {
+            // A closed numeric stage only: never log UI text, files or accounts.
+            eprintln!("morpheus-ui-timeout-phase={}", phase.get());
+        }
+        outcome.expect("account UI scenario must finish without network or vault access");
         // Opt-in live room/thread controller coverage shares this one event
         // loop; it returns at once unless a disposable local fixture is set.
         crate::live::timeline_controller_tests::run_if_configured(runtime_handle).await;
@@ -3307,7 +3312,7 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     settle(ui).await;
 }
 
-async fn exercise_account_ui(runtime: Handle) {
+async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell<u8>>) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
     let directory = tempfile::tempdir().unwrap();
@@ -3320,22 +3325,38 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.show().unwrap();
     ui.window()
         .dispatch_event(WindowEvent::WindowActiveChanged(true));
+    phase.set(1);
     assert_sign_in_keyboard(&ui).await;
     settle(&ui).await;
+    phase.set(2);
     assert_navigation_projection_and_focus(&ui).await;
+    phase.set(3);
     assert_accessible_action_focus_and_first_click(&ui).await;
+    phase.set(4);
     assert_native_motion_and_preference(&ui, &directory.path().join("appearance.toml")).await;
+    phase.set(5);
     assert_lazy_timeline_view(&ui).await;
+    phase.set(6);
     assert_palette_and_density_keyboard(&ui).await;
+    phase.set(7);
     assert_scale_keyboard_and_focus_bounds(&ui).await;
+    phase.set(8);
     assert_message_role_precedence_and_thread_metadata(&ui).await;
+    phase.set(9);
     assert_appearance_workspace_and_search(&ui, directory.path()).await;
+    phase.set(10);
     assert_metric_workspace_and_extremes(&ui, directory.path()).await;
+    phase.set(11);
     assert_interaction_states_and_sender_palette(&ui, directory.path()).await;
+    phase.set(12);
     assert_pane_composition_and_motion(&ui).await;
+    phase.set(13);
     assert_account_scoped_appearance(&ui, directory.path()).await;
+    phase.set(14);
     assert_shortcut_customization(&ui, directory.path()).await;
+    phase.set(18);
     assert_style_profiles(&ui, directory.path()).await;
+    phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));
@@ -3344,7 +3365,9 @@ async fn exercise_account_ui(runtime: Handle) {
     // A denied account-change guard also prevents any mistaken key sequence
     // from starting policy writes, account activation, or local deletion.
     let access = AccountAccessUi::register(&ui, live.clone(), runtime.clone(), || false);
+    phase.set(16);
     assert_switch_readiness(&ui, &live, &access).await;
+    phase.set(17);
     ui.set_composer_text("untouched conversation draft".into());
     settle(&ui).await;
 
