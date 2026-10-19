@@ -351,6 +351,15 @@ jobs:
               'cc_command_failed':'error occurred in cc-rs',
               'cmake_error':'CMake Error',
               'linker_error':'linking with',
+              'slint_compile':'failed to compile Morpheus UI',
+              'slint_syntax':'Syntax error',
+              'slint_unknown_property':'Unknown property',
+              'slint_unknown_identifier':'Unknown identifier',
+              'slint_unknown_type':'Unknown type',
+              'slint_override':'Cannot override property',
+              'slint_missing_property':'does not have a property',
+              'slint_conversion':'Cannot convert',
+              'slint_impure':'Calling an impure function',
               'gnu_link_extra_operand':'extra operand',
               'gnu_link_help':"link --help",
               'linker_not_found':'linker `link.exe` not found',
@@ -406,6 +415,7 @@ jobs:
           }
           allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
           checks=(
+              ('native_ui_compile',['cargo','check','--locked','-p','morpheus-ui-check'],20*60,None,set()),
               ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
@@ -459,7 +469,7 @@ jobs:
                       'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
               record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
               if not passed:
-                  crates=set(re.findall(r"failed to run custom build command for `([A-Za-z0-9_-]+) v([0-9][A-Za-z0-9.+_-]*)`",output))
+                  crates=set(re.findall(r"failed to run custom build command for `([A-Za-z0-9_-]+) v([0-9][A-Za-z0-9.+_-]*)(?: \([^`\r\n]{0,1024}\))?`",output))
                   # Only fixed tool families and package names from the reviewed lock
                   # may leave the private log. Normalize NULs for native UTF-16 output.
                   normalized=output.replace('\x00','')
@@ -477,7 +487,19 @@ jobs:
                   resolved_link=shutil.which('link.exe',path=environment.get('PATH','')) if os.name=='nt' else None
                   locked_names={package for package,version in locked}
                   failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
+                  # Only known public production file names and numeric spans.
+                  # Never publish compiler text, source snippets or raw paths.
+                  ui_files=('crates/morpheus-app/ui/app-window.slint',
+                      'crates/morpheus-app/ui/call-stage.slint')
+                  ui_locations=[]
+                  for path in ui_files:
+                      line_limit=len((workspace/path).read_text().splitlines())+1
+                      pattern=re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})'
+                      spans={(int(line),int(column)) for line,column in re.findall(pattern,normalized)
+                          if 0<int(line)<=line_limit and 0<int(column)<=4096}
+                      ui_locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
                   record['failure_diagnostics']={
+                      'ui_locations':ui_locations,
                       'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
                       'path_link_family':tool_family(resolved_link) if resolved_link else 'not_resolved',
                       'locked_failed_packages':sorted(failed_packages & locked_names),
@@ -493,5 +515,5 @@ jobs:
               all_passed=all_passed and passed
               # Failed compilation cannot yield meaningful unit checks. Independent test
               # suites still run after a test failure, using the same compiled graph.
-              if name=='native_app_build' and not passed: break
+              if name in ('native_ui_compile','native_app_build') and not passed: break
           if not all_passed: raise SystemExit(1)
