@@ -182,13 +182,16 @@ enum Owner {
 }
 
 /// One open request: its owner, which every later step re-checks, the
-/// target and the authority of the navigation it started, which a newer
-/// open withdraws (and, for search, a newer query, scope or reset).
+/// target, the authority of the navigation it started, which a newer open
+/// withdraws (and, for search, a newer query, scope or reset), and the
+/// navigation epoch it opened under. Backend steps take the owner's own
+/// selection and this epoch, never ones looked up again later.
 #[derive(Clone)]
 struct Opening {
     owner: Owner,
     hit: Hit,
     authority: NavigationAuthority,
+    navigation: u64,
 }
 
 impl Opening {
@@ -219,13 +222,6 @@ impl Opening {
 
     fn searching(&self) -> bool {
         matches!(self.owner, Owner::Search { .. })
-    }
-
-    fn account(&self) -> &str {
-        match &self.owner {
-            Owner::Search { ticket, .. } => &ticket.account,
-            Owner::Activation { account, .. } => account,
-        }
     }
 
     fn selection(&self) -> &AccountSelection {
@@ -821,6 +817,7 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
         owner: Owner::Search { ticket, operation },
         hit,
         authority,
+        navigation: live.current_navigation_epoch(),
     };
     navigate(window, live, runtime, opening);
 }
@@ -956,12 +953,13 @@ fn activate(
         owner,
         hit,
         authority,
+        navigation: live.current_navigation_epoch(),
     };
     navigate(window, live, runtime, opening);
 }
 
 /// Open the target's room unless it is already open, then show the target.
-fn navigate(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: Opening) {
+fn navigate(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, mut opening: Opening) {
     if opening.here(window) {
         arrived(window, live, runtime, &opening, false);
         return;
@@ -970,19 +968,19 @@ fn navigate(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: O
     // the draft store and return with the room.
     window.invoke_cancel_room_settings();
     window.invoke_close_image_preview();
-    let epoch = live.invalidate_navigation();
+    opening.navigation = live.invalidate_navigation();
     let weak = window.as_weak();
     let task_live = live.clone();
     let handle = runtime.clone();
     runtime.spawn(async move {
-        let account = opening.account();
+        let selection = opening.selection().clone();
         let room = opening.hit.room_id.clone();
-        let authority = opening.authority.clone();
+        let (epoch, authority) = (opening.navigation, opening.authority.clone());
         let outcome = task_live
-            .reveal_room_for(account, room, epoch, authority, weak.clone())
+            .reveal_room_for(selection, room, epoch, authority, weak.clone())
             .await;
         let _ = weak.upgrade_in_event_loop(move |window| {
-            navigated(&window, &task_live, &handle, &opening, epoch, outcome);
+            navigated(&window, &task_live, &handle, &opening, outcome);
         });
     });
 }
@@ -992,7 +990,6 @@ fn navigated(
     live: &Arc<LiveUi>,
     runtime: &Handle,
     opening: &Opening,
-    epoch: u64,
     outcome: Result<bool, MatrixCoreError>,
 ) {
     if !opening.current(window) {
@@ -1000,7 +997,7 @@ fn navigated(
     }
     let here = opening.here(window);
     match outcome {
-        Ok(true) if here && live.navigation_is_current(epoch) => {
+        Ok(true) if here && live.navigation_is_current(opening.navigation) => {
             arrived(window, live, runtime, opening, true);
         }
         // Withdrawn or replaced by another navigation.
@@ -1091,10 +1088,11 @@ fn focus(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Ope
     let opening = opening.clone();
     let weak = window.as_weak();
     runtime.spawn(async move {
-        let account = opening.account();
+        let selection = opening.selection().clone();
         let (room, event) = (opening.hit.room_id.clone(), opening.hit.event_id.as_str());
-        let authority = opening.authority.clone();
-        let focus = task_live.focus_event_for(account, room, event, authority, weak.clone());
+        let (epoch, authority) = (opening.navigation, opening.authority.clone());
+        let focus =
+            task_live.focus_event_for(selection, room, event, epoch, authority, weak.clone());
         let outcome = tokio::time::timeout(FOCUS_TIMEOUT, focus).await;
         let _ = weak.upgrade_in_event_loop(move |window| focused(&window, &opening, outcome));
     });
