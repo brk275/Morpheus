@@ -1,0 +1,326 @@
+// Presence beside a voice room's entry: who is in its call, read from this
+// account's validated live MatrixRTC memberships without joining, ringing,
+// capturing or publishing. Rust owns every value and request; rows only read
+// the global and report explicit choices.
+
+import { ListView } from "std-widgets.slint";
+
+import { StyleTokens } from "style-tokens.slint";
+
+export struct VoicePresence {
+    // 0 not watched, 1 loading, 2 live, 3 stale, 4 no open call confirmed,
+    // 5 unsupported, 6 unavailable.
+    state: int,
+    count: int,
+    // Short text for the pill: "3", "3?", "…" or "–".
+    label: string,
+    // Up to three initials of people in the call.
+    preview: string,
+    // Spoken and shown in the roster: what is known and how fresh it is.
+    description: string,
+}
+
+export struct VoiceParticipant {
+    // Sanitized, bounded display name, or the ID's localpart.
+    name: string,
+    // Sanitized, bounded Matrix ID.
+    user-id: string,
+    initials: string,
+    // Devices this person joined the call from.
+    devices: int,
+}
+
+export global VoiceRosters {
+    // Bumped whenever any watched room's presence changes.
+    in-out property <int> revision: 0;
+    // A reset invalidates every open popup, even if a later selection uses
+    // the same room ID before Slint evaluates changed string properties.
+    in-out property <int> context: 0;
+    // The room whose roster is open, its rows and how many were not named.
+    in-out property <string> expanded-room;
+    in-out property <[VoiceParticipant]> participants;
+    in-out property <int> unnamed: 0;
+    pure callback presence(string, int) -> VoicePresence;
+    callback expand(string);
+    callback collapse();
+    // Quiet Join through the existing voice-space call start; never rings.
+    callback join(string);
+    callback reset();
+}
+
+// The count pill of one voice room entry and its roster. Its height never
+// changes the row's.
+export component VoicePresencePill inherits Rectangle {
+    in property <string> room-id;
+    in property <string> room-name;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> accent;
+    in property <color> surface;
+    in property <float> text-scale: 1;
+    // Fixed, so the row can reserve exactly this much room for it.
+    in property <length> pill-width: 34px;
+    property <VoicePresence> presence: VoiceRosters.presence(root.room-id, VoiceRosters.revision);
+    property <bool> shown: root.presence.state != 0;
+    property <int> opened-context: -1;
+    property <int> roster-context: VoiceRosters.context;
+    property <bool> roster-current: VoiceRosters.expanded-room == root.room-id && root.shown;
+    changed roster-context => { roster.close(); }
+    changed roster-current => { if !root.roster-current { roster.close(); } }
+    property <color> voice: StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1;
+    width: root.shown ? root.pill-width : 0px;
+    height: max(18px, 13px * root.text-scale);
+    border-radius: self.height / 2;
+    border-width: root.shown ? 1px : 0px;
+    border-color: root.presence.state == 2 && root.presence.count > 0 ? root.voice : root.muted;
+    background: pill-focus.has-focus || pill-hit.has-hover ? root.surface : transparent;
+    visible: root.shown;
+    accessible-role: button;
+    accessible-label: "Who is in " + root.room-name + ": " + root.presence.description;
+    accessible-action-default => { root.open-roster(); }
+
+    function open-roster() {
+        VoiceRosters.expand(root.room-id);
+        if VoiceRosters.expanded-room == root.room-id && root.shown {
+            root.opened-context = VoiceRosters.context;
+            roster.show();
+        }
+    }
+
+    pill-text := Text {
+        text: root.presence.label;
+        color: root.presence.state == 2 && root.presence.count > 0 ? root.voice : root.muted;
+        font-size: 9px * root.text-scale;
+        font-weight: 750;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    pill-focus := FocusScope {
+        enabled: root.shown;
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == Key.Space {
+                root.open-roster();
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    pill-hit := TouchArea {
+        enabled: root.shown;
+        mouse-cursor: pointer;
+        clicked => {
+            pill-focus.focus();
+            root.open-roster();
+        }
+    }
+    if pill-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: 2px;
+        border-color: root.accent;
+        background: transparent;
+    }
+
+    roster := PopupWindow {
+        x: 0px;
+        y: root.height + 4px;
+        width: 280px * root.text-scale;
+        // Always fit the application's minimum 620px window height. The
+        // participant list scrolls; Join and Close remain outside it.
+        height: min(500px, (220px + max(1, min(6, VoiceRosters.participants.length)) * 34px) * root.text-scale);
+        close-policy: close-on-click-outside;
+        changed is-open => {
+            if !self.is-open && root.opened-context == VoiceRosters.context
+                && VoiceRosters.expanded-room == root.room-id {
+                VoiceRosters.collapse();
+            }
+        }
+        Rectangle {
+            background: root.surface;
+            border-radius: StyleTokens.radius * 0.8;
+            border-width: 1px;
+            border-color: root.muted;
+            accessible-role: region;
+            accessible-label: "People in " + root.room-name;
+            roster-keys := FocusScope {
+                init => {
+                    if join-action.enabled { join-action.focus(); } else { close-focus.focus(); }
+                }
+                key-pressed(event) => {
+                    if event.text == Key.Escape {
+                        VoiceRosters.collapse();
+                        roster.close();
+                        accept
+                    } else {
+                        reject
+                    }
+                }
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 6px;
+                    Text {
+                        text: root.room-name;
+                        color: root.ink;
+                        font-size: 13px * root.text-scale;
+                        font-weight: 750;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.presence.description;
+                        color: root.muted;
+                        font-size: 11px * root.text-scale;
+                        wrap: word-wrap;
+                        accessible-live-region: polite;
+                    }
+                    if VoiceRosters.expanded-room == root.room-id : ListView {
+                        vertical-stretch: 1;
+                        min-height: 34px;
+                        for person in VoiceRosters.participants : Rectangle {
+                            height: 36px * root.text-scale;
+                            accessible-role: list-item;
+                            accessible-label: person.name + ", " + person.user-id
+                                + (person.devices > 1 ? ", " + person.devices + " devices" : "");
+                          HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                width: 22px * root.text-scale;
+                                height: 22px * root.text-scale;
+                                border-radius: self.height / 2;
+                                background: root.voice;
+                                Text {
+                                    text: person.initials;
+                                    color: root.surface;
+                                    font-size: 9px * root.text-scale;
+                                    font-weight: 750;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    accessible-role: none;
+                                }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: person.name;
+                                    color: root.ink;
+                                    font-size: 11px * root.text-scale;
+                                    overflow: elide;
+                                    accessible-role: none;
+                                }
+                                Text {
+                                    text: person.user-id + (person.devices > 1 ? " · " + person.devices + " devices" : "");
+                                    color: root.muted;
+                                    font-size: 9px * root.text-scale;
+                                    overflow: elide;
+                                    accessible-role: none;
+                                }
+                            }
+                          }
+                        }
+                    }
+                    if VoiceRosters.expanded-room == root.room-id && VoiceRosters.unnamed > 0 : Text {
+                        text: "and " + VoiceRosters.unnamed + " more";
+                        color: root.muted;
+                        font-size: 10px * root.text-scale;
+                    }
+                    Text {
+                        text: "From this account's encrypted call memberships; it may not list everyone. Nobody is notified when you look.";
+                        color: root.muted;
+                        font-size: 9px * root.text-scale;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        join-action := Rectangle {
+                            property <bool> enabled: root.presence.state >= 1 && root.presence.state <= 4;
+                            width: join-text.preferred-width + 20px;
+                            height: max(26px, 16px * root.text-scale + 10px);
+                            border-radius: StyleTokens.radius * 0.6;
+                            background: !self.enabled ? transparent : join-hit.has-hover ? root.voice.darker(0.2) : root.voice;
+                            border-width: join-focus.has-focus ? 2px : 0px;
+                            border-color: root.accent;
+                            opacity: self.enabled ? 1 : 0.5;
+                            accessible-role: button;
+                            accessible-label: "Join " + root.room-name + " quietly. Nobody is rung";
+                            accessible-enabled: self.enabled;
+                            accessible-action-default => {
+                                if self.enabled {
+                                    roster.close();
+                                    VoiceRosters.join(root.room-id);
+                                }
+                            }
+                            forward-focus: join-focus;
+                            join-text := Text {
+                                text: "Join quietly";
+                                color: parent.enabled ? root.surface : root.muted;
+                                font-size: 11px * root.text-scale;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            join-focus := FocusScope {
+                                enabled: parent.enabled;
+                                key-pressed(event) => {
+                                    if event.text == Key.Return || event.text == Key.Space {
+                                        roster.close();
+                                        VoiceRosters.join(root.room-id);
+                                        accept
+                                    } else {
+                                        reject
+                                    }
+                                }
+                            }
+                            join-hit := TouchArea {
+                                enabled: parent.enabled;
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    roster.close();
+                                    VoiceRosters.join(root.room-id);
+                                }
+                            }
+                        }
+                        Rectangle {
+                            width: close-text.preferred-width + 20px;
+                            height: max(26px, 16px * root.text-scale + 10px);
+                            border-radius: StyleTokens.radius * 0.6;
+                            border-width: close-focus.has-focus ? 2px : 1px;
+                            border-color: close-focus.has-focus ? root.accent : root.muted;
+                            accessible-role: button;
+                            accessible-label: "Close the list of people";
+                            accessible-action-default => {
+                                VoiceRosters.collapse();
+                                roster.close();
+                            }
+                            close-text := Text {
+                                text: "Close";
+                                color: root.ink;
+                                font-size: 11px * root.text-scale;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            close-focus := FocusScope {
+                                key-pressed(event) => {
+                                    if event.text == Key.Return || event.text == Key.Space {
+                                        VoiceRosters.collapse();
+                                        roster.close();
+                                        accept
+                                    } else {
+                                        reject
+                                    }
+                                }
+                            }
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    VoiceRosters.collapse();
+                                    roster.close();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

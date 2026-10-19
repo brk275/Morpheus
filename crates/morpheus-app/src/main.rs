@@ -60,6 +60,8 @@ mod updater;
 mod verification;
 #[cfg(feature = "native-calls")]
 mod video_render;
+#[cfg(feature = "native-calls")]
+mod voice_rosters;
 mod voice_spaces;
 mod workspace_layout;
 
@@ -1587,6 +1589,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     let mut incoming_calls =
         incoming_ring::ui::IncomingUi::bind(&ui, runtime.handle(), live.clone(), calls.clone());
+    #[cfg(feature = "native-calls")]
+    let voice_presence =
+        voice_rosters::VoiceRosterUi::register(&ui, live.clone(), runtime.handle());
     #[cfg(feature = "native-calls")]
     let applied_audio_token = Arc::new(AtomicU64::new(0));
     #[cfg(feature = "native-calls")]
@@ -4400,6 +4405,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pinned_messages.shutdown(&ui);
     room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);
+    #[cfg(feature = "native-calls")]
+    voice_presence.shutdown(&ui);
     #[cfg(feature = "native-calls")]
     incoming_calls.shutdown();
     notifications.shutdown();

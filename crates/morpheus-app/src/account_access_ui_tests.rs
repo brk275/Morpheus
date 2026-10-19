@@ -3798,6 +3798,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     )));
     let live = LiveUi::new(manager.clone(), runtime.clone(), ui.as_weak(), voices);
     assert_pane_navigation_epoch(&ui, &live, directory.path()).await;
+    #[cfg(feature = "native-calls")]
+    crate::voice_rosters::assert_unowned_presentation_is_cleared(&ui, live.clone(), &runtime);
     // This suite tests the actual dialog/controller boundary, not credentials.
     // A denied account-change guard also prevents any mistaken key sequence
     // from starting policy writes, account activation, or local deletion.
@@ -5886,7 +5888,14 @@ async fn assert_layout_navigation_recovery(ui: &AppWindow, directory: &std::path
     // Explicit panel navigation must still reach a details pane hidden by
     // TOML, including the responsive fallback at the minimum window width.
     let size = ui.window().size();
-    for width in [1310.0, 640.0] {
+    let was_live = ui.get_live_session();
+    for (width, available) in [
+        (1310.0, false),
+        (1310.0, true),
+        (640.0, false),
+        (640.0, true),
+    ] {
+        ui.set_live_session(available);
         let mut config = Config::default();
         config.layout.hidden_panes = vec![PaneId::Details];
         store.save(&config).unwrap();
@@ -5909,10 +5918,15 @@ async fn assert_layout_navigation_recovery(ui: &AppWindow, directory: &std::path
         i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
         settle(ui).await;
         assert!(ui.get_pane_details_w() >= 200.0);
-        assert!(focused_control_has_label(
-            ui,
-            &format!("Transfers: {}", ui.get_transfer_summary())
-        ));
+        let transfer_heading = if available {
+            format!("Transfers: {}", ui.get_transfer_summary())
+        } else {
+            "Transfers: Sign in to see this account's transfers".to_owned()
+        };
+        assert!(
+            focused_control_has_label(ui, &transfer_heading),
+            "explicitly opening Transfers must focus its actual available/signed-out heading"
+        );
         assert_eq!(
             std::fs::read(store.path()).unwrap(),
             saved,
@@ -5924,6 +5938,7 @@ async fn assert_layout_navigation_recovery(ui: &AppWindow, directory: &std::path
         assert!(!ui.get_details_reveal_open());
         assert_eq!(ui.get_pane_details_w(), 0.0);
     }
+    ui.set_live_session(was_live);
     ui.window().set_size(size);
     apply_config(ui, &Config::default(), None);
     assert_pane_pointer_cancellation(ui, &store).await;

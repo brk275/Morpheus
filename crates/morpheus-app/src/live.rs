@@ -3747,6 +3747,9 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     crate::polls::clear_presentation(ui);
     // Decrypted pinned rows are account-private and never wait for a task.
     ui.invoke_reset_pinned_messages();
+    // So is who is in this account's voice rooms.
+    #[cfg(feature = "native-calls")]
+    crate::voice_rosters::clear(ui);
     ui.set_room_actions_open(false);
     ui.set_room_action_busy(false);
     ui.set_room_action_error("".into());

@@ -100,6 +100,17 @@ pub(crate) fn apply_room_order(ui: &AppWindow) {
         ui.get_sort_unread_first(),
         crate::room_organization::tags,
     );
+    // The first listed voice rooms get bounded live presence (voice_rosters).
+    #[cfg(feature = "native-calls")]
+    crate::voice_rosters::listed(
+        ui,
+        order
+            .favourites
+            .iter()
+            .chain(&order.combined)
+            .chain(&order.low_priority)
+            .map(|entry| &entry.room),
+    );
     let same_room = |a: &RoomItem, b: &RoomItem| a.id == b.id;
     let same_entry = |a: &NavigationRoomItem, b: &NavigationRoomItem| a.room.id == b.room.id;
     sync_model(ui.get_channels(), order.channels, same_room, |model| {

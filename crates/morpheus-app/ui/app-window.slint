@@ -17,6 +17,8 @@ import { ActionRect, ControlColors, HoverSurface, TextAction, TokenButton, Token
 export { BaseColorSet, ColorRole, StyleTokens, ThemeRoleSet, ThemeStateSet } from "style-tokens.slint";
 import { RoomOrganizationButton, RoomOrganizationState, RoomSectionHeader } from "room-organization.slint";
 export { RoomOrganizationState } from "room-organization.slint";
+import { VoicePresencePill, VoiceRosters } from "voice-rosters.slint";
+export { VoiceParticipant, VoicePresence, VoiceRosters } from "voice-rosters.slint";
 import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "device-sessions.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
@@ -620,6 +622,9 @@ component NavigationRoomRow inherits ActionRect {
     // distinct from a plain unread count. The window resolves both colors.
     in property <color> mention-surface;
     in property <color> mention-ink;
+    // Room kept free at the right edge for an overlay (a voice room's
+    // presence pill), which this control would otherwise cover.
+    in property <length> trailing-reserve: 0px;
     callback open(string, bool);
     property <bool> selected-ink-set: StyleTokens.states.nav-selected-ink.present || StyleTokens.roles.selection-ink.present;
     property <color> selected-ink: StyleTokens.states.nav-selected-ink.present ? StyleTokens.states.nav-selected-ink.color : StyleTokens.roles.selection-ink.color;
@@ -681,6 +686,7 @@ component NavigationRoomRow inherits ActionRect {
             background: StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent;
             unread-count := Text { text: root.room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
         }
+        if root.trailing-reserve > 0px : Rectangle { width: root.trailing-reserve; }
     }
 }
 
@@ -708,6 +714,11 @@ component OrganizableRoomRow inherits Rectangle {
     in property <bool> can-move-up;
     in property <bool> can-move-down;
     callback open(string, bool);
+    // A watched voice room's presence pill sits over the row's reserved
+    // right edge: inside the row, the row's own control would take its
+    // clicks. Inspecting it never joins (see voice-rosters.slint).
+    property <bool> presence-shown: root.room.voice-space && VoiceRosters.presence(root.room.id, VoiceRosters.revision).state != 0;
+    property <length> presence-width: 34px * root.text-scale;
     height: row.height;
     // Never focused itself; it only sees keys the row's control passes on.
     FocusScope {
@@ -742,7 +753,20 @@ component OrganizableRoomRow inherits Rectangle {
             accent-ink: root.accent-ink;
             mention-surface: root.mention-surface;
             mention-ink: root.mention-ink;
+            trailing-reserve: root.presence-shown ? root.presence-width + 6px : 0px;
             open(id, voice) => { root.open(id, voice); }
+        }
+        if root.presence-shown : VoicePresencePill {
+            x: root.width - self.width - 9px;
+            y: (root.height - self.height) / 2;
+            pill-width: root.presence-width;
+            room-id: root.room.id;
+            room-name: root.room.name;
+            ink: root.ink;
+            muted: root.muted;
+            accent: root.accent;
+            surface: root.elevated;
+            text-scale: root.text-scale;
         }
     }
     row-menu := ContextMenuArea {
