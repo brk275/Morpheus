@@ -324,7 +324,7 @@ async fn test_morpheus_earliest_valid_end_wins_even_when_received_later() {
         )
         .await;
     let results = timeline.poll_state().await.results();
-    assert_eq!(results.end_time.unwrap().0.get(), 50);
+    assert_eq!(u64::from(results.end_time.unwrap().0), 50);
     assert!(results.votes.values().all(Vec::is_empty));
 }
 
@@ -353,7 +353,7 @@ async fn test_morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes() 
         .handle_live_event(timeline.factory.event(start).sender(&ALICE).event_id(poll_id))
         .await;
     let results = timeline.poll_state().await.results();
-    assert_eq!(results.end_time.unwrap().0.get(), 100);
+    assert_eq!(u64::from(results.end_time.unwrap().0), 100);
     assert_eq!(results.votes["id_up"], vec![ALICE.to_string()]);
 }
 
