@@ -1825,12 +1825,8 @@ impl CallWorker {
                 ));
                 break (CallOutcome::Failed(error.to_string()), Ok(()));
             }
-            if invitation_pending {
-                // The invitation named the lost membership. It is never resent.
-                invitation_pending = false;
-                self.shared
-                    .send_invitation(self.presentation, &self.selection, INVITATION_INTERRUPTED);
-            }
+            // A pending invitation named the lost membership; it is never resent.
+            let invitation_interrupted = std::mem::take(&mut invitation_pending);
             outgoing.detach_publications();
             if !self.advance_presentation(&mut outgoing).await {
                 // Leave or an account change won before the rejoin began.
@@ -1838,6 +1834,10 @@ impl CallWorker {
                     Ok(()) => (CallOutcome::Idle, Ok(())),
                     Err(error) => (CallOutcome::Failed(error.to_string()), Ok(())),
                 };
+            }
+            if invitation_interrupted {
+                self.shared
+                    .send_invitation(self.presentation, &self.selection, INVITATION_INTERRUPTED);
             }
             let requested = controls.requested_state();
             let guards = self.spawn_capture_guards(&active, &sync, None, None);
