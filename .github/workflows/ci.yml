@@ -270,6 +270,10 @@ jobs:
           fi
       - name: Test desktop controller and call guards
         id: desktop-tests
+        # ElementHandle queries need compiler-generated element metadata even
+        # when Rust debug symbols are disabled for the hosted test build.
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
         # The independently built app can still exercise disposable fixtures
         # after a unit assertion fails. Keep that evidence and reject the
         # candidate at the final gate instead of rebuilding just to reach it.

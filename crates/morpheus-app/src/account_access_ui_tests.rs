@@ -1,6 +1,8 @@
 //! Real generated Slint properties, keyboard routing, and account presentation.
 //! The headless backend has no native display or screen reader. These tests do
 //! not authenticate or remove a core account, and cannot access a credential vault.
+//! The public ElementHandle accessibility-action query requires compile-time
+//! SLINT_EMIT_DEBUG_INFO=1; the app-test CI step enables that metadata.
 
 use super::*;
 use crate::{
@@ -1905,9 +1907,19 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     key(ui, Key::LeftArrow);
     settle(ui).await;
     assert_eq!(store.load().unwrap().window.opacity_percent, 99);
-    let slider = ElementHandle::find_by_accessible_label(ui, "Window background opacity, percent")
+    let mut sliders =
+        ElementHandle::find_by_accessible_label(ui, "Window background opacity, percent").filter(
+            |element| {
+                element.accessible_role() == Some(i_slint_backend_testing::AccessibleRole::Slider)
+            },
+        );
+    let slider = sliders
         .next()
-        .expect("the opacity slider is exposed to assistive technology");
+        .expect("the opacity slider is exposed to assistive technology (build tests with SLINT_EMIT_DEBUG_INFO=1)");
+    assert!(
+        sliders.next().is_none(),
+        "the opacity slider must be unique"
+    );
     slider.set_accessible_value("50");
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
     settle(ui).await;
