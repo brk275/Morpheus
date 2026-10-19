@@ -22,7 +22,7 @@ use std::{
 
 use morpheus_matrix::{AccountInfo, AccountSelection, MessageInfo};
 use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
-use tokio::{runtime::Handle, sync::mpsc};
+use tokio::{runtime::Handle, sync::mpsc, time::MissedTickBehavior};
 
 use crate::{AppWindow, MessageItem, live::LiveUi, navigation_target::NavigationTarget};
 
@@ -77,20 +77,32 @@ impl PendingSlot {
         }
     }
 
-    /// The active account changed. The request is returned exactly once
-    /// when its own account became active in time; any other account ends
-    /// it. No active account (a failed or locked switch) leaves it waiting.
-    fn account_changed(&mut self, active: Option<&AccountInfo>, now: Instant) -> Option<Pending> {
-        let pending = self.0.as_ref()?;
-        if now >= pending.deadline {
+    /// The active account changed: any other account ends the request. Its
+    /// own account, or none (a failed or locked switch), leaves it waiting.
+    fn account_changed(&mut self, active: Option<&AccountInfo>, now: Instant) {
+        self.expire(now);
+        if let (Some(pending), Some(active)) = (&self.0, active)
+            && active.id != pending.target.account_id()
+        {
             self.0 = None;
-            return None;
         }
-        let active = active?;
-        if active.id == pending.target.account_id() {
+    }
+
+    fn expire(&mut self, now: Instant) {
+        if self.0.as_ref().is_some_and(|pending| now >= pending.deadline) {
+            self.0 = None;
+        }
+    }
+
+    fn peek(&self) -> Option<Pending> {
+        self.0.clone()
+    }
+
+    /// Consume the request exactly once, only if it is still `generation`.
+    fn take_if(&mut self, generation: u64) -> Option<Pending> {
+        if self.0.as_ref().is_some_and(|pending| pending.generation == generation) {
             self.0.take()
         } else {
-            self.0 = None;
             None
         }
     }
@@ -356,8 +368,11 @@ fn show_thread(ui: &AppWindow, root: &str, item: Option<MessageItem>) {
     ui.invoke_open_thread(root.into(), sender, body);
 }
 
-/// Complete a waiting request once the protected switch made its account
-/// active, after the switch released the account transition.
+/// Complete a waiting request once its account is active and shown. Checked
+/// on every account change and once a second while a request waits, since
+/// choosing an account that is already active and syncing publishes no
+/// change. A switch in progress holds the account transition; waiting for it
+/// lets its activation and room list finish first.
 async fn watch_switches(activator: std::sync::Weak<Activator>) {
     let Some(manager) = activator
         .upgrade()
@@ -366,26 +381,54 @@ async fn watch_switches(activator: std::sync::Weak<Activator>) {
         return;
     };
     let mut active = manager.subscribe_active_account();
-    while active.changed().await.is_ok() {
-        let account = active.borrow_and_update().clone();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        let changed = tokio::select! {
+            result = active.changed() => {
+                if result.is_err() {
+                    return;
+                }
+                true
+            }
+            _ = tick.tick() => false,
+        };
         let Some(activator) = activator.upgrade() else {
             return;
         };
-        let Some(pending) = activator
-            .slot()
-            .account_changed(account.as_ref(), Instant::now())
-        else {
+        let now = Instant::now();
+        if changed {
+            let account = active.borrow_and_update().clone();
+            activator.slot().account_changed(account.as_ref(), now);
+        } else {
+            activator.slot().expire(now);
+        }
+        let Some(pending) = activator.slot().peek() else {
             continue;
         };
-        // The switch publishes the account while it still holds the
-        // transition; its activation (and the room list) finishes first.
         drop(activator.live.account_transition.lock().await);
+        if manager
+            .active_account()
+            .await
+            .is_none_or(|account| account.id != pending.target.account_id())
+        {
+            continue;
+        }
         let Some(selection) = manager.account_selection(pending.target.account_id()) else {
             continue;
         };
         let opener = activator.clone();
         let _ = activator.ui.upgrade_in_event_loop(move |ui| {
-            if selection.is_current() && opener.is_current(pending.generation) {
+            if !selection.is_current()
+                || !ui.get_live_session()
+                || ui.get_account_switch_pending()
+                || ui.get_active_account_local_id().as_str() != pending.target.account_id()
+            {
+                return;
+            }
+            // Release the slot before navigating: navigation may run callbacks.
+            let taken = opener.slot().take_if(pending.generation);
+            if let Some(pending) = taken {
                 opener.navigate(&ui, pending.target, pending.generation);
             }
         });
@@ -415,13 +458,15 @@ mod tests {
         let mut slot = PendingSlot::default();
         slot.wait(1, target("alice"), now);
         // A failed or locked switch leaves no active account: keep waiting.
-        assert!(slot.account_changed(None, now).is_none());
-        assert!(slot.0.is_some());
-        let opened = slot.account_changed(Some(&account("alice")), now).unwrap();
-        assert_eq!(opened.generation, 1);
+        slot.account_changed(None, now);
+        slot.account_changed(Some(&account("alice")), now);
+        assert_eq!(slot.peek().map(|pending| pending.generation), Some(1));
+        // Only the current request is consumed, and only once.
+        assert!(slot.take_if(0).is_none());
+        let opened = slot.take_if(1).unwrap();
         assert_eq!(opened.target.account_id(), "alice");
-        // Consumed: returning to the same account later opens nothing.
-        assert!(slot.account_changed(Some(&account("alice")), now).is_none());
+        assert!(slot.take_if(1).is_none());
+        assert!(slot.peek().is_none());
     }
 
     #[test]
@@ -430,31 +475,34 @@ mod tests {
         let mut slot = PendingSlot::default();
         // A → B → A: B becoming active ends the request for A for good.
         slot.wait(1, target("alice"), now);
-        assert!(slot.account_changed(Some(&account("bob")), now).is_none());
-        assert!(slot.account_changed(Some(&account("alice")), now).is_none());
+        slot.account_changed(Some(&account("bob")), now);
+        slot.account_changed(Some(&account("alice")), now);
+        assert!(slot.peek().is_none());
 
-        // A newer activation replaces the older; the older cannot clear it.
+        // A newer activation replaces the older; the older cannot clear or
+        // consume it.
         slot.wait(2, target("alice"), now);
         slot.wait(3, target("bob"), now);
         slot.clear_if(2);
-        assert_eq!(slot.0.as_ref().map(|pending| pending.generation), Some(3));
+        assert!(slot.take_if(2).is_none());
+        assert_eq!(slot.peek().map(|pending| pending.generation), Some(3));
 
         // The leave-call confirmation re-enters the switch to the same
         // account and keeps the request; any other navigation ends it.
         slot.user_navigated(Some("bob"));
-        assert!(slot.0.is_some());
+        assert!(slot.peek().is_some());
         slot.user_navigated(Some("alice"));
-        assert!(slot.0.is_none());
+        assert!(slot.peek().is_none());
         slot.wait(4, target("alice"), now);
         slot.user_navigated(None);
-        assert!(slot.0.is_none());
+        assert!(slot.peek().is_none());
 
         // An abandoned app-password prompt cannot open the room later.
         slot.wait(5, target("alice"), now);
-        assert!(
-            slot.account_changed(Some(&account("alice")), now + PENDING_TTL)
-                .is_none()
-        );
-        assert!(slot.0.is_none());
+        slot.expire(now + PENDING_TTL);
+        assert!(slot.peek().is_none());
+        slot.wait(6, target("alice"), now);
+        slot.account_changed(Some(&account("alice")), now + PENDING_TTL);
+        assert!(slot.take_if(6).is_none());
     }
 }
