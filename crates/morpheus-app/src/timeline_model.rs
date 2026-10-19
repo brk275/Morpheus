@@ -143,6 +143,26 @@ pub(crate) fn update_shared(
     }
 }
 
+/// Position of the row showing `event_id`. A timeline model is read from its
+/// stored rows without projecting any row.
+pub(crate) fn index_of_event(model: &ModelRc<MessageItem>, event_id: &str) -> Option<usize> {
+    if let Some(model) = model.as_any().downcast_ref::<TimelineModel>() {
+        return model
+            .rows
+            .borrow()
+            .iter()
+            .position(|row| row.event_id.as_deref() == Some(event_id));
+    }
+    model
+        .iter()
+        .position(|row| row.event_id.as_str() == event_id)
+}
+
+/// The row showing `event_id`, projecting only that row.
+pub(crate) fn item_of_event(model: &ModelRc<MessageItem>, event_id: &str) -> Option<MessageItem> {
+    model.row_data(index_of_event(model, event_id)?)
+}
+
 // Owned fixtures also exercise the value-equality fallback: a rebuilt row can
 // be equal even when it has a different allocation from the previous snapshot.
 #[cfg(test)]

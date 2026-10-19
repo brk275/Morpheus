@@ -25,8 +25,9 @@ pub use discovery::{
     parse_matrix_link_target,
 };
 mod history;
+pub use history::{FocusedView, HistoryReveal};
 mod search;
-pub use search::MessageSearchResult;
+pub use search::{MessageSearchPage, MessageSearchResult};
 mod formatting;
 pub use formatting::TextFormat;
 mod compose;
@@ -1728,6 +1729,39 @@ impl AccountManager {
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
     }
 
+    /// Toggle a reaction on a message shown in a focused conversation view.
+    /// Its row may be absent from the live timeline, so the view's own
+    /// timeline sends it. The view must belong to the expected account's
+    /// current selection epoch, not merely to the same account ID.
+    pub async fn toggle_focused_reaction_for(
+        &self,
+        expected_account_id: &str,
+        view: &FocusedView,
+        event_id: &str,
+        reaction: &str,
+    ) -> Result<bool> {
+        let owned = || match self.account_selection(expected_account_id) {
+            Some(current) => view.owned_by(&current),
+            None => false,
+        };
+        if !owned() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let state = self.state.lock().await;
+        // The state lock can wait through an account transition.
+        if !owned() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let loaded = selected_loaded_for(&state, expected_account_id)?;
+        gate_room_send(loaded, view.room_id()).await?;
+        let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
+        let timeline = view.timeline();
+        timeline
+            .toggle_reaction(&item_id, reaction)
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+    }
+
     /// Queue a plain text message in the selected room. Observe the timeline
     /// send state for remote acknowledgement or failure.
     pub async fn send_text(&self, room_id: &str, body: impl Into<String>) -> Result<()> {
@@ -2437,6 +2471,63 @@ impl AccountManager {
             .send(request)
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        Ok(SpaceHierarchyPage {
+            nodes: response.rooms.into_iter().map(space_node_info).collect(),
+            next_batch: response.next_batch,
+        })
+    }
+
+    /// Read a hierarchy under the exact selection captured by its caller.
+    /// A delayed scan never looks up a newer account's client after a switch.
+    pub async fn space_hierarchy_selected(
+        &self,
+        selection: &AccountSelection,
+        space_id: &str,
+        from: Option<&str>,
+        limit: u32,
+    ) -> Result<SpaceHierarchyPage> {
+        let owns = || {
+            selection.is_current()
+                && self
+                    .account_selection(selection.account_id())
+                    .is_some_and(|current| selection.same_epoch(&current))
+        };
+        if !owns() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let client = {
+            let state = selection
+                .guard(self.state.lock())
+                .await
+                .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+            if !owns() {
+                return Err(MatrixCoreError::SelectedAccountChanged);
+            }
+            account_access::ensure_eligible(&state, selection.account_id())?;
+            selected_loaded_for(&state, selection.account_id())?
+                .client
+                .clone()
+        };
+        let id = RoomId::parse(space_id)
+            .map_err(|error| MatrixCoreError::InvalidRoomId(error.to_string()))?;
+        let mut request = get_hierarchy::v1::Request::new(id);
+        request.from = from.map(str::to_owned);
+        request.limit = Some(limit.clamp(1, 100).into());
+        let response = selection
+            .guard(async {
+                if !owns() {
+                    return Err(MatrixCoreError::SelectedAccountChanged);
+                }
+                client
+                    .send(request)
+                    .await
+                    .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+            })
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)??;
+        if !owns() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
         Ok(SpaceHierarchyPage {
             nodes: response.rooms.into_iter().map(space_node_info).collect(),
             next_batch: response.next_batch,

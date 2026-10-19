@@ -1,0 +1,437 @@
+import { ListView, ScrollView } from "std-widgets.slint";
+
+// One local search hit. `room-id`, `event-id` and `thread-root` route the
+// open action; they are never displayed. Text fields are sanitized in Rust.
+export struct MessageSearchItem {
+    room-id: string,
+    event-id: string,
+    sender: string,
+    time: string,
+    body: string,
+    preview: string,
+    // Display name of the hit's room.
+    room-name: string,
+    // Root event of the thread the hit belongs to, or empty.
+    thread-root: string,
+}
+
+// The window's resolved theme roles for the search surface. Optional
+// StyleTokens roles are resolved by the window before they reach this file,
+// so customization and themes apply here exactly as in the root view.
+export struct SearchPalette {
+    ink: color,
+    muted: color,
+    panel: color,
+    elevated: color,
+    hover: color,
+    accent: color,
+    divider: color,
+    error: color,
+    selection: color,
+    // Used only when the theme defines selection ink; rows otherwise keep
+    // their own ink on a selected surface, as in the timeline.
+    selection-ink: color,
+    has-selection-ink: bool,
+    focus: color,
+}
+
+// A focusable action with the same keyboard path as the window's actions:
+// Tab reaches it, Return or Space activates it, a click focuses it first.
+component SearchAction inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <color> focus-color;
+    out property <bool> has-hover: hit.has-hover;
+    out property <bool> has-focus: keyboard-focus.has-focus;
+    callback activated();
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.activated(); } }
+    @children
+    keyboard-focus := FocusScope {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        focus-on-click: true;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled { root.activated(); }
+                accept
+            } else { reject }
+        }
+    }
+    hit := TouchArea {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { keyboard-focus.focus(); root.activated(); }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        border-radius: root.border-radius;
+        border-width: 2px;
+        border-color: root.focus-color;
+        background: transparent;
+    }
+}
+
+// Message search over the account's encrypted on-device index. The window
+// owns every property; this component only presents them and reports input.
+// The field owns Up/Down/PageUp/PageDown (highlight), Return (open the
+// highlighted hit, otherwise search now) and Escape (clear, then dismiss).
+export component MessageSearchPanel inherits VerticalLayout {
+    in property <SearchPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> radius: 10px;
+    // Signed in to a live account.
+    in property <bool> available;
+    // A room is open, so the current-room scope can be searched.
+    in property <bool> room-available;
+    in property <string> room-name;
+    in-out property <string> query;
+    // 0 searches the open room, 1 every joined room of the account.
+    in property <int> scope;
+    in property <[MessageSearchItem]> results;
+    in property <[MessageSearchItem]> context;
+    in property <bool> loading;
+    in property <bool> loading-more;
+    in property <bool> searched;
+    in property <bool> has-more;
+    in property <string> error;
+    in property <string> notice;
+    in property <bool> context-loading;
+    in property <string> context-error;
+    in property <string> context-notice;
+    // Highlighted row for keyboard navigation, or -1.
+    in-out property <int> index: -1;
+    in property <string> selected-room-id;
+    in property <string> selected-event-id;
+    in property <string> selected-sender;
+    in property <string> selected-time;
+    in property <string> selected-body;
+    in property <int> focus-request;
+    // The query text changed; the controller debounces and cancels.
+    callback edited(string);
+    // Search now (Return with no highlighted hit).
+    callback submit();
+    callback choose-scope(int);
+    callback load-more();
+    // Open one hit by its room and event IDs.
+    callback open(string, string);
+    // Escape in an empty field.
+    callback dismiss();
+
+    property <bool> scope-ready: root.available && (root.scope == 1 || root.room-available);
+    property <length> row-height: max(74px, 54px * root.text-scale + 22px);
+
+    spacing: 0px;
+    forward-focus: input;
+
+    function step-highlight(step: int) {
+        if root.results.length > 0 {
+            root.index = max(0, min(root.results.length - 1, (root.index < 0 && step < 0 ? root.results.length : root.index) + step));
+        }
+    }
+    // Rows have one fixed height, so a row's offset in the list is exact.
+    function reveal(row: int) {
+        if row >= 0 {
+            let top = row * root.row-height;
+            if top < -results-list.content-y {
+                results-list.content-y = -top;
+            } else if top + root.row-height > -results-list.content-y + results-list.visible-height {
+                results-list.content-y = -(top + root.row-height - results-list.visible-height);
+            }
+        }
+    }
+    function open-highlighted() {
+        if root.index >= 0 && root.index < root.results.length {
+            root.open(root.results[root.index].room-id, root.results[root.index].event-id);
+        }
+    }
+    changed index => { root.reveal(root.index); }
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        Text {
+            text: "Search messages";
+            color: root.palette.ink; font-size: 15px * root.text-scale; font-weight: 750;
+        }
+        HorizontalLayout {
+            spacing: 4px;
+            height: max(30px, 22px * root.text-scale + 8px);
+            for scope-name[option] in ["This room", "All rooms"] : SearchAction {
+                horizontal-stretch: 1;
+                border-radius: root.radius * 0.7;
+                border-width: 1px;
+                border-color: root.scope == option ? root.palette.accent : root.palette.divider;
+                background: root.scope == option ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                focus-color: root.palette.focus;
+                enabled: root.available && (option == 1 || root.room-available);
+                accessible-role: tab;
+                accessible-checkable: true;
+                accessible-checked: root.scope == option;
+                label: option == 0 ? "Search only the open room" : "Search all rooms of this account";
+                activated => { if root.scope != option { root.index = -1; root.choose-scope(option); } }
+                Text {
+                    text: scope-name;
+                    color: root.scope == option && root.palette.has-selection-ink ? root.palette.selection-ink
+                        : root.scope == option ? root.palette.ink : root.palette.muted;
+                    font-size: 12px * root.text-scale; font-weight: 700;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle {
+            height: max(36px, 26px * root.text-scale + 10px);
+            background: root.palette.elevated;
+            border-radius: root.radius * 0.7;
+            border-width: input.has-focus ? 2px : 1px;
+            border-color: input.has-focus ? root.palette.focus : root.palette.divider;
+            if root.query == "" : Text {
+                x: 10px; width: parent.width - 20px; height: parent.height;
+                text: root.scope == 0 ? "Search " + (root.room-name != "" ? root.room-name : "this room") + "…" : "Search all rooms…";
+                color: root.palette.muted; font-size: 12px * root.text-scale;
+                vertical-alignment: center; overflow: elide;
+            }
+            // Capture navigation keys before the text field edits with them.
+            keys := FocusScope {
+                x: 10px; width: parent.width - 20px; height: parent.height;
+                focus-on-click: false;
+                focus-on-tab-navigation: false;
+                capture-key-pressed(event) => {
+                    if event.text == Key.DownArrow && root.results.length > 0 {
+                        root.step-highlight(1);
+                        accept
+                    } else if event.text == Key.UpArrow && root.results.length > 0 {
+                        root.step-highlight(-1);
+                        accept
+                    } else if event.text == Key.PageDown && root.results.length > 0 {
+                        root.step-highlight(5);
+                        accept
+                    } else if event.text == Key.PageUp && root.results.length > 0 {
+                        root.step-highlight(-5);
+                        accept
+                    } else if event.text == Key.Return && root.index >= 0 && root.index < root.results.length {
+                        root.open-highlighted();
+                        accept
+                    } else if event.text == Key.Escape {
+                        if root.query != "" {
+                            root.query = "";
+                            root.index = -1;
+                            root.edited("");
+                        } else {
+                            root.dismiss();
+                        }
+                        accept
+                    } else { reject }
+                }
+                input := TextInput {
+                    width: parent.width; height: parent.height;
+                    text <=> root.query;
+                    single-line: true;
+                    enabled: root.scope-ready;
+                    color: root.palette.ink; font-size: 12px * root.text-scale;
+                    vertical-alignment: center;
+                    selection-background-color: root.palette.selection;
+                    selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                    accessible-label: root.scope == 0 ? "Search messages in the open room" : "Search messages in all rooms";
+                    accessible-description: root.index >= 0 && root.index < root.results.length
+                        ? root.results[root.index].sender + " in " + root.results[root.index].room-name + ", " + root.results[root.index].time + ": " + root.results[root.index].preview
+                        : "";
+                    property <int> focus-request: root.focus-request;
+                    init => { if self.enabled { self.focus(); } }
+                    changed focus-request => { if self.enabled { self.focus(); } }
+                    edited => { root.index = -1; root.edited(self.text); }
+                    accepted => { root.submit(); }
+                }
+            }
+        }
+    }
+    Rectangle { height: 1px; background: root.palette.divider; }
+    VerticalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        Text {
+            min-height: max(22px, 18px * root.text-scale);
+            text: root.error != "" ? root.error
+                : !root.available ? "Sign in to search messages."
+                : root.loading ? (root.scope == 0 ? "Searching this room…" : "Searching all rooms…")
+                : root.scope == 0 && !root.room-available ? "Open a room, or search all rooms."
+                : root.searched && root.results.length == 0 ? (root.scope == 0
+                    ? "No messages in this room matched. Only messages stored on this device are searched."
+                    : "No messages matched in any room. Only messages stored on this device are searched.")
+                : root.results.length > 0 ? "" + root.results.length + (root.has-more ? "+ results" : root.results.length == 1 ? " result" : " results")
+                    + (root.notice != "" ? " · " + root.notice : "")
+                : root.scope == 0 ? "Searches this room's messages stored on this device."
+                : "Searches every room's messages stored on this device.";
+            color: root.error != "" ? root.palette.error : root.palette.muted;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            accessible-live-region: polite;
+        }
+    }
+    if root.selected-event-id != "" : context-scroll := ScrollView {
+        height: min(230px, 150px * root.text-scale + 60px);
+        horizontal-scrollbar-policy: always-off;
+        accessible-role: list;
+        accessible-label: "Messages around the opened result";
+        VerticalLayout {
+            width: context-scroll.visible-width;
+            padding: 12px;
+            spacing: 6px;
+            alignment: start;
+            Text {
+                text: "MESSAGE CONTEXT";
+                color: root.palette.muted; font-size: 10px * root.text-scale; font-weight: 750;
+            }
+            if root.context-loading : Text {
+                text: "Loading nearby messages…";
+                color: root.palette.muted; font-size: 11px * root.text-scale;
+                accessible-live-region: polite;
+            }
+            if root.context-error != "" : Text {
+                text: root.context-error;
+                color: root.palette.error; font-size: 11px * root.text-scale; wrap: word-wrap;
+                accessible-live-region: polite;
+            }
+            if root.context-notice != "" && !root.context-loading : Text {
+                text: root.context-notice;
+                color: root.palette.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                accessible-live-region: polite;
+            }
+            if !root.context-loading && root.context.length == 0 : Text {
+                text: root.selected-sender + " · " + root.selected-time;
+                color: root.palette.accent; font-size: 11px * root.text-scale; wrap: word-wrap;
+            }
+            if !root.context-loading && root.context.length == 0 : Text {
+                text: root.selected-body;
+                color: root.palette.ink; font-size: 12px * root.text-scale; wrap: word-wrap;
+            }
+            for item in root.context : context-row := Rectangle {
+                property <bool> target: item.event-id == root.selected-event-id;
+                property <bool> inked: context-row.target && root.palette.has-selection-ink;
+                min-height: 44px;
+                background: context-row.target ? root.palette.selection : root.palette.elevated;
+                border-radius: root.radius * 0.7;
+                accessible-role: list-item;
+                accessible-label: (context-row.target ? "Matched message from " : "") + item.sender + ", " + item.time + ": " + item.body;
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 3px;
+                    Text {
+                        text: item.sender + " · " + item.time;
+                        color: context-row.inked ? root.palette.selection-ink : root.palette.accent;
+                        font-size: 10px * root.text-scale; overflow: elide;
+                    }
+                    Text {
+                        text: item.body;
+                        color: context-row.inked ? root.palette.selection-ink : root.palette.ink;
+                        font-size: 11px * root.text-scale; wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+    Rectangle { height: 1px; background: root.palette.divider; }
+    results-list := ListView {
+        vertical-stretch: 1;
+        horizontal-scrollbar-policy: always-off;
+        accessible-label: "Search results";
+        for result[row] in root.results : result-row := SearchAction {
+            property <bool> highlighted: row == root.index;
+            property <bool> chosen: result.event-id == root.selected-event-id && result.room-id == root.selected-room-id;
+            property <bool> inked: (result-row.highlighted || result-row.chosen) && root.palette.has-selection-ink;
+            width: results-list.visible-width;
+            height: root.row-height;
+            border-radius: root.radius * 0.8;
+            border-width: result-row.highlighted ? 1px : 0px;
+            border-color: root.palette.accent;
+            background: result-row.chosen || result-row.highlighted ? root.palette.selection
+                : result-row.has-hover ? root.palette.elevated : transparent;
+            focus-color: root.palette.focus;
+            accessible-role: list-item;
+            accessible-item-selectable: true;
+            accessible-item-selected: result-row.highlighted;
+            accessible-item-index: row;
+            accessible-item-count: root.results.length;
+            label: "Open message from " + result.sender + " in " + result.room-name + ", " + result.time
+                + (result.thread-root != "" ? ", in a thread" : "") + ": " + result.preview;
+            activated => {
+                root.index = row;
+                root.open(result.room-id, result.event-id);
+            }
+            VerticalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                padding-top: 7px;
+                padding-bottom: 7px;
+                spacing: 2px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: result.room-name;
+                        color: result-row.inked ? root.palette.selection-ink : root.palette.accent;
+                        font-size: 10px * root.text-scale; font-weight: 700;
+                        overflow: elide; horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: result.time;
+                        color: result-row.inked ? root.palette.selection-ink : root.palette.muted;
+                        font-size: 10px * root.text-scale;
+                        horizontal-stretch: 0;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: result.sender;
+                        color: result-row.inked ? root.palette.selection-ink : root.palette.ink;
+                        font-size: 11px * root.text-scale; font-weight: 700;
+                        overflow: elide; horizontal-stretch: 1;
+                    }
+                    if result.thread-root != "" : Text {
+                        text: "THREAD";
+                        color: result-row.inked ? root.palette.selection-ink : root.palette.muted;
+                        font-size: 9px * root.text-scale; font-weight: 750;
+                        horizontal-stretch: 0; vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: result.preview;
+                    color: result-row.inked ? root.palette.selection-ink : root.palette.ink;
+                    font-size: 11px * root.text-scale;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+    if root.has-more || root.loading-more : Rectangle {
+        height: max(44px, 26px * root.text-scale + 18px);
+        SearchAction {
+            x: 12px;
+            y: 6px;
+            width: parent.width - 24px;
+            height: parent.height - 12px;
+            border-radius: root.radius * 0.7;
+            border-width: 1px;
+            border-color: root.palette.divider;
+            background: self.has-hover ? root.palette.hover : root.palette.elevated;
+            focus-color: root.palette.focus;
+            enabled: !root.loading && !root.loading-more;
+            label: "Load more search results";
+            activated => { root.load-more(); }
+            Text {
+                text: root.loading-more ? "Loading more…" : "Load more results";
+                color: root.loading-more ? root.palette.muted : root.palette.ink;
+                font-size: 12px * root.text-scale;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

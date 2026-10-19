@@ -7,7 +7,67 @@
 
 use std::{future::Future, pin::Pin};
 
+use matrix_sdk_ui::timeline::TimelineEventFocusThreadMode;
+
 use super::*;
+
+/// Most history pages one reveal may read, and the events per page.
+const MAX_REVEAL_PAGES: u8 = 8;
+const REVEAL_PAGE_EVENTS: u16 = 50;
+/// Most events a focused conversation view loads around its event.
+const MAX_FOCUS_CONTEXT: u16 = 50;
+
+/// One conversation view focused on an event, owned by whoever loaded it.
+/// Nothing about it is cached or shared: loading another view never
+/// replaces it, paging acts on exactly this view, and dropping the last
+/// clone ends it.
+#[derive(Clone)]
+pub struct FocusedView {
+    /// The exact selection that loaded it: its timeline belongs to that
+    /// selection's client and to nothing selected later.
+    selection: AccountSelection,
+    room_id: String,
+    timeline: Arc<Timeline>,
+}
+
+impl FocusedView {
+    pub fn room_id(&self) -> &str {
+        &self.room_id
+    }
+
+    /// Whether both handles are the same loaded view (not merely the same
+    /// room or event).
+    pub fn same_view(&self, other: &FocusedView) -> bool {
+        Arc::ptr_eq(&self.timeline, &other.timeline)
+    }
+
+    /// Only the selection that loaded the view, while current, may act on
+    /// it; a later selection of the same account ID may not.
+    pub(crate) fn owned_by(&self, selection: &AccountSelection) -> bool {
+        view_owned_by(&self.selection, selection)
+    }
+
+    /// Its rows are only in this timeline, so actions on them use it.
+    pub(crate) fn timeline(&self) -> &Arc<Timeline> {
+        &self.timeline
+    }
+}
+
+/// A view loaded under `view` may be used under `selection` only when that
+/// is the same selection epoch and it is still current: A -> B -> A, removal
+/// and signing in again all create a new epoch for the same account ID.
+fn view_owned_by(view: &AccountSelection, selection: &AccountSelection) -> bool {
+    selection.is_current() && view.same_epoch(selection)
+}
+
+/// How far a bounded backward reveal through history got.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistoryReveal {
+    /// The event is among the timeline's loaded items.
+    pub found: bool,
+    /// The start of the room or thread was reached.
+    pub start_reached: bool,
+}
 
 impl AccountManager {
     /// Load older items for the account selected when this future is polled.
@@ -59,6 +119,137 @@ impl AccountManager {
         .await
     }
 
+    /// Load older replies of one thread under the exact selection captured
+    /// by the caller. Returns true when the start of the thread was reached.
+    pub async fn paginate_thread_backwards_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        root_event_id: &str,
+        count: u16,
+    ) -> Result<bool> {
+        self.read_selected_timeline(selection, |loaded| async move {
+            let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
+            timeline
+                .paginate_backwards(count)
+                .await
+                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+        })
+        .await
+    }
+
+    /// Page back through a room's conversation, or one of its threads, until
+    /// `event_id` is loaded, the start is reached or `max_pages` pages were
+    /// read. The feeds of that same timeline show what was loaded.
+    pub async fn reveal_event_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        thread_root: Option<&str>,
+        event_id: &str,
+        max_pages: u8,
+    ) -> Result<HistoryReveal> {
+        let target = parse_event_id(event_id)?;
+        self.read_selected_timeline(selection, |loaded| async move {
+            let timeline = match thread_root {
+                Some(root) => loaded.thread_timeline(room_id, root).await?,
+                None => loaded.timeline(room_id).await?,
+            };
+            let mut start_reached = false;
+            for _ in 0..max_pages.min(MAX_REVEAL_PAGES) {
+                if timeline.item_by_event_id(&target).await.is_some() {
+                    return Ok(HistoryReveal {
+                        found: true,
+                        start_reached,
+                    });
+                }
+                if start_reached {
+                    break;
+                }
+                start_reached = timeline
+                    .paginate_backwards(REVEAL_PAGE_EVENTS)
+                    .await
+                    .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+            }
+            let found = timeline.item_by_event_id(&target).await.is_some();
+            Ok(HistoryReveal {
+                found,
+                start_reached,
+            })
+        })
+        .await
+    }
+
+    /// Load a conversation view of one room focused on `event_id`, with up
+    /// to `num_context_events` around it, for showing an older message in
+    /// context. The view and its feed belong to the caller alone: nothing is
+    /// cached, so a superseded load can never replace a view that is shown.
+    /// The feed has the same ownership rules as live feeds.
+    pub async fn focused_view_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        event_id: &str,
+        num_context_events: u16,
+    ) -> Result<(FocusedView, MessageFeed)> {
+        let target = parse_event_id(event_id)?;
+        self.read_selected_timeline(selection, |loaded| async move {
+            let id = RoomId::parse(room_id)
+                .map_err(|error| MatrixCoreError::InvalidRoomId(error.to_string()))?;
+            let room = loaded
+                .client
+                .get_room(&id)
+                .ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.into()))?;
+            let timeline = room
+                .timeline_builder()
+                .with_focus(TimelineFocus::Event {
+                    target,
+                    num_context_events: num_context_events.min(MAX_FOCUS_CONTEXT),
+                    thread_mode: TimelineEventFocusThreadMode::Automatic {
+                        hide_threaded_events: true,
+                    },
+                })
+                .build()
+                .await
+                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+            let view = FocusedView {
+                selection: selection.clone(),
+                room_id: room_id.to_owned(),
+                timeline: Arc::new(timeline),
+            };
+            let account_id = selection.account_id().to_owned();
+            let timeline = view.timeline.clone();
+            let feed = message_feed_from_timeline(account_id, room_id, timeline).await;
+            Ok((view, feed))
+        })
+        .await
+    }
+
+    /// Page exactly `view` to older (`backwards`) or newer messages under the
+    /// caller's selection, which must be the very selection epoch that loaded
+    /// the view and still current. Returns true when that end of the room
+    /// was reached.
+    pub async fn paginate_focused_selected(
+        &self,
+        selection: &AccountSelection,
+        view: &FocusedView,
+        backwards: bool,
+        count: u16,
+    ) -> Result<bool> {
+        if !view.owned_by(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let timeline = view.timeline.clone();
+        self.read_selected_timeline(selection, |_| async move {
+            let reached = if backwards {
+                timeline.paginate_backwards(count).await
+            } else {
+                timeline.paginate_forwards(count).await
+            };
+            reached.map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+        })
+        .await
+    }
     fn current_timeline_selection(&self) -> Result<AccountSelection> {
         let account_id = self
             .active_tx
@@ -351,6 +542,73 @@ mod tests {
             drop(foreign);
             drop(manager);
             fs::remove_dir_all(foreign_directory).unwrap();
+            fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
+    fn search_rejects_an_aba_selection_and_keeps_the_current_one() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let stale = manager.account_selection(&account.id).unwrap();
+            // A fresh selection of the same local account is a new epoch.
+            manager.publish_active_account(None);
+            manager.publish_active_account(Some(account.clone()));
+            let (room, event) = ("!unused:example.org", "$event:example.org");
+            assert!(matches!(
+                manager
+                    .search_all_messages_page_selected(&stale, "plans", 10, 0)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            assert!(matches!(
+                manager
+                    .search_messages_page_selected(&stale, room, "plans", 10, 0)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            assert!(matches!(
+                manager
+                    .search_result_context_selected(&stale, room, event, 3)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            // A queued hierarchy scan also cannot reacquire the renewed
+            // account's client, or contact a homeserver for its old selection.
+            assert!(matches!(
+                manager
+                    .space_hierarchy_selected(&stale, room, None, 100)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            // The current selection searches its own (empty) room set and
+            // reports no further page.
+            let current = manager.account_selection(&account.id).unwrap();
+            let page = manager
+                .search_all_messages_page_selected(&current, "plans", 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(page, MessageSearchPage::default());
+            drop(manager);
+            fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_focused_view_is_owned_only_by_the_selection_that_loaded_it() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let loading = manager.account_selection(&account.id).unwrap();
+            assert!(view_owned_by(&loading, &loading));
+            // The same account selected again (A -> B -> A, removal and
+            // signing in again) is a new epoch: it cannot use the old view.
+            manager.publish_active_account(None);
+            manager.publish_active_account(Some(account.clone()));
+            let fresh = manager.account_selection(&account.id).unwrap();
+            assert!(!view_owned_by(&loading, &fresh));
+            assert!(!view_owned_by(&loading, &loading));
+            assert!(view_owned_by(&fresh, &fresh));
+            drop(manager);
             fs::remove_dir_all(directory).unwrap();
         });
     }

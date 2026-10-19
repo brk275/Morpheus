@@ -1,5 +1,6 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
 import { CallParticipantItem, CallStage, CallTileItem } from "call-stage.slint";
+import { MessageSearchItem, MessageSearchPanel } from "message-search.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -386,15 +387,6 @@ export struct PublicRoomItem {
     members: string,
     is-space: bool,
     route-server: string,
-}
-
-export struct MessageSearchItem {
-    room-id: string,
-    event-id: string,
-    sender: string,
-    time: string,
-    body: string,
-    preview: string,
 }
 
 component AvatarBadge inherits Rectangle {
@@ -3015,6 +3007,32 @@ export component AppWindow inherits Window {
     in-out property <bool> room-search-context-loading: false;
     in-out property <string> room-search-context-error;
     in-out property <int> room-search-context-operation: 0;
+    // All-room search and navigation (see message-search.slint). Scope 0 is
+    // the open room, 1 every joined room; results are fenced in Rust.
+    in-out property <int> room-search-scope: 0;
+    in-out property <int> room-search-index: -1;
+    in-out property <bool> room-search-loading-more: false;
+    in-out property <bool> room-search-has-more: false;
+    in-out property <string> room-search-notice;
+    in-out property <string> room-search-context-notice;
+    in-out property <string> room-search-selected-room-id;
+    in-out property <string> room-search-selected-thread-root;
+    // Scroll the conversation to a loaded row by its index; the row with
+    // the jump event finishes the reveal. Nothing is rebuilt.
+    in-out property <int> timeline-jump-index: -1;
+    // The event a jump or thread open is revealing; rows compare against it.
+    in-out property <string> timeline-jump-event-id;
+    in-out property <int> timeline-jump-request: 0;
+    property <int> timeline-jump-passes: 0;
+    // The conversation shows the messages around an opened search hit
+    // instead of the latest ones, until Return to live or a room change.
+    in-out property <bool> conversation-focused: false;
+    in-out property <bool> focus-newer-loading: false;
+    // Older replies of the open thread; reset whenever the thread changes.
+    in-out property <bool> thread-history-loading: false;
+    in-out property <bool> thread-history-at-start: false;
+    in-out property <string> thread-history-error;
+    in-out property <int> thread-history-operation: 0;
     in-out property <string> directory-search;
     in-out property <string> directory-server;
     in-out property <string> directory-next-batch;
@@ -3239,7 +3257,17 @@ export component AppWindow inherits Window {
     callback open-discovery();
     callback query-public-rooms(bool);
     callback query-room-messages();
-    callback open-search-result(string);
+    callback room-search-edited(string);
+    callback choose-room-search-scope(int);
+    callback load-more-room-search();
+    // Room ID and event ID of one listed hit.
+    callback open-search-result(string, string);
+    callback load-older-thread-replies();
+    callback return-to-live();
+    callback load-newer-focused();
+    // Navigation seam (message_search::open_conversation): local account ID,
+    // room ID, event ID, thread root ID; empty for no event or thread.
+    callback open-conversation(string, string, string, string);
     callback join-discovery-target(string, string, string, string, bool);
     callback toggle-native-microphone();
     callback toggle-native-deafen();
@@ -3429,7 +3457,12 @@ export component AppWindow inherits Window {
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {
         root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); }
-    changed thread-root-id => { root.close-image-preview(); root.mention-context-changed(); }
+    changed thread-root-id => {
+        root.close-image-preview(); root.mention-context-changed();
+        // A page request for the previous thread can no longer publish here.
+        root.thread-history-operation += 1; root.thread-history-loading = false;
+        root.thread-history-at-start = false; root.thread-history-error = "";
+    }
     changed active-space-id => { root.quick-switcher-open = false; }
     // Conditional dialog subtrees do not retain a usable keyboard focus target
     // after dismissal. Return to an account control on the visible surface.
@@ -4221,10 +4254,10 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "S"; label: "Search messages in this room"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "S"; label: "Search messages"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 2;
-                            enabled: root.live-session && root.active-room-id != "";
-                            activated => { root.show-side-panel = true; root.side-panel-tab = 2; }
+                            enabled: root.live-session;
+                            activated => { root.focus-room-search(); }
                         }
                         }
                         if root.page == 0 : VerticalLayout {
@@ -4430,6 +4463,42 @@ export component AppWindow inherits Window {
                         accessible-live-region: polite;
                         overflow: elide;
                     }
+                    // The conversation is showing an older message in its
+                    // context instead of the latest messages.
+                    if root.live-session && root.active-room-id != "" && root.conversation-focused : Rectangle {
+                        height: max(42px, 32px * root.text-scale + 10px);
+                        background: root.elevated;
+                        accessible-role: groupbox;
+                        accessible-label: "Viewing earlier messages";
+                        HorizontalLayout {
+                            padding-left: 24px;
+                            padding-right: 24px;
+                            padding-top: 5px;
+                            padding-bottom: 5px;
+                            spacing: 10px;
+                            Text {
+                                text: "Viewing messages around a search result. New messages appear in the live conversation.";
+                                color: root.muted; font-size: 11px * root.text-scale;
+                                vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                                accessible-live-region: polite;
+                            }
+                            TextAction {
+                                ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale;
+                                text: root.focus-newer-loading ? "Loading newer…" : "Load newer";
+                                enabled: !root.focus-newer-loading;
+                                accessible-label: "Load newer messages after these";
+                                activated => { root.load-newer-focused(); }
+                            }
+                            TextAction {
+                                ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
+                                outline: root.accent; text-scale: root.text-scale;
+                                text: "Return to live";
+                                accessible-label: "Return to the latest messages in this room";
+                                activated => { root.return-to-live(); }
+                            }
+                        }
+                    }
                     if root.live-session && root.active-room-id != "" : HorizontalLayout {
                         height: max(36px, 32px * root.text-scale);
                         padding-left: 24px;
@@ -4456,6 +4525,20 @@ export component AppWindow inherits Window {
                     timeline-list := ListView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
+                        // A search jump first approaches the row from the average
+                        // row height, refines it as nearby rows load, and the row
+                        // itself finishes the reveal once it exists.
+                        property <int> jump-request: root.timeline-jump-request;
+                        changed jump-request => {
+                            root.timeline-jump-passes = 3;
+                            self.approach-jump();
+                        }
+                        function approach-jump() {
+                            if root.timeline-jump-index >= 0 && root.messages.length > 0 {
+                                self.content-y = -max(0px, min(self.content-height - self.visible-height,
+                                    root.timeline-jump-index * self.content-height / root.messages.length - self.visible-height / 3));
+                            }
+                        }
                         for message[index] in root.messages : message-row := Rectangle {
                             width: timeline-list.visible-width;
                             // The timeline uses time for local delivery status too. Hiding
@@ -4481,6 +4564,22 @@ export component AppWindow inherits Window {
                             min-height: max(28px + 2 * root.message-row-gap, root.show-message-avatars ? self.avatar-size + 2 * root.message-row-gap : 0px);
                             background: root.row-surface(message-row.selected-message, message-hover.has-hover, message.is-own, transparent);
                             message-hover := TouchArea { mouse-cursor: default; }
+                            // Finish a search jump once this row exists: place it a
+                            // third of the way down the visible conversation. A Timer
+                            // cannot itself be conditional, so a zero-size holder is.
+                            if root.timeline-jump-passes > 0 && message.event-id != "" && message.event-id == root.timeline-jump-event-id : Rectangle {
+                                width: 0px; height: 0px;
+                                Timer {
+                                    interval: 1ms;
+                                    running: true;
+                                    triggered => {
+                                        self.running = false;
+                                        timeline-list.content-y = -max(0px, min(timeline-list.content-height - timeline-list.visible-height,
+                                            message-row.y - timeline-list.visible-height / 3));
+                                        root.timeline-jump-passes = 0;
+                                    }
+                                }
+                            }
                             message-flow := HorizontalLayout {
                                 padding-left: root.content-inset; padding-right: root.content-inset;
                                 padding-top: root.message-row-gap; padding-bottom: root.message-row-gap;
@@ -4689,6 +4788,15 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                        }
+                    }
+                    // Bounded follow-up passes of a search jump (see timeline-list).
+                    Timer {
+                        interval: 50ms;
+                        running: root.timeline-jump-passes > 0;
+                        triggered => {
+                            root.timeline-jump-passes -= 1;
+                            timeline-list.approach-jump();
                         }
                     }
                     Rectangle {
@@ -6939,10 +7047,10 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1; height: 34px; border-radius: 8px;
                             background: root.side-panel-tab == 2 ? root.hover : transparent;
                             focus-color: root.accent;
-                            label: "Search messages in this room";
+                            label: "Search messages";
                             accessible-checkable: true;
                             accessible-checked: root.side-panel-tab == 2;
-                            enabled: root.live-session && root.active-room-id != "";
+                            enabled: root.live-session;
                             activated => { root.side-panel-tab = 2; }
                             Text { text: "Search"; color: root.side-panel-tab == 2 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                         }
@@ -7181,6 +7289,12 @@ export component AppWindow inherits Window {
                     spacing: 0px;
                     HorizontalLayout {
                         height: 49px; padding-left: 14px; padding-right: 10px; spacing: 8px;
+                        // A thread opened from a search hit returns to its results.
+                        if root.room-search-selected-thread-root != "" && root.room-search-selected-thread-root == root.thread-root-id : IconAction {
+                            width: 28px; height: 28px; icon: "←"; label: "Back to search results";
+                            ink: root.muted; surface: transparent; hover-surface: root.hover;
+                            activated => { root.side-panel-tab = 2; }
+                        }
                         Text { text: "Thread"; color: root.ink; font-size: 17px * root.text-scale; font-weight: 750; horizontal-stretch: 1; vertical-alignment: center; }
                         if root.thread-root-id != "" : IconAction {
                             width: 28px; height: 28px; icon: "×"; label: "Close thread";
@@ -7204,7 +7318,7 @@ export component AppWindow inherits Window {
                         wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
                         vertical-stretch: 1;
                     }
-                    if root.thread-root-id != "" : ScrollView {
+                    if root.thread-root-id != "" : thread-scroll := ScrollView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
                         VerticalLayout {
@@ -7233,29 +7347,61 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Rectangle { height: 1px; background: root.divider; }
+                            // A thread feed starts with its latest replies; earlier
+                            // replies load on request, a page at a time.
+                            if root.live-session : TextAction {
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; wrap-caption: true;
+                                text: root.thread-history-loading ? "Loading earlier replies…" : root.thread-history-at-start ? "Start of thread" : "Load earlier replies";
+                                enabled: !root.thread-history-loading && !root.thread-history-at-start;
+                                accessible-label: root.thread-history-at-start ? "Start of thread reached" : "Load earlier replies in this thread";
+                                activated => { root.load-older-thread-replies(); }
+                            }
+                            if root.thread-history-error != "" : Text {
+                                text: root.thread-history-error;
+                                color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
+                                font-size: 11px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
+                                accessible-live-region: polite;
+                            }
                             Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
                             for reply in root.thread-messages : thread-reply := Rectangle {
                                 property <string> time-label: root.message-time-label(reply);
+                                // The reply a search hit opened, highlighted like a
+                                // selected conversation row.
+                                property <bool> search-hit: root.room-search-selected-event-id != "" && reply.event-id == root.room-search-selected-event-id;
                                 min-height: 43px;
                                 vertical-stretch: 0;
-                                background: root.row-surface(false, false, reply.is-own, root.elevated);
+                                background: root.row-surface(thread-reply.search-hit, false, reply.is-own, root.elevated);
                                 border-radius: StyleTokens.radius * 0.8;
+                                // Reveal that reply once it is laid out (a zero-size
+                                // holder carries the condition; a Timer cannot).
+                                if reply.event-id != "" && reply.event-id == root.timeline-jump-event-id : Rectangle {
+                                    width: 0px; height: 0px;
+                                    Timer {
+                                        interval: 1ms;
+                                        running: true;
+                                        triggered => {
+                                            self.running = false;
+                                            thread-scroll.content-y = -max(0px, min(thread-scroll.content-height - thread-scroll.visible-height, thread-reply.y - 12px));
+                                        }
+                                    }
+                                }
                                 VerticalLayout {
                                     padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
                                     HorizontalLayout {
                                         spacing: 6px;
-                                        Text { text: reply.sender; color: root.sender-ink(false, reply.is-own, reply.sender-palette-index, reply.accent); font-size: 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; horizontal-stretch: 0; min-width: 0px; accessible-label: reply.sender; }
+                                        Text { text: reply.sender; color: root.sender-ink(thread-reply.search-hit, reply.is-own, reply.sender-palette-index, reply.accent); font-size: 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; horizontal-stretch: 0; min-width: 0px; accessible-label: reply.sender; }
                                         // Reply clocks keep the timestamp role and the delivery status
                                         // text even when optional timestamps are hidden.
                                         if (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" : Text {
-                                            text: "· " + thread-reply.time-label; color: root.clock-ink(false); font-family: root.monospace-font-family;
+                                            text: "· " + thread-reply.time-label; color: root.clock-ink(thread-reply.search-hit); font-family: root.monospace-font-family;
                                             font-size: root.timestamp-font-px; vertical-alignment: top; horizontal-stretch: 0; accessible-label: thread-reply.time-label;
                                         }
                                         Rectangle { horizontal-stretch: 1; min-width: 0px; }
                                     }
                                     StyledText {
                                         text: reply.rich-body;
-                                        default-color: root.body-ink(false, reply.is-own);
+                                        default-color: root.body-ink(thread-reply.search-hit, reply.is-own);
                                         default-font-size: root.message-font-px;
                                         default-font-family: root.message-font-family;
                                         link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
@@ -7410,120 +7556,53 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if root.side-panel-tab == 2 : VerticalLayout {
+                if root.side-panel-tab == 2 : MessageSearchPanel {
                     vertical-stretch: 1;
-                    spacing: 0px;
-                    Rectangle {
-                        height: 123px;
-                        background: root.panel;
-                        VerticalLayout {
-                            padding: 12px; spacing: 7px;
-                            Text { text: "Search this room"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 750; }
-                            Rectangle {
-                                height: 34px; background: root.elevated; border-radius: 7px;
-                                search-message-input := ThemedTextInput {
-                                    x: 8px; y: 2px; width: parent.width - 16px; height: parent.height - 4px;
-                                    text <=> root.room-search-query; color: root.ink; font-size: 12px * root.text-scale;
-                                    enabled: root.live-session && root.active-room-id != "" && !root.room-search-loading;
-                                    accessible-label: "Search terms for current room";
-                                    property <int> focus-request: root.search-focus-request;
-                                    init => { if root.live-session { self.focus(); } }
-                                    changed focus-request => { if root.live-session && self.enabled { self.focus(); } }
-                                    accepted => { root.query-room-messages(); }
-                                }
-                            }
-                            Button {
-                                text: root.room-search-loading ? "Searching…" : "Search";
-                                accessible-label: "Search messages in current room";
-                                enabled: root.live-session && root.active-room-id != "" && !root.room-search-loading;
-                                clicked => { root.query-room-messages(); }
-                            }
-                        }
-                    }
-                    Rectangle { height: 1px; background: root.divider; }
-                    Text {
-                        height: 43px; text: "Searches messages indexed on this device.";
-                        color: root.muted; font-size: 11px * root.text-scale;
-                        wrap: word-wrap; vertical-alignment: center;
-                        x: 12px; width: parent.width - 24px;
-                    }
-                    if root.room-search-error != "" : Text {
-                        height: 52px; text: root.room-search-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b;
-                        font-size: 11px * root.text-scale; wrap: word-wrap;
-                        accessible-live-region: polite;
-                    }
-                    if root.room-search-loading : Text {
-                        height: 34px; text: "Searching this room…";
-                        color: root.muted; font-size: 11px * root.text-scale;
-                        accessible-live-region: polite;
-                    }
-                    if root.room-search-searched && !root.room-search-loading && root.room-search-error == "" && root.room-search-results.length == 0 : Text {
-                        height: 54px; text: "No indexed messages matched in this room.";
-                        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
-                        accessible-live-region: polite;
-                    }
-                    if root.room-search-selected-event-id != "" : ScrollView {
-                        height: 210px; horizontal-scrollbar-policy: always-off;
-                        VerticalLayout {
-                            width: parent.width; padding: 12px; spacing: 8px;
-                            Text { text: "MESSAGE CONTEXT"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; }
-                            if root.room-search-context-loading : Text {
-                                text: "Loading nearby messages…"; color: root.muted; font-size: 11px * root.text-scale;
-                                accessible-live-region: polite;
-                            }
-                            if root.room-search-context-error != "" : Text {
-                                text: root.room-search-context-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b;
-                                font-size: 11px * root.text-scale; wrap: word-wrap;
-                                accessible-live-region: polite;
-                            }
-                            if !root.room-search-context-loading && root.room-search-context-error == "" && root.room-search-context.length == 0 : Text {
-                                text: root.room-search-selected-sender + " · " + root.room-search-selected-time;
-                                color: root.accent; font-size: 11px * root.text-scale; wrap: word-wrap;
-                            }
-                            if !root.room-search-context-loading && root.room-search-context-error == "" && root.room-search-context.length == 0 : Text {
-                                text: root.room-search-selected-body; color: root.ink;
-                                font-size: 12px * root.text-scale; wrap: word-wrap;
-                            }
-                            for context in root.room-search-context : Rectangle {
-                                min-height: 55px; background: context.event-id == root.room-search-selected-event-id ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : root.elevated;
-                                border-radius: 7px;
-                                VerticalLayout {
-                                    padding: 8px; spacing: 3px;
-                                    Text { text: context.sender + " · " + context.time; color: context.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.accent; font-size: 10px * root.text-scale; overflow: elide; }
-                                    Text { text: context.body; color: context.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink; font-size: 11px * root.text-scale; wrap: word-wrap; }
-                                }
-                            }
-                        }
-                    }
-                    Rectangle { height: 1px; background: root.divider; }
-                    Text {
-                        height: 31px; text: "RESULTS · " + root.room-search-results.length;
-                        color: root.muted; font-size: 10px * root.text-scale; font-weight: 750;
-                        vertical-alignment: center;
-                        x: 12px; width: parent.width - 24px;
-                    }
-                    search-results-list := ListView {
-                        vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
-                        for result in root.room-search-results : ActionRect {
-                            width: search-results-list.visible-width; height: 94px;
-                            border-radius: 8px; focus-color: result.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.accent;
-                            background: result.event-id == root.room-search-selected-event-id ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.elevated : root.panel;
-                            label: "Show message context from " + result.sender + " at " + result.time;
-                            activated => {
-                                root.room-search-selected-event-id = result.event-id;
-                                root.room-search-selected-sender = result.sender;
-                                root.room-search-selected-time = result.time;
-                                root.room-search-selected-body = result.body;
-                                root.open-search-result(result.event-id);
-                            }
-                            VerticalLayout {
-                                padding: 9px; spacing: 4px;
-                                Text { text: result.sender; color: result.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.accent; font-size: 11px * root.text-scale; font-weight: 700; overflow: elide; }
-                                Text { text: result.time; color: result.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-size: 10px * root.text-scale; overflow: elide; }
-                                Text { text: result.preview; color: result.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink; font-size: 11px * root.text-scale; overflow: elide; }
-                            }
-                        }
-                    }
+                    palette: {
+                        ink: root.ink,
+                        muted: root.muted,
+                        panel: root.panel,
+                        elevated: root.elevated,
+                        hover: root.hover,
+                        accent: root.accent,
+                        divider: root.divider,
+                        error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+                        selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover,
+                        selection-ink: StyleTokens.roles.selection-ink.color,
+                        has-selection-ink: StyleTokens.roles.selection-ink.present,
+                        focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent
+                    };
+                    text-scale: root.text-scale;
+                    radius: StyleTokens.radius;
+                    available: root.live-session;
+                    room-available: root.active-room-id != "";
+                    room-name: root.active-room-name;
+                    query <=> root.room-search-query;
+                    scope: root.room-search-scope;
+                    results: root.room-search-results;
+                    context: root.room-search-context;
+                    loading: root.room-search-loading;
+                    loading-more: root.room-search-loading-more;
+                    searched: root.room-search-searched;
+                    has-more: root.room-search-has-more;
+                    error: root.room-search-error;
+                    notice: root.room-search-notice;
+                    context-loading: root.room-search-context-loading;
+                    context-error: root.room-search-context-error;
+                    context-notice: root.room-search-context-notice;
+                    index <=> root.room-search-index;
+                    selected-room-id: root.room-search-selected-room-id;
+                    selected-event-id: root.room-search-selected-event-id;
+                    selected-sender: root.room-search-selected-sender;
+                    selected-time: root.room-search-selected-time;
+                    selected-body: root.room-search-selected-body;
+                    focus-request: root.search-focus-request;
+                    edited(text) => { root.room-search-edited(text); }
+                    submit => { root.query-room-messages(); }
+                    choose-scope(scope) => { root.choose-room-search-scope(scope); }
+                    load-more => { root.load-more-room-search(); }
+                    open(room-id, event-id) => { root.open-search-result(room-id, event-id); }
+                    dismiss => { root.focus-composer(false); }
                 }
             }
         }
