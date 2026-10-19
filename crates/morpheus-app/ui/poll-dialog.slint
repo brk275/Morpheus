@@ -3,10 +3,10 @@
 // Send does. The window passes resolved colors and surfaces; geometry and
 // interaction states come from StyleTokens.
 
-import { CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 import { PollPalette, PollUiState } from "poll-card.slint";
 import { StyleTokens } from "style-tokens.slint";
-import { ControlColors, TokenButton } from "controls.slint";
+import { ControlColors, TokenButton, TokenCheck, TokenField } from "controls.slint";
 
 export component PollCreateDialog inherits FocusScope {
     in property <PollPalette> palette;
@@ -96,11 +96,13 @@ export component PollCreateDialog inherits FocusScope {
                             font-weight: 650;
                             accessible-role: none;
                         }
-                        question := LineEdit {
+                        question := TokenField {
                             text: PollUiState.dialog-question;
                             placeholder-text: "Ask a question";
                             enabled: !PollUiState.dialog-busy;
-                            accessible-label: "Poll question";
+                            label: "Poll question";
+                            colors: root.button-colors;
+                            text-scale: root.text-scale;
                             edited(text) => { PollUiState.question-edited(text); }
                         }
                         Text {
@@ -112,11 +114,13 @@ export component PollCreateDialog inherits FocusScope {
                         }
                         for answer[index] in PollUiState.dialog-answers : HorizontalLayout {
                             spacing: 8px;
-                            LineEdit {
+                            TokenField {
                                 text: answer;
                                 placeholder-text: "Option " + (index + 1);
                                 enabled: !PollUiState.dialog-busy;
-                                accessible-label: "Poll option " + (index + 1);
+                                label: "Poll option " + (index + 1);
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
                                 edited(text) => { PollUiState.answer-edited(index, text); }
                             }
                             TokenButton {
@@ -176,10 +180,12 @@ export component PollCreateDialog inherits FocusScope {
                                 horizontal-stretch: 1;
                             }
                         }
-                        CheckBox {
+                        TokenCheck {
                             text: "Show results while the poll is open";
                             checked: PollUiState.dialog-disclosed;
                             enabled: !PollUiState.dialog-busy;
+                            colors: root.button-colors;
+                            text-scale: root.text-scale;
                             toggled => { PollUiState.set-disclosed(self.checked); }
                         }
                         Text {

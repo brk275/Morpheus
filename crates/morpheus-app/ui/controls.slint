@@ -2,6 +2,7 @@
 // the Settings preview. They read only StyleTokens and caller colors, never
 // a setting store, and report activation through callbacks.
 
+import { Palette } from "std-widgets.slint";
 import { StyleTokens } from "style-tokens.slint";
 
 // Animate only the decorative hover layer. Selection colors, content, focus
@@ -199,6 +200,147 @@ export component TokenButton inherits ActionRect {
         border-radius: parent.border-radius;
         border-width: StyleTokens.focus-width;
         border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.focus-color;
+        background: transparent;
+    }
+}
+
+// A single-line text field drawn from StyleTokens: input surface, border and
+// corner, the focus role at the focus width while focused, and the input
+// padding. It keeps LineEdit's text, placeholder, enabled and edited API.
+export component TokenField inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder-text;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    out property <bool> has-focus: input.has-focus;
+    callback edited(string);
+    callback accepted(string);
+    forward-focus: input;
+    min-height: max(32px, 16px * root.text-scale + 14px);
+    preferred-height: self.min-height;
+    min-width: 48px;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    clip: true;
+    background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.colors.surface;
+    border-radius: StyleTokens.input-corner;
+    border-width: input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+    border-color: input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.colors.accent)
+        : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.colors.outline;
+    if root.text == "" : Text {
+        x: StyleTokens.input-padding;
+        width: max(0px, parent.width - 2 * StyleTokens.input-padding);
+        height: parent.height;
+        text: root.placeholder-text;
+        color: root.colors.muted;
+        font-size: 12px * root.text-scale;
+        vertical-alignment: center;
+        overflow: elide;
+        accessible-role: none;
+    }
+    input := TextInput {
+        x: StyleTokens.input-padding;
+        width: max(0px, parent.width - 2 * StyleTokens.input-padding);
+        height: parent.height;
+        text <=> root.text;
+        enabled: root.enabled;
+        single-line: true;
+        color: root.enabled ? root.colors.ink
+            : StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.colors.muted;
+        font-size: 12px * root.text-scale;
+        vertical-alignment: center;
+        selection-background-color: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : Palette.selection-background;
+        selection-foreground-color: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground;
+        accessible-label: root.label;
+        accessible-placeholder-text: root.placeholder-text;
+        edited => { root.edited(self.text); }
+        accepted => { root.accepted(self.text); }
+    }
+}
+
+// A checkbox drawn from StyleTokens with CheckBox's text, checked, enabled
+// and toggled API: Space or Return toggles it, a click focuses and toggles.
+export component TokenCheck inherits Rectangle {
+    in property <string> text;
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    out property <bool> has-focus: scope.has-focus;
+    callback toggled();
+    function toggle() {
+        if root.enabled {
+            root.checked = !root.checked;
+            root.toggled();
+        }
+    }
+    forward-focus: scope;
+    min-height: max(28px, caption.preferred-height + 8px);
+    vertical-stretch: 0;
+    accessible-role: checkbox;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.toggle(); }
+    HorizontalLayout {
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 16px * root.text-scale;
+                height: self.width;
+                border-radius: StyleTokens.control-radius >= 0px ? min(StyleTokens.control-radius, self.width / 2) : StyleTokens.radius * 0.3;
+                border-width: max(2px, StyleTokens.line-width);
+                border-color: root.checked ? root.colors.accent : root.colors.muted;
+                background: root.checked ? root.colors.accent : transparent;
+                if root.checked : Text {
+                    text: "✓";
+                    color: root.colors.accent-ink;
+                    font-size: 12px * root.text-scale;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    accessible-role: none;
+                }
+            }
+        }
+        caption := Text {
+            text: root.text;
+            color: root.enabled ? root.colors.ink
+                : StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.colors.muted;
+            font-size: 12px * root.text-scale;
+            vertical-alignment: center;
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+            accessible-role: none;
+        }
+    }
+    scope := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                root.toggle();
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            scope.focus();
+            root.toggle();
+        }
+    }
+    if scope.has-focus : Rectangle {
+        border-radius: StyleTokens.control-corner;
+        border-width: StyleTokens.focus-width;
+        border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.colors.accent;
         background: transparent;
     }
 }
