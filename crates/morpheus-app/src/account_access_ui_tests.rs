@@ -720,7 +720,10 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
     apply_config(ui, &fonts, None);
     ui.invoke_reset_style_fonts();
     let reset = store.load().unwrap();
-    assert_eq!(reset.appearance.font_family, defaults.appearance.font_family);
+    assert_eq!(
+        reset.appearance.font_family,
+        defaults.appearance.font_family
+    );
     assert_eq!(
         reset.typography.message_font_family,
         defaults.typography.message_font_family
@@ -729,7 +732,10 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
         reset.typography.monospace_font_family,
         defaults.typography.monospace_font_family
     );
-    assert_eq!(reset.typography.message_size, 17, "the reset kept other preferences");
+    assert_eq!(
+        reset.typography.message_size, 17,
+        "the reset kept other preferences"
+    );
     assert_eq!(
         ui.get_appearance_ui_font_input().as_str(),
         defaults.appearance.font_family
@@ -2151,13 +2157,20 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
             _ => ui.invoke_focus_settings_search(),
         }
         settle(ui).await;
-        assert!(!ui.get_settings_search_dismissed(), "{query}: results stay hidden");
+        assert!(
+            !ui.get_settings_search_dismissed(),
+            "{query}: results stay hidden"
+        );
         assert_eq!(ui.get_settings_search_index(), row as i32, "{query}");
         assert!(
             focused_control_has_label(ui, "Search settings"),
             "{query}: the search field is not focused"
         );
-        assert_eq!(ui.get_color_selected_id(), token, "{query}: returning changed the token");
+        assert_eq!(
+            ui.get_color_selected_id(),
+            token,
+            "{query}: returning changed the token"
+        );
     }
     assert_eq!(
         std::fs::read_to_string(store.path()).unwrap(),
@@ -3184,7 +3197,10 @@ async fn assert_live_preview(ui: &AppWindow) {
     ui.invoke_settings_search("".into());
     ui.set_page(1);
     settle(ui).await;
-    assert!(ui.get_appearance_preview_shown(), "the preview starts shown");
+    assert!(
+        ui.get_appearance_preview_shown(),
+        "the preview starts shown"
+    );
     // Samples sit between the header actions and the links in the tree; Tab
     // skips every one of them.
     tab_to_control(ui, "Hide the live preview");
@@ -3218,7 +3234,10 @@ async fn assert_live_preview(ui: &AppWindow) {
     assert!(ui.get_appearance_preview_shown());
     // Pinning keeps a compact copy above the settings until its own Unpin.
     assert!(!ui.get_appearance_preview_pinned(), "pinning is opt-in");
-    tab_to_control(ui, "Keep a compact preview above the settings while editing");
+    tab_to_control(
+        ui,
+        "Keep a compact preview above the settings while editing",
+    );
     key(ui, Key::Return);
     settle(ui).await;
     assert!(ui.get_appearance_preview_pinned());

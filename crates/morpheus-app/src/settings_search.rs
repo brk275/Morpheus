@@ -4,7 +4,9 @@
 //! accounts on a safe control. Searching never changes a setting, and no
 //! result routes to a URL, a path or an action.
 
-use morpheus_config::registry::{self, AccountsFocus, Requirement, Route, SearchHit, SettingTarget};
+use morpheus_config::registry::{
+    self, AccountsFocus, Requirement, Route, SearchHit, SettingTarget,
+};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use super::{AppWindow, SettingsResult};
