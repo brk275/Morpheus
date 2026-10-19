@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
 use morpheus_matrix::{
     AccountManager, AccountSelection, HistoryReveal, MatrixCoreError, MessageInfo,
     MessageSearchPage, MessageSearchResult,
@@ -551,6 +551,10 @@ fn read_filters(window: &AppWindow) -> Result<SearchFilters, &'static str> {
 /// The first and last millisecond of the local calendar day `text` names,
 /// written exactly as YYYY-MM-DD from 1970 on.
 fn local_day(text: &str) -> Option<(u64, u64)> {
+    local_day_in_zone(text, &Local)
+}
+
+fn local_day_in_zone(text: &str, zone: &impl TimeZone) -> Option<(u64, u64)> {
     let bytes = text.as_bytes();
     if bytes.len() != DATE_CHARS
         || bytes[4] != b'-'
@@ -570,16 +574,57 @@ fn local_day(text: &str) -> Option<(u64, u64)> {
         return None;
     }
     let date = NaiveDate::from_ymd_opt(year, month, day)?;
-    let start = local_midnight(date)?;
-    let end = local_midnight(date.succ_opt()?)?.checked_sub(1)?;
-    Some((start, end))
+    let resolve = |wall_time: &NaiveDateTime| {
+        zone.from_local_datetime(wall_time)
+            .earliest()
+            .map(|time| time.timestamp_millis())
+    };
+    let (first_wall_time, start) = local_day_boundary(date, &resolve)?;
+    // A timezone can skip an entire calendar day when crossing the date line.
+    if first_wall_time.date() != date {
+        return None;
+    }
+    let (_, next_start) = local_day_boundary(date.succ_opt()?, &resolve)?;
+    let end = u64::try_from(next_start.checked_sub(1)?).ok()?;
+    // Matrix timestamps cannot name an instant before the Unix epoch. A local
+    // 1970-01-01 in a positive UTC offset still has a searchable partial day.
+    let start = u64::try_from(start.max(0)).ok()?;
+    (start <= end).then_some((start, end))
 }
 
-/// Local midnight at the start of `date`, in milliseconds since the epoch.
-fn local_midnight(date: NaiveDate) -> Option<u64> {
+/// First valid wall time on or after midnight, and its earliest UTC instant.
+/// Midnight may be missing at a clock change; the following date may itself
+/// be skipped. Bound the search to two days and refine the first valid minute
+/// to a millisecond, preserving timezone transitions with second offsets.
+fn local_day_boundary(
+    date: NaiveDate,
+    resolve: &impl Fn(&NaiveDateTime) -> Option<i64>,
+) -> Option<(NaiveDateTime, i64)> {
     let midnight = date.and_hms_opt(0, 0, 0)?;
-    let local = Local.from_local_datetime(&midnight).earliest()?;
-    u64::try_from(local.timestamp_millis()).ok()
+    if let Some(timestamp) = resolve(&midnight) {
+        return Some((midnight, timestamp));
+    }
+    for minute in 1..=2 * 24 * 60 {
+        let upper_ms = minute * 60_000;
+        let wall_time = midnight.checked_add_signed(chrono::Duration::milliseconds(upper_ms))?;
+        if resolve(&wall_time).is_none() {
+            continue;
+        }
+        let mut lower = upper_ms - 60_000;
+        let mut upper = upper_ms;
+        while upper - lower > 1 {
+            let middle = lower + (upper - lower) / 2;
+            let probe = midnight.checked_add_signed(chrono::Duration::milliseconds(middle))?;
+            if resolve(&probe).is_some() {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        let first = midnight.checked_add_signed(chrono::Duration::milliseconds(upper))?;
+        return Some((first, resolve(&first)?));
+    }
+    None
 }
 
 /// Return with nothing highlighted: highlight the first hit of a finished
@@ -1705,5 +1750,62 @@ mod tests {
         ] {
             assert_eq!(local_day(text), None, "{text:?} must be refused");
         }
+    }
+
+    #[test]
+    fn date_filters_clip_only_the_pre_epoch_part_of_a_local_day() {
+        let east = chrono::FixedOffset::east_opt(3_600).unwrap();
+        let west = chrono::FixedOffset::west_opt(3_600).unwrap();
+        assert_eq!(
+            local_day_in_zone("1970-01-01", &east),
+            Some((0, 23 * 3_600_000 - 1))
+        );
+        assert_eq!(
+            local_day_in_zone("1970-01-01", &west),
+            Some((3_600_000, 25 * 3_600_000 - 1))
+        );
+        let (_, end) = local_day_in_zone("1970-01-01", &east).unwrap();
+        let (next, _) = local_day_in_zone("1970-01-02", &east).unwrap();
+        assert_eq!(next, end + 1);
+    }
+
+    #[test]
+    fn date_boundary_finds_a_missing_midnight_without_rounding_the_gap() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 14).unwrap();
+        let first = date.and_hms_opt(0, 30, 45).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let resolve = |wall_time: &NaiveDateTime| {
+            calls.set(calls.get() + 1);
+            (*wall_time >= first).then(|| wall_time.and_utc().timestamp_millis())
+        };
+        assert_eq!(
+            local_day_boundary(date, &resolve),
+            Some((first, first.and_utc().timestamp_millis()))
+        );
+        assert!(calls.get() < 100);
+    }
+
+    #[test]
+    fn date_boundary_crosses_a_skipped_following_day_and_bounds_missing_time() {
+        let date = NaiveDate::from_ymd_opt(2011, 12, 30).unwrap();
+        let first = date.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
+        let resolve = |wall_time: &NaiveDateTime| {
+            (*wall_time >= first).then(|| wall_time.and_utc().timestamp_millis())
+        };
+        // An end boundary can cross this skipped day. A start boundary's
+        // caller refuses it because the returned calendar date is different.
+        let (wall_time, timestamp) = local_day_boundary(date, &resolve).unwrap();
+        assert_eq!(wall_time, first);
+        assert_ne!(wall_time.date(), date);
+        assert_eq!(timestamp, first.and_utc().timestamp_millis());
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            local_day_boundary(date, &|_| {
+                calls.set(calls.get() + 1);
+                None
+            }),
+            None
+        );
+        assert_eq!(calls.get(), 2 * 24 * 60 + 1);
     }
 }
