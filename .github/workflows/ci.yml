@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed SDKUI lock metadata
-run-name: SDKUI registry metadata - 9100616
+run-name: SDKUI dependency graph diagnosis - 9100616
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sdkui-registry-metadata-9100616
+  group: sdkui-graph-diagnosis-9100616
   cancel-in-progress: false
 jobs:
   contracts:
@@ -125,16 +125,33 @@ jobs:
           }
           report['error_families']=sorted(name for name,value in families.items() if value)
           if reason is None and code==0:
+              stage='size'
               try:
                   after=pathlib.Path('Cargo.lock').read_bytes()
                   assert len(before)<=4*1024*1024 and len(after)<=4*1024*1024
                   old=tomllib.loads(before.decode()); new=tomllib.loads(after.decode())
+                  stage='top_level'
+                  report['changed_top_level_keys']=sorted(key for key in ('version','metadata','patch') if old.get(key)!=new.get(key))
                   assert {k:v for k,v in old.items() if k!='package'}=={k:v for k,v in new.items() if k!='package'}
                   def identity(package):
                       return tuple(package.get(key,'') for key in ('name','version','source','checksum'))
                   previous={identity(package):package for package in old['package']}
                   current={identity(package):package for package in new['package']}
                   assert len(previous)==len(old['package']) and len(current)==len(new['package'])
+                  stage='identities'
+                  added=sorted(set(current)-set(previous)); removed=sorted(set(previous)-set(current))
+                  report.update(previous_packages=len(previous),current_packages=len(current))
+                  assert len(added)<=64 and len(removed)<=64
+                  known_sources={key[2] for key in previous}
+                  def public_identity(key):
+                      name,version,source,checksum=key
+                      assert type(name) is str and re.fullmatch(r'[A-Za-z0-9_-]{1,100}',name)
+                      assert type(version) is str and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+_-]{1,80})?',version)
+                      assert checksum=='' or re.fullmatch(r'[a-f0-9]{64}',checksum)
+                      return {'name':name,'version':version,'source':source if source in known_sources else None,
+                          'source_known':source in known_sources,'checksum':checksum}
+                  report['identity_changes']={'added':[public_identity(key) for key in added],
+                      'removed':[public_identity(key) for key in removed]}
                   assert set(previous)==set(current)
                   allowed={edge for package in old['package'] for edge in package.get('dependencies',[])}
                   for package in old['package']:
@@ -145,12 +162,15 @@ jobs:
                   changes=[]
                   for key in sorted(previous):
                       first,last=previous[key],current[key]
+                      stage='package_fields'
                       assert {k:v for k,v in first.items() if k!='dependencies'}=={k:v for k,v in last.items() if k!='dependencies'}
+                      stage='edge_references'
                       left,right=first.get('dependencies',[]),last.get('dependencies',[])
                       assert type(left) is list and type(right) is list and len(right)<=256
                       assert all(type(edge) is str and edge in allowed for edge in right)
                       if left!=right:
                           changes.append({'package':key[0]+'@'+key[1],'before':left,'after':right})
+                  stage='change_bound'
                   assert len(changes)<=64
                   report.update(status='passed',failure=None,error_families=[],
                       package_identities_unchanged=True,changes=changes,
@@ -158,6 +178,7 @@ jobs:
                       generated_lock_sha256=hashlib.sha256(after).hexdigest())
               except (AssertionError,ValueError,KeyError,TypeError,UnicodeError):
                   report['failure']='unexpected_dependency_graph'
+                  report['graph_stage']=stage
           print(json.dumps(report,sort_keys=True),flush=True)
           if report['status']!='passed': raise SystemExit(1)
           PY
