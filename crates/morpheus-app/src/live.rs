@@ -3472,6 +3472,8 @@ fn apply_snapshot(
         ui.set_member_selected_self(false);
         ui.set_member_selected_creator(false);
         ui.set_member_confirm_open(false);
+        // Pinned rows, flags and filter text belong to the previous room.
+        ui.invoke_reset_pinned_messages();
         crate::reset_attachment_view(ui);
         // All-room results stay with their account across rooms, which is
         // how opening a hit in another room keeps the list it came from.
@@ -3663,6 +3665,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     crate::call_stage::clear_private_presentation(ui);
     // Poll drafts, pending votes and the create dialog end with the account.
     crate::polls::clear_presentation(ui);
+    // Decrypted pinned rows are account-private and never wait for a task.
+    ui.invoke_reset_pinned_messages();
     ui.set_room_actions_open(false);
     ui.set_room_action_busy(false);
     ui.set_room_action_error("".into());
@@ -3914,6 +3918,7 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
         reaction: info.reaction_summary.as_str().into(),
         poll: crate::polls::poll_card(info),
         accent: accent(&info.sender),
+        pinned: crate::pinned_messages::row_pinned(info.event_id.as_deref()),
     }
 }
 

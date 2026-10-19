@@ -5,6 +5,7 @@ import { PollCard, PollCardData, PollPalette } from "poll-card.slint";
 import { PollCreateDialog } from "poll-dialog.slint";
 // Rust drives poll drafts, pending actions and the create dialog through this global.
 export { PollOptionItem, PollUiState } from "poll-card.slint";
+import { PinnedMessageItem, PinnedMessagesPanel } from "pinned-messages.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -381,6 +382,8 @@ export struct MessageItem {
     // Native poll card state; `present` is false for every other message.
     poll: PollCardData,
     accent: color,
+    // The visible room's authoritative pinned list contains this event.
+    pinned: bool,
 }
 
 // Type comes from the originating list, independently of a room's display name.
@@ -469,6 +472,7 @@ component InterfaceGlyph inherits Path {
         : icon == "♥" ? "M 10 17 C 8 15 2 11 2 6.5 C 2 2 8 1 10 5 C 12 1 18 2 18 6.5 C 18 11 12 15 10 17 Z"
         : icon == "⌫" ? "M 3 5 L 17 5 M 7 5 L 7 2 L 13 2 L 13 5 M 5 5 L 6 18 L 14 18 L 15 5 M 8 8 L 8 15 M 12 8 L 12 15"
         : icon == "✎" ? "M 4 16 L 8 15 L 16 7 L 13 4 L 5 12 Z M 12 5 L 15 8"
+        : icon == "Pin" ? "M 7 2 L 13 2 L 12 7 L 15 10 L 15 11 L 5 11 L 5 10 L 8 7 Z M 10 11 L 10 18"
         : "M 3 4 L 17 4 L 17 13 L 10 13 L 6 17 L 6 13 L 3 13 Z M 6 7 L 14 7 M 6 10 L 12 10";
 }
 
@@ -487,7 +491,7 @@ component IconAction inherits Rectangle {
     // Reveal the associated value row as well as a small settings action.
     in property <length> reveal-height: root.height;
     out property <bool> has-focus: keyboard-focus.has-focus;
-    property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷";
+    property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷" || icon == "Pin";
     // The configured icon size. A larger icon stays inside a call site's
     // explicitly smaller button, but never below the built-in 18 px, so the
     // default look is unchanged at every text scale. The button's own size
@@ -3371,6 +3375,27 @@ export component AppWindow inherits Window {
     in-out property <bool> thread-history-at-start: false;
     in-out property <string> thread-history-error;
     in-out property <int> thread-history-operation: 0;
+    // Pinned messages of the visible room (pinned_messages.rs). Status: 0 idle,
+    // 1 loading, 2 ready, 3 failed. Rust clears all of it synchronously on any
+    // account or room change.
+    in-out property <[PinnedMessageItem]> pinned-items;
+    in-out property <int> pinned-status: 0;
+    in-out property <string> pinned-error;
+    in-out property <string> pinned-notice;
+    in-out property <string> pinned-summary;
+    in-out property <string> pinned-read-only-note;
+    in-out property <bool> pinned-can-edit: false;
+    in-out property <bool> pinned-state-loaded: false;
+    in-out property <bool> pinned-busy: false;
+    in-out property <string> pinned-filter;
+    in-out property <int> pinned-focus-request: 0;
+    // Set by an explicit open of a hidden pane; Rust consumes it once the pane
+    // exists, so merely revealing the side panel never moves focus.
+    in-out property <bool> pinned-focus-pending: false;
+    property <string> pinned-scope: root.active-account-local-id + "\n" + root.active-room-id + "\n" + (root.live-session ? "1" : "0");
+    changed pinned-scope => { root.pinned-context-changed(); }
+    property <bool> pinned-pane-visible: root.page == 0 && root.show-side-panel && root.side-panel-tab == 3;
+    changed pinned-pane-visible => { root.pinned-pane-shown(root.pinned-pane-visible); }
     in-out property <string> directory-search;
     in-out property <string> directory-server;
     in-out property <string> directory-next-batch;
@@ -3463,6 +3488,20 @@ export component AppWindow inherits Window {
     callback discard-record-text(bool, string);
     callback discard-unreadable-status(bool);
     callback toggle-message-reaction(string, string);
+    // Account ID, room ID and event ID captured at the click; true pins.
+    callback toggle-message-pin(string, string, string, bool);
+    callback pinned-context-changed();
+    // Synchronous clear at account, room and lock boundaries.
+    callback reset-pinned-messages();
+    callback pinned-pane-shown(bool);
+    callback refresh-pinned-messages();
+    callback unpin-pinned-message(string);
+    callback pinned-filter-edited(string);
+    // Event ID, thread root ID (empty outside a thread).
+    callback open-pinned-message(string, string);
+    // Navigation seam (message_search::open_conversation): local account ID,
+    // room ID, event ID, thread root ID; empty for no event or thread.
+    callback open-conversation(string, string, string, string);
     callback add-account();
     callback manage-accounts();
     callback log-out();
@@ -3502,6 +3541,13 @@ export component AppWindow inherits Window {
         root.page = 0;
         root.show-side-panel = true;
         root.side-panel-tab = 1;
+    }
+    // Presentation only: show the pinned-messages tab of the side panel.
+    public function show-pinned-panel() {
+        if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
+        root.page = 0;
+        root.show-side-panel = true;
+        root.side-panel-tab = 3;
     }
     callback focus-room-search();
     focus-room-search => {
@@ -3607,9 +3653,6 @@ export component AppWindow inherits Window {
     callback load-older-thread-replies();
     callback return-to-live();
     callback load-newer-focused();
-    // Navigation seam (message_search::open_conversation): local account ID,
-    // room ID, event ID, thread root ID; empty for no event or thread.
-    callback open-conversation(string, string, string, string);
     callback join-discovery-target(string, string, string, string, bool);
     callback toggle-native-microphone();
     callback toggle-native-deafen();
@@ -4621,6 +4664,19 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
+                            icon: "Pin"; label: "Show pinned messages"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            selected: root.show-side-panel && root.side-panel-tab == 3;
+                            enabled: root.live-session && root.active-room-id != "";
+                            activated => {
+                                if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
+                                root.show-side-panel = true;
+                                root.side-panel-tab = 3;
+                            }
+                        }
+                        }
+                        if root.page == 0 : VerticalLayout {
+                            width: StyleTokens.icon-button-size; alignment: center;
+                            IconAction {
                             icon: "C"; label: "Open current room call stage"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             activated => { root.page = 2; }
                         }
@@ -4962,7 +5018,10 @@ export component AppWindow inherits Window {
                                 + (self.show-time ? max(0px, (root.timestamp-width-px - 72) * 1px * root.text-scale) : 0px);
                             property <bool> selected-message: root.room-search-selected-event-id != "" && message.event-id == root.room-search-selected-event-id;
                             property <length> avatar-size: StyleTokens.message-avatar-size > 0px ? StyleTokens.message-avatar-size : root.message-layout == 0 ? 38px : 26px;
-                            property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px);
+                            // A pin action shows once the pinned list is known, for anyone who
+                            // may change it, and as a disabled marker on pinned messages.
+                            property <bool> pin-action: message.event-id != "" && root.pinned-state-loaded && (root.pinned-can-edit || message.pinned);
+                            property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px) + (self.pin-action ? 36px : 0px);
                             property <length> column-width: self.columns ? min(root.nickname-width-px * 1px, self.width * 0.2) : 0px;
                             property <bool> tight-header: !self.columns && self.body-width < self.action-width + 180px * root.text-scale;
                             // The tallest header text: name, message size and, when shown, the
@@ -5190,6 +5249,17 @@ export component AppWindow inherits Window {
                                         root.side-panel-tab = 1;
                                         root.show-side-panel = true;
                                         root.open-thread(message.event-id, message.sender, message.body);
+                                    }
+                                }
+                                if message-row.pin-action : IconAction {
+                                    quiet: !message.pinned; context-hover: message-hover.has-hover;
+                                    width: 28px; height: 26px; icon: "Pin";
+                                    label: (message.pinned ? "Unpin message from " : "Pin message from ") + message.sender;
+                                    selected: message.pinned;
+                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    enabled: root.live-session && root.pinned-can-edit && !root.pinned-busy;
+                                    activated => {
+                                        root.toggle-message-pin(root.active-account-local-id, root.active-room-id, message.event-id, !message.pinned);
                                     }
                                 }
                                 if message.event-id != "" : IconAction {
@@ -7542,6 +7612,21 @@ export component AppWindow inherits Window {
                             activated => { root.side-panel-tab = 2; }
                             Text { text: "Search"; color: root.side-panel-tab == 2 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                         }
+                        ActionRect {
+                            horizontal-stretch: 1; height: 34px;
+                            border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8;
+                            background: root.side-panel-tab == 3 ? root.hover : transparent;
+                            focus-color: root.accent;
+                            label: "Show pinned messages";
+                            accessible-checkable: true;
+                            accessible-checked: root.side-panel-tab == 3;
+                            enabled: root.live-session && root.active-room-id != "";
+                            activated => {
+                                if !root.pinned-pane-visible { root.pinned-focus-pending = true; }
+                                root.side-panel-tab = 3;
+                            }
+                            Text { text: "Pins"; color: root.side-panel-tab == 3 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                        }
                     }
                 }
                 Rectangle { height: 1px; background: root.divider; }
@@ -7911,6 +7996,23 @@ export component AppWindow inherits Window {
                                         enabled: root.live-session;
                                         clicked => { root.preview-image-attachment(reply.event-id, reply.attachment); }
                                     }
+                                    // The timeline pin rule: shown once the pinned list is known, for
+                                    // anyone who may change it, and as a disabled marker on pinned
+                                    // replies otherwise. Rust rechecks the account, room and scope.
+                                    if reply.event-id != "" && root.pinned-state-loaded && (root.pinned-can-edit || reply.pinned) : HorizontalLayout {
+                                        alignment: end;
+                                        TextAction {
+                                            text: reply.pinned ? "Unpin" : "Pin";
+                                            ink: root.ink; muted: root.muted; surface: transparent;
+                                            hover-surface: root.hover; outline: root.divider;
+                                            text-scale: root.text-scale;
+                                            accessible-label: (reply.pinned ? "Unpin reply from " : "Pin reply from ") + reply.sender;
+                                            enabled: root.live-session && root.pinned-can-edit && !root.pinned-busy;
+                                            activated => {
+                                                root.toggle-message-pin(root.active-account-local-id, root.active-room-id, reply.event-id, !reply.pinned);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -8100,6 +8202,53 @@ export component AppWindow inherits Window {
                     load-more => { root.load-more-room-search(); }
                     open(room-id, event-id) => { root.open-search-result(room-id, event-id); }
                     dismiss => { root.focus-composer(false); }
+                }
+                if root.side-panel-tab == 3 : PinnedMessagesPanel {
+                    vertical-stretch: 1;
+                    items: root.pinned-items;
+                    status: root.pinned-status;
+                    error: root.pinned-error;
+                    notice: root.pinned-notice;
+                    summary: root.pinned-summary;
+                    read-only-note: root.pinned-read-only-note;
+                    busy: root.pinned-busy;
+                    available: root.live-session && root.active-room-id != "";
+                    filter <=> root.pinned-filter;
+                    focus-request: root.pinned-focus-request;
+                    text-scale: root.text-scale;
+                    style: {
+                        radius: StyleTokens.radius * 0.8,
+                        control-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7,
+                        input-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7,
+                        line-width: StyleTokens.line-width,
+                        focus-width: StyleTokens.focus-width,
+                        control-padding: StyleTokens.control-padding,
+                        input-padding: StyleTokens.input-padding,
+                        sender-font-size: StyleTokens.sender-font-size,
+                        timestamp-font-size: StyleTokens.timestamp-font-size,
+                    };
+                    palette: {
+                        ink: root.ink,
+                        muted: root.muted,
+                        panel: root.panel,
+                        elevated: root.elevated,
+                        hover: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover,
+                        pressed: StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent,
+                        disabled: StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.muted,
+                        input-surface: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated,
+                        input-border: StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.divider,
+                        accent: root.accent,
+                        divider: root.divider,
+                        focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+                        selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : Palette.selection-background,
+                        selection-ink: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground,
+                        error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+                        warning: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+                    };
+                    filter-edited(text) => { root.pinned-filter-edited(text); }
+                    refresh => { root.refresh-pinned-messages(); }
+                    open-message(event, thread) => { root.open-pinned-message(event, thread); }
+                    unpin(event) => { root.unpin-pinned-message(event); }
                 }
             }
         }

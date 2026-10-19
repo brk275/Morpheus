@@ -178,6 +178,30 @@ pub(crate) fn info_of_event(
         .cloned()
 }
 
+/// Re-project the rows whose source matches, for presentation state kept
+/// outside `MessageInfo` (pinned flags). Bounded like a snapshot replacement.
+pub(crate) fn refresh_rows(current: &ModelRc<MessageItem>, matches: impl Fn(&MessageInfo) -> bool) {
+    let Some(model) = current.as_any().downcast_ref::<TimelineModel>() else {
+        return;
+    };
+    let rows: Vec<usize> = model
+        .rows
+        .borrow()
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| matches(row))
+        .map(|(index, _)| index)
+        .take(MAX_ROW_NOTIFICATIONS + 1)
+        .collect();
+    if rows.len() > MAX_ROW_NOTIFICATIONS {
+        model.notify.reset();
+        return;
+    }
+    for row in rows {
+        model.notify.row_changed(row);
+    }
+}
+
 // Owned fixtures also exercise the value-equality fallback: a rebuilt row can
 // be equal even when it has a different allocation from the previous snapshot.
 #[cfg(test)]
