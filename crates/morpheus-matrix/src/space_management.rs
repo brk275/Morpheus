@@ -53,6 +53,10 @@ pub const MAX_ORDER_BYTES: usize = 50;
 pub const MAX_REORDER_WRITES: usize = 8;
 /// Longest name of a room created inside a Space.
 pub const MAX_CHILD_NAME_BYTES: usize = 255;
+/// Joined rooms one list of candidates offers at most.
+pub const MAX_JOINED_CANDIDATES: usize = 300;
+/// Rooms one change adds at most.
+pub const MAX_LINKS_AT_ONCE: usize = 20;
 const MAX_TOKEN_BYTES: usize = 2048;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_TOPIC_BYTES: usize = 512;
@@ -504,6 +508,96 @@ impl SpaceSession {
             Ok(SpaceWriteOutcome {
                 accepted,
                 requested: plan.len(),
+                confirmed: confirmed && stopped.is_none(),
+                stopped,
+            })
+        })
+        .await
+    }
+
+    /// This account's joined rooms and Spaces other than this one, by name,
+    /// with route servers from the Matrix routing algorithm over each room's
+    /// synced members. Reads only this account's local store: nothing is
+    /// fetched, previewed or joined. Rooms without a route are left out.
+    pub async fn joined_rooms(&self) -> Result<Vec<SpaceTarget>> {
+        self.run(READ_TIMEOUT, async {
+            let client = self.space.client();
+            let mut rooms = client.joined_rooms();
+            rooms.retain(|room| room.room_id() != self.space.room_id());
+            rooms.sort_by_cached_key(|room| {
+                let name = room.name().unwrap_or_default().to_lowercase();
+                (name.is_empty(), name, room.room_id().to_owned())
+            });
+            let mut targets = Vec::new();
+            for room in rooms.into_iter().take(MAX_JOINED_CANDIDATES) {
+                let members = room.route().await.unwrap_or_default();
+                self.check()?;
+                let Ok((via, route)) = choose_route(members, Vec::new(), &[]) else {
+                    continue;
+                };
+                let name = room.name().map(|name| room_admin::bounded(&name, MAX_NAME_BYTES));
+                targets.push(SpaceTarget {
+                    room_id: room.room_id().to_string(),
+                    name,
+                    is_space: Some(room.is_space()),
+                    membership: Some(RoomMembership::Joined),
+                    via,
+                    route,
+                    resolved: (),
+                });
+            }
+            Ok(targets)
+        })
+        .await
+    }
+
+    /// Link several resolved rooms below this Space, one at a time and in
+    /// order, each checked and read back like `link`. The first failure
+    /// stops the rest; nobody joins any of them.
+    pub async fn link_many(
+        &self,
+        targets: &[SpaceTarget],
+        suggested: bool,
+    ) -> Result<SpaceWriteOutcome> {
+        if targets.is_empty() {
+            return Err(RoomAdminError::NotApplicable);
+        }
+        if targets.len() > MAX_LINKS_AT_ONCE {
+            return Err(RoomAdminError::TooManyChanges);
+        }
+        let mut children = Vec::with_capacity(targets.len());
+        for target in targets {
+            let child = RoomId::parse(&target.room_id).map_err(|_| RoomAdminError::InvalidRoom)?;
+            children.push(child);
+        }
+        self.run(WRITE_TIMEOUT, async {
+            self.require_manage().await?;
+            let mut accepted = 0;
+            let mut confirmed = true;
+            let mut stopped = None;
+            for (target, child) in targets.iter().zip(&children) {
+                let step = async {
+                    let current = self.child_state(child).await?;
+                    let content = link_content(current.as_ref(), &target.via, suggested, None)?;
+                    self.send_child(child, &content).await?;
+                    Ok::<_, RoomAdminError>(content)
+                };
+                match step.await {
+                    Ok(content) => {
+                        accepted += 1;
+                        let after = self.child_state(child).await.ok().flatten();
+                        confirmed &= after.as_ref() == Some(&content);
+                    }
+                    Err(error) if accepted == 0 => return Err(error),
+                    Err(error) => {
+                        stopped = Some(error);
+                        break;
+                    }
+                }
+            }
+            Ok(SpaceWriteOutcome {
+                accepted,
+                requested: targets.len(),
                 confirmed: confirmed && stopped.is_none(),
                 stopped,
             })
@@ -1319,6 +1413,8 @@ mod tests {
             send(session.reorder(&[]));
             send(session.create_child("Planning", ChildKind::Room, true, false));
             send(session.replace(link));
+            send(session.joined_rooms());
+            send(session.link_many(std::slice::from_ref(target), false));
         }
     }
 }

@@ -1,6 +1,6 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
 import { MemberActionDialog, RoomMembersPanel, RosterMember, RosterPalette, RosterPermission } from "room-admin.slint";
-import { SpaceManagerPage, SpaceManagerView, SpaceRow } from "space-manager.slint";
+import { SpaceManagerPage, SpaceManagerView, SpacePick, SpaceRow } from "space-manager.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -1925,6 +1925,7 @@ export component AppWindow inherits Window {
     // `space-manager-view.panel-id` fences every asynchronous result to one page.
     in-out property <SpaceManagerView> space-manager-view;
     in-out property <[SpaceRow]> space-manager-rows;
+    in-out property <[SpacePick]> space-manager-picks;
     in-out property <string> space-manager-query;
     in-out property <string> space-manager-target-input;
     in-out property <bool> space-manager-target-suggested: false;
@@ -2294,6 +2295,7 @@ export component AppWindow inherits Window {
     // Action codes are listed on SpaceManagerPage.action.
     callback space-manager-action(int);
     callback space-manager-select(string);
+    callback space-manager-pick(string);
     callback space-manager-search-edited(string);
     callback space-manager-choose-filter(int);
     callback space-manager-confirm();
@@ -4227,6 +4229,7 @@ export component AppWindow inherits Window {
                     scope-key: root.active-account-local-id + "\n" + root.active-space-id;
                     view: root.space-manager-view;
                     rows: root.space-manager-rows;
+                    picks: root.space-manager-picks;
                     query <=> root.space-manager-query;
                     target-input <=> root.space-manager-target-input;
                     target-suggested <=> root.space-manager-target-suggested;
@@ -4240,6 +4243,7 @@ export component AppWindow inherits Window {
                     scope-changed => { root.space-manager-scope-changed(); }
                     action(code) => { root.space-manager-action(code); }
                     select(key) => { root.space-manager-select(key); }
+                    pick(key) => { root.space-manager-pick(key); }
                     search-edited(text) => { root.space-manager-search-edited(text); }
                     choose-filter(index) => { root.space-manager-choose-filter(index); }
                     close => { root.page = 0; }

@@ -4,6 +4,7 @@
 //! newer view. Opening reads only. Writes are sent once and reported only
 //! after the homeserver answered and the affected state was read back.
 
+use std::collections::HashSet;
 use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicU64, Ordering},
@@ -11,14 +12,15 @@ use std::sync::{
 
 use morpheus_matrix::{
     AccountSelection, ChildKind, CreatedChild, HierarchyPage, MAX_CHILD_NAME_BYTES,
-    MAX_HIERARCHY_PAGES, MatrixLinkTarget, RoomAdminError, RoomMembership, RoomSettingsCancellation,
-    SpaceChildLink, SpaceNode, SpacePermissions, SpaceSession, SpaceTarget, SpaceWriteOutcome,
+    MAX_HIERARCHY_PAGES, MAX_LINKS_AT_ONCE, MatrixLinkTarget, RoomAdminError, RoomMembership,
+    RoomSettingsCancellation, SpaceChildLink, SpaceNode, SpacePermissions, SpaceSession,
+    SpaceTarget, SpaceWriteOutcome,
 };
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::Notify};
 
 use super::{Change, Filter, Intent, Reading, Row};
-use crate::{AppWindow, SpaceManagerView, SpaceRow, live::LiveUi};
+use crate::{AppWindow, SpaceManagerView, SpacePick, SpaceRow, live::LiveUi};
 
 const SECURITY_BUSY: &str = "Finish the open account security step before changing the Space.";
 const JOIN_FAILED: &str = "Could not join. Check the room's access rules, then try again.";
@@ -39,6 +41,9 @@ pub(crate) const STOP: i32 = 11;
 pub(crate) const CREATE: i32 = 12;
 pub(crate) const BACK: i32 = 13;
 pub(crate) const REPLACE: i32 = 14;
+pub(crate) const LIST_ROOMS: i32 = 15;
+pub(crate) const ADD_PICKED: i32 = 16;
+pub(crate) const CLOSE_ROOMS: i32 = 17;
 /// Spaces remembered for Back, newest last.
 const MAX_TRAIL: usize = 8;
 
@@ -71,6 +76,10 @@ struct PanelState {
     selected: Option<String>,
     /// The resolved room waiting for the operator's choices.
     target: Option<SpaceTarget>,
+    /// The account's joined rooms offered for adding, while that list is open.
+    rooms: Option<Vec<SpaceTarget>>,
+    /// Room IDs picked from `rooms`, at most `MAX_LINKS_AT_ONCE`.
+    picked: HashSet<String>,
     /// The change waiting for the homeserver.
     pending: Option<Intent>,
     /// The change waiting for the operator's deliberate confirmation.
@@ -165,6 +174,7 @@ enum Done {
         fresh: bool,
     },
     Resolved(SpaceTarget),
+    Rooms(Vec<SpaceTarget>),
     Written(SpaceWriteOutcome),
     Created(CreatedChild),
     Joined,
@@ -236,6 +246,13 @@ impl SpaceManagerUi {
         ui.on_space_manager_select(move |key| {
             if let Some(ui) = weak.upgrade() {
                 this.select(&ui, key.as_str());
+            }
+        });
+        let this = owner.clone();
+        let weak = ui.as_weak();
+        ui.on_space_manager_pick(move |room_id| {
+            if let Some(ui) = weak.upgrade() {
+                this.pick(&ui, room_id.as_str());
             }
         });
         let this = owner.clone();
@@ -444,6 +461,9 @@ impl SpaceManagerUi {
             CREATE => self.review_create(ui, panel),
             BACK => self.back_to_parent(ui, &panel),
             REPLACE => self.review_replace(ui, panel),
+            LIST_ROOMS => self.list_rooms(ui, panel),
+            ADD_PICKED => self.review_picked(ui, panel),
+            CLOSE_ROOMS => self.close_rooms(ui, &panel),
             _ => {}
         }
     }
@@ -606,6 +626,92 @@ impl SpaceManagerUi {
             };
             this.finish(panel, generation, None, result);
         });
+    }
+
+    /// List the account's joined rooms from its local store. This reads
+    /// only; nothing is fetched or joined.
+    fn list_rooms(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
+        if !panel.lock().can_manage() {
+            return;
+        }
+        let Some(generation) = self.begin(ui, &panel) else {
+            return;
+        };
+        {
+            let mut state = panel.lock();
+            state.reading = Some(Reading::Rooms);
+            state.error.clear();
+            state.notice.clear();
+        }
+        self.repaint_panel(ui, &panel);
+        let this = self.clone();
+        self.runtime.spawn(async move {
+            let session = panel.lock().session.clone();
+            let result = tokio::select! { biased;
+                _ = panel.cancelled() => return,
+                _ = panel.stopped(generation) => Err(Failure::Stopped),
+                result = async {
+                    let session = session.ok_or(RoomAdminError::Unavailable)?;
+                    let rooms = session.joined_rooms().await?;
+                    Ok::<_, Failure>(Done::Rooms(rooms))
+                } => result,
+            };
+            this.finish(panel, generation, None, result);
+        });
+    }
+
+    fn close_rooms(&self, ui: &AppWindow, panel: &Panel) {
+        {
+            let mut state = panel.lock();
+            state.rooms = None;
+            state.picked.clear();
+        }
+        self.repaint_panel(ui, panel);
+    }
+
+    /// Pick or unpick one listed room, up to `MAX_LINKS_AT_ONCE`.
+    fn pick(&self, ui: &AppWindow, room_id: &str) {
+        let Some(panel) = self.current_for(ui) else {
+            return;
+        };
+        {
+            let mut state = panel.lock();
+            let rooms = state.rooms.as_deref().unwrap_or_default();
+            let listed = rooms.iter().any(|room| room.room_id == room_id);
+            if !listed || state.progress.busy {
+                return;
+            }
+            if !state.picked.remove(room_id) {
+                if state.picked.len() == MAX_LINKS_AT_ONCE {
+                    state.error = super::too_many_picked();
+                } else {
+                    state.picked.insert(room_id.to_owned());
+                    state.error.clear();
+                }
+            }
+        }
+        self.repaint_panel(ui, &panel);
+    }
+
+    fn review_picked(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
+        if !self.idle(&panel) || !panel.lock().can_manage() {
+            return;
+        }
+        let targets = {
+            let state = panel.lock();
+            let direct = state.direct(&panel.space);
+            let rooms = state.rooms.as_deref().unwrap_or_default();
+            let offered = super::candidates(rooms, &direct);
+            let chosen = |room: &&SpaceTarget| state.picked.contains(&room.room_id);
+            let picked = offered.into_iter().filter(chosen);
+            picked.cloned().collect::<Vec<_>>()
+        };
+        if targets.is_empty() {
+            return self.reject(ui, &panel, super::NOTHING_PICKED.to_owned());
+        }
+        let name = super::rooms_text(targets.len());
+        let suggested = ui.get_space_manager_target_suggested();
+        self.review(ui, panel, Change::LinkMany { targets, suggested }, name);
     }
 
     fn idle(&self, panel: &Panel) -> bool {
@@ -837,6 +943,7 @@ impl SpaceManagerUi {
                     let session = session.ok_or(RoomAdminError::Unavailable)?;
                     let outcome = match change {
                         Change::Link { target, suggested, order } => session.link(&target, suggested, order.as_deref()).await?,
+                        Change::LinkMany { targets, suggested } => session.link_many(&targets, suggested).await?,
                         Change::Update { link, suggested, order } => session.update(&link, suggested, order.as_deref()).await?,
                         Change::Unlink { link } => session.unlink(&link).await?,
                         Change::Replace { link, .. } => session.replace(&link).await?,
@@ -891,6 +998,10 @@ impl SpaceManagerUi {
                     fresh,
                 }) => apply_page(&mut state, &panel.space, session, permissions, page, fresh),
                 Ok(Done::Resolved(target)) => state.target = Some(target),
+                Ok(Done::Rooms(rooms)) => {
+                    state.rooms = Some(rooms);
+                    state.picked.clear();
+                }
                 Ok(Done::Written(outcome)) => {
                     if let Some(intent) = &intent {
                         state.notice = super::outcome_text(intent, outcome);
@@ -990,6 +1101,8 @@ impl SpaceManagerUi {
         };
         view.back_name = self.back_name(panel.selection.account_id()).into();
         ui.set_space_manager_rows(ModelRc::new(VecModel::from(rows)));
+        let picks = picker_rows(&panel.lock(), &panel.space);
+        update_picks(ui, picks);
         ui.set_space_manager_view(view);
     }
 }
@@ -1039,6 +1152,11 @@ fn apply_page(
 fn settle(state: &mut PanelState, intent: &Intent, outcome: SpaceWriteOutcome) {
     match intent.change {
         Change::Link { .. } if outcome.confirmed => state.target = None,
+        // The refreshed hierarchy shows what was added; the list closes.
+        Change::LinkMany { .. } if outcome.accepted > 0 => {
+            state.rooms = None;
+            state.picked.clear();
+        }
         Change::Unlink { .. } | Change::Replace { .. } if outcome.confirmed => {
             state.selected = None;
         }
@@ -1061,6 +1179,43 @@ fn reset_inputs(ui: &AppWindow, intent: &Intent) {
         }
         _ => {}
     }
+}
+
+/// Show the picker rows, updating them in place while the same rooms are
+/// listed so the list keeps its scroll position as rooms are picked.
+fn update_picks(ui: &AppWindow, picks: Vec<SpacePick>) {
+    let model = ui.get_space_manager_picks();
+    let mut same_rooms = model.row_count() == picks.len();
+    for (index, pick) in picks.iter().enumerate() {
+        same_rooms &= model.row_data(index).is_some_and(|row| row.key == pick.key);
+    }
+    if !same_rooms {
+        ui.set_space_manager_picks(ModelRc::new(VecModel::from(picks)));
+        return;
+    }
+    for (index, pick) in picks.into_iter().enumerate() {
+        if model.row_data(index).as_ref() != Some(&pick) {
+            model.set_row_data(index, pick);
+        }
+    }
+}
+
+/// The open list of joined rooms the Space does not list yet.
+fn picker_rows(state: &PanelState, space: &str) -> Vec<SpacePick> {
+    let Some(rooms) = &state.rooms else {
+        return Vec::new();
+    };
+    let direct = state.direct(space);
+    let offered = super::candidates(rooms, &direct);
+    offered
+        .into_iter()
+        .map(|room| SpacePick {
+            key: room.room_id.as_str().into(),
+            name: super::candidate_title(room).into(),
+            detail: super::candidate_detail(room).into(),
+            picked: state.picked.contains(&room.room_id),
+        })
+        .collect()
 }
 
 fn render(
@@ -1130,6 +1285,8 @@ fn render(
         target_ready: state.target.is_some() && can_manage,
         ..SpaceManagerView::default()
     };
+    view.rooms_open = state.rooms.is_some();
+    view.picked = i32::try_from(state.picked.len()).unwrap_or(i32::MAX);
     if let Some(row) = selected {
         view.selected = space_row(row, &state.nodes, pending_room);
         let detail = super::selected_detail(row, &state.nodes, can_manage);
@@ -1171,6 +1328,7 @@ fn space_row(row: &Row, nodes: &[SpaceNode], pending_room: Option<&str>) -> Spac
 pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_space_manager_view(SpaceManagerView::default());
     ui.set_space_manager_rows(ModelRc::new(VecModel::<SpaceRow>::default()));
+    ui.set_space_manager_picks(ModelRc::new(VecModel::<SpacePick>::default()));
     ui.set_space_manager_query("".into());
     ui.set_space_manager_target_input("".into());
     ui.set_space_manager_target_order("".into());

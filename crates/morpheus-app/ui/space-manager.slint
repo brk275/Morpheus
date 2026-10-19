@@ -23,6 +23,16 @@ export struct SpaceRow {
     pending: bool,
 }
 
+// One of the account's joined rooms offered for adding. `key` is the exact
+// room ID and only routes a pick; the controller re-resolves it against the
+// list it read. Text is sanitized in Rust.
+export struct SpacePick {
+    key: string,
+    name: string,
+    detail: string,
+    picked: bool,
+}
+
 // Everything the page shows apart from rows and text inputs, set at once by
 // the controller after each result.
 export struct SpaceManagerView {
@@ -60,6 +70,9 @@ export struct SpaceManagerView {
     target-ready: bool,
     // The Space this one was opened from with "Manage this Space", or empty.
     back-name: string,
+    // The list of joined rooms to add from is open, and how many are picked.
+    rooms-open: bool,
+    picked: int,
     confirm-open: bool,
     confirm-title: string,
     confirm-body: string,
@@ -106,6 +119,53 @@ component SpaceToggle inherits RosterAction {
     }
 }
 
+// One joined room in the add-from-your-rooms list: a check box with the
+// room's kind and route servers. Activation is reported, never applied here.
+component SpacePickRow inherits RosterAction {
+    in property <RosterPalette> palette;
+    in property <float> text-scale: 1;
+    in property <string> text;
+    in property <string> detail;
+    in property <bool> checked;
+    accessible-role: checkbox;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    label: root.text + ", " + root.detail;
+    focus-color: root.palette.focus;
+    border-radius: 6px;
+    min-height: max(30px, 20px * root.text-scale + 10px);
+    background: self.has-hover ? root.palette.hover : transparent;
+    HorizontalLayout {
+        padding-left: 6px; padding-right: 6px; spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 16px; height: 16px; border-radius: 4px;
+                border-width: 2px;
+                border-color: root.checked ? root.palette.accent : root.palette.muted;
+                background: root.checked ? root.palette.accent : transparent;
+                if root.checked : Text {
+                    text: "✓"; color: root.palette.accent-ink;
+                    font-size: 11px; font-weight: 700;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.text; color: root.enabled ? root.palette.ink : root.palette.muted;
+                font-size: 11px * root.text-scale; overflow: elide;
+            }
+            Text {
+                text: root.detail; color: root.palette.muted;
+                font-size: 9px * root.text-scale; overflow: elide;
+            }
+        }
+    }
+}
+
 // Space hierarchy browsing and entry management for the active Space. The
 // window owns every property; this page presents them and reports input.
 // Nothing here claims a server result: pending, error and notice text come
@@ -119,6 +179,7 @@ export component SpaceManagerPage inherits VerticalLayout {
     in property <string> scope-key;
     in property <SpaceManagerView> view;
     in property <[SpaceRow]> rows;
+    in property <[SpacePick]> picks;
     in-out property <string> query;
     in-out property <string> target-input;
     in-out property <bool> target-suggested;
@@ -134,9 +195,12 @@ export component SpaceManagerPage inherits VerticalLayout {
     // 0 refresh, 1 load more, 2 find, 3 clear found, 4 add, 5 save,
     // 6 move up, 7 move down, 8 remove, 9 join, 10 open sub-Space, 11 stop read,
     // 12 create a room here, 13 back to the previous Space, 14 list an upgraded
-    // room's replacement in its place
+    // room's replacement in its place, 15 list your joined rooms, 16 add the
+    // picked rooms, 17 close that list
     callback action(int);
     callback select(string);
+    // Pick or unpick one listed joined room by its room ID.
+    callback pick(string);
     callback search-edited(string);
     callback choose-filter(int);
     callback close();
@@ -474,6 +538,51 @@ export component SpaceManagerPage inherits VerticalLayout {
                             label: "Find this room without joining it";
                             enabled: !root.view.busy && root.target-input != "";
                             activated => { root.action(2); }
+                        }
+                    }
+                    if !root.view.rooms-open : HorizontalLayout {
+                        alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Choose from your rooms…";
+                            label: "List the rooms and Spaces you have joined, to add several at once";
+                            enabled: !root.view.busy;
+                            activated => { root.action(15); }
+                        }
+                    }
+                    if root.view.rooms-open && root.picks.length == 0 : Text {
+                        text: "Every room you have joined is already listed here.";
+                        color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+                    }
+                    if root.view.rooms-open && root.picks.length > 0 : picks-list := ListView {
+                        height: min(220px, root.picks.length * max(30px, 20px * root.text-scale + 10px));
+                        horizontal-scrollbar-policy: always-off;
+                        for candidate in root.picks : SpacePickRow {
+                            width: picks-list.visible-width;
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: candidate.name;
+                            detail: candidate.detail;
+                            checked: candidate.picked;
+                            enabled: !root.view.busy;
+                            activated => { root.pick(candidate.key); }
+                        }
+                    }
+                    if root.view.rooms-open : HorizontalLayout {
+                        spacing: 5px; alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: root.view.picked == 1 ? "Add 1 room…" : "Add " + root.view.picked + " rooms…";
+                            label: "Review adding the picked rooms to the Space";
+                            primary: true;
+                            enabled: !root.view.busy && root.view.picked > 0;
+                            activated => { root.action(16); }
+                        }
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Close list";
+                            label: "Close the list of your rooms without adding any";
+                            enabled: !root.view.busy;
+                            activated => { root.action(17); }
                         }
                     }
                     if root.view.target != "" : Text {

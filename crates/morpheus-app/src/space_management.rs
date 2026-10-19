@@ -10,8 +10,9 @@ pub(crate) use ui::clear_presentation;
 use std::collections::{HashMap, HashSet};
 
 use morpheus_matrix::{
-    CreatedChild, HIERARCHY_MAX_DEPTH, NodeAccess, RoomAdminError, RoomMembership, RouteSource,
-    SpaceChildLink, SpaceNode, SpaceTarget, SpaceWriteOutcome, reorder_plan, valid_order,
+    CreatedChild, HIERARCHY_MAX_DEPTH, MAX_LINKS_AT_ONCE, NodeAccess, RoomAdminError,
+    RoomMembership, RouteSource, SpaceChildLink, SpaceNode, SpaceTarget, SpaceWriteOutcome,
+    reorder_plan, valid_order,
 };
 
 /// Rows the hierarchy view lists at once; search narrows the rest.
@@ -29,6 +30,11 @@ const UNLINK_BODY: &str =
 const JOIN_BODY: &str = "You join only this one, not the rest of the Space. Members can see it.";
 const MOVE_BODY: &str = "Everyone in the Space sees the new order.";
 const CREATE_BODY: &str = "Nobody else is invited, and nothing already in the Space changes.";
+pub(crate) const NOTHING_PICKED: &str = "Choose at least one room to add.";
+const LINK_MANY_BODY: &str = "Nobody joins them, and they stay in any other Spaces that list them. \
+     They are added one at a time, and the first failure stops the rest.";
+/// Rooms named in a confirmation for adding several; the rest are counted.
+const MAX_NAMED_ROOMS: usize = 8;
 const REPLACE_BODY: &str =
     "Nobody joins or leaves, and the old room keeps its history and stays in other Spaces.";
 
@@ -62,6 +68,7 @@ pub(crate) enum Reading {
     Refresh,
     More,
     Find,
+    Rooms,
 }
 
 pub(crate) fn reading_text(reading: Reading) -> &'static str {
@@ -70,6 +77,7 @@ pub(crate) fn reading_text(reading: Reading) -> &'static str {
         Reading::Refresh => "Refreshing the Space…",
         Reading::More => "Loading more of the Space…",
         Reading::Find => "Finding the room through your homeserver…",
+        Reading::Rooms => "Listing the rooms you have joined…",
     }
 }
 
@@ -79,6 +87,7 @@ pub(crate) fn stopped_text(reading: Reading) -> &'static str {
         Reading::Refresh => "Stopped refreshing. The list may be out of date.",
         Reading::More => "Stopped loading more. The entries already shown are kept.",
         Reading::Find => "Stopped finding the room. Nothing was added.",
+        Reading::Rooms => "Stopped listing your rooms. Nothing was added.",
     }
 }
 
@@ -352,6 +361,11 @@ pub(crate) enum Change {
         suggested: bool,
         order: Option<String>,
     },
+    /// Add several of the account's joined rooms, in the listed order.
+    LinkMany {
+        targets: Vec<SpaceTarget>,
+        suggested: bool,
+    },
     Update {
         link: SpaceChildLink,
         suggested: bool,
@@ -401,8 +415,8 @@ impl Intent {
                 plan.first().map_or("", |(link, _)| link.room_id.as_str())
             }
             Change::Join { room_id, .. } => room_id.as_str(),
-            // The room does not exist yet, so no row is marked.
-            Change::Create { .. } => "",
+            // New entries are not rows yet, so no row is marked.
+            Change::Create { .. } | Change::LinkMany { .. } => "",
         }
     }
     /// Every reviewed link is still listed unchanged by a fresher load.
@@ -413,7 +427,10 @@ impl Intent {
             | Change::Unlink { link }
             | Change::Replace { link, .. } => listed(link),
             Change::Reorder { plan, .. } => plan.iter().all(|(link, _)| listed(link)),
-            Change::Link { .. } | Change::Join { .. } | Change::Create { .. } => true,
+            Change::Link { .. }
+            | Change::LinkMany { .. }
+            | Change::Join { .. }
+            | Change::Create { .. } => true,
         }
     }
 }
@@ -464,6 +481,26 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
             }
             body.push(' ');
             body.push_str(&route_text(target));
+            Confirmation {
+                title: format!("Add {name} to {space}?"),
+                body,
+                action: "Add",
+                destructive: false,
+            }
+        }
+        Change::LinkMany { targets, suggested } => {
+            let named = targets.iter().take(MAX_NAMED_ROOMS).map(candidate_title);
+            let named = named.collect::<Vec<_>>().join(", ");
+            let mut body = format!("Members of {space} will see {named}");
+            let more = targets.len().saturating_sub(MAX_NAMED_ROOMS);
+            if more > 0 {
+                body.push_str(&format!(" and {more} more"));
+            }
+            body.push_str(&format!(" listed. {LINK_MANY_BODY}"));
+            if *suggested {
+                body.push_str(" They are suggested to members.");
+            }
+            body.push_str(" Route servers come from each room's members.");
             Confirmation {
                 title: format!("Add {name} to {space}?"),
                 body,
@@ -573,7 +610,7 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
 
 pub(crate) fn pending_text(intent: &Intent) -> String {
     let verb = match intent.change {
-        Change::Link { .. } => "Adding",
+        Change::Link { .. } | Change::LinkMany { .. } => "Adding",
         Change::Update { .. } => "Updating",
         Change::Unlink { .. } => "Removing",
         Change::Replace { .. } => "Replacing",
@@ -590,6 +627,9 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
     if let Change::Replace { .. } = intent.change {
         return replaced_text(name, &intent.space, outcome);
     }
+    if let Change::LinkMany { .. } = intent.change {
+        return linked_text(name, &intent.space, outcome);
+    }
     if let Some(error) = outcome.stopped {
         let (accepted, requested) = (outcome.accepted, outcome.requested);
         let reason = error_text(error);
@@ -602,6 +642,7 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
     }
     match intent.change {
         Change::Link { .. } => format!("Added {name}. The homeserver confirmed the link."),
+        Change::LinkMany { .. } => linked_text(name, &intent.space, outcome),
         Change::Update { .. } => format!("Updated {name}. The homeserver confirmed it."),
         Change::Unlink { .. } => format!("Removed the link to {name}; the room is unchanged."),
         Change::Replace { .. } => replaced_text(name, &intent.space, outcome),
@@ -609,6 +650,69 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
         Change::Join { .. } => format!("Joined {name}."),
         Change::Create { .. } => format!("Created {name}."),
     }
+}
+
+/// What adding several rooms did: each was added in order until the first
+/// failure, which is named.
+fn linked_text(name: &str, space: &str, outcome: SpaceWriteOutcome) -> String {
+    let (accepted, requested) = (outcome.accepted, outcome.requested);
+    if let Some(error) = outcome.stopped {
+        let reason = error_text(error);
+        return format!("{accepted} of {requested} rooms were added to {space}, then: {reason}");
+    }
+    if !outcome.confirmed {
+        return format!(
+            "The homeserver accepted the links for {name}, but reading them back differed."
+        );
+    }
+    format!("Added {name} to {space}. The homeserver confirmed each link.")
+}
+
+pub(crate) fn too_many_picked() -> String {
+    format!("Add at most {MAX_LINKS_AT_ONCE} rooms at a time.")
+}
+
+/// "1 room" or "N rooms", for a change of several.
+pub(crate) fn rooms_text(count: usize) -> String {
+    if count == 1 {
+        "1 room".to_owned()
+    } else {
+        format!("{count} rooms")
+    }
+}
+
+/// A joined room offered for adding: its sanitized name, else its ID.
+pub(crate) fn candidate_title(target: &SpaceTarget) -> String {
+    let id = crate::directory_plain_text(&target.room_id, MAX_NAME_CHARS);
+    let name = target.name.as_deref();
+    let name = name.map(|name| crate::directory_plain_text(name, MAX_NAME_CHARS));
+    name.filter(|name| !name.is_empty()).unwrap_or(id)
+}
+
+/// The secondary line of a joined room offered for adding.
+pub(crate) fn candidate_detail(target: &SpaceTarget) -> String {
+    let kind = if target.is_space == Some(true) {
+        "Space"
+    } else {
+        "Room"
+    };
+    let servers = crate::directory_plain_text(&target.via.join(", "), 120);
+    format!("{kind} · via {servers}")
+}
+
+/// Joined rooms the Space does not list directly yet, in the given order.
+pub(crate) fn candidates<'a>(
+    rooms: &'a [SpaceTarget],
+    direct: &[SpaceChildLink],
+) -> Vec<&'a SpaceTarget> {
+    let listed = direct
+        .iter()
+        .map(|link| link.room_id.as_str())
+        .collect::<HashSet<_>>();
+    rooms
+        .iter()
+        .filter(|room| !listed.contains(room.room_id.as_str()))
+        .collect()
 }
 
 /// What replacing an upgraded room did: the new room is listed first, so a
@@ -861,6 +965,47 @@ mod tests {
         let confirmation = confirmation(&intent);
         assert!(confirmation.destructive);
         assert!(confirmation.body.contains("Nobody leaves"));
+    }
+
+    #[test]
+    fn adding_several_rooms_is_reviewed_and_a_partial_result_names_the_failure() {
+        let intent = Intent {
+            change: Change::LinkMany {
+                targets: Vec::new(),
+                suggested: true,
+            },
+            name: rooms_text(3),
+            space: "Crew".to_owned(),
+        };
+        assert_eq!(rooms_text(1), "1 room");
+        // New entries are not rows yet, and links are refused if already live.
+        assert_eq!(intent.room_id(), "");
+        assert!(intent.still_matches(&[]));
+        let review = confirmation(&intent);
+        assert!(!review.destructive && review.title == "Add 3 rooms to Crew?");
+        assert!(review.body.contains("first failure stops the rest"));
+        assert!(review.body.contains("suggested to members"));
+        let pending = pending_text(&intent);
+        assert_eq!(pending, "Adding 3 rooms… Waiting for the homeserver.");
+        let all = SpaceWriteOutcome {
+            accepted: 3,
+            requested: 3,
+            confirmed: true,
+            stopped: None,
+        };
+        assert_eq!(
+            outcome_text(&intent, all),
+            "Added 3 rooms to Crew. The homeserver confirmed each link."
+        );
+        let partial = SpaceWriteOutcome {
+            accepted: 1,
+            confirmed: false,
+            stopped: Some(RoomAdminError::Forbidden),
+            ..all
+        };
+        let text = outcome_text(&intent, partial);
+        assert!(text.starts_with("1 of 3 rooms were added to Crew, then:"));
+        assert!(too_many_picked().contains(&MAX_LINKS_AT_ONCE.to_string()));
     }
 
     #[test]
