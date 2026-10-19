@@ -18,8 +18,8 @@ export struct SettingsResult {
     label: string,
     breadcrumb: string,
     description: string,
-    // The config.toml key the result edits, such as `typography.sender_size`;
-    // empty for a section. Registry text, never a file path.
+    // The config.toml key the result edits, such as `typography.sender_size`, or
+    // the keys a section edits; empty when not listed. Registry text, never a path.
     key: string,
 }
 
@@ -1660,7 +1660,7 @@ component SettingsSearchBar inherits VerticalLayout {
                 accessible-label: "Search settings";
                 accessible-description: root.open && root.results.length > 0 && root.index >= 0 && root.index < root.results.length
                     ? root.results[root.index].label + ", " + root.results[root.index].breadcrumb
-                        + (root.results[root.index].key != "" ? ", key " + root.results[root.index].key : "")
+                        + (root.results[root.index].key != "" ? ", in config.toml " + root.results[root.index].key : "")
                     : root.can-return ? "Press Down to show the results again" : "";
                 edited => { root.search(self.text); }
                 accepted => { root.pick(); }
@@ -1705,7 +1705,7 @@ component SettingsSearchBar inherits VerticalLayout {
             min-height: max(44px, label-text.preferred-height + trail-text.preferred-height + 14px
                 + (result.key != "" ? key-text.preferred-height + 2px : 0px));
             label: result.label + ", " + result.breadcrumb + ". " + result.description
-                + (result.key != "" ? " Key " + result.key + " in config.toml." : "");
+                + (result.key != "" ? " In config.toml: " + result.key + "." : "");
             background: i == root.index ? root.hover-surface
                 : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface) : transparent;
             border-radius: StyleTokens.radius * 0.6;

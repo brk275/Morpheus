@@ -95,9 +95,10 @@ rearrange at narrow widths and large text. **Edit colors**, **Edit sizes and
 shapes** and **Edit base palette** below it jump to the detailed editors.
 
 Settings search (`Mod+Shift+F`) finds sections, every color token and every
-size or shape metric. Color and metric results show their `config.toml` key,
-such as `colors.link` or `typography.sender_size`; typing a key as shown, or
-a part of it such as `sender_size`, finds its field. Choosing a result focuses that exact field;
+size or shape metric. Results show the `config.toml` keys they edit, such as
+`colors.link`, `typography.sender_size` or, for Fonts, the three font keys;
+typing a key as shown, or a part of a metric key such as `sender_size`, finds
+its field or section. Choosing a result focuses that exact field;
 **Back to results**, Down in the search field or `Mod+Shift+F` brings the
 same results back. Each color and metric editor has its own Reset and Undo.
 

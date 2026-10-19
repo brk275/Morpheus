@@ -2265,7 +2265,7 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     let key_note = if last.key.is_empty() {
         String::new()
     } else {
-        format!(" Key {} in config.toml.", last.key)
+        format!(" In config.toml: {}.", last.key)
     };
     let row = control_with_label(
         ui,

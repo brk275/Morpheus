@@ -4,7 +4,7 @@
 //! accounts on a safe control. Searching never changes a setting, and no
 //! result routes to a URL, a path or an action.
 
-use morpheus_config::registry::{self, AccountsFocus, Requirement, Route, SearchHit};
+use morpheus_config::registry::{self, AccountsFocus, Requirement, Route, SearchHit, SettingTarget};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use super::{AppWindow, SettingsResult};
@@ -46,12 +46,75 @@ fn search_query(query: &str) -> String {
         .join(" ")
 }
 
+/// The `config.toml` keys a Settings section edits, for sections whose keys
+/// are unambiguous. Results show them, and typing one finds its section. A
+/// unit test keeps every ID and key in the registry.
+const SECTION_KEYS: &[(&str, &[&str])] = &[
+    ("appearance.window_opacity", &["window.opacity_percent"]),
+    ("appearance.base_palette", &["appearance.theme", "appearance.theme_pack"]),
+    ("appearance.reduce_motion", &["appearance.reduce_motion"]),
+    ("appearance.hover_duration", &["appearance.hover_duration_ms"]),
+    (
+        "appearance.fonts",
+        &[
+            "appearance.font_family",
+            "typography.message_font_family",
+            "typography.monospace_font_family",
+        ],
+    ),
+    ("appearance.message_size", &["typography.message_size"]),
+    ("appearance.sender_weight", &["typography.sender_weight"]),
+    ("appearance.room_header", &["conversation.header"]),
+    ("appearance.message_layout", &["chat.layout"]),
+    (
+        "appearance.timestamps",
+        &[
+            "chat.timestamp_format",
+            "chat.timestamp_brackets",
+            "chat.timestamp_width",
+        ],
+    ),
+    ("appearance.geometry", &["geometry.corner_radius"]),
+    ("appearance.spacing", &["geometry.message_gap", "geometry.content_padding"]),
+    ("appearance.rail_width", &["geometry.rail_width"]),
+    ("appearance.font_scale", &["appearance.scale_percent"]),
+    ("appearance.sender_colors", &["senders.colors"]),
+    ("layout.unread_first", &["layout.sort_unread_first"]),
+    ("notifications.desktop", &["notifications.enabled"]),
+    ("notifications.previews", &["notifications.show_message_preview"]),
+    ("notifications.highlights", &["notifications.highlight_words"]),
+    ("media.audio_devices", &["media.microphone_device", "media.speaker_device"]),
+    ("media.image_previews", &["media.previews_in_encrypted_rooms"]),
+];
+
+fn section_keys(id: &str) -> &'static [&'static str] {
+    SECTION_KEYS
+        .iter()
+        .find(|(section, _)| *section == id)
+        .map(|&(_, keys)| keys)
+        .unwrap_or(&[])
+}
+
+/// The section whose `config.toml` key is exactly `query`, if any.
+fn section_for_key(query: &str) -> Option<&'static SettingTarget> {
+    let query = query.trim();
+    SECTION_KEYS
+        .iter()
+        .find(|(_, keys)| keys.iter().any(|key| key.eq_ignore_ascii_case(query)))
+        .and_then(|(id, _)| registry::setting_target(id))
+}
+
 fn show_results(ui: &AppWindow, query: &str) {
-    let results: Vec<SettingsResult> =
-        registry::search(&search_query(query), |requirement| available(ui, requirement))
-            .into_iter()
-            .map(result_item)
-            .collect();
+    let mut hits = registry::search(&search_query(query), |requirement| available(ui, requirement));
+    // A typed section key leads with its section.
+    if let Some(target) = section_for_key(query)
+        .filter(|target| available(ui, target.requires))
+        .filter(|target| !hits.iter().any(|hit| hit.id() == target.id))
+    {
+        hits.insert(0, SearchHit::Setting(target));
+        hits.truncate(registry::MAX_SEARCH_RESULTS);
+    }
+    let results: Vec<SettingsResult> = hits.into_iter().map(result_item).collect();
     ui.set_settings_search_index(if results.is_empty() { -1 } else { 0 });
     ui.set_settings_search_results(ModelRc::new(VecModel::from(results)));
     ui.set_settings_search_dismissed(false);
@@ -64,8 +127,8 @@ fn result_item(hit: SearchHit) -> SettingsResult {
             label: target.label.into(),
             breadcrumb: target.breadcrumb.into(),
             description: target.description.into(),
-            // A section can hold several keys; its controls name them.
-            key: SharedString::new(),
+            // Empty for a section whose keys are not listed.
+            key: section_keys(target.id).join(", ").into(),
         },
         SearchHit::Color(token) => SettingsResult {
             id: hit.id().into(),
@@ -173,6 +236,31 @@ mod tests {
 
         let section = registry::setting_target("appearance.colors").expect("the colors section");
         assert!(result_item(SearchHit::Setting(section)).key.is_empty());
+        let fonts = registry::setting_target("appearance.fonts").expect("the fonts section");
+        assert_eq!(
+            result_item(SearchHit::Setting(fonts)).key,
+            "appearance.font_family, typography.message_font_family, typography.monospace_font_family"
+        );
+    }
+
+    #[test]
+    fn listed_section_keys_are_registry_keys_and_find_their_section() {
+        for (id, keys) in SECTION_KEYS {
+            assert!(registry::setting_target(id).is_some(), "{id} is not a setting target");
+            assert!(!keys.is_empty(), "{id} lists no key");
+            for key in *keys {
+                assert!(
+                    registry::FIELDS.iter().any(|field| field.key == *key),
+                    "{key} of {id} is not a registry key"
+                );
+                assert_eq!(section_for_key(key).map(|target| target.id), Some(*id));
+            }
+        }
+        assert_eq!(
+            section_for_key(" Typography.Message_Size ").map(|target| target.id),
+            Some("appearance.message_size")
+        );
+        assert!(section_for_key("typography").is_none());
     }
 
     #[test]

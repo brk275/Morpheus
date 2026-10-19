@@ -305,8 +305,11 @@ dialog's close action; removal is never focused, and every action still needs
 its own activation and confirmation. Search never changes a setting or runs
 an action. Security & recovery is offered only while signed in.
 
-Color and metric results also show and announce their `config.toml` key
-(`colors.<token>` or the metric's field key); sections show none. Once a
+Results also show and announce the `config.toml` keys they edit:
+`colors.<token>`, a metric's field key, or the keys of a section whose keys
+are unambiguous (fonts, sizes, timestamps, geometry, notifications, audio
+devices and others; listed in `settings_search.rs` and checked against the
+registry). Typing such a key exactly puts its section first. Once a
 result is chosen its list is hidden; **Back to results** below the field,
 Down in the field or the Search Settings shortcut shows the same results
 again with the same highlight, without retyping.
