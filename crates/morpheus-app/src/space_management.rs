@@ -38,6 +38,8 @@ pub(crate) enum Filter {
     Joined,
     NotJoined,
     Spaces,
+    /// Links the Space suggests to its members.
+    Suggested,
 }
 
 impl Filter {
@@ -46,6 +48,7 @@ impl Filter {
             1 => Self::Joined,
             2 => Self::NotJoined,
             3 => Self::Spaces,
+            4 => Self::Suggested,
             _ => Self::All,
         }
     }
@@ -163,7 +166,7 @@ pub(crate) fn visible<'a>(
     let mut total = 0;
     for row in rows {
         let node = row.node.map(|index| &nodes[index]);
-        if !admits(filter, node) || !matches_query(&row.link.room_id, node, &needle) {
+        if !admits(filter, row, node) || !matches_query(&row.link.room_id, node, &needle) {
             continue;
         }
         total += 1;
@@ -174,13 +177,14 @@ pub(crate) fn visible<'a>(
     (shown, total)
 }
 
-fn admits(filter: Filter, node: Option<&SpaceNode>) -> bool {
+fn admits(filter: Filter, row: &Row, node: Option<&SpaceNode>) -> bool {
     let joined = node.is_some_and(|node| node.membership == Some(RoomMembership::Joined));
     match filter {
         Filter::All => true,
         Filter::Joined => joined,
         Filter::NotJoined => !joined,
         Filter::Spaces => node.is_some_and(|node| node.is_space),
+        Filter::Suggested => row.link.suggested,
     }
 }
 
@@ -789,6 +793,13 @@ mod tests {
         assert_eq!(others[0].link.room_id, b);
         let (found, _) = visible(&rows, &nodes, "!C:EXAMPLE", Filter::All);
         assert_eq!(found.len(), 1);
+        assert_eq!(visible(&rows, &nodes, "", Filter::Suggested).1, 0);
+        let mut suggested = nodes.clone();
+        suggested[1].children[0].suggested = true;
+        let rows = super::rows(SPACE, &suggested);
+        let (shown, total) = visible(&rows, &suggested, "", Filter::Suggested);
+        assert_eq!((shown[0].link.room_id.as_str(), total), (b, 1));
+        assert_eq!(Filter::from_index(4), Filter::Suggested);
     }
 
     #[test]

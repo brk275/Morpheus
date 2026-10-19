@@ -36,7 +36,7 @@ export struct SpaceManagerView {
     busy: bool,
     can-manage: bool,
     has-more: bool,
-    // 0 all, 1 joined, 2 not joined, 3 Spaces
+    // 0 all, 1 joined, 2 not joined, 3 Spaces, 4 suggested
     filter: int,
     permission: string,
     summary: string,
@@ -242,7 +242,7 @@ export component SpaceManagerPage inherits VerticalLayout {
             HorizontalLayout {
                 spacing: 3px;
                 height: max(26px, 18px * root.text-scale + 8px);
-                for chip[index] in ["All", "Joined", "Not joined", "Spaces"] : RosterAction {
+                for chip[index] in ["All", "Joined", "Not joined", "Spaces", "Suggested"] : RosterAction {
                     horizontal-stretch: 1;
                     border-radius: 6px;
                     border-width: 1px;
