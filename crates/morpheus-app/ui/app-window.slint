@@ -3001,11 +3001,26 @@ export component AppWindow inherits Window {
     // is hidden. Keep navigation recovery beside the account in that case.
     property <bool> account-toolbar: !root.account-column && root.pane-rail-w == 0px;
     property <length> account-toolbar-height: root.account-toolbar ? 44px * root.text-scale : 0px;
-    property <length> pane-rail-w0: root.navigation-mode == 0 && !root.pane-spaces-hidden ? root.rail-width-px * 1px : 0px;
+    // An explicit Thread/Members/Search/Pins/Transfers request temporarily
+    // reveals its destination even if the saved layout hides or collapses it.
+    // It never edits that saved layout, and ends on close/account/config change.
+    in-out property <bool> details-reveal-open: false;
+    property <bool> details-reveal-active: root.details-reveal-open && root.show-side-panel && root.page == 0;
+    property <length> pane-rail-saved: root.navigation-mode == 0 && !root.pane-spaces-hidden ? root.rail-width-px * 1px : 0px;
     property <length> pane-rooms-full: root.room-list-width * 1px;
-    property <length> pane-rooms-w0: root.pane-rooms-hidden ? 0px : root.pane-rooms-collapsed ? root.pane-strip : root.pane-rooms-full;
-    property <bool> pane-details-open: root.show-side-panel && root.page == 0 && !root.pane-details-hidden;
-    property <length> pane-details-w0: !root.pane-details-open ? 0px : root.pane-details-collapsed ? root.pane-strip : root.details-width * 1px;
+    property <length> pane-rooms-saved: root.pane-rooms-hidden ? 0px : root.pane-rooms-collapsed ? root.pane-strip : root.pane-rooms-full;
+    property <length> details-reveal-width: min(root.details-width * 1px, max(0px, root.width - root.account-column-width - root.pane-conversation-min));
+    property <length> details-reveal-room-budget: max(0px, root.width - root.account-column-width - root.pane-conversation-min - root.details-reveal-width);
+    property <length> pane-rooms-w0: !root.details-reveal-active ? root.pane-rooms-saved
+        : root.details-reveal-room-budget >= root.pane-rooms-saved ? root.pane-rooms-saved
+        : root.pane-rooms-saved > 0px && root.details-reveal-room-budget >= root.pane-strip ? root.pane-strip : 0px;
+    property <length> pane-rail-w0: !root.details-reveal-active || root.details-reveal-room-budget - root.pane-rooms-w0 >= root.pane-rail-saved ? root.pane-rail-saved : 0px;
+    property <bool> pane-details-open: root.show-side-panel && root.page == 0 && (!root.pane-details-hidden || root.details-reveal-active);
+    property <length> pane-details-w0: !root.pane-details-open ? 0px : root.details-reveal-active ? root.details-reveal-width
+        : root.pane-details-collapsed ? root.pane-strip : root.details-width * 1px;
+    changed show-side-panel => {
+        if !root.show-side-panel { root.details-reveal-open = false; }
+    }
     // The room list leads when only the Space rail may come before it.
     property <bool> pane-rooms-leads: root.pane-slot-rooms < root.pane-slot-conversation && root.pane-slot-rooms < root.pane-slot-details;
     property <bool> pane-column0: !(root.pane-rooms-leads && root.pane-rooms-w0 == root.pane-rooms-full);
@@ -3613,6 +3628,7 @@ export component AppWindow inherits Window {
     public function show-thread-panel() {
         root.page = 0;
         root.show-side-panel = true;
+        root.details-reveal-open = true;
         root.side-panel-tab = 1;
     }
     // Presentation only: show the pinned-messages tab of the side panel.
@@ -3620,12 +3636,14 @@ export component AppWindow inherits Window {
         if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
         root.page = 0;
         root.show-side-panel = true;
+        root.details-reveal-open = true;
         root.side-panel-tab = 3;
     }
     callback focus-room-search();
     focus-room-search => {
         root.page = 0;
         root.show-side-panel = true;
+        root.details-reveal-open = true;
         root.side-panel-tab = 2;
         root.search-focus-request += 1;
     }
@@ -3640,6 +3658,7 @@ export component AppWindow inherits Window {
     public function show-members-panel() {
         root.page = 0;
         root.show-side-panel = true;
+        root.details-reveal-open = true;
         root.side-panel-tab = 0;
     }
     // Presentation only: show the transfers tab of the side panel and focus
@@ -3649,6 +3668,7 @@ export component AppWindow inherits Window {
         root.transfer-focus-pending = true;
         root.page = 0;
         root.show-side-panel = true;
+        root.details-reveal-open = true;
         root.side-panel-tab = 4;
     }
     // Opens the menu and focuses its trigger; each entry keeps its own
@@ -3814,6 +3834,7 @@ export component AppWindow inherits Window {
     out property <int> side-panel-tab: 0;
     in-out property <int> page: 0; // 0 chat, 1 settings, 2 call stage
     changed page => {
+        if root.page != 0 { root.details-reveal-open = false; }
         root.cancel-room-settings();
         root.close-image-preview();
         if root.page != 1 {
@@ -3963,6 +3984,7 @@ export component AppWindow inherits Window {
         if root.room-admin-mode != 0 { root.cancel-room-settings(); }
     }
     changed active-account-local-id => {
+        root.details-reveal-open = false;
         root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {

@@ -202,6 +202,12 @@ and focus survive any change. Dialogs, call indicators and security, recovery
 and password screens are not part of any pane and are never hidden. An invalid
 edit is rejected and the last valid arrangement stays in effect.
 
+Opening a thread, members, search, pins or transfers explicitly reveals that
+panel for the current view even when the saved layout hides or collapses it.
+At narrow widths, navigation panes temporarily give way so the requested panel
+and conversation remain usable. Closing the panel, changing accounts or
+applying a configuration ends the temporary reveal; the TOML file is unchanged.
+
 ## Keyboard shortcuts
 
 **Settings → Keyboard shortcuts** lists every action with its combination and

@@ -5,8 +5,10 @@
 //! The window keeps one element per pane and only places it (see
 //! `pane-x` and the `pane-*-w` properties in app-window.slint), so a change
 //! never re-creates a timeline, composer, scroll position or focus. The
-//! geometry rules are written once here as `arrange`, which the window
-//! mirrors and the tests below pin down:
+//! saved-layout geometry is described here by `arrange`, mirrored by the
+//! window and pinned by the tests below. Explicit panel navigation temporarily
+//! prioritizes its destination in the window; generated-UI tests cover that
+//! separate presentation path without changing the stored arrangement:
 //!
 //! - Every pane appears exactly once; the conversation is never hidden.
 //! - A window narrower than the saved panes gives way in a fixed order: the
@@ -73,7 +75,10 @@ fn index(pane: PaneId) -> usize {
 }
 
 fn slot(order: &[PaneId; 4], pane: PaneId) -> usize {
-    order.iter().position(|candidate| *candidate == pane).unwrap_or(0)
+    order
+        .iter()
+        .position(|candidate| *candidate == pane)
+        .unwrap_or(0)
 }
 
 /// The reference geometry; app-window.slint computes the same values.
@@ -148,8 +153,7 @@ pub(crate) fn register(ui: &AppWindow, store: &ConfigStore) {
     ui.on_move_pane(move |pane, delta| move_pane(pane.as_str(), delta));
     let set_hidden = edit(|layout, pane, hidden| set_hidden(layout, pane, hidden != 0));
     ui.on_set_pane_hidden(move |pane, hidden| set_hidden(pane.as_str(), i32::from(hidden)));
-    let set_collapsed =
-        edit(|layout, pane, collapsed| set_collapsed(layout, pane, collapsed != 0));
+    let set_collapsed = edit(|layout, pane, collapsed| set_collapsed(layout, pane, collapsed != 0));
     ui.on_set_pane_collapsed(move |pane, collapsed| {
         set_collapsed(pane.as_str(), i32::from(collapsed));
     });
@@ -175,6 +179,9 @@ pub(crate) fn register(ui: &AppWindow, store: &ConfigStore) {
 /// Project an accepted configuration's arrangement into the window.
 pub(crate) fn apply_config(ui: &AppWindow, config: &Config) {
     let layout = &config.layout;
+    // A new accepted config ends temporary explicit-open presentation. The
+    // saved hide/collapse choices remain authoritative after an edit/reload.
+    ui.set_details_reveal_open(false);
     let order = layout.effective_pane_order();
     let slot_of = |pane| i32::try_from(slot(&order, pane)).unwrap_or(0);
     ui.set_pane_slot_spaces(slot_of(PaneId::Spaces));
@@ -232,7 +239,9 @@ fn set_hidden(layout: &mut Layout, id: &str, hidden: bool) -> bool {
     }
     if hidden {
         layout.hidden_panes.push(pane);
-        layout.collapsed_panes.retain(|collapsed| *collapsed != pane);
+        layout
+            .collapsed_panes
+            .retain(|collapsed| *collapsed != pane);
     } else {
         layout.hidden_panes.retain(|shown| *shown != pane);
     }
@@ -367,7 +376,10 @@ mod tests {
         };
         for pane in input.order {
             let at = index(pane);
-            assert_eq!(arrangement.x[at], edge, "{pane:?} starts where the last ended");
+            assert_eq!(
+                arrangement.x[at], edge,
+                "{pane:?} starts where the last ended"
+            );
             edge += arrangement.width[at];
         }
         assert!(edge <= input.window.max(CONVERSATION_MIN) + 0.5);
@@ -377,7 +389,10 @@ mod tests {
     fn the_default_arrangement_matches_the_classic_layout() {
         let input = input(STANDARD, 1310.0);
         let shown = arrange(input);
-        assert!(!shown.account_column, "the account control sits in the room list");
+        assert!(
+            !shown.account_column,
+            "the account control sits in the room list"
+        );
         assert_eq!(shown.width, [70.0, 260.0, 680.0, 300.0]);
         assert_eq!(shown.x, [0.0, 70.0, 330.0, 1010.0]);
         assert_eq!((shown.account_x, shown.account_width), (70.0, 260.0));
@@ -404,7 +419,10 @@ mod tests {
         assert!(shown.width[index(PaneId::Conversation)] >= CONVERSATION_MIN - 0.5);
         // The room list gave way, so the account control has its column.
         assert!(shown.account_column);
-        assert_eq!((shown.account_x, shown.account_width), (0.0, ACCOUNT_COLUMN));
+        assert_eq!(
+            (shown.account_x, shown.account_width),
+            (0.0, ACCOUNT_COLUMN)
+        );
         every_pane_once_without_overlap(&shown, &tight);
     }
 
@@ -412,9 +430,24 @@ mod tests {
     fn the_account_control_stays_bottom_left_in_every_arrangement() {
         let orders = [
             STANDARD,
-            [PaneId::Conversation, PaneId::Details, PaneId::Rooms, PaneId::Spaces],
-            [PaneId::Details, PaneId::Conversation, PaneId::Spaces, PaneId::Rooms],
-            [PaneId::Rooms, PaneId::Spaces, PaneId::Conversation, PaneId::Details],
+            [
+                PaneId::Conversation,
+                PaneId::Details,
+                PaneId::Rooms,
+                PaneId::Spaces,
+            ],
+            [
+                PaneId::Details,
+                PaneId::Conversation,
+                PaneId::Spaces,
+                PaneId::Rooms,
+            ],
+            [
+                PaneId::Rooms,
+                PaneId::Spaces,
+                PaneId::Conversation,
+                PaneId::Details,
+            ],
         ];
         for order in orders {
             for rooms in [260.0, STRIP, 0.0] {
@@ -491,6 +524,9 @@ mod tests {
         let rows = editor_rows(&layout);
         assert_eq!(rows.len(), 4);
         assert!(!rows[0].can_move_up && !rows[3].can_move_down);
-        assert!(rows.iter().any(|row| row.id == "conversation" && !row.can_hide));
+        assert!(
+            rows.iter()
+                .any(|row| row.id == "conversation" && !row.can_hide)
+        );
     }
 }

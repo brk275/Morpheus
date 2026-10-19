@@ -5689,6 +5689,48 @@ async fn assert_layout_navigation_recovery(ui: &AppWindow, directory: &std::path
         assert!(store.load().unwrap().layout.hidden_panes.is_empty());
         assert!(!ui.get_layout_customized());
     }
+    // Explicit panel navigation must still reach a details pane hidden by
+    // TOML, including the responsive fallback at the minimum window width.
+    let size = ui.window().size();
+    for width in [1310.0, 640.0] {
+        let mut config = Config::default();
+        config.layout.hidden_panes = vec![PaneId::Details];
+        store.save(&config).unwrap();
+        let saved = std::fs::read(store.path()).unwrap();
+        apply_config(ui, &config, None);
+        ui.window().set_size(slint::LogicalSize::new(width, 820.0));
+        ui.set_page(0);
+        settle(ui).await;
+        assert_eq!(ui.get_pane_details_w(), 0.0);
+        ui.invoke_show_thread_panel();
+        settle(ui).await;
+        assert!(ui.get_pane_details_w() >= 200.0);
+        assert!(ui.get_pane_conversation_w() >= 360.0);
+        ui.set_show_side_panel(false);
+        settle(ui).await;
+        assert!(!ui.get_details_reveal_open());
+        assert_eq!(ui.get_pane_details_w(), 0.0);
+        ui.invoke_show_transfer_panel();
+        settle(ui).await;
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+        settle(ui).await;
+        assert!(ui.get_pane_details_w() >= 200.0);
+        assert!(focused_control_has_label(
+            ui,
+            &format!("Transfers: {}", ui.get_transfer_summary())
+        ));
+        assert_eq!(
+            std::fs::read(store.path()).unwrap(),
+            saved,
+            "explicit navigation must not rewrite the saved layout"
+        );
+        // A new accepted configuration ends the temporary reveal too.
+        apply_config(ui, &config, None);
+        settle(ui).await;
+        assert!(!ui.get_details_reveal_open());
+        assert_eq!(ui.get_pane_details_w(), 0.0);
+    }
+    ui.window().set_size(size);
     apply_config(ui, &Config::default(), None);
     ui.set_page(page);
     settle(ui).await;
