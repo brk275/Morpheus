@@ -171,6 +171,16 @@ fn plain_label(value: &str, limit: usize) -> String {
         .collect()
 }
 
+/// How a person flow names the other person: their display name with the
+/// Matrix ID it belongs to, because display names are not unique.
+fn peer_label(name: &str, user_id: &str) -> String {
+    if name.is_empty() || name == user_id {
+        user_id.to_owned()
+    } else {
+        format!("{name} ({user_id})")
+    }
+}
+
 fn comparison_labels(presentation: SasPresentation) -> Option<(String, String)> {
     let emoji = presentation
         .emoji
@@ -347,6 +357,7 @@ pub(crate) fn request_user(
     if account_id.is_empty() || user_id.is_empty() {
         return;
     }
+    let name = peer_label(&name, &user_id);
     let operation = next_operation(ui);
     ui.set_sas_busy(true);
     ui.set_sas_incoming_loading(false);
@@ -411,6 +422,7 @@ pub(crate) fn accept_person(
     if account_id.is_empty() || user_id.is_empty() || flow_id.is_empty() {
         return;
     }
+    let name = peer_label(&name, &user_id);
     let operation = next_operation(ui);
     ui.set_sas_busy(true);
     ui.set_sas_error("".into());
@@ -1060,6 +1072,14 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
 mod tests {
     use super::*;
     use morpheus_matrix::SasEmojiInfo;
+
+    #[test]
+    fn person_flows_show_the_matrix_id_beside_the_display_name() {
+        let id = "@jordan:example.org";
+        assert_eq!(peer_label("Jordan", id), format!("Jordan ({id})"));
+        assert_eq!(peer_label("", id), id);
+        assert_eq!(peer_label(id, id), id);
+    }
 
     #[test]
     fn comparison_requires_values_and_sanitizes_labels() {

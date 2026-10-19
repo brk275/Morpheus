@@ -349,6 +349,8 @@ export component PersonVerificationBanner inherits Rectangle {
     in property <float> text-scale: 1;
     // Display name, or the user ID when the person has none.
     in property <string> name;
+    // Their Matrix ID, shown beside the name since names are not unique.
+    in property <string> user-id;
     in property <bool> can-review: true;
     // A decline is being sent; its failure text, if any.
     in property <bool> busy;
@@ -367,7 +369,8 @@ export component PersonVerificationBanner inherits Rectangle {
         padding-bottom: 4px;
         spacing: 8px;
         Text {
-            text: root.name + " wants to verify identities with you. Review only if you expected this."
+            text: root.name + (root.user-id != "" && root.user-id != root.name ? " (" + root.user-id + ")" : "")
+                + " wants to verify identities with you. Review only if you expected this."
                 + (root.error != "" ? " " + root.error : "");
             color: root.palette.ink;
             font-size: 11px * root.text-scale;
