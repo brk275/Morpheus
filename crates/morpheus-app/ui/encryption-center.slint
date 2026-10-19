@@ -379,6 +379,49 @@ export component PersonVerificationBanner inherits Rectangle {
     }
 }
 
+// Asks to finish securing this device. Set up only opens Security settings;
+// nothing is verified, recovered or reset from here.
+export component DeviceSetupBanner inherits Rectangle {
+    in property <EncryptionPalette> palette;
+    in property <float> text-scale: 1;
+    // 1: this device is not verified; 2: recovery is incomplete here.
+    in property <int> need;
+    callback set-up();
+    callback dismiss();
+
+    background: root.palette.panel;
+    height: row.preferred-height;
+
+    row := HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        spacing: 8px;
+        Text {
+            text: root.need == 1
+                ? "This device isn't verified yet. Verify it from another device or enter your recovery key to read encrypted messages."
+                : "Enter your recovery key to finish setting up encrypted history on this device.";
+            color: root.palette.ink;
+            font-size: 11px * root.text-scale;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        Button {
+            text: "Set up";
+            accessible-label: root.need == 1 ? "Verify this device in Security settings" : "Enter your recovery key in Security settings";
+            clicked => { root.set-up(); }
+        }
+        Button {
+            text: "Not now";
+            accessible-label: "Hide this device security notice";
+            clicked => { root.dismiss(); }
+        }
+    }
+}
+
 // Warns that a member of the open room has a changed identity. Accepting a
 // changed identity or withdrawing a lost verification is the person's
 // explicit choice; there is no dismiss, because the warning stays until the

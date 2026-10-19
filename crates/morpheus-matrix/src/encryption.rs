@@ -10,6 +10,7 @@ use futures_util::{StreamExt, stream::BoxStream};
 use matrix_sdk::{
     Client, Room, RoomMemberships,
     encryption::{
+        VerificationState,
         recovery::RecoveryState,
         verification::{SasVerification, VerificationRequest},
     },
@@ -73,6 +74,33 @@ impl Drop for PersonRequestWatch {
         if let Some(handler) = self.handler.take() {
             self.client.remove_event_handler(handler);
         }
+    }
+}
+
+/// What this device still needs before it can read encrypted history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceSetupNeed {
+    /// Nothing, or the state is not known yet.
+    None,
+    /// This device is not verified: verify it from another device or enter
+    /// the recovery key.
+    Verify,
+    /// This device is verified, but recovery is incomplete here.
+    EnterRecoveryKey,
+}
+
+enum DeviceStateChange {
+    Verification(VerificationState),
+    Recovery(RecoveryState),
+}
+
+fn device_setup_need(verification: VerificationState, recovery: RecoveryState) -> DeviceSetupNeed {
+    match (verification, recovery) {
+        (VerificationState::Unverified, _) => DeviceSetupNeed::Verify,
+        (VerificationState::Verified, RecoveryState::Incomplete) => {
+            DeviceSetupNeed::EnterRecoveryKey
+        }
+        _ => DeviceSetupNeed::None,
     }
 }
 
@@ -490,6 +518,34 @@ impl AccountManager {
             .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
     }
 
+    /// Follow what this device still needs (verification, or the recovery
+    /// key) through the SDK's state subscribers: the current need first,
+    /// then every change. Nothing is changed here.
+    pub async fn watch_device_setup_for(
+        &self,
+        expected_account_id: &str,
+    ) -> Result<BoxStream<'static, DeviceSetupNeed>> {
+        let client = self.encryption_client_for(expected_account_id).await?;
+        let encryption = client.encryption();
+        let verification = encryption
+            .verification_state()
+            .map(DeviceStateChange::Verification);
+        let recovery = encryption
+            .recovery()
+            .state_stream()
+            .map(DeviceStateChange::Recovery);
+        let changes = futures_util::stream::select(verification, recovery);
+        let start = (VerificationState::Unknown, RecoveryState::Unknown);
+        let needs = changes.scan(start, |latest, change| {
+            match change {
+                DeviceStateChange::Verification(state) => latest.0 = state,
+                DeviceStateChange::Recovery(state) => latest.1 = state,
+            }
+            std::future::ready(Some(device_setup_need(latest.0, latest.1)))
+        });
+        Ok(needs.boxed())
+    }
+
     /// Request progress plus the reason a cancelled flow stopped, so the UI
     /// can say whether it timed out, was declined or the values differed.
     pub async fn verification_outcome_for(
@@ -664,6 +720,26 @@ mod tests {
             (CancelCode::UnknownMethod, VerificationCancelKind::Other),
         ] {
             assert_eq!(cancel_kind(&code), kind, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn device_setup_asks_only_for_what_this_device_still_needs() {
+        use DeviceSetupNeed::{EnterRecoveryKey, Verify};
+        use RecoveryState::{Disabled, Enabled, Incomplete, Unknown};
+
+        let ready = DeviceSetupNeed::None;
+        let unverified = VerificationState::Unverified;
+        for recovery in [Unknown, Enabled, Disabled, Incomplete] {
+            assert_eq!(device_setup_need(unverified, recovery), Verify);
+            // Nothing is asked while the device state is still loading.
+            let checking = device_setup_need(VerificationState::Unknown, recovery);
+            assert_eq!(checking, ready, "{recovery:?}");
+        }
+        let verified = VerificationState::Verified;
+        assert_eq!(device_setup_need(verified, Incomplete), EnterRecoveryKey);
+        for recovery in [Unknown, Enabled, Disabled] {
+            assert_eq!(device_setup_need(verified, recovery), ready);
         }
     }
 

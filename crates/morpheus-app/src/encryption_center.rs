@@ -113,6 +113,7 @@ pub(crate) fn clear_ui(ui: &AppWindow) {
     crate::device_sessions::clear_ui(ui);
     crate::identity_warnings::clear_ui(ui);
     crate::person_requests::clear_ui(ui);
+    crate::device_setup::clear_ui(ui);
 }
 
 fn publish_incoming(weak: &Weak<AppWindow>, account_id: &str, flow_id: String) {
@@ -218,6 +219,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     crate::device_sessions::register(ui, live.clone(), handle.clone());
     crate::identity_warnings::register(ui, live.clone(), handle.clone());
     crate::person_requests::register(ui, live.clone(), handle.clone());
+    crate::device_setup::register(ui, live.clone(), handle.clone());
     let weak = ui.as_weak();
     let refresh_live = live.clone();
     let refresh_handle = handle.clone();

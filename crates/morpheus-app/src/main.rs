@@ -14,6 +14,7 @@ mod calls;
 mod composer_mentions;
 mod config_cli;
 mod device_sessions;
+mod device_setup;
 mod draft_recovery;
 mod drafts;
 mod encryption_center;

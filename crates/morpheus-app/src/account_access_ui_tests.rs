@@ -2683,6 +2683,9 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.set_person_request_dismissed("private-flow".into());
     ui.set_person_request_busy(true);
     ui.set_person_request_error("private decline error".into());
+    // The departed account's device-setup prompt and its dismissal.
+    ui.set_device_setup_need(1);
+    ui.set_device_setup_dismissed(true);
     ui.set_security_key_file_passphrase("synthetic key file passphrase".into());
     ui.set_security_key_file_confirm("synthetic key file passphrase".into());
     settle(&ui).await;
@@ -2753,6 +2756,8 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_person_request_dismissed().is_empty());
     assert!(!ui.get_person_request_busy());
     assert!(ui.get_person_request_error().is_empty());
+    assert_eq!(ui.get_device_setup_need(), 0);
+    assert!(!ui.get_device_setup_dismissed());
     assert!(ui.get_security_key_file_passphrase().is_empty());
     assert!(ui.get_security_key_file_confirm().is_empty());
     assert!(manager.active_account().await.is_none());

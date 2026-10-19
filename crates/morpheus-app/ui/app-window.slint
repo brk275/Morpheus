@@ -1,5 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
-import { EncryptionDevices, EncryptionPalette, IdentityWarningBanner, PersonVerificationBanner, SasVerificationPanel, TrustedDeviceItem, VerificationRequestBanner } from "encryption-center.slint";
+import { DeviceSetupBanner, EncryptionDevices, EncryptionPalette, IdentityWarningBanner, PersonVerificationBanner, SasVerificationPanel, TrustedDeviceItem, VerificationRequestBanner } from "encryption-center.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -2209,6 +2209,10 @@ export component AppWindow inherits Window {
     in-out property <string> person-request-dismissed;
     in-out property <bool> person-request-busy;
     in-out property <string> person-request-error;
+    // What this device still needs (src/device_setup.rs): 0 nothing,
+    // 1 verification, 2 the recovery key; hidden for this account view.
+    in-out property <int> device-setup-need;
+    in-out property <bool> device-setup-dismissed;
     property <EncryptionPalette> encryption-palette: {
         ink: root.ink,
         muted: root.muted,
@@ -2518,6 +2522,7 @@ export component AppWindow inherits Window {
     callback person-request-scope-changed();
     callback review-person-request();
     callback decline-person-request();
+    callback device-setup-scope-changed();
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
@@ -2608,9 +2613,13 @@ export component AppWindow inherits Window {
     // Identity warnings follow exactly one live account and room view.
     property <string> identity-scope: (root.live-session ? "live" : "") + "\n" + root.active-account-local-id + "\n" + root.active-room-id;
     changed identity-scope => { root.identity-scope-changed(); }
-    // Requests from other people belong to one live account.
+    // Requests from other people and this device's setup prompt belong to
+    // one live account.
     property <string> person-request-scope: (root.live-session ? "live" : "") + "\n" + root.active-account-local-id;
-    changed person-request-scope => { root.person-request-scope-changed(); }
+    changed person-request-scope => {
+        root.person-request-scope-changed();
+        root.device-setup-scope-changed();
+    }
     property <bool> composer-focus-thread: false;
     property <int> composer-focus-request: 0;
 
@@ -3521,6 +3530,16 @@ export component AppWindow inherits Window {
                         root.open-security();
                         root.settings-search-choose("security.recovery");
                     }
+                }
+                if root.live-session && root.page == 0 && root.sas-stage == 0 && root.device-setup-need != 0 && !root.device-setup-dismissed : DeviceSetupBanner {
+                    palette: root.encryption-palette;
+                    text-scale: root.text-scale;
+                    need: root.device-setup-need;
+                    set-up => {
+                        root.open-security();
+                        root.settings-search-choose("security.recovery");
+                    }
+                    dismiss => { root.device-setup-dismissed = true; }
                 }
                 if root.config-error != "" : Rectangle {
                     height: 39px;
