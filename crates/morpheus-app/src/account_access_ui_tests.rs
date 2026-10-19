@@ -2780,6 +2780,8 @@ async fn assert_pane_composition_and_motion(ui: &AppWindow) {
     // destination is still a live control, the selected details-panel side.
     config.layout.group_direct_messages = false;
     apply_config(ui, &config, None);
+    // Like the other destinations, Settings is built before the reveal.
+    ui.set_page(1);
     ui.set_settings_revealed_id("".into());
     settle(ui).await;
     assert!(crate::settings_search::reveal(ui, "layout.composition"));

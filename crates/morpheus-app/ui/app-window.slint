@@ -2317,6 +2317,8 @@ component SenderColorActions inherits HorizontalLayout {
     in property <float> text-scale: 1;
     callback moved(int, int);
     callback removed(int);
+    // Fixed-size actions: the hex field or the sample takes the free width.
+    horizontal-stretch: 0;
     spacing: 8px;
     if !root.palette-entry.readable : Text {
         text: "Low contrast"; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center;
@@ -2441,7 +2443,6 @@ component SenderPaletteEditor inherits VerticalLayout {
         spacing: 8px; alignment: start;
         add-color := TextAction {
             text: "Add color"; label: "Add a sender color";
-            wrap-caption: root.stacked;
             enabled: root.rows.length < 16;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
@@ -2449,14 +2450,12 @@ component SenderPaletteEditor inherits VerticalLayout {
         }
         if root.can-undo : TextAction {
             text: "Undo"; label: "Undo the last change to sender colors";
-            wrap-caption: root.stacked;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
             activated => { root.undo(); }
         }
         if root.custom : TextAction {
             text: "Use theme colors"; label: "Remove your sender colors and use the theme's";
-            wrap-caption: root.stacked;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
             activated => { root.reset(); }
