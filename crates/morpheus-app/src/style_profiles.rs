@@ -56,10 +56,13 @@ enum Confirm {
     },
 }
 
-/// A shown preview. `base` is the accepted look it replaced.
+/// A shown preview. `base` is the accepted look it replaced; `profile` and
+/// `theme` are exactly what is shown, which Apply saves.
 struct Preview {
     file: ProfileFile,
     name: String,
+    profile: StyleProfile,
+    theme: Option<ThemePack>,
     base: (Config, Option<ThemePack>),
     account: String,
 }
@@ -241,7 +244,14 @@ pub(crate) fn register(ui: &AppWindow, store: &ConfigStore) {
     let weak = ui.as_weak();
     ui.on_style_profile_cancel_preview(move || {
         if let Some(ui) = weak.upgrade() {
-            cancel_preview(&ui, "Preview cancelled. Your look is restored.");
+            cancel_preview(&ui, "");
+            notify(&ui, "Preview cancelled. Your look is restored.", false);
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_style_profile_notice_dismiss(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_style_profile_notice("".into());
         }
     });
     let weak = ui.as_weak();
@@ -636,6 +646,11 @@ fn confirm(ui: &AppWindow) {
             refresh(ui);
         }
         Confirm::Replace { file, profile } => {
+            // A previewed profile whose file is replaced is no longer what
+            // its preview shows.
+            if with_state(|state| state.preview.as_ref().is_some_and(|p| p.file == file)) {
+                cancel_preview(ui, "");
+            }
             match store.replace(&file, &profile) {
                 Ok(()) => {
                     select(ui, file, &profile.name);
@@ -694,6 +709,7 @@ fn start_preview(ui: &AppWindow) {
     };
     let account = ui.get_active_account_local_id().to_string();
     let name = profile.name.clone();
+    let shown_theme = theme.clone();
     with_state(|state| {
         state.confirm = Confirm::None;
         let base = state
@@ -703,10 +719,13 @@ fn start_preview(ui: &AppWindow) {
         state.preview = Some(Preview {
             file,
             name: name.clone(),
+            profile,
+            theme: shown_theme,
             base,
             account,
         });
     });
+    ui.set_style_profile_notice("".into());
     crate::apply_appearance(ui, &candidate, theme.as_ref(), false);
     set_message(
         format!(
@@ -735,26 +754,30 @@ fn cancel_preview(ui: &AppWindow, note: &str) {
 /// Apply the previewed profile (`previewed`) or the selected one. Either way
 /// a preview ends first, without restoring it: the save shows the new look.
 fn apply(ui: &AppWindow, previewed: bool) {
-    let target = if previewed {
-        with_state(|state| state.preview.as_ref().map(|preview| preview.file.clone()))
-    } else {
-        selected_file(ui)
-    };
-    let Some(file) = target else {
-        return;
-    };
     let (Some(store), Some(config_store)) =
         with_state(|state| (state.profiles.clone(), state.config.clone()))
     else {
         return;
     };
-    let profile = match store.read(&file) {
-        Ok(profile) => profile,
-        Err(error) => {
-            cancel_preview(ui, "");
-            set_message(format!("Could not apply the profile: {error}."), true);
-            refresh(ui);
+    // The preview bar applies exactly the look it shows, not the file as it
+    // is now; the Settings card applies the selected profile's file.
+    let profile = if previewed {
+        let Some(profile) =
+            with_state(|state| state.preview.as_ref().map(|preview| preview.profile.clone()))
+        else {
             return;
+        };
+        profile
+    } else {
+        let Some(file) = selected_file(ui) else { return };
+        match store.read(&file) {
+            Ok(profile) => profile,
+            Err(error) => {
+                cancel_preview(ui, "");
+                notify(ui, format!("Could not apply the profile: {error}."), true);
+                refresh(ui);
+                return;
+            }
         }
     };
     // Check the theme pack against the look as it would be applied, so a
@@ -775,18 +798,29 @@ fn apply(ui: &AppWindow, previewed: bool) {
         true
     });
     match saved {
-        Some(_) => set_message(format!("Applied {}.", shown_name(&profile.name)), false),
+        Some(_) => notify(ui, format!("Applied {}.", shown_name(&profile.name)), false),
         None => {
             if let Some(preview) = preview {
                 let (config, theme) = &preview.base;
                 crate::apply_appearance(ui, config, theme.as_ref(), true);
             }
-            set_message(
+            notify(
+                ui,
                 "Could not apply the profile: the settings file has a problem (shown above). Nothing was changed.",
                 true,
             );
         }
     }
+    project(ui);
+}
+
+/// A preview outcome: shown in the Settings card and in a notice on every
+/// page (a polite live region), because a preview can end on any page.
+fn notify(ui: &AppWindow, text: impl Into<String>, error: bool) {
+    let text = text.into();
+    ui.set_style_profile_notice(text.as_str().into());
+    ui.set_style_profile_notice_error(error);
+    set_message(text, error);
     project(ui);
 }
 
@@ -812,9 +846,10 @@ pub(crate) fn end_preview_for_save(ui: &AppWindow, before: &Config, after: &Conf
     let keeps_look = style_profiles::same_look(before, after);
     cancel_preview(ui, "");
     if keeps_look {
-        set_message("The preview ended because a setting changed.", false);
+        notify(ui, "The preview ended because a setting changed.", false);
     } else {
-        set_message(
+        notify(
+            ui,
             "The preview was cancelled and your look restored; that change was not saved. Make it again to save it.",
             true,
         );
@@ -825,25 +860,33 @@ pub(crate) fn end_preview_for_save(ui: &AppWindow, before: &Config, after: &Conf
 
 /// Called for every accepted configuration. While previewing, a
 /// configuration with the same look as the preview's base (the watcher
-/// re-reading a save of other settings) keeps the preview and becomes its
-/// base; any other ends the preview, and the caller applies it.
+/// re-reading a save of other settings) keeps the preview: it becomes the
+/// base, and the previewed look is shown over it again, so its other
+/// settings (text size, Reduce motion, the focus ring, grouping, sorting)
+/// take effect at once. Any other configuration ends the preview, and the
+/// caller applies it.
 pub(crate) fn keeps_preview(ui: &AppWindow, loaded: &LoadedConfig) -> bool {
     let kept = with_state(|state| {
         let preview = state.preview.as_mut()?;
         let (base, theme) = &preview.base;
         if style_profiles::same_look(base, &loaded.config) && *theme == loaded.theme {
             preview.base = (loaded.config.clone(), loaded.theme.clone());
-            Some(true)
+            let mut candidate = loaded.config.clone();
+            preview.profile.apply_to(&mut candidate);
+            Some(Some((candidate, preview.theme.clone())))
         } else {
             state.preview = None;
-            Some(false)
+            Some(None)
         }
     });
     match kept {
         None => false,
-        Some(true) => true,
-        Some(false) => {
-            set_message("The preview ended because the settings changed.", false);
+        Some(Some((candidate, theme))) => {
+            crate::apply_appearance(ui, &candidate, theme.as_ref(), false);
+            true
+        }
+        Some(None) => {
+            notify(ui, "The preview ended because the settings changed.", false);
             project(ui);
             false
         }
@@ -859,7 +902,8 @@ pub(crate) fn check_account(ui: &AppWindow) {
         })
     });
     if changed {
-        cancel_preview(ui, "Switching accounts cancelled the preview.");
+        cancel_preview(ui, "");
+        notify(ui, "Switching accounts cancelled the preview.", false);
     }
 }
 

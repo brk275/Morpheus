@@ -3174,6 +3174,11 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert!(!ui.get_style_preview_active());
     assert!(ui.get_style_profile_message_error());
     assert_eq!(ui.get_message_font_size(), 20);
+    // The outcome is also announced on every page until dismissed.
+    assert!(ui.get_style_profile_notice_error());
+    assert!(!ui.get_style_profile_notice().is_empty());
+    ui.invoke_style_profile_notice_dismiss();
+    assert!(ui.get_style_profile_notice().is_empty());
     // A save that keeps the look ends the preview and is saved.
     preview(ui);
     let kept = crate::save_config_edit(ui, &store, |config| {
@@ -3185,15 +3190,18 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert!(!store.load().unwrap().notifications.sounds);
     assert_eq!(ui.get_message_font_size(), 20);
 
-    // Re-reading the same look keeps the preview; a different look ends it.
+    // Re-reading the same look keeps the preview and shows its other
+    // settings at once; a different look ends it.
     preview(ui);
-    let same = LoadedConfig {
+    let mut same = LoadedConfig {
         config: store.load().unwrap(),
         theme: None,
     };
+    same.config.appearance.scale_percent = 150;
     crate::apply_loaded_config(ui, &same);
     assert!(ui.get_style_preview_active());
     assert_eq!(ui.get_message_font_size(), 15);
+    assert_eq!(ui.get_font_scale_percent(), 150);
     let mut external = store.load().unwrap();
     external.typography.message_size = 22;
     store.save(&external).unwrap();
@@ -3214,13 +3222,22 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     crate::appearance::apply_theme_mode(ui);
     assert!(!ui.get_style_preview_active());
     assert_eq!(ui.get_message_font_size(), 22);
+    assert!(ui.get_style_profile_notice().contains("Switching accounts"));
     ui.set_active_account_local_id(account.clone());
     crate::appearance::apply_theme_mode(ui);
 
-    // Apply saves the look over the re-read file and keeps other settings.
+    // Apply from the bar saves exactly the previewed look, even when the
+    // profile's file changed meanwhile, and keeps other settings.
     preview(ui);
+    let previewed = profiles.list().unwrap().entries.remove(0);
+    let original = previewed.profile.unwrap();
+    let mut changed = original.clone();
+    changed.typography.message_size = 19;
+    profiles.replace(&previewed.file, &changed).unwrap();
     ui.invoke_style_preview_apply();
     settle(ui).await;
+    profiles.replace(&previewed.file, &original).unwrap();
+    ui.invoke_style_profiles_refresh();
     let applied = store.load().unwrap();
     assert_eq!(applied.typography.message_size, 15);
     assert_eq!(applied.notifications.highlight_words, ["private-word"]);

@@ -2674,7 +2674,8 @@ component StyleProfilesEditor inherits VerticalLayout {
                     label: "Preview " + root.state.name + " without saving it";
                     ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
                     outline: root.outline; text-scale: root.text-scale;
-                    activated => { root.preview(); }
+                    // This button gives way to Cancel preview; keep focus in the card.
+                    activated => { filter-input.focus(); root.preview(); }
                 }
                 if root.state.previewed : TextAction {
                     text: "Cancel preview"; wrap-caption: true;
@@ -3148,6 +3149,10 @@ export component AppWindow inherits Window {
     in-out property <bool> style-profile-busy: false;
     in-out property <bool> style-preview-active: false;
     in-out property <string> style-preview-name;
+    // How the last preview ended or was applied; shown on every page.
+    in-out property <string> style-profile-notice;
+    in-out property <bool> style-profile-notice-error: false;
+    callback style-profile-notice-dismiss();
     callback style-profile-filter-changed(string);
     callback style-profile-chosen(string);
     callback style-profile-save-current();
@@ -4716,6 +4721,29 @@ export component AppWindow inherits Window {
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                             outline: root.divider; text-scale: root.text-scale;
                             activated => { shortcut-scope.focus(); root.style-profile-cancel-preview(); }
+                        }
+                    }
+                }
+                // How a preview ended, on every page, until dismissed.
+                if root.style-profile-notice != "" : Rectangle {
+                    height: max(36px, 32px * root.text-scale + 8px);
+                    background: root.panel;
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 12px; padding-top: 4px; padding-bottom: 4px; spacing: 10px;
+                        Text {
+                            text: root.style-profile-notice;
+                            color: root.style-profile-notice-error && StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.ink;
+                            font-size: 11px * root.text-scale;
+                            vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                            accessible-live-region: polite;
+                        }
+                        TextAction {
+                            text: "Dismiss";
+                            label: "Dismiss the style profile notice";
+                            ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            // The notice closes: keep keyboard focus in the window.
+                            activated => { shortcut-scope.focus(); root.style-profile-notice-dismiss(); }
                         }
                     }
                 }

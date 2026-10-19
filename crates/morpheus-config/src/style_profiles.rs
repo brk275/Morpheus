@@ -34,7 +34,8 @@ use thiserror::Error;
 
 use crate::{
     ChatStyle, Config, ConfigError, ConfigStore, Conversation, Density, DetailsSide, Geometry,
-    NavigationMode, SenderColors, ThemeMode, Typography, WindowStyle, diagnostics, parse_toml,
+    NavigationMode, Problem, SenderColors, ThemeMode, Typography, WindowStyle, diagnostics,
+    parse_toml,
 };
 
 /// The profile format this version reads and writes.
@@ -375,7 +376,21 @@ impl StyleProfile {
         validate_name(&self.name)?;
         let mut probe = Config::default();
         self.apply_to(&mut probe);
-        probe.validate().map_err(ProfileError::Invalid)
+        probe.validate().map_err(ProfileError::Invalid)?;
+        // A theme pack name becomes a file name in the themes folder, where
+        // Windows would open a device for these names.
+        if self
+            .appearance
+            .theme_pack
+            .as_deref()
+            .is_some_and(reserved_device_name)
+        {
+            return Err(ProfileError::Invalid(ConfigError::Field {
+                field: "appearance.theme_pack".into(),
+                problem: Problem::ThemeName,
+            }));
+        }
+        Ok(())
     }
 
     /// Parse and validate a profile file's text.
@@ -499,12 +514,17 @@ pub fn validate_name(name: &str) -> Result<String, ProfileError> {
     if length == 0
         || length > MAX_PROFILE_NAME_CHARS
         || name.chars().any(|character| {
-            // Controls, line separators and bidirectional formatting could
-            // disguise the name where it is shown.
+            // Controls, line separators, zero-width and bidirectional
+            // formatting characters could make a name look empty or like
+            // another one: the same set the window blanks when it shows text.
             character.is_control()
                 || matches!(
                     character,
-                    '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}'
+                    '\u{061C}'
+                        | '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2060}'..='\u{206F}'
+                        | '\u{FEFF}'
                 )
         })
     {
@@ -1480,6 +1500,7 @@ mod tests {
             ("profile_version = 1\nname = \"A\"\n[colors]\nlink = \"#zzz-secret\"\n", "invalid-profile"),
             ("profile_version = 1\nname = \"A\"\n[colors]\nsecret_token = \"#123456\"\n", "invalid-profile"),
             ("profile_version = 1\nname = \"A\"\n[appearance]\ntheme_pack = \"../secret\"\n", "invalid-profile"),
+            ("profile_version = 1\nname = \"A\"\n[appearance]\ntheme_pack = \"com1\"\n", "invalid-profile"),
             ("profile_version = 1\nname = \"\"\n", "profile-name"),
             ("profile_version = 1\nname = \"bad\\nname\"\n", "profile-name"),
             ("profile_version = 1\n[account_overrides.secret]\n", "invalid-profile"),
@@ -1520,7 +1541,16 @@ mod tests {
 
     #[test]
     fn names_and_file_stems_are_bounded_and_safe() {
-        for disguised in ["a\u{202E}b", "a\u{2066}b", "a\u{200F}b", "a\u{2028}b"] {
+        for disguised in [
+            "a\u{202E}b",
+            "a\u{2066}b",
+            "a\u{200F}b",
+            "a\u{2028}b",
+            "a\u{061C}b",
+            "a\u{200B}b",
+            "a\u{FEFF}b",
+            "\u{2060}",
+        ] {
             assert!(validate_name(disguised).is_err(), "{disguised:?}");
         }
         assert!(validate_name(&"x".repeat(MAX_PROFILE_NAME_CHARS)).is_ok());

@@ -39,7 +39,8 @@ account is active.
   exactly the look you had. Switching accounts, a change to your look in the
   settings file from elsewhere, or saving any setting ends the preview first; a setting
   that would change the look is not saved during a preview, so make it again
-  afterwards.
+  afterwards. How a preview ended, or that a profile was applied, is shown at
+  the top of the window on every page until you dismiss it.
 - **Apply** saves the profile's look into `config.toml`. The file is re-read
   first: when it has an error, nothing is changed and the error is shown.
 - **Rename**, **Duplicate** and **Delete** act on the selected profile.
@@ -117,13 +118,13 @@ Ready-to-import examples are in
 Lantern, checked by the configuration tests.
 
 `profile_version = 1` and `name` (1 to 48 characters, without line breaks or
-control or bidirectional formatting characters) are required. The accepted
+control, zero-width or bidirectional formatting characters) are required. The accepted
 keys are listed by `morpheus-app config schema` (the `style_profile` section
 of `--json`). Unknown keys, another `profile_version`, values outside a key's
-limits, unknown color tokens and theme-pack names that are not plain names are
-rejected with a message that names the key, never the rejected value; the
-list shows such a file as invalid, and it cannot be previewed or applied
-until it is fixed or deleted.
+limits, unknown color tokens, and theme-pack names that are not plain names or are
+Windows device names such as `com1` are rejected with a message that names
+the key, never the rejected value; the list shows such a file as invalid, and
+it cannot be previewed or applied until it is fixed or deleted.
 
 A profile names a theme pack but does not contain it. The built-in packs
 (`nocturne`, `terminal`, `paper`) are always available; any other pack must be
