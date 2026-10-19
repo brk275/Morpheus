@@ -972,19 +972,30 @@ impl Drop for FilePermit<'_> {
     }
 }
 async fn choose_file(form: Arc<Form>) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
+    let active = Arc::new(move || form.selection.is_current() && !form.cancellation.is_cancelled());
+    choose_avatar_file("Choose room avatar", active).await
+}
+/// The one guarded native image chooser and bounded file read, shared by the
+/// room-avatar form and the account's own public-profile editor. One chooser
+/// or read runs process-wide; `active` is checked before and after the dialog
+/// and between reads, so a closed form or changed account reads nothing more.
+pub(crate) async fn choose_avatar_file(
+    title: &'static str,
+    active: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
     let permit = FilePermit::acquire(&FILE_WORKER).ok_or("A native image chooser or file read is still active. Finish it before choosing another image.")?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("morpheus-avatar-file".into())
         .spawn(move || {
             let _permit = permit;
-            let active = || form.selection.is_current() && !form.cancellation.is_cancelled();
+            let active = || active();
             let result = (|| {
                 if !active() {
                     return Ok(None);
                 }
                 let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose room avatar")
+                    .set_title(title)
                     .add_filter("PNG or baseline JPEG", &["png", "jpg", "jpeg"])
                     .pick_file()
                 else {

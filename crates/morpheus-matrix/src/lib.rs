@@ -57,6 +57,11 @@ pub use account_access::{
 };
 mod admin;
 mod room_settings;
+mod own_profile;
+pub use own_profile::{
+    MAX_DISPLAY_NAME_BYTES, MAX_DISPLAY_NAME_CHARS, MAX_OWN_AVATAR_PREVIEW_BYTES, OwnProfile,
+    ProfileError, ProfileResult, validate_display_name,
+};
 pub use room_settings::{
     AvatarPng, CurrentJoinRule, EditableJoinRule, JoinRuleKind, MAX_RESTRICTED_ALLOW_ROOMS,
     MAX_ROOM_AVATAR_PIXELS, MAX_ROOM_AVATAR_PREVIEW_BYTES, MAX_ROOM_AVATAR_SIDE,

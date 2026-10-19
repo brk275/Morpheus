@@ -2158,6 +2158,7 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
             "{} has no destination",
             target.id
         );
+        let edit_profile_label = format!("Edit public profile of {}", ui.get_active_account_handle());
         let account_label = match target.id {
             "accounts.manage" => Some("Add account"),
             "accounts.remove" => Some("Done"),
@@ -2166,6 +2167,8 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
             } else {
                 "Set app password"
             }),
+            // Focus only: the editor opens on its own activation.
+            "accounts.public_profile" => Some(edit_profile_label.as_str()),
             _ => None,
         };
         if let Some(label) = account_label {
@@ -3792,6 +3795,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_layout_navigation_recovery(&ui, directory.path()).await;
     phase.set(27);
     assert_vector_icons(&ui).await;
+    phase.set(28);
+    assert_public_profile_projection(&ui).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
@@ -5831,6 +5836,120 @@ async fn assert_vector_icons(ui: &AppWindow) {
 
 /// Real generated controls remain visible and usable when only the Space
 /// rail is hidden; the full room list does not require an account column.
+/// The public-profile editor's presentation on the real generated window,
+/// with synthetic identities only and no network: a server-confirmed name
+/// relabels exactly that account's switcher rows (never another account's),
+/// the editor names the identity it changes, and clearing the editor drops
+/// its draft, preview, status and error synchronously.
+async fn assert_public_profile_projection(ui: &AppWindow) {
+    let saved = (
+        ui.get_account_options(),
+        ui.get_accounts(),
+        ui.get_active_account_local_id(),
+        ui.get_active_account_index(),
+        ui.get_active_account_name(),
+        ui.get_active_account_initials(),
+    );
+    let option = |local: &str, name: &str| crate::AccountOption {
+        local_id: local.into(),
+        name: name.into(),
+        handle: format!("@{local}:example.org").as_str().into(),
+        initials: "SY".into(),
+        ..Default::default()
+    };
+    ui.set_account_options(ModelRc::new(VecModel::from(vec![
+        option("synthetic-a", "synthetic-a"),
+        option("synthetic-b", "synthetic-b"),
+    ])));
+    ui.set_accounts(ModelRc::new(VecModel::from(vec![
+        crate::AccountItem {
+            name: "synthetic-a".into(),
+            ..Default::default()
+        },
+        crate::AccountItem {
+            name: "synthetic-b".into(),
+            ..Default::default()
+        },
+    ])));
+    ui.set_active_account_local_id("synthetic-a".into());
+    ui.set_active_account_index(0);
+    ui.set_active_account_name("synthetic-a".into());
+    settle(ui).await;
+
+    let confirmed = morpheus_matrix::OwnProfile::synthetic(
+        "synthetic-a",
+        "@synthetic-a:example.org",
+        "https://example.org",
+        Some("Public Alias"),
+    );
+    crate::account_identity::apply_server(ui, &confirmed, true);
+    settle(ui).await;
+    assert_eq!(ui.get_active_account_name(), "Public Alias");
+    assert_eq!(ui.get_active_account_initials(), "PA");
+    assert_eq!(ui.get_account_options().row_data(0).unwrap().name, "Public Alias");
+    assert_eq!(ui.get_account_options().row_data(1).unwrap().name, "synthetic-b");
+    assert_eq!(ui.get_accounts().row_data(0).unwrap().name, "Public Alias");
+    assert_eq!(ui.get_accounts().row_data(1).unwrap().name, "synthetic-b");
+    assert_eq!(ui.get_account_profile_user_id(), "@synthetic-a:example.org");
+    assert_eq!(ui.get_account_profile_homeserver(), "https://example.org");
+    assert_eq!(ui.get_account_profile_name_input(), "Public Alias");
+    assert_eq!(
+        crate::account_identity::confirmed_name("synthetic-a").as_deref(),
+        Some("Public Alias")
+    );
+
+    // Another account's confirmed profile never relabels the visible one.
+    let other = morpheus_matrix::OwnProfile::synthetic(
+        "synthetic-b",
+        "@synthetic-b:example.org",
+        "https://example.org",
+        Some("Other Alias"),
+    );
+    crate::account_identity::apply_server(ui, &other, false);
+    settle(ui).await;
+    assert_eq!(ui.get_active_account_name(), "Public Alias");
+    assert_eq!(ui.get_account_options().row_data(1).unwrap().name, "Other Alias");
+    assert_eq!(ui.get_accounts().row_data(1).unwrap().name, "synthetic-b");
+
+    // A server profile without a name falls back to the user ID localpart.
+    let unnamed = morpheus_matrix::OwnProfile::synthetic(
+        "synthetic-a",
+        "@synthetic-a:example.org",
+        "https://example.org",
+        None,
+    );
+    crate::account_identity::apply_server(ui, &unnamed, false);
+    settle(ui).await;
+    assert_eq!(ui.get_active_account_name(), "synthetic-a");
+    assert_eq!(crate::account_identity::confirmed_name("synthetic-a"), None);
+
+    // Detach clears the editor's private presentation at once.
+    ui.set_account_profile_open(true);
+    ui.set_account_profile_name_input("Unsaved Synthetic".into());
+    ui.set_account_profile_avatar_state(1);
+    ui.set_account_profile_image_visible(true);
+    ui.set_account_profile_status("synthetic status".into());
+    ui.set_account_profile_error("synthetic error".into());
+    crate::account_identity::clear_presentation(ui);
+    assert!(!ui.get_account_profile_open());
+    assert_eq!(ui.get_account_profile_name_input(), "");
+    assert_eq!(ui.get_account_profile_user_id(), "");
+    assert_eq!(ui.get_account_profile_avatar_state(), 0);
+    assert!(!ui.get_account_profile_image_visible());
+    assert_eq!(ui.get_account_profile_status(), "");
+    assert_eq!(ui.get_account_profile_error(), "");
+    crate::account_identity::retain_confirmed(&[]);
+
+    let (options, accounts, local, index, name, initials) = saved;
+    ui.set_account_options(options);
+    ui.set_accounts(accounts);
+    ui.set_active_account_local_id(local);
+    ui.set_active_account_index(index);
+    ui.set_active_account_name(name);
+    ui.set_active_account_initials(initials);
+    settle(ui).await;
+}
+
 async fn assert_layout_navigation_recovery(ui: &AppWindow, directory: &std::path::Path) {
     use morpheus_config::{ConfigStore, PaneId};
     let store = ConfigStore::at(directory.join("layout-recovery.toml"));

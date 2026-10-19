@@ -249,6 +249,7 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
                     AccountsFocus::Close => "close",
                     AccountsFocus::Add => "add",
                     AccountsFocus::Protection => "protection",
+                    AccountsFocus::Profile => "profile",
                 }
                 .into(),
             );

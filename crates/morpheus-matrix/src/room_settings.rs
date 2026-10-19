@@ -113,7 +113,7 @@ impl RoomSettingsCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
     }
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         loop {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
@@ -220,6 +220,11 @@ impl AvatarPng {
             width,
             height,
         })
+    }
+    /// The validated PNG and its dimensions, for another core upload path
+    /// (the account's own avatar). Validation already happened in `new`.
+    pub(crate) fn into_parts(self) -> (Vec<u8>, u32, u32) {
+        (self.bytes, self.width, self.height)
     }
 }
 /// Session-resolved avatar input, never an arbitrary caller URL. Decode using

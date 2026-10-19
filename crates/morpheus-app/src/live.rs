@@ -3773,6 +3773,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     ui.set_transfer_focus_pending(false);
     // Poll drafts, pending votes and the create dialog end with the account.
     crate::polls::clear_presentation(ui);
+    // The public-profile editor's drafts, previews and errors end with it too.
+    crate::account_identity::clear_presentation(ui);
     // Decrypted pinned rows are account-private and never wait for a task.
     ui.invoke_reset_pinned_messages();
     // So is who is in this account's voice rooms.
@@ -3850,6 +3852,9 @@ pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], activ
     let Some(active_index) = accounts.iter().position(|account| account.id == active.id) else {
         return;
     };
+    crate::account_identity::retain_confirmed(
+        &accounts.iter().map(|account| account.id.as_str()).collect::<Vec<_>>(),
+    );
     let items = accounts
         .iter()
         .enumerate()
@@ -3886,7 +3891,10 @@ pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], activ
 }
 
 fn account_item(account: &AccountInfo, selected: bool) -> AccountItem {
-    let name = display_user(&account.user_id);
+    // A display name this session confirmed with the server, else the
+    // user ID's localpart. Never a locally stored identity.
+    let name = crate::account_identity::confirmed_name(&account.id)
+        .unwrap_or_else(|| display_user(&account.user_id));
     let account_initials = initials(&name);
     AccountItem {
         name: name.into(),
@@ -4036,7 +4044,7 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
     }
 }
 
-fn display_user(id: &str) -> String {
+pub(crate) fn display_user(id: &str) -> String {
     id.trim_start_matches('@')
         .split(':')
         .next()

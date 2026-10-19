@@ -3,6 +3,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod account_access;
+mod account_identity;
 mod appearance;
 mod appearance_editor;
 mod attachment_workbench;
@@ -2875,6 +2876,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     message_search::register(&ui, live.clone(), runtime.handle().clone());
     space_explorer::register(&ui, live.clone(), runtime.handle().clone());
     thread_history::register(&ui, live.clone(), runtime.handle().clone());
+    account_identity::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let directory_live = live.clone();

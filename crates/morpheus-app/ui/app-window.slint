@@ -3366,8 +3366,34 @@ export component AppWindow inherits Window {
     in-out property <string> settings-reveal-id;
     in-out property <int> settings-reveal-serial: 0;
     in-out property <string> settings-revealed-id;
-    // Manage accounts focuses "add", "protection" or its close action.
+    // Manage accounts focuses "add", "protection", "profile" or its close action.
     in-out property <string> manage-accounts-focus;
+    // Public profile editor (account_identity.rs) for the current account.
+    // Server-confirmed values, the local draft and the request in flight stay
+    // apart; everything here clears with the account.
+    in-out property <bool> account-profile-open: false;
+    in-out property <bool> account-profile-busy: false;
+    in-out property <bool> account-profile-loaded: false;
+    in-out property <string> account-profile-user-id;
+    in-out property <string> account-profile-homeserver;
+    in-out property <string> account-profile-server-name;
+    in-out property <bool> account-profile-server-has-avatar: false;
+    in-out property <string> account-profile-name-input;
+    in-out property <bool> account-profile-name-dirty: false;
+    // 0 keep the server avatar, 1 a chosen image to publish, 2 remove it.
+    in-out property <int> account-profile-avatar-state: 0;
+    in-out property <image> account-profile-image;
+    in-out property <bool> account-profile-image-visible: false;
+    in-out property <string> account-profile-status;
+    in-out property <string> account-profile-error;
+    callback open-account-profile();
+    callback close-account-profile();
+    callback account-profile-name-edited();
+    callback account-profile-refresh();
+    callback account-profile-choose-avatar();
+    callback account-profile-stage-remove-avatar();
+    callback account-profile-keep-avatar();
+    callback account-profile-save();
     pure function reveal-request(id: string) -> int {
         return root.settings-reveal-id == id ? root.settings-reveal-serial : 0;
     }
@@ -9675,7 +9701,7 @@ export component AppWindow inherits Window {
             x: root.account-corner-x + 9px;
             y: parent.height - self.height - account-trigger.height - 5px;
             width: max(root.account-corner-width, 280px) - 18px;
-            height: min(parent.height - account-trigger.height - 14px, 170px + root.account-options.length * (max(42px, 30px * root.text-scale + 12px) + 2px));
+            height: min(parent.height - account-trigger.height - 14px, 207px + root.account-options.length * (max(42px, 30px * root.text-scale + 12px) + 2px));
             background: root.elevated;
             border-color: root.divider;
             border-width: StyleTokens.line-width;
@@ -9797,6 +9823,18 @@ export component AppWindow inherits Window {
                         VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "manage-accounts"; ink: root.ink; } }
                         Text { text: "Manage accounts"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                     }
+                }
+                ActionRect {
+                    height: 35px;
+                    border-radius: StyleTokens.radius * 0.8;
+                    background: root.control-fill(self.has-hover, self.has-pressed, transparent);
+                    focus-color: root.accent;
+                    cancel-on-escape: true;
+                    label: "Edit public profile of " + root.active-account-handle;
+                    enabled: root.live-session && !root.account-switch-pending;
+                    cancelled => { root.account-menu-open = false; account-trigger.focus(); }
+                    activated => { root.account-menu-open = false; root.open-account-profile(); }
+                    Text { x: 9px; text: "✎   Public profile"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
                 }
                 ActionRect {
                     height: 35px;
@@ -10977,6 +11015,8 @@ export component AppWindow inherits Window {
                     manage-add.focus();
                 } else if root.manage-accounts-focus == "protection" {
                     manage-protection.focus();
+                } else if root.manage-accounts-focus == "profile" {
+                    manage-profile.focus();
                 } else {
                     manage-close.focus();
                 }
@@ -11016,6 +11056,16 @@ export component AppWindow inherits Window {
                                 height: 40px * root.text-scale; vertical-stretch: 0;
                                 text: "Add account"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                                 activated => { root.manage-accounts-open = false; root.add-account(); }
+                            }
+                            // The current account's public display name and avatar.
+                            manage-profile := TextAction {
+                                reveal-full-control: true;
+                                height: 40px * root.text-scale; vertical-stretch: 0;
+                                text: "Edit public profile of the current account";
+                                label: "Edit public profile of " + root.active-account-handle;
+                                enabled: root.live-session && !root.account-switch-pending;
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                activated => { root.manage-accounts-open = false; root.open-account-profile(); }
                             }
                             VerticalLayout {
                                 spacing: 8px; alignment: start; vertical-stretch: 0;
@@ -11083,6 +11133,135 @@ export component AppWindow inherits Window {
                         height: 40px * root.text-scale; vertical-stretch: 0;
                         text: "Done"; ink: root.accent-ink; muted: root.muted; surface: root.accent; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                         activated => { root.manage-accounts-open = false; }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.account-profile-open : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { profile-name-input.focus(); }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close-account-profile();
+                account-trigger.focus();
+                accept
+            } else { reject }
+        }
+        Rectangle {
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
+            TouchArea { width: parent.width; height: parent.height; }
+            Rectangle {
+                width: min(520px * root.text-scale, parent.width - 32px);
+                height: min(560px * root.text-scale, parent.height - 32px);
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                background: root.dialog-surface; border-radius: StyleTokens.radius * 1.4; border-width: StyleTokens.line-width; border-color: root.divider;
+                accessible-role: region; accessible-label: "Public Matrix profile of " + root.account-profile-user-id;
+                VerticalLayout {
+                    padding: 20px; spacing: 10px;
+                    Text { text: "Public profile"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
+                    // Exactly which identity this changes.
+                    Text { text: root.account-profile-user-id; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; overflow: elide; vertical-stretch: 0; accessible-label: "Matrix account " + root.account-profile-user-id; }
+                    if root.account-profile-homeserver != "" : Text { text: "on " + root.account-profile-homeserver; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; vertical-stretch: 0; }
+                    Text {
+                        text: "Anyone who can see this Matrix account sees its display name and avatar. Your local account entry, device name, sign-in and app password are not changed here.";
+                        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
+                    }
+                    HorizontalLayout {
+                        spacing: 12px; vertical-stretch: 0; height: 72px * root.text-scale;
+                        Rectangle {
+                            width: 64px * root.text-scale; height: 64px * root.text-scale;
+                            border-radius: StyleTokens.radius; clip: true; background: root.elevated;
+                            if root.account-profile-image-visible : Image {
+                                width: parent.width; height: parent.height; source: root.account-profile-image; image-fit: cover;
+                                accessible-role: image;
+                                accessible-label: root.account-profile-avatar-state == 1 ? "New avatar preview, not saved" : "Current avatar";
+                            }
+                            if !root.account-profile-image-visible : Text {
+                                text: root.account-profile-avatar-state == 2 ? "None" : root.active-account-initials;
+                                color: root.muted; font-size: 18px * root.text-scale; font-weight: 700;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 6px; alignment: center; horizontal-stretch: 1;
+                            HorizontalLayout {
+                                spacing: 6px; alignment: start;
+                                TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                    text: "Choose image…"; label: "Choose a new public avatar image";
+                                    enabled: root.account-profile-loaded && !root.account-profile-busy;
+                                    activated => { root.account-profile-choose-avatar(); }
+                                }
+                                if root.account-profile-server-has-avatar && root.account-profile-avatar-state != 2 : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                    text: "Remove avatar"; label: "Remove the public avatar when saving";
+                                    enabled: root.account-profile-loaded && !root.account-profile-busy;
+                                    activated => { root.account-profile-stage-remove-avatar(); }
+                                }
+                                if root.account-profile-avatar-state != 0 : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                    text: "Keep current"; label: "Discard the avatar change";
+                                    enabled: !root.account-profile-busy;
+                                    activated => { root.account-profile-keep-avatar(); }
+                                }
+                            }
+                            Text {
+                                text: root.account-profile-avatar-state == 1 ? "New image, not public until you Save" : root.account-profile-avatar-state == 2 ? "Avatar will be removed when you Save" : root.account-profile-server-has-avatar ? "Current avatar" : "No avatar";
+                                color: root.muted; font-size: 11px * root.text-scale; overflow: elide;
+                            }
+                        }
+                    }
+                    Text { text: "Display name"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; vertical-stretch: 0; }
+                    Rectangle {
+                        height: 38px * root.text-scale; vertical-stretch: 0;
+                        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated;
+                        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                        border-width: profile-name-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+                        border-color: profile-name-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : root.divider;
+                        profile-name-input := ThemedTextInput {
+                            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                            text <=> root.account-profile-name-input; color: root.ink; font-size: 13px * root.text-scale;
+                            single-line: true; vertical-alignment: center;
+                            enabled: root.account-profile-loaded;
+                            accessible-label: "Public display name of " + root.account-profile-user-id;
+                            edited => { root.account-profile-name-edited(); }
+                            accepted => {
+                                if !root.account-profile-busy && (root.account-profile-name-dirty || root.account-profile-avatar-state != 0) {
+                                    root.account-profile-save();
+                                }
+                            }
+                        }
+                    }
+                    if root.account-profile-server-name != "" : Text {
+                        text: "Saved name: " + root.account-profile-server-name; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; vertical-stretch: 0;
+                    }
+                    if root.account-profile-status != "" : Text {
+                        text: root.account-profile-status; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
+                        accessible-live-region: polite;
+                    }
+                    if root.account-profile-error != "" : Text {
+                        text: root.account-profile-error;
+                        color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483;
+                        font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
+                        accessible-live-region: polite;
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    HorizontalLayout {
+                        spacing: 8px; vertical-stretch: 0;
+                        TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                            text: "Refresh"; label: "Read the public profile again from the homeserver";
+                            enabled: !root.account-profile-busy;
+                            activated => { root.account-profile-refresh(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                            text: "Close";
+                            activated => { root.close-account-profile(); account-trigger.focus(); }
+                        }
+                        TokenButton { colors: root.button-colors; text-scale: root.text-scale; primary: true;
+                            text: "Save to public profile"; label: "Save to the public profile of " + root.account-profile-user-id;
+                            enabled: root.account-profile-loaded && !root.account-profile-busy && (root.account-profile-name-dirty || root.account-profile-avatar-state != 0);
+                            activated => { root.account-profile-save(); }
+                        }
                     }
                 }
             }

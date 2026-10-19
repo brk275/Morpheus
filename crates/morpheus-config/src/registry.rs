@@ -1657,6 +1657,9 @@ pub enum AccountsFocus {
     Add,
     /// Set or change the app password.
     Protection,
+    /// Open the current account's public profile editor. Focus alone opens
+    /// nothing; the editor only reads until the user explicitly saves.
+    Profile,
 }
 
 /// How a search result reaches its control.
@@ -2103,6 +2106,25 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             ],
         ),
         AccountsFocus::Protection,
+    ),
+    accounts(
+        live(target(
+            "accounts.public_profile",
+            "Accounts",
+            "Accounts › Manage accounts › Public profile",
+            "Public profile (display name and avatar)",
+            "Change the display name and avatar other people see for the current Matrix account.",
+            &[
+                "profile",
+                "display name",
+                "avatar",
+                "picture",
+                "photo",
+                "identity",
+                "alias",
+            ],
+        )),
+        AccountsFocus::Profile,
     ),
     live(target(
         "security.recovery",
@@ -2675,7 +2697,10 @@ mod tests {
             if let Route::ManageAccounts(focus) = target.route {
                 assert!(matches!(
                     focus,
-                    AccountsFocus::Close | AccountsFocus::Add | AccountsFocus::Protection
+                    AccountsFocus::Close
+                        | AccountsFocus::Add
+                        | AccountsFocus::Protection
+                        | AccountsFocus::Profile
                 ));
             }
         }

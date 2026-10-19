@@ -79,6 +79,13 @@ impl PreparedAvatar {
     /// background save task: core envelope validation includes bounded CRC work.
     /// After transfer, the SDK/core owns the PNG; this helper cannot promise
     /// zeroization of their upload buffers. No image decoding/encoding occurs here.
+    /// A validated copy of the staged PNG for one upload attempt, keeping the
+    /// staged image so a failed attempt can be retried without choosing the
+    /// file again. Like `into_upload`, call from a background task.
+    pub(crate) fn upload_copy(&self) -> Result<AvatarPng, AvatarPrepareError> {
+        AvatarPng::new(self.png.to_vec(), self.pixels.width, self.pixels.height)
+            .map_err(|_| AvatarPrepareError::Invalid)
+    }
     pub(crate) fn into_upload(mut self) -> Result<AvatarPng, AvatarPrepareError> {
         let bytes = std::mem::take(&mut *self.png);
         AvatarPng::new(bytes, self.pixels.width, self.pixels.height)
