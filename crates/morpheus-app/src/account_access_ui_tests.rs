@@ -2663,6 +2663,14 @@ async fn exercise_account_ui(runtime: Handle) {
     // render that private surface as well before testing the real detach.
     ui.set_security_recovery_input("synthetic recovery input".into());
     ui.set_security_recovery_key("synthetic recovery output".into());
+    // An open remote sign-out with a typed password, plus a rename draft.
+    ui.set_device_signout_stage(1);
+    ui.set_device_signout_name("private device name".into());
+    ui.set_device_signout_shown_id("PRIVATEID".into());
+    ui.set_device_signout_password("synthetic device password".into());
+    ui.set_device_rename_id("PRIVATEID".into());
+    ui.set_device_rename_input("private draft name".into());
+    ui.set_device_session_notice("private device notice".into());
     settle(&ui).await;
     assert_eq!(control_bounds(&ui, "One-time Matrix recovery key").len(), 1);
     live.account_detached(ui.as_weak()).await;
@@ -2714,6 +2722,13 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_attachment_status().is_empty());
     assert!(ui.get_security_recovery_input().is_empty());
     assert!(ui.get_security_recovery_key().is_empty());
+    assert_eq!(ui.get_device_signout_stage(), 0);
+    assert!(ui.get_device_signout_name().is_empty());
+    assert!(ui.get_device_signout_shown_id().is_empty());
+    assert!(ui.get_device_signout_password().is_empty());
+    assert!(ui.get_device_rename_id().is_empty());
+    assert!(ui.get_device_rename_input().is_empty());
+    assert!(ui.get_device_session_notice().is_empty());
     assert!(manager.active_account().await.is_none());
 
     assert_removed_account_menu_projection(&ui);

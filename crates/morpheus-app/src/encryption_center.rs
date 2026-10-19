@@ -110,6 +110,7 @@ pub(crate) fn clear_ui(ui: &AppWindow) {
     ui.set_encryption_devices_error("".into());
     ui.set_encryption_incoming_flow_id("".into());
     ui.set_encryption_incoming_dismissed("".into());
+    crate::device_sessions::clear_ui(ui);
 }
 
 fn publish_incoming(weak: &Weak<AppWindow>, account_id: &str, flow_id: String) {
@@ -212,6 +213,7 @@ fn watch_incoming_requests(ui: &AppWindow, live: Arc<LiveUi>, handle: &Handle) {
 
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     watch_incoming_requests(ui, live.clone(), &handle);
+    crate::device_sessions::register(ui, live.clone(), handle.clone());
     let weak = ui.as_weak();
     let refresh_live = live.clone();
     let refresh_handle = handle.clone();

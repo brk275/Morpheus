@@ -4,7 +4,7 @@
 // the person's explicit choices. It cannot import the window's globals, so
 // the window passes resolved colors.
 
-import { Button } from "std-widgets.slint";
+import { Button, LineEdit } from "std-widgets.slint";
 
 export struct EncryptionPalette {
     ink: color,
@@ -299,6 +299,10 @@ export struct TrustedDeviceItem {
     can-verify: bool,
 }
 
+// Rename and sign-out are explicit per-row actions. Rust validates every
+// target against the loaded list and owns the authentication challenge; the
+// password field here is cleared before it is handed over. This device's row
+// only offers the normal logout.
 export component EncryptionDevices inherits Rectangle {
     in property <EncryptionPalette> palette;
     in property <float> text-scale: 1;
@@ -307,11 +311,35 @@ export component EncryptionDevices inherits Rectangle {
     // Another security operation owns this account; Verify waits for it.
     in property <bool> busy;
     in property <string> error;
+    in property <string> notice;
+    // The row being renamed (its device ID) and the draft name.
+    in property <string> rename-id;
+    in-out property <string> rename-input;
+    in property <bool> rename-busy;
+    // Sign-out stages: 0 closed, 1 confirm, 2 working, 3 password, 4 browser
+    // confirmation, 5 provider's device page, 6 blocked, 7 this device.
+    in property <int> signout-stage;
+    in property <string> signout-name;
+    in property <string> signout-shown-id;
+    in-out property <string> signout-password;
+    in property <string> signout-message;
+    in property <bool> signout-page-opened;
     // Settings search: each new positive value reveals and focuses Refresh,
     // or the status line while Refresh is unavailable.
     in property <int> reveal-request;
     callback refresh();
     callback verify-device(string);
+    callback start-rename(string);
+    callback save-rename(string, string);
+    callback cancel-rename();
+    callback open-signout(string);
+    callback confirm-signout();
+    callback submit-signout-password(string);
+    callback open-signout-page();
+    callback continue-signout();
+    callback cancel-signout();
+    // Hands this device to the window's normal guarded logout.
+    callback logout-this-device();
     // Asks the settings page to scroll an absolute y position into view.
     callback reveal-at(length);
     callback revealed(string);
@@ -360,7 +388,7 @@ export component EncryptionDevices inherits Rectangle {
         status-field := TextInput {
             text: root.loading ? "Loading this account's devices…"
                 : root.devices.length == 0 ? "No device list loaded yet. Choose Refresh."
-                : "Verify only devices you recognize. Compare the emoji or numbers on both devices before confirming.";
+                : "Verify only devices you recognize and sign out any you don't. Compare the emoji or numbers on both devices before confirming.";
             read-only: true;
             single-line: false;
             wrap: word-wrap;
@@ -375,42 +403,209 @@ export component EncryptionDevices inherits Rectangle {
             wrap: word-wrap;
             accessible-live-region: polite;
         }
+        if root.notice != "" : Text {
+            text: root.notice;
+            color: root.palette.ink;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        if root.signout-stage != 0 : Rectangle {
+            border-radius: 8px;
+            background: root.palette.panel;
+            border-width: 1px;
+            border-color: root.palette.accent;
+            VerticalLayout {
+                padding: 10px;
+                spacing: 6px;
+                Text {
+                    text: root.signout-stage == 7 ? "Log out of this device" : "Sign out " + root.signout-name;
+                    color: root.palette.ink;
+                    font-size: 12px * root.text-scale;
+                    font-weight: 700;
+                    wrap: word-wrap;
+                }
+                // The confirmation always names the exact target.
+                Text {
+                    text: root.signout-name + "  ·  Device ID " + root.signout-shown-id;
+                    color: root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.signout-stage == 1 ? "That device will be signed out of your account and must sign in again. It can read encrypted messages again only after it recovers its keys or is verified."
+                        : root.signout-stage == 2 ? "Asking your homeserver to sign out that device…"
+                        : root.signout-stage == 3 ? "Your homeserver asks for your account password to confirm. Morpheus uses it only for this request and never saves it."
+                        : root.signout-stage == 4 ? "Your homeserver asks you to confirm in your web browser. Open its page, finish there, then continue here."
+                        : root.signout-stage == 5 ? "Your account provider manages devices on its own page. Sign the device out there, then refresh the list here to see the result."
+                        : root.signout-stage == 6 ? "Morpheus cannot sign out that device from here."
+                        : "Morpheus does not sign out the device you are using from this list. Log out instead; it runs the usual checks first.";
+                    color: root.palette.ink;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if root.signout-message != "" : Text {
+                    text: root.signout-message;
+                    color: root.palette.error;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if root.signout-stage == 3 : LineEdit {
+                    text <=> root.signout-password;
+                    input-type: password;
+                    placeholder-text: "Account password";
+                    accessible-label: "Account password to confirm signing out " + root.signout-name;
+                    init => { self.focus(); }
+                    accepted => {
+                        if root.signout-password != "" {
+                            let secret = root.signout-password;
+                            root.signout-password = "";
+                            root.submit-signout-password(secret);
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    if root.signout-stage == 1 : Button {
+                        text: "Sign out device";
+                        enabled: !root.busy;
+                        accessible-label: "Sign out " + root.signout-name + " from this account";
+                        clicked => { root.confirm-signout(); }
+                    }
+                    if root.signout-stage == 3 : Button {
+                        text: "Confirm";
+                        enabled: !root.busy && root.signout-password != "";
+                        accessible-label: "Confirm signing out " + root.signout-name + " with your password";
+                        clicked => {
+                            let secret = root.signout-password;
+                            root.signout-password = "";
+                            root.submit-signout-password(secret);
+                        }
+                    }
+                    if root.signout-stage == 4 || root.signout-stage == 5 : Button {
+                        text: root.signout-page-opened ? "Open page again" : "Open page in browser";
+                        accessible-label: "Open the confirmation page in your web browser";
+                        clicked => { root.open-signout-page(); }
+                    }
+                    if root.signout-stage == 4 : Button {
+                        text: "Continue";
+                        enabled: root.signout-page-opened;
+                        accessible-label: "Continue after confirming in your web browser";
+                        clicked => { root.continue-signout(); }
+                    }
+                    if root.signout-stage == 5 : Button {
+                        text: "Refresh list";
+                        enabled: root.signout-page-opened;
+                        accessible-label: "Close this and refresh the device list";
+                        clicked => { root.continue-signout(); }
+                    }
+                    if root.signout-stage == 7 : Button {
+                        text: "Log out";
+                        accessible-label: "Log out of Morpheus on this device";
+                        clicked => { root.logout-this-device(); }
+                    }
+                    Button {
+                        text: root.signout-stage == 6 ? "Close" : "Cancel";
+                        accessible-label: root.signout-stage == 6 ? "Close this message" : "Do not sign out the device";
+                        clicked => {
+                            root.signout-password = "";
+                            root.cancel-signout();
+                        }
+                    }
+                }
+            }
+        }
         for device in root.devices : Rectangle {
             border-radius: 8px;
             background: root.palette.panel;
             border-width: device.verified ? 0px : 1px;
             border-color: root.palette.divider;
-            HorizontalLayout {
+            VerticalLayout {
                 padding: 10px;
-                spacing: 8px;
-                VerticalLayout {
-                    horizontal-stretch: 1;
-                    spacing: 2px;
-                    Text {
-                        text: device.current ? device.name + " · this device" : device.name;
-                        color: root.palette.ink;
-                        font-size: 12px * root.text-scale;
-                        font-weight: 600;
-                        wrap: word-wrap;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text {
+                            text: device.current ? device.name + " · this device" : device.name;
+                            color: root.palette.ink;
+                            font-size: 12px * root.text-scale;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: device.trust + "  ·  " + device.shown-id;
+                            color: device.verified ? root.palette.success : root.palette.muted;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: device.detail;
+                            color: root.palette.muted;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                        }
+                    }
+                    if device.can-verify : Button {
+                        text: "Verify";
+                        enabled: !root.busy && !root.loading;
+                        accessible-label: "Verify " + device.name + " by comparing emoji or numbers";
+                        clicked => { root.verify-device(device.device-id); }
+                    }
+                }
+                if root.rename-id == device.device-id : VerticalLayout {
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        LineEdit {
+                            text: root.rename-input;
+                            enabled: !root.rename-busy;
+                            placeholder-text: "Device name";
+                            accessible-label: "New name for " + device.name;
+                            init => { self.focus(); }
+                            edited(text) => { root.rename-input = text; }
+                            accepted(text) => { root.save-rename(device.device-id, text); }
+                        }
+                        Button {
+                            text: root.rename-busy ? "Saving…" : "Save";
+                            enabled: !root.rename-busy && root.rename-input != "";
+                            accessible-label: "Save the new name for " + device.name;
+                            clicked => { root.save-rename(device.device-id, root.rename-input); }
+                        }
+                        Button {
+                            text: "Cancel";
+                            enabled: !root.rename-busy;
+                            accessible-label: "Keep the current name of " + device.name;
+                            clicked => { root.cancel-rename(); }
+                        }
                     }
                     Text {
-                        text: device.trust + "  ·  " + device.shown-id;
-                        color: device.verified ? root.palette.success : root.palette.muted;
-                        font-size: 11px * root.text-scale;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: device.detail;
+                        text: "Up to 64 characters. People you talk to may be able to see device names.";
                         color: root.palette.muted;
                         font-size: 11px * root.text-scale;
                         wrap: word-wrap;
                     }
                 }
-                if device.can-verify : Button {
-                    text: "Verify";
-                    enabled: !root.busy && !root.loading;
-                    accessible-label: "Verify " + device.name + " by comparing emoji or numbers";
-                    clicked => { root.verify-device(device.device-id); }
+                if root.rename-id != device.device-id : HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Rename";
+                        enabled: !root.loading && !root.rename-busy && root.signout-stage == 0;
+                        accessible-label: "Rename " + device.name;
+                        clicked => { root.start-rename(device.device-id); }
+                    }
+                    Button {
+                        text: device.current ? "Log out…" : "Sign out…";
+                        enabled: !root.loading && !root.busy && !root.rename-busy && root.signout-stage == 0;
+                        accessible-label: device.current ? "Log out of Morpheus on this device" : "Sign out " + device.name + " from this account";
+                        clicked => { root.open-signout(device.device-id); }
+                    }
                 }
             }
         }

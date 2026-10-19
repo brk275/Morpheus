@@ -2166,6 +2166,19 @@ export component AppWindow inherits Window {
     in-out property <bool> encryption-devices-loading: false;
     in-out property <string> encryption-devices-error;
     in-out property <int> encryption-devices-operation: 0;
+    // Device rename and remote sign-out; see src/device_sessions.rs. The
+    // password is cleared on submit, cancel, leaving Settings and hiding.
+    in-out property <int> device-session-operation: 0;
+    in-out property <string> device-session-notice;
+    in-out property <string> device-rename-id;
+    in-out property <string> device-rename-input;
+    in-out property <bool> device-rename-busy: false;
+    in-out property <int> device-signout-stage: 0;
+    in-out property <string> device-signout-name;
+    in-out property <string> device-signout-shown-id;
+    in-out property <string> device-signout-password;
+    in-out property <string> device-signout-message;
+    in-out property <bool> device-signout-page-opened: false;
     // Newest pending request from another device of this account, and the
     // one the person chose to hide; opaque flow IDs, never shown.
     in-out property <string> encryption-incoming-flow-id;
@@ -2461,6 +2474,15 @@ export component AppWindow inherits Window {
     callback cancel-sas-verification();
     callback refresh-encryption-devices();
     callback verify-encryption-device(string);
+    callback start-device-rename(string);
+    callback save-device-rename(string, string);
+    callback cancel-device-rename();
+    callback open-device-signout(string);
+    callback confirm-device-signout();
+    callback submit-device-signout-password(string);
+    callback open-device-signout-page();
+    callback continue-device-signout();
+    callback cancel-device-signout();
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
@@ -2496,6 +2518,7 @@ export component AppWindow inherits Window {
         root.close-image-preview();
         if root.page != 1 {
             root.security-recovery-input = "";
+            root.device-signout-password = "";
             root.sas-compared = false;
             root.notification-highlight-error = "";
         }
@@ -5176,9 +5199,32 @@ export component AppWindow inherits Window {
                                 loading: root.encryption-devices-loading;
                                 busy: root.sas-stage != 0 || root.sas-busy || root.security-busy || root.security-recovery-key != "";
                                 error: root.encryption-devices-error;
+                                notice: root.device-session-notice;
+                                rename-id: root.device-rename-id;
+                                rename-input <=> root.device-rename-input;
+                                rename-busy: root.device-rename-busy;
+                                signout-stage: root.device-signout-stage;
+                                signout-name: root.device-signout-name;
+                                signout-shown-id: root.device-signout-shown-id;
+                                signout-password <=> root.device-signout-password;
+                                signout-message: root.device-signout-message;
+                                signout-page-opened: root.device-signout-page-opened;
                                 reveal-request: root.reveal-request("security.devices");
                                 refresh => { root.refresh-encryption-devices(); }
                                 verify-device(device-id) => { root.verify-encryption-device(device-id); }
+                                start-rename(device-id) => { root.start-device-rename(device-id); }
+                                save-rename(device-id, name) => { root.save-device-rename(device-id, name); }
+                                cancel-rename => { root.cancel-device-rename(); }
+                                open-signout(device-id) => { root.open-device-signout(device-id); }
+                                confirm-signout => { root.confirm-device-signout(); }
+                                submit-signout-password(secret) => { root.submit-device-signout-password(secret); }
+                                open-signout-page => { root.open-device-signout-page(); }
+                                continue-signout => { root.continue-device-signout(); }
+                                cancel-signout => { root.cancel-device-signout(); }
+                                logout-this-device => {
+                                    root.cancel-device-signout();
+                                    root.log-out();
+                                }
                                 reveal-at(y) => { settings-scroll.reveal(y - settings-content.absolute-position.y); }
                                 revealed(id) => { root.settings-revealed-id = id; }
                             }

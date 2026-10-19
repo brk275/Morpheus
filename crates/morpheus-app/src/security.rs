@@ -340,6 +340,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         {
             // A hidden window keeps running; it must not keep a typed secret.
             window.set_security_recovery_input("".into());
+            crate::device_sessions::clear_secret(&window);
         }
         response
     });
