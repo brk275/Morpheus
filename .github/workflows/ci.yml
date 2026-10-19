@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed customization native checks
-run-name: Reviewed customization integration - 69a6c04 - ${{ inputs.platform }}
+name: Reviewed room organization native checks
+run-name: Reviewed room organization integration - ee3a7a7 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-69a6c04-${{ github.ref }}
+  group: beta-native-ee3a7a7-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 69a6c040b8f46eda1b69fe667fd1f4fab27a07d8
+          ref: ee3a7a77f7e38621d2a4197d2514cb6881236b99
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='69a6c040b8f46eda1b69fe667fd1f4fab27a07d8'
+          source='ee3a7a77f7e38621d2a4197d2514cb6881236b99'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text(encoding='utf-8').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='69a6c040b8f46eda1b69fe667fd1f4fab27a07d8'
+          source='ee3a7a77f7e38621d2a4197d2514cb6881236b99'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -453,23 +453,19 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          needed_settings={'settings_search::tests::exact_field_results_name_their_config_key_and_sections_none', 'settings_search::tests::typed_input_is_bounded_before_normalization_and_key_matching', 'settings_search::tests::listed_section_keys_are_registry_keys_and_find_their_section', 'settings_search::tests::an_exact_section_key_always_leads_once_within_the_bound', 'settings_search::tests::a_typed_config_key_finds_its_field'}
-          needed_permit={'style_profiles::tests::the_dialog_permit_admits_one_operation_at_a_time'}
+          needed_tags=set(['room_tags::tests::a_superseded_selection_changes_no_tags', 'room_tags::tests::changes_follow_what_the_caller_knows_over_the_stored_tags', 'room_tags::tests::deserialized_orders_cannot_bypass_numeric_bounds', 'room_tags::tests::orders_are_bounded_and_compare_numerically', 'room_tags::tests::retrying_uncertain_tags_never_discards_other_clients_metadata', 'room_tags::tests::stored_orders_and_foreign_fields_are_read_faithfully'])
+          needed_organization=set(['room_organization::tests::a_failed_request_keeps_the_room_in_place_and_its_tags_uncertain', 'room_organization::tests::a_move_writes_one_order_between_its_new_neighbours', 'room_organization::tests::a_stale_snapshot_never_ends_a_newer_write', 'room_organization::tests::an_accepted_change_keeps_an_untouched_uncertain_tag_uncertain', 'room_organization::tests::confirmed_writes_show_until_sync_returns_them_for_that_account_only', 'room_organization::tests::discarded_history_cannot_falsely_confirm_a_repeated_order', 'room_organization::tests::follow_up_choices_use_confirmed_writes', 'room_organization::tests::header_menu_ownership_rejects_revocation_replay_and_replaced_menus', 'room_organization::tests::hidden_favourites_keep_their_place_when_a_visible_one_moves', 'room_organization::tests::menu_choices_plan_one_change_and_nothing_redundant', 'room_organization::tests::missing_or_crowded_orders_renumber_only_what_changes', 'room_organization::tests::writes_on_rooms_tagged_both_ways_keep_the_low_priority_order'])
+          needed_navigation=set(['navigation::tests::merged_names_do_not_conflate_room_dm_or_voice_identity', 'navigation::tests::tagged_rooms_form_ordered_sections_without_changing_their_identity', 'navigation::tests::unchanged_room_sequences_update_rows_in_place', 'navigation::tests::unread_partition_spans_types_and_reverting_restores_filtered_order'])
           needed_ui={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}
           checks=[
               ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
-              ('app_settings_search',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','settings_search::tests::','--','--test-threads=1'],40*60,needed_settings,set()),
-              ('app_style_permit',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','style_profiles::tests::the_dialog_permit_admits_one_operation_at_a_time',
-                  '--','--exact','--test-threads=1'],40*60,needed_permit,set()),
-              ('app_customization_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-                  '--','--exact','--test-threads=1'],40*60,needed_ui,set()),
+              ('matrix_room_tags',['cargo','test','--locked','-p','morpheus-matrix','--lib','room_tags::tests::','--','--test-threads=1'],40*60,needed_tags,set()),
+              ('app_room_organization',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app','room_organization::tests::','--','--test-threads=1'],40*60,needed_organization,set()),
+              ('app_navigation',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app','navigation::tests::','--','--test-threads=1'],40*60,needed_navigation,set()),
+              ('app_customization_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation','--','--exact','--test-threads=1'],40*60,needed_ui,set()),
           ]
-          # Shared UI requires every supported native target on the combined source.
-          # Config/Matrix/RTC/SDK inputs are unchanged from the accepted adccb baseline;
-          # keep their immutable component evidence and do not repeat their suites here.
+          # Check changed room tag boundaries, organization, navigation and real UI.
+          # Preserve unchanged config/RTC/SDK evidence; no package or real-account work.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               result=bounded(args,name,seconds)
@@ -539,6 +535,10 @@ jobs:
                   # Missing identifiers are admitted only if already in those public sources.
                   source_files=('crates/morpheus-app/src/main.rs',
                       'crates/morpheus-app/src/settings_search.rs',
+                      'crates/morpheus-app/src/room_organization/mod.rs',
+                      'crates/morpheus-app/src/navigation.rs',
+                      'crates/morpheus-app/ui/room-organization.slint',
+                      'crates/morpheus-matrix/src/room_tags.rs',
                       'crates/morpheus-app/src/appearance.rs',
                       'crates/morpheus-app/src/style_profiles.rs',
                       'crates/morpheus-app/ui/controls.slint',
