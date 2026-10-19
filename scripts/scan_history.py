@@ -118,7 +118,7 @@ def scan(candidate, scanner, manifest, evidence):
                  "--gitleaks-ignore-path", str(ignore), "--ignore-gitleaks-allow",
                  "--redact=100", "--no-banner", "--max-target-megabytes", "0",
                  "--report-format", "json", "--report-path", str(report),
-                 "--log-opts=--all --full-history --text --no-ext-diff --no-textconv"],
+                 "--log-opts=--all --full-history --text --no-ext-diff --no-textconv --diff-merges=first-parent"],
                 cwd=root, env=git_env(), stdout=log, stderr=subprocess.STDOUT, timeout=240,
             )
         if result.returncode not in (0, 1) or not report.is_file() or report.stat().st_size > MAX_REPORT:

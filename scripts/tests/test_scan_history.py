@@ -56,6 +56,24 @@ class HistoryScannerTests(unittest.TestCase):
         git("-C", self.repo, "checkout", "--detach", base)
         self.assertGreater(self.execute("other-ref")["unexpected_findings"], 0)
 
+    def test_merge_only_introduction_is_scanned(self):
+        (self.repo / "readme.txt").write_text("Synthetic merge history only\n")
+        base = self.commit("Merge fixture base")
+        git("-C", self.repo, "checkout", "-b", "side-fixture")
+        (self.repo / "side.txt").write_text("Side parent has no credential\n")
+        self.commit("Side parent")
+        git("-C", self.repo, "checkout", "-b", "primary-fixture", base)
+        (self.repo / "primary.txt").write_text("First parent has no credential\n")
+        self.commit("First parent")
+        git("-C", self.repo, "merge", "--no-ff", "--no-commit", "side-fixture")
+        # Neither parent contains this file; only the merge introduces it.
+        (self.repo / "fixture.txt").write_text(self.canary)
+        merge = self.commit("Synthetic merge-only introduction")
+        result = self.execute("merge-introduction")
+        self.assertGreater(result["unexpected_findings"], 0)
+        findings = json.loads((self.root / "merge-introduction/redacted-findings.json").read_text())
+        self.assertTrue(any(f["Commit"] == merge and f["File"] == "fixture.txt" for f in findings))
+
     def test_exception_requires_exact_fingerprint_and_complete_blob_digest(self):
         (self.repo / "fixture.txt").write_text(self.canary)
         self.commit("Synthetic public fixture")
