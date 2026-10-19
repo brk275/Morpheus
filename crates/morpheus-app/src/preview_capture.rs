@@ -375,7 +375,7 @@ fn reset_capture_overlays(ui: &AppWindow) {
     ui.set_account_menu_open(false);
     ui.set_room_admin_open(false);
     ui.set_room_actions_open(false);
-    ui.set_member_confirm_open(false);
+    ui.set_roster_confirm_open(false);
     ui.set_native_capture_picker_open(false);
     ui.set_leave_call_dialog(false);
     ui.set_quick_switcher_open(false);

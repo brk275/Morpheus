@@ -1,4 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
+import { MemberActionDialog, RoomMembersPanel, RosterMember, RosterPalette } from "room-admin.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -1874,7 +1875,7 @@ export component AppWindow inherits Window {
         if mode != root.navigation-mode && root.navigation-focus-owner == root.navigation-mode
             && !root.show-sign-in && !root.manage-accounts-open && !root.access-open
             && !root.account-menu-open && !root.room-actions-open && !root.room-admin-open
-            && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog
+            && !root.roster-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog
             && !root.quick-switcher-open && !root.image-preview-open && root.security-recovery-key == "" {
             account-trigger.focus();
         }
@@ -1885,27 +1886,38 @@ export component AppWindow inherits Window {
     in-out property <[RoomItem]> unsorted-direct-messages;
     in-out property <[MessageItem]> messages;
     in-out property <[MessageItem]> thread-messages;
+    // Offline preview roster. Live rooms use the roster-* administration state.
     in-out property <[MemberItem]> members;
-    in-out property <bool> member-loading: false;
-    in-out property <string> member-error;
-    in-out property <string> member-invite-user-id;
-    in-out property <string> member-selected-user-id;
-    in-out property <string> member-selected-name;
-    in-out property <string> member-selected-membership;
-    in-out property <string> member-selected-power;
-    in-out property <bool> member-selected-self: false;
-    in-out property <bool> member-selected-creator: false;
-    in-out property <bool> member-action-busy: false;
-    in-out property <string> member-action-error;
-    in-out property <string> member-action-notice;
-    in-out property <int> member-action-operation: 0;
-    in-out property <bool> member-confirm-open: false;
-    in-out property <int> member-confirm-kind: -1;
-    in-out property <string> member-confirm-user-id;
-    in-out property <string> member-confirm-name;
-    in-out property <string> member-confirm-value;
-    in-out property <string> member-confirm-account-id;
-    in-out property <string> member-confirm-room-id;
+    // Native room administration: room-admin.slint, owned by room_admin/ui.rs.
+    // `roster-panel-id` fences every asynchronous result to one open roster.
+    in-out property <string> roster-panel-id;
+    in-out property <[RosterMember]> roster-members;
+    in-out property <string> roster-summary;
+    in-out property <string> roster-shown-text;
+    in-out property <string> roster-own-role;
+    in-out property <bool> roster-loaded: false;
+    in-out property <bool> roster-loading: false;
+    in-out property <bool> roster-busy: false;
+    in-out property <string> roster-pending-text;
+    in-out property <string> roster-error;
+    in-out property <string> roster-notice;
+    in-out property <bool> roster-can-invite: false;
+    in-out property <int> roster-own-level: 0;
+    in-out property <int> roster-member-level: 0;
+    in-out property <string> roster-query;
+    in-out property <int> roster-filter: 0;
+    in-out property <string> roster-invite-input;
+    in-out property <string> roster-selected-key;
+    in-out property <RosterMember> roster-selected;
+    in-out property <string> roster-selected-status;
+    in-out property <string> roster-selected-restriction;
+    in-out property <string> roster-level-input;
+    in-out property <string> roster-reason-input;
+    in-out property <bool> roster-confirm-open: false;
+    in-out property <string> roster-confirm-title;
+    in-out property <string> roster-confirm-body;
+    in-out property <string> roster-confirm-action;
+    in-out property <bool> roster-confirm-destructive: false;
     in-out property <int> active-account-index: 0;
     in-out property <string> active-account-local-id;
     in-out property <string> active-account-name;
@@ -2247,8 +2259,16 @@ export component AppWindow inherits Window {
     callback set-shared-voice-space(bool);
     callback choose-room-call-mode(int);
     callback load-older-messages();
-    callback refresh-room-members();
-    callback submit-member-action(int, string, string);
+    callback roster-scope-changed();
+    callback roster-search-edited(string);
+    callback roster-choose-filter(int);
+    callback roster-refresh();
+    callback roster-select(string);
+    callback roster-invite();
+    // 1 kick, 2 ban, 3 unban, 4 set level, 5 approve request, 6 deny request
+    callback roster-request(int);
+    callback roster-confirm();
+    callback roster-cancel-confirm();
     callback submit-room-admin(int, string, string);
     callback open-room-settings();
     callback cancel-room-settings();
@@ -2523,7 +2543,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.roster-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -2646,6 +2666,26 @@ export component AppWindow inherits Window {
     property <color> divider: StyleTokens.base.divider.present ? StyleTokens.base.divider.color : custom-theme-active ? custom-divider : light-palette ? #dfe4ee : theme-mode == 2 ? #ffffff : #303747;
     property <color> accent: StyleTokens.base.accent.present ? StyleTokens.base.accent.color : custom-theme-active ? custom-accent : light-palette ? #6545b5 : theme-mode == 2 ? #ffff00 : #ad91ff;
     property <color> accent-ink: StyleTokens.base.accent-ink.present ? StyleTokens.base.accent-ink.color : custom-theme-active ? custom-accent-ink : light-palette ? #ffffff : theme-mode == 2 ? #000000 : #10131b;
+    // Theme roles for room administration, resolved once for room-admin.slint.
+    property <RosterPalette> roster-palette: {
+        ink: root.ink,
+        muted: root.muted,
+        elevated: root.elevated,
+        hover: root.hover,
+        accent: root.accent,
+        accent-ink: root.accent-ink,
+        divider: root.divider,
+        error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483,
+        destructive: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483,
+        destructive-ink: StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b,
+        selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover,
+        selection-ink: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink,
+        text-selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : Palette.selection-background,
+        text-selection-ink: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground,
+        focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+        avatar-ink: StyleTokens.roles.avatar-ink.present ? StyleTokens.roles.avatar-ink.color : #ffffff,
+        scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa,
+    };
     // Surfaces painted directly on the native window. Below 100% their own
     // alpha is scaled and the window's background is cleared, so the desktop
     // shows through only these panes; text, icons, inputs, cards, popups,
@@ -5824,7 +5864,7 @@ export component AppWindow inherits Window {
                     }
                 }
                 Rectangle { height: 1px; background: root.divider; }
-                if root.side-panel-tab == 0 : VerticalLayout {
+                if root.side-panel-tab == 0 && !root.live-session : VerticalLayout {
                     vertical-stretch: 1;
                     spacing: 0px;
                     HorizontalLayout {
@@ -5836,72 +5876,6 @@ export component AppWindow inherits Window {
                             vertical-alignment: center; horizontal-stretch: 1;
                             accessible-live-region: polite;
                         }
-                        if root.live-session : IconAction {
-                            width: 28px; height: 28px;
-                            icon: "↻"; label: "Refresh room members";
-                            ink: root.muted; surface: transparent; hover-surface: root.hover;
-                            enabled: !root.member-loading && root.active-room-id != "";
-                            activated => { root.refresh-room-members(); }
-                        }
-                    }
-                    if root.live-session && root.member-loading : Text {
-                        height: 32px; text: "Loading members…";
-                        color: root.muted; font-size: 11px * root.text-scale;
-                        horizontal-alignment: center; vertical-alignment: center;
-                        accessible-live-region: polite;
-                    }
-                    if root.live-session && root.member-error != "" : Text {
-                        height: 58px; text: root.member-error;
-                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #d65163; font-size: 11px * root.text-scale;
-                        wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
-                        accessible-live-region: assertive;
-                    }
-                    if root.live-session && !root.member-loading && root.member-error == "" && root.members.length == 0 : Text {
-                        height: 52px; text: "No members to show";
-                        color: root.muted; font-size: 11px * root.text-scale;
-                        horizontal-alignment: center; vertical-alignment: center;
-                    }
-                    if root.live-session && root.active-room-id != "" : Text {
-                        height: 21px; text: "INVITE BY MATRIX USER ID";
-                        color: root.muted; font-size: 10px * root.text-scale;
-                        font-weight: 700;
-                    }
-                    if root.live-session && root.active-room-id != "" : HorizontalLayout {
-                        height: max(42px, 32px * root.text-scale); padding-left: 10px; padding-right: 10px; spacing: 6px;
-                        Rectangle {
-                            horizontal-stretch: 1; background: root.elevated;
-                            border-radius: 7px; border-color: root.divider; border-width: 1px;
-                            ThemedTextInput {
-                                x: 7px; width: parent.width - 14px; height: parent.height;
-                                text <=> root.member-invite-user-id;
-                                color: root.ink; font-size: 11px * root.text-scale;
-                                enabled: !root.member-action-busy;
-                                accessible-label: "Matrix user ID to invite to this room";
-                                accepted => {
-                                    if root.member-invite-user-id != "" && !root.member-action-busy {
-                                        root.submit-member-action(0, root.member-invite-user-id, "");
-                                    }
-                                }
-                            }
-                        }
-                        TextAction {
-                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
-                            outline: root.divider; text-scale: root.text-scale;
-                            text: "Invite";
-                            enabled: !root.member-action-busy && root.member-invite-user-id != "";
-                            accessible-label: "Invite Matrix user to this room";
-                            activated => { root.submit-member-action(0, root.member-invite-user-id, ""); }
-                        }
-                    }
-                    if root.member-action-error != "" : Text {
-                        height: 44px; text: root.member-action-error;
-                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 11px * root.text-scale;
-                        wrap: word-wrap; accessible-live-region: polite;
-                    }
-                    if root.member-action-notice != "" : Text {
-                        height: 26px; text: root.member-action-notice;
-                        color: root.accent; font-size: 11px * root.text-scale;
-                        overflow: elide; accessible-live-region: polite;
                     }
                     member-list := ListView {
                         vertical-stretch: 1;
@@ -5918,138 +5892,50 @@ export component AppWindow inherits Window {
                                     Text { text: member.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
                                     Text { text: member.detail; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
                                 }
-                                if root.live-session : ActionRect {
-                                    width: 72px * root.text-scale; height: 30px * root.text-scale;
-                                    horizontal-stretch: 0; border-radius: 7px;
-                                    background: self.has-hover ? root.hover : root.elevated;
-                                    focus-color: root.accent;
-                                    enabled: !root.member-action-busy;
-                                    label: "Manage room member " + member.name + " · " + member.user-id;
-                                    activated => {
-                                        root.member-selected-user-id = member.user-id;
-                                        root.member-selected-name = member.name;
-                                        root.member-selected-membership = member.membership;
-                                        root.member-selected-power = member.power-level-text;
-                                        root.member-selected-self = member.is-account-user;
-                                        root.member-selected-creator = member.is-creator;
-                                        root.member-action-error = "";
-                                        root.member-action-notice = "";
-                                    }
-                                    Text {
-                                        text: "Manage";
-                                        color: root.member-action-busy ? root.muted : root.ink;
-                                        font-size: 11px * root.text-scale;
-                                        horizontal-alignment: center; vertical-alignment: center;
-                                    }
-                                }
-                                if !root.live-session : Rectangle {
+                                Rectangle {
                                     width: 7px; background: transparent;
                                     Rectangle { y: (parent.height - 7px) / 2; width: 7px; height: 7px; border-radius: 4px; background: member.online ? (StyleTokens.roles.presence-online.present ? StyleTokens.roles.presence-online.color : #64c9a7) : root.muted; }
                                 }
                             }
                         }
                     }
-                    if root.live-session && root.member-selected-user-id != "" : Rectangle {
-                        height: root.member-selected-membership == "ban" ? 133px : 184px;
-                        background: root.elevated; border-color: root.divider; border-width: 1px;
-                        VerticalLayout {
-                            padding: 9px; spacing: 5px;
-                            HorizontalLayout {
-                                Text {
-                                    text: "Manage " + root.member-selected-name;
-                                    color: root.ink; font-size: 11px * root.text-scale; font-weight: 700;
-                                    horizontal-stretch: 1; overflow: elide;
-                                }
-                                member-manage-close := Button {
-                                    width: 27px; height: 25px; text: "×";
-                                    accessible-label: "Close member controls";
-                                    clicked => { root.member-selected-user-id = ""; }
-                                }
-                            }
-                            Text {
-                                text: root.member-selected-user-id;
-                                color: root.muted; font-size: 10px * root.text-scale;
-                                overflow: elide;
-                            }
-                            if root.member-selected-membership != "ban" : HorizontalLayout {
-                                height: 34px; spacing: 5px;
-                                Rectangle {
-                                    horizontal-stretch: 1; background: root.panel;
-                                    border-radius: 7px; border-color: root.divider; border-width: 1px;
-                                    ThemedTextInput {
-                                        x: 7px; width: parent.width - 14px; height: parent.height;
-                                        text <=> root.member-selected-power;
-                                        color: root.ink; font-size: 11px * root.text-scale;
-                                        enabled: !root.member-action-busy && !root.member-selected-creator;
-                                        accessible-label: "Power level for selected room member";
-                                    }
-                                }
-                                Button {
-                                    width: 72px; text: "Set power";
-                                    enabled: !root.member-action-busy && !root.member-selected-creator && root.member-selected-power != "";
-                                    accessible-label: "Review power level change for " + root.member-selected-name;
-                                    clicked => {
-                                        root.member-confirm-kind = 4;
-                                        root.member-confirm-user-id = root.member-selected-user-id;
-                                        root.member-confirm-name = root.member-selected-name;
-                                        root.member-confirm-value = root.member-selected-power;
-                                        root.member-confirm-account-id = root.active-account-local-id;
-                                        root.member-confirm-room-id = root.active-room-id;
-                                        root.member-confirm-open = true;
-                                    }
-                                }
-                            }
-                            HorizontalLayout {
-                                height: 34px; spacing: 6px;
-                                if root.member-selected-membership == "ban" : Button {
-                                    text: "Unban";
-                                    enabled: !root.member-action-busy;
-                                    accessible-label: "Review unban of " + root.member-selected-name;
-                                    clicked => {
-                                        root.member-confirm-kind = 3;
-                                        root.member-confirm-user-id = root.member-selected-user-id;
-                                        root.member-confirm-name = root.member-selected-name;
-                                        root.member-confirm-value = "";
-                                        root.member-confirm-account-id = root.active-account-local-id;
-                                        root.member-confirm-room-id = root.active-room-id;
-                                        root.member-confirm-open = true;
-                                    }
-                                }
-                                if root.member-selected-membership != "ban" : Button {
-                                    text: "Kick";
-                                    enabled: !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
-                                    accessible-label: "Review kick of " + root.member-selected-name;
-                                    clicked => {
-                                        root.member-confirm-kind = 1;
-                                        root.member-confirm-user-id = root.member-selected-user-id;
-                                        root.member-confirm-name = root.member-selected-name;
-                                        root.member-confirm-value = "";
-                                        root.member-confirm-account-id = root.active-account-local-id;
-                                        root.member-confirm-room-id = root.active-room-id;
-                                        root.member-confirm-open = true;
-                                    }
-                                }
-                                if root.member-selected-membership != "ban" : Button {
-                                    text: "Ban";
-                                    enabled: !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
-                                    accessible-label: "Review ban of " + root.member-selected-name;
-                                    clicked => {
-                                        root.member-confirm-kind = 2;
-                                        root.member-confirm-user-id = root.member-selected-user-id;
-                                        root.member-confirm-name = root.member-selected-name;
-                                        root.member-confirm-value = "";
-                                        root.member-confirm-account-id = root.active-account-local-id;
-                                        root.member-confirm-room-id = root.active-room-id;
-                                        root.member-confirm-open = true;
-                                    }
-                                }
-                            }
-                            Text {
-                                text: "The homeserver checks your room permissions.";
-                                color: root.muted; font-size: 10px * root.text-scale;
-                            }
-                        }
-                    }
+                }
+                if root.side-panel-tab == 0 && root.live-session : RoomMembersPanel {
+                    vertical-stretch: 1;
+                    palette: root.roster-palette;
+                    text-scale: root.text-scale;
+                    available: root.active-room-id != "";
+                    scope-key: root.active-account-local-id + "\n" + root.active-room-id;
+                    members: root.roster-members;
+                    summary: root.roster-summary;
+                    shown-text: root.roster-shown-text;
+                    own-role: root.roster-own-role;
+                    loaded: root.roster-loaded;
+                    loading: root.roster-loading;
+                    busy: root.roster-busy;
+                    pending-text: root.roster-pending-text;
+                    error: root.roster-error;
+                    notice: root.roster-notice;
+                    can-invite: root.roster-can-invite;
+                    own-level: root.roster-own-level;
+                    member-level: root.roster-member-level;
+                    query <=> root.roster-query;
+                    filter: root.roster-filter;
+                    invite-input <=> root.roster-invite-input;
+                    selected-key: root.roster-selected-key;
+                    selected: root.roster-selected;
+                    selected-status: root.roster-selected-status;
+                    selected-restriction: root.roster-selected-restriction;
+                    level-input <=> root.roster-level-input;
+                    reason-input <=> root.roster-reason-input;
+                    scope-changed => { root.roster-scope-changed(); }
+                    search-edited(text) => { root.roster-search-edited(text); }
+                    choose-filter(index) => { root.roster-choose-filter(index); }
+                    refresh => { root.roster-refresh(); }
+                    select(key) => { root.roster-select(key); }
+                    invite => { root.roster-invite(); }
+                    request(kind) => { root.roster-request(kind); }
+                    open-settings => { root.open-room-settings(); }
                 }
                 if root.side-panel-tab == 1 : VerticalLayout {
                     vertical-stretch: 1;
@@ -6976,80 +6862,17 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.member-confirm-open : FocusScope {
-        init => { cancel-member-action.focus(); }
-        key-pressed(event) => {
-            if event.text == Key.Escape && !root.member-action-busy {
-                root.member-confirm-open = false;
-                account-trigger.focus();
-                accept
-            } else { reject }
-        }
-        Rectangle {
-            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
-            TouchArea { width: parent.width; height: parent.height; }
-            Rectangle {
-                x: (parent.width - 430px) / 2;
-                y: (parent.height - 220px) / 2;
-                width: 430px; height: 220px;
-                background: root.elevated; border-color: root.divider;
-                border-width: 1px; border-radius: 14px;
-                accessible-role: region;
-                accessible-label: "Confirm room member action";
-                VerticalLayout {
-                    padding: 20px; spacing: 12px;
-                    Text {
-                        text: root.member-confirm-kind == 1 ? "Kick " + root.member-confirm-name + "?"
-                            : root.member-confirm-kind == 2 ? "Ban " + root.member-confirm-name + "?"
-                            : root.member-confirm-kind == 3 ? "Unban " + root.member-confirm-name + "?"
-                            : "Change power for " + root.member-confirm-name + "?";
-                        color: root.ink; font-size: 18px * root.text-scale;
-                        font-weight: 750; wrap: word-wrap;
-                    }
-                    Text {
-                        text: root.member-confirm-kind == 4
-                            ? "Set this member's Matrix room power level to " + root.member-confirm-value + "."
-                            : root.member-confirm-kind == 1
-                            ? "Remove this member from the room. They may rejoin if room rules allow it."
-                            : root.member-confirm-kind == 2
-                            ? "Remove this member and prevent them from rejoining until unbanned."
-                            : "Allow this member to join the room again.";
-                        color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
-                    }
-                    Rectangle { vertical-stretch: 1; background: transparent; }
-                    HorizontalLayout {
-                        alignment: end; spacing: 9px;
-                        cancel-member-action := ActionRect {
-                            width: 98px; height: 36px; border-radius: 8px;
-                            background: root.panel; label: "Cancel member action";
-                            trap-tab: true; cancel-on-escape: true;
-                            next-focus => { confirm-member-action.focus(); }
-                            previous-focus => { confirm-member-action.focus(); }
-                            cancelled => { root.member-confirm-open = false; account-trigger.focus(); }
-                            activated => { root.member-confirm-open = false; account-trigger.focus(); }
-                            Text { text: "Cancel"; color: root.ink; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
-                        }
-                        confirm-member-action := ActionRect {
-                            width: 128px; height: 36px; border-radius: 8px;
-                            background: root.accent; label: "Confirm room member action";
-                            trap-tab: true; cancel-on-escape: true;
-                            next-focus => { cancel-member-action.focus(); }
-                            previous-focus => { cancel-member-action.focus(); }
-                            cancelled => { root.member-confirm-open = false; account-trigger.focus(); }
-                            activated => {
-                                if root.member-confirm-account-id == root.active-account-local-id
-                                    && root.member-confirm-room-id == root.active-room-id {
-                                    root.submit-member-action(root.member-confirm-kind, root.member-confirm-user-id, root.member-confirm-value);
-                                }
-                                root.member-confirm-open = false;
-                                account-trigger.focus();
-                            }
-                            Text { text: "Confirm"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        }
-                    }
-                }
-            }
-        }
+    if root.roster-confirm-open && root.live-session : MemberActionDialog {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        palette: root.roster-palette;
+        text-scale: root.text-scale;
+        title: root.roster-confirm-title;
+        body: root.roster-confirm-body;
+        action-text: root.roster-confirm-action;
+        destructive: root.roster-confirm-destructive;
+        busy: root.roster-busy;
+        confirm => { root.roster-confirm(); account-trigger.focus(); }
+        cancel => { root.roster-cancel-confirm(); account-trigger.focus(); }
     }
 
     if root.native-capture-picker-open && root.page == 2 && root.live-session && root.native-call-joined : FocusScope {

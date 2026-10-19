@@ -44,6 +44,13 @@ pub use account_access::{
     ActivationCancellation, ActivationChallenge, ActivationGrant, AppPasswordStatus, RemovalResult,
 };
 mod admin;
+mod room_admin;
+pub use room_admin::{
+    AdminAction, AdminMember, AdminMembership, AdminOutcome, AdminRequest, MAX_ADMIN_REASON_BYTES,
+    MAX_ROSTER_MEMBERS, MemberActions, MemberExpectation, MemberPower, MembershipCounts,
+    ObservedMembership, ObservedTarget, OwnAdminPermissions, PowerThresholds, RoomAdminError,
+    RoomAdminSession, RoomAdminSnapshot, RosterWatch,
+};
 mod room_settings;
 pub use room_settings::{
     AvatarPng, CurrentJoinRule, EditableJoinRule, JoinRuleKind, MAX_RESTRICTED_ALLOW_ROOMS,

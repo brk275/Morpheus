@@ -28,6 +28,7 @@ mod notifications;
 mod outgoing_ring;
 #[cfg(debug_assertions)]
 mod preview_capture;
+mod room_admin;
 mod room_settings;
 mod security;
 mod settings_search;
@@ -682,8 +683,6 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
     ui.set_invitations(ModelRc::new(VecModel::from(Vec::<RoomItem>::new())));
     apply_room_sort(ui);
     ui.set_members(ModelRc::new(VecModel::from(account.members.clone())));
-    ui.set_member_loading(false);
-    ui.set_member_error("".into());
 
     if state.active_room == "#discover" {
         ui.set_active_room_id("#discover".into());
@@ -1609,6 +1608,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
     let room_settings =
         room_settings::RoomSettingsUi::register(&ui, live.clone(), runtime.handle());
+    let room_admin = room_admin::ui::RoomAdminUi::register(&ui, live.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
@@ -2706,183 +2706,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => window.set_history_error(
                         "Could not load earlier history. Check sync and retry.".into(),
                     ),
-                }
-            });
-        });
-    });
-
-    let weak = ui.as_weak();
-    let members_live = live.clone();
-    let members_handle = runtime.handle().clone();
-    ui.on_refresh_room_members(move || {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !members_live.is_live.load(Ordering::Acquire) {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        if account_id.is_empty() || room_id.is_empty() {
-            return;
-        }
-        let live = members_live.clone();
-        let ui = weak.clone();
-        members_handle.spawn(async move {
-            live.refresh_members_for(account_id, room_id, ui, true)
-                .await;
-        });
-    });
-
-    let weak = ui.as_weak();
-    let member_action_live = live.clone();
-    let member_action_handle = runtime.handle().clone();
-    ui.on_submit_member_action(move |kind, user_id, value| {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !member_action_live.is_live.load(Ordering::Acquire) || window.get_member_action_busy() {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        let user_id = user_id.trim().to_owned();
-        if account_id.is_empty() || room_id.is_empty() || user_id.is_empty() {
-            window.set_member_action_error("Choose a room and enter a Matrix user ID".into());
-            return;
-        }
-        let label = match kind {
-            0 => "invite",
-            1 => "kick",
-            2 => "ban",
-            3 => "unban",
-            4 => "change power for",
-            _ => return,
-        };
-        let value = value.to_string();
-        let power_level = if kind == 4 {
-            match value.trim().parse::<i64>() {
-                Ok(level) => Some(level),
-                Err(_) => {
-                    window.set_member_action_error("Enter a whole-number power level".into());
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let operation = window.get_member_action_operation().wrapping_add(1);
-        window.set_member_action_operation(operation);
-        window.set_member_action_busy(true);
-        window.set_member_action_error("".into());
-        window.set_member_action_notice("".into());
-        let navigation_epoch = member_action_live.current_navigation_epoch();
-        let live = member_action_live.clone();
-        let weak = weak.clone();
-        member_action_handle.spawn(async move {
-            // A room or account switch can invalidate the action before its
-            // Tokio task reaches the network. The core checks the account ID
-            // again while it holds the selection lock.
-            if !live.navigation_is_current(navigation_epoch) {
-                return;
-            }
-            let manager = live.manager.clone();
-            let result = match kind {
-                0 => {
-                    manager
-                        .invite_user_for(&account_id, &room_id, &user_id)
-                        .await
-                }
-                1 => {
-                    manager
-                        .kick_user_for(&account_id, &room_id, &user_id, None)
-                        .await
-                }
-                2 => {
-                    manager
-                        .ban_user_for(&account_id, &room_id, &user_id, None)
-                        .await
-                }
-                3 => {
-                    manager
-                        .unban_user_for(&account_id, &room_id, &user_id, None)
-                        .await
-                }
-                4 => {
-                    manager
-                        .set_member_power_level_for(
-                            &account_id,
-                            &room_id,
-                            &user_id,
-                            power_level.expect("parsed for power action"),
-                        )
-                        .await
-                }
-                _ => return,
-            };
-            if result.is_ok() && live.navigation_is_current(navigation_epoch) {
-                // The SDK member snapshot may still contain the previous
-                // sync state immediately after the homeserver accepts a
-                // change. Wait briefly for the target state before repainting.
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-                loop {
-                    if !live.navigation_is_current(navigation_epoch) {
-                        break;
-                    }
-                    let settled = manager
-                        .room_members_for(&account_id, &room_id)
-                        .await
-                        .ok()
-                        .is_some_and(|members| {
-                            let member = members.iter().find(|member| member.user_id == user_id);
-                            match kind {
-                                0 => member.is_some_and(|member| {
-                                    member.membership == "invite" || member.membership == "join"
-                                }),
-                                1 | 3 => member.is_none(),
-                                2 => member.is_some_and(|member| member.membership == "ban"),
-                                4 => member.is_some_and(|member| member.power_level == power_level),
-                                _ => false,
-                            }
-                        });
-                    if settled || tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                }
-                live.refresh_members_for(account_id.clone(), room_id.clone(), weak.clone(), true)
-                    .await;
-            }
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                    || window.get_member_action_operation() != operation
-                {
-                    return;
-                }
-                window.set_member_action_busy(false);
-                match result {
-                    Ok(()) => {
-                        if kind == 0 && window.get_member_invite_user_id().as_str() == user_id {
-                            window.set_member_invite_user_id("".into());
-                        }
-                        if kind != 0 && kind != 4 {
-                            window.set_member_selected_user_id("".into());
-                        }
-                        window.set_member_action_notice(
-                            format!("Room member action completed: {label} {user_id}").into(),
-                        );
-                        window.set_member_action_error("".into());
-                    }
-                    Err(error) => {
-                        window.set_member_action_error(
-                            directory_plain_text(
-                                &format!("Could not {label} {user_id}: {error}"),
-                                240,
-                            )
-                            .into(),
-                        );
-                    }
                 }
             });
         });
@@ -4890,6 +4713,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(morpheus_timeline_acceptance)]
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
     let ui_result = ui.run();
+    room_admin.shutdown(&ui);
     room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]

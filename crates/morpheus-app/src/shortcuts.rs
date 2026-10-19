@@ -139,7 +139,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || ui.get_access_open()
         || ui.get_room_actions_open()
         || ui.get_room_admin_open()
-        || ui.get_member_confirm_open()
+        || ui.get_roster_confirm_open()
         || ui.get_native_capture_picker_open()
         || ui.get_leave_call_dialog()
         || !ui.get_security_recovery_key().is_empty()

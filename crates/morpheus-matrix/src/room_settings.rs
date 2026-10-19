@@ -54,10 +54,10 @@ pub const MAX_ROOM_AVATAR_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESTRICTED_ALLOW_ROOMS: usize = 32;
 const MAX_STATE_BYTES: usize = 64 * 1024;
 const MAX_ROOM_ID_BYTES: usize = 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
-const READ_TIMEOUT: Duration = Duration::from_secs(45);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RoomSettingsError {
@@ -113,7 +113,7 @@ impl RoomSettingsCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
     }
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         loop {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
@@ -552,7 +552,7 @@ impl RoomSettingsSession {
     }
 }
 
-fn ensure_scope(
+pub(crate) fn ensure_scope(
     selection: &AccountSelection,
     cancellation: &RoomSettingsCancellation,
 ) -> Result<()> {
@@ -564,7 +564,7 @@ fn ensure_scope(
     }
     Ok(())
 }
-fn ensure_joined(room: &Room) -> Result<()> {
+pub(crate) fn ensure_joined(room: &Room) -> Result<()> {
     if room.state() != RoomState::Joined {
         return Err(RoomSettingsError::NotJoined);
     }
@@ -607,16 +607,15 @@ fn require_baseline(expected: &Option<Value>, current: &Option<Value>) -> Result
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct StateEnvelope {
-    #[serde(rename = "event_id")]
-    _event_id: OwnedEventId,
+#[derive(Clone, Deserialize)]
+pub(crate) struct StateEnvelope {
+    pub(crate) event_id: OwnedEventId,
     room_id: OwnedRoomId,
     sender: OwnedUserId,
     #[serde(rename = "type")]
     event_type: StateEventType,
     state_key: String,
-    content: Value,
+    pub(crate) content: Value,
 }
 fn parse_state(
     raw: &str,
@@ -659,7 +658,11 @@ fn request_failure(error: HttpError) -> RoomSettingsError {
         RoomSettingsError::Unavailable
     }
 }
-async fn state(room: &Room, kind: StateEventType, key: &str) -> Result<Option<StateEnvelope>> {
+pub(crate) async fn state(
+    room: &Room,
+    kind: StateEventType,
+    key: &str,
+) -> Result<Option<StateEnvelope>> {
     let mut request = get_state_event_for_key::v3::Request::new(
         room.room_id().to_owned(),
         kind.clone(),
@@ -697,7 +700,7 @@ async fn send_state(
         .map_err(request_failure)?;
     Ok(())
 }
-fn content<T: serde::de::DeserializeOwned>(event: &StateEnvelope) -> Result<T> {
+pub(crate) fn content<T: serde::de::DeserializeOwned>(event: &StateEnvelope) -> Result<T> {
     serde_json::from_value(event.content.clone()).map_err(|_| RoomSettingsError::InvalidState)
 }
 async fn read_settings(room: &Room, own: &OwnedUserId) -> Result<Loaded> {
@@ -743,34 +746,9 @@ fn assemble(
     encrypted: bool,
 ) -> Result<Loaded> {
     let creation: RoomCreateEventContent = content(create)?;
-    let rules = creation.room_version.rules();
     let mut permissions = RoomSettingsPermissions::default();
     let available = rule_options(&creation.room_version);
-    if let Some(rules) = rules {
-        let mut creators = if rules.authorization.use_room_create_sender {
-            vec![create.sender.clone()]
-        } else {
-            #[allow(deprecated)]
-            vec![
-                creation
-                    .creator
-                    .clone()
-                    .ok_or(RoomSettingsError::InvalidState)?,
-            ]
-        };
-        if rules.authorization.additional_room_creators {
-            creators.extend(creation.additional_creators.clone());
-        }
-        if creators.len() > 64 {
-            return Err(RoomSettingsError::InvalidState);
-        }
-        let power = match power {
-            Some(event) => {
-                RoomPowerLevelsSource::Original(content::<RoomPowerLevelsEventContent>(event)?)
-            }
-            None => RoomPowerLevelsSource::None,
-        };
-        let levels = RoomPowerLevels::new(power, &rules.authorization, creators);
+    if let Some(levels) = effective_power_levels(create, power)? {
         permissions = RoomSettingsPermissions {
             name: levels.user_can_send_state(own, StateEventType::RoomName),
             topic: levels.user_can_send_state(own, StateEventType::RoomTopic),
@@ -816,6 +794,42 @@ fn assemble(
         join_rule: join.map(|e| e.content.clone()),
         avatar_source,
     })
+}
+/// Effective levels from authoritative create and power-level state. `None`
+/// for a room version whose authorization rules are unknown to the pinned
+/// client; callers must then deny every privileged action.
+pub(crate) fn effective_power_levels(
+    create: &StateEnvelope,
+    power: Option<&StateEnvelope>,
+) -> Result<Option<RoomPowerLevels>> {
+    let creation: RoomCreateEventContent = content(create)?;
+    let Some(rules) = creation.room_version.rules() else {
+        return Ok(None);
+    };
+    let mut creators = if rules.authorization.use_room_create_sender {
+        vec![create.sender.clone()]
+    } else {
+        #[allow(deprecated)]
+        vec![
+            creation
+                .creator
+                .clone()
+                .ok_or(RoomSettingsError::InvalidState)?,
+        ]
+    };
+    if rules.authorization.additional_room_creators {
+        creators.extend(creation.additional_creators.clone());
+    }
+    if creators.len() > 64 {
+        return Err(RoomSettingsError::InvalidState);
+    }
+    let power = match power {
+        Some(event) => {
+            RoomPowerLevelsSource::Original(content::<RoomPowerLevelsEventContent>(event)?)
+        }
+        None => RoomPowerLevelsSource::None,
+    };
+    Ok(Some(RoomPowerLevels::new(power, &rules.authorization, creators)))
 }
 fn state_text(event: Option<&StateEnvelope>, key: &str, maximum: usize) -> Result<String> {
     match event.and_then(|e| e.content.get(key)) {

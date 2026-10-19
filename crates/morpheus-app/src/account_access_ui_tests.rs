@@ -2651,7 +2651,12 @@ async fn exercise_account_ui(runtime: Handle) {
         MessageSearchItem::default(),
     ])));
     ui.set_room_search_selected_body("private search result".into());
-    ui.set_member_confirm_name("Jordan".into());
+    ui.set_roster_members(ModelRc::new(VecModel::from(vec![crate::RosterMember {
+        name: "Jordan".into(),
+        ..Default::default()
+    }])));
+    ui.set_roster_confirm_body("Ban Jordan?".into());
+    ui.set_roster_reason_input("private moderation reason".into());
     ui.set_room_admin_topic_input("private topic".into());
     ui.set_attachment_status("private upload name".into());
     assert_recovery_strip_projection(&ui).await;
@@ -2709,7 +2714,9 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_room_search_query().is_empty());
     assert_eq!(ui.get_room_search_results().row_count(), 0);
     assert!(ui.get_room_search_selected_body().is_empty());
-    assert!(ui.get_member_confirm_name().is_empty());
+    assert_eq!(ui.get_roster_members().row_count(), 0);
+    assert!(ui.get_roster_confirm_body().is_empty());
+    assert!(ui.get_roster_reason_input().is_empty());
     assert!(ui.get_room_admin_topic_input().is_empty());
     assert!(ui.get_attachment_status().is_empty());
     assert!(ui.get_security_recovery_input().is_empty());
