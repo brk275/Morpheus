@@ -124,9 +124,10 @@ impl PollState {
 
     /// Marks the poll as ended.
     ///
-    /// Returns false if the poll was already ended, true otherwise.
+    /// The first valid end by server timestamp wins, including when that
+    /// earlier event arrives after another end during pagination.
     pub(crate) fn end(&mut self, timestamp: MilliSecondsSinceUnixEpoch) -> bool {
-        if self.end_event_timestamp.is_none() {
+        if self.end_event_timestamp.is_none_or(|previous| timestamp < previous) {
             self.end_event_timestamp = Some(timestamp);
             true
         } else {

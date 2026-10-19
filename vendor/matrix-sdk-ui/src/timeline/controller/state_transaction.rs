@@ -257,8 +257,11 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
 
         let (forwarder, forwarder_profile) = get_forwarder_info(&event, room_data_provider).await;
 
+        let sender_can_redact_others = timeline_actions.iter().any(TimelineAction::ends_poll)
+            && room_data_provider.user_can_redact_others(&sender).await;
         let mut ctx = TimelineEventContext {
             sender,
+            sender_can_redact_others,
             sender_profile,
             forwarder,
             forwarder_profile,
@@ -850,8 +853,11 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
             };
 
             let mut item_added = false;
+            let sender_can_redact_others = timeline_actions.iter().any(TimelineAction::ends_poll)
+                && room_data_provider.user_can_redact_others(&sender).await;
             let ctx = TimelineEventContext {
                 sender,
+                sender_can_redact_others,
                 sender_profile,
                 forwarder,
                 forwarder_profile,

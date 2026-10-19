@@ -268,7 +268,9 @@ impl ValidPoll {
         for (index, answer) in self.answers.iter().enumerate() {
             fallback.push_str(&format!("\n{}. {answer}", index + 1));
         }
-        Ok(NewUnstablePollStartEventContent::plain_text(fallback, block))
+        Ok(NewUnstablePollStartEventContent::plain_text(
+            fallback, block,
+        ))
     }
 }
 
@@ -303,9 +305,7 @@ impl AccountManager {
                 .map(drop)
                 .map_err(|error| send_failure(&error))
         };
-        tokio::time::timeout(SEND_TIMEOUT, work)
-            .await
-            .unwrap_or_else(|_| Err(timed_out(&entered)))
+        selected_action(selection, &entered, work).await
     }
 
     /// Vote, or change this account's vote, on a poll shown in the room
@@ -344,14 +344,12 @@ impl AccountManager {
                 .map(drop)
                 .map_err(|error| send_failure(&error))
         };
-        tokio::time::timeout(SEND_TIMEOUT, work)
-            .await
-            .unwrap_or_else(|_| Err(timed_out(&entered)))
+        selected_action(selection, &entered, work).await
     }
 
-    /// End one of this account's own open polls. MSC3381 lets only the
-    /// creator end a poll; the pinned timeline does not enforce that for
-    /// incoming ends, so Morpheus never sends one for another person's poll.
+    /// End one of this account's own open polls. The composer exposes only
+    /// creator ends; received creator and authorized moderator ends are
+    /// checked by the patched timeline aggregation path.
     pub async fn end_poll_for(
         &self,
         selection: &AccountSelection,
@@ -389,9 +387,7 @@ impl AccountManager {
                 .map(drop)
                 .map_err(|error| send_failure(&error))
         };
-        tokio::time::timeout(SEND_TIMEOUT, work)
-            .await
-            .unwrap_or_else(|_| Err(timed_out(&entered)))
+        selected_action(selection, &entered, work).await
     }
 
     fn owns(&self, selection: &AccountSelection) -> bool {
@@ -411,7 +407,14 @@ impl AccountManager {
         if !self.owns(selection) {
             return Err(PollError::AccountChanged);
         }
-        let state = self.state.lock().await;
+        let state = selection
+            .guard(self.state.lock())
+            .await
+            .ok_or(PollError::AccountChanged)?;
+        // Waiting for the lock may span A -> B -> A; the ID alone is not authority.
+        if !self.owns(selection) {
+            return Err(PollError::AccountChanged);
+        }
         let loaded = selected_loaded_for(&state, selection.account_id())
             .map_err(core_failure)?
             .clone();
@@ -572,6 +575,22 @@ fn send_failure(error: &matrix_sdk::Error) -> PollError {
     }
 }
 
+/// Cancel pending lookup/permission/send waits with their exact selection.
+/// Cancellation cannot recall a request already handed to the SDK/server;
+/// never claim that such a request was not sent.
+async fn selected_action(
+    selection: &AccountSelection,
+    entered: &AtomicBool,
+    work: impl std::future::Future<Output = Result<(), PollError>>,
+) -> Result<(), PollError> {
+    match tokio::time::timeout(SEND_TIMEOUT, selection.guard(work)).await {
+        Ok(Some(result)) => result,
+        Ok(None) if entered.load(Ordering::Acquire) => Err(PollError::Uncertain),
+        Ok(None) => Err(PollError::AccountChanged),
+        Err(_) => Err(timed_out(entered)),
+    }
+}
+
 fn timed_out(entered: &AtomicBool) -> PollError {
     if entered.load(Ordering::Acquire) {
         PollError::Uncertain
@@ -717,6 +736,45 @@ fn display_text(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use matrix_sdk::ruma::user_id;
+
+    #[test]
+    fn revoked_poll_actions_release_pending_work_and_report_uncertain_sends() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let selections = crate::account_selection::Selections::default();
+                for already_sending in [false, true] {
+                    selections.replace(Some("synthetic-local"));
+                    let selection = selections.for_account("synthetic-local").unwrap();
+                    let entered = AtomicBool::new(already_sending);
+                    let held = Arc::new(());
+                    let waiting = held.clone();
+                    let work = async move {
+                        let _held = waiting;
+                        std::future::pending::<Result<(), PollError>>().await
+                    };
+                    let mut action = Box::pin(selected_action(&selection, &entered, work));
+                    assert!(futures_util::poll!(action.as_mut()).is_pending());
+                    assert_eq!(Arc::strong_count(&held), 2);
+                    selections.replace(Some("another-synthetic-local"));
+                    selections.replace(Some("synthetic-local"));
+                    let result = tokio::time::timeout(Duration::from_secs(2), action)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        result,
+                        Err(if already_sending {
+                            PollError::Uncertain
+                        } else {
+                            PollError::AccountChanged
+                        })
+                    );
+                    assert_eq!(Arc::strong_count(&held), 1);
+                }
+            });
+    }
 
     fn draft(answers: &[&str], max_selections: usize) -> PollDraft {
         PollDraft {

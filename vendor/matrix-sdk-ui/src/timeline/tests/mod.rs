@@ -275,6 +275,9 @@ struct TestRoomDataProvider {
     /// The ID of our own user.
     own_user_id: Option<OwnedUserId>,
 
+    /// Users with known permission to redact other peoples events.
+    redactors: Vec<OwnedUserId>,
+
     /// The initial list of user receipts for that room.
     ///
     /// Configurable at construction, static for the lifetime of the provider.
@@ -296,6 +299,11 @@ struct TestRoomDataProvider {
 }
 
 impl TestRoomDataProvider {
+    fn with_redactors(mut self, redactors: Vec<OwnedUserId>) -> Self {
+        self.redactors = redactors;
+        self
+    }
+
     fn with_initial_user_receipts(mut self, initial_user_receipts: ReadReceiptMap) -> Self {
         self.initial_user_receipts = initial_user_receipts;
         self
@@ -340,6 +348,10 @@ impl PaginableThread for TestRoomDataProvider {
 }
 
 impl RoomDataProvider for TestRoomDataProvider {
+    async fn user_can_redact_others<'a>(&'a self, user_id: &'a UserId) -> bool {
+        self.redactors.iter().any(|known| known.as_str() == user_id.as_str())
+    }
+
     fn room_id(&self) -> &RoomId {
         self.room_id.as_deref().unwrap_or(room_id!("!r0"))
     }

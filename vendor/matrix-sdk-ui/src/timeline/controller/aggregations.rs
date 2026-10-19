@@ -113,6 +113,10 @@ pub(crate) enum AggregationKind {
 
     /// This is the marker of the end of a poll.
     PollEnd {
+        /// The end event sender, retained even before its poll is loaded.
+        sender: OwnedUserId,
+        /// Known moderator authority when the event was received.
+        sender_can_redact_others: bool,
         /// Timestamp at which the poll ends, i.e. all the responses with a
         /// timestamp prior to this one should be taken into account (and all
         /// the responses with a timestamp after this one should be dropped).
@@ -342,10 +346,18 @@ impl Aggregation {
                 }
             }
 
-            AggregationKind::PollEnd { end_date } => match poll_state_from_item(event) {
+            AggregationKind::PollEnd { sender, sender_can_redact_others, .. }
+                if !*sender_can_redact_others && sender.as_str() != event.sender().as_str() =>
+            {
+                // Invalid ends must not stop apply_all from applying votes or
+                // reactions stashed after them, including before the start.
+                ApplyAggregationResult::LeftItemIntact
+            }
+
+            AggregationKind::PollEnd { end_date, .. } => match poll_state_from_item(event) {
                 Ok(state) => {
                     if !state.end(*end_date) {
-                        return ApplyAggregationResult::Error(AggregationError::PollAlreadyEnded);
+                        return ApplyAggregationResult::LeftItemIntact;
                     }
                     ApplyAggregationResult::UpdatedItem
                 }
@@ -430,6 +442,14 @@ impl Aggregation {
                 };
                 state.remove_response(sender, *timestamp);
                 ApplyAggregationResult::UpdatedItem
+            }
+
+            AggregationKind::PollEnd { sender, sender_can_redact_others, .. }
+                if !*sender_can_redact_others && sender.as_str() != event.sender().as_str() =>
+            {
+                // Invalid ends must not stop apply_all from applying votes or
+                // reactions stashed after them, including before the start.
+                ApplyAggregationResult::LeftItemIntact
             }
 
             AggregationKind::PollEnd { .. } => {
