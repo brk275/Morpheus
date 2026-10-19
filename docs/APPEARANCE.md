@@ -203,8 +203,10 @@ dimming.
 - Inputs, buttons, the composer and icons use `elevated`, `hover`, `ink` and
   `muted`; separate `input_surface`, `button_surface`, `composer_surface` and
   `icon` tokens are planned.
-- Call stage surfaces, in-app notification banners beyond the error/success
-  roles, and unread badges other than the count badge use base tokens only.
+- Call stage tile and roster surfaces, in-app notification banners beyond the
+  error/success roles, and unread badges other than the count badge use base
+  tokens only. The call stage's buttons, focus rings, outlines and corners
+  follow the control tokens and states.
 - Error texts keep slightly different built-in defaults per control until
   `error` is set; setting it recolors all of them.
 - Sender palette editing in the workspace is planned; it remains in theme files
@@ -303,6 +305,12 @@ dialog's close action; removal is never focused, and every action still needs
 its own activation and confirmation. Search never changes a setting or runs
 an action. Security & recovery is offered only while signed in.
 
+Color and metric results also show and announce their `config.toml` key
+(`colors.<token>` or the metric's field key); sections show none. Once a
+result is chosen its list is hidden; **Back to results** below the field,
+Down in the field or the Search Settings shortcut shows the same results
+again with the same highlight, without retyping.
+
 ## Appearance workspace
 
 Settings → Appearance → Colors and window holds one bounded, scrolling list of
@@ -323,6 +331,26 @@ while the color still holds the value this window saved: after a later edit
 made elsewhere it changes nothing and says so. A restore that cannot read or
 write the file keeps its snapshot so it can be tried again; a color set again
 since the removal is kept.
+
+### Live preview
+
+The top of Settings → Appearance holds a fixed-height live preview: sample
+rooms (the real navigation row), messages (the timeline's surface, sender,
+body and clock color rules, avatar size, sender weight, timestamp format and
+visibility), a focused composer, an account with presence, a speaking call
+tile, token-drawn buttons in their ordinary, hover, pressed, focus, disabled
+and primary states, and error, success, selection, unread, mention and link
+samples. Everything in it is synthetic and inert: sample controls take no
+focus or pointer input and nothing reaches an account, the network, a call or
+capture. Its height does not follow the edited values, so the page does not
+move while editing; the samples clip instead. Hiding it is session state and
+is never saved. Its links reveal the color, metric and base-palette editors
+through the same reveal as search.
+
+Message search, polls, the poll dialog and the call stage import the same
+`StyleTokens` global as the window (from `ui/style-tokens.slint`); pinned
+messages receives the same resolved values through its style struct. Shared
+actions and `TokenButton` live in `ui/controls.slint`.
 
 Targets (33): appearance presets, colors, window transparency, base palette,
 reduce motion, fonts, message size, sender weight, room header, conversation
