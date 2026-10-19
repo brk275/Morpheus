@@ -291,6 +291,15 @@ fn schema() -> Value {
             "group": action.group().label(),
             "default": action.default_binding(),
         })).collect::<Vec<_>>(),
+        // Style profiles: the keys a profile file may contain, as config.toml
+        // keys plus `profile_version` and `name`. See docs/STYLE_PROFILES.md.
+        "style_profile": json!({
+            "profile_version": morpheus_config::style_profiles::PROFILE_VERSION,
+            "keys": morpheus_config::style_profiles::schema_paths(),
+            "max_bytes": morpheus_config::style_profiles::MAX_PROFILE_BYTES,
+            "max_profiles": morpheus_config::style_profiles::MAX_PROFILES,
+            "max_name_chars": morpheus_config::style_profiles::MAX_PROFILE_NAME_CHARS,
+        }),
         "diagnostic_codes": diagnostics::CODES.iter().map(|(code, meaning)| json!({
             "code": code,
             "meaning": meaning,
@@ -332,6 +341,14 @@ fn schema_text() -> String {
             action.default_binding().unwrap_or("(none)"),
             action.label()
         ));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Style profile keys (profile_version = {}; omitted keys use the default):",
+        morpheus_config::style_profiles::PROFILE_VERSION
+    ));
+    for key in morpheus_config::style_profiles::schema_paths() {
+        lines.push(format!("  {key}"));
     }
     lines.push(String::new());
     lines.push("Color tokens ([colors] keys):".into());
@@ -471,6 +488,23 @@ mod tests {
         for token in COLOR_TOKENS {
             assert!(text.contains(token.id));
         }
+        // Style profiles list their keys, appearance only.
+        let profile = &value["style_profile"];
+        assert_eq!(profile["profile_version"], 1);
+        let keys: Vec<&str> = profile["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key.as_str().unwrap())
+            .collect();
+        assert!(keys.contains(&"typography.message_size") && keys.contains(&"colors.<token>"));
+        for private in ["appearance.scale_percent", "geometry.focus_width", "shortcuts.<action>"] {
+            assert!(!keys.contains(&private), "{private}");
+        }
+        assert!(keys.iter().all(|key| !key.starts_with("notifications")
+            && !key.starts_with("media")
+            && !key.starts_with("account_overrides")));
+        assert!(text.contains("Style profile keys"));
         // Editor metrics carry the same metadata the Settings workspace shows.
         let fields = value["fields"].as_array().unwrap();
         for (field, editor) in registry::metric_fields() {

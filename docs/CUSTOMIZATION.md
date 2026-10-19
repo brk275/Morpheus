@@ -68,6 +68,15 @@ your `config.toml` rather than replacing it, then adjust from Settings.
 Custom colors are applied as written; check contrast with your own surfaces
 and text scale. Beacon keeps the built-in high-contrast colors.
 
+### Style profiles
+
+**Settings → Appearance → Style profiles** saves the look you see under a
+name, previews a saved look without changing anything until you apply it, and
+imports or exports looks as small TOML files. A profile holds appearance
+only; text size, Reduce motion, the focus ring, notifications, shortcuts,
+devices and accounts are never saved in it or changed by it. See
+[style profiles](STYLE_PROFILES.md) for the file format and limits.
+
 ## Navigation
 
 **Settings → Layout → Navigation** edits the same schema-version-1 fields as

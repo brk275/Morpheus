@@ -1705,6 +1705,14 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         ],
     ),
     target(
+        "appearance.style_profiles",
+        APPEARANCE,
+        "Settings › Appearance › Style profiles",
+        "Style profiles",
+        "Save, preview, import and export named looks.",
+        &["profile", "saved look", "import", "export", "share look"],
+    ),
+    target(
         "appearance.colors",
         APPEARANCE,
         "Settings › Appearance › Colors and window",
