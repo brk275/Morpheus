@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed attachment focused checks
-run-name: Themed inputs focused checks - 6a08c39 - ${{ inputs.platform }}
+run-name: Themed inputs focused checks - 0e9fb22 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: themed-inputs-6a08c39-${{ github.ref }}
+  group: themed-inputs-0e9fb22-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 6a08c39b4c5d3478fe296c47cd4e1b18ba3f4264
+          ref: 0e9fb22e9c1a0f1a9a9a430ab48bbb8c97f997e6
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='6a08c39b4c5d3478fe296c47cd4e1b18ba3f4264'
+          source='0e9fb22e9c1a0f1a9a9a430ab48bbb8c97f997e6'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text(encoding='utf-8').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='6a08c39b4c5d3478fe296c47cd4e1b18ba3f4264'
+          source='0e9fb22e9c1a0f1a9a9a430ab48bbb8c97f997e6'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
