@@ -343,12 +343,24 @@ export component CallStage inherits Rectangle {
     // The tile to refocus after a pin change rebuilds the stage.
     property <int> restore-focus: -1;
 
-    // Featured mode: the featured tile above a row of page tiles.
-    property <length> strip-height: root.count > 0 ? min(120px, root.stage-height * 0.26) : 0px;
-    property <length> strip-tile-width: root.count > 0 ? max(0px, min(root.strip-height * 16 / 9, (root.stage-width - (root.count - 1) * root.gap) / root.count)) : 0px;
-    property <length> strip-x: root.stage-x + max(0px, (root.stage-width - root.count * root.strip-tile-width - (root.count - 1) * root.gap) / 2);
-    property <length> strip-y: root.stage-y + root.stage-height - root.strip-height;
-    property <length> featured-height: max(0px, root.stage-height - (root.count > 0 ? root.strip-height + root.gap : 0px));
+    // Featured mode: the featured tile above a row of page tiles, or beside
+    // a column of them when the stage is much wider than it is tall.
+    property <bool> strip-beside: root.count > 0 && root.stage-width > root.stage-height * 2;
+    property <length> strip-height: root.count > 0 && !root.strip-beside ? min(120px, root.stage-height * 0.26) : 0px;
+    property <length> strip-tile-width: root.count == 0 ? 0px
+        : root.strip-beside ? min(240px, root.stage-width * 0.22)
+        : max(0px, min(root.strip-height * 16 / 9, (root.stage-width - (root.count - 1) * root.gap) / root.count));
+    property <length> strip-tile-height: root.count == 0 ? 0px
+        : root.strip-beside ? max(0px, min(root.strip-tile-width * 9 / 16, (root.stage-height - (root.count - 1) * root.gap) / root.count))
+        : root.strip-height;
+    property <length> strip-x: root.strip-beside
+        ? root.stage-x + root.stage-width - root.strip-tile-width
+        : root.stage-x + max(0px, (root.stage-width - root.count * root.strip-tile-width - (root.count - 1) * root.gap) / 2);
+    property <length> strip-y: root.strip-beside
+        ? root.stage-y + max(0px, (root.stage-height - root.count * root.strip-tile-height - (root.count - 1) * root.gap) / 2)
+        : root.stage-y + root.stage-height - root.strip-height;
+    property <length> featured-width: max(0px, root.stage-width - (root.strip-beside ? root.strip-tile-width + root.gap : 0px));
+    property <length> featured-height: max(0px, root.stage-height - (root.count > 0 && !root.strip-beside ? root.strip-height + root.gap : 0px));
 
     // Grid mode: the column count that gives the largest 16:9 tiles.
     property <length> fit-one: root.fit(1);
@@ -362,10 +374,10 @@ export component CallStage inherits Rectangle {
     property <length> grid-y: root.stage-y + max(0px, (root.stage-height - root.rows * root.cell-height - (root.rows - 1) * root.gap) / 2);
     property <int> last-row-count: root.count - (root.rows - 1) * root.columns;
 
-    // The widest 16:9 tile when the page uses `columns` columns.
-    pure function fit(columns: int) -> length {
-        let rows = max(1, ceil(root.count / columns));
-        min((root.stage-width - (columns - 1) * root.gap) / columns, (root.stage-height - (rows - 1) * root.gap) / rows * 16 / 9)
+    // The widest 16:9 tile when the page uses `column-count` columns.
+    pure function fit(column-count: int) -> length {
+        let row-count = max(1, ceil(root.count / column-count));
+        min((root.stage-width - (column-count - 1) * root.gap) / column-count, (root.stage-height - (row-count - 1) * root.gap) / row-count * 16 / 9)
     }
 
     // Pin or unpin `id`, keeping keyboard focus on that tile once it moves.
@@ -394,16 +406,20 @@ export component CallStage inherits Rectangle {
     }
 
     // Arrow keys: index -1 is the featured tile, then the page in order.
+    // Along the strip moves between page tiles; back across it returns to
+    // the featured tile.
     function navigate(origin: int, dx: int, dy: int) {
         if root.featured-visible {
+            let along = root.strip-beside ? dy : dx;
+            let across = root.strip-beside ? dx : dy;
             if origin < 0 {
-                if (dx > 0 || dy > 0) && root.count > 0 {
+                if (along > 0 || across > 0) && root.count > 0 {
                     root.focus-target = root.tiles[0].id;
                 }
-            } else if dy < 0 {
+            } else if across < 0 {
                 root.focus-target = root.featured.id;
-            } else if origin + dx >= 0 && origin + dx < root.count {
-                root.focus-target = root.tiles[origin + dx].id;
+            } else if origin + along >= 0 && origin + along < root.count {
+                root.focus-target = root.tiles[origin + along].id;
             }
         } else {
             let target = origin + dx + dy * root.columns;
@@ -444,7 +460,7 @@ export component CallStage inherits Rectangle {
     if root.featured-visible : StageTile {
         x: root.stage-x;
         y: root.stage-y;
-        width: root.stage-width;
+        width: root.featured-width;
         height: root.featured-height;
         tile: root.featured;
         frame: root.frames[max(0, root.featured.frame-slot)];
@@ -464,12 +480,14 @@ export component CallStage inherits Rectangle {
     for item[index] in root.tiles : StageTile {
         property <int> row: floor(index / root.columns);
         x: root.featured-visible
-            ? root.strip-x + index * (root.strip-tile-width + root.gap)
+            ? root.strip-x + (root.strip-beside ? 0px : index * (root.strip-tile-width + root.gap))
             : root.grid-x + mod(index, root.columns) * (root.cell-width + root.gap)
                 + (self.row == root.rows - 1 ? (root.columns - root.last-row-count) * (root.cell-width + root.gap) / 2 : 0px);
-        y: root.featured-visible ? root.strip-y : root.grid-y + self.row * (root.cell-height + root.gap);
+        y: root.featured-visible
+            ? root.strip-y + (root.strip-beside ? index * (root.strip-tile-height + root.gap) : 0px)
+            : root.grid-y + self.row * (root.cell-height + root.gap);
         width: root.featured-visible ? root.strip-tile-width : root.cell-width;
-        height: root.featured-visible ? root.strip-height : root.cell-height;
+        height: root.featured-visible ? root.strip-tile-height : root.cell-height;
         tile: item;
         frame: root.frames[max(0, item.frame-slot)];
         palette: root.palette;
