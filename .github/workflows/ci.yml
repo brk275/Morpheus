@@ -1,12 +1,12 @@
 # TEMPORARY owner-reviewed search contracts. NEVER MERGE this workflow.
 name: Reviewed search contracts
-run-name: Reviewed search contracts - 778d8b9
+run-name: Reviewed search contracts - c77f3b7
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: search-contracts-778d8b9-${{ github.ref }}
+  group: search-contracts-c77f3b7-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 778d8b97391700352c4cb954476ccacc056c99d0
+          ref: c77f3b77b5c40e5cfa51bfaf7316f4fcc9cb57ac
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='778d8b97391700352c4cb954476ccacc056c99d0'
+          source='c77f3b77b5c40e5cfa51bfaf7316f4fcc9cb57ac'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
