@@ -239,6 +239,9 @@ pub struct ProfileLayout {
     pub direct_messages_first: bool,
     pub room_density: Option<Density>,
     pub message_density: Option<Density>,
+    pub pane_order: Vec<crate::PaneId>,
+    pub hidden_panes: Vec<crate::PaneId>,
+    pub collapsed_panes: Vec<crate::PaneId>,
 }
 
 impl Default for ProfileLayout {
@@ -254,6 +257,9 @@ impl Default for ProfileLayout {
             direct_messages_first: layout.direct_messages_first,
             room_density: layout.room_density,
             message_density: layout.message_density,
+            pane_order: layout.pane_order.clone(),
+            hidden_panes: layout.hidden_panes.clone(),
+            collapsed_panes: layout.collapsed_panes.clone(),
         }
     }
 }
@@ -321,6 +327,9 @@ impl StyleProfile {
                 direct_messages_first: layout.direct_messages_first,
                 room_density: layout.room_density,
                 message_density: layout.message_density,
+                pane_order: layout.pane_order.clone(),
+                hidden_panes: layout.hidden_panes.clone(),
+                collapsed_panes: layout.collapsed_panes.clone(),
             },
             window: config.window.clone(),
             colors: config.colors.clone(),
@@ -354,6 +363,11 @@ impl StyleProfile {
         layout.direct_messages_first = self.layout.direct_messages_first;
         layout.room_density = self.layout.room_density;
         layout.message_density = self.layout.message_density;
+        layout.pane_order.clone_from(&self.layout.pane_order);
+        layout.hidden_panes.clone_from(&self.layout.hidden_panes);
+        layout
+            .collapsed_panes
+            .clone_from(&self.layout.collapsed_panes);
         config.window = self.window.clone();
         config.colors = self.colors.clone();
         config.senders = self.senders.clone();
@@ -1439,6 +1453,49 @@ mod tests {
             .unwrap()
             .apply_to(&mut reset);
         assert!(StyleProfile::named("Plain").matches(&reset));
+    }
+
+    #[test]
+    fn pane_arrangements_round_trip_in_profiles_and_old_profiles_reset_them() {
+        use crate::PaneId;
+        let mut config = styled();
+        config.layout.pane_order = vec![
+            PaneId::Conversation,
+            PaneId::Rooms,
+            PaneId::Spaces,
+            PaneId::Details,
+        ];
+        config.layout.hidden_panes = vec![PaneId::Spaces];
+        config.layout.collapsed_panes = vec![PaneId::Details];
+        let profile = StyleProfile::from_config("Reading", &config);
+        let raw = profile.to_toml().unwrap();
+        for key in ["pane_order", "hidden_panes", "collapsed_panes"] {
+            assert!(raw.contains(key), "the profile must preserve {key}");
+        }
+        let restored = StyleProfile::parse(&raw).unwrap();
+        assert_eq!(restored, profile);
+        let mut target = Config::default();
+        target.notifications.enabled = false;
+        restored.apply_to(&mut target);
+        assert_eq!(target.layout.pane_order, config.layout.pane_order);
+        assert_eq!(target.layout.hidden_panes, config.layout.hidden_panes);
+        assert_eq!(target.layout.collapsed_panes, config.layout.collapsed_panes);
+        assert!(!target.notifications.enabled);
+        target.validate().unwrap();
+        // Old v1 profiles omit the new keys and still produce their default
+        // arrangement, rather than silently retaining a previous custom look.
+        StyleProfile::parse("profile_version = 1\nname = 'Old'\n")
+            .unwrap()
+            .apply_to(&mut target);
+        assert!(target.layout.pane_order.is_empty());
+        assert!(target.layout.hidden_panes.is_empty());
+        assert!(target.layout.collapsed_panes.is_empty());
+        assert!(!target.notifications.enabled);
+        let bad = "profile_version = 1\nname = 'Bad'\n[layout]\npane_order = ['rooms']\n";
+        assert!(StyleProfile::parse(bad).is_err());
+        let hidden_conversation =
+            "profile_version = 1\nname = 'Bad'\n[layout]\nhidden_panes = ['conversation']\n";
+        assert!(StyleProfile::parse(hidden_conversation).is_err());
     }
 
     /// The documented schema (the registry keys a profile accepts) is exactly

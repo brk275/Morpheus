@@ -143,3 +143,12 @@ search finds the Style profiles section, never a profile. Messages about
 profiles never include a file path or a rejected value. Nothing in a profile
 is executed, downloaded or opened automatically: fonts are names resolved on
 your computer, and a theme pack is a name in your own themes folder.
+
+### Pane arrangements
+
+A saved profile includes `layout.pane_order`, `layout.hidden_panes` and
+`layout.collapsed_panes`, together with pane widths and navigation style.
+They use the same stable pane IDs and validation as `config.toml`. Older v1
+profiles that omit these keys keep working; applying one restores the default
+order and visibility. Notification, account and security settings stay outside
+style profiles.
