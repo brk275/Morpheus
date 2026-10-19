@@ -437,6 +437,7 @@ fn request_bridge_focus(ui: &AppWindow, label: &str) {
     assert_eq!(focused.geometry().size, target.geometry().size);
 }
 
+#[track_caller]
 fn click_control_once(ui: &AppWindow, label: &str) {
     let target = control_with_label(ui, label);
     // map_to_window takes a point in the item's parent coordinates; it does
@@ -2151,6 +2152,12 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
         ui.set_settings_search_query("".into());
         ui.invoke_settings_search("".into());
         settle(ui).await;
+        // Returning to results intentionally focuses this field. A later
+        // iteration must move away before exercising pointer focus again.
+        if focused_control_has_label(ui, "Search settings") {
+            key(ui, Key::Tab);
+            settle(ui).await;
+        }
         click_control_once(ui, "Search settings");
         type_text(ui, query);
         settle(ui).await;
