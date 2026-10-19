@@ -32,6 +32,15 @@ impl FocusedView {
     pub fn room_id(&self) -> &str {
         &self.room_id
     }
+
+    pub(crate) fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// Its rows are only in this timeline, so actions on them use it.
+    pub(crate) fn timeline(&self) -> &Arc<Timeline> {
+        &self.timeline
+    }
 }
 
 /// How far a bounded backward reveal through history got.

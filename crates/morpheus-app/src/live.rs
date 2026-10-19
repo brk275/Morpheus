@@ -2991,6 +2991,13 @@ impl LiveUi {
         reaction: String,
     ) -> Result<bool, MatrixCoreError> {
         self.require_selected_room(&room_id).await?;
+        // A focused view's rows may be missing from the live timeline.
+        if let Some(view) = self.focused_view(&room_id) {
+            return self
+                .manager
+                .toggle_focused_reaction_for(&account_id, &view, &event_id, &reaction)
+                .await;
+        }
         self.manager
             .toggle_reaction_for(&account_id, &room_id, &event_id, &reaction)
             .await

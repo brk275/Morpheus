@@ -1724,6 +1724,30 @@ impl AccountManager {
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
     }
 
+    /// Toggle a reaction on a message shown in a focused conversation view.
+    /// Its row may be absent from the live timeline, so the view's own
+    /// timeline sends it; the view must belong to the expected account.
+    pub async fn toggle_focused_reaction_for(
+        &self,
+        expected_account_id: &str,
+        view: &FocusedView,
+        event_id: &str,
+        reaction: &str,
+    ) -> Result<bool> {
+        if view.account_id() != expected_account_id {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, expected_account_id)?;
+        gate_room_send(loaded, view.room_id()).await?;
+        let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
+        let timeline = view.timeline();
+        timeline
+            .toggle_reaction(&item_id, reaction)
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+    }
+
     /// Queue a plain text message in the selected room. Observe the timeline
     /// send state for remote acknowledgement or failure.
     pub async fn send_text(&self, room_id: &str, body: impl Into<String>) -> Result<()> {
