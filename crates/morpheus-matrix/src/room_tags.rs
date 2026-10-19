@@ -312,7 +312,12 @@ impl AccountManager {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use uuid::Uuid;
+
     use super::*;
+    use crate::{AccountInfo, LoadedAccount};
 
     #[test]
     fn orders_are_bounded_and_compare_numerically() {
@@ -346,5 +351,81 @@ mod tests {
         assert!(carries_other_fields(odd.as_object().unwrap(), FAVOURITE));
         assert_eq!(tag_info(TagOrder::new(0.5)).order, Some(0.5));
         assert_eq!(tag_info(None).order, None);
+    }
+
+    /// A change captured before A -> B -> A is refused before any request,
+    /// and the current selection still reaches only joined rooms and
+    /// bounded reorders. No homeserver is contacted.
+    #[test]
+    fn a_superseded_selection_changes_no_tags() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = std::env::temp_dir().join(format!("morpheus-room-tags-{}", Uuid::new_v4()));
+            let manager = AccountManager::open(&root).unwrap();
+            let homeserver = "http://127.0.0.1:9";
+            let account = AccountInfo {
+                id: Uuid::new_v4().to_string(),
+                user_id: "@alice:localhost".into(),
+                device_id: "ALICE".into(),
+                homeserver: homeserver.into(),
+            };
+            let client = Client::builder()
+                .homeserver_url(homeserver)
+                .build()
+                .await
+                .unwrap();
+            let loaded = Arc::new(LoadedAccount::new(
+                client,
+                account.id.clone(),
+                String::new(),
+                manager._access_lock.clone(),
+            ));
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts = vec![account.clone()];
+                state.active_account_id = Some(account.id.clone());
+                state.loaded.insert(account.id.clone(), loaded);
+            }
+            manager.selections.replace(Some(&account.id));
+            let stale = manager.account_selection(&account.id).unwrap();
+            manager.selections.replace(None);
+            manager.selections.replace(Some(&account.id));
+            let order = TagOrder::new(0.5).unwrap();
+            let room = "!room:localhost";
+            assert_eq!(
+                manager
+                    .change_room_tags_selected(&stale, room, RoomTagChange::LowPriority)
+                    .await,
+                Err(RoomTagError::AccountChanged)
+            );
+            assert_eq!(
+                manager
+                    .set_favourite_orders_selected(&stale, vec![(room.to_owned(), order)])
+                    .await,
+                Err(RoomTagError::AccountChanged)
+            );
+            let current = manager.account_selection(&account.id).unwrap();
+            assert_eq!(
+                manager
+                    .change_room_tags_selected(&current, room, RoomTagChange::LowPriority)
+                    .await,
+                Err(RoomTagError::RoomUnavailable)
+            );
+            let too_many = (0..=MAX_TAG_ORDER_WRITES)
+                .map(|index| (format!("!{index}:localhost"), order))
+                .collect();
+            assert_eq!(
+                manager
+                    .set_favourite_orders_selected(&current, too_many)
+                    .await,
+                Err(RoomTagError::TooMany)
+            );
+            manager.selections.replace(None);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(&root);
+        });
     }
 }
