@@ -1,0 +1,147 @@
+// Encryption center: this account's signed-in devices and their trust. Rust
+// supplies every row and decides which devices may be verified; this file
+// only lays them out and reports Refresh, Verify and settings-search reveals.
+// It cannot import the window's globals, so the window passes resolved colors.
+
+import { Button } from "std-widgets.slint";
+
+export struct EncryptionPalette {
+    ink: color,
+    muted: color,
+    panel: color,
+    elevated: color,
+    divider: color,
+    error: color,
+    success: color,
+}
+
+export struct TrustedDeviceItem {
+    // Opaque Matrix device ID; it only names the Verify target.
+    device-id: string,
+    // Display form of the device ID.
+    shown-id: string,
+    name: string,
+    trust: string,
+    detail: string,
+    verified: bool,
+    current: bool,
+    can-verify: bool,
+}
+
+export component EncryptionDevices inherits Rectangle {
+    in property <EncryptionPalette> palette;
+    in property <float> text-scale: 1;
+    in property <[TrustedDeviceItem]> devices;
+    in property <bool> loading;
+    // Another security operation owns this account; Verify waits for it.
+    in property <bool> busy;
+    in property <string> error;
+    // Settings search: each new positive value reveals and focuses Refresh,
+    // or the status line while Refresh is unavailable.
+    in property <int> reveal-request;
+    callback refresh();
+    callback verify-device(string);
+    // Asks the settings page to scroll an absolute y position into view.
+    callback reveal-at(length);
+    callback revealed(string);
+
+    border-radius: 10px;
+    background: root.palette.elevated;
+    height: content.preferred-height;
+
+    changed reveal-request => {
+        if root.reveal-request > 0 {
+            root.reveal-at(refresh-button.absolute-position.y);
+            if refresh-button.enabled {
+                refresh-button.focus();
+                if refresh-button.has-focus { root.revealed("security.devices"); }
+            } else {
+                status-field.focus();
+                if status-field.has-focus { root.revealed("security.devices:status"); }
+            }
+        }
+    }
+
+    content := VerticalLayout {
+        padding: 14px;
+        spacing: 7px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Devices on this account";
+                color: root.palette.ink;
+                font-size: 13px * root.text-scale;
+                font-weight: 700;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            refresh-button := Button {
+                text: root.loading ? "Loading…" : "Refresh";
+                enabled: !root.loading;
+                accessible-label: "Refresh this account's device list";
+                clicked => { root.refresh(); }
+                changed has-focus => {
+                    if self.has-focus { root.reveal-at(self.absolute-position.y); }
+                }
+            }
+        }
+        // Read-only and focusable, so search can reveal it while Refresh is busy.
+        status-field := TextInput {
+            text: root.loading ? "Loading this account's devices…"
+                : root.devices.length == 0 ? "No device list loaded yet. Choose Refresh."
+                : "Verify only devices you recognize. Compare the emoji or numbers on both devices before confirming.";
+            read-only: true;
+            single-line: false;
+            wrap: word-wrap;
+            color: root.palette.muted;
+            font-size: 11px * root.text-scale;
+            accessible-label: "Device list status: " + self.text;
+        }
+        if root.error != "" : Text {
+            text: root.error;
+            color: root.palette.error;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        for device in root.devices : Rectangle {
+            border-radius: 8px;
+            background: root.palette.panel;
+            border-width: device.verified ? 0px : 1px;
+            border-color: root.palette.divider;
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 8px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+                    Text {
+                        text: device.current ? device.name + " · this device" : device.name;
+                        color: root.palette.ink;
+                        font-size: 12px * root.text-scale;
+                        font-weight: 600;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: device.trust + "  ·  " + device.shown-id;
+                        color: device.verified ? root.palette.success : root.palette.muted;
+                        font-size: 11px * root.text-scale;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: device.detail;
+                        color: root.palette.muted;
+                        font-size: 11px * root.text-scale;
+                        wrap: word-wrap;
+                    }
+                }
+                if device.can-verify : Button {
+                    text: "Verify";
+                    enabled: !root.busy && !root.loading;
+                    accessible-label: "Verify " + device.name + " by comparing emoji or numbers";
+                    clicked => { root.verify-device(device.device-id); }
+                }
+            }
+        }
+    }
+}

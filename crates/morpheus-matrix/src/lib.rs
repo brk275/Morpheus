@@ -55,6 +55,10 @@ pub use room_settings::{
 mod rich_text;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
+mod encryption;
+pub use encryption::{
+    DeviceTrust, OwnDeviceInfo, VerificationCancel, VerificationCancelKind, VerificationOutcome,
+};
 
 use std::{
     collections::{HashMap, HashSet},

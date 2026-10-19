@@ -1298,6 +1298,23 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             "cross signing",
         ],
     )),
+    live(target(
+        "security.devices",
+        "Security",
+        "Settings › Security & recovery › Devices on this account",
+        "Devices on this account",
+        "This account's signed-in devices, whether each is verified, and verifying one.",
+        &[
+            "devices",
+            "sessions",
+            "signed in",
+            "device list",
+            "trusted devices",
+            "verify device",
+            "unverified",
+            "trust",
+        ],
+    )),
     target(
         "media.image_previews",
         "Media",

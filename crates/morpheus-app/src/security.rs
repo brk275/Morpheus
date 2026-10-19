@@ -212,6 +212,32 @@ fn status_labels(info: SecurityInfo) -> (&'static str, &'static str, &'static st
     )
 }
 
+/// The SDK reporting success means the secrets were imported; whether this
+/// device can now read encrypted history is decided by the refreshed state.
+/// Returns whether recovery is complete and the message to show.
+fn recovery_result(status: Option<SecurityInfo>) -> (bool, &'static str) {
+    let Some(status) = status else {
+        return (
+            false,
+            "Recovery ran, but status could not be refreshed. Choose Refresh to confirm it.",
+        );
+    };
+    match (status.recovery, status.device_verification) {
+        (RecoveryStatus::Enabled, DeviceVerificationStatus::Verified) => (
+            true,
+            "Recovery complete. This device is verified and can read encrypted history.",
+        ),
+        (RecoveryStatus::Enabled, _) => (
+            false,
+            "Keys restored, but this device is not verified yet. Verify it with another device.",
+        ),
+        _ => (
+            false,
+            "Recovery ran but is still incomplete. Refresh, or check key backup elsewhere.",
+        ),
+    }
+}
+
 fn apply_status(ui: &AppWindow, info: SecurityInfo) {
     let (device, recovery, backup, can_enable) = status_labels(info);
     ui.set_security_device_status(device.into());
@@ -229,6 +255,7 @@ pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
         return;
     }
     crate::verification::clear_ui(ui);
+    crate::encryption_center::clear_ui(ui);
     next_operation(ui);
     ui.set_security_device_status("Unknown".into());
     ui.set_security_recovery_status("Unknown".into());
@@ -275,6 +302,7 @@ pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool 
 
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     crate::verification::register(ui, live.clone(), handle.clone());
+    crate::encryption_center::register(ui, live.clone(), handle.clone());
     let close_gate = live.security_gate.clone();
     let close_manager = live.manager.clone();
     let close_weak = ui.as_weak();
@@ -317,6 +345,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         {
             ui.invoke_refresh_security();
             ui.invoke_refresh_incoming_verification();
+            ui.invoke_refresh_encryption_devices();
         }
     });
 
@@ -517,10 +546,14 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 }
                 match result {
                     Ok(()) => {
-                        window.set_security_notice(
-                            "Recovery completed. Refresh status if key backup is still updating."
-                                .into(),
-                        );
+                        let (complete, message) = recovery_result(status);
+                        if complete {
+                            window.set_security_notice(message.into());
+                        } else {
+                            window.set_security_notice("".into());
+                            window.set_security_error(message.into());
+                        }
+                        window.invoke_refresh_encryption_devices();
                     }
                     Err(_) => {
                         window.set_security_notice("".into());
@@ -592,6 +625,23 @@ mod tests {
         assert!(!gate.blocked());
         assert!(!gate.ringing_allowed(old_generation));
         assert!(gate.try_restart().is_some());
+    }
+
+    #[test]
+    fn recovery_success_is_claimed_only_for_a_verified_enabled_device() {
+        let status = |recovery, device| {
+            Some(SecurityInfo {
+                device_verification: device,
+                recovery,
+                backup: BackupStatus::Enabled,
+            })
+        };
+        let verified = DeviceVerificationStatus::Verified;
+        let unverified = DeviceVerificationStatus::Unverified;
+        assert!(recovery_result(status(RecoveryStatus::Enabled, verified)).0);
+        assert!(!recovery_result(status(RecoveryStatus::Enabled, unverified)).0);
+        assert!(!recovery_result(status(RecoveryStatus::Incomplete, verified)).0);
+        assert!(!recovery_result(None).0);
     }
 
     #[test]

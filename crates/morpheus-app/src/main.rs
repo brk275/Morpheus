@@ -15,6 +15,7 @@ mod composer_mentions;
 mod config_cli;
 mod draft_recovery;
 mod drafts;
+mod encryption_center;
 mod image_previews;
 #[cfg(feature = "native-calls")]
 mod incoming_ring;

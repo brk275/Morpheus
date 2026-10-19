@@ -1,4 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
+import { EncryptionDevices, TrustedDeviceItem } from "encryption-center.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -2159,6 +2160,12 @@ export component AppWindow inherits Window {
     in-out property <string> sas-incoming-flow-id;
     in-out property <string> sas-incoming-user-id;
     in-out property <bool> sas-incoming-loading: false;
+    // Encryption center device list; see encryption-center.slint and
+    // src/encryption_center.rs.
+    in-out property <[TrustedDeviceItem]> encryption-devices;
+    in-out property <bool> encryption-devices-loading: false;
+    in-out property <string> encryption-devices-error;
+    in-out property <int> encryption-devices-operation: 0;
     in-out property <bool> native-call-enabled: false;
     in-out property <int> room-call-mode: 0;
     in-out property <bool> native-call-request-pending: false;
@@ -2434,7 +2441,10 @@ export component AppWindow inherits Window {
     callback refresh-sas-verification();
     callback start-sas-verification();
     callback confirm-sas-verification();
+    callback mismatch-sas-verification();
     callback cancel-sas-verification();
+    callback refresh-encryption-devices();
+    callback verify-encryption-device(string);
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
@@ -5205,14 +5215,41 @@ export component AppWindow inherits Window {
                                             accessible-label: "Confirm that SAS values match on both devices";
                                             clicked => { root.confirm-sas-verification(); }
                                         }
-                                        Button {
-                                            text: root.sas-stage == 4 ? "Values differ / cancel" : "Cancel verification";
+                                        if root.sas-stage == 4 : Button {
+                                            text: root.sas-busy ? "Reporting…" : "They don't match";
                                             enabled: !root.sas-busy;
-                                            accessible-label: root.sas-stage == 4 ? "The SAS values differ; cancel verification" : "Cancel this verification request";
+                                            accessible-label: "The values differ: stop verification on both devices without trusting either";
+                                            clicked => { root.mismatch-sas-verification(); }
+                                        }
+                                        Button {
+                                            text: "Cancel verification";
+                                            enabled: !root.sas-busy;
+                                            accessible-label: "Cancel this verification request";
                                             clicked => { root.cancel-sas-verification(); }
                                         }
                                     }
                                 }
+                            }
+                            EncryptionDevices {
+                                palette: {
+                                    ink: root.ink,
+                                    muted: root.muted,
+                                    panel: root.panel,
+                                    elevated: root.elevated,
+                                    divider: root.divider,
+                                    error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483,
+                                    success: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent
+                                };
+                                text-scale: root.text-scale;
+                                devices: root.encryption-devices;
+                                loading: root.encryption-devices-loading;
+                                busy: root.sas-stage != 0 || root.sas-busy || root.security-busy || root.security-recovery-key != "";
+                                error: root.encryption-devices-error;
+                                reveal-request: root.reveal-request("security.devices");
+                                refresh => { root.refresh-encryption-devices(); }
+                                verify-device(device-id) => { root.verify-encryption-device(device-id); }
+                                reveal-at(y) => { settings-scroll.reveal(y - settings-content.absolute-position.y); }
+                                revealed(id) => { root.settings-revealed-id = id; }
                             }
                             Rectangle {
                                 height: 108px; border-radius: 10px; background: root.elevated;

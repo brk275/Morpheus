@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use morpheus_matrix::{
-    DeviceVerificationStatus, MatrixCoreError, SasPresentation, VerificationInfo,
+    DeviceVerificationStatus, MatrixCoreError, SasPresentation, VerificationCancel,
+    VerificationCancelKind, VerificationInfo,
 };
 use slint::ComponentHandle;
 use tokio::runtime::Handle;
@@ -89,6 +90,31 @@ fn comparison_labels(presentation: SasPresentation) -> Option<(String, String)> 
     }
 }
 
+/// Why a flow stopped, for the person who has to decide whether to retry.
+/// Every stop leaves trust unchanged.
+fn cancel_message(cancel: Option<VerificationCancel>) -> &'static str {
+    let Some(cancel) = cancel else {
+        return "Verification was canceled. Nothing was trusted.";
+    };
+    match (cancel.kind, cancel.by_us) {
+        (VerificationCancelKind::Timeout, _) => {
+            "Verification timed out before both devices finished. Nothing was trusted."
+        }
+        (VerificationCancelKind::Mismatch, false) => {
+            "The other device reported that the values differ. Nothing was trusted."
+        }
+        (VerificationCancelKind::Mismatch, true) => {
+            "Verification stopped because the values differ. Nothing was trusted."
+        }
+        (VerificationCancelKind::User, false) => "The other device canceled verification.",
+        (VerificationCancelKind::User, true) => "Verification was canceled on this device.",
+        (VerificationCancelKind::AcceptedElsewhere, _) => {
+            "Another of your devices answered this request."
+        }
+        (VerificationCancelKind::Other, _) => "Verification was canceled. Nothing was trusted.",
+    }
+}
+
 fn may_confirm(stage: i32, compared: bool, busy: bool, recovery_blocked: bool) -> bool {
     stage == COMPARING && compared && !busy && !recovery_blocked
 }
@@ -126,6 +152,70 @@ pub(crate) fn clear_ui(ui: &AppWindow) {
     ui.set_sas_decimals("".into());
     ui.set_sas_error("".into());
     ui.set_sas_notice("".into());
+}
+
+/// Start an outgoing SAS request to one other device of this account, chosen
+/// from the encryption center's device list. The flow then continues like a
+/// request from this device: nothing is trusted until both people compare
+/// the values and confirm on both devices.
+pub(crate) fn request_device(
+    ui: &AppWindow,
+    live: Arc<LiveUi>,
+    handle: &Handle,
+    device_id: String,
+    device_name: String,
+) {
+    if !ui.get_live_session()
+        || ui.get_sas_stage() != IDLE
+        || ui.get_sas_busy()
+        || ui.get_security_busy()
+        || !ui.get_security_recovery_key().is_empty()
+        || live.security_gate.blocked()
+    {
+        return;
+    }
+    let account_id = ui.get_active_account_local_id().to_string();
+    if account_id.is_empty() || device_id.is_empty() {
+        return;
+    }
+    let operation = next_operation(ui);
+    ui.set_sas_busy(true);
+    ui.set_sas_incoming_loading(false);
+    ui.set_sas_error("".into());
+    ui.set_sas_notice(format!("Sending a verification request to {device_name}…").into());
+    let weak = ui.as_weak();
+    handle.spawn(async move {
+        let _transition = live.account_transition.lock().await;
+        let result = live
+            .manager
+            .request_device_verification_for(&account_id, &device_id)
+            .await;
+        let _ = weak.upgrade_in_event_loop(move |window| {
+            if !same_account(&window, &account_id, operation) {
+                return;
+            }
+            window.set_sas_busy(false);
+            match result {
+                Ok(info) => {
+                    window.set_sas_flow_id(info.flow_id.into());
+                    window.set_sas_other_user_id(info.other_user_id.into());
+                    window.set_sas_request_initiator(info.we_started);
+                    window.set_sas_stage(WAITING_FOR_REQUEST);
+                    window.set_sas_notice(
+                        format!("Approve the request on {device_name}, then compare the values.")
+                            .into(),
+                    );
+                }
+                Err(_) => {
+                    window.set_sas_notice("".into());
+                    window.set_sas_error(
+                        "Could not send a request to that device. Check that it is signed in, then retry."
+                            .into(),
+                    );
+                }
+            }
+        });
+    });
 }
 
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
@@ -325,10 +415,12 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             if !active_account_is(&live, &account_id).await {
                 return;
             }
-            let info = live
+            let outcome = live
                 .manager
-                .verification_request_info(&user_id, &flow_id)
+                .verification_outcome_for(&account_id, &user_id, &flow_id)
                 .await;
+            let cancel = outcome.as_ref().ok().and_then(|outcome| outcome.cancel);
+            let info = outcome.map(|outcome| outcome.info);
             // Only the device that sent the request starts SAS. After the
             // responder accepted that request, it waits for the incoming SAS
             // start and accepts the method without confirming the values.
@@ -374,17 +466,19 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 match info {
                     Ok(info) if info.is_cancelled => {
                         clear_ui(&window);
-                        window.set_sas_error("The other device canceled verification.".into());
+                        window.set_sas_error(cancel_message(cancel).into());
                     }
                     Ok(info) if info.is_done => {
                         clear_ui(&window);
                         window.set_sas_notice("Device verification completed.".into());
                         window.invoke_refresh_security();
+                        window.invoke_refresh_encryption_devices();
                     }
                     Err(_) if pruned_and_verified => {
                         clear_ui(&window);
                         window.set_sas_notice("This device is Verified.".into());
                         window.invoke_refresh_security();
+                        window.invoke_refresh_encryption_devices();
                     }
                     Ok(info)
                         if stage == WAITING_FOR_REQUEST && info.we_started && info.is_ready =>
@@ -550,6 +644,56 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     });
 
     let weak = ui.as_weak();
+    let mismatch_live = live.clone();
+    let mismatch_handle = handle.clone();
+    ui.on_mismatch_sas_verification(move || {
+        let Some(window) = weak.upgrade() else { return };
+        // Reporting a difference is always allowed while values are shown; it
+        // can only stop a flow, never trust a device.
+        if !window.get_live_session()
+            || window.get_sas_stage() != COMPARING
+            || window.get_sas_busy()
+        {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let user_id = window.get_sas_other_user_id().to_string();
+        let flow_id = window.get_sas_flow_id().to_string();
+        if account_id.is_empty() || user_id.is_empty() || flow_id.is_empty() {
+            return;
+        }
+        let operation = next_operation(&window);
+        window.set_sas_busy(true);
+        window.set_sas_compared(false);
+        window.set_sas_error("".into());
+        let live = mismatch_live.clone();
+        let weak = weak.clone();
+        mismatch_handle.spawn(async move {
+            let _transition = live.account_transition.lock().await;
+            let mut reported = live
+                .manager
+                .sas_mismatch_for(&account_id, &user_id, &flow_id)
+                .await;
+            if reported.is_err() && active_account_is(&live, &account_id).await {
+                // Fall back to a plain cancel so the other device stops too.
+                reported = live.manager.cancel_verification(&user_id, &flow_id).await;
+            }
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if !same_flow(&window, &account_id, operation, &flow_id) {
+                    return;
+                }
+                clear_ui(&window);
+                let message = if reported.is_ok() {
+                    "Values reported as different. Verification stopped; nothing was trusted."
+                } else {
+                    "Could not reach the other device. Nothing was trusted; cancel there too."
+                };
+                window.set_sas_error(message.into());
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     let cancel_live = live.clone();
     ui.on_cancel_sas_verification(move || {
         let Some(window) = weak.upgrade() else { return };
@@ -614,6 +758,29 @@ mod tests {
         .unwrap();
         assert_eq!(labels.0, "🐶 Dog spoof");
         assert_eq!(labels.1, "1234 · 0567 · 9999");
+    }
+
+    #[test]
+    fn stopped_flows_say_why_and_never_claim_trust() {
+        let cancel = |kind, by_us| Some(VerificationCancel { kind, by_us });
+        let timeout = cancel_message(cancel(VerificationCancelKind::Timeout, false));
+        assert!(timeout.contains("timed out"));
+        let theirs = cancel_message(cancel(VerificationCancelKind::Mismatch, false));
+        assert!(theirs.contains("other device"));
+        let ours = cancel_message(cancel(VerificationCancelKind::Mismatch, true));
+        assert!(ours.contains("differ"));
+        assert!(cancel_message(None).contains("Nothing was trusted"));
+        for kind in [
+            VerificationCancelKind::User,
+            VerificationCancelKind::Timeout,
+            VerificationCancelKind::Mismatch,
+            VerificationCancelKind::AcceptedElsewhere,
+            VerificationCancelKind::Other,
+        ] {
+            for by_us in [false, true] {
+                assert!(!cancel_message(cancel(kind, by_us)).contains("completed"));
+            }
+        }
     }
 
     #[test]
