@@ -16,7 +16,7 @@ use toml::de::{DeTable, DeValue};
 use crate::registry::{self, FIELDS, TokenSource};
 use crate::{
     BuiltInStylePreset, Config, ConfigError, ConfigStore, InputError, MAX_CONFIG_BYTES,
-    MAX_THEME_BYTES, Problem, ShortcutAction, ThemePack, ThemeRoles, read_bounded,
+    MAX_THEME_BYTES, Problem, ShortcutAction, ThemePack, ThemeRoles, ThemeStates, read_bounded,
 };
 
 /// Every diagnostic code with its meaning, for the schema output and docs.
@@ -367,6 +367,7 @@ fn patterns(file: FileKind) -> Vec<Vec<&'static str>> {
             vec!["name"],
             vec!["colors", "<base>"],
             vec!["roles", "<role>"],
+            vec!["states", "<state>"],
             vec!["senders", "colors"],
         ],
     }
@@ -379,6 +380,10 @@ fn segment_matches(pattern: &str, segment: &str) -> bool {
             registry::color_token(segment).is_some_and(|token| token.source == TokenSource::Base)
         }
         "<role>" => ThemeRoles::default()
+            .entries()
+            .iter()
+            .any(|(name, _)| *name == segment),
+        "<state>" => ThemeStates::default()
             .entries()
             .iter()
             .any(|(name, _)| *name == segment),
@@ -427,6 +432,7 @@ fn pattern_name<'a>(pattern: &'a str, segment: &str) -> &'a str {
         .iter()
         .map(|token| token.id)
         .chain(ThemeRoles::default().entries().map(|(name, _)| name))
+        .chain(ThemeStates::default().entries().map(|(name, _)| name))
         .chain(ShortcutAction::ALL.map(ShortcutAction::name))
         .find(|name| *name == segment)
         .unwrap_or("<unknown>")

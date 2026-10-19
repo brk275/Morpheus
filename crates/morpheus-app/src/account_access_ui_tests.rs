@@ -2194,6 +2194,563 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     settle(ui).await;
 }
 
+/// Font sizes and window-relative tops of the real Text items showing `text`.
+fn text_sizes_and_tops(ui: &AppWindow, text: &str) -> Vec<(f32, f32)> {
+    use slint::private_unstable_api::re_exports::{ComplexText, ItemRc, SimpleText, WindowInner};
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut found = Vec::new();
+    root.visit_descendants(|item| {
+        let size = if let Some(simple) = item.downcast::<SimpleText>() {
+            let simple = simple.as_pin_ref();
+            (simple.text().as_str() == text).then(|| simple.font_size().get())
+        } else if let Some(complex) = item.downcast::<ComplexText>() {
+            let complex = complex.as_pin_ref();
+            (complex.text().as_str() == text).then(|| complex.font_size().get())
+        } else {
+            None
+        };
+        if let Some(size) = size {
+            found.push((size, item_bounds(item).top));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+/// Typography and geometry metrics on the real generated window: a metric
+/// result reveals its value field and saves nothing; the steppers and an
+/// entered value save through the re-read file while typing alone does not;
+/// Undo never overwrites a later edit; an invalid hand edit is never replaced
+/// and the last valid tokens stay; an omitted metric steps from its built-in
+/// look and Use built-in omits it again; Reset all restores. At the largest
+/// icon and clock sizes with 200% text, default-size icon buttons fit inside
+/// both composers, and a narrow row keeps its actions below the clock.
+async fn assert_metric_workspace_and_extremes(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::{ConfigStore, MetricValue};
+
+    let store = ConfigStore::at(directory.join("metrics.toml"));
+    let config = store.load_or_create().unwrap();
+    crate::metric_editor::register(ui, &store);
+    crate::settings_search::register(ui);
+    apply_config(ui, &config, None);
+    ui.set_page(1);
+    settle(ui).await;
+    let tokens = ui.global::<crate::StyleTokens>();
+    assert_eq!(tokens.get_focus_width(), 2.0);
+    assert_eq!(tokens.get_icon_button_size(), 34.0);
+    assert_eq!(tokens.get_control_radius(), -1.0);
+    assert_eq!(tokens.get_line_width(), 1.0);
+    assert_eq!(ui.get_metric_override_count(), 0);
+
+    let before = std::fs::read_to_string(store.path()).unwrap();
+    assert!(crate::settings_search::reveal(
+        ui,
+        "metric:geometry.focus_width"
+    ));
+    settle(ui).await;
+    assert_eq!(ui.get_settings_revealed_id(), "metric:geometry.focus_width");
+    assert!(focused_control_has_label(
+        ui,
+        "Focus ring width in logical pixels, 1 to 6; Enter applies"
+    ));
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), before);
+    let focus = || store.load().unwrap().geometry.focus_width;
+
+    ui.invoke_metric_step(1);
+    settle(ui).await;
+    assert_eq!(focus(), 3);
+    assert_eq!(tokens.get_focus_width(), 3.0);
+    ui.invoke_metric_value_edited("9".into());
+    settle(ui).await;
+    assert!(!ui.get_metric_editor().hint.is_empty());
+    ui.invoke_metric_value_accepted("9".into());
+    settle(ui).await;
+    assert_eq!(focus(), 3, "an out-of-range value was saved");
+    ui.invoke_metric_value_accepted("5".into());
+    settle(ui).await;
+    assert_eq!(focus(), 5);
+    assert!(ui.get_metric_editor().can_undo && ui.get_metric_editor().overridden);
+    ui.invoke_metric_undo();
+    settle(ui).await;
+    assert_eq!(focus(), 3);
+
+    // Undo never overwrites a later edit made elsewhere.
+    ui.invoke_metric_step(1);
+    settle(ui).await;
+    assert_eq!(focus(), 4);
+    let mut external = store.load().unwrap();
+    external
+        .set_metric("geometry.focus_width", MetricValue::Set(6))
+        .unwrap();
+    store.save(&external).unwrap();
+    let superseded = std::fs::read_to_string(store.path()).unwrap();
+    ui.invoke_metric_undo();
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), superseded);
+    assert!(!ui.get_metric_editor().can_undo);
+    assert!(!ui.get_metric_editor().hint.is_empty());
+
+    // An invalid hand edit is never overwritten and its value never shown.
+    let applied = tokens.get_focus_width();
+    let broken = "[geometry]\nfocus_width = 0\n";
+    std::fs::write(store.path(), broken).unwrap();
+    ui.invoke_metric_step(1);
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), broken);
+    assert_eq!(tokens.get_focus_width(), applied);
+    assert!(!ui.get_config_error().is_empty());
+    assert!(!ui.get_config_error().contains('0'));
+    std::fs::write(store.path(), &superseded).unwrap();
+
+    // An omitted metric steps from its built-in look; Use built-in omits it.
+    assert!(crate::settings_search::reveal(
+        ui,
+        "metric:geometry.avatar_roundness"
+    ));
+    settle(ui).await;
+    assert!(ui.get_metric_editor().inherited);
+    ui.invoke_metric_step(1);
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().geometry.avatar_roundness, Some(40));
+    assert_eq!(tokens.get_avatar_roundness(), 40);
+    ui.invoke_metric_reset();
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().geometry.avatar_roundness, None);
+    assert_eq!(tokens.get_avatar_roundness(), -1);
+
+    // Reset all is armed first, then resets every metric, then restores.
+    ui.invoke_metric_reset_all();
+    settle(ui).await;
+    assert!(!ui.get_metric_reset_all_notice().is_empty());
+    assert_eq!(focus(), 6, "arming Reset all changed the file");
+    ui.invoke_metric_reset_all();
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().geometry, Config::default().geometry);
+    assert_eq!(tokens.get_focus_width(), 2.0);
+    ui.invoke_metric_reset_all();
+    settle(ui).await;
+    assert_eq!(focus(), 6);
+
+    // The largest icon and clock with the smallest message text at 200%.
+    let mut extreme = store.load().unwrap();
+    extreme.typography.message_size = 10;
+    for (key, value) in [
+        ("geometry.icon_size", 28),
+        ("typography.timestamp_size", 20),
+    ] {
+        extreme.set_metric(key, MetricValue::Set(value)).unwrap();
+    }
+    store.save(&extreme).unwrap();
+    apply_config(ui, &extreme, None);
+    assert_eq!(tokens.get_icon_button_size(), 44.0);
+    ui.set_messages(ModelRc::new(VecModel::from(vec![role_message(
+        "$metric-extreme",
+        false,
+        "Metric Author",
+        0,
+        "10:15 AM",
+        Color::from_rgb_u8(0x11, 0x22, 0x33),
+    )])));
+    ui.set_thread_root_id("$metric-extreme".into());
+    ui.set_thread_root_sender("Metric Author".into());
+    ui.invoke_show_thread_panel();
+    let panes = ui.get_rail_width_px() + ui.get_room_list_width() + ui.get_details_width();
+    let narrow = (panes + 360).max(940);
+    ui.window()
+        .set_size(slint::PhysicalSize::new(narrow as u32, 760));
+    ui.set_font_scale_percent(200);
+    settle(ui).await;
+    for (button, input) in [
+        (
+            "Attach file".to_owned(),
+            format!("Message composer for {}", ui.get_active_room_name()),
+        ),
+        (
+            "Open emoji picker for thread reply".to_owned(),
+            "Reply in thread started by Metric Author".to_owned(),
+        ),
+    ] {
+        let button_box = control_bounds(ui, &button);
+        let input_box = control_bounds(ui, &input);
+        assert_eq!((button_box.len(), input_box.len()), (1, 1), "{button}");
+        let (button_box, input_box) = (button_box[0], input_box[0]);
+        assert!(
+            button_box.bottom - button_box.top >= 44.0 - 0.5,
+            "{button} did not grow"
+        );
+        assert!(
+            button_box.top >= input_box.top - 0.5 && button_box.bottom <= input_box.bottom + 0.5,
+            "{button} {button_box:?} is clipped by its composer row {input_box:?}"
+        );
+    }
+    // The narrow row's clock is 40 px; its actions start below it.
+    let clocks = text_sizes_and_tops(ui, "· 10:15 AM");
+    assert_eq!(clocks.len(), 1, "the narrow header shows one clock");
+    let (clock_size, clock_top) = clocks[0];
+    assert!((clock_size - 40.0).abs() < 0.01, "clock is {clock_size}");
+    let reply = control_bounds(ui, "Reply to Metric Author");
+    assert_eq!(reply.len(), 1);
+    assert!(
+        reply[0].top >= clock_top + clock_size * 1.2 - 0.5,
+        "the reply action {:?} covers the clock at {clock_top}",
+        reply[0]
+    );
+
+    ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    ui.set_thread_root_id("".into());
+    ui.set_thread_root_sender("".into());
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_page(0);
+    apply_config(ui, &Config::default(), None);
+    settle(ui).await;
+}
+
+/// Interaction states and the sender palette on the real generated window:
+/// unset states keep every built-in color; config states reach the message
+/// hover, disabled buttons and a distinct mention badge; the palette editor
+/// hints on partial input, saves a complete value, reorders, undoes only its
+/// own change, never overwrites an invalid file, reports low contrast and
+/// returns to the theme palette; the timeline names use the saved palette.
+async fn assert_interaction_states_and_sender_palette(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+
+    let store = ConfigStore::at(directory.join("states.toml"));
+    let mut config = store.load_or_create().unwrap();
+    crate::sender_palette_editor::register(ui, &store);
+    apply_config(ui, &config, None);
+    settle(ui).await;
+    let transparent = Color::from_argb_u8(0, 0, 0, 0);
+    let elevated = ui.invoke_token_color("elevated".into());
+    assert_eq!(ui.invoke_row_surface(false, true, false, transparent), elevated);
+    assert_eq!(
+        ui.invoke_token_color("mention".into()),
+        ui.invoke_token_color("destructive".into())
+    );
+    assert_eq!(
+        ui.invoke_token_color("control_pressed".into()),
+        transparent
+    );
+
+    // Config states reach real controls.
+    let rgb = |red, green, blue| Color::from_rgb_u8(red, green, blue);
+    for (id, value) in [
+        ("message_hover", "#223344"),
+        ("mention", "#AA3344"),
+        ("mention_ink", "#FFFFFF"),
+        ("control_disabled", "#5A6B7C"),
+        ("composer_surface", "#334455"),
+    ] {
+        config.colors.insert(id.into(), value.into());
+    }
+    config.appearance.hover_duration_ms = 0;
+    apply_config(ui, &config, None);
+    ui.set_page(0);
+    ui.set_unsorted_channels(ModelRc::new(VecModel::from(vec![RoomItem {
+        id: "!mentions:example.org".into(),
+        name: "Mentions room".into(),
+        unread: 3,
+        mentions: 2,
+        ..Default::default()
+    }])));
+    crate::navigation::apply_room_order(ui);
+    settle(ui).await;
+    assert_eq!(
+        ui.invoke_row_surface(false, true, false, transparent),
+        rgb(0x22, 0x33, 0x44)
+    );
+    assert_eq!(ui.invoke_token_color("composer_surface".into()), rgb(0x33, 0x44, 0x55));
+    assert_text_color(ui, "@2", rgb(0xff, 0xff, 0xff), 1);
+    assert!(
+        text_colors_of(ui, "3").is_empty(),
+        "a mention badge replaces the unread count"
+    );
+    // The hover-fade decrease at 0 ms is disabled and draws the state.
+    ui.set_page(1);
+    settle(ui).await;
+    assert!(
+        text_colors_of(ui, "−").contains(&rgb(0x5a, 0x6b, 0x7c)),
+        "a disabled button keeps its built-in ink"
+    );
+    let plain = store.load().unwrap();
+    apply_config(ui, &plain, None);
+    settle(ui).await;
+    assert!(!text_colors_of(ui, "−").contains(&rgb(0x5a, 0x6b, 0x7c)));
+
+    // The palette editor starts from the identity colors.
+    let mut colored = store.load().unwrap();
+    colored.chat.color_senders = true;
+    store.save(&colored).unwrap();
+    apply_config(ui, &colored, None);
+    settle(ui).await;
+    let rows = || ui.get_sender_color_rows();
+    assert_eq!(rows().row_count(), 5);
+    assert!(!ui.get_sender_palette_custom());
+    let senders = || store.load().unwrap().senders.colors;
+    ui.invoke_sender_color_edited(0, "#12345".into());
+    settle(ui).await;
+    assert!(!ui.get_sender_palette_hint().is_empty());
+    assert_eq!(senders(), None, "a partial value was saved");
+    ui.invoke_sender_color_edited(0, "#123456".into());
+    settle(ui).await;
+    let saved = senders().expect("a complete value saves");
+    assert_eq!(saved.len(), 5);
+    assert_eq!(saved[0], "#123456");
+    assert!(ui.get_sender_palette_custom() && ui.get_sender_palette_can_undo());
+    assert_eq!(
+        ui.invoke_sender_ink(false, false, 0, transparent),
+        rgb(0x12, 0x34, 0x56)
+    );
+    ui.invoke_sender_color_move(0, 1);
+    settle(ui).await;
+    assert_eq!(senders().unwrap()[1], "#123456");
+    ui.invoke_sender_colors_undo();
+    settle(ui).await;
+    assert_eq!(senders().unwrap()[0], "#123456");
+
+    // Undo never overwrites a later edit made elsewhere.
+    ui.invoke_sender_color_edited(1, "#654321".into());
+    settle(ui).await;
+    let mut external = store.load().unwrap();
+    external.senders.colors = Some(vec!["#ABCDEF".into()]);
+    store.save(&external).unwrap();
+    let superseded = std::fs::read_to_string(store.path()).unwrap();
+    ui.invoke_sender_colors_undo();
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), superseded);
+    assert!(!ui.get_sender_palette_hint().is_empty());
+
+    // An invalid hand edit is never overwritten.
+    let broken = "[senders]\ncolors = []\n";
+    std::fs::write(store.path(), broken).unwrap();
+    ui.invoke_sender_color_add();
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), broken);
+    assert!(!ui.get_config_error().is_empty());
+    std::fs::write(store.path(), &superseded).unwrap();
+
+    // A one-color palette cannot lose its last color; low contrast is
+    // reported, not corrected.
+    let mut light = store.load().unwrap();
+    light.colors.insert("canvas".into(), "#FFFFFF".into());
+    store.save(&light).unwrap();
+    apply_config(ui, &light, None);
+    settle(ui).await;
+    ui.invoke_sender_color_remove(0);
+    settle(ui).await;
+    assert_eq!(senders().unwrap().len(), 1);
+    assert!(!ui.get_sender_palette_hint().is_empty());
+    ui.invoke_sender_color_edited(0, "#FFFF00".into());
+    settle(ui).await;
+    assert_eq!(senders().unwrap(), vec!["#FFFF00".to_owned()]);
+    assert!(!rows().row_data(0).unwrap().readable);
+    ui.invoke_sender_colors_reset();
+    settle(ui).await;
+    assert_eq!(senders(), None);
+    assert!(!ui.get_sender_palette_custom());
+
+    ui.set_unsorted_channels(ModelRc::new(VecModel::<RoomItem>::default()));
+    crate::navigation::apply_room_order(ui);
+    ui.set_page(0);
+    apply_config(ui, &Config::default(), None);
+    settle(ui).await;
+}
+
+/// Pane composition and motion on the real generated window: the details
+/// panel moves to either side without moving the room list or the account
+/// control, keyboard room order follows the displayed section order, each
+/// pane keeps its own density, and the opt-in fades are zero under Reduce
+/// motion.
+async fn assert_pane_composition_and_motion(ui: &AppWindow) {
+    use morpheus_config::{Density, DetailsSide};
+
+    let mut config = Config::default();
+    apply_config(ui, &config, None);
+    ui.set_page(0);
+    ui.set_show_side_panel(true);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    settle(ui).await;
+    let details = || control_bounds(ui, "Conversation details");
+    let (width, _) = window_size(ui);
+    let right = details();
+    assert_eq!(right.len(), 1);
+    assert!((right[0].right - width).abs() < 1.0, "{:?}", right[0]);
+    let account_label = format!(
+        "Account menu for {}, {}",
+        ui.get_active_account_name(),
+        ui.get_active_account_handle()
+    );
+    let account = control_bounds(ui, &account_label);
+    assert_eq!(account.len(), 1);
+    config.layout.details_side = DetailsSide::Left;
+    apply_config(ui, &config, None);
+    settle(ui).await;
+    let left = details();
+    assert_eq!(left.len(), 1);
+    let rail = ui.get_rail_width_px() as f32;
+    let list = ui.get_room_list_width() as f32;
+    assert!(
+        (left[0].left - (rail + list)).abs() < 1.0,
+        "the panel starts after the room list: {:?}",
+        left[0]
+    );
+    assert_eq!(
+        control_bounds(ui, &account_label),
+        account,
+        "the account control moved"
+    );
+
+    // Keyboard order follows the displayed sections.
+    let room = |id: &str, unread| RoomItem {
+        id: id.into(),
+        name: id.into(),
+        unread,
+        ..Default::default()
+    };
+    ui.set_unsorted_channels(ModelRc::new(VecModel::from(vec![room("!room", 1)])));
+    ui.set_unsorted_direct_messages(ModelRc::new(VecModel::from(vec![room("!direct", 1)])));
+    crate::navigation::apply_room_order(ui);
+    let order = || {
+        crate::navigation::visible_rooms(ui)
+            .into_iter()
+            .map(|room| room.id.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(order(), ["!room", "!direct"]);
+    config.layout.direct_messages_first = true;
+    config.layout.room_density = Some(Density::Spacious);
+    config.layout.message_density = Some(Density::Compact);
+    apply_config(ui, &config, None);
+    settle(ui).await;
+    assert_eq!(order(), ["!direct", "!room"]);
+    assert_eq!(ui.get_density_mode(), 1);
+    assert_eq!(ui.get_room_density_mode(), 2);
+    assert_eq!(ui.get_message_density_mode(), 0);
+    let row = control_bounds(ui, "Open room !room");
+    assert_eq!(row.len(), 1);
+    assert!(
+        (row[0].bottom - row[0].top - 44.0).abs() < 0.5,
+        "spacious room rows: {:?}",
+        row[0]
+    );
+
+    // Fades are opt-in, and Reduce motion makes them immediate.
+    let tokens = ui.global::<crate::StyleTokens>();
+    assert_eq!(tokens.get_popup_duration(), 0);
+    config.appearance.popup_fade_ms = 160;
+    config.appearance.panel_fade_ms = 240;
+    apply_config(ui, &config, None);
+    assert_eq!(tokens.get_popup_duration(), 160);
+    assert_eq!(tokens.get_panel_duration(), 240);
+    config.appearance.reduce_motion = true;
+    apply_config(ui, &config, None);
+    assert_eq!(tokens.get_popup_duration(), 0);
+    assert_eq!(tokens.get_panel_duration(), 0);
+
+    ui.set_unsorted_channels(ModelRc::new(VecModel::<RoomItem>::default()));
+    ui.set_unsorted_direct_messages(ModelRc::new(VecModel::<RoomItem>::default()));
+    crate::navigation::apply_room_order(ui);
+    apply_config(ui, &Config::default(), None);
+    settle(ui).await;
+}
+
+/// Account-scoped colors on the real generated window: an account's colors
+/// appear only while the window publishes that account, a switch or detach
+/// never leaves them on screen, the scoped editor writes only the active
+/// account's entry, an undo step never crosses accounts, and removing the
+/// account clears exactly its own appearance.
+async fn assert_account_scoped_appearance(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+
+    let store = ConfigStore::at(directory.join("accounts.toml"));
+    let mut config = store.load_or_create().unwrap();
+    config.colors.insert("canvas".into(), "#101010".into());
+    config
+        .account_overrides
+        .entry("account-one".into())
+        .or_default()
+        .colors
+        .insert("canvas".into(), "#203040".into());
+    config
+        .account_overrides
+        .entry("account-two".into())
+        .or_default()
+        .colors
+        .insert("accent".into(), "#405060".into());
+    store.save(&config).unwrap();
+    crate::appearance_editor::register(ui, &store);
+    let canvas = || ui.invoke_token_color("canvas".into());
+    let global = Color::from_rgb_u8(0x10, 0x10, 0x10);
+    let own = Color::from_rgb_u8(0x20, 0x30, 0x40);
+    ui.set_active_account_local_id("".into());
+    apply_config(ui, &config, None);
+    settle(ui).await;
+    assert_eq!(canvas(), global);
+    // The window publishes an account only after its activation succeeded.
+    for (account, expected) in [
+        ("account-one", own),
+        ("account-two", global),
+        ("account-one", own),
+        ("", global),
+        ("unknown-account", global),
+    ] {
+        ui.set_active_account_local_id(account.into());
+        crate::appearance::apply_theme_mode(ui);
+        settle(ui).await;
+        assert_eq!(canvas(), expected, "{account}");
+    }
+
+    // The scoped editor writes only the active account's entry.
+    ui.set_active_account_local_id("account-one".into());
+    crate::appearance::apply_theme_mode(ui);
+    ui.set_page(1);
+    settle(ui).await;
+    ui.invoke_color_scope_chosen(1);
+    ui.invoke_color_token_chosen("link".into());
+    ui.invoke_color_hex_edited("#ABCDEF".into());
+    settle(ui).await;
+    let saved = store.load().unwrap();
+    assert_eq!(
+        saved.account_overrides["account-one"].colors.get("link").map(String::as_str),
+        Some("#ABCDEF")
+    );
+    assert!(!saved.colors.contains_key("link"), "the global table changed");
+    assert!(!saved.account_overrides["account-two"].colors.contains_key("link"));
+    assert!(ui.get_color_editor().can_undo);
+    // Switching accounts drops the undo step; Undo cannot reach another account.
+    ui.set_active_account_local_id("account-two".into());
+    crate::appearance::apply_theme_mode(ui);
+    settle(ui).await;
+    assert!(!ui.get_color_editor().can_undo);
+    let before = std::fs::read_to_string(store.path()).unwrap();
+    ui.invoke_color_undo();
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), before);
+    // With no active account, the editor returns to the colors for all.
+    ui.set_active_account_local_id("".into());
+    crate::appearance::apply_theme_mode(ui);
+    settle(ui).await;
+    assert_eq!(ui.get_color_scope(), 0);
+
+    // Removal clears exactly the removed account's appearance.
+    let voices = VoiceSpaces::new(ConfigStore::at(store.path()));
+    voices.clear_logged_out_account("account-one").unwrap();
+    let cleaned = store.load().unwrap();
+    assert!(!cleaned.account_overrides.contains_key("account-one"));
+    assert_eq!(
+        cleaned.account_overrides["account-two"],
+        saved.account_overrides["account-two"]
+    );
+    assert_eq!(cleaned.colors, saved.colors);
+
+    ui.set_page(0);
+    apply_config(ui, &Config::default(), None);
+    settle(ui).await;
+}
+
 async fn exercise_account_ui(runtime: Handle) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
@@ -2217,6 +2774,10 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_scale_keyboard_and_focus_bounds(&ui).await;
     assert_message_role_precedence_and_thread_metadata(&ui).await;
     assert_appearance_workspace_and_search(&ui, directory.path()).await;
+    assert_metric_workspace_and_extremes(&ui, directory.path()).await;
+    assert_interaction_states_and_sender_palette(&ui, directory.path()).await;
+    assert_pane_composition_and_motion(&ui).await;
+    assert_account_scoped_appearance(&ui, directory.path()).await;
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));

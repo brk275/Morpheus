@@ -34,6 +34,27 @@ export struct ThemeRoleSet {
     avatar-ink: ColorRole,
 }
 
+// Optional interaction states. An absent state keeps the color it follows,
+// or each control's own state color.
+export struct ThemeStateSet {
+    message-hover: ColorRole,
+    control-hover: ColorRole,
+    control-pressed: ColorRole,
+    control-disabled: ColorRole,
+    input-surface: ColorRole,
+    input-border: ColorRole,
+    composer-surface: ColorRole,
+    composer-border: ColorRole,
+    composer-focus: ColorRole,
+    icon: ColorRole,
+    icon-active: ColorRole,
+    nav-hover: ColorRole,
+    nav-selected: ColorRole,
+    nav-selected-ink: ColorRole,
+    mention: ColorRole,
+    mention-ink: ColorRole,
+}
+
 // Sparse `[colors]` overrides of the eleven base colors. An absent entry
 // keeps the theme pack's color, or the built-in palette's.
 export struct BaseColorSet {
@@ -85,16 +106,100 @@ export struct ColorEditorState {
     hint: string,
 }
 
+// One color of the sender-name palette, in slot order.
+export struct SenderColorRow {
+    index: int,
+    hex: string,
+    swatch: color,
+    // At least 4.5:1 against the conversation background; reported only.
+    readable: bool,
+}
+
+// One group of the typography and geometry workspace.
+export struct MetricGroupItem {
+    id: string,
+    label: string,
+    count: int,
+}
+
+// One metric row. `key` is a registry field key, never a path.
+export struct MetricItem {
+    key: string,
+    label: string,
+    value-text: string,
+    overridden: bool,
+}
+
+// The one selected metric. Range, step and unit come from the registry.
+export struct MetricEditorState {
+    key: string,
+    label: string,
+    description: string,
+    group: string,
+    // The value the steppers move from; for an omitted metric, the value
+    // its built-in look is closest to.
+    value: int,
+    minimum: int,
+    maximum: int,
+    step: int,
+    suffix: string,
+    unit-spoken: string,
+    // Omitted: every surface keeps its built-in value.
+    inherited: bool,
+    inherit-text: string,
+    default-text: string,
+    overridden: bool,
+    can-undo: bool,
+    hint: string,
+}
+
 // Runtime geometry shared by small reusable controls and the main view.
 export global StyleTokens {
     in-out property <length> radius: 10px;
     in-out property <ThemeRoleSet> roles;
+    in-out property <ThemeStateSet> states;
     in-out property <BaseColorSet> base;
     // Share of each window surface's own alpha that is painted, 0 to 1.
     in-out property <float> window-opacity: 1;
     in-out property <bool> reduced-motion: false;
     in-out property <int> hover-duration-ms: 90;
     out property <duration> interaction-duration: StyleTokens.reduced-motion ? 0ms : StyleTokens.hover-duration-ms * 1ms;
+    // Opt-in decorative fades; zero by default and under reduced motion.
+    in-out property <int> popup-fade-ms: 0;
+    in-out property <int> panel-fade-ms: 0;
+    out property <duration> popup-duration: StyleTokens.reduced-motion ? 0ms : StyleTokens.popup-fade-ms * 1ms;
+    out property <duration> panel-duration: StyleTokens.reduced-motion ? 0ms : StyleTokens.panel-fade-ms * 1ms;
+    // The effective palette is high contrast; borders then stay visible.
+    in-out property <bool> high-contrast: false;
+    // Typography and geometry metrics from the registry. Rust projects every
+    // value with each accepted configuration; these defaults draw the
+    // built-in look. Sizes are logical pixels before text scaling.
+    in-out property <length> sidebar-font-size: 13px;
+    // Zero keeps each surface's own size.
+    in-out property <length> sender-font-size: 0px;
+    in-out property <length> timestamp-font-size: 10px;
+    // Zero follows the message font size.
+    in-out property <length> composer-font-size: 0px;
+    // Negative keeps each control's built-in proportion of `radius`.
+    in-out property <length> control-radius: -1px;
+    in-out property <length> input-radius: -1px;
+    in-out property <length> composer-radius: -1px;
+    in-out property <length> border-width: 1px;
+    out property <length> line-width: StyleTokens.high-contrast ? max(1px, StyleTokens.border-width) : StyleTokens.border-width;
+    in-out property <length> focus-width: 2px;
+    in-out property <length> control-padding: 12px;
+    in-out property <length> input-padding: 10px;
+    in-out property <length> composer-padding: 10px;
+    in-out property <length> icon-size: 18px;
+    // Default-size icon buttons grow to fit the configured icon. Containers
+    // designed around the 34 px button grow by the same amount, so the
+    // button never clips; at the default size both stay unchanged.
+    out property <length> icon-button-size: max(34px, StyleTokens.icon-size + 16px);
+    out property <length> icon-button-growth: StyleTokens.icon-button-size - 34px;
+    // Zero keeps each message layout's avatar size.
+    in-out property <length> message-avatar-size: 0px;
+    // Percent of each avatar's size; negative keeps its built-in corners.
+    in-out property <int> avatar-roundness: -1;
 }
 
 // Animate only the decorative hover layer. Selection colors, content, focus
@@ -199,6 +304,8 @@ export struct RoomItem {
     id: string,
     name: string,
     unread: int,
+    // Unread messages that mention this account; shown as a distinct badge.
+    mentions: int,
     private-room: bool,
     voice-space: bool,
     voice-local: bool,
@@ -288,14 +395,18 @@ component AvatarBadge inherits Rectangle {
     in property <string> initials;
     in property <color> accent;
     in property <color> ink: StyleTokens.roles.avatar-ink.present ? StyleTokens.roles.avatar-ink.color : #ffffff;
+    // Each call site's own corners. Avatar roundness, when set, replaces
+    // them with a share of this avatar's size, so every size stays alike.
+    in property <length> built-in-radius: StyleTokens.radius * 1.3;
+    in property <length> initials-size: 12px;
     width: 38px;
     height: 38px;
-    border-radius: StyleTokens.radius * 1.3;
+    border-radius: StyleTokens.avatar-roundness >= 0 ? min(self.width, self.height) * StyleTokens.avatar-roundness / 100 : root.built-in-radius;
     background: accent;
     Text {
         text: root.initials;
         color: root.ink;
-        font-size: 12px;
+        font-size: root.initials-size;
         font-weight: 700;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -342,12 +453,17 @@ component IconAction inherits Rectangle {
     in property <length> reveal-height: root.height;
     out property <bool> has-focus: keyboard-focus.has-focus;
     property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷";
+    // The configured icon size. A larger icon stays inside a call site's
+    // explicitly smaller button, but never below the built-in 18 px, so the
+    // default look is unchanged at every text scale. The button's own size
+    // never depends on its children.
+    property <length> glyph-size: min(StyleTokens.icon-size, max(18px, min(root.width, root.height) - 6px));
     opacity: !quiet || context-hover || area.has-hover || keyboard-focus.has-focus ? 1 : 0;
     callback activated();
     callback focus-state-changed(bool);
-    width: 34px;
-    height: 34px;
-    border-radius: StyleTokens.radius * 0.9;
+    width: StyleTokens.icon-button-size;
+    height: StyleTokens.icon-button-size;
+    border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.9;
     background: selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : hover-surface) : surface;
     forward-focus: keyboard-focus;
     accessible-role: button;
@@ -358,22 +474,30 @@ component IconAction inherits Rectangle {
         width: parent.width; height: parent.height; border-radius: parent.border-radius;
         visible: !root.selected;
         highlighted: root.enabled && area.has-hover;
-        background: root.hover-surface;
+        background: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface;
     }
+    // Drawn only when a theme or config.toml sets a pressed state.
+    Rectangle {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        background: root.enabled && area.pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent;
+    }
+    // Disabled, then selected, then the caller's ink.
+    property <color> glyph-ink: !root.enabled && StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color
+        : root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
     if !root.vector-icon : Text {
         text: root.icon;
-        color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
-        font-size: root.icon == "Md" ? 13px : 18px;
+        color: root.glyph-ink;
+        font-size: root.icon == "Md" ? root.glyph-size * 13 / 18 : root.glyph-size;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
     if root.vector-icon : InterfaceGlyph {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        width: 18px;
-        height: 18px;
+        width: root.glyph-size;
+        height: root.glyph-size;
         icon: root.icon;
-        ink: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+        ink: root.glyph-ink;
     }
     keyboard-focus := FocusScope {
         x: 0px;
@@ -401,7 +525,7 @@ component IconAction inherits Rectangle {
     }
     if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;
-        border-width: 2px;
+        border-width: StyleTokens.focus-width;
         border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.ink;
         background: transparent;
     }
@@ -417,6 +541,7 @@ component ActionRect inherits Rectangle {
     // Zero-sized targets can round outside a scroll clip and lose focus on release.
     in property <bool> reveal-full-control: true;
     out property <bool> has-hover: hit.has-hover;
+    out property <bool> has-pressed: hit.pressed;
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
     callback focus-state-changed(bool);
@@ -461,7 +586,7 @@ component ActionRect inherits Rectangle {
     }
     if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;
-        border-width: 2px;
+        border-width: StyleTokens.focus-width;
         border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.focus-color;
         background: transparent;
     }
@@ -481,20 +606,34 @@ component NavigationRoomRow inherits ActionRect {
     in property <color> hover;
     in property <color> accent;
     in property <color> accent-ink;
+    // Mentions and highlights use their own badge colors, so a ping stays
+    // distinct from a plain unread count. The window resolves both colors.
+    in property <color> mention-surface;
+    in property <color> mention-ink;
     callback open(string, bool);
+    property <bool> selected-ink-set: StyleTokens.states.nav-selected-ink.present || StyleTokens.roles.selection-ink.present;
+    property <color> selected-ink: StyleTokens.states.nav-selected-ink.present ? StyleTokens.states.nav-selected-ink.color : StyleTokens.roles.selection-ink.color;
     height: max(root.direct ? (root.density-mode == 0 ? 32px : root.density-mode == 2 ? 47px : 39px)
-        : (root.density-mode == 0 ? 30px : root.density-mode == 2 ? 44px : 36px), 22px * root.text-scale);
+        : (root.density-mode == 0 ? 30px : root.density-mode == 2 ? 44px : 36px), (StyleTokens.sidebar-font-size + 9px) * root.text-scale);
     border-radius: StyleTokens.radius * 0.8;
-    background: root.selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : transparent;
+    background: root.selected ? (StyleTokens.states.nav-selected.present ? StyleTokens.states.nav-selected.color
+        : StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : transparent;
     HoverSurface {
         width: parent.width; height: parent.height; border-radius: parent.border-radius;
         visible: !root.selected;
         highlighted: root.enabled && root.has-hover;
-        background: root.elevated;
+        background: StyleTokens.states.nav-hover.present ? StyleTokens.states.nav-hover.color : root.elevated;
+    }
+    Rectangle {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        background: root.enabled && root.has-pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent;
     }
     focus-color: root.accent;
     label: root.room.voice-space ? (root.direct ? "Enter voice space with " : "Enter voice space ") + root.room.name
         : (root.direct ? "Open direct message with " : "Open room ") + root.room.name;
+    // Counts are spoken without changing the action's name.
+    accessible-description: root.room.mentions > 0 ? root.room.mentions + " unread mentions, " + root.room.unread + " unread"
+        : root.room.unread > 0 ? root.room.unread + " unread" : "";
     activated => { root.open(root.room.id, root.room.voice-space); }
     HorizontalLayout {
         padding-left: root.direct ? 9px : 10px; padding-right: 9px; spacing: root.direct ? 9px : 8px;
@@ -504,23 +643,32 @@ component NavigationRoomRow inherits ActionRect {
         }
         if !root.direct : Text {
             text: root.room.voice-space ? "◖" : (root.room.private-room ? "⌑" : "#");
-            color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.room.voice-space ? (StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1) : root.muted;
+            color: root.selected && root.selected-ink-set ? root.selected-ink : root.room.voice-space ? (StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1) : root.muted;
             font-size: 18px * root.text-scale; vertical-alignment: center;
         }
         Text {
             text: root.room.name;
-            color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : (root.room.unread > 0 ? root.ink : root.muted);
-            font-size: 13px * root.text-scale; font-weight: root.direct ? 0 : root.room.unread > 0 ? 700 : 500;
+            color: root.selected && root.selected-ink-set ? root.selected-ink : (root.room.unread > 0 ? root.ink : root.muted);
+            font-size: StyleTokens.sidebar-font-size * root.text-scale; font-weight: root.direct ? 0 : root.room.unread > 0 ? 700 : 500;
             vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
         }
         if root.room.voice-space : Text {
-            text: "VOICE"; color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1;
+            text: "VOICE"; color: root.selected && root.selected-ink-set ? root.selected-ink : StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1;
             font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center;
         }
-        if root.room.unread > 0 : Rectangle {
-            width: 20px; height: 20px; border-radius: 10px;
+        // One badge: mentions win over the plain unread count. Both grow with
+        // a long count or large text instead of overflowing the pill.
+        if root.room.mentions > 0 : mention-pill := Rectangle {
+            width: max(20px, mention-count.preferred-width + 10px); height: max(20px, 14px * root.text-scale);
+            border-radius: self.height / 2;
+            background: root.mention-surface;
+            mention-count := Text { text: "@" + root.room.mentions; color: root.mention-ink; font-size: 10px * root.text-scale; font-weight: 750; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        if root.room.mentions <= 0 && root.room.unread > 0 : Rectangle {
+            width: max(20px, unread-count.preferred-width + 10px); height: max(20px, 14px * root.text-scale);
+            border-radius: self.height / 2;
             background: StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent;
-            Text { text: root.room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+            unread-count := Text { text: root.room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
         }
     }
 }
@@ -533,22 +681,29 @@ component NavigationTextAction inherits ActionRect {
     in property <color> muted;
     in property <color> hover;
     in property <color> accent;
-    height: max(32px, 22px * root.text-scale + 8px); vertical-stretch: 0;
+    property <bool> selected-ink-set: StyleTokens.states.nav-selected-ink.present || StyleTokens.roles.selection-ink.present;
+    property <color> selected-ink: StyleTokens.states.nav-selected-ink.present ? StyleTokens.states.nav-selected-ink.color : StyleTokens.roles.selection-ink.color;
+    height: max(32px, (StyleTokens.sidebar-font-size + 9px) * root.text-scale + 8px); vertical-stretch: 0;
     reveal-full-control: true;
     border-radius: StyleTokens.radius * 0.8;
-    background: root.selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : transparent;
+    background: root.selected ? (StyleTokens.states.nav-selected.present ? StyleTokens.states.nav-selected.color
+        : StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : transparent;
     HoverSurface {
         width: parent.width; height: parent.height; border-radius: parent.border-radius;
         visible: !root.selected;
         highlighted: root.enabled && root.has-hover;
-        background: root.hover;
+        background: StyleTokens.states.nav-hover.present ? StyleTokens.states.nav-hover.color : root.hover;
+    }
+    Rectangle {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        background: root.enabled && root.has-pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent;
     }
     focus-color: root.accent;
     label: root.text;
     Text {
         x: 8px; width: parent.width - 16px; height: parent.height;
-        text: root.text; color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.selected ? root.ink : root.muted;
-        font-size: 13px * root.text-scale; font-weight: root.selected ? 650 : 500;
+        text: root.text; color: root.selected && root.selected-ink-set ? root.selected-ink : root.selected ? root.ink : root.muted;
+        font-size: StyleTokens.sidebar-font-size * root.text-scale; font-weight: root.selected ? 650 : 500;
         overflow: elide; vertical-alignment: center;
     }
 }
@@ -565,27 +720,31 @@ component TextAction inherits ActionRect {
     label: text;
     // Stacked actions must accept the pane's width rather than exporting an
     // unbroken caption's intrinsic width into the surrounding layout.
-    min-width: root.wrap-caption ? 32px : max(32px, caption.preferred-width + 24px * root.text-scale);
+    min-width: root.wrap-caption ? 32px : max(32px, caption.preferred-width + 2 * StyleTokens.control-padding * root.text-scale);
     preferred-width: root.wrap-caption ? 32px : self.min-width;
     min-height: root.wrap-caption ? max(32px * root.text-scale, caption.preferred-height + 16px * root.text-scale) : 32px * root.text-scale;
     horizontal-stretch: root.wrap-caption ? 1 : 0;
-    border-radius: StyleTokens.radius * 0.7;
-    border-width: 1px;
+    border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
+    border-width: StyleTokens.line-width;
     border-color: outline;
     background: surface;
     focus-color: ink;
     HoverSurface {
         width: parent.width; height: parent.height; border-radius: parent.border-radius;
         highlighted: root.enabled && root.has-hover;
-        background: root.hover-surface;
+        background: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface;
+    }
+    Rectangle {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        background: root.enabled && root.has-pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent;
     }
     caption := Text {
-        x: 12px * root.text-scale;
-        width: parent.width - 24px * root.text-scale;
+        x: StyleTokens.control-padding * root.text-scale;
+        width: parent.width - 2 * StyleTokens.control-padding * root.text-scale;
         height: root.wrap-caption ? self.preferred-height : parent.height;
         y: (parent.height - self.height) / 2;
         text: root.text;
-        color: root.enabled ? root.ink : root.muted;
+        color: root.enabled ? root.ink : StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.muted;
         font-size: 12px * root.text-scale;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -809,6 +968,11 @@ component MentionPopup inherits Rectangle {
     in property <float> text-scale: 1;
     callback choose(string);
     height: min(360px, self.items.length * (36px * root.text-scale + 10px) + 8px);
+    // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
+    property <bool> entered: false;
+    init => { self.entered = true; }
+    opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
+    animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
     background: surface; border-radius: StyleTokens.radius * 0.8; border-width: 1px; border-color: accent;
     accessible-role: region; accessible-label: "Mention suggestions; arrows select, Enter or Tab inserts, Escape closes";
     mention-list := ListView {
@@ -846,6 +1010,11 @@ component EmojiPopup inherits Rectangle {
     callback choose(string);
     callback dismiss();
     height: min(380px, 280px * root.text-scale + 70px);
+    // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
+    property <bool> entered: false;
+    init => { self.entered = true; }
+    opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
+    animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
     background: surface; border-radius: StyleTokens.radius * 0.9; border-width: 1px; border-color: accent;
     accessible-role: region; accessible-label: "Emoji picker";
     FocusScope {
@@ -856,7 +1025,7 @@ component EmojiPopup inherits Rectangle {
         VerticalLayout {
         padding: 8px; spacing: 6px;
         HorizontalLayout {
-            height: 34px * root.text-scale; spacing: 6px;
+            height: 34px * root.text-scale + StyleTokens.icon-button-growth; spacing: 6px;
             Rectangle {
                 horizontal-stretch: 1; background: root.elevated; border-radius: StyleTokens.radius * 0.6;
                 if root.query == "" : Text {
@@ -1105,13 +1274,18 @@ component StickerPopup inherits Rectangle {
     property <bool> has-current: root.current >= 0 && root.current < root.items.length;
     property <bool> narrow: root.width < 340px * root.text-scale;
     property <length> row-height: 34px * root.text-scale + 6px;
-    property <length> field-height: 34px * root.text-scale;
+    property <length> field-height: 34px * root.text-scale + StyleTokens.icon-button-growth;
     property <string> current-label: root.has-current ? root.items[root.current].label : "";
     property <string> selected-text: root.notice != "" ? root.notice
         : root.phase != 1 ? root.status
         : root.has-current ? "Selected sticker: " + root.items[root.current].label + ", from " + root.items[root.current].pack
         : root.status;
     height: max(140px, min(root.available-height, root.narrow ? 620px : min(470px, 330px * root.text-scale + 130px)));
+    // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
+    property <bool> entered: false;
+    init => { self.entered = true; }
+    opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
+    animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
     background: surface; border-radius: StyleTokens.radius * 0.9; border-width: 1px; border-color: accent;
     accessible-role: region; accessible-label: "Sticker picker";
     FocusScope {
@@ -1288,7 +1462,7 @@ component StickerSendStatus inherits Rectangle {
     callback cancel();
     callback retry();
     callback dismiss();
-    property <length> action-height: max(30px, 32px * root.text-scale);
+    property <length> action-height: max(30px, 32px * root.text-scale) + StyleTokens.icon-button-growth;
     height: message.y + message.height + 4px + root.action-height + 6px;
     background: surface; border-radius: StyleTokens.radius * 0.6;
     message := Text {
@@ -1342,7 +1516,7 @@ component ShortcutSetting inherits Rectangle {
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
         Rectangle {
             width: 200px; height: 38px; background: root.surface; border-radius: StyleTokens.radius * 0.7;
-            border-width: shortcut-input.has-focus ? 2px : 0px; border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
+            border-width: shortcut-input.has-focus ? StyleTokens.focus-width : 0px; border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
             if root.binding == "" : Text { x: 9px; text: "Disabled"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
             shortcut-input := ThemedTextInput {
                 x: 9px; width: parent.width - 18px; height: parent.height;
@@ -1374,7 +1548,7 @@ component StyleNumberSetting inherits Rectangle {
     public function focus-control() {
         if root.value > root.minimum { decrease.focus(); } else { increase.focus(); }
     }
-    height: max(58px, 34px * root.text-scale + 20px);
+    height: max(58px, 34px * root.text-scale + 20px) + StyleTokens.icon-button-growth;
     background: surface; border-radius: StyleTokens.radius;
     forward-focus: decrease;
     HorizontalLayout {
@@ -1403,10 +1577,10 @@ component StyleFontSetting inherits Rectangle {
         spacing: 7px;
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
         Rectangle {
-            height: 38px * root.text-scale; background: root.surface; border-radius: StyleTokens.radius * 0.7;
-            border-width: input.has-focus ? 2px : 0px; border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
+            height: 38px * root.text-scale; background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+            border-width: input.has-focus ? StyleTokens.focus-width : 0px; border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
             input := ThemedTextInput {
-                x: 10px; width: max(0px, parent.width - 20px); height: parent.height;
+                x: StyleTokens.input-padding; width: max(0px, parent.width - 2 * StyleTokens.input-padding); height: parent.height;
                 text <=> root.family; single-line: true;
                 color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
                 accessible-label: root.label;
@@ -1446,22 +1620,22 @@ component SettingsSearchBar inherits VerticalLayout {
     }
     Rectangle {
         height: max(40px, 32px * root.text-scale);
-        background: root.surface;
-        border-radius: StyleTokens.radius * 0.8;
-        border-width: input.has-focus ? 2px : 1px;
-        border-color: input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : root.outline;
+        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+        border-width: input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+        border-color: input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
         InterfaceGlyph {
-            x: 10px; y: (parent.height - self.height) / 2; width: 16px; height: 16px;
+            x: StyleTokens.input-padding; y: (parent.height - self.height) / 2; width: 16px; height: 16px;
             icon: "S"; ink: root.muted;
         }
         if root.query == "" : Text {
-            x: 34px; width: parent.width - 44px; height: parent.height;
+            x: StyleTokens.input-padding + 24px; width: parent.width - 2 * StyleTokens.input-padding - 24px; height: parent.height;
             text: "Search settings: colors, fonts, transparency, password…";
             color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
         }
         // Capture navigation keys before the text field edits with them.
         keys := FocusScope {
-            x: 34px; width: parent.width - 44px; height: parent.height;
+            x: StyleTokens.input-padding + 24px; width: parent.width - 2 * StyleTokens.input-padding - 24px; height: parent.height;
             focus-on-click: false;
             focus-on-tab-navigation: false;
             capture-key-pressed(event) => {
@@ -1559,16 +1733,16 @@ component ColorTokenList inherits VerticalLayout {
     alignment: start;
     Rectangle {
         height: max(36px, 30px * root.text-scale);
-        background: root.surface; border-radius: StyleTokens.radius * 0.7;
-        border-width: filter-input.has-focus ? 2px : 1px;
-        border-color: filter-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : root.outline;
+        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+        border-width: filter-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+        border-color: filter-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
         if root.filter == "" : Text {
-            x: 10px; width: parent.width - 20px; height: parent.height;
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
             text: "Filter colors: link, badge, backdrop…"; color: root.muted;
             font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
         }
         filter-input := ThemedTextInput {
-            x: 10px; width: parent.width - 20px; height: parent.height;
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
             text <=> root.filter; single-line: true;
             color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
             accessible-label: "Filter colors by name";
@@ -1683,11 +1857,11 @@ component ColorTokenEditor inherits VerticalLayout {
     Text { text: root.state.description; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
     Rectangle {
         height: max(38px, 32px * root.text-scale);
-        background: root.surface; border-radius: StyleTokens.radius * 0.7;
-        border-width: hex-input.has-focus ? 2px : 1px;
-        border-color: hex-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : root.outline;
+        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+        border-width: hex-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+        border-color: hex-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
         FocusScope {
-            x: 10px; width: parent.width - 20px; height: parent.height;
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
             focus-on-click: false;
             focus-on-tab-navigation: false;
             capture-key-pressed(event) => {
@@ -1730,6 +1904,334 @@ component ColorTokenEditor inherits VerticalLayout {
         ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
         outline: root.outline; text-scale: root.text-scale;
         activated => { root.reset-all(); }
+    }
+}
+
+// Metric groups, a filter over every metric and the metrics shown. Choosing
+// one opens it in the editor; nothing changes until a value is applied.
+component MetricList inherits VerticalLayout {
+    in property <[MetricGroupItem]> groups;
+    in property <[MetricItem]> items;
+    in property <int> group-index;
+    in property <string> selected-key;
+    in-out property <string> filter;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> accent;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    // The groups and metrics scroll inside this height, so the editor stays
+    // close to the list at narrow widths and large text.
+    in property <length> max-list-height: 320px;
+    out property <bool> has-focus: filter-input.has-focus;
+    callback filter-edited(string);
+    callback group-chosen(int);
+    callback metric-chosen(string);
+    forward-focus: filter-input;
+    spacing: 4px;
+    alignment: start;
+    Rectangle {
+        height: max(36px, 30px * root.text-scale);
+        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+        border-width: filter-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+        border-color: filter-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
+        if root.filter == "" : Text {
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+            text: "Filter sizes: border, focus, avatar…"; color: root.muted;
+            font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
+        }
+        filter-input := ThemedTextInput {
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+            text <=> root.filter; single-line: true;
+            color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+            accessible-label: "Filter typography and geometry by name";
+            edited => { root.filter-edited(self.text); }
+        }
+    }
+    list-scroll := ScrollView {
+        height: min(list-content.preferred-height, root.max-list-height);
+        horizontal-scrollbar-policy: always-off;
+        accessible-role: list;
+        accessible-label: "Typography and geometry to edit";
+        list-content := VerticalLayout {
+            width: list-scroll.visible-width;
+            spacing: 2px; alignment: start;
+            if root.filter == "" : VerticalLayout {
+                spacing: 2px; alignment: start;
+                for group[index] in root.groups : ActionRect {
+                    height: max(32px, 26px * root.text-scale);
+                    label: group.label + (index == root.group-index ? ", selected" : "");
+                    background: index == root.group-index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
+                        : self.has-hover ? root.hover-surface : transparent;
+                    border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
+                    activated => { root.group-chosen(index); }
+                    HorizontalLayout {
+                        padding-left: 10px; padding-right: 10px; spacing: 6px;
+                        Text {
+                            text: group.label;
+                            color: index == root.group-index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+                            font-size: 12px * root.text-scale; font-weight: index == root.group-index ? 700 : 500;
+                            vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                        }
+                        Text { text: "" + group.count; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
+                    }
+                }
+            }
+            Rectangle { height: 1px; background: root.outline; }
+            if root.items.length == 0 : Text {
+                text: "No sizes match. Try another word."; color: root.muted;
+                font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
+            }
+            for item in root.items : ActionRect {
+                height: max(36px, 30px * root.text-scale);
+                label: item.label + ", " + item.value-text + (item.overridden ? ", customized" : "") + (item.key == root.selected-key ? ", selected" : "");
+                background: item.key == root.selected-key ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
+                    : self.has-hover ? root.hover-surface : transparent;
+                border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
+                activated => { root.metric-chosen(item.key); }
+                HorizontalLayout {
+                    padding-left: 10px; padding-right: 10px; spacing: 8px;
+                    Text {
+                        text: item.label;
+                        color: item.key == root.selected-key && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+                        font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                    }
+                    Text {
+                        text: item.value-text;
+                        color: item.key == root.selected-key && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted;
+                        font-size: 11px * root.text-scale; vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The one selected metric. The steppers apply at once; a typed whole number
+// applies with Enter and Escape restores the field. Other input only shows a
+// hint, and the last valid value stays applied.
+component MetricValueEditor inherits VerticalLayout {
+    in property <MetricEditorState> state;
+    in-out property <string> value-text;
+    in property <int> override-count;
+    in property <string> reset-all-notice;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> accent;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    callback step(int);
+    callback edited(string);
+    callback accepted(string);
+    callback restore-input();
+    callback reset();
+    callback undo();
+    callback reset-all();
+    out property <bool> has-focus: value-input.has-focus;
+    forward-focus: value-input;
+    spacing: 8px;
+    alignment: start;
+    Text { text: root.state.label; color: root.ink; font-size: 14px * root.text-scale; font-weight: 700; wrap: word-wrap; }
+    Text {
+        text: root.state.group + " · " + (root.state.inherited ? root.state.inherit-text : root.state.default-text)
+            + " · " + root.state.minimum + "–" + root.state.maximum + root.state.suffix;
+        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+    Text { text: root.state.description; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+    HorizontalLayout {
+        spacing: 8px;
+        IconAction {
+            icon: "−"; label: "Decrease " + root.state.label;
+            ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+            enabled: root.state.value > root.state.minimum;
+            activated => { root.step(-1); }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            height: max(38px, 32px * root.text-scale);
+            background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+            border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+            border-width: value-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+            border-color: value-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
+            if root.value-text == "" : Text {
+                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                text: root.state.inherit-text; color: root.muted;
+                font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
+            }
+            FocusScope {
+                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                focus-on-click: false;
+                focus-on-tab-navigation: false;
+                capture-key-pressed(event) => {
+                    if event.text == Key.Escape { root.restore-input(); accept } else { reject }
+                }
+                value-input := ThemedTextInput {
+                    width: parent.width; height: parent.height;
+                    text <=> root.value-text; single-line: true; input-type: number;
+                    color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center;
+                    accessible-label: root.state.label + " in " + root.state.unit-spoken + ", " + root.state.minimum + " to " + root.state.maximum + "; Enter applies";
+                    accessible-description: root.state.hint;
+                    edited => { root.edited(self.text); }
+                    accepted => { root.accepted(self.text); }
+                }
+            }
+        }
+        Text { text: root.state.suffix; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
+        IconAction {
+            icon: "+"; label: "Increase " + root.state.label;
+            ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+            enabled: root.state.value < root.state.maximum;
+            activated => { root.step(1); }
+        }
+    }
+    if root.state.hint != "" : Text {
+        text: root.state.hint; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    HorizontalLayout {
+        spacing: 8px; alignment: start;
+        if root.state.overridden : TextAction {
+            text: root.state.inherit-text != "" ? "Use built-in" : "Reset to default";
+            label: root.state.inherit-text != "" ? "Return " + root.state.label + " to its built-in value" : "Reset " + root.state.label + " to its default";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.reset(); }
+        }
+        if root.state.can-undo : TextAction {
+            text: "Undo"; label: "Undo the last change to " + root.state.label;
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.undo(); }
+        }
+    }
+    Text { text: "Advanced: key " + root.state.key + " in config.toml"; color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
+    if root.override-count > 0 || root.reset-all-notice != "" : TextAction {
+        wrap-caption: true;
+        text: root.reset-all-notice != "" ? root.reset-all-notice : "Reset all " + root.override-count + " customized sizes";
+        ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+        outline: root.outline; text-scale: root.text-scale;
+        activated => { root.reset-all(); }
+    }
+}
+
+// The sender-name palette: one row per slot with a sample name drawn on the
+// conversation background, its hex value, reordering and removal. A valid
+// value saves at once; partial input only hints. Low contrast is reported
+// beside the sample and never corrected.
+component SenderPaletteEditor inherits VerticalLayout {
+    in property <[SenderColorRow]> rows;
+    in property <string> source;
+    in property <bool> custom;
+    in property <bool> can-undo;
+    in property <string> hint;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> accent;
+    in property <color> outline;
+    // The background the timeline draws names on.
+    in property <color> canvas;
+    in property <string> sample-font-family;
+    in property <float> text-scale: 1;
+    callback edited(int, string);
+    callback moved(int, int);
+    callback removed(int);
+    callback added();
+    callback reset();
+    callback undo();
+    out property <bool> has-focus: add-color.has-focus;
+    forward-focus: add-color;
+    spacing: 6px;
+    alignment: start;
+    Text { text: root.source; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+    for row in root.rows : HorizontalLayout {
+        spacing: 8px;
+        Rectangle {
+            width: 128px * root.text-scale; height: max(34px, 26px * root.text-scale);
+            background: root.canvas; border-radius: StyleTokens.radius * 0.6;
+            border-width: StyleTokens.line-width; border-color: root.outline;
+            Text {
+                x: 8px; width: parent.width - 16px; height: parent.height;
+                text: "Sample name " + (row.index + 1); color: row.swatch;
+                font-family: root.sample-font-family; font-size: 12px * root.text-scale; font-weight: 650;
+                vertical-alignment: center; overflow: elide;
+                accessible-label: "Sample of sender color " + (row.index + 1) + (row.readable ? "" : ", low contrast on the conversation background");
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1; height: max(34px, 28px * root.text-scale);
+            background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+            border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+            border-width: hex-field.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+            border-color: hex-field.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent)
+                : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
+            hex-field := ThemedTextInput {
+                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                text: row.hex; single-line: true;
+                color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+                accessible-label: "Sender color " + (row.index + 1) + " hex, #RRGGBB or #RRGGBBAA";
+                accessible-description: row.readable ? "" : "Low contrast on the conversation background";
+                edited => { root.edited(row.index, self.text); }
+                accepted => { root.edited(row.index, self.text); }
+            }
+        }
+        if !row.readable : Text {
+            text: "Low contrast"; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center;
+        }
+        IconAction {
+            icon: "▲"; label: "Move sender color " + (row.index + 1) + " earlier";
+            ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+            enabled: row.index > 0;
+            activated => { root.moved(row.index, -1); }
+        }
+        IconAction {
+            icon: "▼"; label: "Move sender color " + (row.index + 1) + " later";
+            ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+            enabled: row.index < root.rows.length - 1;
+            activated => { root.moved(row.index, 1); }
+        }
+        IconAction {
+            icon: "×"; label: "Remove sender color " + (row.index + 1);
+            ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+            enabled: root.rows.length > 1;
+            activated => { root.removed(row.index); }
+        }
+    }
+    if root.hint != "" : Text {
+        text: root.hint; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    HorizontalLayout {
+        spacing: 8px; alignment: start;
+        add-color := TextAction {
+            text: "Add color"; label: "Add a sender color";
+            enabled: root.rows.length < 16;
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.added(); }
+        }
+        if root.can-undo : TextAction {
+            text: "Undo"; label: "Undo the last change to sender colors";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.undo(); }
+        }
+        if root.custom : TextAction {
+            text: "Use theme colors"; label: "Remove your sender colors and use the theme's";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.reset(); }
+        }
+    }
+    Text {
+        text: "Advanced: [senders] colors in config.toml. Each sender keeps the slot derived from their user ID, so names keep their color in every room; nothing about senders is saved.";
+        color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
     }
 }
 
@@ -1963,6 +2465,20 @@ export component AppWindow inherits Window {
     in-out property <string> account-theme-notice: "";
     in-out property <int> font-scale-percent: 100;
     in-out property <int> density-mode: 1;
+    // Separate room-list and message densities; Rust resolves omitted ones
+    // to density-mode.
+    in-out property <int> room-density-mode: 1;
+    in-out property <int> message-density-mode: 1;
+    // 0 right, 1 left of the conversation.
+    in-out property <int> details-side: 0;
+    in-out property <bool> direct-messages-first: false;
+    // -1 when the pane follows density-mode, else that pane's own density.
+    in-out property <int> room-density-choice: -1;
+    in-out property <int> message-density-choice: -1;
+    callback choose-details-side(int);
+    callback set-direct-messages-first(bool);
+    // Pane 0 room list or 1 messages; density -1 follows, 0 to 2 overrides.
+    callback choose-pane-density(int, int);
     in-out property <bool> sort-unread-first: false;
     in-out property <bool> notifications-enabled: true;
     in-out property <bool> notification-sounds: true;
@@ -2043,11 +2559,49 @@ export component AppWindow inherits Window {
     callback color-reset();
     callback color-undo();
     callback color-reset-all();
+    // 0 edits the colors for all accounts, 1 the active account's own.
+    in-out property <int> color-scope: 0;
+    callback color-scope-chosen(int);
     in-out property <int> window-opacity-percent: 100;
     in-out property <int> window-opacity-revision: 0;
     in-out property <string> window-transparency-status;
     callback preview-window-opacity(int);
     callback set-window-opacity(int);
+
+    // Typography and geometry workspace: one selected registry metric.
+    in-out property <[MetricGroupItem]> metric-groups;
+    in-out property <[MetricItem]> metric-items;
+    in-out property <int> metric-group-index: 0;
+    in-out property <string> metric-filter;
+    in-out property <string> metric-selected-key;
+    in-out property <MetricEditorState> metric-editor;
+    in-out property <string> metric-value-input;
+    in-out property <string> metric-reset-all-notice;
+    in-out property <int> metric-override-count: 0;
+    callback metric-filter-changed(string);
+    callback metric-group-chosen(int);
+    callback metric-chosen(string);
+    // -1 or 1: one registry step down or up from the value in the file.
+    callback metric-step(int);
+    callback metric-value-edited(string);
+    callback metric-value-accepted(string);
+    callback metric-reset();
+    callback metric-undo();
+    callback metric-reset-all();
+
+    // Sender-name palette in config.toml; each sender keeps a stable slot.
+    in-out property <[SenderColorRow]> sender-color-rows;
+    in-out property <string> sender-palette-source;
+    in-out property <bool> sender-palette-custom: false;
+    in-out property <bool> sender-palette-can-undo: false;
+    in-out property <string> sender-palette-hint;
+    callback sender-color-edited(int, string);
+    // Slot, then -1 to move it earlier or 1 to move it later.
+    callback sender-color-move(int, int);
+    callback sender-color-remove(int);
+    callback sender-color-add();
+    callback sender-colors-reset();
+    callback sender-colors-undo();
 
     // Empty alternate clocks identify delivery status or a row with no clock.
     // Keep those labels unchanged even when clocks are hidden or decorated.
@@ -2082,7 +2636,7 @@ export component AppWindow inherits Window {
     }
     public pure function row-surface(selected: bool, hovered: bool, own: bool, idle: color) -> color {
         return selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover)
-            : hovered ? root.elevated
+            : hovered ? root.message-hover-surface
             : own && StyleTokens.roles.own-surface.present ? StyleTokens.roles.own-surface.color : idle;
     }
 
@@ -2630,8 +3184,20 @@ export component AppWindow inherits Window {
     property <bool> light-palette: root.theme-mode == 1 || (root.theme-mode == 3 && Palette.color-scheme == ColorScheme.light);
     property <float> text-scale: root.font-scale-percent / 100.0;
     property <length> message-font-px: root.message-font-size * 1px * root.text-scale;
-    property <length> message-row-gap: root.message-gap-px * 1px * (root.density-mode == 0 ? 0.5 : root.density-mode == 2 ? 1.333 : 1);
+    property <length> message-row-gap: root.message-gap-px * 1px * (root.message-density-mode == 0 ? 0.5 : root.message-density-mode == 2 ? 1.333 : 1);
     property <length> content-inset: root.content-padding-px * 1px;
+    // Typography metrics as scaled logical pixels. A zero sender size keeps
+    // each layout's message-based name size.
+    property <length> sender-font-px: StyleTokens.sender-font-size * root.text-scale;
+    property <length> timestamp-font-px: StyleTokens.timestamp-font-size * root.text-scale;
+    property <length> composer-font-px: StyleTokens.composer-font-size > 0px ? StyleTokens.composer-font-size * root.text-scale : root.message-font-px;
+    // The tallest name or message text in a timeline header.
+    property <length> header-font-px: max(root.message-font-px, root.sender-font-px);
+    // The room composer box fits its text and its default-size icon buttons
+    // inside the fixed 11 px vertical padding; the thread composer's row has
+    // 8 px. Both equal their built-in heights at the default metrics.
+    property <length> composer-box-height: max(58px, 1.5 * root.composer-font-px + 28px, StyleTokens.icon-button-size + 22px);
+    property <length> thread-composer-height: max(64px, 1.5 * root.composer-font-px + 24px, StyleTokens.icon-button-size + 16px);
 
     property <color> rail: StyleTokens.base.rail.present ? StyleTokens.base.rail.color : custom-theme-active ? custom-rail : light-palette ? #e7ebf3 : theme-mode == 2 ? #000000 : #10131b;
     property <color> sidebar: StyleTokens.base.sidebar.present ? StyleTokens.base.sidebar.color : custom-theme-active ? custom-sidebar : light-palette ? #f1f3f8 : theme-mode == 2 ? #101010 : #171b26;
@@ -2648,6 +3214,20 @@ export component AppWindow inherits Window {
     // alpha is scaled and the window's background is cleared, so the desktop
     // shows through only these panes; text, icons, inputs, cards, popups,
     // sign-in and dialogs keep their own colors. At 100% nothing changes.
+    // Interaction states. Each unset state follows the color its registry
+    // entry names, so the built-in look is unchanged until a theme or
+    // config.toml sets it.
+    property <color> message-hover-surface: StyleTokens.states.message-hover.present ? StyleTokens.states.message-hover.color : root.elevated;
+    property <color> composer-surface: StyleTokens.states.composer-surface.present ? StyleTokens.states.composer-surface.color : root.elevated;
+    property <color> composer-border: StyleTokens.states.composer-border.present ? StyleTokens.states.composer-border.color : root.divider;
+    property <color> composer-focus-border: StyleTokens.states.composer-focus.present ? StyleTokens.states.composer-focus.color : root.composer-border;
+    property <color> icon-ink: StyleTokens.states.icon.present ? StyleTokens.states.icon.color : root.muted;
+    property <color> icon-active-ink: StyleTokens.states.icon-active.present ? StyleTokens.states.icon-active.color : root.accent;
+    property <color> input-border-color: StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.divider;
+    property <color> mention-badge: StyleTokens.states.mention.present ? StyleTokens.states.mention.color
+        : StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483;
+    property <color> mention-badge-ink: StyleTokens.states.mention-ink.present ? StyleTokens.states.mention-ink.color
+        : StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b;
     // The color each registry token shows now, for swatches and the editor.
     // A role without a value shows the built-in color it falls back to.
     public pure function token-color(id: string) -> color {
@@ -2691,6 +3271,28 @@ export component AppWindow inherits Window {
         if id == "presence_online" { return StyleTokens.roles.presence-online.present ? StyleTokens.roles.presence-online.color : #64c9a7; }
         if id == "voice" { return StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1; }
         if id == "avatar_ink" { return StyleTokens.roles.avatar-ink.present ? StyleTokens.roles.avatar-ink.color : #ffffff; }
+        if id == "message_hover" { return root.message-hover-surface; }
+        if id == "control_hover" { return StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover; }
+        if id == "control_pressed" { return StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent; }
+        if id == "control_disabled" { return StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.muted; }
+        if id == "input_surface" { return StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated; }
+        if id == "input_border" { return root.input-border-color; }
+        if id == "composer_surface" { return root.composer-surface; }
+        if id == "composer_border" { return root.composer-border; }
+        if id == "composer_focus" { return root.composer-focus-border; }
+        if id == "icon" { return root.icon-ink; }
+        if id == "icon_active" { return root.icon-active-ink; }
+        if id == "nav_hover" { return StyleTokens.states.nav-hover.present ? StyleTokens.states.nav-hover.color : root.elevated; }
+        if id == "nav_selected" {
+            return StyleTokens.states.nav-selected.present ? StyleTokens.states.nav-selected.color
+                : StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover;
+        }
+        if id == "nav_selected_ink" {
+            return StyleTokens.states.nav-selected-ink.present ? StyleTokens.states.nav-selected-ink.color
+                : StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+        }
+        if id == "mention" { return root.mention-badge; }
+        if id == "mention_ink" { return root.mention-badge-ink; }
         return transparent;
     }
     // Whether `token-color` knows the ID; the registry coverage test uses it.
@@ -2703,7 +3305,12 @@ export component AppWindow inherits Window {
             || id == "unread" || id == "unread_ink" || id == "selection_ink" || id == "error"
             || id == "error_surface" || id == "error_ink" || id == "success" || id == "success_surface"
             || id == "success_ink" || id == "destructive" || id == "destructive_ink"
-            || id == "presence_online" || id == "voice" || id == "avatar_ink";
+            || id == "presence_online" || id == "voice" || id == "avatar_ink"
+            || id == "message_hover" || id == "control_hover" || id == "control_pressed"
+            || id == "control_disabled" || id == "input_surface" || id == "input_border"
+            || id == "composer_surface" || id == "composer_border" || id == "composer_focus"
+            || id == "icon" || id == "icon_active" || id == "nav_hover" || id == "nav_selected"
+            || id == "nav_selected_ink" || id == "mention" || id == "mention_ink";
     }
     // Any pane color with its own alpha also clears the window background, so
     // each pane is painted exactly once at every opacity, including 100%.
@@ -2763,7 +3370,7 @@ export component AppWindow inherits Window {
                     icon: "⌂";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:home", focused); }
                     label: "Home and all rooms";
-                    ink: root.page == 0 && root.active-space-id == "" ? root.accent : root.muted;
+                    ink: root.page == 0 && root.active-space-id == "" ? root.icon-active-ink : root.icon-ink;
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 0 && root.active-space-id == "";
@@ -2780,7 +3387,10 @@ export component AppWindow inherits Window {
                             height: root.show-space-labels ? 52px + 14px * root.text-scale : 48px;
                             focus-state-changed(focused) => { root.navigation-focus-changed(0, "space:" + space.id, focused); }
                             border-radius: StyleTokens.radius * 1.2;
-                            background: root.active-space-id == space.id && root.page == 0 ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : transparent;
+                            background: root.active-space-id == space.id && root.page == 0
+                                ? (StyleTokens.states.nav-selected.present ? StyleTokens.states.nav-selected.color : StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover)
+                                : self.has-pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+                                : self.has-hover ? (StyleTokens.states.nav-hover.present ? StyleTokens.states.nav-hover.color : root.hover) : transparent;
                             focus-color: root.accent;
                             label: "Select space " + space.name;
                             activated => {
@@ -2798,7 +3408,9 @@ export component AppWindow inherits Window {
                             if root.show-space-labels : Text {
                                 x: 2px; y: 48px; width: parent.width - 4px; height: 14px * root.text-scale;
                                 text: space.name; font-size: 10px * root.text-scale; overflow: elide;
-                                color: root.active-space-id == space.id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted;
+                                color: root.active-space-id != space.id || root.page != 0 ? root.muted
+                                    : StyleTokens.states.nav-selected-ink.present ? StyleTokens.states.nav-selected-ink.color
+                                    : StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted;
                                 horizontal-alignment: center; accessible-label: space.name;
                             }
                         }
@@ -2811,7 +3423,7 @@ export component AppWindow inherits Window {
                     icon: "S";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:discover", focused); }
                     label: "Explore public Matrix rooms";
-                    ink: root.page == 3 ? root.accent : root.muted;
+                    ink: root.page == 3 ? root.icon-active-ink : root.icon-ink;
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 3;
@@ -2823,7 +3435,7 @@ export component AppWindow inherits Window {
                     icon: "C";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:calls", focused); }
                     label: "Open call stage";
-                    ink: root.page == 2 ? root.accent : root.muted;
+                    ink: root.page == 2 ? root.icon-active-ink : root.icon-ink;
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 2;
@@ -2835,7 +3447,7 @@ export component AppWindow inherits Window {
                     icon: "⚙";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:settings", focused); }
                     label: "Open settings";
-                    ink: root.page == 1 ? root.accent : root.muted;
+                    ink: root.page == 1 ? root.icon-active-ink : root.icon-ink;
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 1;
@@ -2874,7 +3486,7 @@ export component AppWindow inherits Window {
                             height: 34px;
                             icon: "+";
                             label: "Create or join a Matrix room";
-                            ink: root.muted; surface: transparent; hover-surface: root.hover;
+                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             activated => {
                                 root.room-action-mode = 0;
                                 root.room-action-input = "";
@@ -2957,13 +3569,13 @@ export component AppWindow inherits Window {
                             vertical-alignment: bottom;
                         }
                         Rectangle {
-                            height: 30px;
+                            height: max(30px, 30px + (StyleTokens.sidebar-font-size - 13px) * root.text-scale);
                             background: transparent;
                             Text {
                                 x: 8px;
                                 text: "v   " + (root.active-space-id == "" ? "Home" : root.active-space-name);
                                 color: root.ink;
-                                font-size: 13px * root.text-scale;
+                                font-size: StyleTokens.sidebar-font-size * root.text-scale;
                                 font-weight: 650;
                                 vertical-alignment: center;
                             }
@@ -3017,28 +3629,56 @@ export component AppWindow inherits Window {
                         }
                         if root.group-direct-messages : VerticalLayout {
                             spacing: 3px; alignment: start; vertical-stretch: 0;
+                            // Direct messages first, when chosen; keyboard order follows.
+                            if root.direct-messages-first : Text {
+                                text: "DIRECT MESSAGES"; color: root.muted; font-size: 10px * root.text-scale;
+                                font-weight: 750; letter-spacing: 1px; height: 29px; vertical-alignment: bottom;
+                            }
+                            if root.direct-messages-first : VerticalLayout {
+                                spacing: 3px; alignment: start;
+                                for dm in root.direct-messages : NavigationRoomRow {
+                                    room: dm; direct: true;
+                                    selected: dm.id == root.active-room-id && root.page == 0;
+                                    density-mode: root.room-density-mode; text-scale: root.text-scale;
+                                    ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                    mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
+                                    open(id, voice) => {
+                                        if voice && root.live-session { root.open-voice-space(id); }
+                                        else { root.page = 0; root.open-room(id); }
+                                    }
+                                }
+                            }
+                            if root.direct-messages-first : Text {
+                                text: "ROOMS"; color: root.muted; font-size: 10px * root.text-scale;
+                                font-weight: 750; letter-spacing: 1px; height: 40px; vertical-alignment: bottom;
+                            }
                             for channel in root.channels : NavigationRoomRow {
                                 room: channel; direct: false;
                                 selected: channel.id == root.active-room-id && root.page == 0;
-                                density-mode: root.density-mode; text-scale: root.text-scale;
+                                density-mode: root.room-density-mode; text-scale: root.text-scale;
                                 ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
                                 open(id, voice) => {
                                     if voice && root.live-session { root.open-voice-space(id); }
                                     else { root.page = 0; root.open-room(id); }
                                 }
                             }
-                            Text {
+                            if !root.direct-messages-first : Text {
                                 text: "DIRECT MESSAGES"; color: root.muted; font-size: 10px * root.text-scale;
                                 font-weight: 750; letter-spacing: 1px; height: 40px; vertical-alignment: bottom;
                             }
-                            for dm in root.direct-messages : NavigationRoomRow {
-                                room: dm; direct: true;
-                                selected: dm.id == root.active-room-id && root.page == 0;
-                                density-mode: root.density-mode; text-scale: root.text-scale;
-                                ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
-                                open(id, voice) => {
-                                    if voice && root.live-session { root.open-voice-space(id); }
-                                    else { root.page = 0; root.open-room(id); }
+                            if !root.direct-messages-first : VerticalLayout {
+                                spacing: 3px; alignment: start;
+                                for dm in root.direct-messages : NavigationRoomRow {
+                                    room: dm; direct: true;
+                                    selected: dm.id == root.active-room-id && root.page == 0;
+                                    density-mode: root.room-density-mode; text-scale: root.text-scale;
+                                    ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                    mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
+                                    open(id, voice) => {
+                                        if voice && root.live-session { root.open-voice-space(id); }
+                                        else { root.page = 0; root.open-room(id); }
+                                    }
                                 }
                             }
                         }
@@ -3047,8 +3687,9 @@ export component AppWindow inherits Window {
                             for entry in root.combined-rooms : NavigationRoomRow {
                                 room: entry.room; direct: entry.direct;
                                 selected: entry.room.id == root.active-room-id && root.page == 0;
-                                density-mode: root.density-mode; text-scale: root.text-scale;
+                                density-mode: root.room-density-mode; text-scale: root.text-scale;
                                 ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
                                 open(id, voice) => {
                                     if voice && root.live-session { root.open-voice-space(id); }
                                     else { root.page = 0; root.open-room(id); }
@@ -3097,6 +3738,11 @@ export component AppWindow inherits Window {
                 drop-shadow-color: StyleTokens.roles.shadow.present ? StyleTokens.roles.shadow.color : #00000044;
                 drop-shadow-blur: 18px;
                 drop-shadow-offset-y: 7px;
+                // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
+                property <bool> entered: false;
+                init => { self.entered = true; }
+                opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
+                animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
                 VerticalLayout {
                     padding: 8px;
                     spacing: 2px;
@@ -3146,7 +3792,7 @@ export component AppWindow inherits Window {
                             padding-top: 6px;
                             padding-bottom: 6px;
                             spacing: 9px;
-                            VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; border-radius: StyleTokens.radius * 1.0; initials: account.initials; accent: account.accent; } }
+                            VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; built-in-radius: StyleTokens.radius * 1.0; initials: account.initials; accent: account.accent; } }
                             VerticalLayout {
                                 alignment: center;
                                 spacing: 1px;
@@ -3215,17 +3861,29 @@ export component AppWindow inherits Window {
             }
         }
 
-        // Conversation, settings, and call stage share the main canvas.
-        Rectangle {
+        // The conversation and the details panel share this area, which only
+        // the layout sizes. Both are placed over it below, so the panel can
+        // sit on either side while tab and reading order stay the same.
+        main-area := Rectangle {
             horizontal-stretch: 1;
             // Match the independent conversation minimum used by the Window.
             // Long room content must not push the fixed details pane offscreen.
-            min-width: 360px;
+            min-width: 360px + self.panel-width;
+            property <length> panel-width: root.show-side-panel && root.page == 0 ? root.details-width * 1px : 0px;
+        }
+    }
+
+        // Conversation, settings, and call stage share the main canvas.
+        Rectangle {
+            x: main-area.x + (root.details-side == 1 ? main-area.panel-width : 0px);
+            y: main-area.y;
+            width: main-area.width - main-area.panel-width;
+            height: main-area.height;
             background: root.window-canvas;
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: max(64px, 40px * root.text-scale + 24px);
+                    height: max(64px, 40px * root.text-scale + 24px) + StyleTokens.icon-button-growth;
                     background: transparent;
                     HorizontalLayout {
                         padding-left: 24px;
@@ -3271,9 +3929,9 @@ export component AppWindow inherits Window {
                             overflow: elide;
                         }
                         if root.page == 0 : VerticalLayout {
-                            width: 34px; alignment: center;
+                            width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "⚙"; label: "Edit room settings"; ink: root.muted; surface: transparent; hover-surface: root.hover;
+                            icon: "⚙"; label: "Edit room settings"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
                                 root.open-room-settings();
@@ -3281,26 +3939,26 @@ export component AppWindow inherits Window {
                         }
                         }
                         if root.page == 0 : VerticalLayout {
-                            width: 34px; alignment: center;
+                            width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "S"; label: "Search messages in this room"; ink: root.muted; surface: transparent; hover-surface: root.hover;
+                            icon: "S"; label: "Search messages in this room"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 2;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => { root.show-side-panel = true; root.side-panel-tab = 2; }
                         }
                         }
                         if root.page == 0 : VerticalLayout {
-                            width: 34px; alignment: center;
+                            width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "C"; label: "Open current room call stage"; ink: root.muted; surface: transparent; hover-surface: root.hover;
+                            icon: "C"; label: "Open current room call stage"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             activated => { root.page = 2; }
                         }
                         }
                         if root.page == 0 : VerticalLayout {
-                            width: 34px; alignment: center;
+                            width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
                             icon: "P"; label: root.show-side-panel ? "Hide details panel" : "Show details panel";
-                            ink: root.muted; surface: transparent; hover-surface: root.hover;
+                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel;
                             activated => { root.set-side-panel(!root.show-side-panel); }
                         }
@@ -3529,10 +4187,14 @@ export component AppWindow inherits Window {
                             property <bool> columns: root.message-layout == 2 && self.width >= max(640px, 640px * root.text-scale)
                                 + (self.show-time ? max(0px, (root.timestamp-width-px - 72) * 1px * root.text-scale) : 0px);
                             property <bool> selected-message: root.room-search-selected-event-id != "" && message.event-id == root.room-search-selected-event-id;
-                            property <length> avatar-size: root.message-layout == 0 ? 38px : 26px;
+                            property <length> avatar-size: StyleTokens.message-avatar-size > 0px ? StyleTokens.message-avatar-size : root.message-layout == 0 ? 38px : 26px;
                             property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px);
                             property <length> column-width: self.columns ? min(root.nickname-width-px * 1px, self.width * 0.2) : 0px;
                             property <bool> tight-header: !self.columns && self.body-width < self.action-width + 180px * root.text-scale;
+                            // The tallest header text: name, message size and, when shown, the
+                            // independently sized clock. A narrow row places the 26 px actions
+                            // below this height, so they never cover the name or the time.
+                            property <length> header-height: max(26px, max(root.header-font-px, self.show-time ? root.timestamp-font-px : 0px) * 1.4);
                             property <length> body-width: max(0px, self.width - 2 * root.content-inset
                                 - (root.show-message-avatars ? self.avatar-size + (root.message-layout == 0 ? 10px : 7px) : 0px)
                                 - (self.columns ? self.column-width + 7px + (message-row.show-time ? root.timestamp-width-px * 1px * root.text-scale + 7px : 0px) : 0px));
@@ -3546,19 +4208,20 @@ export component AppWindow inherits Window {
                                 cross-axis-alignment: start;
                                 if root.show-message-avatars : AvatarBadge {
                                     width: message-row.avatar-size; height: message-row.avatar-size;
-                                    border-radius: StyleTokens.radius * 1.3;
+                                    // Initials grow with a configured avatar size only.
+                                    initials-size: StyleTokens.message-avatar-size > 0px ? max(9px, self.height * 0.32) : 12px;
                                     initials: message.initials; accent: message.accent;
                                 }
                                 if message-row.columns && message-row.show-time : Text {
                                     width: root.timestamp-width-px * 1px * root.text-scale; text: message-row.time-label;
                                     color: root.clock-ink(message-row.selected-message); font-family: root.monospace-font-family;
-                                    font-size: 10px * root.text-scale; overflow: elide;
+                                    font-size: root.timestamp-font-px; overflow: elide;
                                     accessible-label: message-row.time-label;
                                 }
                                 if message-row.columns : Text {
                                     width: message-row.column-width; text: root.nickname-column-label(message.sender);
                                     color: root.sender-ink(message-row.selected-message, message.is-own, message.sender-palette-index, message.accent);
-                                    font-family: root.message-font-family; font-size: root.message-font-px;
+                                    font-family: root.message-font-family; font-size: root.sender-font-px > 0px ? root.sender-font-px : root.message-font-px;
                                     font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650;
                                     horizontal-alignment: root.nickname-alignment == 0 ? TextHorizontalAlignment.left : TextHorizontalAlignment.right; overflow: elide;
                                     accessible-label: message.sender;
@@ -3568,13 +4231,13 @@ export component AppWindow inherits Window {
                                     spacing: root.message-layout == 0 ? 5px : 2px;
                                     padding-right: message-row.columns ? message-row.action-width + 8px : 0px;
                                     if !message-row.columns : HorizontalLayout {
-                                        min-height: message-row.tight-header ? max(26px, root.message-font-px * 1.4) + 26px : max(26px, root.message-font-px * 1.4);
+                                        min-height: message-row.tight-header ? message-row.header-height + 26px : message-row.header-height;
                                         padding-right: message-row.tight-header ? 0px : message-row.action-width + 8px;
                                         spacing: 8px;
                                         if message-row.tight-header : Text {
                                             text: message.sender;
                                             color: root.sender-ink(message-row.selected-message, message.is-own, message.sender-palette-index, message.accent);
-                                            font-family: root.message-font-family; font-size: root.message-font-px;
+                                            font-family: root.message-font-family; font-size: root.sender-font-px > 0px ? root.sender-font-px : root.message-font-px;
                                             font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650; overflow: elide; vertical-alignment: top;
                                             horizontal-stretch: 0; min-width: 0px;
                                             accessible-label: message.sender;
@@ -3583,20 +4246,20 @@ export component AppWindow inherits Window {
                                         // failed delivery status beside the name on narrow rows.
                                         if message-row.tight-header && message-row.show-time && message-row.time-label != "" : Text {
                                             text: "· " + message-row.time-label; color: root.clock-ink(message-row.selected-message);
-                                            font-family: root.monospace-font-family; font-size: 10px * root.text-scale; vertical-alignment: top;
+                                            font-family: root.monospace-font-family; font-size: root.timestamp-font-px; vertical-alignment: top;
                                             horizontal-stretch: 0; accessible-label: message-row.time-label;
                                         }
                                         if !message-row.tight-header : Text {
                                             text: message.sender; color: root.sender-ink(message-row.selected-message, message.is-own, message.sender-palette-index, message.accent);
                                             font-family: root.message-font-family;
-                                            font-size: root.message-layout == 0 ? root.message-font-px : max(10px, root.message-font-px - 2px);
+                                            font-size: root.sender-font-px > 0px ? root.sender-font-px : root.message-layout == 0 ? root.message-font-px : max(10px, root.message-font-px - 2px);
                                             font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650; overflow: elide;
                                             horizontal-stretch: 0; min-width: 0px;
                                             accessible-label: message.sender;
                                         }
                                         if !message-row.tight-header && message-row.show-time : Text {
                                             text: message-row.time-label; color: root.clock-ink(message-row.selected-message); font-family: root.monospace-font-family;
-                                            font-size: 10px * root.text-scale; vertical-alignment: center;
+                                            font-size: root.timestamp-font-px; vertical-alignment: center;
                                             horizontal-stretch: 0;
                                         }
                                         // Keep author and time adjacent; the spare width follows
@@ -3626,7 +4289,7 @@ export component AppWindow inherits Window {
                                     if message.attachment-is-image && message.event-id != "" : ActionRect {
                                         height: 67px; border-radius: StyleTokens.radius * 1;
                                         background: self.has-hover ? root.hover : root.elevated;
-                                        border-width: 1px; border-color: root.divider; focus-color: root.accent;
+                                        border-width: StyleTokens.line-width; border-color: root.divider; focus-color: root.accent;
                                         label: "Preview image " + message.attachment;
                                         enabled: root.live-session;
                                         activated => { root.preview-image-attachment(message.event-id, message.attachment); }
@@ -3643,10 +4306,10 @@ export component AppWindow inherits Window {
                                     }
                                     if message.attachment != "" : Rectangle {
                                         width: min(440px, max(0px, message-content.width - (message-row.columns ? message-row.action-width + 8px : 0px)));
-                                        height: 58px;
+                                        height: 58px + StyleTokens.icon-button-growth;
                                         border-radius: StyleTokens.radius * 0.9;
                                         border-color: root.divider;
-                                        border-width: 1px;
+                                        border-width: StyleTokens.line-width;
                                         background: root.panel;
                                         HorizontalLayout {
                                             padding-left: 12px;
@@ -3661,7 +4324,7 @@ export component AppWindow inherits Window {
                                             IconAction {
                                                 icon: "↓";
                                                 label: "Save attachment " + message.attachment;
-                                                ink: root.accent; surface: transparent; hover-surface: root.hover;
+                                                ink: root.icon-active-ink; surface: transparent; hover-surface: root.hover;
                                                 enabled: root.live-session && message.event-id != "" && root.downloading-event-id == "";
                                                 activated => { root.save-attachment(message.event-id, message.attachment); }
                                             }
@@ -3672,7 +4335,7 @@ export component AppWindow inherits Window {
                                         height: max(24px, 16px * root.text-scale + 6px);
                                         border-radius: StyleTokens.radius * 0.8;
                                         border-color: root.divider;
-                                        border-width: 1px;
+                                        border-width: StyleTokens.line-width;
                                         background: root.panel;
                                         reaction-label := Text { text: message.reaction; color: root.ink; font-size: 11px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                                     }
@@ -3682,12 +4345,12 @@ export component AppWindow inherits Window {
                             // paths. Reserve their width in the header/column body before overlaying.
                             HorizontalLayout {
                                 x: parent.width - root.content-inset - message-row.action-width;
-                                y: root.message-row-gap + (message-row.tight-header ? max(26px, root.message-font-px * 1.4) : 0px); width: message-row.action-width; height: 26px;
+                                y: root.message-row-gap + (message-row.tight-header ? message-row.header-height : 0px); width: message-row.action-width; height: 26px;
                                 spacing: 8px; alignment: end;
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "↩"; label: "Reply to " + message.sender;
-                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         if !root.composer-busy { root.begin-compose(1, message.event-id, message.sender, "", false); }
                                         message-input.focus();
@@ -3696,7 +4359,7 @@ export component AppWindow inherits Window {
                                 if message.event-id != "" && message.is-own && message.attachment == "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
-                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         if !root.composer-busy { root.begin-compose(2, message.event-id, message.sender, message.edit-source, message.edit-markdown); }
                                         message-input.focus();
@@ -3705,13 +4368,13 @@ export component AppWindow inherits Window {
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "♥"; label: "Toggle heart reaction";
-                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     activated => { root.toggle-message-reaction(message.event-id, "❤️"); }
                                 }
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "☷"; label: "Open thread for " + message.sender;
-                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         root.thread-root-id = message.event-id;
                                         root.thread-root-sender = message.sender;
@@ -3732,7 +4395,7 @@ export component AppWindow inherits Window {
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "⌫"; label: "Redact message from " + message.sender;
-                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     enabled: root.live-session && !root.room-admin-busy;
                                     activated => {
                                         root.room-admin-mode = 2;
@@ -3750,7 +4413,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle {
                         property <length> status-height: root.composer-status-visible ? composer-status.height + 10px : 0px;
-                        height: (root.composer-mode == 0 ? max(78px, 1.5 * root.message-font-px + 48px) : max(109px, 1.5 * root.message-font-px + 79px)) + (root.attachment-busy ? 29px : 0px) + self.status-height;
+                        height: root.composer-box-height + (root.composer-mode == 0 ? 20px : 51px) + (root.attachment-busy ? 29px : 0px) + self.status-height;
                         background: transparent;
                         composer-status := PendingSendStrip {
                             x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + (root.attachment-busy ? 29px : 0px);
@@ -3781,12 +4444,12 @@ export component AppWindow inherits Window {
                             }
                             if root.attachment-needs-retry : IconAction {
                                 width: 27px; height: 26px; icon: "↻"; label: "Retry queued attachment";
-                                ink: root.accent; surface: transparent; hover-surface: root.hover;
+                                ink: root.icon-active-ink; surface: transparent; hover-surface: root.hover;
                                 activated => { root.retry-attachment(); }
                             }
                             IconAction {
                                 width: 27px; height: 26px; icon: "×"; label: "Cancel attachment upload";
-                                ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                 activated => { root.cancel-attachment(); }
                             }
                         }
@@ -3798,7 +4461,7 @@ export component AppWindow inherits Window {
                             }
                             IconAction {
                                 width: 26px; height: 25px; icon: "×"; label: "Cancel reply or edit";
-                                ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                 activated => {
                                     if !root.composer-busy { root.cancel-compose(); }
                                 }
@@ -3808,25 +4471,25 @@ export component AppWindow inherits Window {
                             x: root.content-inset;
                             y: (root.composer-mode == 0 ? 7px : 38px) + (root.attachment-busy ? 29px : 0px) + parent.status-height;
                             width: max(0px, parent.width - 2 * root.content-inset);
-                            height: max(58px, 1.5 * root.message-font-px + 28px);
-                            border-radius: StyleTokens.radius * 1.1;
-                            border-color: root.divider;
-                            border-width: 1px;
-                            background: root.elevated;
+                            height: root.composer-box-height;
+                            border-radius: StyleTokens.composer-radius >= 0px ? StyleTokens.composer-radius : StyleTokens.radius * 1.1;
+                            border-color: message-input.has-focus ? root.composer-focus-border : root.composer-border;
+                            border-width: StyleTokens.line-width;
+                            background: root.composer-surface;
                             HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 10px;
+                                padding-left: StyleTokens.composer-padding;
+                                padding-right: StyleTokens.composer-padding;
                                 padding-top: 11px;
                                 padding-bottom: 11px;
                                 spacing: 6px;
                                 IconAction {
-                                    icon: "+"; label: "Attach file"; ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    icon: "+"; label: "Attach file"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     enabled: root.live-session && root.active-room-id != "" && root.composer-mode == 0 && !root.attachment-busy;
                                     activated => { root.attach-file(); }
                                 }
                                 IconAction {
                                     width: 32px; icon: "☺"; label: "Open emoji picker for message";
-                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     enabled: root.mention-ui-allowed && !root.composer-busy;
                                     activated => {
                                         if root.sticker-open { root.sticker-dismiss(); }
@@ -3836,7 +4499,7 @@ export component AppWindow inherits Window {
                                 }
                                 IconAction {
                                     width: 32px; icon: "✿"; label: "Open sticker picker for this room";
-                                    ink: root.sticker-open && !root.sticker-threaded ? root.accent : root.muted;
+                                    ink: root.sticker-open && !root.sticker-threaded ? root.icon-active-ink : root.icon-ink;
                                     selected: root.sticker-open && !root.sticker-threaded;
                                     surface: transparent; hover-surface: root.hover;
                                     enabled: root.mention-ui-allowed && !root.composer-busy && root.composer-mode == 0 && root.active-room-id != "";
@@ -3850,7 +4513,7 @@ export component AppWindow inherits Window {
                                     icon: "Md";
                                     label: root.composer-markdown ? "Clear Markdown formatting" : "Use Markdown formatting";
                                     selected: root.composer-markdown;
-                                    ink: root.composer-markdown ? root.accent : root.muted;
+                                    ink: root.composer-markdown ? root.icon-active-ink : root.icon-ink;
                                     surface: transparent; hover-surface: root.hover;
                                     enabled: root.active-room-id != "" && !root.composer-busy;
                                     activated => {
@@ -3867,7 +4530,7 @@ export component AppWindow inherits Window {
                                         x: 3px;
                                         text: root.composer-mode == 1 ? "Write a reply" : root.composer-mode == 2 ? "Edit your message" : "Message #" + root.active-room-name;
                                         color: root.muted;
-                                        font-size: 13px * root.text-scale;
+                                        font-size: StyleTokens.composer-font-size > 0px ? root.composer-font-px : 13px * root.text-scale;
                                         vertical-alignment: center;
                                     }
                                     message-input := MentionInput {
@@ -3877,7 +4540,7 @@ export component AppWindow inherits Window {
                                         height: parent.height;
                                         text <=> root.composer-text;
                                         color: root.ink;
-                                        font-size: root.message-font-px;
+                                        font-size: root.composer-font-px;
                                         vertical-alignment: center;
                                         accessible-label: root.composer-mode == 1 ? "Reply to " + root.composer-target-label : root.composer-mode == 2 ? "Edit your message" : "Message composer for " + root.active-room-name;
                                         caret-changed => { root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing); }
@@ -3906,7 +4569,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 IconAction {
-                                    icon: "➤"; label: root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.accent;
+                                    icon: "➤"; label: root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.icon-active-ink;
                                     surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
@@ -3988,14 +4651,14 @@ export component AppWindow inherits Window {
                         height: 39px; spacing: 8px;
                         Rectangle {
                             horizontal-stretch: 2; height: 39px;
-                            background: root.elevated; border-radius: StyleTokens.radius * 0.8;
+                            background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
                             if root.directory-search == "" : Text {
-                                x: 10px; width: parent.width - 20px; height: parent.height;
+                                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
                                 text: "Room name or topic"; color: root.muted;
                                 font-size: 12px * root.text-scale; vertical-alignment: center;
                             }
                             directory-search-input := ThemedTextInput {
-                                x: 10px; y: 2px; width: parent.width - 20px; height: parent.height - 4px;
+                                x: StyleTokens.input-padding; y: 2px; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height - 4px;
                                 text <=> root.directory-search;
                                 color: root.ink; font-size: 13px * root.text-scale;
                                 enabled: root.live-session && !root.directory-loading;
@@ -4005,14 +4668,14 @@ export component AppWindow inherits Window {
                         }
                         Rectangle {
                             width: 190px; height: 39px;
-                            background: root.elevated; border-radius: StyleTokens.radius * 0.8;
+                            background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
                             if root.directory-server == "" : Text {
-                                x: 10px; width: parent.width - 20px; height: parent.height;
+                                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
                                 text: "Server (optional)"; color: root.muted;
                                 font-size: 12px * root.text-scale; vertical-alignment: center;
                             }
                             ThemedTextInput {
-                                x: 10px; y: 2px; width: parent.width - 20px; height: parent.height - 4px;
+                                x: StyleTokens.input-padding; y: 2px; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height - 4px;
                                 text <=> root.directory-server;
                                 color: root.ink; font-size: 12px * root.text-scale;
                                 enabled: root.live-session && !root.directory-loading;
@@ -4042,14 +4705,14 @@ export component AppWindow inherits Window {
                         height: 39px; spacing: 8px;
                         Rectangle {
                             horizontal-stretch: 1; height: 39px;
-                            background: root.elevated; border-radius: StyleTokens.radius * 0.8;
+                            background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
                             if root.directory-join-input == "" : Text {
-                                x: 10px; width: parent.width - 20px; height: parent.height;
+                                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
                                 text: "#room:server or matrix.to link"; color: root.muted;
                                 font-size: 12px * root.text-scale; vertical-alignment: center;
                             }
                             ThemedTextInput {
-                                x: 10px; y: 2px; width: parent.width - 20px; height: parent.height - 4px;
+                                x: StyleTokens.input-padding; y: 2px; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height - 4px;
                                 text <=> root.directory-join-input;
                                 color: root.ink; font-size: 12px * root.text-scale;
                                 enabled: root.live-session && !root.directory-join-busy;
@@ -4263,6 +4926,23 @@ export component AppWindow inherits Window {
                             text: "Choose a color, then type #RRGGBB or #RRGGBBAA, with alpha last. A valid value applies and saves at once; Reset returns one color to its theme or built-in value. Your colors stay when you choose a starting point.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
+                        HorizontalLayout {
+                            spacing: 8px; alignment: start;
+                            for scope[index] in ["All accounts", "This account"] : TextAction {
+                                height: 36px * root.text-scale; vertical-stretch: 0;
+                                enabled: index == 0 || root.active-account-local-id != "";
+                                text: scope;
+                                label: "Edit colors for " + (index == 0 ? "all accounts" : "this account only") + (root.color-scope == index ? ", selected" : "");
+                                ink: root.ink; muted: root.muted; surface: root.color-scope == index ? root.hover : root.elevated;
+                                hover-surface: root.hover; outline: root.color-scope == index ? root.accent : root.divider; text-scale: root.text-scale;
+                                activated => { root.color-scope-chosen(index); }
+                            }
+                        }
+                        if root.color-scope == 1 : Text {
+                            text: "Colors you set now apply only while this account is active, over the colors for all accounts. Removing the account removes them.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
                         color-workspace := Rectangle {
                             // Side by side when there is room; stacked at narrow widths or large text.
                             property <bool> wide: self.width >= 620px * root.text-scale;
@@ -4330,6 +5010,47 @@ export component AppWindow inherits Window {
                                 reset => { root.color-reset(); }
                                 undo => { root.color-undo(); }
                                 reset-all => { root.color-reset-all(); }
+                            }
+                        }
+                        Text { text: "Sender name colors"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        Text {
+                            text: "Used when Colored sender names is on. Each sender keeps the same slot everywhere. Edit a value, reorder or remove colors; your palette replaces the theme's and stays when you choose a starting point.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
+                        sender-palette-card := Rectangle {
+                            height: sender-palette.preferred-height + 24px;
+                            background: root.elevated;
+                            border-radius: StyleTokens.radius;
+                            sender-palette := SenderPaletteEditor {
+                                property <int> reveal-request: root.reveal-request("appearance.sender_colors");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.sender_colors"; }
+                                    }
+                                }
+                                x: 12px; y: 12px; width: parent.width - 24px;
+                                rows: root.sender-color-rows;
+                                source: root.sender-palette-source;
+                                custom: root.sender-palette-custom;
+                                can-undo: root.sender-palette-can-undo;
+                                hint: root.sender-palette-hint;
+                                ink: root.ink; muted: root.muted; surface: root.canvas; hover-surface: root.hover;
+                                accent: root.accent; outline: root.divider; canvas: root.canvas;
+                                sample-font-family: root.message-font-family; text-scale: root.text-scale;
+                                edited(index, text) => { root.sender-color-edited(index, text); }
+                                moved(index, direction) => { root.sender-color-move(index, direction); }
+                                removed(index) => { root.sender-color-remove(index); }
+                                added => { root.sender-color-add(); }
+                                reset => { root.sender-colors-reset(); }
+                                undo => { root.sender-colors-undo(); }
                             }
                         }
                         window-opacity-card := Rectangle {
@@ -4646,6 +5367,80 @@ export component AppWindow inherits Window {
                         StyleNumberSetting { label: "Nickname column width"; value: root.nickname-width-px; minimum: 64; maximum: 240; step: 8;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(5, value); } }
+                        Text { text: "Typography, geometry and motion"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        Text {
+                            text: "Fine-tune one value at a time: text sizes, corners, borders, focus rings, padding, icons, avatars and decorative fades. Values are logical pixels before text scaling, percent or milliseconds; Reduce motion turns every fade off. Use built-in returns a size to the look of your starting point; starting points keep your focus ring width.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
+                        metric-workspace := Rectangle {
+                            // Side by side when there is room; stacked at narrow widths or large text.
+                            property <bool> wide: self.width >= 620px * root.text-scale;
+                            height: self.wide ? max(metric-list-view.preferred-height, metric-value-editor.preferred-height) + 24px
+                                : metric-list-view.preferred-height + metric-value-editor.preferred-height + 36px;
+                            background: root.elevated;
+                            border-radius: StyleTokens.radius;
+                            metric-list-view := MetricList {
+                                property <int> reveal-request: root.reveal-request("appearance.metrics");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.metrics"; }
+                                    }
+                                }
+                                x: 12px; y: 12px;
+                                width: parent.wide ? min(300px * root.text-scale, (parent.width - 36px) * 0.45) : parent.width - 24px;
+                                groups: root.metric-groups; items: root.metric-items;
+                                group-index: root.metric-group-index; selected-key: root.metric-selected-key;
+                                filter <=> root.metric-filter;
+                                ink: root.ink; muted: root.muted; surface: root.canvas; hover-surface: root.hover;
+                                accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                                max-list-height: parent.wide ? max(240px, root.height * 0.5) : max(140px, root.height * 0.24);
+                                filter-edited(text) => { root.metric-filter-changed(text); }
+                                group-chosen(index) => { root.metric-group-chosen(index); }
+                                metric-chosen(key) => { root.metric-chosen(key); metric-value-editor.focus(); }
+                            }
+                            metric-value-editor := MetricValueEditor {
+                                // A metric search result selects its metric first,
+                                // then asks for this field, which reports that result.
+                                property <int> reveal-request: root.reveal-request("appearance.metric_value");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "metric:" + root.metric-selected-key; }
+                                    }
+                                }
+                                x: parent.wide ? metric-list-view.x + metric-list-view.width + 12px : 12px;
+                                y: parent.wide ? 12px : metric-list-view.y + metric-list-view.height + 12px;
+                                width: parent.wide ? parent.width - metric-list-view.width - 36px : parent.width - 24px;
+                                state: root.metric-editor;
+                                value-text <=> root.metric-value-input;
+                                override-count: root.metric-override-count;
+                                reset-all-notice: root.metric-reset-all-notice;
+                                ink: root.ink; muted: root.muted; surface: root.canvas; hover-surface: root.hover;
+                                accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                                step(direction) => { root.metric-step(direction); }
+                                edited(text) => { root.metric-value-edited(text); }
+                                accepted(text) => { root.metric-value-accepted(text); }
+                                restore-input => { root.metric-chosen(root.metric-selected-key); }
+                                reset => { root.metric-reset(); }
+                                undo => { root.metric-undo(); }
+                                reset-all => { root.metric-reset-all(); }
+                            }
+                        }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Base palette for all accounts"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         HorizontalLayout {
@@ -4811,6 +5606,59 @@ export component AppWindow inherits Window {
                             label: root.group-direct-messages ? "Combine rooms and direct messages" : "Group direct messages separately";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                             activated => { root.set-group-direct-messages(!root.group-direct-messages); }
+                        }
+                        TextAction {
+                            property <int> reveal-request: root.reveal-request("layout.composition");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "layout.composition"; }
+                                }
+                            }
+                            height: 36px * root.text-scale; vertical-stretch: 0;
+                            enabled: root.group-direct-messages;
+                            text: root.direct-messages-first ? "Direct messages first: on" : "Direct messages first: off";
+                            label: root.direct-messages-first ? "Show rooms above direct messages" : "Show direct messages above rooms";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.set-direct-messages-first(!root.direct-messages-first); }
+                        }
+                        Text { text: "Details panel side"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                        HorizontalLayout {
+                            spacing: 10px; alignment: start;
+                            for side[index] in ["Right", "Left"] : TextAction {
+                                height: 36px * root.text-scale; vertical-stretch: 0;
+                                text: side; label: "Details panel on the " + side + " of the conversation" + (root.details-side == index ? ", selected" : "");
+                                ink: root.ink; muted: root.muted; surface: root.details-side == index ? root.hover : root.elevated;
+                                hover-surface: root.hover; outline: root.details-side == index ? root.accent : root.divider; text-scale: root.text-scale;
+                                activated => { root.choose-details-side(index); }
+                            }
+                        }
+                        for pane[which] in ["Room list density", "Message density"] : density-row := VerticalLayout {
+                            spacing: 6px; alignment: start;
+                            property <int> choice: which == 0 ? root.room-density-choice : root.message-density-choice;
+                            Text { text: pane; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                            HorizontalLayout {
+                                spacing: 8px; alignment: start;
+                                // -1 follows the global density; 0 to 2 override it.
+                                for option[index] in ["Follow density", "Compact", "Comfortable", "Spacious"] : TextAction {
+                                    height: 36px * root.text-scale; vertical-stretch: 0;
+                                    text: option; label: pane + ": " + option + (density-row.choice == index - 1 ? ", selected" : "");
+                                    ink: root.ink; muted: root.muted; surface: density-row.choice == index - 1 ? root.hover : root.elevated;
+                                    hover-surface: root.hover; outline: density-row.choice == index - 1 ? root.accent : root.divider; text-scale: root.text-scale;
+                                    activated => { root.choose-pane-density(which, index - 1); }
+                                }
+                            }
+                        }
+                        Text {
+                            text: "The details panel can sit on either side; Tab order, the room list and the account control stay where they are. Room list and message density override the global density for one pane each.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
                         Text {
                             text: "Text sidebar moves Home, Spaces and app routes into the room list. Combined conversations use name order, with unread conversations first when enabled. Space labels affect only the icon rail.";
@@ -5010,9 +5858,9 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             height: 38px; spacing: 8px;
                             Rectangle {
-                                horizontal-stretch: 1; background: root.panel; border-radius: 8px; border-color: root.divider; border-width: 1px;
+                                horizontal-stretch: 1; background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.panel; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : 8px; border-color: root.input-border-color; border-width: StyleTokens.line-width;
                                 ThemedTextInput {
-                                    x: 10px; width: parent.width - 20px; height: parent.height;
+                                    x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
                                     text <=> root.notification-highlight-input;
                                     color: root.ink; font-size: 12px * root.text-scale;
                                     property <int> reveal-request: root.reveal-request("notifications.highlights");
@@ -5045,7 +5893,7 @@ export component AppWindow inherits Window {
                             font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
                         }
                         for word in root.notification-highlight-words : Rectangle {
-                            height: 36px; border-radius: 8px; background: root.elevated;
+                            height: 36px + StyleTokens.icon-button-growth; border-radius: 8px; background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 12px; padding-right: 8px; spacing: 8px;
                                 Text { text: word; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
@@ -5235,9 +6083,9 @@ export component AppWindow inherits Window {
                                     HorizontalLayout {
                                         spacing: 8px;
                                         Rectangle {
-                                            height: 38px; horizontal-stretch: 1; background: root.panel; border-radius: 8px; border-color: root.divider; border-width: 1px;
+                                            height: 38px; horizontal-stretch: 1; background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.panel; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : 8px; border-color: root.input-border-color; border-width: StyleTokens.line-width;
                                             ThemedTextInput {
-                                                x: 10px; width: parent.width - 20px; height: parent.height;
+                                                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
                                                 text <=> root.security-recovery-input; input-type: password;
                                                 enabled: root.sas-stage == 0 && !root.sas-busy && !root.security-busy;
                                                 color: root.ink; font-size: 12px * root.text-scale;
@@ -5648,12 +6496,12 @@ export component AppWindow inherits Window {
                         spacing: 12px;
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated; border-radius: 14px;
-                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; border-radius: 24px; initials: "CY"; accent: #a88cff; }
+                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; built-in-radius: 24px; initials: "CY"; accent: #a88cff; }
                             Text { y: parent.height - 43px; text: "Casey"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; }
                         }
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated; border-radius: 14px;
-                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; border-radius: 24px; initials: "JN"; accent: #f39f78; }
+                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; built-in-radius: 24px; initials: "JN"; accent: #f39f78; }
                             Text { y: parent.height - 43px; text: "Jules"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; }
                         }
                     }
@@ -5662,7 +6510,7 @@ export component AppWindow inherits Window {
                         spacing: 12px;
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated; border-radius: 14px;
-                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; border-radius: 24px; initials: "SK"; accent: #78c8b1; }
+                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; built-in-radius: 24px; initials: "SK"; accent: #78c8b1; }
                             Text { y: parent.height - 43px; text: "Sam"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; }
                         }
                         Rectangle {
@@ -5774,8 +6622,16 @@ export component AppWindow inherits Window {
         }
 
         if root.show-side-panel && root.page == 0 : Rectangle {
+            x: root.details-side == 1 ? main-area.x : main-area.x + main-area.width - self.width;
+            y: main-area.y;
+            height: main-area.height;
             width: root.details-width * 1px;
             background: root.window-panel;
+            // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
+            property <bool> entered: false;
+            init => { self.entered = true; }
+            opacity: StyleTokens.panel-duration == 0ms || self.entered ? 1 : 0;
+            animate opacity { duration: StyleTokens.panel-duration; easing: ease-out; }
             border-color: root.divider;
             border-width: 1px;
             accessible-role: region;
@@ -5836,7 +6692,7 @@ export component AppWindow inherits Window {
                         if root.live-session : IconAction {
                             width: 28px; height: 28px;
                             icon: "↻"; label: "Refresh room members";
-                            ink: root.muted; surface: transparent; hover-surface: root.hover;
+                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             enabled: !root.member-loading && root.active-room-id != "";
                             activated => { root.refresh-room-members(); }
                         }
@@ -5909,7 +6765,7 @@ export component AppWindow inherits Window {
                             background: transparent;
                             HorizontalLayout {
                                 padding-left: 12px; padding-right: 12px; padding-top: 11px; padding-bottom: 11px; spacing: 9px;
-                                VerticalLayout { width: 32px; alignment: center; AvatarBadge { width: 32px; height: 32px; border-radius: 11px; initials: member.initials; accent: member.accent; } }
+                                VerticalLayout { width: 32px; alignment: center; AvatarBadge { width: 32px; height: 32px; built-in-radius: 11px; initials: member.initials; accent: member.accent; } }
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1; spacing: 2px;
                                     Text { text: member.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
@@ -6056,7 +6912,7 @@ export component AppWindow inherits Window {
                         Text { text: "Thread"; color: root.ink; font-size: 17px * root.text-scale; font-weight: 750; horizontal-stretch: 1; vertical-alignment: center; }
                         if root.thread-root-id != "" : IconAction {
                             width: 28px; height: 28px; icon: "×"; label: "Close thread";
-                            ink: root.muted; surface: transparent; hover-surface: root.hover;
+                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             activated => {
                                 root.thread-root-id = "";
                                 root.thread-root-is-own = false;
@@ -6121,7 +6977,7 @@ export component AppWindow inherits Window {
                                         // text even when optional timestamps are hidden.
                                         if (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" : Text {
                                             text: "· " + thread-reply.time-label; color: root.clock-ink(false); font-family: root.monospace-font-family;
-                                            font-size: 10px * root.text-scale; vertical-alignment: top; horizontal-stretch: 0; accessible-label: thread-reply.time-label;
+                                            font-size: root.timestamp-font-px; vertical-alignment: top; horizontal-stretch: 0; accessible-label: thread-reply.time-label;
                                         }
                                         Rectangle { horizontal-stretch: 1; min-width: 0px; }
                                     }
@@ -6146,7 +7002,7 @@ export component AppWindow inherits Window {
                     }
                     if root.thread-root-id != "" : Rectangle {
                         property <length> status-height: root.thread-status-visible ? thread-status.height + 12px : 0px;
-                        height: max(64px, 1.5 * root.message-font-px + 24px) + self.status-height; background: transparent;
+                        height: root.thread-composer-height + self.status-height; background: transparent;
                         thread-status := PendingSendStrip {
                             x: 10px; y: 6px; width: parent.width - 20px;
                             items: root.thread-pending-items; blocked-notice: root.thread-blocked-notice;
@@ -6162,13 +7018,16 @@ export component AppWindow inherits Window {
                             discard-unreadable => { root.discard-unreadable-status(true); }
                         }
                         HorizontalLayout {
-                            padding-left: 10px; padding-right: 10px; padding-top: 8px + parent.status-height; padding-bottom: 8px; spacing: 5px;
+                            padding-left: StyleTokens.composer-padding; padding-right: StyleTokens.composer-padding; padding-top: 8px + parent.status-height; padding-bottom: 8px; spacing: 5px;
                             Rectangle {
-                                horizontal-stretch: 1; background: root.elevated; border-radius: 8px;
+                                horizontal-stretch: 1; background: root.composer-surface; border-radius: StyleTokens.composer-radius >= 0px ? StyleTokens.composer-radius : 8px;
+                                // The thread composer has no border until a focus state is set.
+                                border-width: thread-input.has-focus && StyleTokens.states.composer-focus.present ? StyleTokens.focus-width : 0px;
+                                border-color: root.composer-focus-border;
                                 thread-input := MentionInput {
                                     font-family: root.message-font-family;
                                     x: 8px; width: parent.width - 16px; height: parent.height;
-                                    text <=> root.thread-composer-text; color: root.ink; font-size: root.message-font-px;
+                                    text <=> root.thread-composer-text; color: root.ink; font-size: root.composer-font-px;
                                     accessible-label: "Reply in thread started by " + root.thread-root-sender;
                                     property <string> thread-context: root.thread-root-id;
                                     init => { self.focus(); root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
@@ -6194,7 +7053,7 @@ export component AppWindow inherits Window {
                             }
                             IconAction {
                                 width: 28px; icon: "☺"; label: "Open emoji picker for thread reply";
-                                ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                 enabled: root.mention-ui-allowed && !root.thread-send-pending;
                                 activated => {
                                     if root.sticker-open { root.sticker-dismiss(); }
@@ -6204,7 +7063,7 @@ export component AppWindow inherits Window {
                             }
                             IconAction {
                                 width: 28px; icon: "✿"; label: "Open sticker picker for this thread";
-                                ink: root.sticker-open && root.sticker-threaded ? root.accent : root.muted;
+                                ink: root.sticker-open && root.sticker-threaded ? root.icon-active-ink : root.icon-ink;
                                 selected: root.sticker-open && root.sticker-threaded;
                                 surface: root.panel; hover-surface: root.hover;
                                 enabled: root.mention-ui-allowed && !root.thread-send-pending;
@@ -6216,11 +7075,11 @@ export component AppWindow inherits Window {
                             IconAction {
                                 width: 32px; icon: "Md"; label: root.thread-markdown ? "Thread plain text" : "Thread Markdown";
                                 selected: root.thread-markdown; enabled: !root.thread-send-pending;
-                                ink: root.thread-markdown ? root.accent : root.muted; surface: transparent; hover-surface: root.hover;
+                                ink: root.thread-markdown ? root.icon-active-ink : root.icon-ink; surface: transparent; hover-surface: root.hover;
                                 activated => { root.thread-markdown = !root.thread-markdown; root.thread-formatting-changed(root.thread-markdown); thread-input.focus(); }
                             }
                             IconAction {
-                                icon: "➤"; label: "Send thread reply"; ink: root.accent;
+                                icon: "➤"; label: "Send thread reply"; ink: root.icon-active-ink;
                                 enabled: !root.thread-send-pending;
                                 surface: transparent; hover-surface: root.hover;
                                 activated => {
@@ -6396,7 +7255,6 @@ export component AppWindow inherits Window {
                 }
             }
         }
-    }
 
     if root.image-preview-open && root.image-preview-account-id == root.active-account-local-id && root.image-preview-room-id == root.active-room-id : FocusScope {
         focus-on-tab-navigation: false;
@@ -6458,6 +7316,11 @@ export component AppWindow inherits Window {
         }
         Rectangle {
             background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
+            // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
+            property <bool> entered: false;
+            init => { self.entered = true; }
+            opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
+            animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
             TouchArea { width: parent.width; height: parent.height; }
             Rectangle {
                 x: (parent.width - 530px) / 2;
@@ -6470,10 +7333,10 @@ export component AppWindow inherits Window {
                     padding: 20px; spacing: 6px;
                     Text { text: "Switch room · " + root.active-space-name; color: root.ink; font-size: 18px * root.text-scale; font-weight: 750; }
                     Rectangle {
-                        height: 38px; background: root.elevated; border-radius: 8px;
-                        if root.quick-switcher-query == "" : Text { x: 10px; text: "Room name or Matrix room ID"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
+                        height: 38px; background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : 8px;
+                        if root.quick-switcher-query == "" : Text { x: StyleTokens.input-padding; text: "Room name or Matrix room ID"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
                         quick-room-input := ThemedTextInput {
-                            x: 10px; width: parent.width - 20px; height: parent.height;
+                            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
                             text <=> root.quick-switcher-query; color: root.ink; font-size: 12px * root.text-scale;
                             single-line: true; accessible-label: "Filter rooms; arrows select, Enter opens, Escape closes";
                             edited => { root.filter-quick-switcher(); }

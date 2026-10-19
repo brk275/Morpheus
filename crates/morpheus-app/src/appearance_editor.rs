@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use morpheus_config::registry::{
     self, COLOR_TOKENS, ColorToken, Fallback, TokenGroup, TokenSource,
 };
-use morpheus_config::{Config, ConfigStore, ThemePack};
+use morpheus_config::{AccountOverrides, Config, ConfigStore, ThemePack};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use super::{
@@ -61,6 +61,62 @@ struct Session {
     /// The configuration and theme last applied, for projecting selection
     /// and filter changes without reading the file.
     source: Option<(Config, Option<ThemePack>)>,
+    /// The account whose colors the undo steps and the Reset all snapshot
+    /// belong to; `None` is the table for all accounts.
+    scope: Option<String>,
+}
+
+/// The account whose colors the editor changes, or `None` for all accounts.
+/// Only the published active account can be chosen; the window publishes it
+/// after a successful activation and clears it when no account is active.
+fn scope_account(ui: &AppWindow) -> Option<String> {
+    let account = ui.get_active_account_local_id();
+    (ui.get_color_scope() == 1 && !account.is_empty()).then(|| account.to_string())
+}
+
+/// The overrides of one scope as `config` holds them.
+fn scoped<'a>(config: &'a Config, account: Option<&str>) -> Option<&'a BTreeMap<String, String>> {
+    match account {
+        None => Some(&config.colors),
+        Some(id) => config
+            .account_overrides
+            .get(id)
+            .map(|overrides| &overrides.colors),
+    }
+}
+
+fn scoped_color<'a>(config: &'a Config, account: Option<&str>, id: &str) -> Option<&'a String> {
+    scoped(config, account).and_then(|colors| colors.get(id))
+}
+
+/// Change the overrides of one scope, removing an account entry left empty.
+fn edit_scoped<R>(
+    config: &mut Config,
+    account: Option<&str>,
+    edit: impl FnOnce(&mut BTreeMap<String, String>) -> R,
+) -> R {
+    let Some(id) = account else {
+        return edit(&mut config.colors);
+    };
+    let overrides = config.account_overrides.entry(id.to_owned()).or_default();
+    let result = edit(&mut overrides.colors);
+    if *overrides == AccountOverrides::default() {
+        config.account_overrides.remove(id);
+    }
+    result
+}
+
+/// Undo steps and a Reset all snapshot never cross scopes or accounts: a
+/// changed scope or active account drops them.
+fn sync_scope(account: &Option<String>) {
+    SESSION.with(|session| {
+        let mut session = session.borrow_mut();
+        if session.scope != *account {
+            session.previous.clear();
+            session.reset_all = ResetAll::Idle;
+            session.scope = account.clone();
+        }
+    });
 }
 
 thread_local! {
@@ -70,6 +126,19 @@ thread_local! {
 
 pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
     ui.set_color_groups(ModelRc::new(VecModel::from(group_items())));
+    let weak = ui.as_weak();
+    ui.on_color_scope_chosen(move |scope| {
+        let Some(ui) = weak.upgrade() else { return };
+        // "This account" needs a published active account.
+        let scope = if scope == 1 && !ui.get_active_account_local_id().is_empty() {
+            1
+        } else {
+            0
+        };
+        ui.set_color_scope(scope);
+        clear_hint();
+        reproject(&ui, true);
+    });
     let weak = ui.as_weak();
     ui.on_color_filter_changed(move |text| {
         let Some(ui) = weak.upgrade() else { return };
@@ -173,20 +242,23 @@ pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
         let Some(token) = registry::color_token(ui.get_color_selected_id().as_str()) else {
             return;
         };
+        let account = scope_account(&ui);
+        sync_scope(&account);
         let step = SESSION.with(|session| session.borrow_mut().previous.remove(token.id));
         let Some(step) = step else { return };
         clear_hint();
         let mut superseded = false;
         let saved = save_config_edit(&ui, &undo_store, |config| {
             // Undo only the change this window made, not a later one.
-            if !same_color(config.colors.get(token.id), step.after.as_ref()) {
+            let current = scoped_color(config, account.as_deref(), token.id);
+            if !same_color(current, step.after.as_ref()) {
                 superseded = true;
                 return false;
             }
-            match &step.before {
-                Some(value) => config.colors.insert(token.id.into(), value.clone()),
-                None => config.colors.remove(token.id),
-            };
+            edit_scoped(config, account.as_deref(), |colors| match &step.before {
+                Some(value) => colors.insert(token.id.into(), value.clone()),
+                None => colors.remove(token.id),
+            });
             true
         });
         if superseded {
@@ -201,6 +273,8 @@ pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
     let all_store = store.clone();
     ui.on_color_reset_all(move || {
         let Some(ui) = weak.upgrade() else { return };
+        let account = scope_account(&ui);
+        sync_scope(&account);
         let state = SESSION.with(|session| std::mem::take(&mut session.borrow_mut().reset_all));
         // Whether the file changed, which ends every single-color undo step.
         let mut written = false;
@@ -210,7 +284,7 @@ pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
                 // The overrides the file holds now, not the ones last applied.
                 let mut removed = BTreeMap::new();
                 let saved = save_config_edit(&ui, &all_store, |config| {
-                    removed = std::mem::take(&mut config.colors);
+                    removed = edit_scoped(config, account.as_deref(), std::mem::take);
                     !removed.is_empty()
                 });
                 written = saved.is_some();
@@ -225,13 +299,16 @@ pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
                 // left to restore. A color set again since is kept.
                 let mut restorable = None;
                 let saved = save_config_edit(&ui, &all_store, |config| {
-                    let mut any = false;
-                    for (id, value) in &removed {
-                        if !config.colors.contains_key(id) {
-                            config.colors.insert(id.clone(), value.clone());
-                            any = true;
+                    let any = edit_scoped(config, account.as_deref(), |colors| {
+                        let mut any = false;
+                        for (id, value) in &removed {
+                            if !colors.contains_key(id) {
+                                colors.insert(id.clone(), value.clone());
+                                any = true;
+                            }
                         }
-                    }
+                        any
+                    });
                     restorable = Some(any);
                     any
                 });
@@ -321,11 +398,22 @@ pub(super) fn project(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>
         if matches!(session.reset_all, ResetAll::Confirm) {
             session.reset_all = ResetAll::Idle;
         }
-        session
-            .previous
-            .retain(|id, step| same_color(config.colors.get(*id), step.after.as_ref()));
+        let scope = session.scope.clone();
+        session.previous.retain(|id, step| {
+            same_color(scoped_color(config, scope.as_deref(), id), step.after.as_ref())
+        });
     });
     reproject(ui, false);
+}
+
+/// Re-project after the active account changed. Scoped undo steps and a
+/// Reset all snapshot of the previous account are dropped, and with no
+/// active account the editor returns to the colors for all accounts.
+pub(super) fn refresh(ui: &AppWindow) {
+    if ui.get_active_account_local_id().is_empty() {
+        ui.set_color_scope(0);
+    }
+    reproject(ui, true);
 }
 
 /// Select one token for editing, as a Settings search result does: its group
@@ -362,15 +450,17 @@ fn clear_hint() {
 /// step's prior value is the one in the re-read file, and nothing is written
 /// when the file already holds the requested color.
 fn save_override(ui: &AppWindow, store: &ConfigStore, id: &'static str, value: Option<String>) {
+    let account = scope_account(ui);
+    sync_scope(&account);
     let mut before = None;
     let saved = save_config_edit(ui, store, |config| {
-        if same_color(config.colors.get(id), value.as_ref()) {
+        if same_color(scoped_color(config, account.as_deref(), id), value.as_ref()) {
             return false;
         }
-        before = Some(match &value {
-            Some(value) => config.colors.insert(id.into(), value.clone()),
-            None => config.colors.remove(id),
-        });
+        before = Some(edit_scoped(config, account.as_deref(), |colors| match &value {
+            Some(value) => colors.insert(id.into(), value.clone()),
+            None => colors.remove(id),
+        }));
         true
     });
     if let (Some(_), Some(before)) = (saved, before) {
@@ -452,14 +542,28 @@ fn effective_rgba(ui: &AppWindow, id: &str) -> [u8; 4] {
     [color.red(), color.green(), color.blue(), color.alpha()]
 }
 
-/// Where the shown color of `token` comes from, as fixed text.
-fn source_text(config: &Config, theme: Option<&ThemePack>, token: &ColorToken) -> String {
+/// Where the shown color of `token` comes from, as fixed text. `account` is
+/// the edited account while the editor is scoped to the active account.
+fn source_text(
+    config: &Config,
+    theme: Option<&ThemePack>,
+    token: &ColorToken,
+    account: Option<&str>,
+) -> String {
+    if account.is_some() && scoped_color(config, account, token.id).is_some() {
+        return "Your color for this account, saved in config.toml".into();
+    }
     if config.colors.contains_key(token.id) {
-        return "Your color, saved in config.toml".into();
+        return if account.is_some() {
+            "Your color for all accounts; a value here applies to this account only".into()
+        } else {
+            "Your color, saved in config.toml".into()
+        };
     }
     let from_theme = match token.source {
         TokenSource::Base => theme.is_some(),
         TokenSource::Role => theme.and_then(|theme| theme.roles.get(token.id)).is_some(),
+        TokenSource::State => theme.and_then(|theme| theme.states.get(token.id)).is_some(),
     };
     if from_theme {
         return "From the selected theme".into();
@@ -479,11 +583,17 @@ fn source_text(config: &Config, theme: Option<&ThemePack>, token: &ColorToken) -
 /// is only replaced when it holds a valid value that differs from it, so a
 /// partial value being typed is never overwritten.
 fn reproject(ui: &AppWindow, refill: bool) {
+    let account = scope_account(ui);
+    sync_scope(&account);
+    let account = account.as_deref();
     SESSION.with(|session| {
         let session = session.borrow();
         let default = (Config::default(), None);
         let (config, theme) = session.source.as_ref().unwrap_or(&default);
         let theme = theme.as_ref();
+        let scope_colors = scoped(config, account);
+        let overridden = |id: &str| scope_colors.is_some_and(|colors| colors.contains_key(id));
+        let override_count = scope_colors.map_or(0, BTreeMap::len);
         let group = usize::try_from(ui.get_color_group_index()).unwrap_or(0);
         let tokens = shown_tokens(group, ui.get_color_filter().as_str());
         let selected = registry::color_token(ui.get_color_selected_id().as_str())
@@ -499,17 +609,16 @@ fn reproject(ui: &AppWindow, refill: bool) {
                 id: token.id.into(),
                 label: token.label.into(),
                 group: token.group.label().into(),
-                overridden: config.colors.contains_key(token.id),
+                overridden: overridden(token.id),
             })
             .collect();
         ui.set_color_tokens(ModelRc::new(VecModel::from(items)));
-        ui.set_color_override_count(config.colors.len() as i32);
+        ui.set_color_override_count(override_count as i32);
         ui.set_color_reset_all_notice(
             match &session.reset_all {
                 ResetAll::Idle => String::new(),
                 ResetAll::Confirm => format!(
-                    "Activate again to remove all {} customized colors",
-                    config.colors.len()
+                    "Activate again to remove all {override_count} customized colors"
                 ),
                 ResetAll::Removed(removed) => {
                     format!("Restore the {} removed colors", removed.len())
@@ -522,8 +631,8 @@ fn reproject(ui: &AppWindow, refill: bool) {
             label: selected.label.into(),
             description: selected.description.into(),
             group: selected.group.label().into(),
-            source: source_text(config, theme, selected).into(),
-            overridden: config.colors.contains_key(selected.id),
+            source: source_text(config, theme, selected, account).into(),
+            overridden: overridden(selected.id),
             can_undo: session.previous.contains_key(selected.id),
             hint: session.hint.as_str().into(),
         });
@@ -550,7 +659,7 @@ mod tests {
             .iter()
             .map(|token| token.id)
             .collect();
-        assert_eq!(badge, ["unread_ink"]);
+        assert_eq!(badge, ["unread_ink", "mention_ink"]);
         assert!(shown_tokens(0, "no such color").is_empty());
         let surfaces = shown_tokens(0, "  ");
         assert!(
@@ -574,19 +683,19 @@ mod tests {
         let canvas = registry::color_token("canvas").unwrap();
         let timestamp = registry::color_token("timestamp").unwrap();
         let scrim = registry::color_token("scrim").unwrap();
-        assert_eq!(source_text(&config, None, canvas), "Built-in palette");
+        assert_eq!(source_text(&config, None, canvas, None), "Built-in palette");
         assert_eq!(
-            source_text(&config, Some(&theme), canvas),
+            source_text(&config, Some(&theme), canvas, None),
             "From the selected theme"
         );
         assert_eq!(
-            source_text(&config, None, timestamp),
+            source_text(&config, None, timestamp, None),
             "Follows Secondary text"
         );
-        assert_eq!(source_text(&config, None, scrim), "Built-in default");
+        assert_eq!(source_text(&config, None, scrim, None), "Built-in default");
         config.colors.insert("canvas".into(), "#000000".into());
         assert_eq!(
-            source_text(&config, Some(&theme), canvas),
+            source_text(&config, Some(&theme), canvas, None),
             "Your color, saved in config.toml"
         );
     }

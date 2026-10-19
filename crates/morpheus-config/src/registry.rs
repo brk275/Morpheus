@@ -13,16 +13,18 @@ pub enum TokenGroup {
     Text,
     Accents,
     Controls,
+    Navigation,
     Calls,
     Avatars,
 }
 
 impl TokenGroup {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Surfaces,
         Self::Text,
         Self::Accents,
         Self::Controls,
+        Self::Navigation,
         Self::Calls,
         Self::Avatars,
     ];
@@ -33,6 +35,7 @@ impl TokenGroup {
             Self::Text => "text",
             Self::Accents => "accents",
             Self::Controls => "controls",
+            Self::Navigation => "navigation",
             Self::Calls => "calls",
             Self::Avatars => "avatars",
         }
@@ -44,6 +47,7 @@ impl TokenGroup {
             Self::Text => "Text and messages",
             Self::Accents => "Accents and states",
             Self::Controls => "Inputs and controls",
+            Self::Navigation => "Navigation and badges",
             Self::Calls => "Calls",
             Self::Avatars => "Avatars",
         }
@@ -57,6 +61,9 @@ pub enum TokenSource {
     Base,
     /// An optional `[roles]` entry of a theme pack.
     Role,
+    /// An optional `[states]` entry of a theme pack: an interaction state
+    /// that follows an existing color until a theme or `config.toml` sets it.
+    State,
 }
 
 /// What a token shows when neither `config.toml` nor the theme pack sets it.
@@ -104,8 +111,8 @@ const fn token(
 }
 
 use Fallback::{Legacy, Palette, Token};
-use TokenGroup::{Accents, Avatars, Calls, Controls, Surfaces, Text};
-use TokenSource::{Base, Role};
+use TokenGroup::{Accents, Avatars, Calls, Controls, Navigation, Surfaces, Text};
+use TokenSource::{Base, Role, State};
 
 /// Every color token the interface consumes, in editor order.
 pub const COLOR_TOKENS: &[ColorToken] = &[
@@ -213,6 +220,15 @@ pub const COLOR_TOKENS: &[ColorToken] = &[
         "Image viewer background",
         "Area around an opened image. The image itself is never recolored.",
         &["image", "viewer", "photo", "preview", "media"],
+    ),
+    token(
+        "message_hover",
+        Surfaces,
+        State,
+        Token("elevated"),
+        "Message hover",
+        "Background of a timeline message under the pointer. Selection colors still win.",
+        &["message", "row", "pointer", "hover", "timeline"],
     ),
     token(
         "ink",
@@ -422,6 +438,157 @@ pub const COLOR_TOKENS: &[ColorToken] = &[
         &["border", "line", "separator", "outline"],
     ),
     token(
+        "control_hover",
+        Controls,
+        State,
+        Legacy { example: "#32394B" },
+        "Button hover",
+        "Hover background of text buttons and icon buttons. Unset keeps each button's hover color.",
+        &["button", "hover", "pointer", "icon button"],
+    ),
+    token(
+        "control_pressed",
+        Controls,
+        State,
+        Legacy {
+            example: "#00000000",
+        },
+        "Pressed button",
+        "Layer drawn while a button or navigation row is pressed. Unset draws no pressed layer.",
+        &["pressed", "active", "click", "down", "button"],
+    ),
+    token(
+        "control_disabled",
+        Controls,
+        State,
+        Legacy { example: "#A7AFC1" },
+        "Disabled button text",
+        "Text and icons of unavailable buttons. Unset keeps each button's disabled look.",
+        &["disabled", "unavailable", "inactive", "dimmed", "greyed"],
+    ),
+    token(
+        "input_surface",
+        Controls,
+        State,
+        Legacy { example: "#272D3B" },
+        "Text field background",
+        "Background of text fields in Settings, discovery, the quick switcher, highlight words and recovery.",
+        &["input", "field", "text box", "search box", "background"],
+    ),
+    token(
+        "input_border",
+        Controls,
+        State,
+        Token("divider"),
+        "Text field border",
+        "Border of those text fields while they do not have keyboard focus.",
+        &["input", "field", "outline", "border"],
+    ),
+    token(
+        "composer_surface",
+        Controls,
+        State,
+        Token("elevated"),
+        "Composer background",
+        "Background of the message and thread composers.",
+        &["composer", "message box", "input", "background"],
+    ),
+    token(
+        "composer_border",
+        Controls,
+        State,
+        Token("divider"),
+        "Composer border",
+        "Border of the message composer.",
+        &["composer", "message box", "outline", "border"],
+    ),
+    token(
+        "composer_focus",
+        Controls,
+        State,
+        Token("composer_border"),
+        "Composer focus border",
+        "Composer border while you type in it. Setting it also outlines the focused thread composer.",
+        &["composer", "focus", "typing", "active", "outline"],
+    ),
+    token(
+        "icon",
+        Controls,
+        State,
+        Token("muted"),
+        "Icons",
+        "Icons of quiet buttons such as message actions, composer tools and room header actions.",
+        &["icon", "glyph", "symbol", "toolbar"],
+    ),
+    token(
+        "icon_active",
+        Controls,
+        State,
+        Token("accent"),
+        "Active icons",
+        "Icons of primary or switched-on buttons, such as Send and open pickers.",
+        &["icon", "active", "selected", "send", "toggle"],
+    ),
+    token(
+        "nav_hover",
+        Navigation,
+        State,
+        Legacy { example: "#272D3B" },
+        "Navigation hover",
+        "Room, direct message, route and Space rows under the pointer. Unset keeps each row's hover color.",
+        &["sidebar", "room list", "rail", "hover", "pointer"],
+    ),
+    token(
+        "nav_selected",
+        Navigation,
+        State,
+        Token("selection"),
+        "Selected navigation item",
+        "The open room, direct message, route or Space.",
+        &[
+            "sidebar",
+            "room list",
+            "rail",
+            "selected",
+            "active room",
+            "current",
+        ],
+    ),
+    token(
+        "nav_selected_ink",
+        Navigation,
+        State,
+        Token("selection_ink"),
+        "Selected navigation text",
+        "Text and icons of the open room, route or Space.",
+        &["sidebar", "selected text", "active room"],
+    ),
+    token(
+        "mention",
+        Navigation,
+        State,
+        Token("destructive"),
+        "Mention badge",
+        "Badge of rooms with unread messages that mention you; plain unread counts keep the unread badge.",
+        &[
+            "mention",
+            "highlight",
+            "ping",
+            "badge",
+            "notification",
+            "at",
+        ],
+    ),
+    token(
+        "mention_ink",
+        Navigation,
+        State,
+        Token("destructive_ink"),
+        "Mention badge text",
+        "Number on mention badges.",
+        &["mention", "badge text", "highlight count"],
+    ),
+    token(
         "voice",
         Calls,
         Role,
@@ -486,6 +653,8 @@ pub enum FieldKind {
     ThemeName,
     /// `#RRGGBB` or `#RRGGBBAA`.
     Color,
+    /// 1 to 16 colors, each `#RRGGBB` or `#RRGGBBAA`.
+    ColorList,
     /// A host-qualified audio device ID.
     DeviceId,
     /// Free text that is stored without validation.
@@ -506,6 +675,30 @@ pub struct FieldSpec {
     pub description: &'static str,
     /// The setting is stored but nothing in the app uses it yet.
     pub inactive: bool,
+    /// Present when the typography and geometry workspace edits the field.
+    /// Its range is the field's `Integer` kind, so the validator, the schema
+    /// output, the editor and Settings search all read one table.
+    pub editor: Option<MetricEditor>,
+}
+
+impl FieldSpec {
+    /// The accepted range of an integer field.
+    pub fn integer_range(&self) -> Option<(i64, i64)> {
+        match self.kind {
+            FieldKind::Integer { minimum, maximum } => Some((minimum, maximum)),
+            _ => None,
+        }
+    }
+
+    /// The default of an integer field, or `None` when it is normally omitted.
+    pub fn integer_default(&self) -> Option<i64> {
+        self.default.parse().ok()
+    }
+
+    /// Whether the field may be omitted to follow a built-in value.
+    pub fn optional(&self) -> bool {
+        self.default == "(none)"
+    }
 }
 
 const fn field(
@@ -520,6 +713,7 @@ const fn field(
         default,
         description,
         inactive: false,
+        editor: None,
     }
 }
 
@@ -528,9 +722,149 @@ const fn inactive(mut spec: FieldSpec) -> FieldSpec {
     spec
 }
 
+/// How the editor writes a metric's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unit {
+    Pixels,
+    Percent,
+    Milliseconds,
+}
+
+impl Unit {
+    /// Shown after the number, including its separating space.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Pixels => " px",
+            Self::Percent => "%",
+            Self::Milliseconds => " ms",
+        }
+    }
+
+    /// Spoken after the number by assistive technology.
+    pub fn spoken(self) -> &'static str {
+        match self {
+            Self::Pixels => "logical pixels",
+            Self::Percent => "percent",
+            Self::Milliseconds => "milliseconds",
+        }
+    }
+}
+
+/// A category of the typography and geometry workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricGroup {
+    Text,
+    Shapes,
+    Spacing,
+    IconsAndAvatars,
+    Motion,
+}
+
+impl MetricGroup {
+    pub const ALL: [Self; 5] = [
+        Self::Text,
+        Self::Shapes,
+        Self::Spacing,
+        Self::IconsAndAvatars,
+        Self::Motion,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Shapes => "shapes",
+            Self::Spacing => "spacing",
+            Self::IconsAndAvatars => "icons",
+            Self::Motion => "motion",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Text => "Text sizes",
+            Self::Shapes => "Corners, borders and focus",
+            Self::Spacing => "Padding",
+            Self::IconsAndAvatars => "Icons and avatars",
+            Self::Motion => "Motion",
+        }
+    }
+}
+
+/// Editor metadata of one integer metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricEditor {
+    pub group: MetricGroup,
+    pub label: &'static str,
+    pub unit: Unit,
+    pub step: u16,
+    /// Extra search words, including alternative spellings.
+    pub keywords: &'static [&'static str],
+    /// For a field that may be omitted: what omission shows.
+    pub inherit: Option<Inherit>,
+}
+
+/// What an omitted optional metric draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Inherit {
+    /// Fixed text shown while the metric is omitted.
+    pub text: &'static str,
+    /// The value the built-in look is closest to; stepping starts here.
+    pub start: u16,
+}
+
+const fn inherit(text: &'static str, start: u16) -> Option<Inherit> {
+    Some(Inherit { text, start })
+}
+
+const fn metric(mut spec: FieldSpec, editor: MetricEditor) -> FieldSpec {
+    spec.editor = Some(editor);
+    spec
+}
+
+const fn editor(
+    group: MetricGroup,
+    label: &'static str,
+    unit: Unit,
+    step: u16,
+    keywords: &'static [&'static str],
+    inherit: Option<Inherit>,
+) -> MetricEditor {
+    MetricEditor {
+        group,
+        label,
+        unit,
+        step,
+        keywords,
+        inherit,
+    }
+}
+
+/// The accepted range of one integer field of `config.toml`.
+pub fn integer_range(key: &str) -> Option<(i64, i64)> {
+    FIELDS
+        .iter()
+        .find(|field| field.key == key)
+        .and_then(FieldSpec::integer_range)
+}
+
+/// Every metric the typography and geometry workspace edits, in editor order.
+pub fn metric_fields() -> impl Iterator<Item = (&'static FieldSpec, &'static MetricEditor)> {
+    FIELDS
+        .iter()
+        .filter_map(|field| field.editor.as_ref().map(|editor| (field, editor)))
+}
+
+/// One editor metric by its TOML key.
+pub fn metric_field(key: &str) -> Option<(&'static FieldSpec, &'static MetricEditor)> {
+    metric_fields().find(|(field, _)| field.key == key)
+}
+
 use FieldKind::{Bool, Integer};
+use MetricGroup::{IconsAndAvatars, Motion, Shapes, Spacing, Text as TextSizes};
+use Unit::{Milliseconds, Percent, Pixels};
 
 const THEME_MODES: &[&str] = &["dark", "light", "high_contrast", "system"];
+const DENSITIES: &[&str] = &["compact", "comfortable", "spacious"];
 
 /// Every field of `config.toml` schema version 1. A test in this crate
 /// (`the_field_reference_agrees_with_the_real_schema`) checks that a fully
@@ -567,7 +901,7 @@ pub const FIELDS: &[FieldSpec] = &[
     ),
     field(
         "appearance.density",
-        FieldKind::Enum(&["compact", "comfortable", "spacious"]),
+        FieldKind::Enum(DENSITIES),
         "\"comfortable\"",
         "Room and message row density.",
     ),
@@ -594,6 +928,60 @@ pub const FIELDS: &[FieldSpec] = &[
         },
         "90",
         "Decorative button and navigation hover fade in milliseconds; reduce_motion overrides it.",
+    ),
+    metric(
+        field(
+            "appearance.popup_fade_ms",
+            Integer {
+                minimum: 0,
+                maximum: 1000,
+            },
+            "0",
+            "Decorative fade-in of menus, pickers and the quick switcher in milliseconds; 0 is off and reduce_motion overrides it.",
+        ),
+        editor(
+            Motion,
+            "Menu and picker fade",
+            Milliseconds,
+            10,
+            &[
+                "animation",
+                "fade",
+                "popup",
+                "menu",
+                "picker",
+                "duration",
+                "transition",
+            ],
+            None,
+        ),
+    ),
+    metric(
+        field(
+            "appearance.panel_fade_ms",
+            Integer {
+                minimum: 0,
+                maximum: 1000,
+            },
+            "0",
+            "Decorative fade-in of the details panel in milliseconds; 0 is off and reduce_motion overrides it.",
+        ),
+        editor(
+            Motion,
+            "Details panel fade",
+            Milliseconds,
+            10,
+            &[
+                "animation",
+                "fade",
+                "panel",
+                "details",
+                "members",
+                "duration",
+                "transition",
+            ],
+            None,
+        ),
     ),
     field(
         "typography.message_font_family",
@@ -660,6 +1048,305 @@ pub const FIELDS: &[FieldSpec] = &[
         },
         "70",
         "Space rail width.",
+    ),
+    metric(
+        field(
+            "typography.sidebar_size",
+            Integer {
+                minimum: 10,
+                maximum: 24,
+            },
+            "13",
+            "Room list and text-sidebar label size in logical pixels before text scaling.",
+        ),
+        editor(
+            TextSizes,
+            "Room list text size",
+            Pixels,
+            1,
+            &[
+                "sidebar",
+                "room list",
+                "channel list",
+                "navigation",
+                "font size",
+                "rooms",
+            ],
+            None,
+        ),
+    ),
+    metric(
+        field(
+            "typography.sender_size",
+            Integer {
+                minimum: 10,
+                maximum: 32,
+            },
+            "(none)",
+            "Sender-name size in the timeline before text scaling; omitted follows each layout's message-based size.",
+        ),
+        editor(
+            TextSizes,
+            "Sender name size",
+            Pixels,
+            1,
+            &["name", "author", "nickname", "nick", "font size"],
+            inherit("Follows the message size of each layout", 14),
+        ),
+    ),
+    metric(
+        field(
+            "typography.timestamp_size",
+            Integer {
+                minimum: 8,
+                maximum: 20,
+            },
+            "(none)",
+            "Timestamp size in the timeline and thread replies before text scaling; omitted keeps 10.",
+        ),
+        editor(
+            TextSizes,
+            "Timestamp size",
+            Pixels,
+            1,
+            &["time", "clock", "date", "font size"],
+            inherit("Built-in 10 px", 10),
+        ),
+    ),
+    metric(
+        field(
+            "typography.composer_size",
+            Integer {
+                minimum: 10,
+                maximum: 32,
+            },
+            "(none)",
+            "Composer text and placeholder size before text scaling; omitted follows typography.message_size.",
+        ),
+        editor(
+            TextSizes,
+            "Composer text size",
+            Pixels,
+            1,
+            &["composer", "input", "typing", "message box", "font size"],
+            inherit("Follows the message font size", 14),
+        ),
+    ),
+    metric(
+        field(
+            "geometry.control_radius",
+            Integer {
+                minimum: 0,
+                maximum: 24,
+            },
+            "(none)",
+            "Corner radius of text buttons and icon buttons; omitted keeps their share of geometry.corner_radius.",
+        ),
+        editor(
+            Shapes,
+            "Button corner radius",
+            Pixels,
+            1,
+            &["button", "radius", "rounded", "corners", "square"],
+            inherit("Share of the corner radius", 7),
+        ),
+    ),
+    metric(
+        field(
+            "geometry.input_radius",
+            Integer {
+                minimum: 0,
+                maximum: 24,
+            },
+            "(none)",
+            "Corner radius of the text fields that geometry.input_padding lists; omitted keeps each field's built-in corners.",
+        ),
+        editor(
+            Shapes,
+            "Text field corner radius",
+            Pixels,
+            1,
+            &["input", "field", "text box", "radius", "rounded", "corners"],
+            inherit("Built-in corners of each field", 7),
+        ),
+    ),
+    metric(
+        field(
+            "geometry.composer_radius",
+            Integer {
+                minimum: 0,
+                maximum: 32,
+            },
+            "(none)",
+            "Corner radius of the message and thread composers; omitted keeps their built-in corners.",
+        ),
+        editor(
+            Shapes,
+            "Composer corner radius",
+            Pixels,
+            1,
+            &["composer", "message box", "radius", "rounded", "corners"],
+            inherit("Built-in composer corners", 11),
+        ),
+    ),
+    metric(
+        field(
+            "geometry.border_width",
+            Integer {
+                minimum: 0,
+                maximum: 4,
+            },
+            "1",
+            "Border width of text buttons, text fields, the message composer, attachment cards and reactions; high contrast draws at least 1.",
+        ),
+        editor(
+            Shapes,
+            "Border width",
+            Pixels,
+            1,
+            &["border", "outline", "stroke", "line", "frame"],
+            None,
+        ),
+    ),
+    metric(
+        field(
+            "geometry.focus_width",
+            Integer {
+                minimum: 1,
+                maximum: 6,
+            },
+            "2",
+            "Keyboard focus ring width; appearance starting points keep it.",
+        ),
+        editor(
+            Shapes,
+            "Focus ring width",
+            Pixels,
+            1,
+            &[
+                "focus",
+                "focus ring",
+                "outline",
+                "keyboard",
+                "accessibility",
+                "visible",
+            ],
+            None,
+        ),
+    ),
+    metric(
+        field(
+            "geometry.control_padding",
+            Integer {
+                minimum: 4,
+                maximum: 24,
+            },
+            "12",
+            "Horizontal padding inside text buttons before text scaling.",
+        ),
+        editor(
+            Spacing,
+            "Button padding",
+            Pixels,
+            1,
+            &["button", "padding", "spacing", "inset"],
+            None,
+        ),
+    ),
+    metric(
+        field(
+            "geometry.input_padding",
+            Integer {
+                minimum: 4,
+                maximum: 20,
+            },
+            "10",
+            "Horizontal padding inside the text fields of Settings, discovery, the quick switcher, highlight words and recovery.",
+        ),
+        editor(
+            Spacing,
+            "Text field padding",
+            Pixels,
+            1,
+            &["input", "field", "text box", "padding", "inset"],
+            None,
+        ),
+    ),
+    metric(
+        field(
+            "geometry.composer_padding",
+            Integer {
+                minimum: 4,
+                maximum: 24,
+            },
+            "10",
+            "Horizontal padding inside the message and thread composers.",
+        ),
+        editor(
+            Spacing,
+            "Composer padding",
+            Pixels,
+            1,
+            &["composer", "message box", "padding", "inset"],
+            None,
+        ),
+    ),
+    metric(
+        field(
+            "geometry.icon_size",
+            Integer {
+                minimum: 12,
+                maximum: 28,
+            },
+            "18",
+            "Icon size in icon buttons; buttons at their default size grow to fit.",
+        ),
+        editor(
+            IconsAndAvatars,
+            "Icon size",
+            Pixels,
+            1,
+            &["icon", "glyph", "symbol", "toolbar", "button size"],
+            None,
+        ),
+    ),
+    metric(
+        field(
+            "geometry.avatar_size",
+            Integer {
+                minimum: 16,
+                maximum: 64,
+            },
+            "(none)",
+            "Message avatar size; omitted keeps 38 in Stacked and 26 in Compact and Columns.",
+        ),
+        editor(
+            IconsAndAvatars,
+            "Message avatar size",
+            Pixels,
+            2,
+            &["avatar", "profile picture", "initials", "picture"],
+            inherit("Built-in size of each layout", 38),
+        ),
+    ),
+    metric(
+        field(
+            "geometry.avatar_roundness",
+            Integer {
+                minimum: 0,
+                maximum: 50,
+            },
+            "(none)",
+            "Avatar corner roundness in percent of each avatar's size; 50 is a circle; omitted keeps each avatar's built-in corners.",
+        ),
+        editor(
+            IconsAndAvatars,
+            "Avatar roundness",
+            Percent,
+            5,
+            &["avatar", "circle", "round", "square", "radius", "corners"],
+            inherit("Built-in corners of each avatar", 35),
+        ),
     ),
     field(
         "chat.layout",
@@ -781,6 +1468,30 @@ pub const FIELDS: &[FieldSpec] = &[
         "Unread conversations first.",
     ),
     field(
+        "layout.details_side",
+        FieldKind::Enum(&["right", "left"]),
+        "\"right\"",
+        "Side of the conversation that shows the details panel.",
+    ),
+    field(
+        "layout.direct_messages_first",
+        Bool,
+        "false",
+        "With grouped lists, direct messages above rooms.",
+    ),
+    field(
+        "layout.room_density",
+        FieldKind::Enum(DENSITIES),
+        "(none)",
+        "Room-list row density; omitted follows appearance.density.",
+    ),
+    field(
+        "layout.message_density",
+        FieldKind::Enum(DENSITIES),
+        "(none)",
+        "Timeline message spacing density; omitted follows appearance.density.",
+    ),
+    field(
         "notifications.enabled",
         Bool,
         "true",
@@ -878,10 +1589,22 @@ pub const FIELDS: &[FieldSpec] = &[
         "Rooms using the Element Call Matrix 2.0 mode.",
     ),
     field(
+        "account_overrides.<account>.colors.<token>",
+        FieldKind::Color,
+        "(none)",
+        "Color override while this local account is active, drawn over [colors]; removing the account removes it.",
+    ),
+    field(
         "colors.<token>",
         FieldKind::Color,
         "(none)",
         "Sparse color override for one token; see the token list.",
+    ),
+    field(
+        "senders.colors",
+        FieldKind::ColorList,
+        "(none)",
+        "Sender-name palette replacing the theme's; each sender keeps the slot derived from their user ID.",
     ),
     field(
         "window.opacity_percent",
@@ -989,6 +1712,21 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Edit any color with a hex value, and reset one color without resetting the theme.",
         &[
             "color", "colour", "colors", "colours", "hex", "palette", "theme", "rgb", "rgba",
+        ],
+    ),
+    target(
+        "appearance.sender_colors",
+        APPEARANCE,
+        "Settings › Appearance › Sender name colors",
+        "Sender name colors",
+        "Edit, reorder or remove the colors used for sender names, with a contrast check.",
+        &[
+            "sender color",
+            "nick color",
+            "name color",
+            "nickname",
+            "palette",
+            "usernames",
         ],
     ),
     target(
@@ -1151,6 +1889,24 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         &["rail", "pane size", "width", "sidebar width"],
     ),
     target(
+        "appearance.metrics",
+        APPEARANCE,
+        "Settings › Appearance › Typography, geometry and motion",
+        "Typography, geometry and motion details",
+        "Text sizes, corners, borders, focus rings, padding, icons, avatars and fades, one at a time.",
+        &[
+            "metrics",
+            "sizes",
+            "advanced",
+            "details",
+            "border",
+            "padding",
+            "icon size",
+            "avatar size",
+            "fade",
+        ],
+    ),
+    target(
         "appearance.font_scale",
         APPEARANCE,
         "Settings › Appearance › Font scale",
@@ -1181,6 +1937,24 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Pane sizes and members panel",
         "Room list width, details panel width and the members panel.",
         &["pane", "panel", "width", "members", "details", "resize"],
+    ),
+    target(
+        "layout.composition",
+        "Layout",
+        "Settings › Layout › Navigation",
+        "Pane order and density",
+        "Details panel side, direct messages above rooms, and separate room-list and message density.",
+        &[
+            "pane order",
+            "panel side",
+            "left",
+            "right",
+            "direct messages first",
+            "dm first",
+            "density",
+            "compact",
+            "spacious",
+        ],
     ),
     target(
         "layout.unread_first",
@@ -1388,8 +2162,12 @@ pub fn search_settings(
 /// the ID is a registry token ID.
 pub const COLOR_RESULT_PREFIX: &str = "color:";
 
-/// One Settings search result. Both kinds come from the static registry
-/// tables, so a result can only name a known setting or token.
+/// The result-ID prefix of one typography or geometry metric in Settings
+/// search; the rest of the ID is a registry field key.
+pub const METRIC_RESULT_PREFIX: &str = "metric:";
+
+/// One Settings search result. Every kind comes from the static registry
+/// tables, so a result can only name a known setting, token or metric.
 #[derive(Clone, Copy)]
 pub enum SearchHit {
     /// Choosing it reveals and focuses the setting's control.
@@ -1397,14 +2175,19 @@ pub enum SearchHit {
     /// Choosing it selects the token in the color editor and focuses its
     /// hex field.
     Color(&'static ColorToken),
+    /// Choosing it selects the metric in the typography and geometry
+    /// workspace and focuses its value.
+    Metric(&'static FieldSpec, &'static MetricEditor),
 }
 
 impl SearchHit {
-    /// The result ID: a setting ID, or [`COLOR_RESULT_PREFIX`] and a token ID.
+    /// The result ID: a setting ID, [`COLOR_RESULT_PREFIX`] and a token ID, or
+    /// [`METRIC_RESULT_PREFIX`] and a field key.
     pub fn id(self) -> String {
         match self {
             Self::Setting(target) => target.id.to_owned(),
             Self::Color(token) => format!("{COLOR_RESULT_PREFIX}{}", token.id),
+            Self::Metric(field, _) => format!("{METRIC_RESULT_PREFIX}{}", field.key),
         }
     }
 }
@@ -1415,11 +2198,18 @@ pub fn color_result(id: &str) -> Option<&'static ColorToken> {
     id.strip_prefix(COLOR_RESULT_PREFIX).and_then(color_token)
 }
 
-/// Search the available Settings targets and every color token, so one
-/// query can reach a single color directly. Matching is as in
-/// [`search_settings`]; a token also matches its ID and the words of its ID.
-/// Results are ranked best first, settings before tokens at equal score, each
-/// in registry order, and bounded by [`MAX_SEARCH_RESULTS`].
+/// The editor metric a Settings search result ID names. Only registry keys
+/// with editor metadata are accepted.
+pub fn metric_result(id: &str) -> Option<(&'static FieldSpec, &'static MetricEditor)> {
+    id.strip_prefix(METRIC_RESULT_PREFIX).and_then(metric_field)
+}
+
+/// Search the available Settings targets, every color token and every
+/// editor metric, so one query can reach a single color or metric directly.
+/// Matching is as in [`search_settings`]; a token or metric also matches the
+/// words of its ID. Results are ranked best first, then settings, tokens and
+/// metrics at equal score, each in registry order, and bounded by
+/// [`MAX_SEARCH_RESULTS`].
 pub fn search(query: &str, available: impl Fn(Requirement) -> bool) -> Vec<SearchHit> {
     let query: String = query.chars().take(MAX_SEARCH_QUERY_CHARS).collect();
     let query = query.to_lowercase();
@@ -1445,7 +2235,18 @@ pub fn search(query: &str, available: impl Fn(Requirement) -> bool) -> Vec<Searc
                 SearchHit::Color(token),
             ))
         });
-    let mut ranked: Vec<(u32, u8, usize, SearchHit)> = settings.chain(colors).collect();
+    let metrics = metric_fields()
+        .enumerate()
+        .filter_map(|(order, (field, editor))| {
+            Some((
+                metric_score(field, editor, &words)?,
+                2,
+                order,
+                SearchHit::Metric(field, editor),
+            ))
+        });
+    let mut ranked: Vec<(u32, u8, usize, SearchHit)> =
+        settings.chain(colors).chain(metrics).collect();
     ranked.sort_by(|left, right| {
         right
             .0
@@ -1469,6 +2270,19 @@ fn token_score(token: &ColorToken, words: &[&str]) -> Option<u32> {
         token.group.label(),
         &keywords,
         token.description,
+        words,
+    )
+}
+
+fn metric_score(field: &FieldSpec, editor: &MetricEditor, words: &[&str]) -> Option<u32> {
+    let mut keywords: Vec<&str> = editor.keywords.to_vec();
+    keywords.push(field.key);
+    keywords.extend(field.key.split(['.', '_']));
+    score_fields(
+        editor.label,
+        editor.group.label(),
+        &keywords,
+        field.description,
         words,
     )
 }
@@ -1697,8 +2511,63 @@ mod tests {
         let offline = |requirement| requirement == Requirement::Always;
         assert!(search("recovery", offline).iter().all(|hit| match hit {
             SearchHit::Setting(target) => target.requires == Requirement::Always,
-            SearchHit::Color(_) => true,
+            SearchHit::Color(_) | SearchHit::Metric(..) => true,
         }));
+    }
+
+    #[test]
+    fn metrics_are_direct_bounded_search_results_with_exact_ids() {
+        let all = |_| true;
+        let first = |query: &str| search(query, all).first().map(|hit| hit.id());
+        for (query, id) in [
+            ("focus width", "metric:geometry.focus_width"),
+            ("avatar roundness", "metric:geometry.avatar_roundness"),
+            ("icon size", "metric:geometry.icon_size"),
+            ("composer_padding", "metric:geometry.composer_padding"),
+            ("room list text size", "metric:typography.sidebar_size"),
+        ] {
+            assert_eq!(first(query).as_deref(), Some(id), "{query}");
+        }
+        // General words still lead with their setting or color.
+        assert_eq!(first("colour").as_deref(), Some("appearance.colors"));
+        assert_eq!(first("online").as_deref(), Some("color:presence_online"));
+        for (field, editor) in metric_fields() {
+            let id = SearchHit::Metric(field, editor).id();
+            assert_eq!(
+                metric_result(&id).map(|(found, _)| found.key),
+                Some(field.key)
+            );
+            assert!(
+                search(editor.label, all).iter().any(|hit| hit.id() == id),
+                "{} is not found by its label",
+                editor.label
+            );
+        }
+        for id in [
+            "metric:",
+            "metric:geometry.corner_radius",
+            "metric:colors.link",
+            "geometry.focus_width",
+            "METRIC:geometry.focus_width",
+            "color:geometry.focus_width",
+        ] {
+            assert!(metric_result(id).is_none(), "{id}");
+        }
+        assert!(
+            SETTING_TARGETS
+                .iter()
+                .all(|target| !target.id.starts_with(METRIC_RESULT_PREFIX))
+        );
+        for query in ["e", "size", "radius", "padding", "width"] {
+            assert!(search(query, all).len() <= MAX_SEARCH_RESULTS, "{query}");
+        }
+        // Every metric field documents a range the validator reads.
+        for (field, _) in metric_fields() {
+            assert_eq!(integer_range(field.key), field.integer_range());
+        }
+        assert_eq!(integer_range("geometry.corner_radius"), Some((0, 24)));
+        assert_eq!(integer_range("chat.layout"), None);
+        assert_eq!(integer_range("no.such.field"), None);
     }
 
     #[test]

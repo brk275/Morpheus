@@ -60,17 +60,36 @@ fn result_item(hit: SearchHit) -> SettingsResult {
             .into(),
             description: token.description.into(),
         },
+        SearchHit::Metric(field, editor) => SettingsResult {
+            id: hit.id().into(),
+            label: editor.label.into(),
+            breadcrumb: format!(
+                "Settings › Appearance › Typography, geometry and motion › {}",
+                editor.group.label()
+            )
+            .into(),
+            description: field.description.into(),
+        },
     }
 }
 
-/// Reveal the control of one registry target, or the hex field of one color
-/// token. Unknown or unavailable IDs do nothing. Returns whether a
-/// destination was requested.
+/// Reveal the control of one registry target, the hex field of one color
+/// token, or the value field of one typography or geometry metric. Unknown
+/// or unavailable IDs do nothing. Returns whether a destination was requested.
 pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
     if let Some(token) = registry::color_result(id) {
         // Selecting is presentation only; the file is not touched.
         crate::appearance_editor::select_token(ui, token);
         ui.set_settings_reveal_id(SharedString::from(COLOR_HEX_REVEAL));
+        request_settings_reveal(ui);
+        ui.set_settings_search_dismissed(true);
+        return true;
+    }
+    if let Some((field, _)) = registry::metric_result(id) {
+        // Selecting is presentation only; the file is not touched. The value
+        // field reports this result's own ID once it has focus.
+        crate::metric_editor::select_metric(ui, field.key);
+        ui.set_settings_reveal_id(SharedString::from(METRIC_VALUE_REVEAL));
         request_settings_reveal(ui);
         ui.set_settings_search_dismissed(true);
         return true;
@@ -106,6 +125,10 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
 /// The reveal ID of the selected token's hex field. It is not a search
 /// target of its own: color results reach it after selecting their token.
 pub(super) const COLOR_HEX_REVEAL: &str = "appearance.color_hex";
+
+/// The reveal ID of the selected metric's value field. Like the hex field it
+/// is reached through a metric result, which it reports once focused.
+pub(super) const METRIC_VALUE_REVEAL: &str = "appearance.metric_value";
 
 fn request_settings_reveal(ui: &AppWindow) {
     ui.set_page(1);

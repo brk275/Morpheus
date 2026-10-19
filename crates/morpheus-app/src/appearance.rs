@@ -3,14 +3,14 @@
 use std::sync::{Mutex, PoisonError};
 
 use morpheus_config::{
-    BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, MessageLayout, NavigationMode,
-    NicknameAlignment, ThemeMode, ThemePack, TimestampFormat,
+    BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, Density, DetailsSide,
+    MessageLayout, NavigationMode, NicknameAlignment, ThemeMode, ThemePack, TimestampFormat,
 };
 use slint::fontique_011::fontique;
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use super::{
-    AppWindow, BaseColorSet, ColorRole, StyleTokens, ThemeRoleSet, color_from_hex,
+    AppWindow, BaseColorSet, ColorRole, StyleTokens, ThemeRoleSet, ThemeStateSet, color_from_hex,
     save_config_change,
 };
 
@@ -20,11 +20,13 @@ use super::{
 /// the window's active account ID, which the live controller publishes only
 /// after a successful activation and clears whenever no account is active;
 /// a wrong password, a cancelled or stale switch never changes it.
-static THEME_SOURCE: Mutex<Option<Config>> = Mutex::new(None);
+/// The theme pack and per-account colors follow the same rule.
+static THEME_SOURCE: Mutex<Option<(Config, Option<ThemePack>)>> = Mutex::new(None);
 
-/// Record the last valid configuration's theme preferences.
-pub(crate) fn remember_theme_preferences(config: &Config) {
-    *THEME_SOURCE.lock().unwrap_or_else(PoisonError::into_inner) = Some(config.clone());
+/// Record the last valid configuration's theme preferences and theme pack.
+pub(crate) fn remember_theme_preferences(config: &Config, theme: Option<&ThemePack>) {
+    *THEME_SOURCE.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some((config.clone(), theme.cloned()));
 }
 
 /// Show the theme mode configured for the window's active account, or the
@@ -33,13 +35,121 @@ pub(crate) fn remember_theme_preferences(config: &Config) {
 /// while the active account overrides it.
 pub(crate) fn apply_theme_mode(ui: &AppWindow) {
     let account = ui.get_active_account_local_id();
-    let projection = {
-        let source = THEME_SOURCE.lock().unwrap_or_else(PoisonError::into_inner);
-        theme_projection_for(source.as_ref(), account.as_str())
-    };
+    let source = THEME_SOURCE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let projection =
+        theme_projection_for(source.as_ref().map(|(config, _)| config), account.as_str());
     ui.set_theme_mode(theme_mode_index(projection.effective));
     ui.set_global_theme_mode(theme_mode_index(projection.global));
     ui.set_account_theme_notice(projection.notice.into());
+    // High contrast keeps every configured border at least one pixel wide.
+    ui.global::<StyleTokens>()
+        .set_high_contrast(projection.effective == ThemeMode::HighContrast);
+    // The active account's own colors draw over the global ones. An account
+    // switch, detach or reload re-projects them, so no other account's
+    // colors stay on screen.
+    let default = (Config::default(), None);
+    let (config, theme) = source.as_ref().unwrap_or(&default);
+    apply_theme(ui, config, theme.as_ref());
+    crate::appearance_editor::refresh(ui);
+    crate::sender_palette_editor::refresh(ui);
+}
+
+/// The configuration as the active account sees its colors.
+fn account_view<'a>(config: &'a Config, account_id: &str) -> std::borrow::Cow<'a, Config> {
+    let has_colors = config
+        .account_overrides
+        .get(account_id)
+        .is_some_and(|overrides| !overrides.colors.is_empty());
+    if account_id.is_empty() || !has_colors {
+        return std::borrow::Cow::Borrowed(config);
+    }
+    let mut view = config.clone();
+    view.colors = config.colors_for(Some(account_id));
+    std::borrow::Cow::Owned(view)
+}
+
+/// The timeline clock size when `typography.timestamp_size` is omitted.
+const BUILT_IN_TIMESTAMP_SIZE: u16 = 10;
+
+/// Every typography and geometry metric as the window draws it, in logical
+/// pixels before text scaling. An omitted optional metric becomes the
+/// sentinel its surfaces read as "keep the built-in value": zero for a size,
+/// negative for a radius or roundness.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MetricProjection {
+    sidebar_font_size: f32,
+    sender_font_size: f32,
+    timestamp_font_size: f32,
+    composer_font_size: f32,
+    control_radius: f32,
+    input_radius: f32,
+    composer_radius: f32,
+    border_width: f32,
+    focus_width: f32,
+    control_padding: f32,
+    input_padding: f32,
+    composer_padding: f32,
+    icon_size: f32,
+    message_avatar_size: f32,
+    avatar_roundness: i32,
+    popup_fade_ms: i32,
+    panel_fade_ms: i32,
+}
+
+fn metric_projection(config: &Config) -> MetricProjection {
+    let (typography, geometry) = (&config.typography, &config.geometry);
+    let size = |value: Option<u16>| value.map_or(0.0, f32::from);
+    let radius = |value: Option<u16>| value.map_or(-1.0, f32::from);
+    MetricProjection {
+        sidebar_font_size: typography.sidebar_size.into(),
+        sender_font_size: size(typography.sender_size),
+        timestamp_font_size: typography
+            .timestamp_size
+            .unwrap_or(BUILT_IN_TIMESTAMP_SIZE)
+            .into(),
+        composer_font_size: size(typography.composer_size),
+        control_radius: radius(geometry.control_radius),
+        input_radius: radius(geometry.input_radius),
+        composer_radius: radius(geometry.composer_radius),
+        border_width: geometry.border_width.into(),
+        focus_width: geometry.focus_width.into(),
+        control_padding: geometry.control_padding.into(),
+        input_padding: geometry.input_padding.into(),
+        composer_padding: geometry.composer_padding.into(),
+        icon_size: geometry.icon_size.into(),
+        message_avatar_size: size(geometry.avatar_size),
+        avatar_roundness: geometry.avatar_roundness.map_or(-1, i32::from),
+        popup_fade_ms: config.appearance.popup_fade_ms.into(),
+        panel_fade_ms: config.appearance.panel_fade_ms.into(),
+    }
+}
+
+/// Apply the complete metric projection, including the sentinels of omitted
+/// metrics, so removing a value from the file restores the built-in look.
+/// Only global tokens change: model rows and the timeline are not rebuilt.
+fn apply_metrics(ui: &AppWindow, config: &Config) {
+    let metrics = metric_projection(config);
+    let tokens = ui.global::<StyleTokens>();
+    tokens.set_sidebar_font_size(metrics.sidebar_font_size);
+    tokens.set_sender_font_size(metrics.sender_font_size);
+    tokens.set_timestamp_font_size(metrics.timestamp_font_size);
+    tokens.set_composer_font_size(metrics.composer_font_size);
+    tokens.set_control_radius(metrics.control_radius);
+    tokens.set_input_radius(metrics.input_radius);
+    tokens.set_composer_radius(metrics.composer_radius);
+    tokens.set_border_width(metrics.border_width);
+    tokens.set_focus_width(metrics.focus_width);
+    tokens.set_control_padding(metrics.control_padding);
+    tokens.set_input_padding(metrics.input_padding);
+    tokens.set_composer_padding(metrics.composer_padding);
+    tokens.set_icon_size(metrics.icon_size);
+    tokens.set_message_avatar_size(metrics.message_avatar_size);
+    tokens.set_avatar_roundness(metrics.avatar_roundness);
+    tokens.set_popup_fade_ms(metrics.popup_fade_ms);
+    tokens.set_panel_fade_ms(metrics.panel_fade_ms);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -104,10 +214,13 @@ pub(crate) fn theme_mode_index(mode: ThemeMode) -> i32 {
 /// A `[colors]` override in `config.toml` wins over the theme pack, which wins
 /// over each control's built-in color.
 pub(super) fn apply_theme(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
-    let (roles, senders) = theme_projection(config, theme);
+    let account = ui.get_active_account_local_id();
+    let config = account_view(config, account.as_str());
+    let (roles, senders) = theme_projection(&config, theme);
     let tokens = ui.global::<StyleTokens>();
     tokens.set_roles(roles);
-    tokens.set_base(base_projection(config));
+    tokens.set_states(state_projection(&config, theme));
+    tokens.set_base(base_projection(&config));
     ui.set_sender_palette(ModelRc::new(VecModel::from(senders)));
 }
 
@@ -147,8 +260,12 @@ fn theme_projection(
             .or_else(|| theme.and_then(|theme| theme.roles.get(id)));
         color_role(value)
     };
-    let senders = theme
-        .and_then(|theme| theme.senders.colors.as_deref())
+    // A `config.toml` palette replaces the theme's; slots stay stable.
+    let senders = config
+        .senders
+        .colors
+        .as_deref()
+        .or_else(|| theme.and_then(|theme| theme.senders.colors.as_deref()))
         .unwrap_or_default()
         .iter()
         .map(|value| color_from_hex(value))
@@ -183,6 +300,37 @@ fn theme_projection(
         },
         senders,
     )
+}
+
+/// Interaction states: a `[colors]` override, then the theme pack's `[states]`.
+/// An absent state keeps the color each control used before it existed.
+fn state_projection(config: &Config, theme: Option<&ThemePack>) -> ThemeStateSet {
+    let state = |id: &str| {
+        let value = config
+            .colors
+            .get(id)
+            .map(String::as_str)
+            .or_else(|| theme.and_then(|theme| theme.states.get(id)));
+        color_role(value)
+    };
+    ThemeStateSet {
+        message_hover: state("message_hover"),
+        control_hover: state("control_hover"),
+        control_pressed: state("control_pressed"),
+        control_disabled: state("control_disabled"),
+        input_surface: state("input_surface"),
+        input_border: state("input_border"),
+        composer_surface: state("composer_surface"),
+        composer_border: state("composer_border"),
+        composer_focus: state("composer_focus"),
+        icon: state("icon"),
+        icon_active: state("icon_active"),
+        nav_hover: state("nav_hover"),
+        nav_selected: state("nav_selected"),
+        nav_selected_ink: state("nav_selected_ink"),
+        mention: state("mention"),
+        mention_ink: state("mention_ink"),
+    }
 }
 
 /// Fixed status for the window transparency control. Support depends on the
@@ -310,6 +458,7 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.set_rail_width_px(config.geometry.rail_width.into());
     ui.global::<StyleTokens>()
         .set_radius(config.geometry.corner_radius.into());
+    apply_metrics(ui, config);
     ui.set_message_layout(match config.chat.layout {
         MessageLayout::Stacked => 0,
         MessageLayout::Compact => 1,
@@ -380,6 +529,52 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
         if let Some(ui) = weak.upgrade() {
             let _ = save_config_change(&ui, &store_for_grouping, |config| {
                 config.layout.group_direct_messages = group;
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let store_for_side = store.clone();
+    ui.on_choose_details_side(move |index| {
+        let side = match index {
+            0 => DetailsSide::Right,
+            1 => DetailsSide::Left,
+            _ => return,
+        };
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_side, |config| {
+                config.layout.details_side = side;
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let store_for_order = store.clone();
+    ui.on_set_direct_messages_first(move |first| {
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_order, |config| {
+                config.layout.direct_messages_first = first;
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let store_for_density = store.clone();
+    ui.on_choose_pane_density(move |pane, index| {
+        let density = match index {
+            -1 => None,
+            0 => Some(Density::Compact),
+            1 => Some(Density::Comfortable),
+            2 => Some(Density::Spacious),
+            _ => return,
+        };
+        if !(0..=1).contains(&pane) {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_density, |config| {
+                if pane == 0 {
+                    config.layout.room_density = density;
+                } else {
+                    config.layout.message_density = density;
+                }
             });
         }
     });
@@ -658,6 +853,128 @@ mod theme_tests {
         );
         assert!(transparency_status(100).starts_with("Opaque"));
         assert!(transparency_status(40).contains("Not yet verified"));
+    }
+
+    #[test]
+    fn states_follow_config_then_theme_and_sender_palettes_prefer_config() {
+        // Nothing set: every state is absent, so controls keep their colors.
+        assert_eq!(
+            state_projection(&Config::default(), None),
+            ThemeStateSet::default()
+        );
+        let mut theme = morpheus_config::BuiltInStylePreset::Nocturne
+            .theme()
+            .unwrap();
+        assert_eq!(
+            state_projection(&Config::default(), Some(&theme)),
+            ThemeStateSet::default(),
+            "shipped presets set no states"
+        );
+        theme.states.mention = Some("#AA3344".into());
+        theme.states.control_pressed = Some("#00000033".into());
+        let mut config = Config::default();
+        let states = state_projection(&config, Some(&theme));
+        assert!(states.mention.present && states.control_pressed.present);
+        assert_eq!(
+            states.control_pressed.color,
+            slint::Color::from_argb_u8(0x33, 0, 0, 0)
+        );
+        assert!(!states.nav_hover.present && !states.icon.present);
+        // A config.toml override wins over the theme pack.
+        config.colors.insert("mention".into(), "#112233".into());
+        let states = state_projection(&config, Some(&theme));
+        assert_eq!(
+            states.mention.color,
+            slint::Color::from_rgb_u8(0x11, 0x22, 0x33)
+        );
+        // The config palette replaces the theme's sender colors, and its
+        // removal restores the theme palette.
+        config.senders.colors = Some(vec!["#010203".into()]);
+        let (_, senders) = theme_projection(&config, Some(&theme));
+        assert_eq!(senders, vec![slint::Color::from_rgb_u8(1, 2, 3)]);
+        config.senders.colors = None;
+        let (_, senders) = theme_projection(&config, Some(&theme));
+        assert_eq!(senders.len(), theme.senders.colors.as_ref().unwrap().len());
+    }
+
+    #[test]
+    fn omitted_metrics_project_sentinels_that_keep_built_in_surfaces() {
+        let defaults = metric_projection(&Config::default());
+        // The defaults equal the window's own built-in token values.
+        assert_eq!(
+            defaults,
+            MetricProjection {
+                sidebar_font_size: 13.0,
+                sender_font_size: 0.0,
+                timestamp_font_size: 10.0,
+                composer_font_size: 0.0,
+                control_radius: -1.0,
+                input_radius: -1.0,
+                composer_radius: -1.0,
+                border_width: 1.0,
+                focus_width: 2.0,
+                control_padding: 12.0,
+                input_padding: 10.0,
+                composer_padding: 10.0,
+                icon_size: 18.0,
+                message_avatar_size: 0.0,
+                avatar_roundness: -1,
+                popup_fade_ms: 0,
+                panel_fade_ms: 0,
+            }
+        );
+        let mut config = Config::default();
+        for (key, value) in [
+            ("typography.sender_size", 18),
+            ("typography.timestamp_size", 12),
+            ("typography.composer_size", 16),
+            ("geometry.control_radius", 0),
+            ("geometry.input_radius", 0),
+            ("geometry.composer_radius", 0),
+            ("geometry.avatar_size", 48),
+            ("geometry.avatar_roundness", 0),
+            ("geometry.border_width", 0),
+        ] {
+            config
+                .set_metric(key, morpheus_config::MetricValue::Set(value))
+                .unwrap();
+        }
+        let custom = metric_projection(&config);
+        // An explicit zero radius or roundness is a square, not an omission.
+        assert_eq!(custom.control_radius, 0.0);
+        assert_eq!(custom.input_radius, 0.0);
+        assert_eq!(custom.composer_radius, 0.0);
+        assert_eq!(custom.avatar_roundness, 0);
+        assert_eq!(custom.border_width, 0.0);
+        assert_eq!(
+            (
+                custom.sender_font_size,
+                custom.timestamp_font_size,
+                custom.composer_font_size,
+                custom.message_avatar_size
+            ),
+            (18.0, 12.0, 16.0, 48.0)
+        );
+        // Every editor metric reaches the projection: changing each one alone
+        // changes it, so no shipped metric is inert.
+        for (field, _) in morpheus_config::registry::metric_fields() {
+            let (minimum, maximum) = field.integer_range().unwrap();
+            let mut single = Config::default();
+            let value = if field.integer_default() == Some(maximum) {
+                minimum
+            } else {
+                maximum
+            };
+            single
+                .set_metric(field.key, morpheus_config::MetricValue::Set(value as u16))
+                .unwrap();
+            assert_ne!(
+                metric_projection(&single),
+                defaults,
+                "{} is inert",
+                field.key
+            );
+        }
     }
 
     #[test]

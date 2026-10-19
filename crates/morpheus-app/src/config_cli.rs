@@ -191,6 +191,11 @@ fn kind_json(kind: FieldKind) -> Value {
         FieldKind::FontFamily => json!({ "type": "font-family", "max_bytes": 128 }),
         FieldKind::ThemeName => json!({ "type": "theme-name", "max_chars": 64 }),
         FieldKind::Color => json!({ "type": "color" }),
+        FieldKind::ColorList => json!({
+            "type": "color-list",
+            "minimum": 1,
+            "maximum": morpheus_config::MAX_SENDER_COLORS,
+        }),
         FieldKind::DeviceId => json!({ "type": "device-id", "max_bytes": 4096 }),
         FieldKind::Text => json!({ "type": "string" }),
         FieldKind::TextList => json!({ "type": "string-list" }),
@@ -219,6 +224,11 @@ fn schema() -> Value {
         .filter(|token| token.source == TokenSource::Role)
         .map(|token| token.id)
         .collect::<Vec<_>>();
+    let states = COLOR_TOKENS
+        .iter()
+        .filter(|token| token.source == TokenSource::State)
+        .map(|token| token.id)
+        .collect::<Vec<_>>();
     json!({
         "format": "morpheus-config-schema",
         "schema_version": morpheus_config::SCHEMA_VERSION,
@@ -239,6 +249,17 @@ fn schema() -> Value {
             value["default"] = json!(field.default);
             value["description"] = json!(field.description);
             value["inactive"] = json!(field.inactive);
+            if let Some(editor) = &field.editor {
+                value["editor"] = json!({
+                    "group": editor.group.id(),
+                    "label": editor.label,
+                    "unit": editor.unit.spoken(),
+                    "step": editor.step,
+                    "omitted": editor.inherit.map(|inherit| inherit.text),
+                    "omitted_start": editor.inherit.map(|inherit| inherit.start),
+                    "keywords": editor.keywords,
+                });
+            }
             value
         }).collect::<Vec<_>>(),
         "color_tokens": COLOR_TOKENS.iter().map(|token| json!({
@@ -249,6 +270,7 @@ fn schema() -> Value {
             "theme_source": match token.source {
                 TokenSource::Base => "colors",
                 TokenSource::Role => "roles",
+                TokenSource::State => "states",
             },
             "fallback": fallback_json(token.fallback),
             "keywords": token.keywords,
@@ -256,6 +278,7 @@ fn schema() -> Value {
         "theme_file": {
             "required_colors": base,
             "optional_roles": roles,
+            "optional_states": states,
             "sender_colors": { "minimum": 1, "maximum": morpheus_config::MAX_SENDER_COLORS },
         },
         "window_opacity_percent": {
@@ -432,6 +455,24 @@ mod tests {
         for token in COLOR_TOKENS {
             assert!(text.contains(token.id));
         }
+        // Editor metrics carry the same metadata the Settings workspace shows.
+        let fields = value["fields"].as_array().unwrap();
+        for (field, editor) in registry::metric_fields() {
+            let entry = fields
+                .iter()
+                .find(|entry| entry["key"] == field.key)
+                .unwrap();
+            assert_eq!(entry["editor"]["label"], editor.label);
+            assert_eq!(entry["editor"]["group"], editor.group.id());
+            assert!(text.contains(field.key));
+        }
+        assert!(
+            fields
+                .iter()
+                .filter(|entry| entry.get("editor").is_some())
+                .count()
+                == registry::metric_fields().count()
+        );
         assert_eq!(run(&args(&["schema"])), 0);
         assert_eq!(run(&args(&["schema", "--json"])), 0);
     }
