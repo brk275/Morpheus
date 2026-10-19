@@ -2322,7 +2322,7 @@ async fn exercise_account_ui(runtime: Handle) {
     // A denied account-change guard also prevents any mistaken key sequence
     // from starting policy writes, account activation, or local deletion.
     let access = AccountAccessUi::register(&ui, live.clone(), runtime.clone(), || false);
-    let _pinned = crate::pinned_messages::PinnedMessagesUi::register(&ui, live.clone(), &runtime);
+    let pinned = crate::pinned_messages::PinnedMessagesUi::register(&ui, live.clone(), &runtime);
     assert_switch_readiness(&ui, &live, &access).await;
     ui.set_composer_text("untouched conversation draft".into());
     settle(&ui).await;
@@ -2809,8 +2809,10 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(manager.active_account().await.is_none());
 
     assert_removed_account_menu_projection(&ui);
+    pinned.shutdown(&ui);
     ui.hide().unwrap();
     drop(ui); // Drops the registered controller callbacks.
+    drop(pinned); // Release the explicit controller owner before checking profile teardown.
     drop(access);
     drop(live);
     tokio::time::timeout(Duration::from_secs(2), async {
