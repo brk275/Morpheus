@@ -1,16 +1,16 @@
 # TEMPORARY owner-reviewed transfer contracts. NEVER MERGE this workflow.
-name: Reviewed transfer contracts
-run-name: Reviewed transfer contracts - db18125
+name: Reviewed transfer focus
+run-name: Reviewed transfer focus - abb2991
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: transfer-contracts-db18125-${{ github.ref }}
+  group: transfer-focus-abb2991-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
-    name: Transfer contracts Linux x64
+    name: Transfer focus Linux x64
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: db181250c7faf0633082af139d8e5badfcf22515
+          ref: abb2991f8b9eb0729d388d19395baf05cdf01ff3
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='db181250c7faf0633082af139d8e5badfcf22515'
+          source='abb2991f8b9eb0729d388d19395baf05cdf01ff3'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
@@ -256,11 +256,6 @@ jobs:
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
           checks=[
-              ('core_upload_admission', ['cargo', 'test', '--locked', '-p', 'morpheus-matrix', '--lib', 'media::tests::owned_upload_rejects_cancelled_closed_and_aba_selections_before_io', '--', '--exact', '--test-threads=1'], 2700, {'media::tests::owned_upload_rejects_cancelled_closed_and_aba_selections_before_io'}, set()),
-              ('core_upload_limit_scope', ['cargo', 'test', '--locked', '-p', 'morpheus-matrix', '--lib', 'media::tests::upload_limits_reject_foreign_revoked_and_aba_selections_before_client_access', '--', '--exact', '--test-threads=1'], 2700, {'media::tests::upload_limits_reject_foreign_revoked_and_aba_selections_before_client_access'}, set()),
-              ('config_settings_routes', ['cargo', 'test', '--locked', '-p', 'morpheus-config', '--lib', 'registry::tests::setting_targets_are_unique_and_searchable_by_their_aliases', '--', '--exact', '--test-threads=1'], 2700, {'registry::tests::setting_targets_are_unique_and_searchable_by_their_aliases'}, set()),
-              ('app_attachment_workbench', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'attachment_workbench::tests::', '--', '--test-threads=1'], 2700, {'attachment_workbench::tests::staged_files_reorder_only_among_their_room_and_account', 'attachment_workbench::tests::ended_transfers_are_bounded_and_keep_no_path', 'attachment_workbench::tests::failures_use_fixed_wording_without_paths_or_server_text', 'attachment_workbench::tests::transfer_rows_never_invent_progress_or_resend_unknown_uploads', 'attachment_workbench::tests::rows_belong_to_exactly_one_account_and_room', 'attachment_workbench::tests::download_admission_is_rechecked_and_failed_history_stays_bounded', 'attachment_workbench::tests::only_unqueued_failures_and_paused_uploads_offer_retry', 'attachment_workbench::tests::upload_cancel_survives_a_full_click_queue_without_a_busy_loop', 'attachment_workbench::tests::room_admission_keeps_order_through_middle_cancellation_and_retry', 'attachment_workbench::tests::progress_is_a_bounded_percentage'}, set()),
-              ('app_attachments', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'attachments::tests::', '--', '--test-threads=1'], 2700, {'attachments::tests::download_save_refuses_symlinks_including_dangling_targets', 'attachments::tests::download_save_never_overwrites_an_existing_entry', 'attachments::tests::cancellation_while_waiting_for_a_save_guard_never_writes', 'attachments::tests::suggested_save_names_cannot_escape_or_disguise_the_chosen_folder'}, set()),
               ('app_transfer_private_ui', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', '--', '--exact', '--test-threads=1'], 2700, {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}, set()),
               ('native_app_build', ['cargo', 'build', '--locked', '-p', 'morpheus-app', '--features', 'native-calls'], 2400, None, set()),
           ]
@@ -388,6 +383,8 @@ jobs:
                       locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
                   missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
                   record['failure_diagnostics']={
+                      'ui_settings_target_failures':[{'stage':int(stage),'index':int(index),'live':live=='true'}
+                          for stage,index,live in re.findall(r'MORPHEUS_SETTINGS_TARGET_FAILURE stage=([01]) index=([0-9]{1,3}) live=(true|false)',output)[:8]],
                       'source_locations':locations,
                       'missing_public_identifiers':sorted(missing & public_identifiers)[:32],
                       'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
