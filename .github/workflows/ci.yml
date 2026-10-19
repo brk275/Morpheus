@@ -1,13 +1,13 @@
 # TEMPORARY narrowly scoped customization expansion verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
 name: Reviewed customization expansion
-run-name: Customization expansion - 8126716
+run-name: Customization native UI diagnosis - 8126716
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: customization-expansion-8126716
+  group: customization-native-ui-8126716
   cancel-in-progress: false
 jobs:
   native:
@@ -390,48 +390,11 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          needed_app={
-              'metric_editor::tests::groups_list_every_metric_once_and_filters_match_every_word',
-              'metric_editor::tests::typed_values_must_be_whole_numbers_inside_the_registry_range',
-              'sender_palette_editor::tests::contrast_composites_the_sender_color_over_the_conversation_background',
-              'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-              'discovery_tests::timeline_link_handler_accepts_only_browser_urls',
-              'discovery_tests::call_stage_uses_joined_room_even_after_chat_navigation',
-              'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
-              'video_render::tests::screen_share_is_featured_while_cameras_stay_in_a_bounded_filmstrip',
-              'video_render::tests::hidden_stage_pauses_every_remote_stream_and_drops_pictures',
-              'video_render::tests::released_slot_discards_a_late_conversion',
-              'local_video::tests::signaling_gate_withholds_frames_without_an_owner_or_stop',
-              'local_video::tests::transmission_pause_serializes_with_pushes_and_stale_resumes',
-              'call_recovery::tests::only_running_sticky_sync_may_transmit',
-              'calls::tests::recovering_calls_keep_blocking_account_switches',
-              'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
-          }
-          needed_rtc={
-              'tests::build_capability_matches_feature','tests::device_capability_matches_features',
-              'audio_device::tests::signaling_gate_withholds_audio_without_an_owner_or_revocation',
-              'audio_device::tests::paused_transmission_withholds_audio_and_keeps_the_requested_mute_state',
-              'reconnect::tests::no_attempt_starts_at_or_after_the_budget',
-              'reconnect::tests::deliberate_removals_are_not_treated_as_connection_loss',
-              'video_device::tests::cancelled_camera_open_returns_before_native_enumeration',
-              'video_device::tests::camera_permission::stop_while_permission_is_pending_drops_late_grant',
-          }
-          allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
-          needed_config={
-              'tests::every_editor_metric_is_a_bounded_field_with_one_accessor',
-              'tests::metric_edits_reject_invalid_files_without_repeating_values_and_recover',
-              'tests::config_sender_palette_is_bounded_round_trips_and_survives_presets',
-              'tests::account_colors_layer_over_global_colors_for_that_account_only',
-              'registry::tests::metrics_are_direct_bounded_search_results_with_exact_ids',
-          }
+          needed_app={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}
           checks=(
-              ('native_ui_compile',['cargo','check','--locked','-p','morpheus-ui-check'],20*60,None,set()),
-              ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib',
-                  '--','--test-threads=1'],10*60,needed_config,set()),
-              ('appearance_examples',['cargo','test','--locked','-p','morpheus-config','--test','appearance_example',
-                  '--','--test-threads=1'],10*60,{'style_examples_are_valid_and_use_registry_metrics','sparse_appearance_example_uses_supported_settings'},set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
+                  '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
+                  '--','--exact','--test-threads=1'],40*60,needed_app,set()),
           )
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
@@ -501,7 +464,8 @@ jobs:
                   # Only known public production file names and numeric spans.
                   # Never publish compiler text, source snippets or raw paths.
                   ui_files=('crates/morpheus-app/ui/app-window.slint',
-                      'crates/morpheus-app/ui/call-stage.slint')
+                      'crates/morpheus-app/ui/call-stage.slint',
+                      'crates/morpheus-app/src/account_access_ui_tests.rs')
                   ui_locations=[]
                   for path in ui_files:
                       line_limit=len((workspace/path).read_text().splitlines())+1
