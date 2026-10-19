@@ -2630,6 +2630,23 @@ async fn assert_metric_workspace_and_extremes(ui: &AppWindow, directory: &std::p
         reply[0]
     );
 
+    // A download's cancel action follows the shared button metrics instead
+    // of being squeezed into a fixed-height notice. No save is started.
+    let previous_notice = ui.get_transfer_notice();
+    let previous_download = ui.get_downloading_event_id();
+    ui.set_transfer_notice("Preparing synthetic attachment".into());
+    ui.set_downloading_event_id("$synthetic-download:example.org".into());
+    for scale in [100, 200] {
+        ui.set_font_scale_percent(scale);
+        settle(ui).await;
+        let cancel = control_bounds(ui, "Cancel saving the attachment");
+        assert_eq!(cancel.len(), 1);
+        assert!(cancel[0].bottom - cancel[0].top >= 32.0 * scale as f32 / 100.0 - 0.5);
+        assert!(inside_window(ui, cancel[0]));
+    }
+    ui.set_transfer_notice(previous_notice);
+    ui.set_downloading_event_id(previous_download);
+
     ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
     ui.set_thread_root_id("".into());
     ui.set_thread_root_sender("".into());

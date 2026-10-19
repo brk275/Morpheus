@@ -4700,9 +4700,10 @@ export component AppWindow inherits Window {
                 }
                 if root.transfer-notice != "" : Rectangle {
                     property <color> notice-ink: StyleTokens.roles.success-ink.present ? StyleTokens.roles.success-ink.color : #ffffff;
-                    height: 30px;
+                    height: max(30px, transfer-copy.preferred-height + 8px,
+                        root.downloading-event-id != "" ? save-cancel.min-height + 6px : 0px);
                     background: StyleTokens.roles.success-surface.present ? StyleTokens.roles.success-surface.color : #214a46;
-                    Text {
+                    transfer-copy := Text {
                         x: 16px; width: parent.width - 32px - (root.downloading-event-id != "" ? save-cancel.width + 8px : 0px);
                         text: root.transfer-notice;
                         accessible-live-region: polite;
@@ -4714,7 +4715,9 @@ export component AppWindow inherits Window {
                     save-cancel := TextAction {
                         visible: root.downloading-event-id != "";
                         enabled: root.downloading-event-id != "";
-                        x: parent.width - self.width - 12px; y: 3px; width: self.preferred-width; height: 24px;
+                        x: parent.width - self.width - 12px;
+                        y: (parent.height - self.height) / 2;
+                        width: self.preferred-width; height: self.min-height;
                         text: "Cancel"; label: "Cancel saving the attachment";
                         ink: parent.notice-ink; muted: parent.notice-ink; surface: transparent;
                         hover-surface: root.hover; outline: parent.notice-ink; text-scale: root.text-scale;
