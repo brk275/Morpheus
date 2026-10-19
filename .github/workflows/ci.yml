@@ -1,12 +1,12 @@
 # TEMPORARY owner-reviewed search contracts. NEVER MERGE this workflow.
 name: Reviewed search contracts
-run-name: Reviewed search contracts - 3cb8cb2 - remaining
+run-name: Reviewed search contracts - 182d3f3
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: search-contracts-3cb8cb2-${{ github.ref }}
+  group: search-contracts-182d3f3-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 3cb8cb2af7be64905fd5cae51aaf3957ab60ab08
+          ref: 182d3f3aad4bfa89ffe2f6a25e2427da0e22eda2
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='3cb8cb2af7be64905fd5cae51aaf3957ab60ab08'
+          source='182d3f3aad4bfa89ffe2f6a25e2427da0e22eda2'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
@@ -256,7 +256,8 @@ jobs:
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
           checks=[
-              ('sdk_replacement_indexing', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'search_index::tests::', '--', '--test-threads=1'], 2700, {'search_index::tests::test_sync_stable_poll_is_indexed', 'search_index::tests::test_sync_media_message_is_indexed', 'search_index::tests::test_search_index_edit_ordering', 'search_index::tests::test_sync_message_is_indexed', 'search_index::tests::test_sync_sticker_and_poll_are_indexed', 'search_index::tests::test_search_index_ignores_cross_sender_edit', 'search_index::tests::test_search_index_replacements_keep_original_date_and_visible_body'}, set()),
+              ('sdk_search_index', ['cargo', 'test', '--locked', '-p', 'matrix-sdk-search', '--lib', 'index::tests::', '--', '--test-threads=1'], 2700, {'index::tests::test_index_add_idempotency', 'index::tests::test_add_event_with_raw_malformed_timestamp_must_not_panic', 'index::tests::test_index_contains_false', 'index::tests::test_index_contains_true', 'index::tests::test_bulk_add_then_edit_same_event_keeps_it_indexed', 'index::tests::test_search_populated_index', 'index::tests::test_add_event_with_malformed_timestamp_must_not_panic', 'index::tests::test_search_empty_index', 'index::tests::test_edit_removes_old_and_adds_new_event', 'index::tests::test_add_event_with_no_timestamp', 'index::tests::test_remove_event', 'index::tests::test_indexable_event_timestamp_is_capped', 'index::tests::test_add_event', 'index::tests::test_search_filtered_uses_typed_sender_and_date_queries'}, set()),
+              ('sdk_replacement_indexing', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'search_index::tests::', '--', '--test-threads=1'], 2700, {'search_index::tests::test_search_index_edit_ordering', 'search_index::tests::test_sync_sticker_and_poll_are_indexed', 'search_index::tests::test_search_index_replacements_keep_original_date_and_visible_body', 'search_index::tests::test_sync_stable_poll_is_indexed', 'search_index::tests::test_sync_media_message_is_indexed', 'search_index::tests::test_search_index_ignores_cross_sender_edit', 'search_index::tests::test_store_kind_debug_keeps_credentials_out_of_parent_diagnostics', 'search_index::tests::test_sync_message_is_indexed', 'search_index::tests::test_redactions_restore_the_surviving_edit_without_reviving_the_original'}, set()),
               ('core_search', ['cargo', 'test', '--locked', '-p', 'morpheus-matrix', '--lib', 'search::tests::', '--', '--test-threads=1'], 2400, {'search::tests::filters_are_bounded_validated_and_never_printed', 'search::tests::filters_only_searches_need_an_indexed_filter_and_until_stays_on_loaded_hits', 'search::tests::rooms_merge_newest_first_with_a_stable_tie_order'}, set()),
               ('app_search', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'message_search::tests::', '--', '--test-threads=1'], 2700, {'message_search::tests::date_boundary_crosses_a_skipped_following_day_and_bounds_missing_time', 'message_search::tests::date_boundary_finds_a_missing_midnight_without_rounding_the_gap', 'message_search::tests::search_result_display_sanitizes_untrusted_text_without_changing_ids', 'message_search::tests::date_filters_name_whole_local_days_and_refuse_malformed_text', 'message_search::tests::date_filters_clip_only_the_pre_epoch_part_of_a_local_day', 'message_search::tests::context_keeps_the_hit_near_the_top_and_stays_bounded'}, set()),
               ('app_search_ui', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', '--', '--exact', '--test-threads=1'], 2400, {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}, set()),
