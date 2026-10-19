@@ -324,6 +324,49 @@ export component VerificationRequestBanner inherits Rectangle {
     }
 }
 
+// Shown when another person asks to verify identities with this account.
+// Review accepts only the request to compare; nothing is trusted from here.
+export component PersonVerificationBanner inherits Rectangle {
+    in property <EncryptionPalette> palette;
+    in property <float> text-scale: 1;
+    // Display name, or the user ID when the person has none.
+    in property <string> name;
+    in property <bool> can-review: true;
+    callback review();
+    callback dismiss();
+
+    background: root.palette.panel;
+    height: row.preferred-height;
+
+    row := HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        spacing: 8px;
+        Text {
+            text: root.name + " wants to verify identities with you. Review only if you expected this.";
+            color: root.palette.ink;
+            font-size: 11px * root.text-scale;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        Button {
+            text: "Review";
+            enabled: root.can-review;
+            accessible-label: "Review the verification request from " + root.name;
+            clicked => { root.review(); }
+        }
+        Button {
+            text: "Not now";
+            accessible-label: "Hide the verification request from " + root.name;
+            clicked => { root.dismiss(); }
+        }
+    }
+}
+
 // Warns that a member of the open room has a changed identity. Accepting a
 // changed identity or withdrawing a lost verification is the person's
 // explicit choice; there is no dismiss, because the warning stays until the

@@ -227,7 +227,7 @@ fn ordered(
 
 /// One display line without control, invisible or direction-override
 /// characters, at most [`MAX_NAME_CHARS`].
-fn bounded_name(name: &str) -> Option<String> {
+pub(crate) fn bounded_name(name: &str) -> Option<String> {
     let cleaned: String = name
         .chars()
         .filter(|character| {

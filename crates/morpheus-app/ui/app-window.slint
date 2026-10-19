@@ -1,5 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
-import { EncryptionDevices, EncryptionPalette, IdentityWarningBanner, SasVerificationPanel, TrustedDeviceItem, VerificationRequestBanner } from "encryption-center.slint";
+import { EncryptionDevices, EncryptionPalette, IdentityWarningBanner, PersonVerificationBanner, SasVerificationPanel, TrustedDeviceItem, VerificationRequestBanner } from "encryption-center.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -2198,6 +2198,12 @@ export component AppWindow inherits Window {
     in-out property <int> identity-warning-others: 0;
     in-out property <bool> identity-warning-busy: false;
     in-out property <string> identity-warning-error;
+    // Newest pending verification request from another person
+    // (src/person_requests.rs) and the one the person chose to hide.
+    in-out property <string> person-request-user;
+    in-out property <string> person-request-name;
+    in-out property <string> person-request-flow;
+    in-out property <string> person-request-dismissed;
     property <EncryptionPalette> encryption-palette: {
         ink: root.ink,
         muted: root.muted,
@@ -2504,6 +2510,8 @@ export component AppWindow inherits Window {
     callback identity-scope-changed();
     callback acknowledge-identity-warning();
     callback verify-identity-warning();
+    callback person-request-scope-changed();
+    callback review-person-request();
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
@@ -2594,6 +2602,9 @@ export component AppWindow inherits Window {
     // Identity warnings follow exactly one live account and room view.
     property <string> identity-scope: (root.live-session ? "live" : "") + "\n" + root.active-account-local-id + "\n" + root.active-room-id;
     changed identity-scope => { root.identity-scope-changed(); }
+    // Requests from other people belong to one live account.
+    property <string> person-request-scope: (root.live-session ? "live" : "") + "\n" + root.active-account-local-id;
+    changed person-request-scope => { root.person-request-scope-changed(); }
     property <bool> composer-focus-thread: false;
     property <int> composer-focus-request: 0;
 
@@ -3470,6 +3481,20 @@ export component AppWindow inherits Window {
                         root.settings-search-choose("security.recovery");
                     }
                     dismiss => { root.encryption-incoming-dismissed = root.encryption-incoming-flow-id; }
+                }
+                if root.live-session && root.page == 0 && root.sas-stage == 0 && root.person-request-flow != "" && root.person-request-flow != root.person-request-dismissed : PersonVerificationBanner {
+                    palette: root.encryption-palette;
+                    text-scale: root.text-scale;
+                    name: root.person-request-name;
+                    can-review: !root.sas-busy && !root.security-busy && root.security-recovery-key == "";
+                    // The comparison runs in the verification panel in Security settings.
+                    review => {
+                        root.review-person-request();
+                        root.person-request-dismissed = root.person-request-flow;
+                        root.open-security();
+                        root.settings-search-choose("security.recovery");
+                    }
+                    dismiss => { root.person-request-dismissed = root.person-request-flow; }
                 }
                 if root.live-session && root.page == 0 && root.identity-warning-user != "" : IdentityWarningBanner {
                     palette: root.encryption-palette;

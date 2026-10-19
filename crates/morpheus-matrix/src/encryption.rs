@@ -4,7 +4,7 @@
 //! trusts a device or person by itself: trust changes only through a SAS flow
 //! the user compared and confirmed on both sides.
 
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use futures_util::{StreamExt, stream::BoxStream};
 use matrix_sdk::{
@@ -13,23 +13,68 @@ use matrix_sdk::{
         recovery::RecoveryState,
         verification::{SasVerification, VerificationRequest},
     },
+    event_handler::EventHandlerHandle,
     ruma::{
         OwnedDeviceId,
-        events::key::verification::{VerificationMethod, cancel::CancelCode},
+        events::{
+            key::verification::{VerificationMethod, cancel::CancelCode},
+            room::message::{MessageType, OriginalSyncRoomMessageEvent},
+        },
     },
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use crate::{
     AccountManager, MatrixCoreError, RecoveryKey, Result, VerificationInfo, find_sas,
-    find_verification_request, parse_user_id, selected_loaded_for, verification_info,
+    find_verification_request, identity_warnings::bounded_name, parse_user_id, selected_loaded_for,
+    verification_info,
 };
 
 /// Bound for one device-list snapshot shown in Settings.
 const MAX_OWN_DEVICES: usize = 200;
 /// Direct chats with one user checked before asking them to verify.
 const MAX_DIRECT_CHATS: usize = 16;
+/// Incoming verification requests from other people kept per account.
+const MAX_PERSON_REQUESTS: usize = 8;
+
+/// A verification request another person sent this account in a room.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonVerificationRequest {
+    pub user_id: String,
+    /// Bounded, sanitized room display name, if the person has one.
+    pub display_name: Option<String>,
+    pub flow_id: String,
+}
+
+/// Follows verification requests other people send this account. Nothing is
+/// accepted here. Dropping it removes the SDK event handler.
+pub struct PersonRequestWatch {
+    client: Client,
+    handler: Option<EventHandlerHandle>,
+    requests: Arc<watch::Sender<Vec<PersonVerificationRequest>>>,
+}
+
+impl PersonRequestWatch {
+    pub fn subscribe(&self) -> watch::Receiver<Vec<PersonVerificationRequest>> {
+        self.requests.subscribe()
+    }
+
+    /// Forget a request that ended, was reviewed or is no longer pending.
+    pub fn retire(&self, flow_id: &str) {
+        self.requests
+            .send_modify(|known| known.retain(|request| request.flow_id != flow_id));
+    }
+}
+
+impl Drop for PersonRequestWatch {
+    fn drop(&mut self) {
+        if let Some(handler) = self.handler.take() {
+            self.client.remove_event_handler(handler);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -353,6 +398,64 @@ impl AccountManager {
         Ok(verification_info(&request))
     }
 
+    /// Follow verification requests other people send this account in its
+    /// rooms, newest last, at most [`MAX_PERSON_REQUESTS`]. Only pending
+    /// requests addressed to this account are kept; the person reviews each.
+    pub async fn watch_person_verification_requests_for(
+        &self,
+        expected_account_id: &str,
+    ) -> Result<PersonRequestWatch> {
+        let client = self.encryption_client_for(expected_account_id).await?;
+        let own = client
+            .user_id()
+            .ok_or(MatrixCoreError::NoActiveAccount)?
+            .to_owned();
+        let (sender, _) = watch::channel(Vec::<PersonVerificationRequest>::new());
+        let requests = Arc::new(sender);
+        let sender = requests.clone();
+        let handler = client.add_event_handler(
+            move |event: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
+                let own = own.clone();
+                let sender = sender.clone();
+                async move {
+                    let MessageType::VerificationRequest(content) = &event.content.msgtype else {
+                        return;
+                    };
+                    if event.sender == own || content.to != own {
+                        return;
+                    }
+                    let flow_id = event.event_id.to_string();
+                    let Some(request) = client
+                        .encryption()
+                        .get_verification_request(&event.sender, &flow_id)
+                        .await
+                    else {
+                        return;
+                    };
+                    let info = verification_info(&request);
+                    if info.we_started || info.is_done || info.is_cancelled {
+                        return;
+                    }
+                    let display_name = match room.get_member_no_sync(&event.sender).await {
+                        Ok(Some(member)) => member.display_name().and_then(bounded_name),
+                        _ => None,
+                    };
+                    let request = PersonVerificationRequest {
+                        user_id: event.sender.to_string(),
+                        display_name,
+                        flow_id,
+                    };
+                    sender.send_modify(|known| remember_person_request(known, request));
+                }
+            },
+        );
+        Ok(PersonRequestWatch {
+            client,
+            handler: Some(handler),
+            requests,
+        })
+    }
+
     /// Report that the compared SAS values differ. The SDK cancels the flow
     /// with a mismatch reason on both devices; nothing is signed.
     pub async fn sas_mismatch_for(
@@ -483,6 +586,19 @@ fn needs_attention(trust: DeviceTrust) -> bool {
     matches!(trust, DeviceTrust::Unverified | DeviceTrust::NoKeys)
 }
 
+/// One entry per flow, newest last, at most [`MAX_PERSON_REQUESTS`]; a
+/// repeated flow moves to the end instead of appearing twice.
+fn remember_person_request(
+    known: &mut Vec<PersonVerificationRequest>,
+    request: PersonVerificationRequest,
+) {
+    known.retain(|existing| existing.flow_id != request.flow_id);
+    known.push(request);
+    if known.len() > MAX_PERSON_REQUESTS {
+        known.remove(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +648,29 @@ mod tests {
         ] {
             assert_eq!(cancel_kind(&code), kind, "{code:?}");
         }
+    }
+
+    fn person_request(flow: usize) -> PersonVerificationRequest {
+        PersonVerificationRequest {
+            user_id: "@member:example.org".into(),
+            display_name: None,
+            flow_id: format!("$flow{flow}"),
+        }
+    }
+
+    #[test]
+    fn person_requests_keep_one_entry_per_flow_and_stay_bounded() {
+        let mut known = Vec::new();
+        for flow in 0..MAX_PERSON_REQUESTS + 3 {
+            remember_person_request(&mut known, person_request(flow));
+        }
+        assert_eq!(known.len(), MAX_PERSON_REQUESTS);
+        assert_eq!(known[0], person_request(3), "the oldest drop first");
+        // A repeated delivery of a kept flow moves it to the end, never twice.
+        remember_person_request(&mut known, person_request(5));
+        assert_eq!(known.len(), MAX_PERSON_REQUESTS);
+        assert_eq!(known.last(), Some(&person_request(5)));
+        let repeats = known.iter().filter(|r| r.flow_id == "$flow5").count();
+        assert_eq!(repeats, 1);
     }
 }

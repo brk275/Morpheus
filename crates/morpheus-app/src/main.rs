@@ -29,6 +29,7 @@ mod navigation;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
+mod person_requests;
 #[cfg(debug_assertions)]
 mod preview_capture;
 mod room_settings;

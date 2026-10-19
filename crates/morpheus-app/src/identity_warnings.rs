@@ -41,7 +41,11 @@ fn scope(ui: &AppWindow) -> Option<(String, String)> {
 }
 
 fn stop_watcher() {
-    if let Some(task) = WATCHER.lock().unwrap_or_else(|error| error.into_inner()).take() {
+    let previous = WATCHER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(task) = previous {
         task.abort();
     }
 }

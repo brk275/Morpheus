@@ -387,6 +387,73 @@ pub(crate) fn request_user(
     });
 }
 
+/// Accept a verification request another person sent, after the person here
+/// chose Review. Accepting only agrees to compare: the requester starts the
+/// comparison and nothing is trusted until both sides confirm.
+pub(crate) fn accept_person(
+    ui: &AppWindow,
+    live: Arc<LiveUi>,
+    handle: &Handle,
+    user_id: String,
+    flow_id: String,
+    name: String,
+) {
+    if !ui.get_live_session()
+        || ui.get_sas_stage() != IDLE
+        || ui.get_sas_busy()
+        || ui.get_security_busy()
+        || !ui.get_security_recovery_key().is_empty()
+        || live.security_gate.blocked()
+    {
+        return;
+    }
+    let account_id = ui.get_active_account_local_id().to_string();
+    if account_id.is_empty() || user_id.is_empty() || flow_id.is_empty() {
+        return;
+    }
+    let operation = next_operation(ui);
+    ui.set_sas_busy(true);
+    ui.set_sas_error("".into());
+    ui.set_sas_notice("".into());
+    let weak = ui.as_weak();
+    let flow_live = live.clone();
+    let flow_handle = handle.clone();
+    handle.spawn(async move {
+        let _transition = live.account_transition.lock().await;
+        if !active_account_is(&live, &account_id).await {
+            return;
+        }
+        let result = live
+            .manager
+            .accept_verification_request(&user_id, &flow_id)
+            .await;
+        let _ = weak.upgrade_in_event_loop(move |window| {
+            if !same_account(&window, &account_id, operation) {
+                return;
+            }
+            window.set_sas_busy(false);
+            match result {
+                Ok(()) => {
+                    let info = VerificationInfo {
+                        flow_id,
+                        other_user_id: user_id,
+                        we_started: false,
+                        is_ready: true,
+                        is_done: false,
+                        is_cancelled: false,
+                    };
+                    let notice = format!("Accepted. Waiting for {name} to start the comparison.");
+                    begin_flow(&window, &flow_live, &flow_handle, info, notice);
+                    window.set_sas_peer(name.into());
+                }
+                Err(_) => window.set_sas_error(
+                    "Could not accept this request. It may have expired.".into(),
+                ),
+            }
+        });
+    });
+}
+
 /// Check the visible flow's progress. The watcher passes the flow it saw
 /// finish: that check runs even while another action is pending, because a
 /// finished flow must retire at once; every other check waits for pending
