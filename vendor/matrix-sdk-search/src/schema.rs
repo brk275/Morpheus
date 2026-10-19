@@ -61,7 +61,7 @@ impl MatrixSearchIndexSchema for RoomMessageSchema {
     fn new() -> Self {
         let mut schema = Schema::builder();
         let event_id_field = schema.add_text_field("event_id", STORED | STRING);
-        let original_event_id_field = schema.add_text_field("original_event_id", STRING);
+        let original_event_id_field = schema.add_text_field("original_event_id", STORED | STRING);
         let body_field = schema.add_text_field("body", TEXT);
 
         let date_options =

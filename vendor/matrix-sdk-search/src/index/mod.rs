@@ -438,6 +438,38 @@ impl RoomIndex {
         Ok(events)
     }
 
+    /// Resolve an indexed replacement to its original after redaction has
+    /// stripped the relation from the cached event. The lookup is one typed
+    /// primary-key query, never a scan or an interpolated query string.
+    pub fn original_event_id(
+        &self,
+        event_id: &EventId,
+    ) -> Result<Option<OwnedEventId>, IndexError> {
+        if self.uncommitted_removes.contains(event_id) {
+            return Ok(None);
+        }
+        if let Some(original) = self.uncommitted_adds.get(event_id) {
+            return Ok(Some(original.clone()));
+        }
+        let searcher = self.reader()?.searcher();
+        let term = Term::from_field_text(self.schema.primary_key(), event_id.as_str());
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let Some((_, address)) =
+            searcher.search(&query, &TopDocs::with_limit(1))?.into_iter().next()
+        else {
+            return Ok(None);
+        };
+        let doc: TantivyDocument = searcher.doc(address)?;
+        let invalid =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "search index requires repair");
+        let original = doc
+            .get_first(self.schema.deletion_key())
+            .and_then(|value| value.as_str())
+            .ok_or_else(invalid)?;
+        let original = OwnedEventId::try_from(original).map_err(|_| invalid())?;
+        Ok(Some(original))
+    }
+
     fn events_to_be_removed(&self, event_id: &EventId) -> Result<Vec<OwnedEventId>, IndexError> {
         Ok(self
             .search(
@@ -1023,6 +1055,7 @@ mod tests {
         index_message(&mut index, old_event)?;
 
         assert!(index.contains(old_event_id), "Index should contain event");
+        assert_eq!(index.original_event_id(old_event_id)?.as_deref(), Some(old_event_id));
 
         let new_event_id = event_id!("$new_event_id:localhost");
         let edit = f
@@ -1038,6 +1071,10 @@ mod tests {
 
         assert!(!index.contains(old_event_id), "Index should not contain old event");
         assert!(index.contains(new_event_id), "Index should contain edited event");
+        assert_eq!(index.original_event_id(new_event_id)?.as_deref(), Some(old_event_id));
+        assert_eq!(index.original_event_id(old_event_id)?, None);
+        index_remove(&mut index, old_event_id)?;
+        assert_eq!(index.original_event_id(new_event_id)?, None);
 
         Ok(())
     }

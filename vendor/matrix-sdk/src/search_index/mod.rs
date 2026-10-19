@@ -247,8 +247,9 @@ impl SearchIndexGuard<'_> {
         room_id: &RoomId,
         redaction_rules: &RedactionRules,
     ) -> Result<(), IndexError> {
+        let original = self.original_redaction_target(&event, room_id, redaction_rules)?;
         if let Some(index_operation) =
-            parse_timeline_event(room_cache, event, redaction_rules).await
+            parse_timeline_event(room_cache, event, redaction_rules, original).await
         {
             self.execute(index_operation, room_id)
         } else {
@@ -268,11 +269,37 @@ impl SearchIndexGuard<'_> {
     where
         T: Iterator<Item = TimelineEvent>,
     {
-        let futures = events.map(|ev| parse_timeline_event(room_cache, ev, redaction_rules));
+        let events = events
+            .map(|event| {
+                self.original_redaction_target(&event, room_id, redaction_rules)
+                    .map(|original| (event, original))
+            })
+            .collect::<Result<Vec<_>, IndexError>>()?;
+        let futures = events.into_iter().map(|(event, original)| {
+            parse_timeline_event(room_cache, event, redaction_rules, original)
+        });
 
         let operations: Vec<_> = join_all(futures).await.into_iter().flatten().collect();
 
         self.bulk_execute(operations, room_id)
+    }
+
+    fn original_redaction_target(
+        &self,
+        event: &TimelineEvent,
+        room_id: &RoomId,
+        rules: &RedactionRules,
+    ) -> Result<Option<OwnedEventId>, IndexError> {
+        let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(event))) =
+            event.raw().deserialize()
+        else {
+            return Ok(None);
+        };
+        let Some(target) = event.redacts(rules) else { return Ok(None) };
+        match self.index_map.get(room_id) {
+            Some(index) => index.original_event_id(target),
+            None => Ok(None),
+        }
     }
 }
 
@@ -284,8 +311,19 @@ async fn get_most_recent_edit(
     cache: &RoomEventCache,
     original: &EventId,
 ) -> Option<(OriginalSyncRoomMessageEvent, Option<MilliSecondsSinceUnixEpoch>)> {
+    get_most_recent_edit_excluding(cache, original, None).await
+}
+
+async fn get_most_recent_edit_excluding(
+    cache: &RoomEventCache,
+    original: &EventId,
+    excluded: Option<&EventId>,
+) -> Option<(OriginalSyncRoomMessageEvent, Option<MilliSecondsSinceUnixEpoch>)> {
     use ruma::events::{AnySyncTimelineEvent, relation::RelationType};
 
+    if excluded == Some(original) {
+        return None;
+    }
     let Ok(Some((original_ev, related))) =
         cache.find_event_with_relations(original, Some(vec![RelationType::Replacement])).await
     else {
@@ -300,6 +338,17 @@ async fn get_most_recent_edit(
         .iter()
         .rev()
         .find(|edit| {
+            if edit.event_id().is_some_and(|id| excluded == Some(id.as_ref())) {
+                return false;
+            }
+            if !matches!(
+                edit.raw().deserialize(),
+                Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                    SyncRoomMessageEvent::Original(_)
+                )))
+            ) {
+                return false;
+            }
             check_validity_of_replacement_events(
                 original_ev.raw(),
                 original_ev.encryption_info().map(|info| &**info),
@@ -421,8 +470,24 @@ async fn handle_room_redaction(
     event: SyncRoomRedactionEvent,
     cache: &RoomEventCache,
     rules: &RedactionRules,
+    indexed_original: Option<OwnedEventId>,
 ) -> Option<RoomIndexOperation> {
     let redacted_event_id = event.redacts(rules)?;
+
+    // Cache redaction removes m.relates_to. The encrypted index retains the
+    // original ID so the surviving valid version can still be restored.
+    if let Some(original) = indexed_original {
+        let recent =
+            get_most_recent_edit_excluding(cache, &original, Some(redacted_event_id)).await;
+        return Some(
+            match recent
+                .and_then(|(event, timestamp)| indexable_from_room_message(&event, timestamp))
+            {
+                Some(event) => RoomIndexOperation::Edit(original, event),
+                None => RoomIndexOperation::Remove(original),
+            },
+        );
+    }
 
     // If the redacted event was a room message edit, re-add the most recent
     // remaining version instead of just removing it.
@@ -529,6 +594,7 @@ async fn parse_timeline_event(
     cache: &RoomEventCache,
     event: TimelineEvent,
     redaction_rules: &RedactionRules,
+    redaction_original: Option<OwnedEventId>,
 ) -> Option<RoomIndexOperation> {
     use ruma::events::AnySyncTimelineEvent;
 
@@ -545,7 +611,7 @@ async fn parse_timeline_event(
                     handle_room_message(event, cache).await
                 }
                 AnySyncMessageLikeEvent::RoomRedaction(event) => {
-                    handle_room_redaction(event, cache, redaction_rules).await
+                    handle_room_redaction(event, cache, redaction_rules, redaction_original).await
                 }
                 AnySyncMessageLikeEvent::Sticker(event) => handle_sticker(event, timestamp),
                 AnySyncMessageLikeEvent::PollStart(event) => handle_poll_start(event, timestamp),
@@ -972,6 +1038,69 @@ mod tests {
                 assert_eq!(newest[0].0, at(2_000).unwrap());
             }
         }
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_redactions_restore_the_surviving_edit_without_reviving_the_original() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        client.event_cache().subscribe().unwrap();
+        let room_id = room_id!("!redaction-fixture:localhost");
+        let original = event_id!("$repair-original");
+        let older = event_id!("$repair-older");
+        let newer = event_id!("$repair-newer");
+        let f = EventFactory::new().room(room_id).sender(user_id!("@fixture:localhost"));
+        let edit = |id, body, timestamp| {
+            f.text_msg(body)
+                .edit(original, RoomMessageEventContentWithoutRelation::text_plain(body))
+                .event_id(id)
+                .server_ts(timestamp)
+                .into_raw_sync()
+        };
+        let room = server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_bulk(vec![
+                    f.text_msg("firsttext").event_id(original).server_ts(1_000_u64).into_raw_sync(),
+                    edit(older, "olderbody", 2_000_u64),
+                    edit(newer, "newestbody", 3_000_u64),
+                ]),
+            )
+            .await;
+        assert_eq!(room.search("newestbody", 10, None).await.unwrap().events.len(), 1);
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    f.redaction(newer).event_id(event_id!("$remove-newer")).server_ts(4_000_u64),
+                ),
+            )
+            .await;
+        assert_eq!(room.search("olderbody", 10, None).await.unwrap().events.len(), 1);
+        assert!(room.search("newestbody", 10, None).await.unwrap().events.is_empty());
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    f.redaction(original)
+                        .event_id(event_id!("$remove-original"))
+                        .server_ts(5_000_u64),
+                ),
+            )
+            .await;
+        let mut index = client.search_index().lock().await;
+        assert!(
+            index
+                .search_newest(
+                    &matrix_sdk_search::index::SearchFilter::default(),
+                    10,
+                    None,
+                    room_id
+                )
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(feature = "experimental-search")]

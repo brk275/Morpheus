@@ -69,6 +69,10 @@ compatibility.
 - `src/search_index/mod.rs`: explicit diagnostic formatting for the search
   store kind, with its credential field redacted. A focused regression also
   checks formatting through the parent index and acquired guard.
+- Redaction handling resolves an indexed replacement's original ID before
+  parsing the already-redacted cache entry, restores the latest remaining valid
+  edit, and excludes the redacted event explicitly. Redacting the original
+  removes its replacement too. The original message date remains unchanged.
 - `src/search_index/mod.rs`: `SearchIndexGuard::search_filtered(query:
   Option<&str>, &SearchFilter, max, offset, room_id)`. It mirrors the
   existing `pub(crate) search`, creating the room index when missing, and
@@ -119,3 +123,8 @@ upgrade/reindex path remains a separate release gate. Do not reuse the previous
 cohort or claim migration coverage. Source and dependency review, focused hosted
 execution, and actual encrypted-store upgrade acceptance are distinct gates.
 The original contributor worktree remains preserved.
+
+The redaction repair also requires the search crate's stored original-ID field.
+Older search schemas must be rebuilt through the explicit encrypted-generation
+upgrade path. Normal opening refuses a schema mismatch; it must not delete the
+old generation or bypass the profile's persistence cohort.
