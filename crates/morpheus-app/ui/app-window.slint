@@ -4739,12 +4739,17 @@ export component AppWindow inherits Window {
                                 overflow: elide;
                             }
                             // Browse the shown Space's rooms and nested Spaces (space-explorer.slint).
-                            space-explore := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
-                                x: parent.width - self.width; y: (parent.height - self.height) / 2;
+                            space-explore := TextAction {
+                                x: parent.width - self.width - 4px;
+                                y: (parent.height - self.height) / 2;
+                                width: 76px * root.text-scale;
+                                height: 26px;
                                 enabled: root.live-session && root.active-space-id != "";
                                 visible: self.enabled;
+                                ink: root.ink; muted: root.muted; surface: transparent; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale;
                                 text: "Explore";
-                                label: "Explore the rooms and Spaces in " + root.active-space-name;
+                                accessible-label: "Explore the rooms and Spaces in " + root.active-space-name;
                                 activated => { SpaceExplorer.show(root.active-space-id, root.active-space-name, "", ""); }
                             }
                         }
