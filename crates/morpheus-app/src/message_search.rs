@@ -968,6 +968,9 @@ fn navigate(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, mut openin
     // the draft store and return with the room.
     window.invoke_cancel_room_settings();
     window.invoke_close_image_preview();
+    // A pending Load newer of the left room's focused view no longer applies.
+    with(|controller| controller.newer_request = controller.newer_request.wrapping_add(1));
+    window.set_focus_newer_loading(false);
     opening.navigation = live.invalidate_navigation();
     let weak = window.as_weak();
     let task_live = live.clone();
@@ -996,8 +999,10 @@ fn navigated(
         return;
     }
     let here = opening.here(window);
+    // A newer open of either kind withdrew this one: it shows nothing more.
+    let withdrawn = opening.authority.withdrawn();
     match outcome {
-        Ok(true) if here && live.navigation_is_current(opening.navigation) => {
+        Ok(true) if here && !withdrawn && live.navigation_is_current(opening.navigation) => {
             arrived(window, live, runtime, opening, true);
         }
         // Withdrawn or replaced by another navigation.
@@ -1062,7 +1067,7 @@ fn jump_or_focus(
     let Some(window) = weak.upgrade() else {
         return;
     };
-    if !opening.current(&window) || !opening.here(&window) {
+    if !opening.current(&window) || !opening.here(&window) || opening.authority.withdrawn() {
         return;
     }
     if jump_timeline(&window, &opening.hit.event_id) {
@@ -1110,7 +1115,9 @@ fn focused(
         Ok(Ok(true)) => {
             reset_history(window);
             opening.notice(window, "");
-            jump_when_loaded(window.as_weak(), opening.clone(), JUMP_ATTEMPTS);
+            if !opening.authority.withdrawn() {
+                jump_when_loaded(window.as_weak(), opening.clone(), JUMP_ATTEMPTS);
+            }
         }
         // Withdrawn, or the room or account changed meanwhile.
         Ok(Ok(false)) => opening.notice(window, ""),
@@ -1170,7 +1177,7 @@ fn jump_when_loaded(weak: Weak<AppWindow>, opening: Opening, attempts: u8) {
         let Some(window) = weak.upgrade() else {
             return;
         };
-        if !opening.current(&window) || !opening.here(&window) {
+        if !opening.current(&window) || !opening.here(&window) || opening.authority.withdrawn() {
             return;
         }
         if jump_timeline(&window, &opening.hit.event_id) {
@@ -1263,7 +1270,7 @@ fn load_newer(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
 
 /// Load earlier messages pages whichever view is shown, live or focused; a
 /// result for the other view no longer applies.
-fn reset_history(window: &AppWindow) {
+pub(crate) fn reset_history(window: &AppWindow) {
     with(|controller| controller.newer_request = controller.newer_request.wrapping_add(1));
     window.set_history_operation(window.get_history_operation().wrapping_add(1));
     window.set_history_loading(false);

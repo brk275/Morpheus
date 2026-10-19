@@ -85,7 +85,7 @@ impl NavigationAuthority {
         *self.state() = true;
     }
 
-    fn withdrawn(&self) -> bool {
+    pub(crate) fn withdrawn(&self) -> bool {
         *self.state()
     }
 
@@ -1881,15 +1881,39 @@ impl LiveUi {
         if room.is_space || room.membership != RoomMembership::Joined {
             return Err(MatrixCoreError::RoomNotFound(room_id));
         }
-        // The same visibility rule as refresh: Home lists direct rooms and
-        // rooms outside every scanned Space.
+        // The same visibility rules as refresh: a Space is shown only while it
+        // is joined or was just created (known for 60 s), and Home lists
+        // direct rooms and rooms outside every scanned Space.
+        let mut known = HashSet::new();
+        if let Some(created) = self.known_spaces.lock().await.get(&account_id) {
+            for (space, value) in created {
+                if value.recorded_at.elapsed() < Duration::from_secs(60) {
+                    known.insert(space.clone());
+                }
+            }
+        }
+        let shown = |space: &str| {
+            known.contains(space)
+                || rooms.iter().any(|room| {
+                    room.is_space
+                        && room.room_id == space
+                        && room.membership == RoomMembership::Joined
+                })
+        };
         let space_children = self.space_children.lock().await.clone();
         let spaces = space_children
             .iter()
-            .filter(|(_, children)| children.contains(&room_id))
+            .filter(|(space, children)| children.contains(&room_id) && shown(space.as_str()))
             .map(|(space, _)| space.clone())
             .collect::<Vec<_>>();
-        let in_home = room.is_direct || spaces.is_empty();
+        let listed = space_children
+            .values()
+            .any(|children| children.contains(&room_id));
+        let in_home = room.is_direct || !listed;
+        // Listed only under Spaces that are not shown: visible nowhere.
+        if !in_home && spaces.is_empty() {
+            return Err(MatrixCoreError::RoomNotFound(room_id));
+        }
         if !selection.is_current() {
             return Ok(false);
         }
@@ -1897,8 +1921,8 @@ impl LiveUi {
         let Some(previous) = commit.await else {
             return Ok(false);
         };
-        // The feed is not cleared here: open_room replaces it once the room
-        // is shown; an unshown reveal hands it to reopen_unrevealed.
+        // The feed is not cleared here: the owned refresh retires it once the
+        // room is shown; an unshown reveal hands it to reopen_unrevealed.
         let gate = SnapshotGate {
             authority: authority.clone(),
             selection: selection.clone(),
@@ -1936,6 +1960,8 @@ impl LiveUi {
         barrier: Option<tokio::sync::RwLockWriteGuard<'_, ()>>,
     ) {
         self.restore_reveal(room_id, previous).await;
+        #[cfg(test)]
+        self.pauses.reach("reveal.before_release").await;
         drop(barrier);
     }
 
@@ -2144,6 +2170,10 @@ impl LiveUi {
         if self.render_epoch.load(Ordering::Acquire) != render_epoch {
             return Ok(false);
         }
+        // A reveal writes its Space only once its room is confirmed below.
+        if owner.is_none() {
+            *self.selected_space.lock().await = selected_space.clone();
+        }
         let space_children = self.space_children.lock().await.clone();
         let all_space_children = space_children
             .values()
@@ -2189,19 +2219,23 @@ impl LiveUi {
             if selected.as_deref() != Some(owner.room_id.as_str()) {
                 return Err(MatrixCoreError::RoomNotFound(owner.room_id.clone()));
             }
+            *self.selected_space.lock().await = selected_space.clone();
         }
-        *self.selected_space.lock().await = selected_space.clone();
         *self.selected_room.lock().await = selected.clone();
+        // A reveal's draft error is shown only with its snapshot.
+        let mut draft_error = None;
         if let Some(room_id) = selected.as_deref() {
             if let Err(error) = self
                 .drafts
                 .load_if_missing(&self.manager, &active.id, room_id)
                 .await
             {
-                show_error(
-                    &ui,
-                    format!("Could not restore draft on this device: {error}"),
-                );
+                let message = format!("Could not restore draft on this device: {error}");
+                if owner.is_some() {
+                    draft_error = Some(message);
+                } else {
+                    show_error(&ui, message);
+                }
             }
         }
         if self.render_epoch.load(Ordering::Acquire) != render_epoch {
@@ -2257,6 +2291,13 @@ impl LiveUi {
             owner._barrier = None;
             // The left room's thread ends, unless one was opened since.
             self.clear_thread_if_current(thread).await;
+            // Any feed in the slot was opened under an epoch navigate() has
+            // replaced and can no longer publish: open_room opens the room's
+            // feed under this reveal's epoch.
+            *self.feed_key.lock().await = None;
+            if let Some(message) = draft_error.take() {
+                show_error(&ui, message);
+            }
         }
         if let Some(room_id) = selected {
             self.refresh_members_for(
@@ -2508,7 +2549,11 @@ impl LiveUi {
         {
             return;
         }
-        *self.space_children.lock().await = graph;
+        {
+            // Never change the graph a deciding reveal has read.
+            let _barrier = self.snapshot_barrier.read().await;
+            *self.space_children.lock().await = graph;
+        }
         if let Err(error) = self.refresh(ui.clone()).await {
             show_error(&ui, error.to_string());
         }
@@ -2620,9 +2665,11 @@ impl LiveUi {
                                     ui.get_messages(),
                                     messages.as_ref().clone(),
                                 ));
-                                // Live rows replace any focused view.
+                                // Live rows replace any focused view, and with
+                                // it that view's history paging state.
                                 if ui.get_conversation_focused() {
                                     ui.set_conversation_focused(false);
+                                    message_search::reset_history(&ui);
                                 }
                             }
                         })
@@ -2878,7 +2925,12 @@ impl LiveUi {
             .manager
             .account_selection(&account_id)
             .ok_or(MatrixCoreError::SelectedAccountChanged)?;
-        self.require_selected_room(&room_id).await?;
+        {
+            // A reveal still deciding has committed its room; it gives the
+            // room back before it releases the barrier, so check after it.
+            let _settled = self.snapshot_barrier.read().await;
+            self.require_selected_room(&room_id).await?;
+        }
         {
             let mut feed = self.thread_feed.lock().await;
             if self.thread_generation.load(Ordering::Acquire) != generation {
@@ -4182,16 +4234,23 @@ mod account_presentation_tests {
         assert!(waited.is_err());
         assert_eq!(live.render_epoch.load(Ordering::Acquire), render);
 
-        // Withdrawn before its snapshot: the reveal gives the room back and
-        // only then releases the barrier, so the waiting refresh first passes
-        // the barrier with the old room selected.
+        // Withdrawn before its snapshot: the reveal gives the room back while
+        // it still holds the barrier, and only then releases it, so the
+        // waiting refresh first passes the barrier with the old room selected.
         authority.withdraw();
-        live.settle_unshown_reveal(hit_room, previous, Some(barrier))
-            .await;
-        sampling.entered().await;
-        assert_eq!(live.selected_room.lock().await.as_deref(), Some(old_room));
-        assert_eq!(live.render_epoch.load(Ordering::Acquire), render);
-        sampling.proceed();
+        let release = live.pauses.install("reveal.before_release");
+        let settle = live.settle_unshown_reveal(hit_room, previous, Some(barrier));
+        let check = async {
+            release.entered().await;
+            assert_eq!(live.selected_room.lock().await.as_deref(), Some(old_room));
+            let held = tokio::time::timeout(Duration::from_millis(50), sampling.entered()).await;
+            assert!(held.is_err());
+            release.proceed();
+            sampling.entered().await;
+            assert_eq!(live.render_epoch.load(Ordering::Acquire), render);
+            sampling.proceed();
+        };
+        tokio::join!(settle, check);
         assert!(matches!(
             refresh.await.unwrap(),
             Err(MatrixCoreError::NoActiveAccount)
