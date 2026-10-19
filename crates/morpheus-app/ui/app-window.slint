@@ -2180,6 +2180,8 @@ export component AppWindow inherits Window {
     callback pin-native-call-tile(int);
     callback page-native-call-tiles(int);
     callback native-call-stage-presented(bool);
+    // Rust-internal: the stage presenter forgets an emptied account's stage.
+    callback reset-native-call-stage();
     in-out property <[CallParticipantItem]> native-call-participants;
     in-out property <[CallCaptureSourceItem]> native-capture-sources;
     in-out property <bool> native-capture-source-loading: false;

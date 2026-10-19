@@ -2962,6 +2962,10 @@ fn apply_snapshot(
 
 fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::SecurityGate) {
     crate::security::clear_ui(ui, security_gate);
+    // Calls cannot outlive their account, so its call authority is already
+    // revoked here. Its call tiles, pictures and roster must not wait for
+    // the asynchronous stage presenter.
+    crate::call_stage::clear_private_presentation(ui);
     ui.set_room_actions_open(false);
     ui.set_room_action_busy(false);
     ui.set_room_action_error("".into());

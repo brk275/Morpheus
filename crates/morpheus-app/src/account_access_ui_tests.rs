@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::{
-    AccountItem, MemberItem, MessageItem, MessageSearchItem, RoomItem, apply_config,
-    color_from_hex, voice_spaces::VoiceSpaces,
+    AccountItem, CallParticipantItem, CallTileItem, MemberItem, MessageItem, MessageSearchItem,
+    RoomItem, apply_config, color_from_hex, voice_spaces::VoiceSpaces,
 };
 use morpheus_config::{BuiltInStylePreset, Config, NavigationMode};
 use slint::fontique_011::fontique;
@@ -2593,6 +2593,39 @@ async fn exercise_account_ui(runtime: Handle) {
     // The real picker controller over a recording fake core: admission,
     // persistence, single-flight commands, held sends and exact reconciliation.
     crate::stickers::controller_tests::run(&ui, runtime.clone()).await;
+    // A departed account's call stage: tiles, a pinned featured tile, decoded
+    // pictures and roster rows. No video watcher runs in this test, so only
+    // the detach path itself can clear them.
+    ui.set_native_call_tiles(ModelRc::new(VecModel::from(vec![CallTileItem {
+        id: 7,
+        name: "@private:example.org".into(),
+        live: true,
+        frame_slot: 1,
+        ..Default::default()
+    }])));
+    ui.set_native_call_featured(CallTileItem {
+        id: 8,
+        name: "@pinned:example.org".into(),
+        live: true,
+        pinned: true,
+        ..Default::default()
+    });
+    ui.set_native_call_featured_visible(true);
+    let picture = || {
+        slint::Image::from_rgb8(slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(2, 2))
+    };
+    ui.set_native_call_frames(ModelRc::new(VecModel::from(vec![picture(), picture()])));
+    ui.set_native_call_participants(ModelRc::new(VecModel::from(vec![
+        CallParticipantItem {
+            name: "@private:example.org".into(),
+            detail: "Camera on".into(),
+            is_local: false,
+        },
+    ])));
+    ui.set_native_call_page(1);
+    ui.set_native_call_pages(2);
+    ui.set_native_call_tile_count(6);
+    ui.set_native_call_media_degraded(true);
     // Exercise chat controls before opening the one-time-key modal. Then
     // render that private surface as well before testing the real detach.
     ui.set_security_recovery_input("synthetic recovery input".into());
@@ -2648,6 +2681,24 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_attachment_status().is_empty());
     assert!(ui.get_security_recovery_input().is_empty());
     assert!(ui.get_security_recovery_key().is_empty());
+    // The call stage clears synchronously with the account, not after an
+    // asynchronous video update: no tile, pinned row, picture or roster row.
+    assert_eq!(ui.get_native_call_tiles().row_count(), 0);
+    assert!(!ui.get_native_call_featured_visible());
+    assert_eq!(ui.get_native_call_featured(), CallTileItem::default());
+    let frames = ui.get_native_call_frames();
+    assert_eq!(frames.row_count(), 2);
+    assert!(frames.iter().all(|frame| frame.size().width == 0));
+    assert_eq!(ui.get_native_call_participants().row_count(), 0);
+    assert_eq!(
+        (
+            ui.get_native_call_page(),
+            ui.get_native_call_pages(),
+            ui.get_native_call_tile_count()
+        ),
+        (0, 1, 0)
+    );
+    assert!(!ui.get_native_call_media_degraded());
     assert!(manager.active_account().await.is_none());
 
     assert_removed_account_menu_projection(&ui);

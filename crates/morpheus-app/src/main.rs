@@ -9,7 +9,6 @@ mod attachments;
 mod audio_devices;
 #[cfg(feature = "native-calls")]
 mod call_membership;
-#[cfg(feature = "native-calls")]
 mod call_stage;
 #[cfg(feature = "native-calls")]
 mod calls;
@@ -1302,45 +1301,6 @@ fn call_room_display(
 }
 
 #[cfg(feature = "native-calls")]
-fn call_participant_item(participant: morpheus_rtc::ParticipantInfo) -> CallParticipantItem {
-    use morpheus_rtc::RtcStreamKind;
-
-    let has_live = |kind| {
-        participant
-            .streams
-            .iter()
-            .any(|stream| stream.kind == kind && !stream.muted)
-    };
-    let microphone = participant
-        .streams
-        .iter()
-        .find(|stream| stream.kind == RtcStreamKind::Microphone);
-    let mut media = Vec::new();
-    if has_live(RtcStreamKind::ScreenShare) {
-        media.push("Sharing screen");
-    } else if has_live(RtcStreamKind::Camera) {
-        media.push("Camera on");
-    }
-    match microphone {
-        Some(stream) if stream.muted => media.push("Mic muted"),
-        Some(_) => media.push("Mic on"),
-        None => {}
-    }
-    let detail = if !participant.reachable {
-        "Media unavailable".to_owned()
-    } else if media.is_empty() {
-        "In call".to_owned()
-    } else {
-        media.join(" · ")
-    };
-    CallParticipantItem {
-        name: participant.user_id.into(),
-        detail: detail.into(),
-        is_local: participant.is_local,
-    }
-}
-
-#[cfg(feature = "native-calls")]
 fn clear_native_capture(ui: &AppWindow) {
     ui.set_native_camera_active(false);
     ui.set_native_screen_active(false);
@@ -1758,44 +1718,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .is_err();
                 if closed || audio.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    #[cfg(feature = "native-calls")]
-    {
-        let calls = calls.clone();
-        let weak = ui.as_weak();
-        let applied_token = Arc::new(AtomicU64::new(0));
-        runtime.spawn(async move {
-            let mut roster = calls.subscribe_roster();
-            loop {
-                let update = roster.borrow_and_update().clone();
-                let members: Vec<_> = update
-                    .members
-                    .into_iter()
-                    .map(call_participant_item)
-                    .collect();
-                let calls_for_ui = calls.clone();
-                let applied_token = applied_token.clone();
-                let closed = weak
-                    .upgrade_in_event_loop(move |ui| {
-                        let current = calls_for_ui.video_token();
-                        if update.token != current {
-                            if applied_token.load(Ordering::SeqCst) != current {
-                                ui.set_native_call_participants(ModelRc::new(VecModel::from(
-                                    Vec::<CallParticipantItem>::new(),
-                                )));
-                                applied_token.store(current, Ordering::SeqCst);
-                            }
-                            return;
-                        }
-                        ui.set_native_call_participants(ModelRc::new(VecModel::from(members)));
-                        applied_token.store(current, Ordering::SeqCst);
-                    })
-                    .is_err();
-                if closed || roster.changed().await.is_err() {
                     break;
                 }
             }

@@ -55,6 +55,8 @@ const MAX_DRAIN: usize = 8;
 
 const _: () = assert!(GRID_PAGE <= FRAME_SLOTS && FILMSTRIP_PAGE < FRAME_SLOTS);
 
+static NEXT_PRESENTATION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TileMedium {
     Camera,
@@ -156,6 +158,9 @@ pub struct FrameSlot {
 
 #[derive(Clone)]
 pub struct StageSnapshot {
+    /// Unique to one video task. A rejoin keeps the call token but starts a
+    /// new task whose revisions and slot epochs begin again.
+    pub presentation: u64,
     /// Changes only when `layout` changes; new pictures keep it.
     pub revision: u64,
     pub layout: Arc<StageLayout>,
@@ -408,6 +413,7 @@ fn video_key(member_id: &str, kind: MediaStreamKind) -> Option<TileKey> {
 struct Stage<M> {
     media: M,
     token: u64,
+    presentation: u64,
     participants: Vec<ParticipantInfo>,
     pinned: Option<TileKey>,
     page: usize,
@@ -428,6 +434,7 @@ impl<M: StageMedia> Stage<M> {
         Self {
             media,
             token,
+            presentation: NEXT_PRESENTATION.fetch_add(1, Ordering::Relaxed),
             participants: Vec::new(),
             pinned: None,
             page: 0,
@@ -647,6 +654,7 @@ impl<M: StageMedia> Stage<M> {
         updates.send_replace(VideoUpdate::Stage {
             token: self.token,
             stage: Arc::new(StageSnapshot {
+                presentation: self.presentation,
                 revision: self.revision,
                 layout: Arc::clone(&self.layout),
                 frames: self.presenter.frames.clone(),
