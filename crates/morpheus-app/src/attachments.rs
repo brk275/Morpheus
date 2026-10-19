@@ -23,38 +23,31 @@ pub fn safe_file_name(name: &str) -> String {
     const MAX_CHARS: usize = 120;
     const MAX_EXTENSION_CHARS: usize = 16;
     let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
-    let cleaned: String = last
-        .chars()
-        .map(|character| {
-            if character.is_control()
-                || matches!(
-                    character,
-                    '<' | '>'
-                        | ':'
-                        | '"'
-                        | '|'
-                        | '?'
-                        | '*'
-                        | '\u{061c}'
-                        | '\u{200b}'..='\u{200f}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2060}'..='\u{206f}'
-                        | '\u{feff}'
-                )
-            {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect();
-    let trimmed =
-        cleaned.trim_matches(|character: char| character == '.' || character.is_whitespace());
-    let mut name = if trimmed.is_empty() {
-        "attachment".to_owned()
-    } else {
-        trimmed.to_owned()
+    // Trim the borrowed input using the post-sanitization rule. Controls
+    // become '_' and therefore must not be mistaken for trimmable space.
+    let last = last.trim_matches(|character: char| {
+        character == '.' || (character.is_whitespace() && !character.is_control())
+    });
+    let sanitize = |character: char| {
+        if character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '|' | '?' | '*'
+                    | '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}' | '\u{feff}'
+            )
+        {
+            '_'
+        } else {
+            character
+        }
     };
+    // Never allocate a sanitized copy of an arbitrarily long server name.
+    // One extra character tells us whether shortening is needed.
+    let mut name: String = last.chars().take(MAX_CHARS + 1).map(sanitize).collect();
+    if name.is_empty() {
+        name = "attachment".to_owned();
+    }
     let stem = name
         .split('.')
         .next()
@@ -67,9 +60,15 @@ pub fn safe_file_name(name: &str) -> String {
         name.insert(0, '_');
     }
     if name.chars().count() > MAX_CHARS {
-        let extension = name
+        let extension = last
             .rsplit_once('.')
-            .map(|(_, extension)| extension.to_owned())
+            .map(|(_, extension)| {
+                extension
+                    .chars()
+                    .take(MAX_EXTENSION_CHARS + 1)
+                    .map(sanitize)
+                    .collect::<String>()
+            })
             .filter(|extension| {
                 !extension.is_empty() && extension.chars().count() <= MAX_EXTENSION_CHARS
             });
@@ -219,6 +218,10 @@ mod tests {
         assert_eq!(safe_file_name(""), "attachment");
         assert_eq!(safe_file_name("con.txt"), "_con.txt");
         assert_eq!(safe_file_name("COM3"), "_COM3");
+        let hostile = format!("{}.jpeg", "🦉".repeat(100_000));
+        let shortened = safe_file_name(&hostile);
+        assert_eq!(shortened.chars().count(), 120);
+        assert!(shortened.ends_with(".jpeg"));
         let long = format!("{}.jpeg", "x".repeat(300));
         let bounded = safe_file_name(&long);
         assert_eq!(bounded.chars().count(), 120);

@@ -35,7 +35,7 @@ use std::{
     io,
     path::PathBuf,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -47,7 +47,7 @@ use morpheus_matrix::{
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::{
     runtime::Handle,
-    sync::{Semaphore, mpsc, watch},
+    sync::{Notify, Semaphore, mpsc, watch},
 };
 
 use crate::{
@@ -64,6 +64,8 @@ const MAX_ITEMS: usize = 64;
 const MAX_PREPARING: usize = 2;
 /// Downloads waiting or running across every account.
 const MAX_DOWNLOADS: usize = 8;
+/// Failed download records retained across accounts; active work is never evicted.
+const MAX_FAILED_DOWNLOADS: usize = 24;
 /// Downloads held in memory at once; each is bounded by the 25 MiB cap.
 const MAX_DOWNLOADING: usize = 1;
 /// Ended transfers remembered for the transfer center, across accounts.
@@ -168,9 +170,89 @@ impl Item {
     }
 }
 
+/// Reservations are created synchronously in the user's send order. File
+/// reads may complete in any order, so admission must not depend on which
+/// Tokio task first reaches the SDK. Dropping a middle reservation removes
+/// only that reservation; it never lets a successor overtake the head.
+#[derive(Default)]
+struct AdmissionQueue {
+    pending: Mutex<VecDeque<u64>>,
+    changed: Notify,
+}
+
+struct Admission {
+    queue: Arc<AdmissionQueue>,
+    id: u64,
+    released: AtomicBool,
+}
+
+impl AdmissionQueue {
+    fn reserve(self: &Arc<Self>, id: u64) -> Admission {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push_back(id);
+        Admission {
+            queue: self.clone(),
+            id,
+            released: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Admission {
+    async fn wait(&self) {
+        loop {
+            let changed = self.queue.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .queue
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .front()
+                == Some(&self.id)
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let removed = {
+            let mut pending = self
+                .queue
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(index) = pending.iter().position(|id| *id == self.id) {
+                pending.remove(index);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.queue.changed.notify_waiters();
+        }
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// What one upload task owns: never the window or the item itself.
 struct Job {
     id: u64,
+    admission: Admission,
     selection: AccountSelection,
     account_id: String,
     room_id: String,
@@ -259,6 +341,23 @@ struct Finished {
     outcome: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DownloadAdmissionError {
+    Duplicate,
+    Full,
+}
+
+impl DownloadAdmissionError {
+    fn notice(&self) -> String {
+        match self {
+            Self::Duplicate => "This attachment is already being saved.".into(),
+            Self::Full => {
+                format!("Up to {MAX_DOWNLOADS} downloads can wait; let one finish first.")
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     next_id: u64,
@@ -269,6 +368,46 @@ struct State {
 }
 
 impl State {
+    fn check_download_admission(
+        &self,
+        account: &str,
+        event: &str,
+    ) -> Result<(), DownloadAdmissionError> {
+        if self.downloads.iter().any(|download| {
+            download.account_id == account && download.event_id == event && download.phase.running()
+        }) {
+            return Err(DownloadAdmissionError::Duplicate);
+        }
+        if self
+            .downloads
+            .iter()
+            .filter(|download| download.phase.running())
+            .count()
+            >= MAX_DOWNLOADS
+        {
+            return Err(DownloadAdmissionError::Full);
+        }
+        Ok(())
+    }
+
+    fn trim_failed_downloads(&mut self, latest: u64) {
+        let failed = self
+            .downloads
+            .iter()
+            .filter(|download| !download.phase.running())
+            .count();
+        for _ in MAX_FAILED_DOWNLOADS..failed {
+            let Some(index) = self
+                .downloads
+                .iter()
+                .position(|download| download.id != latest && !download.phase.running())
+            else {
+                break;
+            };
+            self.downloads.remove(index);
+        }
+    }
+
     fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
@@ -324,6 +463,7 @@ pub struct Workbench {
     /// A projection is already waiting on the event loop.
     queued: AtomicBool,
     preparing: Semaphore,
+    admissions: Mutex<HashMap<(String, String), Weak<AdmissionQueue>>>,
     downloading: Semaphore,
     /// Each account's homeserver upload limit, once it was read.
     limits: Mutex<HashMap<String, u64>>,
@@ -406,6 +546,7 @@ impl Workbench {
             state: Mutex::new(state),
             queued: AtomicBool::new(false),
             preparing: Semaphore::new(MAX_PREPARING),
+            admissions: Mutex::new(HashMap::new()),
             downloading: Semaphore::new(MAX_DOWNLOADING),
             limits: Mutex::new(HashMap::new()),
         }
@@ -453,7 +594,9 @@ impl Workbench {
     }
 
     fn lock_limits(&self) -> MutexGuard<'_, HashMap<String, u64>> {
-        self.limits.lock().unwrap_or_else(|error| error.into_inner())
+        self.limits
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     /// Save an attachment of the room on screen.
@@ -490,29 +633,10 @@ impl Workbench {
         let Some(selection) = self.live.manager.account_selection(account_id) else {
             return false;
         };
-        {
-            let state = self.lock();
-            let same = state.downloads.iter().any(|download| {
-                download.account_id == account_id
-                    && download.event_id == event_id
-                    && download.phase.running()
-            });
-            if same {
-                ui.set_transfer_notice("This attachment is already being saved.".into());
-                return false;
-            }
-            let running = state
-                .downloads
-                .iter()
-                .filter(|download| download.phase.running())
-                .count();
-            if running >= MAX_DOWNLOADS {
-                ui.set_transfer_notice(
-                    format!("Up to {MAX_DOWNLOADS} downloads can wait; let one finish first.")
-                        .into(),
-                );
-                return false;
-            }
+        let admitted = self.lock().check_download_admission(account_id, event_id);
+        if let Err(error) = admitted {
+            ui.set_transfer_notice(error.notice().into());
+            return false;
         }
         let visible_room = ui.get_active_room_id().to_string();
         // The sender chose this name: suggest only a sanitized final
@@ -545,6 +669,13 @@ impl Workbench {
         let (cancel, cancelled) = watch::channel(false);
         let id = {
             let mut state = self.lock();
+            // Native modal dialogs may pump callbacks. Recheck under the
+            // insertion lock rather than trusting the pre-dialog count.
+            if let Err(error) = state.check_download_admission(account_id, event_id) {
+                drop(state);
+                ui.set_transfer_notice(error.notice().into());
+                return false;
+            }
             let id = state.next_id();
             state.downloads.push(Download {
                 id,
@@ -645,6 +776,7 @@ impl Workbench {
                     download.cancel = None;
                     let notice = format!("Could not save {}: {reason}", download.filename);
                     download.phase = DownloadPhase::Failed(reason);
+                    state.trim_failed_downloads(job.id);
                     notice
                 }
                 SaveOutcome::Saved(name) => {
@@ -707,7 +839,10 @@ impl Workbench {
     fn set_download_phase(self: &Arc<Self>, id: u64, phase: DownloadPhase) {
         {
             let mut state = self.lock();
-            let Some(download) = state.downloads.iter_mut().find(|download| download.id == id)
+            let Some(download) = state
+                .downloads
+                .iter_mut()
+                .find(|download| download.id == id)
             else {
                 return;
             };
@@ -854,8 +989,8 @@ impl Workbench {
         }
     }
 
-    /// Forget the visible account's ended transfers. Failed ones stay until
-    /// each is tried again or removed.
+    /// Forget the visible account's ended transfers. Recent failed downloads
+    /// remain available for retry, subject to the bounded failure history.
     fn clear_finished(&self, ui: &AppWindow) {
         let account_id = ui.get_active_account_local_id().to_string();
         self.lock()
@@ -982,6 +1117,22 @@ impl Workbench {
         self.project(ui);
     }
 
+    fn reserve_admission(&self, account: &str, room: &str, id: u64) -> Admission {
+        let mut rooms = self
+            .admissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Expired rooms keep neither account IDs nor an unbounded map alive.
+        rooms.retain(|_, queue| queue.strong_count() > 0);
+        let key = (account.to_owned(), room.to_owned());
+        let queue = rooms.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let queue = Arc::new(AdmissionQueue::default());
+            rooms.insert(key, Arc::downgrade(&queue));
+            queue
+        });
+        queue.reserve(id)
+    }
+
     /// Hand one staged or not-yet-queued item to a new upload task.
     fn start(self: &Arc<Self>, id: u64) {
         let (job, commands, cancelled) = {
@@ -1005,6 +1156,7 @@ impl Workbench {
             item.note.clear();
             let job = Job {
                 id,
+                admission: self.reserve_admission(&item.account_id, &item.room_id, id),
                 selection,
                 account_id: item.account_id.clone(),
                 room_id: item.room_id.clone(),
@@ -1061,6 +1213,14 @@ impl Workbench {
         {
             return Outcome::Rejected(server_too_large(limit));
         }
+        // Wait before occupying a global preparation slot. Other rooms can
+        // prepare concurrently, while this room enters the SDK in send order.
+        tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancelled) => return Outcome::Cancelled,
+            _ = job.selection.revoked() => return Outcome::Failed("Select this account before sending its attachments.".into()),
+            () = job.admission.wait() => {},
+        }
         let queued = {
             // Waiting tasks own only paths and small bounded command channels.
             let _preparation = tokio::select! {
@@ -1099,6 +1259,9 @@ impl Workbench {
                 }
             }
         };
+        // The enqueue future has settled. Release admission before observing
+        // progress, so uploads in the same room can overlap after SDK commit.
+        job.admission.release();
         let mut queued = match queued {
             Ok(Some(queued)) => queued,
             Ok(None) => return Outcome::Cancelled,
@@ -1114,6 +1277,7 @@ impl Workbench {
             return abort(&queued).await.unwrap_or(Outcome::Uncertain);
         }
         self.set_phase(job.id, Phase::Uploading(0), "");
+        let mut cancellation_delivered = false;
         loop {
             tokio::select! {
                 biased;
@@ -1121,7 +1285,7 @@ impl Workbench {
                 // old observer on account departure, rather than retaining a
                 // removed profile until a paused queue emits another event.
                 _ = job.selection.revoked() => return Outcome::Uncertain,
-                command = commands.recv(), if listening => match command {
+                command = upload_command(commands, cancelled, &mut cancellation_delivered), if listening => match command {
                     Some(Command::Cancel) => {
                         self.set_phase(job.id, Phase::Cancelling, "");
                         match abort(&queued).await {
@@ -1360,19 +1524,24 @@ impl Workbench {
         let owner = self.clone();
         self.runtime.spawn(async move {
             let accounts = owner.live.manager.accounts().await;
-            let saved = |account_id: &String| {
-                accounts.iter().any(|account| &account.id == account_id)
-            };
+            let saved =
+                |account_id: &String| accounts.iter().any(|account| &account.id == account_id);
             let removed = {
                 let mut state = owner.lock();
                 let before = state.items.len() + state.downloads.len() + state.finished.len();
                 state.items.retain(|item| saved(&item.account_id));
                 // Dropping a download's cancel sender stops it too.
-                state.downloads.retain(|download| saved(&download.account_id));
-                state.finished.retain(|finished| saved(&finished.account_id));
+                state
+                    .downloads
+                    .retain(|download| saved(&download.account_id));
+                state
+                    .finished
+                    .retain(|finished| saved(&finished.account_id));
                 before != state.items.len() + state.downloads.len() + state.finished.len()
             };
-            owner.lock_limits().retain(|account_id, _| saved(account_id));
+            owner
+                .lock_limits()
+                .retain(|account_id, _| saved(account_id));
             if removed {
                 owner.refresh();
             }
@@ -1550,6 +1719,30 @@ async fn wait_for_cancel(signal: &watch::Receiver<bool>) {
     let _ = signal.wait_for(|stopped| *stopped).await;
 }
 
+/// Cancellation is a persistent watch signal, independent of the small
+/// click queue. Deliver it once with priority even when Retry fills the
+/// channel. A failed abort then waits for another explicit user action,
+/// rather than spinning forever on a permanently true watch value.
+async fn upload_command(
+    commands: &mut mpsc::Receiver<Command>,
+    cancelled: &watch::Receiver<bool>,
+    cancellation_delivered: &mut bool,
+) -> Option<Command> {
+    tokio::select! {
+        biased;
+        () = wait_for_cancel(cancelled), if !*cancellation_delivered => {
+            *cancellation_delivered = true;
+            Some(Command::Cancel)
+        },
+        command = commands.recv() => {
+            if command == Some(Command::Cancel) {
+                *cancellation_delivered = true;
+            }
+            command
+        },
+    }
+}
+
 /// Withdraw a queued upload. `Ok` says what happened; `Err` leaves it queued.
 async fn abort(queued: &QueuedAttachment) -> Result<Outcome, MatrixCoreError> {
     match queued.abort().await {
@@ -1568,7 +1761,10 @@ fn percent(current: usize, total: usize) -> u8 {
 }
 
 fn server_too_large(limit: u64) -> String {
-    format!("Too large: this homeserver accepts files up to {}.", human_size(limit))
+    format!(
+        "Too large: this homeserver accepts files up to {}.",
+        human_size(limit)
+    )
 }
 
 /// Fixed wording for a file that was never queued. Server text, paths and
@@ -1809,6 +2005,62 @@ fn human_size(bytes: u64) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn room_admission_keeps_order_through_middle_cancellation_and_retry() {
+        let room = Arc::new(AdmissionQueue::default());
+        let first = room.reserve(1);
+        let middle = room.reserve(2);
+        let last = room.reserve(3);
+        first.wait().await;
+        let waiting = last.wait();
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        drop(middle);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        first.release();
+        waiting.await;
+        // Retry may reuse a row ID while the old, released task still owns
+        // its guard. Dropping that guard must not release the new attempt.
+        let retry = room.reserve(1);
+        drop(first);
+        let retry_waiting = retry.wait();
+        tokio::pin!(retry_waiting);
+        assert!(futures_util::poll!(retry_waiting.as_mut()).is_pending());
+        last.release();
+        retry_waiting.await;
+        retry.release();
+        assert!(room.pending.lock().unwrap().is_empty());
+        // Admissions in separate rooms never wait on each other.
+        let other = Arc::new(AdmissionQueue::default()).reserve(4);
+        other.wait().await;
+    }
+
+    #[tokio::test]
+    async fn upload_cancel_survives_a_full_click_queue_without_a_busy_loop() {
+        let (sender, mut commands) = mpsc::channel(COMMAND_CAPACITY);
+        for _ in 0..COMMAND_CAPACITY {
+            sender.try_send(Command::Retry).unwrap();
+        }
+        assert!(sender.try_send(Command::Cancel).is_err());
+        let (cancel, cancelled) = watch::channel(false);
+        cancel.send(true).unwrap();
+        let mut delivered = false;
+        assert_eq!(
+            upload_command(&mut commands, &cancelled, &mut delivered).await,
+            Some(Command::Cancel)
+        );
+        for _ in 0..COMMAND_CAPACITY {
+            assert_eq!(
+                upload_command(&mut commands, &cancelled, &mut delivered).await,
+                Some(Command::Retry)
+            );
+        }
+        // A permanently true watch must not repeatedly call SDK abort.
+        let next = upload_command(&mut commands, &cancelled, &mut delivered);
+        tokio::pin!(next);
+        assert!(futures_util::poll!(next.as_mut()).is_pending());
+    }
+
     fn item(phase: Phase, commands: bool) -> Item {
         Item {
             id: 3,
@@ -1847,6 +2099,46 @@ mod tests {
             phase,
             cancel: None,
         }
+    }
+
+    #[test]
+    fn download_admission_is_rechecked_and_failed_history_stays_bounded() {
+        let mut state = State::default();
+        assert_eq!(state.check_download_admission("a", "$new"), Ok(()));
+        // Represents downloads admitted while a native modal picker pumps
+        // callbacks; the same admission check must now refuse a stale slot.
+        for id in 0..MAX_DOWNLOADS as u64 {
+            let mut row = download(id, DownloadPhase::Waiting);
+            row.event_id = format!("$event-{id}");
+            state.downloads.push(row);
+        }
+        assert_eq!(
+            state.check_download_admission("a", "$new"),
+            Err(DownloadAdmissionError::Full)
+        );
+        assert_eq!(
+            state.check_download_admission("a", "$event-0"),
+            Err(DownloadAdmissionError::Duplicate)
+        );
+        for id in 100..(100 + MAX_FAILED_DOWNLOADS as u64 + 10) {
+            state
+                .downloads
+                .push(download(id, DownloadPhase::Failed("unavailable".into())));
+            state.trim_failed_downloads(id);
+        }
+        assert_eq!(state.downloads.len(), MAX_DOWNLOADS + MAX_FAILED_DOWNLOADS);
+        assert_eq!(
+            state
+                .downloads
+                .iter()
+                .filter(|row| row.phase.running())
+                .count(),
+            MAX_DOWNLOADS
+        );
+        assert_eq!(
+            state.downloads.last().unwrap().id,
+            100 + MAX_FAILED_DOWNLOADS as u64 + 9
+        );
     }
 
     #[test]
@@ -1956,7 +2248,10 @@ mod tests {
         assert!(uploading.group == GROUP_ACTIVE && !uploading.busy);
         assert_eq!(uploading.progress, 0.4);
         assert_eq!(transfer_summary(0, 0, 0), "No transfers for this account");
-        assert_eq!(transfer_summary(1, 2, 3), "1 in progress · 2 waiting for you · 3 ended");
+        assert_eq!(
+            transfer_summary(1, 2, 3),
+            "1 in progress · 2 waiting for you · 3 ended"
+        );
     }
 
     #[test]

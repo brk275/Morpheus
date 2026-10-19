@@ -108,6 +108,11 @@ room, hold the account-switch guard through the local write, and publish only
 under a new name. Existing entries are never overwritten, including ones that
 appear after the Save dialog closes. A name conflict offers Retry with another
 destination; the dialog path is not treated as proof of overwrite consent.
+Upload admission follows the chosen order within each account and room,
+while different rooms share a bounded preparation pool. Cancellation remains
+independent of the bounded click queue. At most eight downloads run or wait;
+recent failed-download and completed-transfer histories each retain at most
+24 records across accounts. Older failures expire without removing active work.
 Morpheus builds the media request with Ruma
 and downloads through
 a dedicated HTTP client with automatic redirects disabled. Each 307/308 target
