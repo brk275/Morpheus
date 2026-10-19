@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed style profile UI fix check
-run-name: Style profile UI fix check - 36a15b9 - ${{ inputs.platform }}
+name: Reviewed style profile platform checks
+run-name: Style profile platform checks - 36a15b9 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -10,21 +10,21 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, macos-arm64, macos-intel, windows, linux]
+        options: [all, macos-arm64, macos-intel, windows]
 permissions:
   contents: read
 concurrency:
-  group: style-ui-fix-36a15b9-${{ github.ref }}
+  group: style-profile-platform-36a15b9-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
     name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && inputs.platform == 'linux'
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
+      matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}') }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 45
     env:
       MORPHEUS_EXPECTED_OS: ${{ matrix.os }}
       MORPHEUS_EXPECTED_ARCH: ${{ matrix.arch }}
@@ -192,16 +192,6 @@ jobs:
               'commits_scanned':int(counts[0]) if len(counts)==1 else None,
               'source':source,'whole_source_tree_claim':False,'raw_logs_public':False},sort_keys=True))
           if not passed: raise SystemExit(1)
-      - name: Install reviewed Linux native compilation dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
-            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev \
-            libsystemd-dev libudev-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xauth \
-            dbus-x11 gnome-keyring libsecret-tools libgl1-mesa-dri fonts-noto-color-emoji
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # reviewed action pin
         with:
           toolchain: 1.99.0
@@ -271,8 +261,8 @@ jobs:
               for name,value in values.items():
                   output.write(name+'='+value+'\n')
           print(json.dumps({'check':'msvc_environment','status':'passed','target':'x64','linker':'msvc'}))
-      - name: Build native desktop and run existing unit and controller suites
-        timeout-minutes: 160
+      - name: Check profile store platform behavior without native desktop builds
+        timeout-minutes: 35
         env:
           CARGO_BUILD_JOBS: "2"
           CARGO_INCREMENTAL: "0"
@@ -453,14 +443,6 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          needed_app={
-              'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-              'config_cli::tests::the_schema_lists_every_field_token_and_code_from_the_registry',
-              'style_profiles::tests::summaries_describe_the_look_without_files_or_paths',
-              'style_profiles::tests::the_dialog_permit_admits_one_operation_at_a_time',
-              'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
-          }
-          allowed_app_ignore={"outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction"}
           needed_config={
               'style_profiles::tests::a_profile_holds_the_look_only_and_round_trips_sparse_toml',
               'style_profiles::tests::applying_replaces_the_look_and_keeps_everything_else',
@@ -482,13 +464,11 @@ jobs:
                   'style_profiles::tests::operations_stay_in_the_anchored_folder_when_its_path_is_swapped',
                   'style_profiles::tests::links_are_never_followed_for_profiles_imports_or_exports',
               })
-          # The other348app, config83, examples1 and UIcompile checks passed.
-          # Diagnose only the failed actual native generated UI case.
+          # Linux config83 and profile examples already passed on identical inputs.
+          # Run only platform-specific configuration behavior on the other targets.
           checks=[
-              ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app',
-                  'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-                  '--','--exact','--test-threads=1'],70*60,
-                  {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'},set()),
+              ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib','--','--test-threads=1'],20*60,needed_config,set()),
+              ('profile_examples',['cargo','test','--locked','-p','morpheus-config','--test','style_profile_examples','--','--test-threads=1'],10*60,{'style_profile_examples_are_valid_importable_profiles'},set()),
           ]
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
