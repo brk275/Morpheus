@@ -40,6 +40,9 @@ pub(crate) struct CaptureStop {
     // every outgoing frame push. Never held across an await.
     push_gate: StdMutex<TransmissionPause>,
     authorization: OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// Read at every push under `push_gate`. A false result withholds the
+    /// frame only; unlike `authorization`, it never latches a stop.
+    transmission: OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 /// A temporary transmission pause, e.g. while signalling reconnects or the
@@ -106,6 +109,19 @@ impl CaptureStop {
         self.notify.notified().await;
     }
 
+    /// Bind the call's temporary transmission gate once, before media starts.
+    /// It must be cheap and perform no I/O; it runs under the push lock.
+    pub(crate) fn bind_transmission_gate(
+        &self,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) {
+        let _ = self.transmission.set(Box::new(allowed));
+    }
+
+    fn transmission_allowed(&self) -> bool {
+        self.transmission.get().is_none_or(|allowed| allowed())
+    }
+
     /// Withhold frames until the returned token resumes. `mute` runs under
     /// the push lock, so no frame is pushed between the pause and the mute.
     pub(crate) fn pause_transmission(&self, mute: impl FnOnce()) -> TransmissionPauseToken {
@@ -163,7 +179,7 @@ impl CaptureStop {
             .push_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if gate.paused || self.requested() {
+        if gate.paused || self.requested() || !self.transmission_allowed() {
             None
         } else {
             Some(push())
@@ -1017,6 +1033,19 @@ mod tests {
         );
         current.store(true, Ordering::SeqCst);
         assert!(stop.requested());
+    }
+
+    #[test]
+    fn signaling_gate_withholds_frames_without_an_owner_or_stop() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&open);
+        let stop = CaptureStop::default();
+        stop.bind_transmission_gate(move || gate.load(Ordering::SeqCst));
+        // No session pauses here: the push boundary reads the gate itself.
+        assert_eq!(stop.push_if_active(|| ()), None);
+        assert!(!stop.requested(), "a transient loss must not stop capture");
+        open.store(true, Ordering::SeqCst);
+        assert_eq!(stop.push_if_active(|| 7), Some(7));
     }
 
     #[test]

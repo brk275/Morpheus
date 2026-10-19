@@ -56,6 +56,7 @@ use tokio::{
 use crate::{
     call_recovery::{
         RejoinCause, SIGNALING_GRACE, SignalingHealth, rejoin_retryable, signaling_health,
+        transmission_allowed,
     },
     incoming_ring::controller::{AcceptedOffer, EstablishedAuthorization, EstablishedGuard},
     local_video::{
@@ -1280,8 +1281,8 @@ async fn wait_cleanup_done(
 
 // Read by the detached audio opener as well as the async call owner. Account
 // and sync invalidation must not wait for the owner's next select-loop poll.
-// A transient sync loss pauses transmission in the worker instead; only the
-// end of sticky sync for this session revokes capture.
+// A transient sync loss is handled by the separate transmission gate at every
+// push (and the worker's pause); only the end of sticky sync revokes capture.
 fn audio_capture_allowed(stop: &CaptureStop, selection_current: bool, sync: &SyncStatus) -> bool {
     !stop.requested()
         && selection_current
@@ -1527,6 +1528,11 @@ impl CallWorker {
         }
         let mut active = self.manager.subscribe_active_account();
         let mut sync = self.manager.subscribe_sync_status();
+        // Video pushes read live sync state themselves, so a worker suspended
+        // in a publish cannot let frames through while signalling is down.
+        let gate_sync = sync.clone();
+        self.capture_stop
+            .bind_transmission_gate(move || transmission_allowed(&gate_sync.borrow()));
         let created = self.new_audio_controls(&rtc, &info, incoming_guard.as_ref(), &sync);
         let controls = match created {
             Ok(controls) => controls,
@@ -2060,13 +2066,20 @@ impl CallWorker {
     ) -> Result<AudioControls, MediaError> {
         let selection = self.selection.clone();
         let stop = Arc::clone(&self.capture_stop);
-        let sync = sync.clone();
+        let allowed_sync = sync.clone();
+        let transmit_sync = sync.clone();
         let incoming = incoming_guard.cloned();
         let info = info.clone();
-        rtc.audio_controls_cancellable(&self.room_id, move || {
-            audio_capture_allowed(&stop, selection.is_current(), &sync.borrow())
-                && incoming_capture_allowed(incoming.as_ref(), &info)
-        })
+        // The second predicate is read at every microphone push, independent
+        // of this worker: a transient sync loss withholds audio, not revokes it.
+        rtc.audio_controls_gated(
+            &self.room_id,
+            move || {
+                audio_capture_allowed(&stop, selection.is_current(), &allowed_sync.borrow())
+                    && incoming_capture_allowed(incoming.as_ref(), &info)
+            },
+            move || transmission_allowed(&transmit_sync.borrow()),
+        )
     }
 
     fn spawn_capture_guards(

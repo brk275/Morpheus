@@ -46,6 +46,13 @@ pub(crate) fn signaling_health(sync: &SyncStatus) -> SignalingHealth {
     }
 }
 
+/// The temporary gate read at every outgoing audio and video push. It does
+/// not depend on the call worker being polled, so a worker suspended in a
+/// publish still cannot send while sync is down.
+pub(crate) fn transmission_allowed(sync: &SyncStatus) -> bool {
+    signaling_health(sync) == SignalingHealth::Ready
+}
+
 /// Why a join became unusable while the user still wants the call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RejoinCause {
@@ -114,6 +121,26 @@ mod tests {
             },
         ] {
             assert_eq!(signaling_health(&terminal), SignalingHealth::Unavailable);
+        }
+    }
+
+    #[test]
+    fn only_running_sticky_sync_may_transmit() {
+        assert!(transmission_allowed(&SyncStatus::Running {
+            backend: SyncBackend::SlidingSticky,
+        }));
+        for closed in [
+            SyncStatus::Starting,
+            SyncStatus::Retrying {
+                after_seconds: 4,
+                reason: "offline".into(),
+            },
+            SyncStatus::Stopped,
+            SyncStatus::Running {
+                backend: SyncBackend::Classic,
+            },
+        ] {
+            assert!(!transmission_allowed(&closed));
         }
     }
 

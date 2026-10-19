@@ -552,6 +552,9 @@ struct AudioAuthorization {
     cancelled: AtomicBool,
     changed: Notify,
     allowed: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Read at every microphone push. Unlike `allowed`, a false result only
+    /// withholds audio; it never revokes these controls or closes a device.
+    may_transmit: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl AudioAuthorization {
@@ -582,6 +585,14 @@ impl AudioControls {
         lease: CallLease,
         allowed: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Self {
+        Self::new_gated(lease, allowed, || true)
+    }
+
+    fn new_gated(
+        lease: CallLease,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+        may_transmit: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
         let desired = AudioState {
             microphone_muted: false,
             deafened: false,
@@ -598,6 +609,7 @@ impl AudioControls {
                 cancelled: AtomicBool::new(false),
                 changed: Notify::new(),
                 allowed: Box::new(allowed),
+                may_transmit: Box::new(may_transmit),
             }),
             state: Arc::new(Mutex::new(AudioControlState {
                 desired,
@@ -834,7 +846,10 @@ impl AudioControls {
     fn should_send_microphone(&self) -> Result<bool, MediaError> {
         self.ensure_authorized()?;
         let state = self.lock_state()?;
-        Ok(!state.suspended && !state.applied.microphone_muted)
+        let send = !state.suspended
+            && !state.applied.microphone_muted
+            && (self.authorization.may_transmit)();
+        Ok(send)
     }
 }
 
@@ -880,6 +895,20 @@ impl RtcService {
     ) -> Result<AudioControls, MediaError> {
         let lease = self.call_lease(room_id).ok_or(MediaError::NotJoined)?;
         Ok(AudioControls::new_cancellable(lease.clone(), allowed))
+    }
+
+    /// Like `audio_controls_cancellable`, plus a temporary transmission gate
+    /// read at every microphone push, independent of any owner task. While it
+    /// returns false, captured audio is dropped instead of sent; the controls
+    /// stay authorized and the devices stay open. Same predicate rules apply.
+    pub fn audio_controls_gated(
+        &self,
+        room_id: &str,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+        may_transmit: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<AudioControls, MediaError> {
+        let lease = self.call_lease(room_id).ok_or(MediaError::NotJoined)?;
+        Ok(AudioControls::new_gated(lease.clone(), allowed, may_transmit))
     }
 
     /// Run the default microphone and speaker for a joined call.
@@ -1482,6 +1511,39 @@ mod tests {
         ));
         let fresh = guarded_controls(|| true);
         assert!(AudioRunGuard::start(&fresh).is_ok());
+    }
+
+    #[test]
+    fn signaling_gate_withholds_audio_without_an_owner_or_revocation() {
+        let open = Arc::new(AtomicBool::new(true));
+        let gate = Arc::clone(&open);
+        let controls = AudioControls::new_gated(
+            CallLease::new(
+                CallInfo {
+                    room_id: "!room:example.test".into(),
+                    slot_id: "m.call#room".into(),
+                    membership_id: "membership".into(),
+                    local_identity: "identity".into(),
+                },
+                "@alice:example.test".into(),
+                "DEVICE".into(),
+            ),
+            || true,
+            move || gate.load(Ordering::SeqCst),
+        );
+        let _running = AudioRunGuard::start(&controls).unwrap();
+        {
+            let mut state = controls.lock_state().unwrap();
+            state.applied.microphone_muted = false;
+            controls.applied.send_replace(state.applied);
+        }
+        assert!(controls.should_send_microphone().unwrap());
+        // Nothing suspends these controls: the push boundary reads the gate.
+        open.store(false, Ordering::SeqCst);
+        assert!(!controls.should_send_microphone().unwrap());
+        assert!(controls.is_running(), "a transient loss must not revoke capture");
+        open.store(true, Ordering::SeqCst);
+        assert!(controls.should_send_microphone().unwrap());
     }
 
     #[test]
