@@ -1,13 +1,13 @@
 # TEMPORARY reviewed messaging verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
 name: Reviewed native messaging
-run-name: Native messaging checks - 0098b78
+run-name: Native messaging diagnosis - 0098b78
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: native-messaging-0098b78
+  group: native-messaging-diagnosis-0098b78
   cancel-in-progress: false
 jobs:
   native:
@@ -407,6 +407,7 @@ jobs:
           }
           allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
           checks=(
+              ('native_ui_compile',['cargo','check','--locked','-p','morpheus-ui-check'],10*60,None,set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
               ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
@@ -479,10 +480,15 @@ jobs:
                   # Only known public production file names and numeric spans.
                   # Never publish compiler text, source snippets or raw paths.
                   ui_files=('crates/morpheus-app/ui/app-window.slint',
-                      'crates/morpheus-app/ui/call-stage.slint',
-                      'crates/morpheus-app/src/account_access_ui_tests.rs')
+                      'crates/morpheus-app/ui/message-search.slint',
+                      'crates/morpheus-app/src/account_access_ui_tests.rs',
+                      'crates/morpheus-app/src/live.rs',
+                      'crates/morpheus-app/src/message_search.rs',
+                      'crates/morpheus-matrix/src/history.rs',
+                      'crates/morpheus-matrix/src/search.rs')
                   ui_locations=[]
                   for path in ui_files:
+                      if not (workspace/path).is_file(): continue
                       line_limit=len((workspace/path).read_text().splitlines())+1
                       pattern=re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})'
                       spans={(int(line),int(column)) for line,column in re.findall(pattern,normalized)
