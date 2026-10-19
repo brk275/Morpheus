@@ -700,6 +700,19 @@ pub(crate) fn candidate_detail(target: &SpaceTarget) -> String {
     format!("{kind} · via {servers}")
 }
 
+/// Whether a joined room matches a case-insensitive search of its name and
+/// ID; an empty search matches every room.
+pub(crate) fn candidate_matches(target: &SpaceTarget, query: &str) -> bool {
+    let needle = query
+        .trim()
+        .chars()
+        .take(MAX_QUERY_CHARS)
+        .collect::<String>()
+        .to_lowercase();
+    let title = candidate_title(target).to_lowercase();
+    needle.is_empty() || title.contains(&needle) || target.room_id.to_lowercase().contains(&needle)
+}
+
 /// Joined rooms the Space does not list directly yet, in the given order.
 pub(crate) fn candidates<'a>(
     rooms: &'a [SpaceTarget],

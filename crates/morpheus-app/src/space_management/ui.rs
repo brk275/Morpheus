@@ -666,6 +666,7 @@ impl SpaceManagerUi {
             state.rooms = None;
             state.picked.clear();
         }
+        ui.set_space_manager_pick_query("".into());
         self.repaint_panel(ui, panel);
     }
 
@@ -1101,7 +1102,8 @@ impl SpaceManagerUi {
         };
         view.back_name = self.back_name(panel.selection.account_id()).into();
         ui.set_space_manager_rows(ModelRc::new(VecModel::from(rows)));
-        let picks = picker_rows(&panel.lock(), &panel.space);
+        let pick_query = ui.get_space_manager_pick_query();
+        let picks = picker_rows(&panel.lock(), &panel.space, pick_query.as_str());
         update_picks(ui, picks);
         ui.set_space_manager_view(view);
     }
@@ -1172,6 +1174,7 @@ fn reset_inputs(ui: &AppWindow, intent: &Intent) {
             ui.set_space_manager_target_order("".into());
             ui.set_space_manager_target_suggested(false);
         }
+        Change::LinkMany { .. } => ui.set_space_manager_pick_query("".into()),
         Change::Create { .. } => {
             ui.set_space_manager_create_name("".into());
             ui.set_space_manager_create_is_space(false);
@@ -1200,8 +1203,9 @@ fn update_picks(ui: &AppWindow, picks: Vec<SpacePick>) {
     }
 }
 
-/// The open list of joined rooms the Space does not list yet.
-fn picker_rows(state: &PanelState, space: &str) -> Vec<SpacePick> {
+/// The open list of joined rooms the Space does not list yet, narrowed by
+/// the list's search. Picks hidden by the search stay picked.
+fn picker_rows(state: &PanelState, space: &str, query: &str) -> Vec<SpacePick> {
     let Some(rooms) = &state.rooms else {
         return Vec::new();
     };
@@ -1209,6 +1213,7 @@ fn picker_rows(state: &PanelState, space: &str) -> Vec<SpacePick> {
     let offered = super::candidates(rooms, &direct);
     offered
         .into_iter()
+        .filter(|room| super::candidate_matches(room, query))
         .map(|room| SpacePick {
             key: room.room_id.as_str().into(),
             name: super::candidate_title(room).into(),
@@ -1330,6 +1335,7 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_space_manager_rows(ModelRc::new(VecModel::<SpaceRow>::default()));
     ui.set_space_manager_picks(ModelRc::new(VecModel::<SpacePick>::default()));
     ui.set_space_manager_query("".into());
+    ui.set_space_manager_pick_query("".into());
     ui.set_space_manager_target_input("".into());
     ui.set_space_manager_target_order("".into());
     ui.set_space_manager_target_suggested(false);

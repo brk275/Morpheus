@@ -1926,6 +1926,7 @@ export component AppWindow inherits Window {
     in-out property <SpaceManagerView> space-manager-view;
     in-out property <[SpaceRow]> space-manager-rows;
     in-out property <[SpacePick]> space-manager-picks;
+    in-out property <string> space-manager-pick-query;
     in-out property <string> space-manager-query;
     in-out property <string> space-manager-target-input;
     in-out property <bool> space-manager-target-suggested: false;
@@ -4230,6 +4231,7 @@ export component AppWindow inherits Window {
                     view: root.space-manager-view;
                     rows: root.space-manager-rows;
                     picks: root.space-manager-picks;
+                    pick-query <=> root.space-manager-pick-query;
                     query <=> root.space-manager-query;
                     target-input <=> root.space-manager-target-input;
                     target-suggested <=> root.space-manager-target-suggested;

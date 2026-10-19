@@ -180,6 +180,8 @@ export component SpaceManagerPage inherits VerticalLayout {
     in property <SpaceManagerView> view;
     in property <[SpaceRow]> rows;
     in property <[SpacePick]> picks;
+    // Narrows the list of joined rooms offered for adding.
+    in-out property <string> pick-query;
     in-out property <string> query;
     in-out property <string> target-input;
     in-out property <bool> target-suggested;
@@ -550,8 +552,16 @@ export component SpaceManagerPage inherits VerticalLayout {
                             activated => { root.action(15); }
                         }
                     }
+                    if root.view.rooms-open : RosterField {
+                        palette: root.palette; text-scale: root.text-scale;
+                        placeholder: "Search your rooms";
+                        label: "Search the rooms you have joined by name or ID";
+                        enabled: !root.view.busy;
+                        text <=> root.pick-query;
+                        edited(text) => { root.search-edited(text); }
+                    }
                     if root.view.rooms-open && root.picks.length == 0 : Text {
-                        text: "Every room you have joined is already listed here.";
+                        text: root.pick-query != "" ? "None of your rooms match the search." : "Every room you have joined is already listed here.";
                         color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
                     }
                     if root.view.rooms-open && root.picks.length > 0 : picks-list := ListView {
