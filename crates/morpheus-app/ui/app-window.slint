@@ -3359,6 +3359,13 @@ export component AppWindow inherits Window {
     in-out property <string> room-search-context-notice;
     in-out property <string> room-search-selected-room-id;
     in-out property <string> room-search-selected-thread-root;
+    // Search filters (see MessageSearchPanel); cleared on account change.
+    in-out property <string> room-search-filter-sender;
+    in-out property <string> room-search-filter-since;
+    in-out property <string> room-search-filter-until;
+    in-out property <int> room-search-filter-attachment: 0;
+    in-out property <bool> room-search-filters-open: false;
+    in-out property <string> room-search-filter-error;
     // Scroll the conversation to a loaded row by its index; the row with
     // the jump event finishes the reveal. Nothing is rebuilt.
     in-out property <int> timeline-jump-index: -1;
@@ -3646,6 +3653,7 @@ export component AppWindow inherits Window {
     callback query-public-rooms(bool);
     callback query-room-messages();
     callback room-search-edited(string);
+    callback room-search-filters-edited();
     callback choose-room-search-scope(int);
     callback load-more-room-search();
     // Room ID and event ID of one listed hit.
@@ -8196,6 +8204,15 @@ export component AppWindow inherits Window {
                     selected-time: root.room-search-selected-time;
                     selected-body: root.room-search-selected-body;
                     focus-request: root.search-focus-request;
+                    filter-sender <=> root.room-search-filter-sender;
+                    filter-since <=> root.room-search-filter-since;
+                    filter-until <=> root.room-search-filter-until;
+                    filter-attachment <=> root.room-search-filter-attachment;
+                    filters-open <=> root.room-search-filters-open;
+                    filter-error: root.room-search-filter-error;
+                    line-width: StyleTokens.line-width;
+                    focus-width: StyleTokens.focus-width;
+                    filters-edited => { root.room-search-filters-edited(); }
                     edited(text) => { root.room-search-edited(text); }
                     submit => { root.query-room-messages(); }
                     choose-scope(scope) => { root.choose-room-search-scope(scope); }

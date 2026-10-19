@@ -32,7 +32,7 @@ pub use discovery::{
 mod history;
 pub use history::{FocusedView, HistoryReveal};
 mod search;
-pub use search::{MessageSearchPage, MessageSearchResult};
+pub use search::{AttachmentFilter, MessageSearchPage, MessageSearchResult, SearchFilters};
 mod formatting;
 pub use formatting::TextFormat;
 mod compose;

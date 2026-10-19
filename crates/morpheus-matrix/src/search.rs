@@ -9,10 +9,10 @@ use matrix_sdk::{
     Client,
     room::Room,
     ruma::{
-        EventId,
+        EventId, UserId,
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
-            room::message::{Relation, SyncRoomMessageEvent},
+            room::message::{MessageType, Relation, SyncRoomMessageEvent},
         },
     },
 };
@@ -30,6 +30,98 @@ const MAX_SEARCH_PAGE: usize = 50;
 /// Deepest index cursor a page may start from or advance to.
 const MAX_SEARCH_OFFSET: usize = 10_000;
 
+/// Most bytes of a sender filter: a full Matrix user ID.
+const MAX_SENDER_BYTES: usize = 255;
+/// Index hits a filtered page may examine to fill itself. Filters are
+/// checked against each loaded hit, so a narrow filter reads further into
+/// the index per page, always within this bound and the cursor cap.
+const MAX_FILTERED_PAGE: usize = 200;
+
+/// Whether a search keeps messages with an attachment. The index holds an
+/// attachment's file name and caption, never the file's contents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttachmentFilter {
+    #[default]
+    Any,
+    /// Only image, video, audio and file messages.
+    With,
+    /// Only messages without an attachment.
+    Without,
+}
+
+/// Optional narrowing of a text search. Filters are checked against each
+/// loaded hit on this device: the index is unchanged and nothing is sent to
+/// a homeserver. Debug output is redacted, since a filter can name a person
+/// or a time.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SearchFilters {
+    /// Only messages from this exact Matrix user ID.
+    pub sender: Option<String>,
+    /// Only messages sent at or after this time, in milliseconds since the
+    /// Unix epoch.
+    pub since_ms: Option<u64>,
+    /// Only messages sent at or before this time.
+    pub until_ms: Option<u64>,
+    pub attachment: AttachmentFilter,
+}
+
+impl std::fmt::Debug for SearchFilters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SearchFilters([redacted])")
+    }
+}
+
+impl SearchFilters {
+    pub fn is_empty(&self) -> bool {
+        self.sender.is_none()
+            && self.since_ms.is_none()
+            && self.until_ms.is_none()
+            && self.attachment == AttachmentFilter::Any
+    }
+
+    /// A malformed filter is refused before any index work, never treated
+    /// as matching nothing.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(sender) = &self.sender {
+            if sender.len() > MAX_SENDER_BYTES || UserId::parse(sender.as_str()).is_err() {
+                return Err(MatrixCoreError::InvalidSearchQuery(
+                    "sender must be a full Matrix user ID".into(),
+                ));
+            }
+        }
+        if let (Some(since), Some(until)) = (self.since_ms, self.until_ms) {
+            if since > until {
+                return Err(MatrixCoreError::InvalidSearchQuery(
+                    "the date range ends before it starts".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn admits(&self, result: &MessageSearchResult) -> bool {
+        let attachment = match self.attachment {
+            AttachmentFilter::Any => true,
+            AttachmentFilter::With => result.has_attachment,
+            AttachmentFilter::Without => !result.has_attachment,
+        };
+        let (sender, since, until) = (self.sender.as_deref(), self.since_ms, self.until_ms);
+        attachment
+            && sender.is_none_or(|sender| sender == result.sender)
+            && since.is_none_or(|since| result.timestamp_ms >= since)
+            && until.is_none_or(|until| result.timestamp_ms <= until)
+    }
+
+    /// Index hits one page may examine for `wanted` results.
+    fn page_allowance(&self, wanted: usize) -> usize {
+        if self.is_empty() {
+            wanted
+        } else {
+            MAX_FILTERED_PAGE
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MessageSearchResult {
     pub room_id: String,
@@ -45,6 +137,10 @@ pub struct MessageSearchResult {
     pub body: String,
     pub timestamp_ms: u64,
     pub relevance_score: f32,
+    /// An image, video, audio or file message (matched by its file name or
+    /// caption).
+    #[serde(default)]
+    pub has_attachment: bool,
 }
 
 /// One bounded page of hits. `next_offset` is the index cursor for the next
@@ -58,6 +154,8 @@ pub struct MessageSearchPage {
     /// Hits on this page whose event could not be loaded from the store or
     /// the homeserver. They are counted, never silently claimed as no match.
     pub unavailable: usize,
+    /// Hits on this page that were loaded but did not match the filters.
+    pub filtered: usize,
 }
 
 impl AccountManager {
@@ -111,7 +209,24 @@ impl AccountManager {
         limit: usize,
         offset: usize,
     ) -> Result<MessageSearchPage> {
+        let filters = SearchFilters::default();
+        self.search_messages_filtered_selected(selection, room_id, query, &filters, limit, offset)
+            .await
+    }
+
+    /// As search_messages_page_selected, keeping only hits that match
+    /// `filters`. Malformed filters are refused before any index work.
+    pub async fn search_messages_filtered_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        query: &str,
+        filters: &SearchFilters,
+        limit: usize,
+        offset: usize,
+    ) -> Result<MessageSearchPage> {
         let query = validate_query(query)?.to_owned();
+        filters.validate()?;
         let room = {
             let state = selection
                 .guard(self.state.lock())
@@ -122,7 +237,7 @@ impl AccountManager {
             super::account_room(&state, selection.account_id(), room_id)?
         };
         let page = selection
-            .guard(room_page(&room, &query, limit, offset))
+            .guard(room_page(&room, &query, filters, limit, offset))
             .await
             .ok_or(MatrixCoreError::SelectedAccountChanged)??;
         self.ensure_search_owner(selection)?;
@@ -138,7 +253,23 @@ impl AccountManager {
         limit: usize,
         offset: usize,
     ) -> Result<MessageSearchPage> {
+        let filters = SearchFilters::default();
+        self.search_all_messages_filtered_selected(selection, query, &filters, limit, offset)
+            .await
+    }
+
+    /// As search_all_messages_page_selected, keeping only hits that match
+    /// `filters`. Malformed filters are refused before any index work.
+    pub async fn search_all_messages_filtered_selected(
+        &self,
+        selection: &AccountSelection,
+        query: &str,
+        filters: &SearchFilters,
+        limit: usize,
+        offset: usize,
+    ) -> Result<MessageSearchPage> {
         let query = validate_query(query)?.to_owned();
+        filters.validate()?;
         let client = {
             let state = selection
                 .guard(self.state.lock())
@@ -150,7 +281,7 @@ impl AccountManager {
                 .clone()
         };
         let page = selection
-            .guard(global_page(&client, &query, limit, offset))
+            .guard(global_page(&client, &query, filters, limit, offset))
             .await
             .ok_or(MatrixCoreError::SelectedAccountChanged)??;
         self.ensure_search_owner(selection)?;
@@ -253,13 +384,15 @@ fn index_error(error: impl std::fmt::Display) -> MatrixCoreError {
 async fn room_page(
     room: &Room,
     query: &str,
+    filters: &SearchFilters,
     limit: usize,
     offset: usize,
 ) -> Result<MessageSearchPage> {
     let offset = offset.min(MAX_SEARCH_OFFSET);
+    let wanted = limit.clamp(1, MAX_SEARCH_PAGE);
     // No page examines a hit at or beyond the advertised cursor cap.
-    let allowance = limit
-        .clamp(1, MAX_SEARCH_PAGE)
+    let allowance = filters
+        .page_allowance(wanted)
         .min(MAX_SEARCH_OFFSET - offset);
     if allowance == 0 {
         return Ok(MessageSearchPage::default());
@@ -270,24 +403,32 @@ async fn room_page(
         .await
         .map_err(index_error)?
         .events;
-    let more = hits.len() > allowance;
-    let examined = hits.len().min(allowance);
+    let fetched = hits.len();
     let mut page = PageBuilder::default();
+    let mut examined = 0;
     for (relevance_score, event_id) in hits.into_iter().take(allowance) {
-        page.add(room, &event_id, relevance_score).await;
+        // A filtered page stops once full; its cursor resumes after the
+        // last hit it examined.
+        if page.results.len() == wanted {
+            break;
+        }
+        examined += 1;
+        page.add(room, &event_id, relevance_score, filters).await;
     }
     let next = offset + examined;
-    let next_offset = (more && next < MAX_SEARCH_OFFSET).then_some(next);
+    let next_offset = (fetched > examined && next < MAX_SEARCH_OFFSET).then_some(next);
     Ok(page.finish(next_offset))
 }
 
 async fn global_page(
     client: &Client,
     query: &str,
+    filters: &SearchFilters,
     limit: usize,
     offset: usize,
 ) -> Result<MessageSearchPage> {
-    let limit = limit.clamp(1, MAX_SEARCH_PAGE);
+    let wanted = limit.clamp(1, MAX_SEARCH_PAGE);
+    let allowance = filters.page_allowance(wanted);
     let offset = offset.min(MAX_SEARCH_OFFSET);
     // The cursor cap is exhausted: no hit at or beyond it is examined.
     if offset == MAX_SEARCH_OFFSET {
@@ -305,14 +446,17 @@ async fn global_page(
                 position += 1;
                 continue;
             }
-            if examined == limit || position >= MAX_SEARCH_OFFSET {
+            if examined == allowance
+                || page.results.len() == wanted
+                || position >= MAX_SEARCH_OFFSET
+            {
                 more = position < MAX_SEARCH_OFFSET;
                 break 'pages;
             }
             position += 1;
             examined += 1;
             if let Some(room) = client.get_room(&room_id) {
-                page.add(&room, &event_id, relevance_score).await;
+                page.add(&room, &event_id, relevance_score, filters).await;
             }
         }
     }
@@ -321,17 +465,26 @@ async fn global_page(
 
 /// Index failures end a page with an error before this builder is used. An
 /// event that cannot be loaded only counts as unavailable, so the page keeps
-/// its cursor and later hits stay reachable.
+/// its cursor and later hits stay reachable. A loaded hit that the filters
+/// reject only counts as filtered.
 #[derive(Default)]
 struct PageBuilder {
     results: Vec<MessageSearchResult>,
     room_names: HashMap<String, String>,
     unavailable: usize,
+    filtered: usize,
 }
 
 impl PageBuilder {
-    async fn add(&mut self, room: &Room, event_id: &EventId, relevance_score: f32) {
+    async fn add(
+        &mut self,
+        room: &Room,
+        event_id: &EventId,
+        relevance_score: f32,
+        filters: &SearchFilters,
+    ) {
         match load_search_result(room, event_id, relevance_score).await {
+            Ok(Some(result)) if !filters.admits(&result) => self.filtered += 1,
             Ok(Some(mut result)) => {
                 result.room_name = self.room_name(room).await;
                 self.results.push(result);
@@ -360,6 +513,7 @@ impl PageBuilder {
             results: self.results,
             next_offset,
             unavailable: self.unavailable,
+            filtered: self.filtered,
         }
     }
 }
@@ -390,6 +544,12 @@ async fn load_search_result(
     else {
         return Ok(None);
     };
+    // An edit's attachment is the one its new content carries.
+    let msgtype = match &event.content.relates_to {
+        Some(Relation::Replacement(replacement)) => &replacement.new_content.msgtype,
+        _ => &event.content.msgtype,
+    };
+    let has_attachment = is_attachment(msgtype);
     // The SDK indexes a replacement under the edit's event ID, but the
     // timeline presents the original event with the new content applied.
     // Return that visible event ID so opening/highlighting the hit works.
@@ -439,5 +599,85 @@ async fn load_search_result(
         body,
         timestamp_ms,
         relevance_score,
+        has_attachment,
     }))
+}
+
+/// Image, video, audio and file messages carry an attachment.
+fn is_attachment(msgtype: &MessageType) -> bool {
+    match msgtype {
+        MessageType::Image(_) | MessageType::Video(_) => true,
+        MessageType::Audio(_) | MessageType::File(_) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(sender: &str, timestamp_ms: u64, has_attachment: bool) -> MessageSearchResult {
+        MessageSearchResult {
+            room_id: "!room:example.org".into(),
+            room_name: String::new(),
+            event_id: "$event:example.org".into(),
+            thread_root: None,
+            sender: sender.into(),
+            body: "plans".into(),
+            timestamp_ms,
+            relevance_score: 1.0,
+            has_attachment,
+        }
+    }
+
+    #[test]
+    fn filters_are_bounded_validated_and_never_printed() {
+        let sender = "@casey:example.org";
+        let filters = SearchFilters {
+            sender: Some(sender.into()),
+            since_ms: Some(1_000),
+            until_ms: Some(2_000),
+            attachment: AttachmentFilter::With,
+        };
+        filters.validate().unwrap();
+        assert_eq!(format!("{filters:?}"), "SearchFilters([redacted])");
+        assert!(filters.admits(&hit(sender, 1_000, true)));
+        assert!(filters.admits(&hit(sender, 2_000, true)));
+        assert!(!filters.admits(&hit(sender, 999, true)));
+        assert!(!filters.admits(&hit(sender, 2_001, true)));
+        assert!(!filters.admits(&hit(sender, 1_500, false)));
+        assert!(!filters.admits(&hit("@casey:example.com", 1_500, true)));
+        let without = SearchFilters {
+            attachment: AttachmentFilter::Without,
+            ..SearchFilters::default()
+        };
+        assert!(without.admits(&hit(sender, 1, false)));
+        assert!(!without.admits(&hit(sender, 1, true)));
+
+        // A malformed sender or a reversed range is refused, not matched.
+        let long = format!("@{}:example.org", "x".repeat(255));
+        for sender in ["casey", "@casey", long.as_str()] {
+            let filters = SearchFilters {
+                sender: Some(sender.to_owned()),
+                ..SearchFilters::default()
+            };
+            assert!(matches!(
+                filters.validate(),
+                Err(MatrixCoreError::InvalidSearchQuery(_))
+            ));
+        }
+        let reversed = SearchFilters {
+            since_ms: Some(2),
+            until_ms: Some(1),
+            ..SearchFilters::default()
+        };
+        assert!(reversed.validate().is_err());
+
+        // Unfiltered pages examine exactly what they show; filtered pages
+        // read further, within a fixed bound.
+        let empty = SearchFilters::default();
+        assert!(empty.is_empty() && empty.admits(&hit(sender, 1, true)));
+        assert_eq!(empty.page_allowance(25), 25);
+        assert_eq!(filters.page_allowance(25), MAX_FILTERED_PAGE);
+    }
 }

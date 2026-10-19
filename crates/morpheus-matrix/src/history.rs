@@ -567,6 +567,24 @@ mod tests {
                     .await,
                 Err(MatrixCoreError::SelectedAccountChanged)
             ));
+            // Filtered searches are fenced by the same exact selection.
+            let filters = SearchFilters {
+                sender: Some("@casey:example.org".into()),
+                attachment: AttachmentFilter::With,
+                ..SearchFilters::default()
+            };
+            assert!(matches!(
+                manager
+                    .search_all_messages_filtered_selected(&stale, "plans", &filters, 10, 0)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            assert!(matches!(
+                manager
+                    .search_messages_filtered_selected(&stale, room, "plans", &filters, 10, 0)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
             assert!(matches!(
                 manager
                     .search_result_context_selected(&stale, room, event, 3)
@@ -598,6 +616,23 @@ mod tests {
             let current = manager.account_selection(&account.id).unwrap();
             let page = manager
                 .search_all_messages_page_selected(&current, "plans", 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(page, MessageSearchPage::default());
+            // A malformed filter is refused before any index work; valid
+            // filters page the same (empty) room set.
+            let invalid = SearchFilters {
+                sender: Some("casey".into()),
+                ..SearchFilters::default()
+            };
+            assert!(matches!(
+                manager
+                    .search_all_messages_filtered_selected(&current, "plans", &invalid, 10, 0)
+                    .await,
+                Err(MatrixCoreError::InvalidSearchQuery(_))
+            ));
+            let page = manager
+                .search_all_messages_filtered_selected(&current, "plans", &filters, 10, 0)
                 .await
                 .unwrap();
             assert_eq!(page, MessageSearchPage::default());

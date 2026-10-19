@@ -13,6 +13,8 @@ export struct MessageSearchItem {
     room-name: string,
     // Root event of the thread the hit belongs to, or empty.
     thread-root: string,
+    // An image, video, audio or file message.
+    has-attachment: bool,
 }
 
 // The window's resolved theme roles for the search surface. Optional
@@ -41,6 +43,8 @@ component SearchAction inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <color> focus-color;
+    // The window's focus ring width (StyleTokens.focus-width).
+    in property <length> focus-width: 2px;
     out property <bool> has-hover: hit.has-hover;
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
@@ -70,12 +74,66 @@ component SearchAction inherits Rectangle {
     if keyboard-focus.has-focus : Rectangle {
         x: 0px; y: 0px; width: root.width; height: root.height;
         border-radius: root.border-radius;
-        border-width: 2px;
+        border-width: root.focus-width;
         border-color: root.focus-color;
         background: transparent;
     }
 }
 
+
+// One filter text field, drawn with the window's line and focus widths.
+// Tab reaches it; Return searches now; Escape closes the filters.
+component FilterField inherits Rectangle {
+    in property <SearchPalette> palette;
+    in property <length> radius: 6px;
+    in property <float> text-scale: 1;
+    in property <length> line-width: 1px;
+    in property <length> focus-width: 2px;
+    in property <string> placeholder;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in-out property <string> text;
+    out property <bool> has-focus: input.has-focus;
+    callback edited();
+    callback accepted();
+    callback escape();
+    forward-focus: input;
+    border-radius: root.radius;
+    height: max(30px, 20px * root.text-scale + 10px);
+    background: root.palette.elevated;
+    border-width: input.has-focus ? root.focus-width : root.line-width;
+    border-color: input.has-focus ? root.palette.focus : root.palette.divider;
+    if root.text == "" : Text {
+        x: 8px; width: parent.width - 16px; height: parent.height;
+        text: root.placeholder;
+        color: root.palette.muted; font-size: 11px * root.text-scale;
+        vertical-alignment: center; overflow: elide;
+    }
+    FocusScope {
+        x: 8px; width: parent.width - 16px; height: parent.height;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.escape();
+                accept
+            } else { reject }
+        }
+        input := TextInput {
+            width: parent.width; height: parent.height;
+            text <=> root.text;
+            single-line: true;
+            enabled: root.enabled;
+            color: root.palette.ink; font-size: 11px * root.text-scale;
+            vertical-alignment: center;
+            selection-background-color: root.palette.selection;
+            selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+            accessible-label: root.label;
+            edited => { root.edited(); }
+            accepted => { root.accepted(); }
+        }
+    }
+}
 // Message search over the account's encrypted on-device index. The window
 // owns every property; this component only presents them and reports input.
 // The field owns Up/Down/PageUp/PageDown (highlight), Return (open the
@@ -111,8 +169,22 @@ export component MessageSearchPanel inherits VerticalLayout {
     in property <string> selected-time;
     in property <string> selected-body;
     in property <int> focus-request;
+    // Filters narrowing a word search. The window keeps them for the
+    // account until it changes; the controller validates them.
+    in-out property <string> filter-sender;
+    in-out property <string> filter-since;
+    in-out property <string> filter-until;
+    // 0 any message, 1 only with an attachment, 2 only without.
+    in-out property <int> filter-attachment;
+    in-out property <bool> filters-open;
+    in property <string> filter-error;
+    // The window's line and focus ring widths (StyleTokens).
+    in property <length> line-width: 1px;
+    in property <length> focus-width: 2px;
     // The query text changed; the controller debounces and cancels.
     callback edited(string);
+    // A filter changed; the controller debounces and cancels likewise.
+    callback filters-edited();
     // Search now (Return with no highlighted hit).
     callback submit();
     callback choose-scope(int);
@@ -123,6 +195,11 @@ export component MessageSearchPanel inherits VerticalLayout {
     callback dismiss();
 
     property <bool> scope-ready: root.available && (root.scope == 1 || root.room-available);
+    // Sender, date range and attachment each count once.
+    property <int> active-filters: (root.filter-sender != "" ? 1 : 0)
+        + (root.filter-since != "" || root.filter-until != "" ? 1 : 0)
+        + (root.filter-attachment != 0 ? 1 : 0);
+    property <length> chip-height: max(26px, 18px * root.text-scale + 8px);
     property <length> row-height: max(74px, 54px * root.text-scale + 22px);
 
     spacing: 0px;
@@ -248,6 +325,190 @@ export component MessageSearchPanel inherits VerticalLayout {
                 }
             }
         }
+        // Filters narrow a word search. They are checked on this device
+        // against each loaded match; the index and the homeserver see none.
+        HorizontalLayout {
+            spacing: 4px;
+            height: root.chip-height;
+            SearchAction {
+                horizontal-stretch: 0;
+                width: filters-label.preferred-width + 20px;
+                border-radius: root.radius * 0.7;
+                border-width: root.line-width;
+                border-color: root.filters-open || root.active-filters > 0 ? root.palette.accent : root.palette.divider;
+                background: root.filters-open ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                focus-color: root.palette.focus;
+                focus-width: root.focus-width;
+                enabled: root.available;
+                accessible-checkable: true;
+                accessible-checked: root.filters-open;
+                label: "Search filters" + (root.active-filters > 0 ? ", " + root.active-filters + " active" : "");
+                activated => { root.filters-open = !root.filters-open; }
+                filters-label := Text {
+                    text: root.active-filters > 0 ? "Filters · " + root.active-filters : "Filters";
+                    color: root.filters-open && root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                    font-size: 11px * root.text-scale; font-weight: 700;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+            // Compact chips for the active filters; activating one removes it.
+            if root.filter-sender != "" : SearchAction {
+                horizontal-stretch: 1; min-width: 0px;
+                border-radius: root.radius * 0.7;
+                border-width: root.line-width;
+                border-color: root.palette.accent;
+                background: self.has-hover ? root.palette.hover : root.palette.elevated;
+                focus-color: root.palette.focus;
+                focus-width: root.focus-width;
+                label: "Remove the sender filter, " + root.filter-sender;
+                activated => { root.filter-sender = ""; root.filters-edited(); }
+                Text {
+                    x: 6px; width: parent.width - 12px; height: parent.height;
+                    text: "× " + root.filter-sender;
+                    color: root.palette.ink; font-size: 10px * root.text-scale;
+                    vertical-alignment: center; overflow: elide;
+                }
+            }
+            if root.filter-since != "" || root.filter-until != "" : SearchAction {
+                horizontal-stretch: 1; min-width: 0px;
+                border-radius: root.radius * 0.7;
+                border-width: root.line-width;
+                border-color: root.palette.accent;
+                background: self.has-hover ? root.palette.hover : root.palette.elevated;
+                focus-color: root.palette.focus;
+                focus-width: root.focus-width;
+                label: "Remove the date filter";
+                activated => { root.filter-since = ""; root.filter-until = ""; root.filters-edited(); }
+                Text {
+                    x: 6px; width: parent.width - 12px; height: parent.height;
+                    text: "× " + (root.filter-since != "" ? root.filter-since : "…") + " – " + (root.filter-until != "" ? root.filter-until : "…");
+                    color: root.palette.ink; font-size: 10px * root.text-scale;
+                    vertical-alignment: center; overflow: elide;
+                }
+            }
+            if root.filter-attachment != 0 : SearchAction {
+                horizontal-stretch: 1; min-width: 0px;
+                border-radius: root.radius * 0.7;
+                border-width: root.line-width;
+                border-color: root.palette.accent;
+                background: self.has-hover ? root.palette.hover : root.palette.elevated;
+                focus-color: root.palette.focus;
+                focus-width: root.focus-width;
+                label: "Remove the attachment filter";
+                activated => { root.filter-attachment = 0; root.filters-edited(); }
+                Text {
+                    x: 6px; width: parent.width - 12px; height: parent.height;
+                    text: root.filter-attachment == 1 ? "× With attachment" : "× No attachment";
+                    color: root.palette.ink; font-size: 10px * root.text-scale;
+                    vertical-alignment: center; overflow: elide;
+                }
+            }
+            if root.active-filters == 0 : Rectangle { horizontal-stretch: 1; }
+        }
+        if root.filters-open : VerticalLayout {
+            spacing: 6px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    width: 48px * root.text-scale;
+                    text: "From";
+                    color: root.palette.muted; font-size: 11px * root.text-scale;
+                    vertical-alignment: center;
+                }
+                FilterField {
+                    horizontal-stretch: 1;
+                    palette: root.palette; text-scale: root.text-scale; radius: root.radius * 0.6;
+                    line-width: root.line-width; focus-width: root.focus-width;
+                    enabled: root.available;
+                    placeholder: "@name:example.org";
+                    label: "Only messages from this sender, by full user ID";
+                    text <=> root.filter-sender;
+                    edited => { root.filters-edited(); }
+                    accepted => { root.submit(); }
+                    escape => { root.filters-open = false; input.focus(); }
+                }
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    width: 48px * root.text-scale;
+                    text: "Sent";
+                    color: root.palette.muted; font-size: 11px * root.text-scale;
+                    vertical-alignment: center;
+                }
+                FilterField {
+                    horizontal-stretch: 1;
+                    palette: root.palette; text-scale: root.text-scale; radius: root.radius * 0.6;
+                    line-width: root.line-width; focus-width: root.focus-width;
+                    enabled: root.available;
+                    placeholder: "From YYYY-MM-DD";
+                    label: "Only messages sent on or after this day, written YYYY-MM-DD";
+                    text <=> root.filter-since;
+                    edited => { root.filters-edited(); }
+                    accepted => { root.submit(); }
+                    escape => { root.filters-open = false; input.focus(); }
+                }
+                FilterField {
+                    horizontal-stretch: 1;
+                    palette: root.palette; text-scale: root.text-scale; radius: root.radius * 0.6;
+                    line-width: root.line-width; focus-width: root.focus-width;
+                    enabled: root.available;
+                    placeholder: "To YYYY-MM-DD";
+                    label: "Only messages sent on or before this day, written YYYY-MM-DD";
+                    text <=> root.filter-until;
+                    edited => { root.filters-edited(); }
+                    accepted => { root.submit(); }
+                    escape => { root.filters-open = false; input.focus(); }
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                height: root.chip-height;
+                for choice[option] in ["Any message", "With attachment", "No attachment"] : SearchAction {
+                    horizontal-stretch: 1;
+                    border-radius: root.radius * 0.7;
+                    border-width: root.line-width;
+                    border-color: root.filter-attachment == option ? root.palette.accent : root.palette.divider;
+                    background: root.filter-attachment == option ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                    focus-color: root.palette.focus;
+                    focus-width: root.focus-width;
+                    enabled: root.available;
+                    accessible-checkable: true;
+                    accessible-checked: root.filter-attachment == option;
+                    label: option == 0 ? "Messages with or without an attachment"
+                        : option == 1 ? "Only messages with an attachment, matched by file name or caption"
+                        : "Only messages without an attachment";
+                    activated => {
+                        if root.filter-attachment != option {
+                            root.filter-attachment = option;
+                            root.filters-edited();
+                        }
+                    }
+                    Text {
+                        text: choice;
+                        color: root.filter-attachment == option && root.palette.has-selection-ink ? root.palette.selection-ink
+                            : root.filter-attachment == option ? root.palette.ink : root.palette.muted;
+                        font-size: 11px * root.text-scale;
+                        horizontal-alignment: center; vertical-alignment: center; overflow: elide;
+                    }
+                }
+            }
+            if root.filter-error != "" : Text {
+                text: root.filter-error;
+                color: root.palette.error; font-size: 11px * root.text-scale; wrap: word-wrap;
+                accessible-live-region: polite;
+            }
+            // What the filters cannot do, said plainly.
+            Text {
+                text: "Filters narrow a word search on this device. Attachments are found by file name or caption, not by their contents; stickers and polls are not shown.";
+                color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+            }
+        }
+        if !root.filters-open && root.filter-error != "" : Text {
+            text: root.filter-error;
+            color: root.palette.error; font-size: 11px * root.text-scale; wrap: word-wrap;
+            accessible-live-region: polite;
+        }
     }
     Rectangle { height: 1px; background: root.palette.divider; }
     VerticalLayout {
@@ -261,6 +522,8 @@ export component MessageSearchPanel inherits VerticalLayout {
                 : !root.available ? "Sign in to search messages."
                 : root.loading ? (root.scope == 0 ? "Searching this room…" : "Searching all rooms…")
                 : root.scope == 0 && !root.room-available ? "Open a room, or search all rooms."
+                : root.searched && root.results.length == 0 && root.active-filters > 0
+                    ? "No messages matched the words and filters." + (root.notice != "" ? " " + root.notice + "." : "")
                 : root.searched && root.results.length == 0 ? (root.scope == 0
                     ? "No messages in this room matched. Only messages stored on this device are searched."
                     : "No messages matched in any room. Only messages stored on this device are searched.")
@@ -360,7 +623,8 @@ export component MessageSearchPanel inherits VerticalLayout {
             accessible-item-index: row;
             accessible-item-count: root.results.length;
             label: "Open message from " + result.sender + " in " + result.room-name + ", " + result.time
-                + (result.thread-root != "" ? ", in a thread" : "") + ": " + result.preview;
+                + (result.thread-root != "" ? ", in a thread" : "")
+                + (result.has-attachment ? ", with an attachment" : "") + ": " + result.preview;
             activated => {
                 root.index = row;
                 root.open(result.room-id, result.event-id);
@@ -396,6 +660,12 @@ export component MessageSearchPanel inherits VerticalLayout {
                     }
                     if result.thread-root != "" : Text {
                         text: "THREAD";
+                        color: result-row.inked ? root.palette.selection-ink : root.palette.muted;
+                        font-size: 9px * root.text-scale; font-weight: 750;
+                        horizontal-stretch: 0; vertical-alignment: center;
+                    }
+                    if result.has-attachment : Text {
+                        text: "ATTACHMENT";
                         color: result-row.inked ? root.palette.selection-ink : root.palette.muted;
                         font-size: 9px * root.text-scale; font-weight: 750;
                         horizontal-stretch: 0; vertical-alignment: center;
