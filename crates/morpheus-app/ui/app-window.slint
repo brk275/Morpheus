@@ -2145,6 +2145,9 @@ export component AppWindow inherits Window {
     in-out property <string> security-error;
     in-out property <string> security-notice;
     in-out property <string> security-recovery-input;
+    // Room-key file passphrases; cleared on use, leaving Settings and hiding.
+    in-out property <string> security-key-file-passphrase;
+    in-out property <string> security-key-file-confirm;
     in-out property <string> security-recovery-key;
     in-out property <bool> security-key-revealed: false;
     in-out property <int> security-operation: 0;
@@ -2472,6 +2475,8 @@ export component AppWindow inherits Window {
     callback refresh-security();
     callback enable-recovery();
     callback change-recovery-key();
+    callback export-room-keys();
+    callback import-room-keys();
     callback recover-account(string);
     callback copy-recovery-key();
     callback dismiss-recovery-key();
@@ -2531,6 +2536,8 @@ export component AppWindow inherits Window {
         root.close-image-preview();
         if root.page != 1 {
             root.security-recovery-input = "";
+            root.security-key-file-passphrase = "";
+            root.security-key-file-confirm = "";
             root.device-signout-password = "";
             root.sas-compared = false;
             root.notification-highlight-error = "";
@@ -5344,6 +5351,51 @@ export component AppWindow inherits Window {
                                                 root.security-recovery-input = "";
                                                 root.recover-account(secret);
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                            // A passphrase-protected copy of the room keys this device holds.
+                            // Passphrases are taken and cleared before the file dialog opens.
+                            Rectangle {
+                                height: key-file-layout.preferred-height; border-radius: 10px; background: root.elevated;
+                                key-file-layout := VerticalLayout {
+                                    padding: 14px; spacing: 8px;
+                                    Text { text: "Room-key file"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: "Save the keys for messages this device can read to a file protected by a passphrase, or import keys from such a file. Anyone with the file and its passphrase can read those messages."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                                    Rectangle {
+                                        height: 38px; background: root.panel; border-radius: 8px; border-color: root.divider; border-width: 1px;
+                                        ThemedTextInput {
+                                            x: 10px; width: parent.width - 20px; height: parent.height;
+                                            text <=> root.security-key-file-passphrase; input-type: password;
+                                            enabled: root.sas-stage == 0 && !root.sas-busy && !root.security-busy;
+                                            color: root.ink; font-size: 12px * root.text-scale;
+                                            accessible-label: "Room-key file passphrase";
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 38px; background: root.panel; border-radius: 8px; border-color: root.divider; border-width: 1px;
+                                        ThemedTextInput {
+                                            x: 10px; width: parent.width - 20px; height: parent.height;
+                                            text <=> root.security-key-file-confirm; input-type: password;
+                                            enabled: root.sas-stage == 0 && !root.sas-busy && !root.security-busy;
+                                            color: root.ink; font-size: 12px * root.text-scale;
+                                            accessible-label: "Repeat the passphrase to export room keys";
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px; alignment: start;
+                                        Button {
+                                            text: "Export keys…";
+                                            enabled: root.sas-stage == 0 && !root.sas-busy && !root.security-busy && !root.security-loading && root.security-recovery-key == "" && root.security-key-file-passphrase != "" && root.security-key-file-confirm != "";
+                                            accessible-label: "Export room keys to a passphrase-protected file";
+                                            clicked => { root.export-room-keys(); }
+                                        }
+                                        Button {
+                                            text: "Import keys…";
+                                            enabled: root.sas-stage == 0 && !root.sas-busy && !root.security-busy && !root.security-loading && root.security-recovery-key == "" && root.security-key-file-passphrase != "";
+                                            accessible-label: "Import room keys from a passphrase-protected file";
+                                            clicked => { root.import-room-keys(); }
                                         }
                                     }
                                 }

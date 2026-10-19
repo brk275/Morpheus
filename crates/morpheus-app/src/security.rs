@@ -7,7 +7,10 @@ use std::sync::{
     atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
-use morpheus_matrix::{BackupStatus, DeviceVerificationStatus, RecoveryStatus, SecurityInfo};
+use morpheus_matrix::{
+    BackupStatus, DeviceVerificationStatus, MIN_KEY_FILE_PASSPHRASE_CHARS, RecoveryStatus,
+    SecurityInfo,
+};
 use slint::{CloseRequestResponse, ComponentHandle};
 use tokio::runtime::Handle;
 use zeroize::Zeroizing;
@@ -275,8 +278,29 @@ pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
     ui.set_security_error("".into());
     ui.set_security_notice("".into());
     ui.set_security_recovery_input("".into());
+    drop(take_key_file_secrets(ui));
     ui.set_security_recovery_key("".into());
     ui.set_security_key_revealed(false);
+}
+
+/// Take both typed room-key-file passphrases out of the window.
+fn take_key_file_secrets(ui: &AppWindow) -> (Zeroizing<String>, Zeroizing<String>) {
+    let secrets = (
+        Zeroizing::new(ui.get_security_key_file_passphrase().to_string()),
+        Zeroizing::new(ui.get_security_key_file_confirm().to_string()),
+    );
+    ui.set_security_key_file_passphrase("".into());
+    ui.set_security_key_file_confirm("".into());
+    secrets
+}
+
+/// No other security work, verification or unsaved recovery key is active.
+fn key_file_idle(ui: &AppWindow) -> bool {
+    !ui.get_security_busy()
+        && ui.get_live_session()
+        && ui.get_sas_stage() == 0
+        && !ui.get_sas_busy()
+        && ui.get_security_recovery_key().is_empty()
 }
 
 /// A recovery operation must finish and a newly generated key must be saved
@@ -349,6 +373,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         {
             // A hidden window keeps running; it must not keep a typed secret.
             window.set_security_recovery_input("".into());
+            drop(take_key_file_secrets(&window));
             crate::device_sessions::clear_secret(&window);
         }
         response
@@ -569,6 +594,149 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                         window.set_security_notice("".into());
                         window.set_security_error(
                             "Could not replace the recovery key. Refresh status, then try again."
+                                .into(),
+                        );
+                    }
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
+    let export_live = live.clone();
+    let export_handle = handle.clone();
+    let export_gate = live.security_gate.clone();
+    ui.on_export_room_keys(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        // The typed passphrases leave the window before any dialog opens.
+        let (passphrase, confirm) = take_key_file_secrets(&window);
+        let account_id = window.get_active_account_local_id().to_string();
+        if !key_file_idle(&window) || account_id.is_empty() {
+            return;
+        }
+        if passphrase.chars().count() < MIN_KEY_FILE_PASSPHRASE_CHARS {
+            window.set_security_error("Use a passphrase of at least 12 characters.".into());
+            return;
+        }
+        if *passphrase != *confirm {
+            window.set_security_error("The two passphrases do not match.".into());
+            return;
+        }
+        // The native dialog runs modally on the UI thread, as AppKit requires.
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export room keys")
+            .set_file_name("morpheus-room-keys.txt")
+            .save_file()
+        else {
+            return;
+        };
+        if window.get_active_account_local_id().as_str() != account_id
+            || !key_file_idle(&window)
+            || !export_gate.begin()
+        {
+            return;
+        }
+        let operation = next_operation(&window);
+        window.set_security_busy(true);
+        window.set_security_error("".into());
+        window.set_security_notice("Exporting room keys…".into());
+        let live = export_live.clone();
+        let gate = export_gate.clone();
+        let weak = weak.clone();
+        export_handle.spawn(async move {
+            let _transition = live.account_transition.lock().await;
+            let result = if active_account_is(&live, &account_id).await {
+                live.manager
+                    .export_room_keys_for(&account_id, path, &passphrase)
+                    .await
+                    .map_err(drop)
+            } else {
+                Err(())
+            };
+            drop(passphrase);
+            gate.reset();
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if !same_view(&window, &account_id, operation) {
+                    return;
+                }
+                window.set_security_busy(false);
+                if result.is_ok() {
+                    window.set_security_notice(
+                        "Room keys exported. Keep the file and its passphrase private.".into(),
+                    );
+                } else {
+                    window.set_security_notice("".into());
+                    window.set_security_error(
+                        "The room keys could not be exported. Try another location.".into(),
+                    );
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
+    let import_live = live.clone();
+    let import_handle = handle.clone();
+    let import_gate = live.security_gate.clone();
+    ui.on_import_room_keys(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let (passphrase, _) = take_key_file_secrets(&window);
+        let account_id = window.get_active_account_local_id().to_string();
+        if !key_file_idle(&window) || account_id.is_empty() {
+            return;
+        }
+        if passphrase.is_empty() {
+            window.set_security_error("Enter the passphrase of the room-key file.".into());
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import room keys")
+            .pick_file()
+        else {
+            return;
+        };
+        if window.get_active_account_local_id().as_str() != account_id
+            || !key_file_idle(&window)
+            || !import_gate.begin()
+        {
+            return;
+        }
+        let operation = next_operation(&window);
+        window.set_security_busy(true);
+        window.set_security_error("".into());
+        window.set_security_notice("Importing room keys…".into());
+        let live = import_live.clone();
+        let gate = import_gate.clone();
+        let weak = weak.clone();
+        import_handle.spawn(async move {
+            let _transition = live.account_transition.lock().await;
+            let result = if active_account_is(&live, &account_id).await {
+                live.manager
+                    .import_room_keys_for(&account_id, path, &passphrase)
+                    .await
+                    .map_err(drop)
+            } else {
+                Err(())
+            };
+            drop(passphrase);
+            gate.reset();
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if !same_view(&window, &account_id, operation) {
+                    return;
+                }
+                window.set_security_busy(false);
+                match result {
+                    Ok((imported, total)) => window.set_security_notice(
+                        format!("Imported {imported} of {total} room keys from the file.").into(),
+                    ),
+                    Err(()) => {
+                        window.set_security_notice("".into());
+                        window.set_security_error(
+                            "The keys could not be imported. Check the file and its passphrase."
                                 .into(),
                         );
                     }

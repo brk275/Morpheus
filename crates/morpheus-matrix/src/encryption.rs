@@ -4,7 +4,7 @@
 //! trusts a device by itself: trust changes only through a SAS flow the user
 //! compared and confirmed on both devices.
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 use futures_util::{StreamExt, stream::BoxStream};
 use matrix_sdk::{
@@ -113,7 +113,82 @@ impl VerificationSnapshot {
     }
 }
 
+/// Shortest passphrase accepted for a room-key file.
+pub const MIN_KEY_FILE_PASSPHRASE_CHARS: usize = 12;
+/// Largest room-key file read for import.
+const MAX_KEY_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// An export target must be a new or regular file, never a link, directory
+/// or device: the SDK follows a link when it creates the file.
+fn export_path_allowed(path: &std::path::Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type().is_file(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 impl AccountManager {
+    /// Write this device's room keys for the account the UI showed to a file
+    /// encrypted with the person's passphrase (the SDK's standard export).
+    pub async fn export_room_keys_for(
+        &self,
+        expected_account_id: &str,
+        path: PathBuf,
+        passphrase: &str,
+    ) -> Result<()> {
+        if passphrase.chars().count() < MIN_KEY_FILE_PASSPHRASE_CHARS {
+            return Err(MatrixCoreError::Sdk(
+                "Use a passphrase of at least 12 characters.".into(),
+            ));
+        }
+        if !export_path_allowed(&path) {
+            return Err(MatrixCoreError::Sdk(
+                "Choose a regular file to save the keys.".into(),
+            ));
+        }
+        let client = {
+            let state = self.state.lock().await;
+            selected_loaded_for(&state, expected_account_id)?
+                .client
+                .clone()
+        };
+        client
+            .encryption()
+            .export_room_keys(path, passphrase, |_| true)
+            .await
+            .map_err(|_| MatrixCoreError::Sdk("The room keys could not be exported.".into()))
+    }
+
+    /// Import room keys from a passphrase-protected key file. Returns how
+    /// many keys were new and how many the file held.
+    pub async fn import_room_keys_for(
+        &self,
+        expected_account_id: &str,
+        path: PathBuf,
+        passphrase: &str,
+    ) -> Result<(usize, usize)> {
+        let readable = std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_KEY_FILE_BYTES);
+        // symlink_metadata does not follow links, so a link is refused here.
+        if !readable {
+            return Err(MatrixCoreError::Sdk(
+                "Choose a room-key file to import.".into(),
+            ));
+        }
+        let client = {
+            let state = self.state.lock().await;
+            selected_loaded_for(&state, expected_account_id)?
+                .client
+                .clone()
+        };
+        let result = client
+            .encryption()
+            .import_room_keys(path, passphrase)
+            .await
+            .map_err(|_| MatrixCoreError::Sdk("Wrong passphrase, or not a key file.".into()))?;
+        Ok((result.imported_count, result.total_count))
+    }
+
     /// Replace the recovery key of the account the UI showed. Offered only
     /// while recovery is fully set up on this device (all cross-signing keys
     /// and the backup key are here), so every secret moves to the new key.
@@ -376,6 +451,14 @@ fn needs_attention(trust: DeviceTrust) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_key_files_are_never_written_into_directories() {
+        let directory = std::env::temp_dir();
+        assert!(!export_path_allowed(&directory));
+        let missing = directory.join("no-such-morpheus-dir").join("keys");
+        assert!(export_path_allowed(&missing));
+    }
 
     fn device(id: &str, current: bool, trust: DeviceTrust, seen: Option<u64>) -> OwnDeviceInfo {
         OwnDeviceInfo {

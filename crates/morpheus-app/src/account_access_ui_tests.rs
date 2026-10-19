@@ -2676,6 +2676,8 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.set_identity_warning_name("private member name".into());
     ui.set_identity_warning_kind(2);
     ui.set_identity_warning_error("private warning error".into());
+    ui.set_security_key_file_passphrase("synthetic key file passphrase".into());
+    ui.set_security_key_file_confirm("synthetic key file passphrase".into());
     settle(&ui).await;
     assert_eq!(control_bounds(&ui, "One-time Matrix recovery key").len(), 1);
     live.account_detached(ui.as_weak()).await;
@@ -2738,6 +2740,8 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_identity_warning_name().is_empty());
     assert_eq!(ui.get_identity_warning_kind(), 0);
     assert!(ui.get_identity_warning_error().is_empty());
+    assert!(ui.get_security_key_file_passphrase().is_empty());
+    assert!(ui.get_security_key_file_confirm().is_empty());
     assert!(manager.active_account().await.is_none());
 
     assert_removed_account_menu_projection(&ui);
