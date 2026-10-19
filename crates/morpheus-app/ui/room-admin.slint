@@ -585,8 +585,8 @@ export component RoomMembersPanel inherits VerticalLayout {
                     }
                     if root.selected.membership != 2 && root.selected.can-kick : RosterButton {
                         palette: root.palette; text-scale: root.text-scale;
-                        text: "Kick…"; destructive: true;
-                        label: "Review kicking " + root.selected.name + " from the room";
+                        text: root.selected.membership == 1 ? "Revoke invite…" : "Kick…"; destructive: true;
+                        label: root.selected.membership == 1 ? "Review revoking the invitation of " + root.selected.name : "Review kicking " + root.selected.name + " from the room";
                         enabled: !root.busy;
                         activated => { root.request(1); }
                     }

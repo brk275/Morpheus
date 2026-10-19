@@ -33,6 +33,8 @@ const DENY_BODY: &str =
     "They will not join. They can ask again unless the room's rules prevent it.";
 const KICK_BODY: &str =
     "They leave the room now and can rejoin if the room's access rules allow it.";
+const REVOKE_BODY: &str =
+    "They can no longer join with this invitation. You can invite them again later.";
 const BAN_BODY: &str = "They leave the room and cannot rejoin until someone unbans them.";
 const BAN_ABSENT_BODY: &str =
     "They are not in the room now. They cannot join or be invited until someone unbans them.";
@@ -836,6 +838,12 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
             action: "Deny request",
             destructive: true,
         },
+        AdminAction::Kick if revokes_invite(intent) => Confirmation {
+            title: format!("Revoke {name}'s invitation?"),
+            body: REVOKE_BODY.to_owned(),
+            action: "Revoke invitation",
+            destructive: true,
+        },
         AdminAction::Kick => Confirmation {
             title: format!("Kick {name}?"),
             body: KICK_BODY.to_owned(),
@@ -972,11 +980,18 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
     Some(confirmation)
 }
 
+/// Kicking someone who was only invited withdraws the invitation.
+fn revokes_invite(intent: &Intent) -> bool {
+    intent.action == AdminAction::Kick
+        && intent.expected.membership == Some(AdminMembership::Invite)
+}
+
 pub(crate) fn pending_text(intent: &Intent) -> String {
     let verb = match intent.action {
         AdminAction::Invite if intent.knock => "Approving",
         AdminAction::Invite => "Inviting",
         AdminAction::Kick if intent.knock => "Denying",
+        AdminAction::Kick if revokes_invite(intent) => "Revoking the invitation of",
         AdminAction::Kick => "Kicking",
         AdminAction::Ban => "Banning",
         AdminAction::Unban => "Unbanning",
@@ -1036,6 +1051,9 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
         AdminAction::Invite if intent.knock => format!("Approved: {name} is invited and can join."),
         AdminAction::Invite => format!("Invited {name}. The homeserver confirmed the invitation."),
         AdminAction::Kick if intent.knock => format!("Denied {name}'s request to join."),
+        AdminAction::Kick if revokes_invite(intent) => {
+            format!("Revoked {name}'s invitation. The homeserver confirmed it.")
+        }
         AdminAction::Kick => format!("Kicked {name}. The homeserver confirmed they left."),
         AdminAction::Ban => format!("Banned {name}. The homeserver confirmed the ban."),
         AdminAction::Unban => format!("Unbanned {name}. The homeserver confirmed it."),
@@ -1391,6 +1409,12 @@ mod tests {
         }
         let deny = review(&intent(AdminAction::Kick, 0, true)).unwrap();
         assert!(deny.destructive && deny.title.starts_with("Deny"));
+        let mut revoke = intent(AdminAction::Kick, 0, false);
+        revoke.expected.membership = Some(AdminMembership::Invite);
+        let withdrawn = review(&revoke).unwrap();
+        assert!(withdrawn.destructive && withdrawn.title == "Revoke Jules's invitation?");
+        assert_eq!(withdrawn.action, "Revoke invitation");
+        assert!(pending_text(&revoke).starts_with("Revoking the invitation of Jules"));
         let unban = review(&intent(AdminAction::Unban, 0, false)).unwrap();
         assert!(!unban.destructive);
         let demotion = review(&intent(AdminAction::SetPowerLevel(0), 50, false)).unwrap();
