@@ -23,9 +23,12 @@ export component ActionRect inherits Rectangle {
     in property <bool> cancel-on-escape: false;
     // Zero-sized targets can round outside a scroll clip and lose focus on release.
     in property <bool> reveal-full-control: true;
-    // False draws the control unchanged but keeps it out of keyboard focus
-    // and pointer input, for preview samples that must never act.
+    // False draws the control unchanged (its enabled look included) but makes
+    // it inert: no keyboard focus, pointer input, accessibility action,
+    // activation or cancellation. For preview samples that must never act.
     in property <bool> interactive: true;
+    // Every path that acts goes through this.
+    property <bool> can-act: root.enabled && root.interactive;
     out property <bool> has-hover: hit.has-hover;
     out property <bool> has-pressed: hit.pressed;
     out property <bool> has-focus: keyboard-focus.has-focus;
@@ -38,7 +41,7 @@ export component ActionRect inherits Rectangle {
     accessible-role: button;
     accessible-label: label;
     accessible-enabled: enabled;
-    accessible-action-default => { if root.enabled { root.activated(); } }
+    accessible-action-default => { if root.can-act { root.activated(); } }
     @children
     keyboard-focus := FocusScope {
         x: 0px;
@@ -46,12 +49,12 @@ export component ActionRect inherits Rectangle {
         height: root.reveal-full-control ? root.height : 0px;
         // Accessible focus uses the same reason as a pointer focus request.
         focus-on-click: true;
-        enabled: root.enabled && root.interactive;
+        enabled: root.can-act;
         focus-gained(reason) => { root.focus-state-changed(true); }
         focus-lost(reason) => { root.focus-state-changed(false); }
         key-pressed(event) => {
             if event.text == Key.Space || event.text == Key.Return {
-                if root.enabled { root.activated(); }
+                if root.can-act { root.activated(); }
                 accept
             } else if root.trap-tab && event.text == Key.Tab && !event.modifiers.shift {
                 root.next-focus();
@@ -60,15 +63,20 @@ export component ActionRect inherits Rectangle {
                 root.previous-focus();
                 accept
             } else if root.cancel-on-escape && event.text == Key.Escape {
-                if root.enabled { root.cancelled(); }
+                if root.can-act { root.cancelled(); }
                 accept
             } else { reject }
         }
     }
     hit := TouchArea {
-        enabled: root.enabled && root.interactive;
+        enabled: root.can-act;
         mouse-cursor: pointer;
-        clicked => { keyboard-focus.focus(); root.activated(); }
+        clicked => {
+            if root.can-act {
+                keyboard-focus.focus();
+                root.activated();
+            }
+        }
     }
     if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;

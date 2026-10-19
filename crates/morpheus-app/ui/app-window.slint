@@ -5761,9 +5761,10 @@ export component AppWindow inherits Window {
                             text: "Sample content in your current look, including a style profile you are previewing. It follows every change as you make it; nothing here is sent or saved.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
-                        if root.appearance-preview-shown : Rectangle {
-                            // A fixed height keeps the settings below in place while
-                            // sizes, fonts and density change; the samples clip instead.
+                        if root.appearance-preview-shown : preview-card := Rectangle {
+                            // A stable outer height keeps the settings below in place while
+                            // sizes, fonts and density change; at large text or narrow widths
+                            // the samples scroll inside it instead of clipping or growing.
                             height: 340px * max(1, min(1.5, root.text-scale));
                             min-width: 0px;
                             clip: true;
@@ -5773,242 +5774,268 @@ export component AppWindow inherits Window {
                             border-color: root.divider;
                             accessible-role: groupbox;
                             accessible-label: "Live preview with sample content";
-                            VerticalLayout {
-                                padding: 12px;
-                                spacing: 10px;
-                                HorizontalLayout {
-                                    spacing: 12px;
-                                    vertical-stretch: 1;
-                                    // Navigation and account samples on the sidebar color.
+                            // Narrow or large-text previews stack the sidebar sample above the
+                            // conversation and wrap the state samples into shorter rows. This
+                            // reads the card's own width, which its contents never change.
+                            property <bool> stacked: self.width < 560px * max(1, min(2, root.text-scale));
+                            property <[string]> button-names: ["Button", "Hover", "Pressed", "Focus", "Disabled", "Primary"];
+                            property <[string]> chip-texts: ["Error", "Saved", "Selected", "3", "@2"];
+                            property <[color]> chip-surfaces: [
+                                root.token-color("error_surface"), root.token-color("success_surface"),
+                                root.token-color("selection"), root.token-color("unread"), root.mention-badge,
+                            ];
+                            property <[color]> chip-inks: [
+                                root.token-color("error_ink"), root.token-color("success_ink"),
+                                root.token-color("selection_ink"), root.token-color("unread_ink"), root.mention-badge-ink,
+                            ];
+                            preview-scroll := ScrollView {
+                                width: parent.width;
+                                height: parent.height;
+                                horizontal-scrollbar-policy: always-off;
+                                content-width: self.visible-width;
+                                VerticalLayout {
+                                    width: preview-scroll.visible-width;
+                                    padding: 12px;
+                                    spacing: 10px;
+                                    alignment: start;
                                     Rectangle {
-                                        width: 196px * min(1.3, root.text-scale);
-                                        background: root.sidebar;
-                                        border-radius: StyleTokens.radius * 0.8;
-                                        clip: true;
-                                        VerticalLayout {
-                                            padding: 8px;
-                                            spacing: 2px;
-                                            alignment: start;
-                                            Text {
-                                                text: "ROOMS"; color: root.muted; font-size: 10px * root.text-scale;
-                                                font-weight: 750; letter-spacing: 1px; height: 18px * root.text-scale; vertical-alignment: center;
-                                            }
-                                            for sample[index] in [
-                                                { name: "Design review", unread: 0, mentions: 0, direct: false },
-                                                { name: "Release notes", unread: 3, mentions: 0, direct: false },
-                                                { name: "Field notes", unread: 2, mentions: 1, direct: false },
-                                                { name: "Juno", unread: 0, mentions: 0, direct: true },
-                                            ] : NavigationRoomRow {
-                                                room: { id: "preview-room-" + index, name: sample.name, unread: sample.unread, mentions: sample.mentions };
-                                                direct: sample.direct;
-                                                selected: index == 0;
-                                                density-mode: root.room-density-mode; text-scale: root.text-scale;
-                                                ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
-                                                mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
-                                                interactive: false;
-                                                accessible-role: none;
-                                            }
-                                            Rectangle {
-                                                height: max(40px, 30px * root.text-scale + 10px);
-                                                background: root.elevated;
-                                                border-radius: StyleTokens.radius * 0.8;
-                                                HorizontalLayout {
-                                                    padding: 6px;
-                                                    spacing: 8px;
-                                                    AvatarBadge {
-                                                        width: 28px; height: 28px; initials: "MS"; accent: #6fb3d2;
-                                                        built-in-radius: StyleTokens.radius * 0.9; initials-size: 11px;
-                                                    }
-                                                    VerticalLayout {
-                                                        alignment: center;
-                                                        spacing: 1px;
-                                                        Text { text: "Mira Sol"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; overflow: elide; }
-                                                        HorizontalLayout {
-                                                            spacing: 5px;
-                                                            alignment: start;
-                                                            VerticalLayout {
-                                                                alignment: center;
-                                                                Rectangle { width: 7px; height: 7px; border-radius: 4px; background: root.token-color("presence_online"); }
+                                        height: preview-card.stacked ? side-sample.height + 10px + talk-sample.height
+                                            : max(side-sample.height, talk-sample.height);
+                                        // Navigation and account samples on the sidebar color.
+                                        side-sample := Rectangle {
+                                            x: 0px;
+                                            y: 0px;
+                                            width: preview-card.stacked ? parent.width : 196px * min(1.3, root.text-scale);
+                                            height: side-layout.preferred-height;
+                                            background: root.sidebar;
+                                            border-radius: StyleTokens.radius * 0.8;
+                                            clip: true;
+                                            side-layout := VerticalLayout {
+                                                padding: 8px;
+                                                spacing: 2px;
+                                                alignment: start;
+                                                Text {
+                                                    text: "ROOMS"; color: root.muted; font-size: 10px * root.text-scale;
+                                                    font-weight: 750; letter-spacing: 1px; height: 18px * root.text-scale; vertical-alignment: center;
+                                                }
+                                                for sample[index] in [
+                                                    { name: "Design review", unread: 0, mentions: 0, direct: false },
+                                                    { name: "Release notes", unread: 3, mentions: 0, direct: false },
+                                                    { name: "Field notes", unread: 2, mentions: 1, direct: false },
+                                                    { name: "Juno", unread: 0, mentions: 0, direct: true },
+                                                ] : NavigationRoomRow {
+                                                    room: { id: "preview-room-" + index, name: sample.name, unread: sample.unread, mentions: sample.mentions };
+                                                    direct: sample.direct;
+                                                    selected: index == 0;
+                                                    density-mode: root.room-density-mode; text-scale: root.text-scale;
+                                                    ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                                    mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
+                                                    interactive: false;
+                                                    accessible-role: none;
+                                                }
+                                                Rectangle {
+                                                    height: max(40px, 30px * root.text-scale + 10px);
+                                                    background: root.elevated;
+                                                    border-radius: StyleTokens.radius * 0.8;
+                                                    HorizontalLayout {
+                                                        padding: 6px;
+                                                        spacing: 8px;
+                                                        AvatarBadge {
+                                                            width: 28px; height: 28px; initials: "MS"; accent: #6fb3d2;
+                                                            built-in-radius: StyleTokens.radius * 0.9; initials-size: 11px;
+                                                        }
+                                                        VerticalLayout {
+                                                            alignment: center;
+                                                            spacing: 1px;
+                                                            Text { text: "Mira Sol"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; overflow: elide; }
+                                                            HorizontalLayout {
+                                                                spacing: 5px;
+                                                                alignment: start;
+                                                                VerticalLayout {
+                                                                    alignment: center;
+                                                                    Rectangle { width: 7px; height: 7px; border-radius: 4px; background: root.token-color("presence_online"); }
+                                                                }
+                                                                Text { text: "Online · sample account"; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
                                                             }
-                                                            Text { text: "Online · sample account"; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                    }
-                                    // Conversation samples on the canvas color.
-                                    Rectangle {
-                                        horizontal-stretch: 1;
-                                        min-width: 0px;
-                                        background: root.canvas;
-                                        border-radius: StyleTokens.radius * 0.8;
-                                        clip: true;
-                                        VerticalLayout {
-                                            padding-bottom: 8px;
-                                            spacing: 0px;
-                                            alignment: start;
-                                            for sample in [
-                                                { initials: "JU", name: "Juno", accent: #f39f78, palette: 0, own: false, hovered: false,
-                                                  body: "Draft is ready for a look before Friday.", link: "Release checklist",
-                                                  twelve: "9:41 AM", day: "09:41", seconds: "09:41:07" },
-                                                { initials: "EL", name: "Ellis", accent: #a88cff, palette: 2, own: false, hovered: true,
-                                                  body: "Hovered message: actions appear here.", link: "",
-                                                  twelve: "9:42 AM", day: "09:42", seconds: "09:42:30" },
-                                                { initials: "MS", name: "Mira Sol", accent: #6fb3d2, palette: 4, own: true, hovered: false,
-                                                  body: "Your own message, with its own colors when a theme sets them.", link: "",
-                                                  twelve: "9:44 AM", day: "09:44", seconds: "09:44:12" },
-                                            ] : sample-row := Rectangle {
-                                                property <length> avatar-size: StyleTokens.message-avatar-size > 0px ? StyleTokens.message-avatar-size : root.message-layout == 0 ? 38px : 26px;
-                                                background: root.row-surface(false, sample.hovered, sample.own, transparent);
-                                                HorizontalLayout {
-                                                    padding-left: 10px; padding-right: 10px;
-                                                    padding-top: root.message-row-gap * 0.5; padding-bottom: root.message-row-gap * 0.5;
-                                                    spacing: root.message-layout == 0 ? 10px : 7px;
-                                                    if root.show-message-avatars : VerticalLayout {
-                                                        alignment: start;
-                                                        AvatarBadge {
-                                                            width: sample-row.avatar-size; height: self.width;
-                                                            initials-size: StyleTokens.message-avatar-size > 0px ? max(9px, self.height * 0.32) : 12px;
-                                                            initials: sample.initials; accent: sample.accent;
-                                                        }
-                                                    }
-                                                    VerticalLayout {
-                                                        spacing: root.message-layout == 0 ? 4px : 2px;
-                                                        alignment: start;
-                                                        horizontal-stretch: 1;
-                                                        min-width: 0px;
-                                                        HorizontalLayout {
-                                                            spacing: 8px;
+                                        // Conversation samples on the canvas color.
+                                        talk-sample := Rectangle {
+                                            x: preview-card.stacked ? 0px : side-sample.width + 12px;
+                                            y: preview-card.stacked ? side-sample.height + 10px : 0px;
+                                            width: preview-card.stacked ? parent.width : max(0px, parent.width - side-sample.width - 12px);
+                                            height: talk-layout.preferred-height;
+                                            background: root.canvas;
+                                            border-radius: StyleTokens.radius * 0.8;
+                                            clip: true;
+                                            talk-layout := VerticalLayout {
+                                                padding-bottom: 8px;
+                                                spacing: 0px;
+                                                alignment: start;
+                                                for sample in [
+                                                    { initials: "JU", name: "Juno", accent: #f39f78, palette: 0, own: false, hovered: false,
+                                                      body: "Draft is ready for a look before Friday.", link: "Release checklist",
+                                                      twelve: "9:41 AM", day: "09:41", seconds: "09:41:07" },
+                                                    { initials: "EL", name: "Ellis", accent: #a88cff, palette: 2, own: false, hovered: true,
+                                                      body: "Hovered message: actions appear here.", link: "",
+                                                      twelve: "9:42 AM", day: "09:42", seconds: "09:42:30" },
+                                                    { initials: "MS", name: "Mira Sol", accent: #6fb3d2, palette: 4, own: true, hovered: false,
+                                                      body: "Your own message, with its own colors when a theme sets them.", link: "",
+                                                      twelve: "9:44 AM", day: "09:44", seconds: "09:44:12" },
+                                                ] : sample-row := Rectangle {
+                                                    property <length> avatar-size: StyleTokens.message-avatar-size > 0px ? StyleTokens.message-avatar-size : root.message-layout == 0 ? 38px : 26px;
+                                                    background: root.row-surface(false, sample.hovered, sample.own, transparent);
+                                                    HorizontalLayout {
+                                                        padding-left: 10px; padding-right: 10px;
+                                                        padding-top: root.message-row-gap * 0.5; padding-bottom: root.message-row-gap * 0.5;
+                                                        spacing: root.message-layout == 0 ? 10px : 7px;
+                                                        if root.show-message-avatars : VerticalLayout {
                                                             alignment: start;
+                                                            AvatarBadge {
+                                                                width: sample-row.avatar-size; height: self.width;
+                                                                initials-size: StyleTokens.message-avatar-size > 0px ? max(9px, self.height * 0.32) : 12px;
+                                                                initials: sample.initials; accent: sample.accent;
+                                                            }
+                                                        }
+                                                        VerticalLayout {
+                                                            spacing: root.message-layout == 0 ? 4px : 2px;
+                                                            alignment: start;
+                                                            horizontal-stretch: 1;
+                                                            min-width: 0px;
+                                                            HorizontalLayout {
+                                                                spacing: 8px;
+                                                                alignment: start;
+                                                                Text {
+                                                                    text: sample.name;
+                                                                    color: root.sender-ink(false, sample.own, sample.palette, sample.accent);
+                                                                    font-family: root.message-font-family;
+                                                                    font-size: root.sender-font-px > 0px ? root.sender-font-px : root.message-layout == 0 ? root.message-font-px : max(10px, root.message-font-px - 2px);
+                                                                    font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650;
+                                                                    overflow: elide;
+                                                                }
+                                                                if root.show-message-timestamps : Text {
+                                                                    text: root.sample-clock(sample.twelve, sample.day, sample.seconds);
+                                                                    color: root.clock-ink(false); font-family: root.monospace-font-family;
+                                                                    font-size: root.timestamp-font-px; vertical-alignment: center;
+                                                                }
+                                                            }
                                                             Text {
-                                                                text: sample.name;
-                                                                color: root.sender-ink(false, sample.own, sample.palette, sample.accent);
-                                                                font-family: root.message-font-family;
-                                                                font-size: root.sender-font-px > 0px ? root.sender-font-px : root.message-layout == 0 ? root.message-font-px : max(10px, root.message-font-px - 2px);
-                                                                font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650;
+                                                                text: sample.body; color: root.body-ink(false, sample.own);
+                                                                font-family: root.message-font-family; font-size: root.message-font-px;
+                                                                wrap: word-wrap; min-width: 0px;
+                                                            }
+                                                            if sample.link != "" : Text {
+                                                                text: sample.link; color: root.token-color("link");
+                                                                font-family: root.message-font-family; font-size: root.message-font-px;
                                                                 overflow: elide;
                                                             }
-                                                            if root.show-message-timestamps : Text {
-                                                                text: root.sample-clock(sample.twelve, sample.day, sample.seconds);
-                                                                color: root.clock-ink(false); font-family: root.monospace-font-family;
-                                                                font-size: root.timestamp-font-px; vertical-alignment: center;
+                                                        }
+                                                    }
+                                                }
+                                                // A focused composer with its icons and placeholder.
+                                                HorizontalLayout {
+                                                    padding-left: 10px; padding-right: 10px; padding-top: 6px;
+                                                    Rectangle {
+                                                        height: root.composer-box-height;
+                                                        border-radius: StyleTokens.composer-radius >= 0px ? StyleTokens.composer-radius : StyleTokens.radius * 1.1;
+                                                        border-color: root.composer-focus-border;
+                                                        border-width: StyleTokens.line-width;
+                                                        background: root.composer-surface;
+                                                        HorizontalLayout {
+                                                            padding-left: StyleTokens.composer-padding;
+                                                            padding-right: StyleTokens.composer-padding;
+                                                            spacing: 8px;
+                                                            VerticalLayout {
+                                                                alignment: center;
+                                                                InterfaceGlyph { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "+"; ink: root.icon-ink; }
+                                                            }
+                                                            Text {
+                                                                text: "Message Design review";
+                                                                color: root.muted; font-family: root.message-font-family; font-size: root.composer-font-px;
+                                                                vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                                                            }
+                                                            VerticalLayout {
+                                                                alignment: center;
+                                                                InterfaceGlyph { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "✎"; ink: root.icon-active-ink; }
                                                             }
                                                         }
-                                                        Text {
-                                                            text: sample.body; color: root.body-ink(false, sample.own);
-                                                            font-family: root.message-font-family; font-size: root.message-font-px;
-                                                            wrap: word-wrap; min-width: 0px;
-                                                        }
-                                                        if sample.link != "" : Text {
-                                                            text: sample.link; color: root.token-color("link");
-                                                            font-family: root.message-font-family; font-size: root.message-font-px;
-                                                            overflow: elide;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            // A focused composer with its icons and placeholder.
-                                            HorizontalLayout {
-                                                padding-left: 10px; padding-right: 10px; padding-top: 6px;
-                                                Rectangle {
-                                                    height: root.composer-box-height;
-                                                    border-radius: StyleTokens.composer-radius >= 0px ? StyleTokens.composer-radius : StyleTokens.radius * 1.1;
-                                                    border-color: root.composer-focus-border;
-                                                    border-width: StyleTokens.line-width;
-                                                    background: root.composer-surface;
-                                                    HorizontalLayout {
-                                                        padding-left: StyleTokens.composer-padding;
-                                                        padding-right: StyleTokens.composer-padding;
-                                                        spacing: 8px;
-                                                        VerticalLayout {
-                                                            alignment: center;
-                                                            InterfaceGlyph { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "+"; ink: root.icon-ink; }
-                                                        }
-                                                        Text {
-                                                            text: "Message Design review";
-                                                            color: root.muted; font-family: root.message-font-family; font-size: root.composer-font-px;
-                                                            vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
-                                                        }
-                                                        VerticalLayout {
-                                                            alignment: center;
-                                                            InterfaceGlyph { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "✎"; ink: root.icon-active-ink; }
-                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                // Control states side by side: ordinary, hovered, pressed,
-                                // focused, disabled and primary.
-                                HorizontalLayout {
-                                    spacing: 6px;
-                                    alignment: start;
-                                    for sample[index] in ["Button", "Hover", "Pressed", "Focus", "Disabled", "Primary"] : TokenButton {
-                                        text: sample;
-                                        colors: root.button-colors;
-                                        text-scale: root.text-scale;
-                                        sample-state: index >= 1 && index <= 3 ? index : 0;
-                                        enabled: index != 4;
-                                        primary: index == 5;
-                                        interactive: false;
-                                        accessible-role: none;
-                                    }
-                                }
-                                // Roles: error, success, selection, unread, mention, link and a
-                                // speaking call tile.
-                                HorizontalLayout {
-                                    spacing: 6px;
-                                    alignment: start;
-                                    for chip in [
-                                        { text: "Error", surface: root.token-color("error_surface"), ink: root.token-color("error_ink") },
-                                        { text: "Saved", surface: root.token-color("success_surface"), ink: root.token-color("success_ink") },
-                                        { text: "Selected", surface: root.token-color("selection"), ink: root.token-color("selection_ink") },
-                                        { text: "3", surface: root.token-color("unread"), ink: root.token-color("unread_ink") },
-                                        { text: "@2", surface: root.mention-badge, ink: root.mention-badge-ink },
-                                    ] : Rectangle {
-                                        height: max(22px, 16px * root.text-scale + 6px);
-                                        width: max(self.height, chip-text.preferred-width + 16px);
-                                        border-radius: self.height / 2;
-                                        background: chip.surface;
-                                        chip-text := Text {
-                                            text: chip.text; color: chip.ink; font-size: 11px * root.text-scale; font-weight: 700;
-                                            horizontal-alignment: center; vertical-alignment: center;
+                                    // Control states: ordinary, hovered, pressed, focused, disabled
+                                    // and primary, in one row or, when stacked, two.
+                                    for button-row in (preview-card.stacked ? [[0, 1, 2], [3, 4, 5]] : [[0, 1, 2, 3, 4, 5]]) : HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        for i in button-row : TokenButton {
+                                            text: preview-card.button-names[i];
+                                            colors: root.button-colors;
+                                            text-scale: root.text-scale;
+                                            sample-state: i >= 1 && i <= 3 ? i : 0;
+                                            enabled: i != 4;
+                                            primary: i == 5;
+                                            interactive: false;
+                                            accessible-role: none;
                                         }
                                     }
-                                    // A text field with its input surface, border and corner.
-                                    Rectangle {
-                                        width: 112px * min(1.3, root.text-scale);
-                                        height: max(26px, 18px * root.text-scale + 8px);
-                                        background: root.input-fill(root.elevated);
-                                        border-radius: StyleTokens.input-corner;
-                                        border-width: StyleTokens.line-width;
-                                        border-color: root.input-border-color;
+                                    // Roles: error, success, selection, unread and mention.
+                                    for chip-row in (preview-card.stacked ? [[0, 1, 2], [3, 4]] : [[0, 1, 2, 3, 4]]) : HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        for i in chip-row : Rectangle {
+                                            height: max(22px, 16px * root.text-scale + 6px);
+                                            width: max(self.height, chip-text.preferred-width + 16px);
+                                            border-radius: self.height / 2;
+                                            background: preview-card.chip-surfaces[i];
+                                            chip-text := Text {
+                                                text: preview-card.chip-texts[i]; color: preview-card.chip-inks[i];
+                                                font-size: 11px * root.text-scale; font-weight: 700;
+                                                horizontal-alignment: center; vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                    // A text field, a link and a speaking call tile.
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        // A text field with its input surface, border and corner.
+                                        Rectangle {
+                                            width: 112px * min(1.3, root.text-scale);
+                                            height: max(26px, 18px * root.text-scale + 8px);
+                                            background: root.input-fill(root.elevated);
+                                            border-radius: StyleTokens.input-corner;
+                                            border-width: StyleTokens.line-width;
+                                            border-color: root.input-border-color;
+                                            Text {
+                                                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                                                text: "Search…"; color: root.muted; font-size: 11px * root.text-scale;
+                                                vertical-alignment: center; overflow: elide;
+                                            }
+                                        }
                                         Text {
-                                            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
-                                            text: "Search…"; color: root.muted; font-size: 11px * root.text-scale;
-                                            vertical-alignment: center; overflow: elide;
+                                            text: "Link"; color: root.token-color("link"); font-size: 12px * root.text-scale;
+                                            vertical-alignment: center;
                                         }
-                                    }
-                                    Text {
-                                        text: "Link"; color: root.token-color("link"); font-size: 12px * root.text-scale;
-                                        vertical-alignment: center;
-                                    }
-                                    Rectangle {
-                                        width: 56px;
-                                        height: max(22px, 16px * root.text-scale + 6px);
-                                        border-radius: StyleTokens.radius * 0.6;
-                                        background: root.token-color("media_backdrop");
-                                        border-width: 2px;
-                                        border-color: root.token-color("voice");
-                                        AvatarBadge {
-                                            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                                            width: 18px; height: 18px; initials: "EL"; accent: #a88cff; initials-size: 8px;
-                                            built-in-radius: 9px;
+                                        Rectangle {
+                                            width: 56px;
+                                            height: max(22px, 16px * root.text-scale + 6px);
+                                            border-radius: StyleTokens.radius * 0.6;
+                                            background: root.token-color("media_backdrop");
+                                            border-width: 2px;
+                                            border-color: root.token-color("voice");
+                                            AvatarBadge {
+                                                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                                                width: 18px; height: 18px; initials: "EL"; accent: #a88cff; initials-size: 8px;
+                                                built-in-radius: 9px;
+                                            }
+                                            accessible-role: image;
+                                            accessible-label: "Sample call tile, speaking";
                                         }
-                                        accessible-role: image;
-                                        accessible-label: "Sample call tile, speaking";
                                     }
                                 }
                             }
