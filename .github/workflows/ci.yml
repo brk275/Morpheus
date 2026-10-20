@@ -1,13 +1,13 @@
-# TEMPORARY Linux-only UI/activity/tag diagnostic. NEVER MERGE this workflow.
+# TEMPORARY Linux-only retained-focus regression check. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed Linux UI activity and tag diagnostic
-run-name: Reviewed Linux focused diagnostic - 52a28c1deea01aa5b0cf507b761533cf7b9b05c8
+name: Reviewed Linux retained focus check
+run-name: Reviewed Linux retained focus check - df8b62486e24779ce2896cc77e20b8e7f63945e0
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: beta-linux-focused-52a28c1deea01aa5b0cf507b761533cf7b9b05c8-${{ github.ref }}
+  group: beta-linux-retained-focus-df8b62486e24779ce2896cc77e20b8e7f63945e0-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -24,7 +24,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 52a28c1deea01aa5b0cf507b761533cf7b9b05c8
+          ref: df8b62486e24779ce2896cc77e20b8e7f63945e0
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -37,7 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = 52a28c1deea01aa5b0cf507b761533cf7b9b05c8
+          test "$(git -C candidate rev-parse HEAD)" = df8b62486e24779ce2896cc77e20b8e7f63945e0
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -52,7 +52,7 @@ jobs:
             --evidence "$RUNNER_TEMP/reviewed-candidate-history"
   native:
     needs: security
-    name: Focused Linux UI activity and tags
+    name: Focused Linux retained focus
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -68,7 +68,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 52a28c1deea01aa5b0cf507b761533cf7b9b05c8
+          ref: df8b62486e24779ce2896cc77e20b8e7f63945e0
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -307,7 +307,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='52a28c1deea01aa5b0cf507b761533cf7b9b05c8'
+          source='df8b62486e24779ce2896cc77e20b8e7f63945e0'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -369,7 +369,7 @@ jobs:
           key: verified-sdk-archives-v1
           workspaces: candidate -> target
           save-if: false
-      - name: Run only generated UI activity and tag checks
+      - name: Check actual generated UI keyboard and focus behavior
         timeout-minutes: 105
         env:
           CARGO_BUILD_JOBS: "2"
@@ -586,7 +586,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='52a28c1deea01aa5b0cf507b761533cf7b9b05c8'
+          source='df8b62486e24779ce2896cc77e20b8e7f63945e0'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -732,43 +732,17 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          # Exact immutable-source libtest sets:1 generated UI,13 tags,5 activity.
+          # Exact immutable-source libtest set:1 generated UI case.
           # No ignored, missing, duplicate or additional test IDs count as a pass.
           needed_app={
               'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-          }
-          needed_tags={
-              'room_tags::tests::orders_are_bounded_and_compare_numerically',
-              'room_tags::tests::deserialized_orders_cannot_bypass_numeric_bounds',
-              'room_tags::tests::fresh_tags_govern_writes_despite_every_cached_hint',
-              'room_tags::tests::retrying_uncertain_tags_never_discards_other_clients_metadata',
-              'room_tags::tests::stored_orders_and_foreign_fields_are_read_faithfully',
-              'room_tags::tests::a_superseded_selection_changes_no_tags',
-              'room_tags::tests::tag_requests_are_bounded_single_attempts',
-              'room_tags::tests::unreadable_content_is_refused_and_results_stay_truthful',
-              'room_tags::tests::a_change_writes_each_tag_once_against_a_fresh_unchanged_baseline',
-              'room_tags::tests::fresh_server_tags_and_orders_survive_stale_confirmation_hints',
-              'room_tags::tests::malformed_rereads_after_accepted_writes_report_partial_changes',
-              'room_tags::tests::reorders_check_every_room_first_and_each_baseline_before_its_write',
-              'room_tags::tests::a_stopped_change_reports_truthfully_what_it_saved',
-          }
-          needed_activity={
-              'room_activity::tests::a_receipt_waiting_for_its_timeline_is_withdrawn_before_it_is_sent',
-              'room_activity::tests::a_typing_start_waiting_for_the_account_lock_expires_at_its_idle_deadline',
-              'room_activity::tests::nothing_is_handed_to_the_sdk_once_a_write_is_cancelled',
-              'room_activity::tests::a_room_event_never_counts_a_thread_receipt',
-              'room_activity::tests::outgoing_receipts_are_private_unless_public_was_chosen',
           }
           checks=[
               ('generated_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
                   '--','--exact','--test-threads=1'],70*60,needed_app,set()),
-              ('room_tags',['cargo','test','--locked','-p','morpheus-matrix','--lib','room_tags::tests::',
-                  '--','--test-threads=1'],15*60,needed_tags,set()),
-              ('room_activity',['cargo','test','--locked','-p','morpheus-matrix','--lib','room_activity::tests::',
-                  '--','--test-threads=1'],15*60,needed_activity,set()),
           ]
-          known_test_ids=needed_app|needed_tags|needed_activity
+          known_test_ids=needed_app
           def motion_projection(output):
               # Called only after independent default scanning of the sealed log.
               # Admit at most4 complete marker lines and8192 UTF-8 bytes total.
@@ -810,7 +784,7 @@ jobs:
                       projected.append(entry)
                   except (ValueError,TypeError,RecursionError,OverflowError): continue
               return projected
-          # Single Linux scope, three affected cases only; no package/artifact jobs.
+          # Single Linux generated UI check; passed tags/activity are not repeated.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               if not tracked_intact():
