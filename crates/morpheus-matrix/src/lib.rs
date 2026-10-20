@@ -92,8 +92,8 @@ pub use notification_rules::{
     RoomNotificationRule, RoomUnreadCounts,
 };
 pub use room_tags::{
-    ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, TagKnowledge,
-    TagOrder,
+    ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, RoomTagState,
+    TagKnowledge, TagOrder,
 };
 mod direct_account_data;
 pub use direct_account_data::{

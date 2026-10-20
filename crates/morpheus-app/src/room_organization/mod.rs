@@ -13,7 +13,7 @@
 //!   the earlier states a snapshot may still show; a snapshot showing the
 //!   write after those, an account change or the time limit ends it;
 //! - after a request that failed but may have written, what was shown before
-//!   it, with the tags it changed marked uncertain for the core, until a
+//!   it, with the tags it changed marked uncertain for display, until a
 //!   snapshot past the earlier states shows the outcome; a refusal made
 //!   before anything was sent changes nothing;
 //! - at most one change in flight per account.
@@ -32,7 +32,7 @@ use std::{
 
 use morpheus_matrix::{
     ConfirmedTags, FavouriteOrder, RoomInfo, RoomMembership, RoomTagChange, RoomTagError,
-    TagKnowledge, TagOrder,
+    RoomTagState, TagKnowledge, TagOrder,
 };
 use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 use tokio::runtime::Handle;
@@ -83,6 +83,17 @@ impl RoomTags {
 
     fn low_priority_tag(&self) -> (bool, Option<TagOrder>) {
         (self.low_priority, self.low_priority_order)
+    }
+}
+
+impl From<&RoomTagState> for RoomTags {
+    fn from(state: &RoomTagState) -> Self {
+        Self {
+            favourite: state.favourite,
+            low_priority: state.low_priority,
+            favourite_order: state.favourite_order,
+            low_priority_order: state.low_priority_order,
+        }
     }
 }
 
@@ -246,8 +257,8 @@ impl State {
             .unwrap_or_else(|| self.stored_tags(room_id))
     }
 
-    /// What this window knows the homeserver holds for a room beyond the
-    /// snapshot, for the core's add/remove decisions.
+    /// Cached display knowledge beyond the snapshot. The core re-reads the
+    /// server before every mutation instead of trusting this hint.
     fn confirmed_tags(&self, room_id: &str) -> ConfirmedTags {
         let Some(confirmed) = self.confirmed(room_id) else {
             return ConfirmedTags::default();
@@ -296,28 +307,50 @@ impl State {
             .filter(|pending| pending.account == self.account)
     }
 
-    /// Show an accepted request's writes until sync returns them. `before`
-    /// is what this window showed for each written room when the request
-    /// was planned.
+    /// Show the server baseline with accepted writes applied, including the
+    /// server's preserved orders when the action required no write.
     fn record(
+        &mut self,
+        account: &str,
+        request: &Request,
+        actual: &[RoomTagState],
+        before: &[(String, RoomTags)],
+    ) {
+        for state in actual {
+            let room = &state.room_id;
+            // The tags the request decided become known; another tag a
+            // failed request left unknown stays so.
+            let known = self.known(room).with(decided(request));
+            self.overlay(account, room, RoomTags::from(state), known, true, before);
+        }
+    }
+
+    /// Fixtures for the existing overlay/history tests, where the server
+    /// outcome equals the plan. Production always uses the core's result.
+    #[cfg(test)]
+    fn record_expected(
         &mut self,
         account: &str,
         request: &Request,
         room_id: &str,
         before: &[(String, RoomTags)],
     ) {
-        let written = written_tags(request, room_id, |id| self.tags(id));
-        for (room, tags) in written {
-            // The tags the request decided become known; another tag a
-            // failed request left unknown stays so.
-            let known = self.known(&room).with(decided(request));
-            self.overlay(account, &room, tags, known, true, before);
-        }
+        let actual = written_tags(request, room_id, |id| self.tags(id))
+            .into_iter()
+            .map(|(room_id, tags)| RoomTagState {
+                room_id,
+                favourite: tags.favourite,
+                low_priority: tags.low_priority,
+                favourite_order: tags.favourite_order,
+                low_priority_order: tags.low_priority_order,
+            })
+            .collect::<Vec<_>>();
+        self.record(account, request, &actual, before);
     }
 
     /// After a failed request that may have written: keep showing what this
-    /// window showed before it, so the rooms keep their place, tell the core
-    /// that a tag the request may have written is uncertain, and let the
+    /// window showed before it, so the rooms keep their display place, mark
+    /// the tags the request may have written uncertain, and let the
     /// first snapshot past the earlier states show the outcome.
     fn uncertain(
         &mut self,
@@ -598,7 +631,8 @@ fn plan_reorder(
     )
 }
 
-/// The tags a confirmed request leaves on each written room.
+/// Expected server outcomes used only by overlay/history fixtures.
+#[cfg(test)]
 fn written_tags(
     request: &Request,
     room_id: &str,
@@ -620,8 +654,8 @@ fn written_tags(
     }
 }
 
-/// The core call for a planned request, with what this window knows from
-/// confirmed writes sync has not stored yet.
+/// The core call with cached display hints; only its fresh server read
+/// decides what needs writing.
 enum Call {
     Change(RoomTagChange, ConfirmedTags),
     Orders(Vec<FavouriteOrder>),
@@ -661,6 +695,15 @@ fn failure_text(error: RoomTagError) -> Option<&'static str> {
         RoomTagError::PartlySaved => {
             Some("Only part of the change was saved; the room list updates from the homeserver.")
         }
+        RoomTagError::Changed => {
+            Some("This room's tags changed in another app; nothing was changed. Try again.")
+        }
+        RoomTagError::Refused => {
+            Some("The homeserver refused the change; the room keeps its place.")
+        }
+        RoomTagError::Unknown => Some(
+            "The change may or may not have been saved; the room list updates from the homeserver.",
+        ),
     }
 }
 
@@ -840,37 +883,39 @@ fn finish(
     room_id: &str,
     request: &Request,
     before: &[(String, RoomTags)],
-    result: Result<(), RoomTagError>,
+    result: Result<Vec<RoomTagState>, RoomTagError>,
 ) {
     let account = selection.account_id();
-    let visible = with_state(|state| {
-        let owned = state
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.operation == operation);
-        if owned {
-            state.pending = None;
-        }
-        let current = selection.is_current();
-        let visible = current && state.account == account;
-        // The same account may still be shown under a new selection, which
-        // cut this request off before or after the homeserver answered it.
-        let cut_off = owned && !current && state.account == account;
-        let shown = visible || cut_off;
-        match &result {
-            // Accepted by the homeserver: shown until sync returns it.
-            Ok(()) if shown => state.record(account, request, room_id, before),
-            Err(RoomTagError::NotConfirmed | RoomTagError::PartlySaved) if shown => {
-                state.uncertain(account, request, room_id, before)
+    let visible =
+        with_state(|state| {
+            let owned = state
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.operation == operation);
+            if owned {
+                state.pending = None;
             }
-            Err(RoomTagError::AccountChanged) if cut_off => {
-                state.uncertain(account, request, room_id, before)
+            let current = selection.is_current();
+            let visible = current && state.account == account;
+            // The same account may still be shown under a new selection, which
+            // cut this request off before or after the homeserver answered it.
+            let cut_off = owned && !current && state.account == account;
+            let shown = visible || cut_off;
+            match &result {
+                // Accepted by the homeserver: shown until sync returns it.
+                Ok(actual) if shown => state.record(account, request, actual, before),
+                // A write may have landed: the room's tags are uncertain.
+                Err(
+                    RoomTagError::NotConfirmed | RoomTagError::PartlySaved | RoomTagError::Unknown,
+                ) if shown => state.uncertain(account, request, room_id, before),
+                Err(RoomTagError::AccountChanged) if cut_off => {
+                    state.uncertain(account, request, room_id, before)
+                }
+                // Refused before anything was sent: what is shown still holds.
+                _ => {}
             }
-            // Refused before anything was sent: what is shown still holds.
-            _ => {}
-        }
-        visible
-    });
+            visible
+        });
     // Rebuild the sections with what the homeserver accepted, and clear the
     // pending state either way.
     crate::navigation::apply_room_order(ui);
@@ -1130,7 +1175,7 @@ mod tests {
         let remove = Request::Change(RoomTagChange::RemoveFavourite, none);
         remember("alice", &[joined("!a", none)]);
         with_state(|state| {
-            state.record("alice", &add, "!a", &[("!a".to_owned(), none)]);
+            state.record_expected("alice", &add, "!a", &[("!a".to_owned(), none)]);
         });
         // A snapshot that has not caught up keeps showing the accepted write.
         remember("alice", &[joined("!a", none)]);
@@ -1140,7 +1185,7 @@ mod tests {
         assert!(with_state(|state| state.confirmed.is_empty()));
         // Another account never sees it.
         with_state(|state| {
-            state.record("alice", &remove, "!a", &[("!a".to_owned(), added)]);
+            state.record_expected("alice", &remove, "!a", &[("!a".to_owned(), added)]);
         });
         remember("bob", &[joined("!a", favourite(order(0.25)))]);
         assert_eq!(tags("!a"), favourite(order(0.25)));
@@ -1156,11 +1201,10 @@ mod tests {
         let moved = Request::Orders(vec![("!a".to_owned(), order(0.25).unwrap())]);
         let to_low = Request::Change(RoomTagChange::LowPriority(None), low(None));
         remember("alice", &[joined("!a", none)]);
-        // A favourite added here but not synced yet: a following move tells
-        // the core it is a favourite, and a following change tells it which
-        // tags the homeserver holds.
+        // A favourite added here but not synced yet supplies display hints
+        // for a follow-up action. The core must still re-read the server.
         with_state(|state| {
-            state.record("alice", &add, "!a", &[("!a".to_owned(), none)]);
+            state.record_expected("alice", &add, "!a", &[("!a".to_owned(), none)]);
             let Call::Orders(writes) = call_for(&moved, "!a", state) else {
                 panic!("a move is an order write");
             };
@@ -1178,6 +1222,38 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_noop_order_replaces_the_plan_and_sync_ends_its_overlay() {
+        with_state(|state| *state = State::default());
+        let none = RoomTags::default();
+        let planned = favourite(order(0.5));
+        let actual = favourite(order(0.8));
+        let request = Request::Change(RoomTagChange::Favourite(order(0.5)), planned);
+        remember("fixture", &[joined("!a", none)]);
+        let read_back = RoomTagState {
+            room_id: "!a".to_owned(),
+            favourite: true,
+            low_priority: false,
+            favourite_order: order(0.8),
+            low_priority_order: None,
+        };
+        with_state(|state| {
+            // Same production seam as finish: the core found an existing
+            // tag and returned its preserved order without sending a PUT.
+            state.record(
+                "fixture",
+                &request,
+                &[read_back],
+                &[("!a".to_owned(), none)],
+            );
+            assert_eq!(state.tags("!a"), actual);
+            assert_ne!(state.tags("!a"), planned);
+        });
+        remember("fixture", &[joined("!a", actual)]);
+        assert_eq!(tags("!a"), actual);
+        assert!(with_state(|state| state.confirmed.is_empty()));
+    }
+
+    #[test]
     fn a_failed_request_keeps_the_room_in_place_and_its_tags_uncertain() {
         with_state(|state| *state = State::default());
         let none = RoomTags::default();
@@ -1188,11 +1264,11 @@ mod tests {
         remember("alice", &[joined("!a", none), joined("!b", none)]);
         with_state(|state| {
             for room in ["!a", "!b"] {
-                state.record("alice", &add, room, &[(room.to_owned(), none)]);
+                state.record_expected("alice", &add, room, &[(room.to_owned(), none)]);
             }
             // Marking !a low priority may have written: it keeps its place,
-            // and a retry is told both tags are uncertain, so it writes them
-            // whatever the stored tags say.
+            // and a follow-up action carries uncertain display hints. Its
+            // core mutation will still be decided by a fresh server read.
             state.uncertain("alice", &to_low, "!a", &[("!a".to_owned(), added)]);
             assert_eq!(state.tags("!a"), added);
             let known = state.confirmed_tags("!a");
@@ -1227,7 +1303,7 @@ mod tests {
             // may hold either tag.
             state.uncertain("alice", &to_low, "!c", &shown);
             // Removing the favourite then decides that tag only.
-            state.record("alice", &unfavourite, "!c", &shown);
+            state.record_expected("alice", &unfavourite, "!c", &shown);
             let known = state.confirmed_tags("!c");
             assert_eq!(known.favourite, TagKnowledge::Absent);
             assert_eq!(known.low_priority, TagKnowledge::Uncertain);
@@ -1249,8 +1325,8 @@ mod tests {
         remember("alice", &[joined("!a", none)]);
         // Added, then removed again before sync returned either.
         with_state(|state| {
-            state.record("alice", &add, "!a", &[("!a".to_owned(), none)]);
-            state.record("alice", &remove, "!a", &[("!a".to_owned(), added)]);
+            state.record_expected("alice", &add, "!a", &[("!a".to_owned(), none)]);
+            state.record_expected("alice", &remove, "!a", &[("!a".to_owned(), added)]);
         });
         // The snapshot from before the add equals the removal but is behind
         // it, and so is the delayed snapshot of the add.
@@ -1267,8 +1343,8 @@ mod tests {
         // the homeserver holds, until its time limit.
         remember("alice", &[joined("!b", none)]);
         with_state(|state| {
-            state.record("alice", &add, "!b", &[("!b".to_owned(), none)]);
-            state.record("alice", &remove, "!b", &[("!b".to_owned(), added)]);
+            state.record_expected("alice", &add, "!b", &[("!b".to_owned(), none)]);
+            state.record_expected("alice", &remove, "!b", &[("!b".to_owned(), added)]);
         });
         remember("alice", &[joined("!b", none)]);
         assert_eq!(tags("!b"), none);
@@ -1288,7 +1364,7 @@ mod tests {
             with_state(|state| {
                 let before = [("!history".to_owned(), state.tags("!history"))];
                 let request = Request::Orders(vec![("!history".to_owned(), order(value).unwrap())]);
-                state.record("fixture", &request, "!history", &before);
+                state.record_expected("fixture", &request, "!history", &before);
             });
         }
         // This is both the original snapshot and the latest accepted order.
@@ -1318,7 +1394,7 @@ mod tests {
         assert_eq!(planned, expected);
         let request = planned.expect("the favourite tag is removed");
         let shown = [("!b".to_owned(), tagged)];
-        with_state(|state| state.record("alice", &request, "!b", &shown));
+        with_state(|state| state.record_expected("alice", &request, "!b", &shown));
         // Until sync returns it, the room keeps its stored low-priority place.
         assert_eq!(tags("!b").order(), order(0.7));
         remember("alice", &[joined("!b", kept)]);
@@ -1329,7 +1405,7 @@ mod tests {
         let shown = [("!b".to_owned(), kept)];
         remember("alice", &[joined("!b", none)]);
         with_state(|state| {
-            state.record("alice", &normal, "!b", &shown);
+            state.record_expected("alice", &normal, "!b", &shown);
             assert!(state.confirmed.is_empty());
         });
     }
