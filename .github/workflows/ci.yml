@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - 9dd17a0 - ${{ inputs.platform }}
+run-name: Reviewed compiler diagnostic - 9dd17a0 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -969,12 +969,13 @@ jobs:
                   # Exclude panic/assertion/authentication bodies. Keep compiler type-chain notes
                   # needed to diagnose Send/Sync constraints, bounded to 4 KiB in total.
                   diagnostics=[]; diagnostic_bytes=0
-                  for line in output.splitlines():
+                  diagnostic_candidates=[]
+                  for sequence,line in enumerate(output.splitlines()):
                       line=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',line)
                       stripped=line.strip()
                       type_note=re.match(r'^(?:=\s*)?(?:note|help): (?:required (?:because|by)|within `|the trait |consider (?:removing|using|further)|future (?:created|is)|this (?:value|type))',stripped)
                       source_span=re.match(r'^(?:-->|:::)\s+[^\r\n]{1,1000}\.(?:rs|slint):[0-9]{1,7}:[0-9]{1,5}',stripped)
-                      compiler_error=re.match(r'^error(?:\[E[0-9]{4}\])?: (?:could not compile|aborting|failed to run custom build command|cannot|expected|unexpected|unresolved|unknown|Unknown|No such|Cannot|invalid|unterminated|mismatched|attribute|proc macro|item|recursion|reached|linking)',stripped)
+                      compiler_error=re.match(r'^error(?:\[E[0-9]{4}\])?: (?:could not compile|aborting|failed to run custom build command|cannot|expected|unexpected|unresolved|unknown|Unknown|No such|Cannot|invalid|unterminated|mismatched|attribute|proc macro|item|recursion|reached|linking|The binding)',stripped)
                       coded_error=re.match(r'^error\[E[0-9]{4}\]: ',stripped)
                       if not (compiler_error or coded_error or stripped.startswith(('fatal error:',
                           'MORPHEUS_SLINT_CONST_REFERENCE')) or type_note or source_span
@@ -987,8 +988,14 @@ jobs:
                       line=re.sub(r"(?i)[a-z]:[\\/][^\s'\"`<>]+",'<runner-path>',line)
                       line=re.sub(r"(?<![A-Za-z0-9_.>])/(?:[^\s'\"`<>]+)",'<runner-path>',line)
                       line=''.join(ch for ch in line if ord(ch)>=32 and ord(ch)!=127)[:1000]
+                      # Source spans from warnings must not consume the budget before errors.
+                      priority=0 if compiler_error or coded_error or stripped.startswith(('fatal error:',
+                          'MORPHEUS_SLINT_CONST_REFERENCE')) else 1 if not source_span else 2
+                      diagnostic_candidates.append((priority,sequence,line))
+                  for _,_,line in sorted(diagnostic_candidates):
                       encoded=line.encode('utf-8')
-                      if diagnostic_bytes+len(encoded)>4096 or len(diagnostics)>=32: break
+                      if diagnostic_bytes+len(encoded)>4096: continue
+                      if len(diagnostics)>=32: break
                       diagnostics.append(line); diagnostic_bytes+=len(encoded)
                   record['compiler_diagnostics']=diagnostics
                   crates=set(re.findall(r"failed to run custom build command for `([A-Za-z0-9_-]+) v([0-9][A-Za-z0-9.+_-]*)`",output))
