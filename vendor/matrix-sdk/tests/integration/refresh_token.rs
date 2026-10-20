@@ -415,7 +415,15 @@ async fn test_mutation_can_disable_auth_refresh_and_replay() {
     assert_eq!(session_changes.try_recv(), Err(TryRecvError::Empty));
     assert_eq!(client.access_token().as_deref(), Some(ACCESS));
     assert_eq!(client.session_tokens().unwrap().refresh_token.as_deref(), Some(REFRESH));
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    // Ignore session-setup discovery; assert exact mutation and refresh counts.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.iter().filter(|request| {
+        request.method.as_str() == "POST"
+            && request.url.path() == "/_matrix/client/v3/createRoom"
+    }).count(), 1);
+    assert_eq!(requests.iter().filter(|request| {
+        request.url.path() == "/_matrix/client/v3/refresh"
+    }).count(), 0);
     let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
     assert!(output.contains("Matrix request failed"), "capture the actual HTTP error route");
     for private in [ACCESS, REFRESH, PRIVATE_REPLY] {
@@ -472,7 +480,15 @@ async fn test_mutation_keeps_default_auth_refresh_and_replay() {
     assert_eq!(response.room_id.as_str(), "!created:example.org");
     assert_eq!(session_changes.try_recv(), Ok(SessionChange::TokensRefreshed));
     assert_eq!(session_changes.try_recv(), Err(TryRecvError::Empty));
-    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    // Ignore session-setup discovery; assert exact mutation and refresh counts.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.iter().filter(|request| {
+        request.method.as_str() == "POST"
+            && request.url.path() == "/_matrix/client/v3/createRoom"
+    }).count(), 2);
+    assert_eq!(requests.iter().filter(|request| {
+        request.url.path() == "/_matrix/client/v3/refresh"
+    }).count(), 1);
     server.verify().await;
 }
 
