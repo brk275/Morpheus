@@ -2784,6 +2784,7 @@ async fn assert_metric_workspace_and_extremes(ui: &AppWindow, directory: &std::p
 /// returns to the theme palette; the timeline names use the saved palette.
 async fn assert_interaction_states_and_sender_palette(ui: &AppWindow, directory: &std::path::Path) {
     use morpheus_config::ConfigStore;
+    use slint::private_unstable_api::re_exports::{AccessibleRole, AccessibleStringProperty};
 
     let store = ConfigStore::at(directory.join("states.toml"));
     let mut config = store.load_or_create().unwrap();
@@ -2838,17 +2839,55 @@ async fn assert_interaction_states_and_sender_palette(ui: &AppWindow, directory:
         text_colors_of(ui, "3").is_empty(),
         "a mention badge replaces the unread count"
     );
-    // The hover-fade decrease at 0 ms is disabled and draws the state.
+    // The hover-fade decrease at 0 ms is disabled. Inspect its actual vector
+    // stroke, not another control's text or the pre-migration minus glyph.
     ui.set_page(1);
     settle(ui).await;
-    assert!(
-        text_colors_of(ui, "−").contains(&rgb(0x5a, 0x6b, 0x7c)),
-        "a disabled button keeps its built-in ink"
+    assert!(crate::settings_search::reveal(
+        ui,
+        "appearance.hover_duration"
+    ));
+    settle(ui).await;
+    let label = "Decrease Hover fade duration";
+    let decrease = control_with_label(ui, label);
+    assert_eq!(decrease.accessible_role(), AccessibleRole::Button);
+    assert_eq!(
+        decrease
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("false"),
+        "the exact hover-duration decrease is disabled at zero"
     );
-    let plain = store.load().unwrap();
+    let (bounds, icon) = drawn_icon(ui, label);
+    assert!(bounds.right > bounds.left && bounds.bottom > bounds.top);
+    assert!(
+        inside_window(ui, bounds),
+        "the disabled control is shown in full"
+    );
+    assert_eq!(icon.commands, ["M 5 12 L 19 12"]);
+    assert!(icon.texts.is_empty(), "the operator remains a vector icon");
+    assert!(
+        icon.bounds[0].right > icon.bounds[0].left && icon.bounds[0].bottom > icon.bounds[0].top
+    );
+    assert!(icon.stroke_widths[0] > 0.0);
+    assert_eq!(icon.strokes, [rgb(0x5a, 0x6b, 0x7c)]);
+    // Remove the color override while keeping this same control disabled.
+    let mut plain = store.load().unwrap();
+    plain.appearance.hover_duration_ms = 0;
     apply_config(ui, &plain, None);
     settle(ui).await;
-    assert!(!text_colors_of(ui, "−").contains(&rgb(0x5a, 0x6b, 0x7c)));
+    let decrease = control_with_label(ui, label);
+    assert_eq!(
+        decrease
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("false")
+    );
+    let (bounds, icon) = drawn_icon(ui, label);
+    assert!(inside_window(ui, bounds));
+    assert_eq!(icon.commands, ["M 5 12 L 19 12"]);
+    assert_eq!(icon.strokes, [ui.invoke_token_color("ink".into())]);
+    assert!(!icon.strokes.contains(&rgb(0x5a, 0x6b, 0x7c)));
 
     // The palette editor starts from the identity colors.
     let mut colored = store.load().unwrap();
