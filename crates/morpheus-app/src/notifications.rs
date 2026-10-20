@@ -794,7 +794,9 @@ fn noted_override(
     noted: Option<NotificationMode>,
     held: Option<NotificationMode>,
 ) -> Option<NotificationMode> {
-    noted.filter(|mode| held != Some(*mode))
+    // A queued event's push actions may predate the accepted Mute even when
+    // the SDK's current copy already holds it. Mute remains a final ceiling.
+    noted.filter(|mode| *mode == NotificationMode::Mute || held != Some(*mode))
 }
 
 fn plan_notification(
@@ -1174,6 +1176,35 @@ mod tests {
         };
         let (plan, ()) = tokio::join!(plan, mute);
         assert!(plan.is_none(), "the Mute accepted during the lookup applies");
+        // The same delayed acceptance must win when the lookup has already
+        // caught up to Mute, not only when it still returns AllMessages.
+        let noted = std::sync::Mutex::new(Some(NotificationMode::AllMessages));
+        let (reached, suspended) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let lookup = async {
+            reached.send(()).unwrap();
+            released.await.unwrap();
+            Some(NotificationMode::Mute)
+        };
+        let plan = plan_after_lookup(
+            &event,
+            || *noted.lock().unwrap(),
+            lookup,
+            || std::future::ready(Some((active.clone(), ui.clone()))),
+            || config.clone(),
+            || true,
+            || sent_at,
+        );
+        let mute = async {
+            suspended.await.unwrap();
+            *noted.lock().unwrap() = Some(NotificationMode::Mute);
+            release.send(()).unwrap();
+        };
+        let (plan, ()) = tokio::join!(plan, mute);
+        assert!(
+            plan.is_none(),
+            "accepted Mute also suppresses a lookup already holding Mute"
+        );
         // The message's age passes while the lookup waits.
         let clock = AtomicU64::new(sent_at);
         let (reached, suspended) = oneshot::channel();
@@ -1273,6 +1304,12 @@ mod tests {
         // Once the SDK holds it, its push actions decide, keywords included.
         assert_eq!(noted_override(mentions, mentions), None);
         assert_eq!(noted_override(None, all), None);
+        let mute = Some(NotificationMode::Mute);
+        assert_eq!(
+            noted_override(mute, mute),
+            mute,
+            "queued actions can predate Mute"
+        );
     }
 
     #[test]

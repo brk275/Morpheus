@@ -26,6 +26,7 @@ use slint::{ComponentHandle, Weak};
 use tokio::runtime::Handle;
 
 use super::rules::{Rules, level};
+use super::uncertainty::{ChangeScope, SyncMark};
 use crate::{AppWindow, RoomNotificationState, live::LiveUi, notifications::DesktopNotifications};
 
 const MAX_NAME_CHARS: usize = 80;
@@ -119,6 +120,19 @@ pub(super) fn header_rule(ui: &AppWindow, account_id: &str, rule: &RoomNotificat
     }
 }
 
+/// Shared uncertainty may arrive from a retired Settings or room-panel
+/// operation. Only the currently open account/room receives its warning.
+pub(super) fn show_uncertainty(ui: &AppWindow, account_id: &str, room_id: &str) {
+    let global = ui.global::<RoomNotificationState>();
+    if global.get_open()
+        && global.get_account_id().as_str() == account_id
+        && global.get_room_id().as_str() == room_id
+        && on_screen(ui, account_id, room_id)
+    {
+        global.set_notice(NOT_SYNCED.into());
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// Bumped by every open, retry and close; a result is shown only while
@@ -132,23 +146,9 @@ struct State {
     /// finished. It outlives a close, so a reopened panel never sends a
     /// second change over it.
     in_flight: Option<(String, String)>,
-    /// The account and room of a change the homeserver did not confirm, with
-    /// no sync observed since. It outlives a close, so a reopened panel never
-    /// calls this device's copy the homeserver's rules.
-    unconfirmed: Option<(String, String)>,
     /// Bumped for every room the header shows; a bell read is used only
     /// while its number is current.
     header: u64,
-}
-
-impl State {
-    /// Whether `room_id` of `account_id` has an unconfirmed change with no
-    /// sync observed since.
-    fn unconfirmed_here(&self, account_id: &str, room_id: &str) -> bool {
-        self.unconfirmed
-            .as_ref()
-            .is_some_and(|(account, room)| account == account_id && room == room_id)
-    }
 }
 
 pub(super) struct RoomPanel {
@@ -340,13 +340,14 @@ impl RoomPanel {
                     global.set_default_level(level(default));
                 }
                 header_rule(ui, selection.account_id(), &rule);
-                let unconfirmed =
-                    self.state().unconfirmed_here(selection.account_id(), &rule.room_id);
+                let unconfirmed = self
+                    .rules
+                    .unconfirmed(selection.account_id(), Some(&rule.room_id));
                 self.show_rule(&global, rule);
                 if unconfirmed {
                     // What was just read is this device's copy, not confirmed.
                     global.set_notice(NOT_SYNCED.into());
-                    self.await_fresh(operation, selection.clone(), None);
+                    self.await_fresh(operation, selection.clone(), None, self.rules.sync_mark());
                 }
             }
             Err(MatrixCoreError::RoomNotFound(_)) => global.set_error(NOT_JOINED.into()),
@@ -395,12 +396,19 @@ impl RoomPanel {
         let panel = self.clone();
         self.runtime.spawn(async move {
             let manager = panel.live.manager.clone();
+            let ticket = panel
+                .rules
+                .begin_change(&selection, ChangeScope::Room(room_id.clone()));
             // Opened before the change, so a sync during or right after it is
             // not missed.
             let mut watch = manager.watch_push_rules_selected(&selection).await.ok();
             let result = manager
                 .set_room_notification_mode_selected(&selection, &room_id, mode)
                 .await;
+            // Record independently of a close, refresh or account navigation.
+            // Drain only after this mark: an earlier event cannot settle a
+            // failure that was recorded between completion and that drain.
+            let mark = panel.rules.complete_change(ticket, result.is_ok());
             if let Some(watch) = &mut watch {
                 watch.change_finished();
             }
@@ -416,7 +424,7 @@ impl RoomPanel {
             }
             let weak = panel.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                panel.finish_choice(&ui, operation, &selection, &room_id, result, watch);
+                panel.finish_choice(&ui, operation, &selection, result, watch, mark);
             });
         });
     }
@@ -426,26 +434,12 @@ impl RoomPanel {
         ui: &AppWindow,
         operation: u64,
         selection: &AccountSelection,
-        room_id: &str,
         result: Result<RoomNotificationRule, MatrixCoreError>,
         watch: Option<PushRuleSyncWatch>,
+        mark: SyncMark,
     ) {
-        {
-            let mut state = self.state();
-            state.in_flight = None;
-            match &result {
-                // A confirmed change settles this room's rules.
-                Ok(_) if state.unconfirmed_here(selection.account_id(), room_id) => {
-                    state.unconfirmed = None;
-                }
-                Ok(_) | Err(MatrixCoreError::RoomNotFound(_)) => {}
-                // The room the change was sent for, wherever the panel is now.
-                Err(_) => {
-                    state.unconfirmed =
-                        Some((selection.account_id().to_owned(), room_id.to_owned()));
-                }
-            }
-        }
+        self.state().in_flight = None;
+        self.rules.publish_uncertainty(ui);
         if let Ok(rule) = &result
             && selection.is_current()
         {
@@ -485,7 +479,7 @@ impl RoomPanel {
             Err(MatrixCoreError::RoomNotFound(_)) => global.set_error(NOT_JOINED.into()),
             Err(_) => {
                 global.set_error(NOT_CONFIRMED.into());
-                self.await_fresh(operation, selection.clone(), watch);
+                self.await_fresh(operation, selection.clone(), watch, mark);
             }
         }
     }
@@ -500,6 +494,7 @@ impl RoomPanel {
         operation: u64,
         selection: AccountSelection,
         watch: Option<PushRuleSyncWatch>,
+        mark: SyncMark,
     ) {
         let panel = self.clone();
         self.runtime.spawn(async move {
@@ -519,7 +514,7 @@ impl RoomPanel {
             };
             let weak = panel.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                panel.finish_wait(&ui, operation, selection, fresh);
+                panel.finish_wait(&ui, operation, selection, fresh, mark);
             });
         });
     }
@@ -530,7 +525,11 @@ impl RoomPanel {
         operation: u64,
         selection: AccountSelection,
         fresh: bool,
+        mark: SyncMark,
     ) {
+        if fresh {
+            self.rules.synced(selection.account_id(), mark);
+        }
         if !self.owns(ui, operation, &selection) {
             return;
         }
@@ -540,14 +539,11 @@ impl RoomPanel {
             global.set_error(text.into());
             return;
         }
-        let room_id = {
-            let mut state = self.state();
-            let room_id = state.room_id.clone();
-            if state.unconfirmed_here(selection.account_id(), &room_id) {
-                state.unconfirmed = None;
-            }
-            room_id
-        };
+        let room_id = self.state().room_id.clone();
+        if self.rules.unconfirmed(selection.account_id(), Some(&room_id)) {
+            global.set_error(NOT_SYNCED.into());
+            return;
+        }
         // The level sync brought is what the homeserver's rules say now.
         self.read(ui, operation, selection, room_id);
         global.set_notice(text.into());

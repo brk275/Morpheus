@@ -22,8 +22,9 @@ use morpheus_matrix::{
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
 use tokio::runtime::Handle;
 
+use super::uncertainty::{ChangeScope, ChangeTicket, SyncMark, Uncertainty};
 use crate::{
-    AppWindow, NotificationRoomItem, NotificationRulesState, live::LiveUi,
+    AppWindow, NotificationRoomItem, NotificationRulesState, RoomNotificationState, live::LiveUi,
     notifications::DesktopNotifications,
 };
 
@@ -115,10 +116,6 @@ struct State {
     loaded: bool,
     /// The account's Matrix keywords exactly as stored in its push rules.
     keywords: Vec<String>,
-    /// An account with a change the homeserver did not confirm and no sync
-    /// observed since. It outlives a refresh, so a reopened list never
-    /// presents this device's copy as the homeserver's rules.
-    unconfirmed: Option<String>,
 }
 
 pub(super) struct Rules {
@@ -128,6 +125,7 @@ pub(super) struct Rules {
     runtime: Handle,
     store: ConfigStore,
     state: Mutex<State>,
+    uncertainty: Mutex<Uncertainty>,
 }
 
 impl Rules {
@@ -145,6 +143,7 @@ impl Rules {
             runtime,
             store: store.clone(),
             state: Mutex::new(State::default()),
+            uncertainty: Mutex::new(Uncertainty::default()),
         });
         let global = ui.global::<NotificationRulesState>();
         let refresh = rules.clone();
@@ -213,6 +212,77 @@ impl Rules {
 
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(super) fn begin_change(
+        &self,
+        selection: &AccountSelection,
+        scope: ChangeScope,
+    ) -> ChangeTicket {
+        self.uncertainty
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .begin(selection.account_id(), scope)
+    }
+
+    pub(super) fn complete_change(&self, ticket: ChangeTicket, confirmed: bool) -> SyncMark {
+        self.uncertainty
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .complete(ticket, confirmed)
+    }
+
+    pub(super) fn sync_mark(&self) -> SyncMark {
+        self.uncertainty
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .mark()
+    }
+
+    pub(super) fn unconfirmed(&self, account: &str, room: Option<&str>) -> bool {
+        self.uncertainty
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .has(account, room)
+    }
+
+    pub(super) fn synced(&self, account: &str, mark: SyncMark) {
+        self.uncertainty
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .synced(account, mark);
+    }
+
+    /// A write can end after its original view was replaced and its next
+    /// cached read already finished. Warn the current view from shared state,
+    /// without applying that retired write's result to it.
+    pub(super) fn publish_uncertainty(&self, ui: &AppWindow) {
+        let account_id = ui.get_active_account_local_id();
+        let account_id = account_id.as_str();
+        if !ui.get_live_session()
+            || !self
+                .live
+                .manager
+                .account_selection(account_id)
+                .is_some_and(|selection| selection.is_current())
+        {
+            return;
+        }
+        let listed = {
+            let state = self.state();
+            state.loaded
+                && state.selection.as_ref().is_some_and(|selection| {
+                    selection.is_current() && selection.account_id() == account_id
+                })
+        };
+        if listed && self.unconfirmed(account_id, None) {
+            ui.global::<NotificationRulesState>()
+                .set_notice(NOT_SYNCED.into());
+        }
+        let room_id = ui.global::<RoomNotificationState>().get_room_id();
+        if self.unconfirmed(account_id, Some(room_id.as_str())) {
+            super::room_panel::show_uncertainty(ui, account_id, room_id.as_str());
+        }
     }
 
     /// Whether a result for `operation` under `selection` may still be shown.
@@ -328,12 +398,11 @@ impl Rules {
             }
         }
         publish(&global, &state);
-        let unconfirmed = state.unconfirmed.as_deref() == Some(selection.account_id());
         drop(state);
-        if unconfirmed {
+        if self.unconfirmed(selection.account_id(), None) {
             // What was just read is this device's copy, not yet confirmed.
             global.set_notice(NOT_SYNCED.into());
-            self.await_fresh(operation, selection.clone(), None);
+            self.await_fresh(operation, selection.clone(), None, self.sync_mark());
         }
     }
 
@@ -390,12 +459,15 @@ impl Rules {
         let room_id = room_id.to_owned();
         self.runtime.spawn(async move {
             let manager = rules.live.manager.clone();
+            let ticket = rules.begin_change(&selection, ChangeScope::Room(room_id.clone()));
             // Opened before the change, so a sync during or right after it is
             // not missed.
             let mut watch = manager.watch_push_rules_selected(&selection).await.ok();
             let result = manager
                 .set_room_notification_mode_selected(&selection, &room_id, mode)
                 .await;
+            // Completion belongs to the account/scope, not this UI opening.
+            let mark = rules.complete_change(ticket, result.is_ok());
             if let Some(watch) = &mut watch {
                 watch.change_finished();
             }
@@ -411,7 +483,7 @@ impl Rules {
             }
             let weak = rules.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                rules.finish_room_mode(&ui, operation, &selection, &room_id, result, watch);
+                rules.finish_room_mode(&ui, operation, &selection, &room_id, result, watch, mark);
             });
         });
     }
@@ -424,7 +496,9 @@ impl Rules {
         room_id: &str,
         result: Result<RoomNotificationRule, MatrixCoreError>,
         watch: Option<PushRuleSyncWatch>,
+        mark: SyncMark,
     ) {
+        self.publish_uncertainty(ui);
         if let Ok(rule) = &result
             && selection.is_current()
         {
@@ -452,9 +526,8 @@ impl Rules {
             Err(_) => {
                 global.set_error(ROOM_UNCONFIRMED.into());
                 update_row(&global, row);
-                state.unconfirmed = Some(selection.account_id().to_owned());
                 drop(state);
-                self.await_fresh(operation, selection.clone(), watch);
+                self.await_fresh(operation, selection.clone(), watch, mark);
                 return;
             }
         }
@@ -522,15 +595,18 @@ impl Rules {
         let rules = self.clone();
         self.runtime.spawn(async move {
             let manager = rules.live.manager.clone();
+            let ticket = rules.begin_change(&selection, ChangeScope::Default(direct));
             let mut watch = manager.watch_push_rules_selected(&selection).await.ok();
             let result = manager
                 .set_notification_default_selected(&selection, direct, mode)
                 .await;
+            let mark = rules.complete_change(ticket, result.is_ok());
             if let Some(watch) = &mut watch {
                 watch.change_finished();
             }
             let weak = rules.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
+                rules.publish_uncertainty(&ui);
                 if !rules.owns(&ui, operation, &selection) {
                     return;
                 }
@@ -545,8 +621,7 @@ impl Rules {
                     }
                     Err(_) => {
                         global.set_error(DEFAULT_UNCONFIRMED.into());
-                        rules.state().unconfirmed = Some(selection.account_id().to_owned());
-                        rules.await_fresh(operation, selection.clone(), watch);
+                        rules.await_fresh(operation, selection.clone(), watch, mark);
                     }
                 }
             });
@@ -599,6 +674,7 @@ impl Rules {
         operation: u64,
         selection: AccountSelection,
         watch: Option<PushRuleSyncWatch>,
+        mark: SyncMark,
     ) {
         let rules = self.clone();
         self.runtime.spawn(async move {
@@ -618,6 +694,9 @@ impl Rules {
             };
             let weak = rules.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
+                if fresh {
+                    rules.synced(selection.account_id(), mark);
+                }
                 if !rules.owns(&ui, operation, &selection) {
                     return;
                 }
@@ -627,11 +706,9 @@ impl Rules {
                     global.set_error(text.into());
                     return;
                 }
-                {
-                    let mut state = rules.state();
-                    if state.unconfirmed.as_deref() == Some(selection.account_id()) {
-                        state.unconfirmed = None;
-                    }
+                if rules.unconfirmed(selection.account_id(), None) {
+                    global.set_error(NOT_SYNCED.into());
+                    return;
                 }
                 global.set_error("".into());
                 global.set_keyword_error("".into());
@@ -787,6 +864,7 @@ impl Rules {
         let rules = self.clone();
         self.runtime.spawn(async move {
             let manager = rules.live.manager.clone();
+            let ticket = rules.begin_change(&selection, ChangeScope::Keywords);
             let mut watch = manager.watch_push_rules_selected(&selection).await.ok();
             let result = if add {
                 manager
@@ -797,11 +875,13 @@ impl Rules {
                     .remove_notification_keyword_selected(&selection, &keyword)
                     .await
             };
+            let mark = rules.complete_change(ticket, result.is_ok());
             if let Some(watch) = &mut watch {
                 watch.change_finished();
             }
             let weak = rules.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
+                rules.publish_uncertainty(&ui);
                 if !rules.owns(&ui, operation, &selection) {
                     return;
                 }
@@ -830,8 +910,7 @@ impl Rules {
                             }
                             .into(),
                         );
-                        rules.state().unconfirmed = Some(selection.account_id().to_owned());
-                        rules.await_fresh(operation, selection.clone(), watch);
+                        rules.await_fresh(operation, selection.clone(), watch, mark);
                     }
                 }
             });

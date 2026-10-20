@@ -19,6 +19,7 @@ mod activation;
 mod read_markers;
 mod room_panel;
 mod rules;
+mod uncertainty;
 
 use std::sync::Arc;
 

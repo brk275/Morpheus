@@ -76,7 +76,9 @@ what the SDK evaluates before an event reaches Morpheus. A change is shown as
 saved only after the homeserver accepts it, and is applied to local delivery at
 once, until sync brings the updated rules to the SDK (at most two minutes);
 from then on the SDK's push actions decide, so keyword matches in a room set to
-mentions and keywords notify. A change the homeserver did not confirm may have
+mentions and keywords notify. A recently accepted mute still suppresses queued
+messages whose push actions predate it, even if the SDK's rules already show
+mute. A change the homeserver did not confirm may have
 reached it in part: one change can be several rules (a default level is one
 for encrypted and one for unencrypted rooms), and the first can land before a
 later one fails or times out, or all of them can land although no answer
@@ -89,7 +91,15 @@ change, waits at most a minute, and only then reads the levels, defaults and
 keywords again and says that they are what the homeserver's rules say (which
 may include part of the change). Without such a sync it says that what is
 shown may differ from what the homeserver holds, also when the list or the
-room panel is opened again, until one arrives. Saving a default updates the rooms that follow it
+room panel is opened again, until one arrives. Unconfirmed changes are tracked
+by account and affected room or rule group, independently of the view that
+started them. Closing or refreshing Settings, switching accounts, or failing
+a change in another room does not forget an earlier unconfirmed change. A
+sync observed for an earlier change cannot confirm a newer failure. The
+in-memory tracker holds at most 2,000 affected scopes; if it fills, a
+conservative warning remains until Morpheus is restarted rather than silently
+forgetting unresolved changes. No rule text is stored in this tracker.
+Saving a default updates the rooms that follow it
 without clearing the search or a room change still waiting for the homeserver.
 The list shows at most 100 matching rooms at a time and reads at most 2,000
 rooms, the first ones by name. Reopening the section, or showing another
