@@ -86,6 +86,12 @@ pub use pinned_messages::{
     PinnedMessagesCancellation, PinnedMessagesError, PinnedRoomChange, PinnedState,
     room_updates_affect_pinned,
 };
+mod room_media_browser;
+pub use room_media_browser::{
+    MAX_MEDIA_NAME_CHARS, MAX_MEDIA_SENDER_CHARS, MEDIA_LOAD_REQUESTS, MEDIA_LOAD_TARGET,
+    MEDIA_PAGE_EVENTS, RoomMediaCancellation, RoomMediaError, RoomMediaItem, RoomMediaKind,
+    RoomMediaPage,
+};
 mod notification_rules;
 mod rich_text;
 mod room_tags;

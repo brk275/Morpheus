@@ -3897,6 +3897,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     )));
     let live = LiveUi::new(manager.clone(), runtime.clone(), ui.as_weak(), voices);
     assert_pane_navigation_epoch(&ui, &live, directory.path()).await;
+    phase.set(74);
+    assert_room_media_scope_and_privacy(&ui, &live, &runtime).await;
     #[cfg(feature = "native-calls")]
     crate::voice_rosters::assert_unowned_presentation_is_cleared(&ui, live.clone(), &runtime);
     // This suite tests the actual dialog/controller boundary, not credentials.
@@ -6581,6 +6583,235 @@ async fn assert_pane_navigation_epoch(
     apply_config(ui, &config, None);
     ui.set_live_session(was_live);
     ui.set_preview_session(was_preview);
+    settle(ui).await;
+}
+
+/// The media browser through its registered callbacks and the window's own
+/// hooks (header entry, scope and tab handlers, the live reset and Close),
+/// with the core's load held: a page is shown only for the scope and the
+/// navigation and security epochs its load started in; a security step in
+/// progress refuses a load; the reset and Close clear every row at once;
+/// View and Save act on a listed row only. No account, network or vault.
+async fn assert_room_media_scope_and_privacy(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    use crate::room_media_browser::{HeldLoader, RoomMediaBrowser};
+    use morpheus_matrix::{RoomMediaItem, RoomMediaKind, RoomMediaPage};
+    use slint::private_unstable_api::re_exports::AccessibilityAction;
+    use std::{cell::RefCell, rc::Rc, sync::atomic::Ordering};
+
+    async fn within(wait: impl std::future::Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the held media core answers");
+    }
+    async fn until(ui: &AppWindow, done: impl Fn(&AppWindow) -> bool) {
+        let wait = async {
+            while !done(ui) {
+                settle(ui).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the media browser reaches the window");
+    }
+    fn rows(ui: &AppWindow) -> usize {
+        ui.global::<RoomMedia>().get_rows().row_count()
+    }
+    fn idle(ui: &AppWindow) -> bool {
+        !ui.global::<RoomMedia>().get_loading()
+    }
+
+    let account = ui.get_active_account_local_id();
+    let room = ui.get_active_room_id();
+    let was_session = ui.get_live_session();
+    let was_page = ui.get_page();
+    ui.set_page(0);
+    settle(ui).await;
+    let was_tab = ui.get_side_panel_tab();
+    let was_panel = ui.get_show_side_panel();
+    let shown = "!media:example.org";
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("media-account".into());
+    ui.set_active_room_id(shown.into());
+    settle(ui).await;
+    let was_live = live.is_live.swap(true, Ordering::AcqRel);
+    let photo = RoomMediaItem {
+        event_id: "$photo:example.org".into(),
+        kind: RoomMediaKind::Image,
+        filename: "beach.png".into(),
+        mime_type: "image/png".into(),
+        size: Some(2_048),
+        timestamp_ms: 0,
+        sender_id: "@ana:example.org".into(),
+        sender_name: "Ana".into(),
+        thread_root: None,
+        encrypted: false,
+        authenticity_warning: false,
+    };
+    let page = RoomMediaPage {
+        room_id: shown.into(),
+        items: vec![photo],
+        next: Some("t1".into()),
+        examined: 50,
+        ..RoomMediaPage::default()
+    };
+    let core = Arc::new(HeldLoader::new(page));
+    let _browser = RoomMediaBrowser::register(ui, live.clone(), runtime, core.clone());
+    let chosen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let views = chosen.clone();
+    ui.on_preview_image_attachment(move |event, _| {
+        views.borrow_mut().push(format!("view {event}"));
+    });
+    let saves = chosen.clone();
+    ui.on_save_attachment(move |event, _| {
+        saves.borrow_mut().push(format!("save {event}"));
+    });
+    let media = ui.global::<RoomMedia>();
+
+    // The header entry shows the tab; its first load is held while the room
+    // changes and comes back, unsettled: equal final strings fire no change,
+    // and the navigation epoch taken at the load drops what it read.
+    ui.invoke_show_room_media();
+    settle(ui).await;
+    within(core.wait_loads(1)).await;
+    assert!(media.get_loading());
+    live.invalidate_navigation();
+    ui.set_active_room_id("!elsewhere:example.org".into());
+    live.invalidate_navigation();
+    ui.set_active_room_id(shown.into());
+    core.release();
+    within(core.wait_answered(1)).await;
+    until(ui, idle).await;
+    assert_eq!(rows(ui), 0);
+    assert!(media.get_can_retry());
+
+    // A security step that begins and ends while the retried load is held.
+    media.invoke_retry();
+    within(core.wait_loads(2)).await;
+    let gate = &live.security_gate;
+    drop(gate.try_account_access().expect("the gate is idle"));
+    core.release();
+    within(core.wait_answered(2)).await;
+    until(ui, idle).await;
+    assert_eq!(rows(ui), 0);
+    // One in progress refuses a load at once.
+    let lease = gate.try_account_access().expect("the gate is idle");
+    media.invoke_retry();
+    assert!(!media.get_loading());
+    assert!(media.get_error().contains("security step"));
+    drop(lease);
+
+    // Nothing changed: the page is shown, and says what it covers.
+    media.invoke_retry();
+    within(core.wait_loads(3)).await;
+    core.release();
+    within(core.wait_answered(3)).await;
+    until(ui, |ui| rows(ui) == 1).await;
+    assert!(media.get_summary().contains("1 item from the 50 messages"));
+    assert!(media.get_can_load_older());
+    // View and Save hand on a listed row only.
+    media.invoke_view("$photo:example.org".into());
+    media.invoke_save("$photo:example.org".into());
+    media.invoke_save("$unlisted:example.org".into());
+    let expected = ["view $photo:example.org", "save $photo:example.org"];
+    assert_eq!(*chosen.borrow(), expected);
+
+    // The live reset hook clears every row before it returns; the tab then
+    // reads again for what is shown.
+    crate::room_media_browser::reset_window(ui);
+    assert_eq!(rows(ui), 0);
+    assert!(media.get_summary().is_empty());
+    settle(ui).await;
+    within(core.wait_loads(4)).await;
+    // Close gives the panel back as it was and ends the held load unshown.
+    let close = control_with_label(ui, "Close the media list");
+    close.accessible_action(&AccessibilityAction::Default);
+    settle(ui).await;
+    assert_eq!(ui.get_side_panel_tab(), was_tab);
+    assert_eq!(ui.get_show_side_panel(), was_panel);
+    core.release();
+    within(core.wait_answered(4)).await;
+    settle(ui).await;
+    assert_eq!(rows(ui), 0);
+
+    // Real Tab focus on each footer action: Escape bubbles from the
+    // focused control and closes, without activating Open/View/Save.
+    for (index, label) in [
+        "Show beach.png in the conversation",
+        "View beach.png",
+        "Save beach.png",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let count = index + 5;
+        ui.invoke_show_room_media();
+        settle(ui).await;
+        within(core.wait_loads(count)).await;
+        core.release();
+        within(core.wait_answered(count)).await;
+        until(ui, |ui| rows(ui) == 1).await;
+        tab_to_control(ui, label);
+        assert!(focused_control_has_label(ui, label));
+        key(ui, Key::Escape);
+        settle(ui).await;
+        assert_eq!(ui.get_side_panel_tab(), was_tab);
+        assert_eq!(rows(ui), 0);
+    }
+    assert_eq!(
+        *chosen.borrow(),
+        expected,
+        "Escape never activates a focused action"
+    );
+
+    // A selector popup gets its own Escape first. Once it is closed, the
+    // same key on the focused selector closes the media panel.
+    ui.invoke_show_room_media();
+    settle(ui).await;
+    within(core.wait_loads(8)).await;
+    tab_to_control(ui, "Kind of media shown");
+    key(ui, Key::Return);
+    settle(ui).await;
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert_eq!(ui.get_side_panel_tab(), crate::room_media_browser::PANE_TAB);
+    assert!(focused_control_has_label(ui, "Kind of media shown"));
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert_eq!(ui.get_side_panel_tab(), was_tab);
+    core.release();
+    within(core.wait_answered(8)).await;
+
+    // Search still clears first, then closes, through actual key input.
+    ui.invoke_show_room_media();
+    settle(ui).await;
+    within(core.wait_loads(9)).await;
+    tab_to_control(
+        ui,
+        "Search loaded media; arrows select, Enter shows it in the conversation, Escape clears or closes",
+    );
+    type_text(ui, "beach");
+    settle(ui).await;
+    assert_eq!(media.get_query().as_str(), "beach");
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(media.get_query().is_empty());
+    assert_eq!(ui.get_side_panel_tab(), crate::room_media_browser::PANE_TAB);
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert_eq!(ui.get_side_panel_tab(), was_tab);
+    core.release();
+    within(core.wait_answered(9)).await;
+    settle(ui).await;
+    assert_eq!(rows(ui), 0);
+
+    live.is_live.store(was_live, Ordering::Release);
+    ui.on_preview_image_attachment(|_, _| {});
+    ui.on_save_attachment(|_, _| {});
+    ui.set_active_account_local_id(account);
+    ui.set_active_room_id(room);
+    ui.set_live_session(was_session);
+    ui.set_page(was_page);
     settle(ui).await;
 }
 

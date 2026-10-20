@@ -32,6 +32,9 @@ export { NotificationRoomItem, NotificationRulesState, RoomNotificationState } f
 import { IgnoredUsersPanel, MemberInspector, MemberPrivacy } from "member-privacy.slint";
 // Rust drives member details and the ignore list through this global.
 export { IgnoredUserRow, IgnoredUsersView, MemberInspectorView, MemberPrivacy } from "member-privacy.slint";
+import { RoomMedia, RoomMediaPanel } from "room-media.slint";
+// Rust drives the room media browser (the details panel's Media tab) through this global.
+export { RoomMedia, RoomMediaRow } from "room-media.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
 // One row of the pane arrangement editor, in the current order.
@@ -4077,6 +4080,15 @@ export component AppWindow inherits Window {
     changed pinned-scope => { root.pinned-context-changed(); }
     property <bool> pinned-pane-visible: root.page == 0 && root.show-side-panel && root.side-panel-tab == 3;
     changed pinned-pane-visible => { root.pinned-pane-shown(root.pinned-pane-visible); }
+    // The media browser (room_media_browser): its scope, its tab, and what
+    // Close gives the details panel back to.
+    property <string> room-media-scope: root.active-account-local-id + "\n" + root.active-room-id + "\n" + (root.live-session ? "1" : "0");
+    changed room-media-scope => { RoomMedia.context-changed(); }
+    property <bool> room-media-visible: root.page == 0 && root.show-side-panel && root.side-panel-tab == 5;
+    changed room-media-visible => { RoomMedia.shown(root.room-media-visible); }
+    property <int> room-media-return-tab: 0;
+    property <bool> room-media-return-shown: false;
+    property <bool> room-media-return-reveal: false;
     in-out property <string> directory-search;
     in-out property <string> directory-server;
     in-out property <string> directory-next-batch;
@@ -4320,6 +4332,29 @@ export component AppWindow inherits Window {
         root.show-side-panel = true;
         root.details-reveal-open = true;
         root.side-panel-tab = 4;
+    }
+    // Presentation only: show the media tab of the side panel and focus its
+    // search. Close gives the panel back as it was, without editing the
+    // saved layout.
+    public function show-room-media() {
+        if !root.room-media-visible {
+            root.room-media-return-tab = root.side-panel-tab == 5 ? 0 : root.side-panel-tab;
+            root.room-media-return-shown = root.page == 0 && root.show-side-panel;
+            root.room-media-return-reveal = root.details-reveal-open;
+            RoomMedia.focus-pending = true;
+        } else {
+            RoomMedia.focus-request += 1;
+        }
+        root.page = 0;
+        root.show-side-panel = true;
+        root.details-reveal-open = true;
+        root.side-panel-tab = 5;
+    }
+    function close-room-media() {
+        root.side-panel-tab = root.room-media-return-tab;
+        root.details-reveal-open = root.room-media-return-reveal;
+        root.show-side-panel = root.room-media-return-shown;
+        root.focus-composer(false);
     }
     // Opens the menu and focuses its trigger; each entry keeps its own
     // activation and confirmation.
@@ -5530,6 +5565,15 @@ export component AppWindow inherits Window {
                                 root.show-side-panel = true;
                                 root.side-panel-tab = 3;
                             }
+                        }
+                        }
+                        if root.page == 0 : VerticalLayout {
+                            width: StyleTokens.icon-button-size; alignment: center;
+                            IconAction {
+                            icon: "media"; label: "Browse this room's media"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
+                            selected: root.room-media-visible;
+                            enabled: root.live-session && root.active-room-id != "";
+                            activated => { root.show-room-media(); }
                         }
                         }
                         if root.page == 0 : VerticalLayout {
@@ -10494,6 +10538,30 @@ export component AppWindow inherits Window {
                     action(kind, id, choice) => { root.transfer-action(kind, id, choice); }
                     clear-finished => { root.clear-finished-transfers(); }
                     revealed => { root.settings-revealed-id = "files.transfers"; }
+                }
+                if root.side-panel-tab == 5 : RoomMediaPanel {
+                    vertical-stretch: 1;
+                    room-name: root.active-room-name;
+                    available: root.live-session && root.active-room-id != "";
+                    text-scale: root.text-scale;
+                    select-colors: root.button-colors;
+                    palette: {
+                        ink: root.ink,
+                        muted: root.muted,
+                        panel: root.panel,
+                        elevated: root.elevated,
+                        hover: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover,
+                        outline: root.divider,
+                        focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+                        selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : Palette.selection-background,
+                        selection-ink: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground,
+                        has-selection-ink: true,
+                        error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+                        warning: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+                        input-surface: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated,
+                        input-border: StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.divider,
+                    };
+                    close => { root.close-room-media(); }
                 }
             }
             // Collapsed (or squeezed by a narrow window): a strip that restores it.

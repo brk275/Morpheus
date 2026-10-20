@@ -17,6 +17,7 @@ implemented and what still needs verification.
 
 - [Messages and formatting](MESSAGING_FORMAT.md), [emoji](EMOJI_CATALOG.md) and [image previews](IMAGE_PREVIEWS.md).
 - [Room settings](ROOM_SETTINGS.md) and [notifications](NOTIFICATIONS.md).
+- [Room media browser](ROOM_MEDIA.md).
 - [Incoming calls](INCOMING_CALLS.md) and [voice spaces](VOICE_SPACES.md).
 
 ## Build and contribute

@@ -44,6 +44,7 @@ mod polls;
 #[cfg(debug_assertions)]
 mod preview_capture;
 mod room_activity;
+mod room_media_browser;
 mod room_organization;
 mod room_settings;
 mod security;
@@ -1585,6 +1586,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         room_settings::RoomSettingsUi::register(&ui, live.clone(), runtime.handle());
     let pinned_messages =
         pinned_messages::PinnedMessagesUi::register(&ui, live.clone(), runtime.handle());
+    let room_media = room_media_browser::RoomMediaBrowser::register(
+        &ui,
+        live.clone(),
+        runtime.handle(),
+        manager.clone(),
+    );
     let room_activity =
         room_activity::RoomActivityUi::register(&ui, live.clone(), store.clone(), runtime.handle());
     let device_sessions =
@@ -4472,6 +4479,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     device_sessions.shutdown(&ui);
     member_privacy.shutdown(&ui);
     pinned_messages.shutdown(&ui);
+    room_media.shutdown(&ui);
     room_activity.shutdown(&ui);
     room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);

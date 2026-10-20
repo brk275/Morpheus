@@ -951,7 +951,11 @@ fn has_replacement(raw: &Raw<AnySyncTimelineEvent>) -> bool {
 }
 // Unverified identities are the ordinary case and carry no warning, as in
 // the timeline. Anything that fails to tie the event to its sender does.
-fn authenticated(encrypted_room: bool, sender: &UserId, info: Option<&EncryptionInfo>) -> bool {
+pub(crate) fn authenticated(
+    encrypted_room: bool,
+    sender: &UserId,
+    info: Option<&EncryptionInfo>,
+) -> bool {
     let Some(info) = info else {
         return !encrypted_room;
     };

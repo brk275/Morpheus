@@ -3577,6 +3577,8 @@ fn apply_snapshot(
         ui.set_member_confirm_open(false);
         // Pinned rows, flags and filter text belong to the previous room.
         ui.invoke_reset_pinned_messages();
+        // So do the media browser's rows, search and load.
+        crate::room_media_browser::reset_window(ui);
         // So do typing names, Seen-by rows and read receipt state.
         crate::room_activity::clear(ui);
         crate::reset_attachment_view(ui);
@@ -3789,6 +3791,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     crate::member_privacy::clear_presentation(ui);
     // Decrypted pinned rows are account-private and never wait for a task.
     ui.invoke_reset_pinned_messages();
+    // So are the media browser's rows.
+    crate::room_media_browser::reset_window(ui);
     // So is who is in this account's voice rooms.
     #[cfg(feature = "native-calls")]
     crate::voice_rosters::clear(ui);
