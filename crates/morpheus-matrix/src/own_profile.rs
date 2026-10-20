@@ -188,7 +188,9 @@ impl OwnProfile {
             account_id: account_id.to_owned(),
             user_id: user_id.to_owned(),
             homeserver: homeserver.to_owned(),
-            display_name: display_name.map(str::to_owned),
+            // `display_name` is treated as the server's raw value, as a read
+            // would: the display copy is derived from it the same way.
+            display_name: shown_name(display_name.map(str::to_owned)),
             raw_display_name: RawName::from_server(display_name.map(str::to_owned)),
             avatar: None,
         }
@@ -537,7 +539,13 @@ impl AccountManager {
                 .upload(
                     &mime::IMAGE_PNG,
                     bytes,
-                    Some(RequestConfig::new().retry_limit(0).timeout(UPLOAD_TIMEOUT)),
+                    Some(
+                        RequestConfig::new()
+                            .retry_limit(0)
+                            .timeout(UPLOAD_TIMEOUT)
+                            .force_auth()
+                            .max_response_bytes(MAX_PROFILE_RESPONSE_BYTES),
+                    ),
                 )
                 .await
                 .map_err(|_| ProfileError::Unavailable)
@@ -766,6 +774,7 @@ mod tests {
             user_id: "@synthetic:example.org".into(),
             homeserver: "https://example.org".into(),
             display_name: Some("Synthetic Name".into()),
+            raw_display_name: RawName::Exact("Synthetic Name".into()),
             avatar: None,
         };
         let shown = format!("{profile:?}");

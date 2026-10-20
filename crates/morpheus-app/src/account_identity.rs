@@ -56,6 +56,18 @@ const PICKER_IN_USE: &str =
 const DECODER_IN_USE: &str =
     "The image decoder is busy with Room settings. Try again when it finishes.";
 
+/// Serializes tests that touch the process-wide name and picture caches
+/// (`retain_confirmed` prunes both), so one test never prunes another's.
+#[cfg(test)]
+pub(crate) static SHARED_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn shared_cache_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    SHARED_CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Server-confirmed display names by local account ID; memory only.
 static CONFIRMED_NAMES: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
@@ -73,6 +85,9 @@ struct Editor {
     selection: Option<AccountSelection>,
     cancellation: Option<RoomSettingsCancellation>,
     server: Option<OwnProfile>,
+    /// A send ended Unknown and the profile could not be read back: the
+    /// server copy above may be out of date.
+    uncertain: bool,
     avatar: AvatarDraft,
     busy: bool,
 }
@@ -87,6 +102,7 @@ impl Default for Editor {
             selection: None,
             cancellation: None,
             server: None,
+            uncertain: false,
             avatar: AvatarDraft::Keep,
             busy: false,
         }
@@ -547,6 +563,9 @@ fn begin(ui: &AppWindow, live: &LiveUi) -> Option<Scope> {
         }
         editor.busy = true;
         editor.operation = editor.operation.wrapping_add(1);
+        // A label read started before this editor step must not publish
+        // over whatever this step reads or saves.
+        retire_label_job();
         Some(Scope {
             epoch: editor.epoch,
             operation: editor.operation,
@@ -622,7 +641,10 @@ fn read(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, reset_name: bool) 
                     apply_server(&ui, &profile, reset_name || !edited);
                     // The switcher and active profile show the same picture.
                     hold_profile_avatar(&ui, &profile, preview.as_ref());
-                    with(|editor| editor.server = Some(profile));
+                    with(|editor| {
+                        editor.server = Some(profile);
+                        editor.uncertain = false;
+                    });
                     if with(|editor| matches!(editor.avatar, AvatarDraft::Keep)) {
                         show_image(&ui, preview.as_ref());
                     }
@@ -659,6 +681,8 @@ async fn avatar_preview(live: &LiveUi, scope: &Scope, profile: &OwnProfile) -> O
 
 /// Show the server-confirmed profile and project it to the switcher.
 pub(crate) fn apply_server(ui: &AppWindow, profile: &OwnProfile, reset_name: bool) {
+    retire_label_job();
+    published();
     let name = profile.display_name.clone().unwrap_or_default();
     ui.set_account_profile_user_id(profile.user_id.as_str().into());
     ui.set_account_profile_homeserver(profile.homeserver.as_str().into());
@@ -724,16 +748,39 @@ fn show_image(ui: &AppWindow, image: Option<&PreparedAvatar>) {
 
 /// The name to save, if it differs from the server's: `Ok(None)` when it is
 /// unchanged, `Err` when it cannot be saved.
-fn name_change(input: &str, server: Option<&str>) -> Result<Option<String>, ProfileError> {
-    if input.trim() == server.unwrap_or("").trim() {
+/// The name to save, decided against the server's exact raw value (never
+/// the shortened, normalized display copy): `Ok(None)` when the server holds
+/// exactly the validated draft (or no name and the field is empty), `Err`
+/// when it cannot be saved. While the server's state is uncertain (a send
+/// ended Unknown and nothing could be read back), nothing counts as
+/// unchanged, so the user can always send again deliberately.
+fn name_change(
+    input: &str,
+    server: Option<&OwnProfile>,
+    uncertain: bool,
+) -> Result<Option<String>, ProfileError> {
+    if input.trim().is_empty() {
+        if !uncertain && server.is_none_or(OwnProfile::name_is_absent) {
+            return Ok(None);
+        }
+        // Emptying the field is not a removal; that is its own action.
+        return Err(ProfileError::InvalidName);
+    }
+    let draft = validate_display_name(input)?;
+    if !uncertain && server.is_some_and(|server| server.name_is_exactly(&draft)) {
         return Ok(None);
     }
-    validate_display_name(input).map(Some)
+    Ok(Some(draft))
 }
 
 fn show_dirty(ui: &AppWindow) {
-    let server = ui.get_account_profile_server_name();
-    let dirty = ui.get_account_profile_name_input().trim() != server.trim();
+    let input = ui.get_account_profile_name_input();
+    let dirty = with(|editor| {
+        !matches!(
+            name_change(input.as_str(), editor.server.as_ref(), editor.uncertain),
+            Ok(None)
+        )
+    });
     ui.set_account_profile_name_dirty(dirty);
 }
 
@@ -930,14 +977,17 @@ enum NameSave {
 }
 
 fn save(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
-    let server_name = with(|editor| editor.server.as_ref().map(|server| server.display_name.clone()));
-    let Some(server_name) = server_name else {
+    let input = ui.get_account_profile_name_input();
+    let decided = with(|editor| {
+        editor
+            .server
+            .as_ref()
+            .map(|server| name_change(input.as_str(), Some(server), editor.uncertain))
+    });
+    let Some(decided) = decided else {
         return;
     };
-    let name = match name_change(
-        ui.get_account_profile_name_input().as_str(),
-        server_name.as_deref(),
-    ) {
+    let name = match decided {
         Ok(name) => name,
         Err(error) => {
             ui.set_account_profile_error(error.to_string().into());
@@ -957,11 +1007,14 @@ fn save(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
 /// The confirmation names the identity; the request is its own change.
 fn clear_name(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     ui.set_account_profile_confirm_clear(false);
+    // A whitespace-only or otherwise unshowable raw name can be removed too:
+    // only a server holding no name at all has nothing to remove.
     let has_name = with(|editor| {
-        editor
-            .server
-            .as_ref()
-            .is_some_and(|server| server.display_name.is_some())
+        editor.uncertain
+            || editor
+                .server
+                .as_ref()
+                .is_some_and(|server| !server.name_is_absent())
     });
     if !has_name {
         return;
@@ -1096,7 +1149,18 @@ fn finish_save(
             .then_some(preview.as_ref())
             .flatten();
         hold_profile_avatar(ui, profile, picture);
-        with(|editor| editor.server = Some(profile.clone()));
+        with(|editor| {
+            editor.server = Some(profile.clone());
+            editor.uncertain = false;
+        });
+    } else if [name, avatar]
+        .into_iter()
+        .flatten()
+        .any(|field| field == FieldOutcome::Unknown)
+    {
+        // Sent, but nothing could be read back: the held server copy may be
+        // stale, so no draft counts as unchanged until a read succeeds.
+        with(|editor| editor.uncertain = true);
     }
     // A failed, unknown or unsent avatar change stays drafted for a retry.
     if avatar == Some(FieldOutcome::Saved) {
@@ -1183,21 +1247,75 @@ thread_local! {
     static LABEL: RefCell<LabelRefresh> = RefCell::new(LabelRefresh::default());
 }
 
-/// Whether a label read should start for `account` now: not while one is in
-/// flight, and once per selection unless `force` (Manage accounts opened).
-fn label_read_needed(
-    refresh: &LabelRefresh,
-    account: &str,
-    force: bool,
-) -> bool {
-    if refresh.in_flight {
-        return false;
+/// Whether a label read should start for `account` now. A read already in
+/// flight for this same current selection is left to finish; one for a
+/// revoked selection or another account (A -> B -> A) is retired by the
+/// caller and never starves the new selection. Otherwise once per selection,
+/// unless `force` (Manage accounts opened).
+fn label_read_needed(refresh: &LabelRefresh, account: &str, force: bool) -> bool {
+    let same_current = refresh
+        .selection
+        .as_ref()
+        .is_some_and(|done| done.is_current() && done.account_id() == account);
+    label_decision(refresh.in_flight, same_current, force)
+}
+
+fn label_decision(in_flight: bool, same_current: bool, force: bool) -> bool {
+    if in_flight {
+        return !same_current;
     }
-    force
-        || !refresh
-            .selection
-            .as_ref()
-            .is_some_and(|done| done.is_current() && done.account_id() == account)
+    force || !same_current
+}
+
+thread_local! {
+    // Bumped on every publication of a confirmed profile to the account
+    // views (editor or label read). A label read applies only if nothing was
+    // published since it started, so an older read can never revert a newer
+    // save.
+    static PUBLICATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn publication() -> u64 {
+    PUBLICATION.with(std::cell::Cell::get)
+}
+
+fn published() {
+    PUBLICATION.with(|publication| publication.set(publication.get().wrapping_add(1)));
+}
+
+/// Retire any label read in flight: cancel it and make its result stale.
+/// Called before every editor read, write and publication, so a slower
+/// label read started earlier can never overwrite what the editor shows.
+fn retire_label_job() {
+    LABEL.with(|label| {
+        let mut label = label.borrow_mut();
+        if let Some(cancellation) = label.cancellation.take() {
+            cancellation.cancel();
+        }
+        if label.in_flight {
+            // Read again on the next snapshot or Manage accounts open.
+            label.selection = None;
+        }
+        label.in_flight = false;
+        label.generation = label.generation.wrapping_add(1);
+    });
+}
+
+/// Whether a finished label read may publish: still the newest label job,
+/// nothing published since it started, and the same visible account under
+/// a still-current selection.
+fn label_result_applies(
+    job: u64,
+    current_job: u64,
+    started_publication: u64,
+    current_publication: u64,
+    selection_current: bool,
+    same_account: bool,
+) -> bool {
+    job == current_job
+        && started_publication == current_publication
+        && selection_current
+        && same_account
 }
 
 /// Read the visible account's profile once for its switcher label. Called
@@ -1235,6 +1353,7 @@ pub(crate) fn refresh_active_label(ui: &AppWindow, force: bool) {
     let Some((generation, cancellation)) = started else {
         return;
     };
+    let started_publication = publication();
     let held_key = held_avatar_key(&account);
     let weak = ui.as_weak();
     runtime.spawn(async move {
@@ -1263,24 +1382,27 @@ pub(crate) fn refresh_active_label(ui: &AppWindow, force: bool) {
             _ => None,
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            let current = LABEL.with(|label| {
+            let current_job = LABEL.with(|label| {
                 let mut label = label.borrow_mut();
-                if label.generation != generation {
-                    return false;
+                if label.generation == generation {
+                    label.in_flight = false;
                 }
-                label.in_flight = false;
-                true
+                label.generation
             });
-            // Only the same visible account under the same selection.
-            if !current
-                || !selection.is_current()
-                || ui.get_active_account_local_id().as_str() != selection.account_id()
-            {
+            if !label_result_applies(
+                generation,
+                current_job,
+                started_publication,
+                publication(),
+                selection.is_current(),
+                ui.get_active_account_local_id().as_str() == selection.account_id(),
+            ) {
                 return;
             }
             if let Ok(profile) = profile
                 && profile.account_id == selection.account_id()
             {
+                published();
                 record_confirmed(&profile);
                 project_switcher(&ui, &profile);
                 hold_profile_avatar(&ui, &profile, picture.as_ref());
@@ -1311,6 +1433,8 @@ fn hold_profile_avatar(ui: &AppWindow, profile: &OwnProfile, picture: Option<&Pr
 
 #[cfg(test)]
 mod tests {
+    use morpheus_matrix::MAX_DISPLAY_NAME_CHARS;
+
     use super::*;
 
     #[test]
@@ -1331,21 +1455,59 @@ mod tests {
         });
     }
 
+    fn raw(name: Option<&str>) -> OwnProfile {
+        // `synthetic` treats the name as the server's raw value.
+        OwnProfile::synthetic("synthetic-a", "@synthetic-a:example.org", "https://example.org", name)
+    }
+
     #[test]
-    fn unchanged_names_are_not_sent_and_invalid_names_are_refused() {
-        assert_eq!(name_change("Synthetic", Some("Synthetic")), Ok(None));
-        assert_eq!(name_change("  Synthetic ", Some("Synthetic")), Ok(None));
-        assert_eq!(name_change("", None), Ok(None));
+    fn unchanged_names_are_decided_on_the_exact_raw_value() {
+        let same = raw(Some("Synthetic"));
+        assert_eq!(name_change("Synthetic", Some(&same), false), Ok(None));
+        // The validated draft (trimmed) still equals the raw value.
+        assert_eq!(name_change("  Synthetic ", Some(&same), false), Ok(None));
+        assert_eq!(name_change("", Some(&raw(None)), false), Ok(None));
         assert_eq!(
-            name_change("New Synthetic", Some("Synthetic")),
+            name_change("New Synthetic", Some(&same), false),
             Ok(Some("New Synthetic".to_owned()))
         );
-        // Clearing a name is not a supported edit; the server copy stays.
-        assert_eq!(name_change("", Some("Synthetic")), Err(ProfileError::InvalidName));
+        // A raw value that only displays like the draft is not unchanged.
+        let spaced = raw(Some("Synthetic  Name"));
+        assert_eq!(spaced.display_name.as_deref(), Some("Synthetic Name"));
         assert_eq!(
-            name_change("two\nlines", Some("Synthetic")),
+            name_change("Synthetic Name", Some(&spaced), false),
+            Ok(Some("Synthetic Name".to_owned()))
+        );
+        let long = raw(Some(&format!("{}tail", "n".repeat(MAX_DISPLAY_NAME_CHARS))));
+        let prefix = "n".repeat(MAX_DISPLAY_NAME_CHARS);
+        assert_eq!(name_change(&prefix, Some(&long), false), Ok(Some(prefix.clone())));
+        // Emptying the field is not a removal.
+        assert_eq!(name_change("", Some(&same), false), Err(ProfileError::InvalidName));
+        assert_eq!(
+            name_change("two\nlines", Some(&same), false),
             Err(ProfileError::InvalidName)
         );
+    }
+
+    #[test]
+    fn an_unknown_outcome_never_reads_as_unchanged() {
+        let same = raw(Some("Synthetic"));
+        // After a send ended Unknown with no read-back, an equal draft can
+        // still be sent deliberately.
+        assert_eq!(
+            name_change("Synthetic", Some(&same), true),
+            Ok(Some("Synthetic".to_owned()))
+        );
+        assert_eq!(name_change("", Some(&raw(None)), true), Err(ProfileError::InvalidName));
+    }
+
+    #[test]
+    fn a_whitespace_only_raw_name_counts_as_a_name_that_can_be_removed() {
+        let blank = raw(Some("   "));
+        assert_eq!(blank.display_name, None);
+        assert!(!blank.name_is_absent());
+        assert!(raw(None).name_is_absent());
+        assert!(raw(Some("")).name_is_absent());
     }
 
     fn profile(name: Option<&str>) -> OwnProfile {
@@ -1434,6 +1596,7 @@ mod tests {
 
     #[test]
     fn pictures_map_only_to_their_exact_local_account_and_leave_with_it() {
+        let _shared = shared_cache_test_guard();
         let thumb = |key: &str| Thumb {
             key: key.to_owned(),
             width: 1,
@@ -1477,21 +1640,60 @@ mod tests {
     }
 
     #[test]
-    fn label_reads_run_once_per_selection_and_never_concurrently() {
-        let idle = LabelRefresh::default();
-        // Nothing read yet: read the visible account once.
-        assert!(label_read_needed(&idle, "synthetic-a", false));
-        let busy = LabelRefresh {
+    fn label_reads_run_once_per_selection_and_a_stale_job_never_starves_a_new_one() {
+        // Nothing read yet for this selection: read once.
+        assert!(label_decision(false, false, false));
+        // Already read for this current selection: not again on a snapshot,
+        // but once more when Manage accounts opens.
+        assert!(!label_decision(false, true, false));
+        assert!(label_decision(false, true, true));
+        // In flight for this same current selection: let it finish.
+        assert!(!label_decision(true, true, false));
+        assert!(!label_decision(true, true, true));
+        // In flight for a revoked selection or another account (A -> B -> A):
+        // the new selection starts its own read; the old job is retired.
+        assert!(label_decision(true, false, false));
+        let stale = LabelRefresh {
             in_flight: true,
             ..LabelRefresh::default()
         };
-        assert!(!label_read_needed(&busy, "synthetic-a", true));
-        // Opening Manage accounts forces one more read.
-        assert!(label_read_needed(&idle, "synthetic-a", true));
+        assert!(label_read_needed(&stale, "synthetic-a", false));
+    }
+
+    #[test]
+    fn a_late_label_read_never_reverts_a_newer_editor_save() {
+        // Controlled completion order, as the UI thread sees it:
+        // 1. a label read (P0) starts: job 1, nothing published yet;
+        let (job, started) = (1, 0);
+        // 2. the editor starts a save, retiring label job 1 (job 2 is now
+        //    current), and publishes its confirmed profile (P1);
+        let (current_job, current_publication) = (2, 1);
+        // 3. the slow label read (P0) finishes last: it must not publish.
+        assert!(!label_result_applies(job, current_job, started, current_publication, true, true));
+        // Even if the job number still matched, a publication since it
+        // started blocks it.
+        assert!(!label_result_applies(1, 1, 0, 1, true, true));
+        // Without any newer publication or job, the same read applies...
+        assert!(label_result_applies(1, 1, 0, 0, true, true));
+        // ...but never under a revoked selection or for another account.
+        assert!(!label_result_applies(1, 1, 0, 0, false, true));
+        assert!(!label_result_applies(1, 1, 0, 0, true, false));
+
+        // The real counters: an editor publication bumps the shared
+        // generation and retires the label job.
+        let before = (publication(), LABEL.with(|label| label.borrow().generation));
+        LABEL.with(|label| label.borrow_mut().in_flight = true);
+        retire_label_job();
+        published();
+        let after = (publication(), LABEL.with(|label| label.borrow().generation));
+        assert_ne!(before.0, after.0);
+        assert_ne!(before.1, after.1);
+        assert!(!LABEL.with(|label| label.borrow().in_flight));
     }
 
     #[test]
     fn confirmed_names_are_memory_only_and_bounded_to_saved_accounts() {
+        let _shared = shared_cache_test_guard();
         // Synthetic identities only.
         CONFIRMED_NAMES
             .lock()

@@ -11312,7 +11312,12 @@ export component AppWindow inherits Window {
 
     if root.account-profile-open : FocusScope {
         focus-on-tab-navigation: false;
-        init => { profile-name-input.focus(); }
+        // The name field is disabled until the profile has loaded; start on
+        // the first enabled control (Close at worst) and move to the first
+        // editable control once the profile arrives.
+        init => { self.focus-first(); }
+        property <bool> profile-loaded: root.account-profile-loaded;
+        changed profile-loaded => { if self.profile-loaded { self.focus-first(); } }
         capture-key-pressed(event) => {
             if event.text == Key.Escape && root.account-profile-confirm-clear {
                 root.account-profile-confirm-clear = false;

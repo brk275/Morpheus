@@ -3745,6 +3745,10 @@ fn apply_snapshot(
     }
     ui.set_live_session(true);
     ui.set_preview_session(false);
+    // The account menu above ran before this snapshot made the session
+    // live, so its label read was skipped on the first publication. Run it
+    // now; the once-per-selection guard keeps it to one read.
+    crate::account_identity::refresh_active_label(ui, false);
     if account_changed && ui.get_page() == 1 {
         ui.invoke_refresh_security();
     }

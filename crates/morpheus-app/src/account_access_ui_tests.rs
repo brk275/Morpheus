@@ -5846,6 +5846,9 @@ async fn assert_vector_icons(ui: &AppWindow) {
 /// the editor names the identity it changes, and clearing the editor drops
 /// its draft, preview, status and error synchronously.
 async fn assert_public_profile_projection(ui: &AppWindow) {
+    // The name and picture caches are process-wide; unit tests that prune
+    // them wait while this phase uses them.
+    let _shared = crate::account_identity::shared_cache_test_guard();
     let saved = (
         ui.get_account_options(),
         ui.get_accounts(),
