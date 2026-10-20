@@ -169,7 +169,10 @@ pub enum KnownDirect {
     NoneKnown,
     One(String),
     /// More than one; at most `MAX_KNOWN_DMS` IDs and the full count.
-    Several { rooms: Vec<String>, count: usize },
+    Several {
+        rooms: Vec<String>,
+        count: usize,
+    },
 }
 
 /// A newly created direct conversation.
@@ -300,7 +303,10 @@ fn request_failure(error: &HttpError) -> PeopleError {
     }
 }
 
-fn ensure_scope(selection: &AccountSelection, cancellation: &PeopleCancellation) -> PeopleResult<()> {
+fn ensure_scope(
+    selection: &AccountSelection,
+    cancellation: &PeopleCancellation,
+) -> PeopleResult<()> {
     if cancellation.is_cancelled() {
         return Err(PeopleError::Cancelled);
     }
@@ -466,7 +472,10 @@ impl AccountManager {
             ensure_scope(selection, cancellation)?;
             client
                 .send(request)
-                .with_request_config(single_wire_attempt(CREATE_TIMEOUT, MAX_CREATE_RESPONSE_BYTES))
+                .with_request_config(single_wire_attempt(
+                    CREATE_TIMEOUT,
+                    MAX_CREATE_RESPONSE_BYTES,
+                ))
                 .await
                 .map_err(|error| request_failure(&error))
         })
@@ -527,18 +536,30 @@ mod tests {
                 let cancellation = PeopleCancellation::new();
                 let lookup = manager.people_client(&selection, &cancellation);
                 tokio::pin!(lookup);
-                assert!(time::timeout(Duration::ZERO, lookup.as_mut()).await.is_err());
+                assert!(
+                    time::timeout(Duration::ZERO, lookup.as_mut())
+                        .await
+                        .is_err()
+                );
                 cancellation.cancel();
-                let result = time::timeout(Duration::from_secs(1), lookup.as_mut()).await.unwrap();
+                let result = time::timeout(Duration::from_secs(1), lookup.as_mut())
+                    .await
+                    .unwrap();
                 assert_eq!(result.err(), Some(PeopleError::Cancelled));
             }
             {
                 let cancellation = PeopleCancellation::new();
                 let lookup = manager.people_client(&selection, &cancellation);
                 tokio::pin!(lookup);
-                assert!(time::timeout(Duration::ZERO, lookup.as_mut()).await.is_err());
+                assert!(
+                    time::timeout(Duration::ZERO, lookup.as_mut())
+                        .await
+                        .is_err()
+                );
                 manager.publish_active_account(None);
-                let result = time::timeout(Duration::from_secs(1), lookup.as_mut()).await.unwrap();
+                let result = time::timeout(Duration::from_secs(1), lookup.as_mut())
+                    .await
+                    .unwrap();
                 assert_eq!(result.err(), Some(PeopleError::AccountChanged));
             }
             drop(held);
@@ -556,27 +577,41 @@ mod tests {
             let selection = selections.for_account("synthetic").unwrap();
             let allowed = Arc::new(AtomicBool::new(true));
             let admitted = allowed.clone();
-            let cancellation = PeopleCancellation::new().with_admission(Arc::new(
-                move || admitted.load(Ordering::Acquire),
-            ));
+            let cancellation = PeopleCancellation::new()
+                .with_admission(Arc::new(move || admitted.load(Ordering::Acquire)));
             assert!(!cancellation.is_cancelled());
             allowed.store(false, Ordering::Release);
             let polled = AtomicBool::new(false);
             let result = guarded(&selection, &cancellation, SEARCH_TIMEOUT, async {
                 polled.store(true, Ordering::Release);
                 Ok(())
-            }).await;
+            })
+            .await;
             assert_eq!(result, Err(PeopleError::Cancelled));
             assert!(!polled.load(Ordering::Acquire));
-            assert!(PeopleGuard { selection: &selection, cancellation: &cancellation }.stopped());
+            assert!(
+                PeopleGuard {
+                    selection: &selection,
+                    cancellation: &cancellation
+                }
+                .stopped()
+            );
         });
     }
 
     #[test]
     fn queries_and_exact_ids_are_bounded() {
         assert_eq!(validate_people_query("  synthetic ").unwrap(), "synthetic");
-        for invalid in ["", "   ", "two\nlines", &"q".repeat(MAX_USER_QUERY_CHARS + 1)] {
-            assert_eq!(validate_people_query(invalid), Err(PeopleError::InvalidQuery));
+        for invalid in [
+            "",
+            "   ",
+            "two\nlines",
+            &"q".repeat(MAX_USER_QUERY_CHARS + 1),
+        ] {
+            assert_eq!(
+                validate_people_query(invalid),
+                Err(PeopleError::InvalidQuery)
+            );
         }
         assert_eq!(
             exact_user_id(" @synthetic:example.org ").as_deref(),
@@ -628,15 +663,27 @@ mod tests {
 
     #[test]
     fn requests_are_single_bounded_authenticated_attempts() {
-        let shown = format!("{:?}", single_attempt(SEARCH_TIMEOUT, MAX_DIRECTORY_RESPONSE_BYTES));
+        let shown = format!(
+            "{:?}",
+            single_attempt(SEARCH_TIMEOUT, MAX_DIRECTORY_RESPONSE_BYTES)
+        );
         assert!(shown.contains("retry_limit: 0") || shown.contains("retry_limit: Some(0)"));
         assert!(shown.contains("force_auth: true"));
         assert!(shown.contains("65536"));
         // The creation alone also refuses the token-refresh replay.
-        let create = format!("{:?}", single_wire_attempt(CREATE_TIMEOUT, MAX_CREATE_RESPONSE_BYTES));
+        let create = format!(
+            "{:?}",
+            single_wire_attempt(CREATE_TIMEOUT, MAX_CREATE_RESPONSE_BYTES)
+        );
         assert!(create.contains("retry_limit: 0") || create.contains("retry_limit: Some(0)"));
         assert!(create.contains("16384"));
-        assert_ne!(create, format!("{:?}", single_attempt(CREATE_TIMEOUT, MAX_CREATE_RESPONSE_BYTES)));
+        assert_ne!(
+            create,
+            format!(
+                "{:?}",
+                single_attempt(CREATE_TIMEOUT, MAX_CREATE_RESPONSE_BYTES)
+            )
+        );
         assert_eq!(
             request_failure(&HttpError::ResponseTooLarge { limit: 1 }),
             PeopleError::InvalidResponse

@@ -37,7 +37,8 @@ const NO_MATCH: &str = "No one in your homeserver's directory matches. A complet
 const LIMITED: &str = "More people match; type more to narrow the list.";
 const CHECKING: &str = "Checking for an existing conversation on this device…";
 const CREATING: &str = "Starting the encrypted conversation…";
-const CREATED_PENDING: &str = "The conversation was created. It opens here once your homeserver syncs it.";
+const CREATED_PENDING: &str =
+    "The conversation was created. It opens here once your homeserver syncs it.";
 const CREATED_READY: &str = "The conversation was created; Open conversation shows it.";
 const NOT_MARKED: &str = " It could not be listed as a direct conversation in your account data.";
 const LISTING_UNKNOWN: &str = " Whether it is listed as a direct conversation in your account data could not be confirmed; it was not tried again.";
@@ -260,11 +261,15 @@ fn open(ui: &AppWindow, live: &LiveUi, prefill: &str) {
         directory.selection = Some(selection);
         let gate = live.security_gate.clone();
         let generation = gate.ringing_generation();
-        directory.cancellation = Some(PeopleCancellation::new().with_admission(Arc::new(
-            move || gate.ringing_allowed(generation),
-        )));
+        directory.cancellation = Some(
+            PeopleCancellation::new()
+                .with_admission(Arc::new(move || gate.ringing_allowed(generation))),
+        );
     });
-    let prefill: String = prefill.chars().take(morpheus_matrix::MAX_USER_QUERY_CHARS).collect();
+    let prefill: String = prefill
+        .chars()
+        .take(morpheus_matrix::MAX_USER_QUERY_CHARS)
+        .collect();
     ui.set_people_query(prefill.as_str().into());
     ui.set_people_open(true);
     project(ui);
@@ -476,7 +481,12 @@ fn open_known(ui: &AppWindow) {
     };
     clear_presentation(ui);
     ui.set_page(0);
-    ui.invoke_open_conversation(account.into(), room.into(), SharedString::new(), SharedString::new());
+    ui.invoke_open_conversation(
+        account.into(),
+        room.into(),
+        SharedString::new(),
+        SharedString::new(),
+    );
 }
 
 /// Ask for an explicit confirmation naming the exact user ID.
@@ -555,7 +565,11 @@ fn confirm_start(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
                     ui.set_people_status(
                         format!(
                             "{}{}",
-                            if created.synced { CREATED_READY } else { CREATED_PENDING },
+                            if created.synced {
+                                CREATED_READY
+                            } else {
+                                CREATED_PENDING
+                            },
                             listing_note(&created.direct_listing)
                         )
                         .into(),
@@ -638,7 +652,10 @@ mod tests {
         // Unknown after the write left: unconfirmed, not retried.
         let unknown = listing_note(&Err(DirectWriteError::Unknown));
         assert!(unknown.contains("could not be confirmed") && unknown.contains("not tried again"));
-        assert!(listing_note(&Err(DirectWriteError::BaselineChanged)).contains("nothing was overwritten"));
+        assert!(
+            listing_note(&Err(DirectWriteError::BaselineChanged))
+                .contains("nothing was overwritten")
+        );
         assert_eq!(listing_note(&Err(DirectWriteError::Refused)), NOT_MARKED);
         // None of them says the creation failed.
         for error in [
@@ -655,7 +672,10 @@ mod tests {
     #[test]
     fn several_and_none_known_are_distinct_states() {
         assert_eq!(known_state(&KnownDirect::NoneKnown), (KNOWN_NONE, 0));
-        assert_eq!(known_state(&KnownDirect::One("!a:example.org".into())), (KNOWN_ONE, 1));
+        assert_eq!(
+            known_state(&KnownDirect::One("!a:example.org".into())),
+            (KNOWN_ONE, 1)
+        );
         let several = KnownDirect::Several {
             rooms: vec!["!a:example.org".into(), "!b:example.org".into()],
             count: 9,

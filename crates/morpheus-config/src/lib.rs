@@ -660,7 +660,9 @@ impl Config {
         if local.is_default() {
             overrides.room_notifications.remove(room_id);
         } else {
-            overrides.room_notifications.insert(room_id.to_owned(), local);
+            overrides
+                .room_notifications
+                .insert(room_id.to_owned(), local);
         }
         if *overrides == AccountOverrides::default() {
             self.account_overrides.remove(account_id);
@@ -1691,12 +1693,14 @@ fn validate_room_notifications(
             },
         ));
     }
-    if rooms.keys().any(|room_id| validate_room_id(room_id).is_err()) {
+    if rooms
+        .keys()
+        .any(|room_id| validate_room_id(room_id).is_err())
+    {
         return Err(field_error(FIELD, Problem::RoomId));
     }
     Ok(())
 }
-
 
 /// Most rooms with their own appearance per account.
 pub const MAX_ROOM_APPEARANCES: usize = 64;
@@ -2757,10 +2761,21 @@ mod tests {
         };
         config.set_room_notification_local("work", "!a:example.org", quiet);
         config.validate().unwrap();
-        assert_eq!(config.room_notification_local("work", "!a:example.org"), quiet);
+        assert_eq!(
+            config.room_notification_local("work", "!a:example.org"),
+            quiet
+        );
         // Other rooms and accounts remove nothing.
-        assert!(config.room_notification_local("work", "!b:example.org").is_default());
-        assert!(config.room_notification_local("home", "!a:example.org").is_default());
+        assert!(
+            config
+                .room_notification_local("work", "!b:example.org")
+                .is_default()
+        );
+        assert!(
+            config
+                .room_notification_local("home", "!a:example.org")
+                .is_default()
+        );
         // Only switched-on keys are written, under their own table.
         let written = toml::to_string(&config).unwrap();
         assert!(written.contains("quiet = true"), "{written}");
@@ -2804,9 +2819,19 @@ mod tests {
         assert!(config.clear_room_notifications("work"));
         assert!(!config.clear_room_notifications("work"));
         // The account keeps its other preferences; other accounts keep theirs.
-        assert!(config.account_overrides["work"].room_notifications.is_empty());
-        assert_eq!(config.account_overrides["work"].notifications_enabled, Some(false));
-        assert_eq!(config.room_notification_local("home", "!a:example.org"), quiet);
+        assert!(
+            config.account_overrides["work"]
+                .room_notifications
+                .is_empty()
+        );
+        assert_eq!(
+            config.account_overrides["work"].notifications_enabled,
+            Some(false)
+        );
+        assert_eq!(
+            config.room_notification_local("home", "!a:example.org"),
+            quiet
+        );
         // An entry left with nothing is removed.
         assert!(config.clear_room_notifications("home"));
         assert!(!config.account_overrides.contains_key("home"));

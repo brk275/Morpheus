@@ -29,7 +29,9 @@ static FILE_WORKER_OWNER: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomi
 
 /// The form holding the native image chooser or its file read now.
 pub(crate) fn chooser_owner() -> Option<crate::image_previews::avatar::AvatarConsumer> {
-    crate::image_previews::avatar::AvatarConsumer::from_u8(FILE_WORKER_OWNER.load(Ordering::Acquire))
+    crate::image_previews::avatar::AvatarConsumer::from_u8(
+        FILE_WORKER_OWNER.load(Ordering::Acquire),
+    )
 }
 const REFRESH_FIRST: &str = "The change may have reached your homeserver. Refresh room details before making another change.";
 const UNAVAILABLE: &str = "Room settings are unavailable. Close this form and reopen it.";

@@ -768,7 +768,10 @@ mod tests {
             "conditions": [{"kind": "event_match", "key": "room_id", "pattern": "!room:example.org"}],
             "actions": []
         });
-        content["global"]["override"].as_array_mut().unwrap().insert(0, mute);
+        content["global"]["override"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, mute);
         content["global"]["room"] = json!([{
             "rule_id": "!room:example.org", "default": false, "enabled": true, "actions": []
         }]);
@@ -788,8 +791,12 @@ mod tests {
         let mut renamed = content.clone();
         renamed["global"]["override"][0]["rule_id"] = json!("mute-everything");
         let mut narrowed = content;
-        let sender = json!({"kind": "event_match", "key": "sender", "pattern": "@caller:example.org"});
-        narrowed["global"]["override"][0]["conditions"].as_array_mut().unwrap().push(sender);
+        let sender =
+            json!({"kind": "event_match", "key": "sender", "pattern": "@caller:example.org"});
+        narrowed["global"]["override"][0]["conditions"]
+            .as_array_mut()
+            .unwrap()
+            .push(sender);
         for other in [renamed, narrowed] {
             let rules =
                 without_room_message_level(strict_push_rules(Some(&raw(other))).unwrap(), room);

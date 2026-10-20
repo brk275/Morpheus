@@ -271,3 +271,11 @@ with zero HTTP retries. A push-rule mutation has the same opted-out 401
 regression, ensuring the production helper is wired to the setting. Existing
 oversized-valid-JSON, 500 single-attempt and fixed-log push-rule regressions
 are retained unchanged.
+
+## Formatter inheritance
+
+The regular `.rustfmt.toml` is copied byte-for-byte from the pinned upstream
+repository root; it restores settings these crates inherited before vendoring.
+No formatting checks are disabled. Stable formatting normalizes local patch
+layout; the SDK event-cache redecryptor doc comment also loses one trailing
+space. Original source inventories remain unchanged in the provenance record.

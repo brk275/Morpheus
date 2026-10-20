@@ -137,9 +137,10 @@ impl Scopes {
     pub(crate) fn current(&mut self, scope: &Scope, account: &str, room: &str) -> bool {
         self.observe(account);
         self.observe_room(room);
-        let room_current = scope.room.as_ref().is_none_or(|(epoch, captured)| {
-            *epoch == self.room_epoch && captured == room
-        });
+        let room_current = scope
+            .room
+            .as_ref()
+            .is_none_or(|(epoch, captured)| *epoch == self.room_epoch && captured == room);
         scope.epoch == self.epoch && scope.account == account && room_current
     }
 

@@ -239,7 +239,12 @@ impl ConfigStore {
     /// Create the file with `config` only while there is none, waiting for
     /// other writers like `save`. Used by `load_or_create` at startup.
     pub(crate) fn create(&self, config: &Config) -> Result<ConfigRevision, CommitError> {
-        self.publish(config, Some(&ConfigRevision::absent()), WRITER_LOCK_WAIT, |_| {})
+        self.publish(
+            config,
+            Some(&ConfigRevision::absent()),
+            WRITER_LOCK_WAIT,
+            |_| {},
+        )
     }
 
     /// Replace the file with `config` whatever it holds, waiting for other

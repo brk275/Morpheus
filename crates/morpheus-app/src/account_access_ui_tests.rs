@@ -2160,7 +2160,8 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
             "{} has no destination",
             target.id
         );
-        let edit_profile_label = format!("Edit public profile of {}", ui.get_active_account_handle());
+        let edit_profile_label =
+            format!("Edit public profile of {}", ui.get_active_account_handle());
         let account_label = match target.id {
             "accounts.manage" => Some("Add account"),
             "accounts.remove" => Some("Done"),
@@ -3407,7 +3408,10 @@ async fn assert_seen_by_modal_guard(ui: &AppWindow) {
     assert!(!press("d"), "a shortcut ran behind the Seen-by view");
     for tab in [Key::Tab, Key::Tab, Key::Backtab] {
         key(ui, tab);
-        assert!(focused_control_has_label(ui, close), "focus left the Seen-by view");
+        assert!(
+            focused_control_has_label(ui, close),
+            "focus left the Seen-by view"
+        );
     }
     key(ui, Key::Escape);
     settle(ui).await;
@@ -5995,8 +5999,14 @@ async fn assert_public_profile_projection(ui: &AppWindow) {
     settle(ui).await;
     assert_eq!(ui.get_active_account_name(), "Public Alias");
     assert_eq!(ui.get_active_account_initials(), "PA");
-    assert_eq!(ui.get_account_options().row_data(0).unwrap().name, "Public Alias");
-    assert_eq!(ui.get_account_options().row_data(1).unwrap().name, "synthetic-b");
+    assert_eq!(
+        ui.get_account_options().row_data(0).unwrap().name,
+        "Public Alias"
+    );
+    assert_eq!(
+        ui.get_account_options().row_data(1).unwrap().name,
+        "synthetic-b"
+    );
     assert_eq!(ui.get_accounts().row_data(0).unwrap().name, "Public Alias");
     assert_eq!(ui.get_accounts().row_data(1).unwrap().name, "synthetic-b");
     assert_eq!(ui.get_account_profile_user_id(), "@synthetic-a:example.org");
@@ -6017,7 +6027,10 @@ async fn assert_public_profile_projection(ui: &AppWindow) {
     crate::account_identity::apply_server(ui, &other, false);
     settle(ui).await;
     assert_eq!(ui.get_active_account_name(), "Public Alias");
-    assert_eq!(ui.get_account_options().row_data(1).unwrap().name, "Other Alias");
+    assert_eq!(
+        ui.get_account_options().row_data(1).unwrap().name,
+        "Other Alias"
+    );
     assert_eq!(ui.get_accounts().row_data(1).unwrap().name, "synthetic-b");
 
     // A server profile without a name falls back to the user ID localpart.
@@ -6172,7 +6185,11 @@ async fn assert_people_window_privacy(ui: &AppWindow) {
     settle(ui).await;
     key(ui, Key::Return);
     settle(ui).await;
-    assert_eq!((searches.get(), chosen.get()), (1, 0), "nothing searches or chooses while busy");
+    assert_eq!(
+        (searches.get(), chosen.get()),
+        (1, 0),
+        "nothing searches or chooses while busy"
+    );
     ui.set_people_busy(false);
     ui.set_people_query(query);
     settle(ui).await;
@@ -6184,7 +6201,10 @@ async fn assert_people_window_privacy(ui: &AppWindow) {
         key(ui, Key::Tab);
         assert!(
             focused_control_has_label(ui, "Close")
-                || focused_control_has_label(ui, "Search people; arrows select, Enter chooses, Escape closes")
+                || focused_control_has_label(
+                    ui,
+                    "Search people; arrows select, Enter chooses, Escape closes"
+                )
                 || {
                     let index = usize::try_from(ui.get_people_index()).unwrap_or(0);
                     focused_control_has_label(
@@ -6212,7 +6232,10 @@ async fn assert_people_window_privacy(ui: &AppWindow) {
         "Search people; arrows select, Enter chooses, Escape closes"
     ));
     key(ui, Key::Backtab);
-    assert!(focused_control_has_label(ui, "Close"), "Shift+Tab cycles to Close");
+    assert!(
+        focused_control_has_label(ui, "Close"),
+        "Shift+Tab cycles to Close"
+    );
 
     // At the smallest window and 200% text a chosen person's decision stays
     // reachable: the actions are fixed below the scrolling body.
@@ -6230,7 +6253,10 @@ async fn assert_people_window_privacy(ui: &AppWindow) {
     ] {
         let bounds = control_bounds(ui, label);
         assert_eq!(bounds.len(), 1, "{label}");
-        assert!(inside_window(ui, bounds[0]), "{label} is reachable at 620 px and 200%");
+        assert!(
+            inside_window(ui, bounds[0]),
+            "{label} is reachable at 620 px and 200%"
+        );
     }
     ui.set_people_confirm(true);
     settle(ui).await;
@@ -6239,7 +6265,10 @@ async fn assert_people_window_privacy(ui: &AppWindow) {
         "Confirm starting an encrypted direct conversation with @synthetic3:example.org",
     );
     assert_eq!(confirm.len(), 1);
-    assert!(inside_window(ui, confirm[0]), "the confirmation action is reachable");
+    assert!(
+        inside_window(ui, confirm[0]),
+        "the confirmation action is reachable"
+    );
     // With the widest valid control padding (24 px) in a 560 px dialog at
     // 200% text, the confirmation, Cancel and Close all fit inside the
     // dialog, one per row, without overlapping, in decision-Cancel-Close
@@ -6269,7 +6298,10 @@ async fn assert_people_window_privacy(ui: &AppWindow) {
     })
     .collect();
     for pair in footer.windows(2) {
-        assert!(pair[0].bottom <= pair[1].top + 0.5, "the footer actions do not overlap");
+        assert!(
+            pair[0].bottom <= pair[1].top + 0.5,
+            "the footer actions do not overlap"
+        );
     }
     tokens.set_control_padding(padding);
     ui.set_people_confirm(false);
@@ -6607,7 +6639,10 @@ async fn assert_room_notification_panel(ui: &AppWindow) {
     assert!(global.get_open());
     assert!(focused_control_has_label(ui, "Close room notifications"));
     key(ui, Key::Backtab);
-    assert!(focused_control_has_label(ui, "Open notification settings for every room"));
+    assert!(focused_control_has_label(
+        ui,
+        "Open notification settings for every room"
+    ));
     key(ui, Key::Tab);
     assert!(focused_control_has_label(ui, "Close room notifications"));
     assert!(
@@ -6629,10 +6664,16 @@ async fn assert_room_notification_panel(ui: &AppWindow) {
     global.invoke_request_open("work".into(), "!room:example.org".into());
     settle(ui).await;
     let panel = item_bounds(&control_with_label(ui, "Notifications for Team room"));
-    assert!(inside_window(ui, panel), "the panel fits the window: {panel:?}");
+    assert!(
+        inside_window(ui, panel),
+        "the panel fits the window: {panel:?}"
+    );
     key(ui, Key::Backtab);
     settle(ui).await;
-    assert!(focused_control_has_label(ui, "Open notification settings for every room"));
+    assert!(focused_control_has_label(
+        ui,
+        "Open notification settings for every room"
+    ));
     let focused = focused_control_bounds(ui).expect("a focused panel control");
     assert!(
         focused.top >= panel.top && focused.bottom <= panel.bottom,
@@ -6736,7 +6777,10 @@ async fn assert_font_browser(ui: &AppWindow, directory: &std::path::Path) {
     ui.invoke_font_browser_show(1);
     assert!(ui.get_font_browser_open());
     assert!(names(ui).contains(&"JetBrains Mono".to_owned()));
-    assert!(ui.get_font_browser_current().contains("Follows the interface font"));
+    assert!(
+        ui.get_font_browser_current()
+            .contains("Follows the interface font")
+    );
     // Typing is searched once it settles.
     ui.set_font_browser_query("lit".into());
     ui.invoke_font_browser_query_changed("lit".into());
@@ -6757,7 +6801,10 @@ async fn assert_font_browser(ui: &AppWindow, directory: &std::path::Path) {
     // Choosing writes the role's key; the composer follows messages.
     ui.invoke_font_browser_use("Literata".into());
     let saved = store.load().unwrap();
-    assert_eq!(saved.typography.message_font_family.as_deref(), Some("Literata"));
+    assert_eq!(
+        saved.typography.message_font_family.as_deref(),
+        Some("Literata")
+    );
     assert_eq!(saved.appearance.font_family, initial.appearance.font_family);
     assert_eq!(ui.get_message_font_family(), "Literata");
     assert_eq!(ui.get_composer_font_family(), "Literata");
@@ -6843,7 +6890,11 @@ async fn assert_room_appearance_scope(ui: &AppWindow, directory: &std::path::Pat
     apply_config(ui, &config, None);
     open(ui, "room-a", room);
     settle(ui).await;
-    assert_eq!(link(ui), grey(0x20), "the room inherits its account's color");
+    assert_eq!(
+        link(ui),
+        grey(0x20),
+        "the room inherits its account's color"
+    );
 
     // A color set for this room is written to it alone and shows only while
     // it is open in this account.
@@ -6853,7 +6904,10 @@ async fn assert_room_appearance_scope(ui: &AppWindow, directory: &std::path::Pat
     ui.invoke_color_hex_edited("#303030".into());
     settle(ui).await;
     let saved = store.load().unwrap();
-    assert_eq!(room_link(&saved, "room-a", room).as_deref(), Some("#303030"));
+    assert_eq!(
+        room_link(&saved, "room-a", room).as_deref(),
+        Some("#303030")
+    );
     assert_eq!(saved.account_overrides["room-a"].colors["link"], "#202020");
     assert_eq!(saved.colors["link"], "#101010");
     assert_eq!(link(ui), grey(0x30));
@@ -6878,14 +6932,23 @@ async fn assert_room_appearance_scope(ui: &AppWindow, directory: &std::path::Pat
     crate::appearance::apply_theme_mode(ui);
     ui.invoke_color_hex_edited("#404040".into());
     let saved = store.load().unwrap();
-    assert_eq!(room_link(&saved, "room-a", other).as_deref(), Some("#404040"));
-    assert_eq!(room_link(&saved, "room-a", room).as_deref(), Some("#303030"));
+    assert_eq!(
+        room_link(&saved, "room-a", other).as_deref(),
+        Some("#404040")
+    );
+    assert_eq!(
+        room_link(&saved, "room-a", room).as_deref(),
+        Some("#303030")
+    );
 
     // Reset removes only this room's color; it inherits again.
     ui.invoke_color_reset();
     let saved = store.load().unwrap();
     assert!(saved.room_appearance(Some("room-a"), Some(other)).is_none());
-    assert_eq!(room_link(&saved, "room-a", room).as_deref(), Some("#303030"));
+    assert_eq!(
+        room_link(&saved, "room-a", room).as_deref(),
+        Some("#303030")
+    );
 
     // Without an open room, "This room" edits nothing.
     open(ui, "room-a", "");
@@ -6953,7 +7016,10 @@ async fn assert_style_profile_scope_fences(ui: &AppWindow, directory: &std::path
     switch(ui, "profile-a");
     assert!(finish_export_for_test(ui, opened, target.clone()));
     assert!(!target.exists());
-    assert!(ui.get_style_profile_message().contains("Nothing was written"));
+    assert!(
+        ui.get_style_profile_message()
+            .contains("Nothing was written")
+    );
     // In scope, the admitted write runs on a worker and is reported.
     let opened = scope::begin_dialog(ui);
     assert!(finish_export_for_test(ui, opened, target.clone()));
@@ -7023,7 +7089,10 @@ async fn assert_pack_scope_fences(ui: &AppWindow, directory: &std::path::Path) {
     ui.invoke_studio_pack_apply();
     assert_eq!(previewed(ui), "");
     assert!(!folder.join("themes").join("harbor.toml").exists());
-    assert_ne!(store.load().unwrap().appearance.theme_pack.as_deref(), Some("harbor"));
+    assert_ne!(
+        store.load().unwrap().appearance.theme_pack.as_deref(),
+        Some("harbor")
+    );
     switch(ui, "scope-a");
 
     // An export answer after A -> B -> A is not admitted: nothing written.
@@ -7052,7 +7121,13 @@ async fn assert_pack_scope_fences(ui: &AppWindow, directory: &std::path::Path) {
     // "nothing written".
     let admitted_target = folder.join("harbor-admitted.toml");
     let opened = scope::begin_dialog(ui);
-    finish_pack_export_for_test(ui, opened, "harbor".into(), pack.clone(), admitted_target.clone());
+    finish_pack_export_for_test(
+        ui,
+        opened,
+        "harbor".into(),
+        pack.clone(),
+        admitted_target.clone(),
+    );
     switch(ui, "scope-b");
     wait_for(ui, |ui| !ui.get_studio_pack_busy()).await;
     assert!(admitted_target.exists());
@@ -7116,11 +7191,21 @@ async fn assert_theme_pack_keeps_installed_file(ui: &AppWindow, directory: &std:
 
     // Another program edits the installed pack after the offer.
     let file = folder.join("themes").join("dusk.toml");
-    let edited = format!("{}\n# edited elsewhere\n", std::fs::read_to_string(&file).unwrap());
+    let edited = format!(
+        "{}\n# edited elsewhere\n",
+        std::fs::read_to_string(&file).unwrap()
+    );
     std::fs::write(&file, &edited).unwrap();
     ui.invoke_studio_pack_apply();
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), edited, "nothing is replaced");
-    assert_ne!(store.load().unwrap().appearance.theme_pack.as_deref(), Some("dusk"));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        edited,
+        "nothing is replaced"
+    );
+    assert_ne!(
+        store.load().unwrap().appearance.theme_pack.as_deref(),
+        Some("dusk")
+    );
     assert!(ui.get_studio_pack_message_error());
     // The preview stays, bound to the file as it is now, and asks again.
     assert_eq!(ui.get_studio_pack_preview_name(), "Dusk");
@@ -7129,9 +7214,14 @@ async fn assert_theme_pack_keeps_installed_file(ui: &AppWindow, directory: &std:
     // Trying again cannot turn the new snapshot into overwrite permission.
     ui.invoke_studio_pack_apply();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
-    assert_ne!(store.load().unwrap().appearance.theme_pack.as_deref(), Some("dusk"));
-    assert!(ui.get_studio_pack_message().contains("different")
-        || ui.get_studio_pack_message().contains("Change the name"));
+    assert_ne!(
+        store.load().unwrap().appearance.theme_pack.as_deref(),
+        Some("dusk")
+    );
+    assert!(
+        ui.get_studio_pack_message().contains("different")
+            || ui.get_studio_pack_message().contains("Change the name")
+    );
     ui.invoke_studio_pack_cancel();
 
     // A different name keeps both packs. It can already be selected in the
@@ -7144,7 +7234,10 @@ async fn assert_theme_pack_keeps_installed_file(ui: &AppWindow, directory: &std:
     assert!(!ui.get_studio_pack_replaces());
     ui.invoke_studio_pack_apply();
     assert_eq!(read_theme_pack(&store, "newdusk").unwrap(), incoming);
-    assert_eq!(store.load().unwrap().appearance.theme_pack.as_deref(), Some("newdusk"));
+    assert_eq!(
+        store.load().unwrap().appearance.theme_pack.as_deref(),
+        Some("newdusk")
+    );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
     assert_eq!(ui.get_studio_pack_preview_name(), "");
 
@@ -7572,8 +7665,7 @@ async fn assert_theme_studio_draft(ui: &AppWindow, directory: &std::path::Path) 
 
     // The new typography and per-control icon settings are drafted like any
     // look key: shown at once, saved only by Apply, gone after Discard.
-    let line_height =
-        |ui: &AppWindow| ui.global::<crate::StyleTokens>().get_line_height_factor();
+    let line_height = |ui: &AppWindow| ui.global::<crate::StyleTokens>().get_line_height_factor();
     let draft_new = |ui: &AppWindow| {
         crate::save_config_change(ui, &store, |config| {
             config.typography.line_height_percent = Some(150);
@@ -7585,7 +7677,10 @@ async fn assert_theme_studio_draft(ui: &AppWindow, directory: &std::path::Path) 
     draft_new(ui);
     assert_eq!(ui.get_studio_pending(), 3);
     assert!((line_height(ui) - 1.5).abs() < 0.001);
-    assert_eq!(ui.global::<crate::StyleTokens>().get_body_font_weight(), 600);
+    assert_eq!(
+        ui.global::<crate::StyleTokens>().get_body_font_weight(),
+        600
+    );
     let header = Color::from_rgb_u8(0x12, 0x34, 0x56);
     assert_eq!(ui.invoke_token_color("icon_header".into()), header);
     let saved = store.load().unwrap();
@@ -7599,7 +7694,10 @@ async fn assert_theme_studio_draft(ui: &AppWindow, directory: &std::path::Path) 
     let applied = store.load().unwrap();
     assert_eq!(applied.typography.line_height_percent, Some(150));
     assert_eq!(applied.typography.body_weight, Some(600));
-    assert_eq!(applied.colors.get("icon_header").map(String::as_str), Some("#123456"));
+    assert_eq!(
+        applied.colors.get("icon_header").map(String::as_str),
+        Some("#123456")
+    );
 
     // Drafted account colors belong to the account that was active.
     ui.set_active_account_local_id("studio-first".into());

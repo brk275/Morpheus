@@ -161,6 +161,9 @@ mod tests {
         assert!(state.has("a", Some(&format!("!{MAX_NOTIFICATION_ROOMS}"))));
         let mark = state.mark();
         state.synced("a", mark);
-        assert!(state.has("a", None), "saturation keeps a conservative warning");
+        assert!(
+            state.has("a", None),
+            "saturation keeps a conservative warning"
+        );
     }
 }

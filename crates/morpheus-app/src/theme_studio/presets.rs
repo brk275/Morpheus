@@ -113,11 +113,17 @@ mod tests {
         for variation in &VARIATIONS {
             let mut config = person.clone();
             variation.apply(&mut config);
-            config.validate().unwrap_or_else(|error| panic!("{}: {error}", variation.name));
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{}: {error}", variation.name));
             assert_eq!(config.appearance.scale_percent, 150, "{}", variation.name);
             assert!(config.appearance.reduce_motion, "{}", variation.name);
             assert_eq!(config.geometry.focus_width, 4, "{}", variation.name);
-            assert_eq!(config.notifications, person.notifications, "{}", variation.name);
+            assert_eq!(
+                config.notifications, person.notifications,
+                "{}",
+                variation.name
+            );
             // A variation differs from its base preset.
             let mut base = person.clone();
             base.apply_style_preset(variation.base);

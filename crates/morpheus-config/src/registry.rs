@@ -2248,7 +2248,13 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Settings › Notifications",
         "Notifications for this account",
         "Turn desktop notifications and call alerts off for the active account only.",
-        &["account", "silence", "mute account", "per account", "work account"],
+        &[
+            "account",
+            "silence",
+            "mute account",
+            "per account",
+            "work account",
+        ],
     )),
     target(
         "notifications.identity",
@@ -2272,7 +2278,13 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Settings › Notifications › Keywords",
         "Notification keywords",
         "Matrix keywords that notify in rooms set to mentions and keywords, on all devices.",
-        &["keyword", "keywords", "alert words", "push rules", "mentions and keywords"],
+        &[
+            "keyword",
+            "keywords",
+            "alert words",
+            "push rules",
+            "mentions and keywords",
+        ],
     )),
     live(target(
         "notifications.rooms",
@@ -2280,7 +2292,14 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Settings › Notifications › Rooms",
         "Room notification rules",
         "Search rooms and choose all messages, mentions and keywords, or mute.",
-        &["mute", "mentions", "keywords", "per room", "push rules", "room notifications"],
+        &[
+            "mute",
+            "mentions",
+            "keywords",
+            "per room",
+            "push rules",
+            "room notifications",
+        ],
     )),
     live(target(
         "notifications.this_room",

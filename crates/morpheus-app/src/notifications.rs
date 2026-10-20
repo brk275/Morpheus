@@ -1175,7 +1175,10 @@ mod tests {
             release.send(()).unwrap();
         };
         let (plan, ()) = tokio::join!(plan, mute);
-        assert!(plan.is_none(), "the Mute accepted during the lookup applies");
+        assert!(
+            plan.is_none(),
+            "the Mute accepted during the lookup applies"
+        );
         // The same delayed acceptance must win when the lookup has already
         // caught up to Mute, not only when it still returns AllMessages.
         let noted = std::sync::Mutex::new(Some(NotificationMode::AllMessages));
@@ -1338,7 +1341,12 @@ mod tests {
         assert!(shown.take(3, Instant::now() + SHOWN_TTL).is_none());
         // The record stays bounded.
         for token in 10..(10 + MAX_SHOWN as u64 + 5) {
-            shown.insert(banner(token, "alice", "@alice:example.org", "!a:example.org"));
+            shown.insert(banner(
+                token,
+                "alice",
+                "@alice:example.org",
+                "!a:example.org",
+            ));
         }
         assert_eq!(shown.0.len(), MAX_SHOWN);
         assert!(shown.take(10, Instant::now()).is_none());

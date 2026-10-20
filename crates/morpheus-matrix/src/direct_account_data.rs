@@ -122,7 +122,11 @@ pub fn merged_direct(
     let unreadable = |_| DirectWriteError::Unreadable;
     let mut fields = match stored {
         None => BTreeMap::new(),
-        Some(raw) => serde_json::from_str::<UniqueFields>(raw).map_err(unreadable)?.0,
+        Some(raw) => {
+            serde_json::from_str::<UniqueFields>(raw)
+                .map_err(unreadable)?
+                .0
+        }
     };
     let room_json = serde_json::to_string(room).map_err(unreadable)?;
     let entry = match fields.get(user) {
@@ -295,10 +299,14 @@ mod tests {
         assert!(merged.contains(r#""decimal":1.10"#), "{merged}");
         assert!(merged.contains(r#""exp":2.5E-3"#), "{merged}");
         assert!(merged.contains(r#""@other:example.org":["!x:example.org","!y:example.org"]"#));
-        assert!(merged.contains(r#""@target:example.org":["!old:example.org","!new:example.org"]"#));
+        assert!(
+            merged.contains(r#""@target:example.org":["!old:example.org","!new:example.org"]"#)
+        );
         // Nothing stored yet: only the new entry.
         assert_eq!(
-            merged_direct(None, "@target:example.org", "!new:example.org").unwrap().as_deref(),
+            merged_direct(None, "@target:example.org", "!new:example.org")
+                .unwrap()
+                .as_deref(),
             Some(r#"{"@target:example.org":["!new:example.org"]}"#)
         );
     }

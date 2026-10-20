@@ -289,7 +289,10 @@ pub(crate) fn with_look_of(target: &Config, source: &Config) -> Result<Config, O
     let wanted = look(source);
     let present = look(target);
     let keys: BTreeSet<&LookKey> = wanted.keys().chain(present.keys()).collect();
-    set_look(target, keys.into_iter().map(|key| (key, value(&wanted, key))))
+    set_look(
+        target,
+        keys.into_iter().map(|key| (key, value(&wanted, key))),
+    )
 }
 
 /// `config` with every key of `group` back to its built-in value. Colors
@@ -303,7 +306,10 @@ pub(crate) fn reset_group(config: &Config, group: Group) -> Result<Config, Overl
         .chain(present.keys())
         .filter(|key| key.group() == group && key.account().is_none())
         .collect();
-    set_look(config, keys.into_iter().map(|key| (key, value(&defaults, key))))
+    set_look(
+        config,
+        keys.into_iter().map(|key| (key, value(&defaults, key))),
+    )
 }
 
 /// One drafted setting: the value the file held when it was first edited
@@ -476,7 +482,10 @@ mod tests {
         assert!(look.contains_key(&field("geometry", "corner_radius")));
         assert!(look.contains_key(&field("window", "opacity_percent")));
         for &(section, name) in EXCLUDED {
-            assert!(!look.contains_key(&field(section, name)), "{section}.{name}");
+            assert!(
+                !look.contains_key(&field(section, name)),
+                "{section}.{name}"
+            );
         }
         let behavior = |key: &LookKey| matches!(key, LookKey::Field("notifications" | "media", _));
         assert!(!look.keys().any(behavior));
@@ -600,7 +609,10 @@ mod tests {
         let reset = reset_group(&config, Group::Geometry).unwrap();
         assert_eq!(reset.geometry, Config::default().geometry);
         assert_eq!(reset.typography.message_size, 20);
-        assert_eq!(reset.colors.get("link").map(String::as_str), Some("#123456"));
+        assert_eq!(
+            reset.colors.get("link").map(String::as_str),
+            Some("#123456")
+        );
         let reset = reset_group(&config, Group::Colors).unwrap();
         assert!(reset.colors.is_empty());
     }

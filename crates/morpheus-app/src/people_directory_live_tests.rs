@@ -171,9 +171,8 @@ fn held(ui: &AppWindow) -> Held {
 
 async fn exercise(runtime: Handle, fixture: Fixture) {
     let directory = tempfile::tempdir().unwrap();
-    let manager = Arc::new(
-        morpheus_matrix::AccountManager::open(directory.path().join("profile")).unwrap(),
-    );
+    let manager =
+        Arc::new(morpheus_matrix::AccountManager::open(directory.path().join("profile")).unwrap());
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));
@@ -216,7 +215,10 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     let target = format!("@morpheus-busy-{process}-{unique}:{}", fixture.server_name);
     ui.invoke_open_people(SharedString::new());
     settle(&ui).await;
-    assert!(ui.get_people_open(), "the window opens for the live account");
+    assert!(
+        ui.get_people_open(),
+        "the window opens for the live account"
+    );
     ui.set_people_query(target.as_str().into());
     ui.invoke_people_search();
     assert_eq!(ui.get_people_items().row_count(), 1);
@@ -247,7 +249,10 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     // Admitted: busy at once on both sides, one operation for the creation.
     assert!(with(|directory| directory.busy));
     assert!(ui.get_people_busy());
-    assert_eq!(with(|directory| directory.operation), before.wrapping_add(1));
+    assert_eq!(
+        with(|directory| directory.operation),
+        before.wrapping_add(1)
+    );
     assert_eq!(ui.get_people_status().as_str(), CREATING);
     point.entered().await;
     settle(&ui).await;
@@ -294,13 +299,22 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     .await;
     let done = held(&ui);
     assert!(!done.busy, "the completion clears the Rust busy state");
-    assert_ne!(done.status, CREATING, "the completion replaced the creating status");
+    assert_ne!(
+        done.status, CREATING,
+        "the completion replaced the creating status"
+    );
     if done.open {
         // Refused, unknown, or created but not yet synced or listed: the
         // completion applied to the same window and operation, and the
         // window takes a new step again.
-        assert_eq!(done.epoch, admitted.epoch, "no clear or reopen happened meanwhile");
-        assert_eq!(done.operation, admitted.operation, "the completion was current");
+        assert_eq!(
+            done.epoch, admitted.epoch,
+            "no clear or reopen happened meanwhile"
+        );
+        assert_eq!(
+            done.operation, admitted.operation,
+            "the completion was current"
+        );
         ui.invoke_people_search();
         assert_eq!(
             with(|directory| directory.operation),
@@ -310,7 +324,11 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     } else {
         // Created, synced and listed: the completion's own success path
         // closed the window and opened the conversation.
-        assert_eq!(done.epoch, admitted.epoch.wrapping_add(1), "closed once, by the completion");
+        assert_eq!(
+            done.epoch,
+            admitted.epoch.wrapping_add(1),
+            "closed once, by the completion"
+        );
         assert!(done.rows.is_empty() && done.query.is_empty());
     }
     clear_presentation(&ui);
@@ -329,7 +347,10 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     drop(ui);
     let deadline = Instant::now() + Duration::from_secs(60);
     while Arc::strong_count(&manager) != 1 {
-        assert!(Instant::now() < deadline, "People tasks must release the profile");
+        assert!(
+            Instant::now() < deadline,
+            "People tasks must release the profile"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drop(manager);

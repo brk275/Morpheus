@@ -4,6 +4,7 @@
   "crate": "matrix-sdk-search",
   "version": "0.19.1",
   "license_file": "LICENSE (repository root at the same revision)",
+  "local_formatter": {"path": ".rustfmt.toml", "source_path": ".rustfmt.toml (upstream repository root)", "revision": "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", "git_blob": "0526e11b5f444883bb5dfd3572e5dcdf4790d3b9", "sha256": "d2f5b3d5b53d31199502b5777931860f490f37fca927b88704f832bb731e0324", "reason": "Restore shared upstream formatter inheritance as a regular file after vendoring; no formatter rules disabled."},
   "upstream_entry_count": 14,
   "regular_file_count": 14,
   "omitted_entries": [],

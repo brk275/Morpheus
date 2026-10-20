@@ -86,7 +86,9 @@ pub(super) fn label(value: &str) -> String {
 
 /// Up to two letters for an avatar fallback.
 pub(super) fn initials(name: &str) -> String {
-    let words = name.split(|c: char| !c.is_alphanumeric()).filter(|word| !word.is_empty());
+    let words = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty());
     let firsts = words.filter_map(|word| word.chars().next());
     let letters: String = firsts.take(2).collect();
     if letters.is_empty() {
@@ -200,7 +202,11 @@ pub(super) fn view(presence: &Presence, now: Instant) -> View {
             View {
                 state: if stale { 3 } else { 2 },
                 count,
-                label: if stale { format!("{count}?") } else { count.to_string() },
+                label: if stale {
+                    format!("{count}?")
+                } else {
+                    count.to_string()
+                },
                 preview: preview.join(" "),
                 description: if stale {
                     format!("Last known: {people_text}; could not check again")
@@ -247,12 +253,18 @@ mod tests {
         assert_eq!(watched_now.len(), MAX_LISTED + 1);
         assert_eq!(watched_now[0], "!open");
         // A room shown in several Spaces or lists is watched once.
-        assert_eq!(watched_now.iter().filter(|id| id.as_str() == "!a").count(), 1);
+        assert_eq!(
+            watched_now.iter().filter(|id| id.as_str() == "!a").count(),
+            1
+        );
         // A hidden room list releases every listed room.
         assert_eq!(watched(Some("!open"), None, &listed, false), ["!open"]);
         assert!(watched(None, None, &listed, false).is_empty());
         let many: Vec<String> = (0..20).map(|n| format!("!r{n}")).collect();
-        assert_eq!(watched(Some("!x"), Some("!y"), &many, true).len(), MAX_WATCHED);
+        assert_eq!(
+            watched(Some("!x"), Some("!y"), &many, true).len(),
+            MAX_WATCHED
+        );
         // Non-voice and empty rooms never count.
         assert!(listed_of(&[("!a", false), ("", true)]).is_empty());
     }
@@ -279,7 +291,9 @@ mod tests {
         // No display name: the localpart, never an invented name.
         assert_eq!(named[1].name, "bob");
         let long = "x".repeat(10 * MAX_LABEL_CHARS);
-        let hostile = people(&[participant("@y:example.org", "Y")], |_| Some(long.clone()));
+        let hostile = people(&[participant("@y:example.org", "Y")], |_| {
+            Some(long.clone())
+        });
         assert_eq!(hostile[0].name.chars().count(), MAX_LABEL_CHARS);
         assert_eq!(initials("  "), "?");
     }
@@ -294,7 +308,10 @@ mod tests {
             refresh_failed: false,
         };
         let fresh = view(&live, now);
-        assert_eq!((fresh.state, fresh.count, fresh.label.as_str()), (2, 1, "1"));
+        assert_eq!(
+            (fresh.state, fresh.count, fresh.label.as_str()),
+            (2, 1, "1")
+        );
         // Expiry of the confirmation: shown as stale, never as current.
         let old = view(&live, now + STALE_AFTER + Duration::from_secs(1));
         assert_eq!((old.state, old.label.as_str()), (3, "1?"));
@@ -309,13 +326,19 @@ mod tests {
         let no_call = view(&Presence::NoCall, now);
         assert_eq!((no_call.state, no_call.count), (4, 0));
         assert!(!no_call.description.contains("Nobody"));
-        assert_eq!(view(&Presence::Unsupported(Unsupported::Dialect), now).state, 5);
+        assert_eq!(
+            view(&Presence::Unsupported(Unsupported::Dialect), now).state,
+            5
+        );
         assert_eq!(view(&Presence::Loading, now).state, 1);
     }
 
     #[test]
     fn only_passive_dialects_get_a_roster() {
-        assert_eq!(interop_mode(RoomCallMode::Standard), Some(InteropMode::Current));
+        assert_eq!(
+            interop_mode(RoomCallMode::Standard),
+            Some(InteropMode::Current)
+        );
         assert_eq!(
             interop_mode(RoomCallMode::ElementCallMatrix2),
             Some(InteropMode::Sticky2025)

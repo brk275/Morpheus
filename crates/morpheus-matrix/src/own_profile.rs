@@ -233,7 +233,13 @@ fn shown_name(raw: Option<String>) -> Option<String> {
     let raw = raw?;
     let line: String = raw
         .chars()
-        .map(|character| if character.is_control() { ' ' } else { character })
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
         .take(MAX_DISPLAY_NAME_CHARS)
         .collect();
     let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -358,7 +364,11 @@ async fn clear_field(
     if delete_profile_field::v3::Request::PATH_BUILDER.is_supported(&versions) {
         let request = delete_profile_field::v3::Request::new(owned.user.clone(), field);
         return send_once(selection, cancellation, async {
-            client.send(request).with_request_config(single_send()).await.map(|_| ())
+            client
+                .send(request)
+                .with_request_config(single_send())
+                .await
+                .map(|_| ())
         })
         .await;
     }
@@ -367,7 +377,11 @@ async fn clear_field(
             #[allow(deprecated)]
             let request = set_display_name::v3::Request::new(owned.user.clone(), None);
             send_once(selection, cancellation, async {
-                client.send(request).with_request_config(single_send()).await.map(|_| ())
+                client
+                    .send(request)
+                    .with_request_config(single_send())
+                    .await
+                    .map(|_| ())
             })
             .await
         }
@@ -375,7 +389,11 @@ async fn clear_field(
             #[allow(deprecated)]
             let request = set_avatar_url::v3::Request::new(owned.user.clone(), None);
             send_once(selection, cancellation, async {
-                client.send(request).with_request_config(single_send()).await.map(|_| ())
+                client
+                    .send(request)
+                    .with_request_config(single_send())
+                    .await
+                    .map(|_| ())
             })
             .await
         }
@@ -460,8 +478,7 @@ impl AccountManager {
             .get_static::<AvatarUrl>()
             .map_err(|_| ProfileError::InvalidResponse)?;
         if let Some(uri) = &avatar {
-            crate::media::validate_media_address(uri)
-                .map_err(|_| ProfileError::InvalidResponse)?;
+            crate::media::validate_media_address(uri).map_err(|_| ProfileError::InvalidResponse)?;
         }
         Ok(OwnProfile {
             account_id: owned.account_id.clone(),
@@ -496,7 +513,11 @@ impl AccountManager {
         let request = set_display_name::v3::Request::new(owned.user.clone(), Some(name.clone()));
         let client = &owned.client;
         let sent = send_once(selection, cancellation, async {
-            client.send(request).with_request_config(single_send()).await.map(|_| ())
+            client
+                .send(request)
+                .with_request_config(single_send())
+                .await
+                .map(|_| ())
         })
         .await;
         Self::confirm(&owned, selection, cancellation, sent, |profile| {
@@ -513,7 +534,13 @@ impl AccountManager {
         cancellation: &RoomSettingsCancellation,
     ) -> ProfileResult<WriteReport> {
         let owned = self.own_client(selection, cancellation).await?;
-        let sent = clear_field(&owned, selection, cancellation, ProfileFieldName::DisplayName).await;
+        let sent = clear_field(
+            &owned,
+            selection,
+            cancellation,
+            ProfileFieldName::DisplayName,
+        )
+        .await;
         Self::confirm(&owned, selection, cancellation, sent, |profile| {
             profile.name_is_absent()
         })
@@ -560,7 +587,11 @@ impl AccountManager {
         let request = set_avatar_url::v3::Request::new(owned.user.clone(), Some(uri.clone()));
         let client = &owned.client;
         let sent = send_once(selection, cancellation, async {
-            client.send(request).with_request_config(single_send()).await.map(|_| ())
+            client
+                .send(request)
+                .with_request_config(single_send())
+                .await
+                .map(|_| ())
         })
         .await;
         Self::confirm(&owned, selection, cancellation, sent, |profile| {
@@ -578,7 +609,9 @@ impl AccountManager {
     ) -> ProfileResult<WriteReport> {
         let owned = self.own_client(selection, cancellation).await?;
         let sent = clear_field(&owned, selection, cancellation, ProfileFieldName::AvatarUrl).await;
-        Self::confirm(&owned, selection, cancellation, sent, |profile| !profile.has_avatar())
+        Self::confirm(&owned, selection, cancellation, sent, |profile| {
+            !profile.has_avatar()
+        })
         .await
     }
 
@@ -598,7 +631,9 @@ impl AccountManager {
             Sent::Sent => None,
             Sent::Unknown(error) => Some(error),
         };
-        let profile = Self::read_profile(owned, selection, cancellation).await.ok();
+        let profile = Self::read_profile(owned, selection, cancellation)
+            .await
+            .ok();
         Ok(WriteReport {
             applied: profile.as_ref().is_some_and(&applied),
             profile,
@@ -642,8 +677,14 @@ mod tests {
 
     #[test]
     fn display_names_are_one_bounded_line() {
-        assert_eq!(validate_display_name("  Synthetic Name  ").unwrap(), "Synthetic Name");
-        assert_eq!(validate_display_name("Synthetic   Spaced").unwrap(), "Synthetic Spaced");
+        assert_eq!(
+            validate_display_name("  Synthetic Name  ").unwrap(),
+            "Synthetic Name"
+        );
+        assert_eq!(
+            validate_display_name("Synthetic   Spaced").unwrap(),
+            "Synthetic Spaced"
+        );
         for invalid in [
             "",
             "   ",
@@ -652,7 +693,10 @@ mod tests {
             "bidi\u{202e}override",
             &"x".repeat(MAX_DISPLAY_NAME_CHARS + 1),
         ] {
-            assert_eq!(validate_display_name(invalid), Err(ProfileError::InvalidName));
+            assert_eq!(
+                validate_display_name(invalid),
+                Err(ProfileError::InvalidName)
+            );
         }
         assert!(validate_display_name(&"x".repeat(MAX_DISPLAY_NAME_CHARS)).is_ok());
         // Multi-byte names are bounded in bytes too.
@@ -664,7 +708,12 @@ mod tests {
 
     #[test]
     fn a_send_without_a_matching_read_back_is_unknown() {
-        let shown = OwnProfile::synthetic("synthetic-a", "@synthetic-a:example.org", "https://example.org", None);
+        let shown = OwnProfile::synthetic(
+            "synthetic-a",
+            "@synthetic-a:example.org",
+            "https://example.org",
+            None,
+        );
         let confirmed = WriteReport {
             profile: Some(shown.clone()),
             applied: true,
@@ -693,7 +742,9 @@ mod tests {
             let shown = format!("{config:?}");
             assert!(
                 shown.contains(&format!("max_response_bytes: {MAX_PROFILE_RESPONSE_BYTES}"))
-                    || shown.contains(&format!("max_response_bytes: Some({MAX_PROFILE_RESPONSE_BYTES})")),
+                    || shown.contains(&format!(
+                        "max_response_bytes: Some({MAX_PROFILE_RESPONSE_BYTES})"
+                    )),
                 "{shown}"
             );
             assert!(shown.contains("retry_limit: 0") || shown.contains("retry_limit: Some(0)"));
@@ -743,7 +794,13 @@ mod tests {
     #[test]
     fn a_whitespace_altered_read_back_is_not_confirmed() {
         let sent = "Synthetic Name";
-        for altered in ["Synthetic  Name", " Synthetic Name", "Synthetic Name ", "Synthetic\tName", "Synthetic\nName"] {
+        for altered in [
+            "Synthetic  Name",
+            " Synthetic Name",
+            "Synthetic Name ",
+            "Synthetic\tName",
+            "Synthetic\nName",
+        ] {
             let shown = read_back(Some(altered));
             // The display copy normalizes to the sent value...
             assert_eq!(shown.display_name.as_deref(), Some(sent), "{altered:?}");

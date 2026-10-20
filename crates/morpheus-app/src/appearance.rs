@@ -899,12 +899,21 @@ mod theme_tests {
         let other = theme_projection_in(Some(&config), "alice", "!other:example.org");
         assert_eq!(other.effective, ThemeMode::Light);
         assert_eq!(account_view(&config, "alice", "").colors["link"], "#222222");
-        assert_eq!(theme_projection_in(Some(&config), "bob", room).effective, ThemeMode::System);
+        assert_eq!(
+            theme_projection_in(Some(&config), "bob", room).effective,
+            ThemeMode::System
+        );
         assert_eq!(account_view(&config, "bob", room).colors["link"], "#111111");
         // Reset of the room removes only that override.
         assert!(config.clear_room_appearance("alice", room));
-        assert_eq!(theme_projection_in(Some(&config), "alice", room).effective, ThemeMode::Light);
-        assert_eq!(account_view(&config, "alice", room).colors["link"], "#222222");
+        assert_eq!(
+            theme_projection_in(Some(&config), "alice", room).effective,
+            ThemeMode::Light
+        );
+        assert_eq!(
+            account_view(&config, "alice", room).colors["link"],
+            "#222222"
+        );
         assert!(!config.clear_room_appearance("alice", room));
     }
 

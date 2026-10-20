@@ -1024,8 +1024,7 @@ fn import(ui: &AppWindow) {
                 style_profiles::import_profile(&path).map_err(|error| error.to_string())
             });
             drop(permit);
-            let _ =
-                weak.upgrade_in_event_loop(move |ui| finish_import(&ui, dialog_scope, result));
+            let _ = weak.upgrade_in_event_loop(move |ui| finish_import(&ui, dialog_scope, result));
         });
     if spawned.is_err() {
         scope::finish_dialog(ui, &opened);
@@ -1172,7 +1171,10 @@ fn finish_export(
     if spawned.is_err() {
         with_state(|state| state.writing = None);
         ui.set_style_profile_busy(false);
-        set_message("The profile export could not start. Nothing was written.", true);
+        set_message(
+            "The profile export could not start. Nothing was written.",
+            true,
+        );
         project(ui);
     }
 }
@@ -1181,7 +1183,12 @@ fn finish_export(
 /// while its scope is current. Otherwise it is reported without naming the
 /// profile, stating only what happened to the file.
 fn finish_write(ui: &AppWindow, admitted: Scope, name: String, result: Result<(), String>) {
-    let ours = with_state(|state| state.writing.take_if(|writing| *writing == admitted).is_some());
+    let ours = with_state(|state| {
+        state
+            .writing
+            .take_if(|writing| *writing == admitted)
+            .is_some()
+    });
     if !ours {
         return;
     }

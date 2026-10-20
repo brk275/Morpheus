@@ -39,7 +39,7 @@ use zeroize::Zeroizing;
 use crate::{
     AppWindow,
     image_previews::avatar::{
-        AvatarConsumer, AvatarPrepareError, PreparedAvatar, prepare_avatar_for, preparation_owner,
+        AvatarConsumer, AvatarPrepareError, PreparedAvatar, preparation_owner, prepare_avatar_for,
     },
     live::LiveUi,
 };
@@ -560,8 +560,7 @@ fn begin(ui: &AppWindow, live: &LiveUi) -> Option<Scope> {
         }
         let selection = editor.selection.clone()?;
         let cancellation = editor.cancellation.clone()?;
-        if !selection.is_current() || editor.account != ui.get_active_account_local_id().as_str()
-        {
+        if !selection.is_current() || editor.account != ui.get_active_account_local_id().as_str() {
             return None;
         }
         editor.busy = true;
@@ -667,7 +666,11 @@ fn read(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, reset_name: bool) 
 
 /// The server avatar prepared for a local preview, or nothing on any
 /// failure (the preview is optional; the profile still loads).
-async fn avatar_preview(live: &LiveUi, scope: &Scope, profile: &OwnProfile) -> Option<PreparedAvatar> {
+async fn avatar_preview(
+    live: &LiveUi,
+    scope: &Scope,
+    profile: &OwnProfile,
+) -> Option<PreparedAvatar> {
     let bytes = live
         .manager
         .own_avatar_bytes_for(&scope.selection, &scope.cancellation, profile)
@@ -811,7 +814,11 @@ fn show_dirty(ui: &AppWindow) {
     let input = ui.get_account_profile_name_input();
     let dirty = with(|editor| {
         !matches!(
-            name_change(input.as_str(), editor.server.as_ref(), editor.name_uncertain),
+            name_change(
+                input.as_str(),
+                editor.server.as_ref(),
+                editor.name_uncertain
+            ),
             Ok(None)
         )
     });
@@ -881,9 +888,7 @@ fn choose(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
 fn prepare_error(error: AvatarPrepareError) -> &'static str {
     match error {
         AvatarPrepareError::Cancelled => PICK_CANCELLED,
-        AvatarPrepareError::Busy
-            if preparation_owner() == Some(AvatarConsumer::RoomSettings) =>
-        {
+        AvatarPrepareError::Busy if preparation_owner() == Some(AvatarConsumer::RoomSettings) => {
             DECODER_IN_USE
         }
         other => other.text(),
@@ -1064,13 +1069,13 @@ fn start_save(
     };
     // The chosen image moves into the save and comes back with the outcome.
     let avatar = if with_avatar {
-        with(|editor| {
-            match std::mem::replace(&mut editor.avatar, AvatarDraft::Keep) {
+        with(
+            |editor| match std::mem::replace(&mut editor.avatar, AvatarDraft::Keep) {
                 AvatarDraft::Keep => AvatarSave::Keep,
                 AvatarDraft::Chosen(image) => AvatarSave::Set(image),
                 AvatarDraft::Remove => AvatarSave::Remove,
-            }
-        })
+            },
+        )
     } else {
         AvatarSave::Keep
     };
@@ -1100,12 +1105,7 @@ fn start_save(
 /// Send each changed field as its own single-send request. A later field is
 /// skipped once the editor or account is gone; an earlier field's result is
 /// kept and reported.
-async fn save_fields(
-    live: &LiveUi,
-    scope: &Scope,
-    name: NameSave,
-    avatar: AvatarSave,
-) -> Outcome {
+async fn save_fields(live: &LiveUi, scope: &Scope, name: NameSave, avatar: AvatarSave) -> Outcome {
     let manager = &live.manager;
     let mut outcome = Outcome::new();
     let name_result = match name {
@@ -1205,7 +1205,12 @@ fn finish_save(
         .and_then(FieldOutcome::error)
         .or_else(|| avatar.and_then(FieldOutcome::error))
         .or(send_error);
-    ui.set_account_profile_error(failure.map(|error| error.to_string()).unwrap_or_default().into());
+    ui.set_account_profile_error(
+        failure
+            .map(|error| error.to_string())
+            .unwrap_or_default()
+            .into(),
+    );
 }
 
 fn field_words(label: &str, outcome: FieldOutcome) -> String {
@@ -1242,11 +1247,15 @@ fn summary(
     match shown {
         Some(profile) => parts.push(format!(
             "The server now shows {} and {}.",
-            profile
-                .display_name
-                .as_deref()
-                .map_or_else(|| "no display name".to_owned(), |name| format!("the name \u{201c}{name}\u{201d}")),
-            if profile.has_avatar() { "an avatar" } else { "no avatar" }
+            profile.display_name.as_deref().map_or_else(
+                || "no display name".to_owned(),
+                |name| format!("the name \u{201c}{name}\u{201d}")
+            ),
+            if profile.has_avatar() {
+                "an avatar"
+            } else {
+                "no avatar"
+            }
         )),
         None => parts.push(
             "The profile could not be read back; Refresh to see what the server holds.".to_owned(),
@@ -1385,7 +1394,10 @@ pub(crate) fn refresh_active_label(ui: &AppWindow, force: bool) {
     let held_key = held_avatar_key(&account);
     let weak = ui.as_weak();
     runtime.spawn(async move {
-        let profile = live.manager.own_profile_for(&selection, &cancellation).await;
+        let profile = live
+            .manager
+            .own_profile_for(&selection, &cancellation)
+            .await;
         // The picture is read only for this active account, only when its
         // profile names one that is not already held, and only while the
         // same selection and read stay current.
@@ -1485,7 +1497,12 @@ mod tests {
 
     fn raw(name: Option<&str>) -> OwnProfile {
         // `synthetic` treats the name as the server's raw value.
-        OwnProfile::synthetic("synthetic-a", "@synthetic-a:example.org", "https://example.org", name)
+        OwnProfile::synthetic(
+            "synthetic-a",
+            "@synthetic-a:example.org",
+            "https://example.org",
+            name,
+        )
     }
 
     #[test]
@@ -1508,9 +1525,15 @@ mod tests {
         );
         let long = raw(Some(&format!("{}tail", "n".repeat(MAX_DISPLAY_NAME_CHARS))));
         let prefix = "n".repeat(MAX_DISPLAY_NAME_CHARS);
-        assert_eq!(name_change(&prefix, Some(&long), false), Ok(Some(prefix.clone())));
+        assert_eq!(
+            name_change(&prefix, Some(&long), false),
+            Ok(Some(prefix.clone()))
+        );
         // Emptying the field is not a removal.
-        assert_eq!(name_change("", Some(&same), false), Err(ProfileError::InvalidName));
+        assert_eq!(
+            name_change("", Some(&same), false),
+            Err(ProfileError::InvalidName)
+        );
         assert_eq!(
             name_change("two\nlines", Some(&same), false),
             Err(ProfileError::InvalidName)
@@ -1534,7 +1557,10 @@ mod tests {
         // never fails with InvalidName for it.
         assert_eq!(name_change("", Some(&raw(None)), false), Ok(None));
         // And an uncertain name with an empty field sends nothing either.
-        assert_eq!(name_change("", Some(&raw(Some("Synthetic"))), true), Ok(None));
+        assert_eq!(
+            name_change("", Some(&raw(Some("Synthetic"))), true),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -1739,7 +1765,14 @@ mod tests {
         //    current), and publishes its confirmed profile (P1);
         let (current_job, current_publication) = (2, 1);
         // 3. the slow label read (P0) finishes last: it must not publish.
-        assert!(!label_result_applies(job, current_job, started, current_publication, true, true));
+        assert!(!label_result_applies(
+            job,
+            current_job,
+            started,
+            current_publication,
+            true,
+            true
+        ));
         // Even if the job number still matched, a publication since it
         // started blocks it.
         assert!(!label_result_applies(1, 1, 0, 1, true, true));
@@ -1770,7 +1803,10 @@ mod tests {
             .unwrap()
             .get_or_insert_with(HashMap::new)
             .insert("synthetic-a".to_owned(), "Synthetic A".to_owned());
-        assert_eq!(confirmed_name("synthetic-a").as_deref(), Some("Synthetic A"));
+        assert_eq!(
+            confirmed_name("synthetic-a").as_deref(),
+            Some("Synthetic A")
+        );
         assert_eq!(confirmed_name("synthetic-b"), None);
         // A removed account's confirmed name is forgotten.
         retain_confirmed(&["synthetic-b"]);

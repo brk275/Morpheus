@@ -61,3 +61,11 @@ redaction regression failed in run `39276398829`, exposing the stripped
 replacement relation. That historical result does not verify the new stored
 mapping or redaction repair. Those changed inputs require fresh focused
 checks, followed by the affected native platform and encrypted upgrade gates.
+
+## Formatter inheritance
+
+The regular `.rustfmt.toml` is copied byte-for-byte from the pinned upstream
+repository root; it restores settings these crates inherited before vendoring.
+No formatting checks are disabled. Stable formatting normalizes local patch
+layout; the SDK event-cache redecryptor doc comment also loses one trailing
+space. Original source inventories remain unchanged in the provenance record.

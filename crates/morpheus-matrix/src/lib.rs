@@ -61,8 +61,8 @@ pub use account_access::{
     ActivationCancellation, ActivationChallenge, ActivationGrant, AppPasswordStatus, RemovalResult,
 };
 mod admin;
-mod room_settings;
 mod own_profile;
+mod room_settings;
 pub use own_profile::{
     MAX_DISPLAY_NAME_BYTES, MAX_DISPLAY_NAME_CHARS, MAX_OWN_AVATAR_PREVIEW_BYTES, OwnProfile,
     ProfileError, ProfileResult, WriteReport, validate_display_name,
@@ -87,7 +87,7 @@ mod room_tags;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
 pub use notification_rules::{
-    MAX_NOTIFICATION_KEYWORDS, MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_ROOMS,
+    MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_KEYWORDS, MAX_NOTIFICATION_ROOMS,
     NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT, PushRuleSyncWatch,
     RoomNotificationRule, RoomUnreadCounts,
 };

@@ -829,9 +829,7 @@ impl AudioControls {
             microphone.discard_buffered_frames();
             let mut state = self.lock_state()?;
             self.ensure_authorized()?;
-            if !state.suspended
-                && !state.desired.microphone_muted
-                && state.applied.microphone_muted
+            if !state.suspended && !state.desired.microphone_muted && state.applied.microphone_muted
             {
                 if let Some(publication) = &state.microphone {
                     publication.set_muted(false)?;
@@ -908,7 +906,11 @@ impl RtcService {
         may_transmit: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<AudioControls, MediaError> {
         let lease = self.call_lease(room_id).ok_or(MediaError::NotJoined)?;
-        Ok(AudioControls::new_gated(lease.clone(), allowed, may_transmit))
+        Ok(AudioControls::new_gated(
+            lease.clone(),
+            allowed,
+            may_transmit,
+        ))
     }
 
     /// Run the default microphone and speaker for a joined call.
@@ -1541,7 +1543,10 @@ mod tests {
         // Nothing suspends these controls: the push boundary reads the gate.
         open.store(false, Ordering::SeqCst);
         assert!(!controls.should_send_microphone().unwrap());
-        assert!(controls.is_running(), "a transient loss must not revoke capture");
+        assert!(
+            controls.is_running(),
+            "a transient loss must not revoke capture"
+        );
         open.store(true, Ordering::SeqCst);
         assert!(controls.should_send_microphone().unwrap());
     }

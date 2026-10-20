@@ -590,9 +590,9 @@ pub(super) fn project(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>
             session.reset_all = ResetAll::Idle;
         }
         let scope = session.scope.clone();
-        session.previous.retain(|id, step| {
-            same_color(scoped_color(config, &scope, id), step.after.as_ref())
-        });
+        session
+            .previous
+            .retain(|id, step| same_color(scoped_color(config, &scope, id), step.after.as_ref()));
     });
     reproject(ui, false);
 }
@@ -657,14 +657,10 @@ fn save_override(ui: &AppWindow, store: &ConfigStore, id: &'static str, value: O
         if same_color(scoped_color(config, &scope, id), value.as_ref()) {
             return false;
         }
-        before = Some(edit_scoped(
-            config,
-            &scope,
-            |colors| match &value {
-                Some(value) => colors.insert(id.into(), value.clone()),
-                None => colors.remove(id),
-            },
-        ));
+        before = Some(edit_scoped(config, &scope, |colors| match &value {
+            Some(value) => colors.insert(id.into(), value.clone()),
+            None => colors.remove(id),
+        }));
         true
     });
     if let (Some(_), Some(before)) = (saved, before) {
@@ -764,7 +760,11 @@ fn visible_tokens(
                 || token.id == selected
         })
         .collect();
-    if basic.is_empty() { all.to_vec() } else { basic }
+    if basic.is_empty() {
+        all.to_vec()
+    } else {
+        basic
+    }
 }
 
 fn effective_rgba(ui: &AppWindow, id: &str) -> [u8; 4] {
@@ -808,7 +808,10 @@ fn decided_above(
     // Each fallback names a different token; the bound only guards a cycle.
     for _ in 0..COLOR_TOKENS.len() {
         let Some(token) = step else { break };
-        if let Some((who, _)) = levels.iter().find(|(_, colors)| colors.contains_key(token.id)) {
+        if let Some((who, _)) = levels
+            .iter()
+            .find(|(_, colors)| colors.contains_key(token.id))
+        {
             return Some(*who);
         }
         let themed = match token.source {
@@ -846,8 +849,7 @@ fn shown_color(
     else {
         return (applied, Shown::Applied);
     };
-    match scoped_color(config, scope, token.id).and_then(|value| registry::parse_hex_color(value))
-    {
+    match scoped_color(config, scope, token.id).and_then(|value| registry::parse_hex_color(value)) {
         Some(own) => (own, Shown::ScopeValue(who)),
         None => (applied, Shown::MoreSpecific(who)),
     }
@@ -977,7 +979,10 @@ fn reproject(ui: &AppWindow, refill: bool) {
         // changed, as after a live refresh or the reload of this window's save.
         let current = ui.get_color_tokens();
         if current.row_count() != items.len()
-            || current.iter().zip(&items).any(|(shown, item)| shown != *item)
+            || current
+                .iter()
+                .zip(&items)
+                .any(|(shown, item)| shown != *item)
         {
             ui.set_color_tokens(ModelRc::new(VecModel::from(items)));
         }
@@ -985,9 +990,9 @@ fn reproject(ui: &AppWindow, refill: bool) {
         ui.set_color_reset_all_notice(
             match &session.reset_all {
                 ResetAll::Idle => String::new(),
-                ResetAll::Confirm => format!(
-                    "Activate again to remove all {override_count} customized colors"
-                ),
+                ResetAll::Confirm => {
+                    format!("Activate again to remove all {override_count} customized colors")
+                }
                 ResetAll::Removed(removed) => {
                     format!("Restore the {} removed colors", removed.len())
                 }
@@ -1015,9 +1020,9 @@ fn reproject(ui: &AppWindow, refill: bool) {
                 (_, Shown::ScopeValue(who)) => {
                     format!("{source}. In this view {who} uses its own color")
                 }
-                (_, Shown::MoreSpecific(who)) => format!(
-                    "{source}. Shown with {who}'s own color; a value here applies {reach}"
-                ),
+                (_, Shown::MoreSpecific(who)) => {
+                    format!("{source}. Shown with {who}'s own color; a value here applies {reach}")
+                }
             }
             .into(),
             overridden: overridden(selected.id),
@@ -1084,7 +1089,10 @@ mod tests {
         let canvas = registry::color_token("canvas").unwrap();
         let timestamp = registry::color_token("timestamp").unwrap();
         let scrim = registry::color_token("scrim").unwrap();
-        assert_eq!(source_text(&config, None, canvas, &EditScope::All), "Built-in palette");
+        assert_eq!(
+            source_text(&config, None, canvas, &EditScope::All),
+            "Built-in palette"
+        );
         assert_eq!(
             source_text(&config, Some(&theme), canvas, &EditScope::All),
             "From the selected theme"
@@ -1093,7 +1101,10 @@ mod tests {
             source_text(&config, None, timestamp, &EditScope::All),
             "Follows Secondary text"
         );
-        assert_eq!(source_text(&config, None, scrim, &EditScope::All), "Built-in default");
+        assert_eq!(
+            source_text(&config, None, scrim, &EditScope::All),
+            "Built-in default"
+        );
         config.colors.insert("canvas".into(), "#000000".into());
         assert_eq!(
             source_text(&config, Some(&theme), canvas, &EditScope::All),

@@ -98,7 +98,9 @@ pub enum ProfileError {
     #[error("the chosen file is a link, folder or device; choose another file")]
     Target,
     /// Exports never replace a file, whatever the system dialog asked.
-    #[error("a file with that name already exists; exports never replace a file, so choose a new name")]
+    #[error(
+        "a file with that name already exists; exports never replace a file, so choose a new name"
+    )]
     TargetExists,
     #[error("the profile could not be saved; the previous file was kept")]
     Write,

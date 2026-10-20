@@ -288,7 +288,9 @@ impl AccountManager {
                 None => settings
                     .delete_user_defined_room_rules(room.room_id())
                     .await
-                    .map_err(refused("resetting the room notification level was not confirmed"))?,
+                    .map_err(refused(
+                        "resetting the room notification level was not confirmed",
+                    ))?,
             }
             Ok(describe_room(&settings, &room).await)
         })
@@ -417,7 +419,9 @@ impl AccountManager {
                 return Ok(existing);
             }
             if existing.len() >= MAX_NOTIFICATION_KEYWORDS {
-                return Err(MatrixCoreError::Sdk("too many notification keywords".into()));
+                return Err(MatrixCoreError::Sdk(
+                    "too many notification keywords".into(),
+                ));
             }
             settings
                 .add_keyword(keyword)
@@ -438,10 +442,9 @@ impl AccountManager {
         let client = self.rule_client(selection).await?;
         self.under_rule_selection(selection, async move {
             let settings = client.notification_settings().await;
-            settings
-                .remove_keyword(&keyword)
-                .await
-                .map_err(refused("removing the notification keyword was not confirmed"))?;
+            settings.remove_keyword(&keyword).await.map_err(refused(
+                "removing the notification keyword was not confirmed",
+            ))?;
             Ok(sorted_keywords(&settings).await)
         })
         .await
@@ -648,7 +651,10 @@ mod tests {
             NotificationMode::MentionsAndKeywords,
             NotificationMode::Mute,
         ] {
-            assert_eq!(NotificationMode::from(RoomNotificationMode::from(mode)), mode);
+            assert_eq!(
+                NotificationMode::from(RoomNotificationMode::from(mode)),
+                mode
+            );
         }
     }
 
@@ -669,6 +675,8 @@ mod tests {
             assert!(!valid_keyword(keyword), "{keyword:?}");
         }
         assert!(valid_keyword(&"a".repeat(MAX_NOTIFICATION_KEYWORD_CHARS)));
-        assert!(!valid_keyword(&"a".repeat(MAX_NOTIFICATION_KEYWORD_CHARS + 1)));
+        assert!(!valid_keyword(
+            &"a".repeat(MAX_NOTIFICATION_KEYWORD_CHARS + 1)
+        ));
     }
 }

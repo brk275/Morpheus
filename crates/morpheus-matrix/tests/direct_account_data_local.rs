@@ -21,7 +21,9 @@ use matrix_sdk::ruma::{
     events::GlobalAccountDataEventType,
     serde::Raw,
 };
-use morpheus_matrix::{AccountManager, DirectListing, DirectWriteError, DirectWriteGuard, list_direct_room};
+use morpheus_matrix::{
+    AccountManager, DirectListing, DirectWriteError, DirectWriteGuard, list_direct_room,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -83,7 +85,10 @@ impl DirectWriteGuard for StopsAtWrite {
 }
 
 async fn stored(client: &matrix_sdk::Client, own: &UserId) -> Option<Value> {
-    let request = get_global_account_data::v3::Request::new(own.to_owned(), GlobalAccountDataEventType::Direct);
+    let request = get_global_account_data::v3::Request::new(
+        own.to_owned(),
+        GlobalAccountDataEventType::Direct,
+    );
     client
         .send(request)
         .await
@@ -118,8 +123,16 @@ fn direct_listing_merges_exactly_and_never_writes_for_another_account() {
         .build()
         .expect("Cannot start local test runtime");
     runtime.block_on(async {
-        let alice = fixture.accounts.iter().find(|a| a.label == "a_primary").unwrap();
-        let carol = fixture.accounts.iter().find(|a| a.label == "b_primary").unwrap();
+        let alice = fixture
+            .accounts
+            .iter()
+            .find(|a| a.label == "a_primary")
+            .unwrap();
+        let carol = fixture
+            .accounts
+            .iter()
+            .find(|a| a.label == "b_primary")
+            .unwrap();
         let manager = AccountManager::open(&root).expect("Cannot open account manager");
         manager
             .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
@@ -155,7 +168,14 @@ fn direct_listing_merges_exactly_and_never_writes_for_another_account() {
 
         // A guard ending as the write is admitted is unknown, never retried.
         assert_eq!(
-            list_direct_room(&client, &own, &target, &room, &StopsAtWrite(AtomicUsize::new(0))).await,
+            list_direct_room(
+                &client,
+                &own,
+                &target,
+                &room,
+                &StopsAtWrite(AtomicUsize::new(0))
+            )
+            .await,
             Err(DirectWriteError::Unknown)
         );
 
@@ -166,8 +186,14 @@ fn direct_listing_merges_exactly_and_never_writes_for_another_account() {
             Ok(DirectListing::Listed)
         );
         let after = stored(&client, &own).await.unwrap();
-        assert_eq!(after["@other-synthetic:example.org"], seeded["@other-synthetic:example.org"]);
-        assert_eq!(after["org.example.synthetic"], seeded["org.example.synthetic"]);
+        assert_eq!(
+            after["@other-synthetic:example.org"],
+            seeded["@other-synthetic:example.org"]
+        );
+        assert_eq!(
+            after["org.example.synthetic"],
+            seeded["org.example.synthetic"]
+        );
         assert_eq!(after[target.as_str()], json!([room.as_str()]));
         // Listing again writes nothing.
         assert_eq!(

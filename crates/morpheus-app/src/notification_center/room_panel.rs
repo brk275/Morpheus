@@ -17,7 +17,9 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, atomic::Ordering};
 
-use morpheus_config::{Config, ConfigStore, MAX_ROOM_NOTIFICATION_OVERRIDES, RoomNotificationLocal};
+use morpheus_config::{
+    Config, ConfigStore, MAX_ROOM_NOTIFICATION_OVERRIDES, RoomNotificationLocal,
+};
 use morpheus_matrix::{
     AccountSelection, MatrixCoreError, NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT,
     PushRuleSyncWatch, RoomNotificationRule,
@@ -540,7 +542,10 @@ impl RoomPanel {
             return;
         }
         let room_id = self.state().room_id.clone();
-        if self.rules.unconfirmed(selection.account_id(), Some(&room_id)) {
+        if self
+            .rules
+            .unconfirmed(selection.account_id(), Some(&room_id))
+        {
             global.set_error(NOT_SYNCED.into());
             return;
         }
@@ -748,9 +753,19 @@ mod tests {
         assert!(over_bound(&config, "work", "!new:example.org", quiet));
         // A listed room may still change, any room may clear, and other
         // accounts have their own bound.
-        assert!(!over_bound(&config, "work", "!r0:example.org", RoomNotificationLocal::default()));
+        assert!(!over_bound(
+            &config,
+            "work",
+            "!r0:example.org",
+            RoomNotificationLocal::default()
+        ));
         assert!(!over_bound(&config, "work", "!r0:example.org", quiet));
-        assert!(!over_bound(&config, "work", "!new:example.org", RoomNotificationLocal::default()));
+        assert!(!over_bound(
+            &config,
+            "work",
+            "!new:example.org",
+            RoomNotificationLocal::default()
+        ));
         assert!(!over_bound(&config, "home", "!new:example.org", quiet));
     }
 
@@ -791,11 +806,21 @@ mod tests {
             LOCAL_FAILED,
         ] {
             let lower = message.to_lowercase();
-            let claims = ["undone", "reverted", "rolled back", "cancelled", "unchanged", "keeps"];
+            let claims = [
+                "undone",
+                "reverted",
+                "rolled back",
+                "cancelled",
+                "unchanged",
+                "keeps",
+            ];
             for claim in claims {
                 assert!(!lower.contains(claim), "{message}");
             }
-            assert!(!message.contains('!') && !message.contains('@'), "{message}");
+            assert!(
+                !message.contains('!') && !message.contains('@'),
+                "{message}"
+            );
         }
     }
 }

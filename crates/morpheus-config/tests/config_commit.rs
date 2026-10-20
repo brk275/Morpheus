@@ -59,7 +59,10 @@ fn an_edit_at_the_pre_publish_boundary_is_kept_with_the_draft() {
     // The draft is the caller's and is untouched.
     assert_eq!(draft.geometry.corner_radius, 3);
     // Nothing staged is left behind: only the file and its lock.
-    assert_eq!(entries(directory.path()), ["config.toml", "config.toml.lock"]);
+    assert_eq!(
+        entries(directory.path()),
+        ["config.toml", "config.toml.lock"]
+    );
 
     // Committing over the version now on disk succeeds.
     let (_, now) = store.load_revision().unwrap();
@@ -95,7 +98,10 @@ fn a_removal_at_the_boundary_is_not_undone() {
     }));
 
     assert_eq!(current, ConfigRevision::absent());
-    assert!(!store.path().exists(), "a removed file is not written again");
+    assert!(
+        !store.path().exists(),
+        "a removed file is not written again"
+    );
 }
 
 #[test]
@@ -231,7 +237,11 @@ fn revisions_and_conflicts_never_print_the_file() {
         })
         .unwrap_err();
 
-    for shown in [format!("{error}"), format!("{error:?}"), format!("{revision:?}")] {
+    for shown in [
+        format!("{error}"),
+        format!("{error:?}"),
+        format!("{revision:?}"),
+    ] {
         assert!(!shown.contains("private-marker-71"), "{shown}");
         assert!(!shown.contains("corner_radius"), "{shown}");
     }

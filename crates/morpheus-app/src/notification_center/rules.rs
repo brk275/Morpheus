@@ -552,7 +552,11 @@ impl Rules {
         if !same || !state.loaded || !selection.is_current() {
             return;
         }
-        let Some(row) = state.rows.iter_mut().find(|row| row.room_id == rule.room_id) else {
+        let Some(row) = state
+            .rows
+            .iter_mut()
+            .find(|row| row.room_id == rule.room_id)
+        else {
             return;
         };
         if row.pending {
@@ -1029,7 +1033,13 @@ mod tests {
             let lower = text.to_lowercase();
             // A partly applied change is possible: no claim that nothing
             // changed, and no claim of a rollback.
-            for claim in ["unchanged", "not changed", "keeps", "was not added", "rolled back"] {
+            for claim in [
+                "unchanged",
+                "not changed",
+                "keeps",
+                "was not added",
+                "rolled back",
+            ] {
                 assert!(!lower.contains(claim), "{text}");
             }
             assert!(lower.contains("may") && lower.contains("sync"), "{text}");
@@ -1055,7 +1065,15 @@ mod tests {
     #[test]
     fn keywords_are_plain_bounded_text() {
         assert_eq!(normalize_keyword("  on   call ").as_deref(), Ok("on call"));
-        for input in ["", "   ", "re*lease", "[urgent]", "who?", "a\u{202e}b", "a\tb"] {
+        for input in [
+            "",
+            "   ",
+            "re*lease",
+            "[urgent]",
+            "who?",
+            "a\u{202e}b",
+            "a\tb",
+        ] {
             assert!(normalize_keyword(input).is_err(), "{input:?}");
         }
         let long = "a".repeat(MAX_NOTIFICATION_KEYWORD_CHARS + 1);

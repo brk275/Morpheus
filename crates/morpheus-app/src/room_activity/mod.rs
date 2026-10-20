@@ -594,7 +594,9 @@ impl RoomActivityUi {
             && !state.stopping
             && current.is_some();
         let started = state.started.as_ref().map(|(context, at)| Started {
-            same_target: current.as_ref().is_some_and(|current| current.id == context.id),
+            same_target: current
+                .as_ref()
+                .is_some_and(|current| current.id == context.id),
             at: *at,
         });
         let step = model::typing_step(enabled, &state.composers, started, now);
@@ -656,7 +658,11 @@ impl RoomActivityUi {
                         )
                         .await;
                     let mut state = self.lock();
-                    if state.pending_start.as_ref().is_some_and(|(id, _)| *id == op) {
+                    if state
+                        .pending_start
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == op)
+                    {
                         state.pending_start = None;
                     }
                     // Withdrawn: nothing reached the SDK, so there is no new

@@ -87,7 +87,10 @@ async fn withdraw_read_elsewhere(live: &LiveUi, notifications: &DesktopNotificat
     let Some(selection) = manager.account_selection(&account.id) else {
         return;
     };
-    let Ok(counts) = manager.room_unread_counts_selected(&selection, &rooms).await else {
+    let Ok(counts) = manager
+        .room_unread_counts_selected(&selection, &rooms)
+        .await
+    else {
         return;
     };
     for room_id in read_rooms(&counts) {

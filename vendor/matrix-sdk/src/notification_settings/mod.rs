@@ -1034,15 +1034,11 @@ mod tests {
         let room_id = get_test_room_id();
         let settings = from_insert_rules(&client, vec![(RuleKind::Room, &room_id, true)]);
         assert_eq!(
-            settings
-                .set_room_notification_mode(&room_id, RoomNotificationMode::Mute)
-                .await,
+            settings.set_room_notification_mode(&room_id, RoomNotificationMode::Mute).await,
             Err(NotificationSettingsError::UnableToAddPushRule)
         );
         assert_eq!(
-            settings
-                .get_user_defined_room_notification_mode(&room_id)
-                .await,
+            settings.get_user_defined_room_notification_mode(&room_id).await,
             Some(RoomNotificationMode::AllMessages)
         );
         server.verify().await;
@@ -1062,9 +1058,7 @@ mod tests {
         let room_id = get_test_room_id();
         let settings = from_insert_rules(&client, vec![(RuleKind::Room, &room_id, true)]);
         assert_eq!(
-            settings
-                .set_room_notification_mode(&room_id, RoomNotificationMode::Mute)
-                .await,
+            settings.set_room_notification_mode(&room_id, RoomNotificationMode::Mute).await,
             Err(NotificationSettingsError::UnableToAddPushRule)
         );
         server.verify().await;
@@ -1124,13 +1118,17 @@ mod tests {
         // Session restoration can make discovery requests before this
         // mutation. Count the wire boundary under test, not setup traffic.
         let requests = server.received_requests().await.unwrap();
-        let mutations = requests.iter().filter(|request| {
-            request.method.as_str() == "PUT"
-                && request.url.path().starts_with("/_matrix/client/v3/pushrules/")
-        }).count();
-        let refreshes = requests.iter().filter(|request| {
-            request.url.path() == "/_matrix/client/v3/refresh"
-        }).count();
+        let mutations = requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "PUT"
+                    && request.url.path().starts_with("/_matrix/client/v3/pushrules/")
+            })
+            .count();
+        let refreshes = requests
+            .iter()
+            .filter(|request| request.url.path() == "/_matrix/client/v3/refresh")
+            .count();
         assert_eq!(mutations, 1);
         assert_eq!(refreshes, 0);
         server.verify().await;
@@ -1149,7 +1147,9 @@ mod tests {
                 self.0.lock().unwrap().extend_from_slice(bytes);
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
         const PRIVATE_REPLY: &str = "private server reply sentinel";
         let server = MockServer::start().await;
@@ -1171,7 +1171,8 @@ mod tests {
             .finish();
         let room_id = get_test_room_id();
         let settings = from_insert_rules(&client, vec![(RuleKind::Room, &room_id, true)]);
-        let result = settings.set_room_notification_mode(&room_id, RoomNotificationMode::Mute)
+        let result = settings
+            .set_room_notification_mode(&room_id, RoomNotificationMode::Mute)
             .with_subscriber(subscriber)
             .await;
         assert_eq!(result, Err(NotificationSettingsError::UnableToAddPushRule));

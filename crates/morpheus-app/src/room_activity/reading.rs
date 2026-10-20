@@ -134,8 +134,8 @@ pub(super) fn read_plan(state: &State, slot: usize, facts: &ReadFacts) -> Plan {
     let Some(shown) = view.shown.as_ref() else {
         return Plan::Idle;
     };
-    let same_thread = slot == MAIN
-        || (state.thread == shown.thread && facts.thread_root == shown.thread);
+    let same_thread =
+        slot == MAIN || (state.thread == shown.thread && facts.thread_root == shown.thread);
     let gate = model::ReadGate {
         tracking_enabled: state.prefs.read_tracking,
         live_session: facts.live_session,

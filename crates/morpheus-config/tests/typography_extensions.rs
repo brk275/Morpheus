@@ -22,10 +22,9 @@ fn files_without_the_new_keys_keep_the_natural_look() {
 
 #[test]
 fn the_new_keys_are_range_checked() {
-    let accepted = parse(
-        "schema_version = 1\n[typography]\nline_height_percent = 150\nbody_weight = 600\n",
-    )
-    .unwrap();
+    let accepted =
+        parse("schema_version = 1\n[typography]\nline_height_percent = 150\nbody_weight = 600\n")
+            .unwrap();
     assert_eq!(accepted.typography.line_height_percent, Some(150));
     assert_eq!(accepted.typography.body_weight, Some(600));
     for raw in [
@@ -36,7 +35,10 @@ fn the_new_keys_are_range_checked() {
         "[typography]\nline_height_percent = -1",
         "[typography]\nline_height = 150",
     ] {
-        assert!(parse(&format!("schema_version = 1\n{raw}\n")).is_err(), "{raw}");
+        assert!(
+            parse(&format!("schema_version = 1\n{raw}\n")).is_err(),
+            "{raw}"
+        );
     }
 }
 

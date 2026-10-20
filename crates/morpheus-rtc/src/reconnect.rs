@@ -99,11 +99,7 @@ impl ReconnectBackoff {
 
     /// `jitter_permille` (0..=1000) places the wait between 80 % and 100 % of
     /// the nominal delay, so clients interrupted together do not retry in step.
-    fn next_attempt_with_jitter(
-        &mut self,
-        now: Instant,
-        jitter_permille: u64,
-    ) -> Option<Duration> {
+    fn next_attempt_with_jitter(&mut self, now: Instant, jitter_permille: u64) -> Option<Duration> {
         if self.attempts >= self.policy.max_attempts || self.expired(now) {
             return None;
         }
@@ -309,7 +305,11 @@ mod tests {
                 Some(RtcConnectionSignal::Ended(RtcCallEnd::Removed))
             );
         }
-        for lost in ["ServerShutdown", "SignalClose", "failed to reconnect after 10"] {
+        for lost in [
+            "ServerShutdown",
+            "SignalClose",
+            "failed to reconnect after 10",
+        ] {
             assert_eq!(
                 ended(lost),
                 Some(RtcConnectionSignal::Ended(RtcCallEnd::ConnectionLost))

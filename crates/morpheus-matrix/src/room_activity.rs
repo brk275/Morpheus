@@ -115,7 +115,10 @@ impl ActivityCancellation {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
-            || self.0.deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || self
+                .0
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// Resolves once any clone is cancelled or the deadline passes.

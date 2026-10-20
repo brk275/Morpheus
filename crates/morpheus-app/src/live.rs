@@ -3865,7 +3865,10 @@ pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], activ
         return;
     };
     crate::account_identity::retain_confirmed(
-        &accounts.iter().map(|account| account.id.as_str()).collect::<Vec<_>>(),
+        &accounts
+            .iter()
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>(),
     );
     let items = accounts
         .iter()
