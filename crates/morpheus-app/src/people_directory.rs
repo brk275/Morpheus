@@ -179,6 +179,7 @@ fn unobstructed(ui: &AppWindow, live: &LiveUi) -> bool {
         && !crate::space_explorer::is_open(ui)
         && !ui.global::<crate::RoomNotificationState>().get_open()
         && !ui.global::<crate::RoomActivity>().get_seen_open()
+        && !crate::identity_warnings::is_open(ui)
 }
 
 /// What one step captured when it started.
@@ -277,6 +278,7 @@ fn open(ui: &AppWindow, live: &LiveUi, prefill: &str) {
     ui.set_people_query(prefill.as_str().into());
     crate::matrix_links::clear(ui);
     crate::thread_browser::withdraw(ui);
+    crate::withdraw_call_bar(ui);
     ui.set_people_open(true);
     project(ui);
 }

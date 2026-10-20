@@ -15,15 +15,26 @@
 //! Facility to track changes to the identity of members of rooms.
 #![cfg(feature = "e2e-encryption")]
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use async_stream::stream;
 use futures_core::Stream;
 use futures_util::{StreamExt, stream_select};
-use matrix_sdk_base::crypto::{
-    IdentityState, IdentityStatusChange, RoomIdentityChange, RoomIdentityState,
+use matrix_sdk_base::{
+    RoomMemberships,
+    crypto::{
+        IdentityState, IdentityStatusChange, RoomIdentityChange, RoomIdentityProvider,
+        RoomIdentityState,
+    },
 };
-use ruma::{OwnedUserId, UserId, events::room::member::SyncRoomMemberEvent};
+use matrix_sdk_common::BoxFuture;
+use ruma::{
+    OwnedUserId, UserId,
+    events::room::member::{MembershipState, SyncRoomMemberEvent},
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -48,7 +59,7 @@ use crate::{
 #[derive(Debug)]
 pub struct IdentityStatusChanges {
     /// Who is in the room and who is in identity violation at this moment
-    room_identity_state: RoomIdentityState<Room>,
+    room_identity_state: RoomIdentityState<MemberSource>,
 
     /// Dropped when we are dropped, and unregisters the event handler we
     /// registered to listen for room events
@@ -89,15 +100,53 @@ impl IdentityStatusChanges {
     pub async fn create_stream(
         room: Room,
     ) -> Result<impl Stream<Item = Vec<IdentityStatusChange>>> {
+        Self::create_stream_from(MemberSource::Room(room)).await
+    }
+
+    /// Like [`IdentityStatusChanges::create_stream`], but membership is read
+    /// only from the room members already stored on this device: the member
+    /// list is never requested from the homeserver, and a stored member counts
+    /// only while joined or invited. Identities come from the local crypto
+    /// store, as with [`IdentityStatusChanges::create_stream`].
+    ///
+    /// A local read that fails is never taken for an empty answer: if the
+    /// stored members or their identities cannot be read for the initial
+    /// state, this returns that error and no stream; if a later read fails,
+    /// the stream ends.
+    /// Queued changes are reconciled against current stored membership;
+    /// departed retained identities are forgotten before publication.
+    pub(crate) async fn create_stream_no_sync(
+        room: Room,
+    ) -> Result<impl Stream<Item = Vec<IdentityStatusChange>>> {
+        Self::create_stream_from(MemberSource::Stored(room, StoredReads::default())).await
+    }
+
+    /// The stream lifecycle shared by both entry points. The stored source
+    /// additionally reconciles queued changes with current local membership.
+    async fn create_stream_from(
+        members: MemberSource,
+    ) -> Result<impl Stream<Item = Vec<IdentityStatusChange>>> {
+        let room = members.room();
         let identity_updates = wrap_identity_updates(&room.client).await?;
-        let (drop_guard, room_member_events) = wrap_room_member_events(&room);
+        let (drop_guard, room_member_events) = wrap_room_member_events(room);
         let mut unprocessed_stream = combine_streams(identity_updates, room_member_events);
         let own_user_id = room.client.user_id().ok_or(Error::InsufficientData)?.to_owned();
+        let stored_reads = members.stored_reads();
+        let stored_members = match &members {
+            MemberSource::Stored(_, _) => Some(members.clone()),
+            MemberSource::Room(_) => None,
+        };
 
         let state = IdentityStatusChanges {
-            room_identity_state: RoomIdentityState::new(room).await,
+            room_identity_state: RoomIdentityState::new(members).await,
             _drop_guard: drop_guard,
         };
+
+        // The stored-members source starts only from a state it actually
+        // read: an unreadable member list is not an empty one.
+        if let Some(error) = stored_reads.as_ref().and_then(StoredReads::take) {
+            return Err(error);
+        }
 
         Ok(stream!({
             // Force enclosing stream to take ownership of state, so that
@@ -113,16 +162,241 @@ impl IdentityStatusChanges {
             }
 
             while let Some(item) = unprocessed_stream.next().await {
-                let mut update = filter_non_self(
-                    state.room_identity_state.process_change(item).await,
-                    &own_user_id,
-                );
+                let changes = if let Some(members) = &stored_members {
+                    state.process_stored_change(item, members).await
+                } else {
+                    state.room_identity_state.process_change(item).await
+                };
+                let mut update = filter_non_self(changes, &own_user_id);
+                // A stored read that failed while processing this change
+                // leaves the state unknown: end the stream rather than
+                // report it as if nothing were missing.
+                if stored_reads.as_ref().is_some_and(StoredReads::failed) {
+                    break;
+                }
                 if !update.is_empty() {
                     update.sort();
                     yield update;
                 }
             }
         }))
+    }
+
+    /// Reconcile queued changes against current stored membership. In the
+    /// upstream state machine with active-only admission, a queued pin or
+    /// verification is ignored after a departure, and the departure itself
+    /// is ignored once the identity is pinned/verified. Rebuild only when an
+    /// affected retained identity has actually departed, so its internal
+    /// state is forgotten as well as its warning. A later active rejoin can
+    /// then report a violation again.
+    async fn process_stored_change(
+        &mut self,
+        item: RoomIdentityChange,
+        members: &MemberSource,
+    ) -> Vec<IdentityStatusChange> {
+        let before: BTreeMap<_, _> = self
+            .room_identity_state
+            .current_state()
+            .into_iter()
+            .map(|change| (change.user_id, change.changed_to))
+            .collect();
+        let mut departed = false;
+        let mut active_membership_event = false;
+        match &item {
+            RoomIdentityChange::IdentityUpdates(updates) => {
+                for user_id in updates.new.keys().chain(updates.changed.keys()) {
+                    if before.contains_key(user_id) && !members.is_member(user_id).await {
+                        departed = true;
+                    }
+                }
+            }
+            RoomIdentityChange::SyncRoomMemberEvent(event) => {
+                if event.as_original().is_none() {
+                    return Vec::new();
+                }
+                let active = members.is_member(event.state_key()).await;
+                departed = before.contains_key(event.state_key()) && !active;
+                active_membership_event = active
+                    && matches!(
+                        event.membership(),
+                        MembershipState::Join | MembershipState::Invite
+                    );
+            }
+        }
+        if members.stored_reads().is_some_and(|reads| reads.failed()) {
+            return Vec::new();
+        }
+
+        if departed {
+            // O(room-size) local reads, once for this detected departure batch.
+            // Dropping the stream cancels this await; no task is spawned.
+            let rebuilt = RoomIdentityState::new(members.clone()).await;
+            if members.stored_reads().is_some_and(|reads| reads.failed()) {
+                return Vec::new();
+            }
+            let after: BTreeMap<_, _> = rebuilt
+                .current_state()
+                .into_iter()
+                .map(|change| (change.user_id, change.changed_to))
+                .collect();
+            let mut changes = Vec::new();
+            for user_id in before.keys().filter(|user_id| !after.contains_key(*user_id)) {
+                // The existing stream API uses Pinned as the removal signal
+                // for departed members. This does not assert or mutate their
+                // actual crypto identity or trust.
+                changes.push(IdentityStatusChange {
+                    user_id: user_id.clone(),
+                    changed_to: IdentityState::Pinned,
+                });
+            }
+            for (user_id, changed_to) in after {
+                if before.get(&user_id) != Some(&changed_to) {
+                    changes.push(IdentityStatusChange { user_id, changed_to });
+                }
+            }
+            self.room_identity_state = rebuilt;
+            return changes;
+        }
+
+        // Membership events may be older than the stored state. A queued
+        // Join must not resurrect a departed warning, nor a queued Leave
+        // remove a current active rejoin. Identity updates retain the stored
+        // provider's Join/Invite admission check.
+        if matches!(&item, RoomIdentityChange::SyncRoomMemberEvent(_)) && !active_membership_event {
+            return Vec::new();
+        }
+        self.room_identity_state.process_change(item).await
+    }
+}
+
+/// Where an [`IdentityStatusChanges`] stream reads the room's membership.
+#[derive(Clone, Debug)]
+enum MemberSource {
+    /// [`Room`]'s own [`RoomIdentityProvider`], unchanged: it requests the
+    /// member list from the homeserver when this device's copy is incomplete.
+    Room(Room),
+    /// Only the members stored on this device. Never requests the member
+    /// list; a stored member who left or was banned is not a member. A local
+    /// read that fails is recorded in [`StoredReads`], never taken for an
+    /// empty answer.
+    Stored(Room, StoredReads),
+}
+
+impl MemberSource {
+    fn room(&self) -> &Room {
+        match self {
+            Self::Room(room) | Self::Stored(room, _) => room,
+        }
+    }
+
+    /// The failure record of the stored-members source; `None` for
+    /// [`MemberSource::Room`], whose behaviour is unchanged.
+    fn stored_reads(&self) -> Option<StoredReads> {
+        match self {
+            Self::Room(_) => None,
+            Self::Stored(_, reads) => Some(reads.clone()),
+        }
+    }
+}
+
+/// The first local read of a [`MemberSource::Stored`] stream that failed.
+///
+/// [`RoomIdentityProvider`] has no error path: its results are a plain list,
+/// `bool` or `Option`. The stored source records a failed read here instead
+/// of answering as if the member or identity were absent, so the stream can
+/// refuse to start (initial state) or end (later change).
+#[derive(Clone, Debug, Default)]
+struct StoredReads(Arc<Mutex<Option<Error>>>);
+
+impl StoredReads {
+    fn record(&self, error: impl Into<Error>) {
+        let mut first = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if first.is_none() {
+            *first = Some(error.into());
+        }
+    }
+
+    fn failed(&self) -> bool {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_some()
+    }
+
+    fn take(&self) -> Option<Error> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    }
+}
+
+/// One identity from the local crypto store (`OlmMachine::get_identity` with
+/// no key-query wait), recording a failed read in `reads`.
+async fn stored_identity(
+    room: &Room,
+    reads: &StoredReads,
+    user_id: &UserId,
+) -> Option<matrix_sdk_base::crypto::UserIdentity> {
+    match room.client.encryption().get_user_identity(user_id).await {
+        Ok(identity) => identity.map(|identity| identity.underlying_identity()),
+        Err(error) => {
+            reads.record(error);
+            None
+        }
+    }
+}
+
+impl RoomIdentityProvider for MemberSource {
+    fn is_member<'a>(&'a self, user_id: &'a UserId) -> BoxFuture<'a, bool> {
+        match self {
+            Self::Room(room) => RoomIdentityProvider::is_member(room, user_id),
+            Self::Stored(room, reads) => Box::pin(async move {
+                match room.get_member_no_sync(user_id).await {
+                    Ok(Some(member)) => matches!(
+                        member.membership(),
+                        MembershipState::Join | MembershipState::Invite
+                    ),
+                    Ok(None) => false,
+                    Err(error) => {
+                        reads.record(error);
+                        false
+                    }
+                }
+            }),
+        }
+    }
+
+    fn member_identities(&self) -> BoxFuture<'_, Vec<matrix_sdk_base::crypto::UserIdentity>> {
+        match self {
+            Self::Room(room) => RoomIdentityProvider::member_identities(room),
+            Self::Stored(room, reads) => Box::pin(async move {
+                let members = match room
+                    .members_no_sync(RoomMemberships::JOIN | RoomMemberships::INVITE)
+                    .await
+                {
+                    Ok(members) => members,
+                    Err(error) => {
+                        reads.record(error);
+                        return Vec::new();
+                    }
+                };
+
+                let mut ret = Vec::new();
+                for member in members {
+                    if let Some(identity) = stored_identity(room, reads, member.user_id()).await {
+                        ret.push(identity);
+                    }
+                }
+                ret
+            }),
+        }
+    }
+
+    /// The local crypto store only, for both sources; the stored source
+    /// records a failed read.
+    fn user_identity<'a>(
+        &'a self,
+        user_id: &'a UserId,
+    ) -> BoxFuture<'a, Option<matrix_sdk_base::crypto::UserIdentity>> {
+        match self {
+            Self::Room(room) => RoomIdentityProvider::user_identity(room, user_id),
+            Self::Stored(room, reads) => Box::pin(stored_identity(room, reads, user_id)),
+        }
     }
 }
 
@@ -206,8 +480,9 @@ mod tests {
     use std::time::Duration;
 
     use futures_util::{FutureExt as _, StreamExt as _, pin_mut};
-    use matrix_sdk_base::crypto::IdentityState;
+    use matrix_sdk_base::{RoomMemberships, crypto::IdentityState};
     use matrix_sdk_test::{async_test, test_json::keys_query_sets::IdentityChangeDataSet};
+    use ruma::events::room::member::MembershipState;
     use test_setup::TestSetup;
 
     use crate::assert_next_with_timeout;
@@ -589,6 +864,313 @@ mod tests {
         assert_eq!(next_change.len(), 1);
     }
 
+    #[async_test]
+    async fn test_no_sync_stream_never_requests_the_member_list() {
+        // Given a room containing us and Bob whose stored member list is not
+        // marked complete, so the syncing stream would request it
+        let (t, server) = TestSetup::new_room_with_other_bob_unsynced().await;
+        assert!(!t.room().are_members_synced());
+
+        // And Bob's identity is unpinned
+        t.unpin_bob().await;
+
+        // When we listen through the stored-members stream
+        let stream = t.subscribe_to_identity_status_changes_no_sync().await;
+        pin_mut!(stream);
+
+        // Then the initial state comes from the stored members
+        let change1 = assert_next_with_timeout!(stream);
+        assert_eq!(change1[0].user_id, t.bob_user_id());
+        assert_eq!(change1[0].changed_to, IdentityState::PinViolation);
+        assert_eq!(change1.len(), 1);
+
+        // And a later identity change is processed from the store
+        t.pin_bob().await;
+        let change2 = assert_next_with_timeout!(stream);
+        assert_eq!(change2[0].user_id, t.bob_user_id());
+        assert_eq!(change2[0].changed_to, IdentityState::Pinned);
+        assert_eq!(change2.len(), 1);
+
+        // And so is one after the list went from complete to incomplete (a
+        // single change, from the pinned identity B to A)
+        t.room().inner.mark_members_synced();
+        t.room().inner.mark_members_missing();
+        t.unpin_bob_with(IdentityChangeDataSet::key_query_with_identity_a()).await;
+        let change3 = assert_next_with_timeout!(stream);
+        assert_eq!(change3[0].user_id, t.bob_user_id());
+        assert_eq!(change3[0].changed_to, IdentityState::PinViolation);
+        assert_eq!(change3.len(), 1);
+
+        // And the member list was never requested or marked complete
+        assert_eq!(members_requests(&server).await, 0);
+        assert!(!t.room().are_members_synced());
+    }
+
+    #[async_test]
+    async fn test_syncing_stream_requests_an_incomplete_member_list() {
+        // Given the same room, whose member list is not marked complete
+        let (t, server) = TestSetup::new_room_with_other_bob_unsynced().await;
+
+        // When we listen through the syncing stream
+        let _stream = t.subscribe_to_identity_status_changes().await;
+
+        // Then it requested the member list: the count above sees requests
+        assert!(members_requests(&server).await > 0);
+    }
+
+    #[async_test]
+    async fn test_no_sync_stream_does_not_report_a_member_who_left_again() {
+        // Given a room containing us and Bob, who is unpinned
+        let mut t = TestSetup::new_room_with_other_bob().await;
+        t.unpin_bob().await;
+
+        // And we are listening through the stored-members stream
+        let stream = t.subscribe_to_identity_status_changes_no_sync().await;
+        pin_mut!(stream);
+        let change1 = assert_next_with_timeout!(stream);
+        assert_eq!(change1[0].user_id, t.bob_user_id());
+        assert_eq!(change1[0].changed_to, IdentityState::PinViolation);
+
+        // When Bob leaves, his warning is removed
+        t.bob_leaves().await;
+        let change2 = assert_next_with_timeout!(stream);
+        assert_eq!(change2[0].user_id, t.bob_user_id());
+        assert_eq!(change2[0].changed_to, IdentityState::Pinned);
+
+        // And his stored membership is Leave, not absent
+        let stored = t
+            .room()
+            .get_member_no_sync(t.bob_user_id())
+            .await
+            .expect("Should not fail to get member")
+            .expect("A member who left stays stored");
+        assert_eq!(*stored.membership(), MembershipState::Leave);
+
+        // When his identity changes again while he is gone
+        t.pin_bob().await;
+        t.unpin_bob().await;
+
+        // Then nothing is reported for him
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), stream.next()).await.is_err(),
+            "a member who left is not warned about again"
+        );
+
+        // And when he joins again, the warning returns
+        t.bob_joins().await;
+        let change3 = assert_next_with_timeout!(stream);
+        assert_eq!(change3[0].user_id, t.bob_user_id());
+        assert_eq!(change3[0].changed_to, IdentityState::PinViolation);
+        assert_eq!(change3.len(), 1);
+    }
+
+    #[async_test]
+    async fn test_no_sync_stream_reconciles_queued_pin_before_leave_or_ban() {
+        for departure in [MembershipState::Leave, MembershipState::Ban] {
+            queued_departure_is_reconciled(departure, false).await;
+        }
+    }
+
+    #[async_test]
+    async fn test_no_sync_stream_reconciles_queued_verification_before_leave_or_ban() {
+        for departure in [MembershipState::Leave, MembershipState::Ban] {
+            queued_departure_is_reconciled(departure, true).await;
+        }
+    }
+
+    async fn queued_departure_is_reconciled(departure: MembershipState, verify: bool) {
+        let (mut t, server) = TestSetup::new_room_with_other_bob_unsynced().await;
+        t.unpin_bob().await;
+        let stream = t.subscribe_to_identity_status_changes_no_sync().await;
+        pin_mut!(stream);
+        let initial = assert_next_with_timeout!(stream);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].user_id, t.bob_user_id());
+        assert_eq!(initial[0].changed_to, IdentityState::PinViolation);
+
+        // Queue the real crypto update, then persist the departure, without
+        // polling the stream between them. Either queue may be selected first.
+        if verify {
+            t.verify_bob_with(
+                IdentityChangeDataSet::key_query_with_identity_b(),
+                IdentityChangeDataSet::master_signing_keys_b(),
+                IdentityChangeDataSet::self_signing_keys_b(),
+            )
+            .await;
+        } else {
+            t.pin_bob().await;
+        }
+        t.bob_membership_change(departure.clone()).await;
+        let removed = assert_next_with_timeout!(stream);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].user_id, t.bob_user_id());
+        assert_eq!(removed[0].changed_to, IdentityState::Pinned);
+
+        // His actual identity now violates again while he is gone. A queued
+        // Join followed by another persisted departure must not revive it.
+        t.unpin_bob_with(IdentityChangeDataSet::key_query_with_identity_a()).await;
+        t.bob_joins().await;
+        t.bob_membership_change(departure).await;
+        assert!(tokio::time::timeout(Duration::from_millis(200), stream.next()).await.is_err());
+
+        // Rejoining really does warn again. A stale Leave in front of the
+        // final Join must not remove that current active warning afterwards.
+        t.bob_joins().await;
+        t.bob_leaves().await;
+        t.bob_joins().await;
+        let rejoined = assert_next_with_timeout!(stream);
+        assert_eq!(rejoined.len(), 1);
+        assert_eq!(rejoined[0].user_id, t.bob_user_id());
+        assert_eq!(
+            rejoined[0].changed_to,
+            if verify { IdentityState::VerificationViolation } else { IdentityState::PinViolation }
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(200), stream.next()).await.is_err());
+        assert_eq!(members_requests(&server).await, 0);
+        assert!(!t.room().are_members_synced());
+    }
+
+    #[async_test]
+    async fn test_no_sync_stream_ends_if_departure_rebuild_cannot_read_members() {
+        let (mut t, server) = TestSetup::new_room_with_other_bob_unsynced().await;
+        t.room().inner.mark_members_synced();
+        t.unpin_bob().await;
+        let stream = t.subscribe_to_identity_status_changes_no_sync().await;
+        pin_mut!(stream);
+        let initial = assert_next_with_timeout!(stream);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].user_id, t.bob_user_id());
+        assert_eq!(initial[0].changed_to, IdentityState::PinViolation);
+
+        t.pin_bob().await;
+        t.bob_leaves().await;
+        // Bob's Leave is readable, so reconciliation detects the departure;
+        // another active member's unreadable event makes the rebuild fail.
+        t.make_stored_own_member_unreadable().await;
+        let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a failed rebuild ends the stream");
+        assert!(next.is_none(), "an unreadable rebuild must not publish a removal/all-clear");
+        assert_eq!(members_requests(&server).await, 0);
+        assert!(t.room().are_members_synced());
+    }
+
+    #[async_test]
+    async fn test_syncing_stream_keeps_queued_departure_and_historical_member_behavior() {
+        let (mut t, server) = TestSetup::new_room_with_other_bob_unsynced().await;
+        t.room().inner.mark_members_synced();
+        t.unpin_bob().await;
+        let stream = t.subscribe_to_identity_status_changes().await;
+        pin_mut!(stream);
+        let initial = assert_next_with_timeout!(stream);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].changed_to, IdentityState::PinViolation);
+
+        t.pin_bob().await;
+        t.bob_leaves().await;
+        let removed = assert_next_with_timeout!(stream);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].user_id, t.bob_user_id());
+        assert_eq!(removed[0].changed_to, IdentityState::Pinned);
+
+        // The existing default provider accepts historical stored members.
+        // Keep that API's behavior, even though the opt-in stream excludes them.
+        t.unpin_bob_with(IdentityChangeDataSet::key_query_with_identity_a()).await;
+        let historical = assert_next_with_timeout!(stream);
+        assert_eq!(historical.len(), 1);
+        assert_eq!(historical[0].user_id, t.bob_user_id());
+        assert_eq!(historical[0].changed_to, IdentityState::PinViolation);
+        assert_eq!(members_requests(&server).await, 0);
+    }
+
+    #[test]
+    fn test_stored_reconciliation_keeps_own_identity_excluded_from_publication() {
+        use matrix_sdk_base::crypto::IdentityStatusChange;
+        use ruma::user_id;
+
+        let own_user_id = user_id!("@example:localhost");
+        let other = IdentityStatusChange {
+            user_id: user_id!("@bob:localhost").to_owned(),
+            changed_to: IdentityState::Pinned,
+        };
+        let own = IdentityStatusChange {
+            user_id: own_user_id.to_owned(),
+            changed_to: IdentityState::PinViolation,
+        };
+        assert_eq!(
+            super::filter_non_self(vec![own.clone(), other.clone()], own_user_id),
+            vec![other]
+        );
+        assert!(super::filter_for_initial_update(vec![own], own_user_id).is_empty());
+    }
+
+    #[async_test]
+    async fn test_no_sync_stream_does_not_start_from_an_unreadable_member_list() {
+        // Given a room containing us and Bob whose stored member list is
+        // marked complete, with its own recording mock server
+        let (t, server) = TestSetup::new_room_with_other_bob_unsynced().await;
+        t.room().inner.mark_members_synced();
+
+        // And Bob's identity is pinned: the stored-members stream starts and
+        // reports nobody (a known empty state, unlike the failure below)
+        t.pin_bob().await;
+        let known_empty = t.subscribe_to_identity_status_changes_no_sync().await;
+        pin_mut!(known_empty);
+        assert!(known_empty.next().now_or_never().is_none());
+
+        // When Bob's stored member event can no longer be read from this
+        // device's store
+        t.make_stored_bob_member_unreadable().await;
+        assert!(t.room().members_no_sync(RoomMemberships::JOIN).await.is_err());
+
+        // Then the stored-members stream refuses to start: an unreadable
+        // member list is not an empty one
+        assert!(t.room().subscribe_to_identity_status_changes_no_sync().await.is_err());
+
+        // And nothing asked the homeserver, and the list stays marked complete
+        assert_eq!(members_requests(&server).await, 0);
+        assert!(t.room().are_members_synced());
+    }
+
+    #[async_test]
+    async fn test_no_sync_stream_ends_when_a_stored_member_cannot_be_read() {
+        // Given a room containing us and Bob, who is unpinned, listened to
+        // through the stored-members stream
+        let (t, server) = TestSetup::new_room_with_other_bob_unsynced().await;
+        t.room().inner.mark_members_synced();
+        t.unpin_bob().await;
+        let stream = t.subscribe_to_identity_status_changes_no_sync().await;
+        pin_mut!(stream);
+        let change1 = assert_next_with_timeout!(stream);
+        assert_eq!(change1[0].user_id, t.bob_user_id());
+        assert_eq!(change1[0].changed_to, IdentityState::PinViolation);
+
+        // When his stored member event can no longer be read, and then his
+        // identity changes
+        t.make_stored_bob_member_unreadable().await;
+        t.pin_bob().await;
+
+        // Then the stream ends rather than dropping the change silently
+        let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the stream ends instead of waiting");
+        assert!(next.is_none(), "a failed stored read is not reported as no change");
+
+        // And nothing asked the homeserver
+        assert_eq!(members_requests(&server).await, 0);
+    }
+
+    /// Requests for a room member list received by `server`.
+    async fn members_requests(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("Request recording is on")
+            .iter()
+            .filter(|request| request.url.path().ends_with("/members"))
+            .count()
+    }
+
     // TODO: I (andyb) haven't figured out how to test room membership changes
     // that affect our own user (they should not be shown). Specifically, I
     // haven't figure out how to get out own user into a non-pinned state.
@@ -596,7 +1178,7 @@ mod tests {
     mod test_setup {
         use futures_core::Stream;
         use matrix_sdk_base::{
-            RoomState,
+            RoomState, StateChanges,
             crypto::{
                 IdentityStatusChange, OtherUserIdentity,
                 testing::simulate_key_query_response_for_verification,
@@ -610,8 +1192,10 @@ mod tests {
         use ruma::{
             OwnedUserId, TransactionId, UserId,
             api::client::keys::{get_keys, get_keys::v3::Response as KeyQueryResponse},
-            events::room::member::MembershipState,
-            owned_user_id, user_id,
+            events::{AnySyncStateEvent, StateEventType, room::member::MembershipState},
+            owned_user_id,
+            serde::Raw,
+            user_id,
         };
         use serde_json::json;
         use wiremock::{
@@ -652,13 +1236,37 @@ mod tests {
                     &mut sync_response_builder,
                     &client,
                     &bob_user_id,
+                    true,
                 )
                 .await;
                 Self { client, bob_user_id, sync_response_builder, room }
             }
 
+            /// A room with Bob whose member list is not marked complete, and
+            /// its own (not pooled) mock server, kept alive and recording every
+            /// request so a test can count member-list requests.
+            pub(super) async fn new_room_with_other_bob_unsynced() -> (Self, MockServer) {
+                let server = MockServer::builder().start().await;
+                mock_members_request(&server).await;
+                mock_secret_storage_default_key(&server).await;
+                let client = logged_in_client(Some(server.uri())).await;
+                let (bob_user_id, mut sync_response_builder) = Self::init_client(&client).await;
+                let room = create_room_with_other_member(
+                    &mut sync_response_builder,
+                    &client,
+                    &bob_user_id,
+                    false,
+                )
+                .await;
+                (Self { client, bob_user_id, sync_response_builder, room }, server)
+            }
+
             pub(super) fn bob_user_id(&self) -> &UserId {
                 &self.bob_user_id
+            }
+
+            pub(super) fn room(&self) -> &Room {
+                &self.room
             }
 
             pub(super) async fn pin_bob(&self) {
@@ -802,9 +1410,62 @@ mod tests {
                     .expect("Should be able to subscribe")
             }
 
+            pub(super) async fn subscribe_to_identity_status_changes_no_sync(
+                &self,
+            ) -> impl Stream<Item = Vec<IdentityStatusChange>> + use<> {
+                self.room
+                    .subscribe_to_identity_status_changes_no_sync()
+                    .await
+                    .expect("Should be able to subscribe")
+            }
+
+            /// Replace Bob's member event in this device's state store with a
+            /// copy that cannot be read (it has no `membership`). The store
+            /// keeps his indexed Join membership, so a later local read of the
+            /// member list or of Bob fails. Nothing is synced or sent.
+            pub(super) async fn make_stored_bob_member_unreadable(&self) {
+                self.make_stored_member_unreadable(&self.bob_user_id).await;
+            }
+
+            pub(super) async fn make_stored_own_member_unreadable(&self) {
+                self.make_stored_member_unreadable(self.room.own_user_id()).await;
+            }
+
+            async fn make_stored_member_unreadable(&self, user_id: &UserId) {
+                let unreadable: Raw<AnySyncStateEvent> = Raw::from_json_string(
+                    json!({
+                        "type": "m.room.member",
+                        "state_key": user_id,
+                        "sender": user_id,
+                        "event_id": "$unreadable-member",
+                        "origin_server_ts": 1,
+                        "content": {},
+                    })
+                    .to_string(),
+                )
+                .expect("Should be valid JSON");
+                let mut changes = StateChanges::default();
+                changes
+                    .state
+                    .entry(self.room.room_id().to_owned())
+                    .or_default()
+                    .entry(StateEventType::RoomMember)
+                    .or_default()
+                    .insert(user_id.to_string(), unreadable);
+                self.client
+                    .state_store()
+                    .save_changes(&changes)
+                    .await
+                    .expect("Should save to this device's store");
+            }
+
             async fn init() -> (Client, OwnedUserId, SyncResponseBuilder) {
                 let (client, _server) = create_client_and_server().await;
+                let (bob_user_id, sync_response_builder) = Self::init_client(&client).await;
+                (client, bob_user_id, sync_response_builder)
+            }
 
+            async fn init_client(client: &Client) -> (OwnedUserId, SyncResponseBuilder) {
                 // Ensure our user has cross-signing keys etc.
                 client
                     .olm_machine()
@@ -821,7 +1482,7 @@ mod tests {
 
                 let sync_response_builder = SyncResponseBuilder::default();
 
-                (client, bob_user_id, sync_response_builder)
+                (bob_user_id, sync_response_builder)
             }
 
             async fn change_bob_identity(
@@ -836,7 +1497,7 @@ mod tests {
                 self.bob_crypto_other_identity().await
             }
 
-            async fn bob_membership_change(&mut self, new_state: MembershipState) {
+            pub(super) async fn bob_membership_change(&mut self, new_state: MembershipState) {
                 let f = EventFactory::new().sender(user_id!("@example:localhost"));
                 let sync_response = self
                     .sync_response_builder
@@ -912,6 +1573,7 @@ mod tests {
             builder: &mut SyncResponseBuilder,
             client: &Client,
             other_user_id: &UserId,
+            members_synced: bool,
         ) -> Room {
             let f = EventFactory::new().sender(user_id!("@example:localhost"));
             let create_room_sync_response = builder
@@ -925,7 +1587,9 @@ mod tests {
                 .build_sync_response();
             client.process_sync(create_room_sync_response).await.unwrap();
             let room = client.get_room(&DEFAULT_TEST_ROOM_ID).expect("Room should exist");
-            room.inner.mark_members_synced();
+            if members_synced {
+                room.inner.mark_members_synced();
+            }
 
             assert_eq!(room.state(), RoomState::Joined);
             assert_eq!(

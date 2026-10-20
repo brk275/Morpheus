@@ -259,6 +259,7 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
             ui.set_account_menu_open(false);
             crate::matrix_links::clear(ui);
             crate::thread_browser::withdraw(ui);
+            crate::withdraw_call_bar(ui);
             ui.set_manage_accounts_open(true);
             // The same read-only refresh the account menu's entry runs.
             ui.invoke_manage_accounts();

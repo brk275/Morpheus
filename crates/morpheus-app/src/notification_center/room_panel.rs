@@ -273,6 +273,7 @@ impl RoomPanel {
         }
         crate::matrix_links::clear(&ui);
         crate::thread_browser::withdraw(&ui);
+        crate::withdraw_call_bar(&ui);
         global.set_open(true);
         self.read(&ui, operation, selection, room_id.to_owned());
     }

@@ -451,6 +451,14 @@ impl RoomLeaveUi {
         // Admission refuses an open browser. Retire any stale page/task as
         // well, before this dialog is shown; ordinary clear never calls back.
         crate::thread_browser::clear(ui);
+        // The dialog protects the call bar: a bar click still waiting for the
+        // call controller is refused for good, synchronously, before the
+        // view opens. Only an admitted start gets here, so a refused one
+        // leaves every other surface's pending work as it was.
+        crate::withdraw_call_bar(ui);
+        // Visible identity details were refused by room-leave-blocked.
+        // An admitted Leave also retires their older focus return intent.
+        crate::identity_warnings::withdraw(ui);
         let cancellation = RoomLeaveCancellation::new();
         let id = {
             let mut state = self.lock();

@@ -322,6 +322,42 @@ struct RunningCall {
     capture_stop: Arc<CaptureStop>,
 }
 
+/// One call as a control observed it, read together with its status
+/// (`CallController::observe`): its account and room, the call's own
+/// lifecycle generation (`call`: `RunningCall::token`, unchanged by rejoins)
+/// and the media generation of the join that was shown (`presentation`:
+/// `RunningCall::presentation`, replaced by each rejoin). A control acting on
+/// it later is admitted only under the slot's lock, only for exactly that
+/// call (and, for its media, exactly that join); another call never matches,
+/// whatever its account and room.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedCall {
+    pub account_id: String,
+    pub room_id: String,
+    pub call: u64,
+    pub presentation: u64,
+}
+
+impl RunningCall {
+    /// Exactly the observed call, through any of its joins, not yet leaving.
+    fn is_call(&self, observed: &ObservedCall) -> bool {
+        observed.call != 0
+            && self.token == observed.call
+            && self.account_id == observed.account_id
+            && self.room_id == observed.room_id
+            && self.cancel.is_some()
+    }
+
+    /// Exactly the observed call's shown join, not yet leaving or stopping
+    /// its capture.
+    fn is_join(&self, observed: &ObservedCall) -> bool {
+        self.is_call(observed)
+            && observed.presentation != 0
+            && self.presentation == observed.presentation
+            && !self.capture_stop.requested()
+    }
+}
+
 /// An applied audio state is scoped to one call generation. A control click
 /// made for an earlier generation cannot change a later join.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1092,6 +1128,151 @@ impl CallController {
         Ok(())
     }
 
+    /// The exact call `status` describes, for a control to act on later (see
+    /// `ObservedCall`): one snapshot of the status, the running call's own
+    /// generation and its current join, read together under the slot's lock.
+    /// A running status (starting, joined, reconnecting) is published only
+    /// under that lock by the call in the slot, so `None` unless `status` is
+    /// still current and names that call. An opening slot, a leave and a
+    /// failed cleanup expose no exact generation.
+    pub async fn observe(&self, status: &CallStatus) -> Option<ObservedCall> {
+        let slot = self.shared.slot.lock().await;
+        self.observe_slot(&slot, status)
+    }
+
+    /// `observe` without waiting, for a check on the UI thread: `Err` while
+    /// the slot is busy, so the caller cannot tell.
+    pub fn try_observe(
+        &self,
+        status: &CallStatus,
+    ) -> Result<Option<ObservedCall>, tokio::sync::TryLockError> {
+        let slot = self.shared.slot.try_lock()?;
+        Ok(self.observe_slot(&slot, status))
+    }
+
+    fn observe_slot(&self, slot: &CallSlot, status: &CallStatus) -> Option<ObservedCall> {
+        let (account_id, room_id) = match status {
+            CallStatus::Starting {
+                account_id,
+                room_id,
+            } => (account_id, room_id),
+            CallStatus::Joined { account_id, call }
+            | CallStatus::Reconnecting {
+                account_id, call, ..
+            } => (account_id, &call.room_id),
+            _ => return None,
+        };
+        let CallSlot::Running(running) = slot else {
+            return None;
+        };
+        if self.status() != *status
+            || running.cancel.is_none()
+            || running.account_id != *account_id
+            || running.room_id != *room_id
+        {
+            return None;
+        }
+        Some(ObservedCall {
+            account_id: account_id.clone(),
+            room_id: room_id.clone(),
+            call: running.token,
+            presentation: running.presentation,
+        })
+    }
+
+    /// Mute or unmute exactly the observed join (see `ObservedCall`): checked,
+    /// with the caller's own `admit` (its security and account context from
+    /// the click), under the slot's lock right before the change. Any other
+    /// call or join is `StaleCall` and is not touched.
+    pub async fn set_microphone_muted_for(
+        &self,
+        observed: &ObservedCall,
+        muted: bool,
+        admit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), CallControllerError> {
+        self.with_observed_audio_controls(observed, admit, |controls| {
+            controls.set_microphone_muted(muted)
+        })
+        .await
+    }
+
+    /// Deafen or undeafen exactly the observed join, as
+    /// `set_microphone_muted_for`.
+    pub async fn set_deafened_for(
+        &self,
+        observed: &ObservedCall,
+        deafened: bool,
+        admit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), CallControllerError> {
+        self.with_observed_audio_controls(observed, admit, |controls| {
+            controls.set_deafened(deafened)
+        })
+        .await
+    }
+
+    /// Stop a capture of exactly the observed join; it never starts one.
+    /// Admission (as `set_microphone_muted_for`) and the enqueue on that
+    /// call's own capture worker happen in one section under the slot's lock,
+    /// which is this Stop's linearization point. The enqueue never waits: a
+    /// full queue is `AlreadyBusy` and nothing is sent. Once queued, the Stop
+    /// is not checked again when the worker applies it. The queue belongs to
+    /// this call alone, so it can only stop this call's capture of `kind`
+    /// (if that still runs), also after a rejoin of the same call, whose
+    /// capture continues paused; it can never reach another call.
+    pub async fn stop_video_capture_for(
+        &self,
+        observed: &ObservedCall,
+        kind: CaptureKind,
+        admit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), CallControllerError> {
+        let (reply, result) = oneshot::channel();
+        {
+            let slot = self.shared.slot.lock().await;
+            let CallSlot::Running(running) = &*slot else {
+                return Err(CallControllerError::StaleCall);
+            };
+            if !running.is_join(observed)
+                || self.video_token() != observed.presentation
+                || !self.status().controls_available()
+                || !admit()
+            {
+                return Err(CallControllerError::StaleCall);
+            }
+            running
+                .video_commands
+                .try_send(CaptureCommand::Stop { kind, reply })
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => CallControllerError::AlreadyBusy,
+                    mpsc::error::TrySendError::Closed(_) => CallControllerError::WorkerStopped,
+                })?;
+        }
+        result
+            .await
+            .map_err(|_| CallControllerError::WorkerStopped)??;
+        Ok(())
+    }
+
+    async fn with_observed_audio_controls(
+        &self,
+        observed: &ObservedCall,
+        admit: &(dyn Fn() -> bool + Send + Sync),
+        change: impl FnOnce(&AudioControls) -> Result<(), MediaError>,
+    ) -> Result<(), CallControllerError> {
+        let slot = self.shared.slot.lock().await;
+        let CallSlot::Running(running) = &*slot else {
+            return Err(CallControllerError::StaleCall);
+        };
+        if !running.is_join(observed) || self.audio_token() != observed.presentation || !admit() {
+            return Err(CallControllerError::StaleCall);
+        }
+        let controls = running
+            .audio_controls
+            .as_ref()
+            .ok_or(CallControllerError::Media(MediaError::ControlNotRunning))?;
+        change(controls)?;
+        Ok(())
+    }
+
     /// Snapshot/read use no watch lock on a native audio callback. A new call
     /// token permanently invalidates an earlier ring even after that call ends.
     pub(crate) fn reserve_ringing_request(&self) -> Option<RingRequestLease> {
@@ -1389,6 +1570,28 @@ impl CallController {
     /// A failed leave remains blocked. Only `abandon_failed_leave` can clear
     /// the block after the worker has terminated and local media has stopped.
     pub async fn end_call(&self) -> Result<(), CallControllerError> {
+        self.end_call_matching(None, &|| true).await
+    }
+
+    /// Leave exactly the observed call (any of its joins), as `end_call`. Its
+    /// call generation, account and room, and the caller's own `admit` (its
+    /// security and account context from the click), are checked under the
+    /// slot's lock in the same step that takes the call's cancellation. Any
+    /// other call, an opening slot, a leave already under way and a failed
+    /// cleanup are `StaleCall` and are not touched.
+    pub async fn end_call_for(
+        &self,
+        observed: &ObservedCall,
+        admit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), CallControllerError> {
+        self.end_call_matching(Some(observed), admit).await
+    }
+
+    async fn end_call_matching(
+        &self,
+        observed: Option<&ObservedCall>,
+        admit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), CallControllerError> {
         enum PriorOperation {
             Opening {
                 done: watch::Receiver<bool>,
@@ -1401,6 +1604,8 @@ impl CallController {
         let prior = {
             let slot = self.shared.slot.lock().await;
             match &*slot {
+                // An observed leave acts only on its running call, below.
+                _ if observed.is_some() => None,
                 CallSlot::OpeningSlot {
                     account_id,
                     room_id,
@@ -1454,6 +1659,14 @@ impl CallController {
         }
         let (cancel, mut done, token, presentation, account_id, room_id) = {
             let mut slot = self.shared.slot.lock().await;
+            if let Some(observed) = observed
+                && !matches!(
+                    &*slot,
+                    CallSlot::Running(running) if running.is_call(observed) && admit()
+                )
+            {
+                return Err(CallControllerError::StaleCall);
+            }
             let running = match &mut *slot {
                 CallSlot::Idle => return Ok(()),
                 CallSlot::OpeningSlot { .. } | CallSlot::CleanupFailed { .. } => {
@@ -4002,6 +4215,473 @@ mod tests {
         drop(pending);
         assert!(!gate.allowed(initial));
         assert!(gate.allowed(pending_epoch));
+    }
+
+    struct TestCall {
+        running: RunningCall,
+        cancelled: oneshot::Receiver<()>,
+        done: watch::Sender<Option<Result<(), String>>>,
+        video: mpsc::Receiver<CaptureCommand>,
+    }
+
+    /// A call of the same account and room every time: only its generations
+    /// tell two of them apart.
+    fn test_call(token: u64, presentation: u64) -> TestCall {
+        let (cancel, cancelled) = oneshot::channel();
+        let (done, done_rx) = watch::channel(None);
+        let (video_commands, video) = mpsc::channel(1);
+        TestCall {
+            running: RunningCall {
+                token,
+                presentation,
+                account_id: "account-a".into(),
+                room_id: "!room:example.org".into(),
+                cancel: Some(cancel),
+                done: done_rx,
+                audio_controls: None,
+                video_commands,
+                capture_stop: Arc::new(CaptureStop::default()),
+            },
+            cancelled,
+            done,
+            video,
+        }
+    }
+
+    fn test_joined() -> CallStatus {
+        CallStatus::Joined {
+            account_id: "account-a".into(),
+            call: CallInfo {
+                room_id: "!room:example.org".into(),
+                slot_id: "m.call#room".into(),
+                membership_id: "member".into(),
+                local_identity: "identity".into(),
+            },
+        }
+    }
+
+    fn observed(call: u64, presentation: u64) -> ObservedCall {
+        ObservedCall {
+            account_id: "account-a".into(),
+            room_id: "!room:example.org".into(),
+            call,
+            presentation,
+        }
+    }
+
+    /// Install `running` joined, as `start_audio_owned` and a rejoin leave it:
+    /// the call's own identity first, then its join's generations.
+    fn install_test_call(shared: &Shared, slot: &mut CallSlot, running: RunningCall) {
+        shared
+            .active_call_token
+            .store(running.token, Ordering::SeqCst);
+        shared
+            .active_video_token
+            .store(running.presentation, Ordering::SeqCst);
+        shared
+            .active_audio_token
+            .store(running.presentation, Ordering::SeqCst);
+        *slot = CallSlot::Running(running);
+        shared.status.send_replace(test_joined());
+    }
+
+    fn untouched(slot: &CallSlot, token: u64) -> bool {
+        matches!(
+            slot,
+            CallSlot::Running(running)
+                if running.token == token
+                    && running.cancel.is_some()
+                    && !running.capture_stop.requested()
+        )
+    }
+
+    fn test_controller() -> (tempfile::TempDir, Arc<CallController>) {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let controller = Arc::new(CallController::new(manager, UpdateActivity::default()));
+        (root, controller)
+    }
+
+    #[tokio::test]
+    async fn observed_leave_ends_only_the_exact_call() {
+        let (_root, controller) = test_controller();
+        let TestCall {
+            running,
+            mut cancelled,
+            done,
+            mut video,
+        } = test_call(9, 9);
+        {
+            let mut slot = controller.shared.slot.lock().await;
+            install_test_call(&controller.shared, &mut slot, running);
+        }
+        // Call 7 was shown; call 9 replaced it in the same room and account.
+        // Neither the names, a zero generation nor a refused admission match.
+        let other_account = ObservedCall {
+            account_id: "account-b".into(),
+            ..observed(9, 9)
+        };
+        for (stale, admitted) in [
+            (observed(7, 7), true),
+            (observed(0, 0), true),
+            (other_account, true),
+            (observed(9, 9), false),
+        ] {
+            let admit = move || admitted;
+            assert!(matches!(
+                controller.end_call_for(&stale, &admit).await,
+                Err(CallControllerError::StaleCall)
+            ));
+        }
+        assert!(untouched(&*controller.shared.slot.lock().await, 9));
+        assert!(matches!(
+            cancelled.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(video.try_recv().is_err());
+        assert_eq!(controller.status(), test_joined());
+        assert_eq!(controller.video_token(), 9);
+        assert_eq!(controller.call_token(), 9);
+
+        let leaving = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.end_call_for(&observed(9, 9), &|| true).await })
+        };
+        (&mut cancelled).await.unwrap();
+        assert!(matches!(controller.status(), CallStatus::Ending { .. }));
+        assert_eq!(controller.video_token(), 0);
+        // Its own stable identity retires with it (compare-exchange on 9).
+        assert_eq!(controller.call_token(), 0);
+        // A second Leave of the same call joins nothing: it is already leaving.
+        assert!(matches!(
+            controller.end_call_for(&observed(9, 9), &|| true).await,
+            Err(CallControllerError::StaleCall)
+        ));
+        done.send_replace(Some(Ok(())));
+        leaving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_observed_actions_cannot_cross_a_same_room_replacement() {
+        let (_root, controller) = test_controller();
+        let first = test_call(7, 7);
+        let mut held = controller.shared.slot.lock().await;
+        install_test_call(&controller.shared, &mut held, first.running);
+        // Clicks for call 7 queue behind the slot's lock (held as by its worker).
+        let leave = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.end_call_for(&observed(7, 7), &|| true).await })
+        };
+        let stop = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                controller
+                    .stop_video_capture_for(&observed(7, 7), CaptureKind::Camera, &|| true)
+                    .await
+            })
+        };
+        let mute = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                controller
+                    .set_microphone_muted_for(&observed(7, 7), true, &|| true)
+                    .await
+            })
+        };
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!leave.is_finished() && !stop.is_finished() && !mute.is_finished());
+        // Call 7 ends and call 9 starts in the same room before they run.
+        let TestCall {
+            running,
+            mut cancelled,
+            done: _done,
+            mut video,
+        } = test_call(9, 9);
+        install_test_call(&controller.shared, &mut held, running);
+        drop(held);
+        for action in [leave, stop, mute] {
+            assert!(matches!(
+                action.await.unwrap(),
+                Err(CallControllerError::StaleCall)
+            ));
+        }
+        assert!(untouched(&*controller.shared.slot.lock().await, 9));
+        assert!(matches!(
+            cancelled.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(video.try_recv().is_err());
+        assert_eq!(controller.status(), test_joined());
+        assert_eq!(controller.video_token(), 9);
+        assert_eq!(controller.audio_token(), 9);
+        assert_eq!(controller.call_token(), 9);
+    }
+
+    #[tokio::test]
+    async fn a_full_capture_queue_refuses_an_observed_stop_without_waiting() {
+        let (_root, controller) = test_controller();
+        let TestCall {
+            running,
+            done: _done,
+            mut video,
+            ..
+        } = test_call(7, 7);
+        let worker_queue = running.video_commands.clone();
+        {
+            let mut slot = controller.shared.slot.lock().await;
+            install_test_call(&controller.shared, &mut slot, running);
+        }
+        // The call's worker has not taken an earlier command yet.
+        let (earlier, _earlier_reply) = oneshot::channel();
+        worker_queue
+            .try_send(CaptureCommand::Stop {
+                kind: CaptureKind::Screen,
+                reply: earlier,
+            })
+            .unwrap();
+        assert!(matches!(
+            controller
+                .stop_video_capture_for(&observed(7, 7), CaptureKind::Camera, &|| true)
+                .await,
+            Err(CallControllerError::AlreadyBusy)
+        ));
+        // Only the earlier command is queued; nothing waited for space.
+        assert!(matches!(
+            video.try_recv(),
+            Ok(CaptureCommand::Stop {
+                kind: CaptureKind::Screen,
+                ..
+            })
+        ));
+        assert!(video.try_recv().is_err());
+        assert!(untouched(&*controller.shared.slot.lock().await, 7));
+    }
+
+    #[tokio::test]
+    async fn security_change_while_queued_refuses_the_observed_call() {
+        let (_root, controller) = test_controller();
+        let TestCall {
+            running,
+            mut cancelled,
+            done: _done,
+            mut video,
+        } = test_call(7, 7);
+        let mut held = controller.shared.slot.lock().await;
+        install_test_call(&controller.shared, &mut held, running);
+        // The click's own security context, checked again at admission.
+        let context = Arc::new(AtomicBool::new(true));
+        let leave = {
+            let controller = controller.clone();
+            let context = context.clone();
+            tokio::spawn(async move {
+                let admit = move || context.load(Ordering::SeqCst);
+                controller.end_call_for(&observed(7, 7), &admit).await
+            })
+        };
+        let stop = {
+            let controller = controller.clone();
+            let context = context.clone();
+            tokio::spawn(async move {
+                let admit = move || context.load(Ordering::SeqCst);
+                controller
+                    .stop_video_capture_for(&observed(7, 7), CaptureKind::Screen, &admit)
+                    .await
+            })
+        };
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        context.store(false, Ordering::SeqCst);
+        drop(held);
+        for action in [leave, stop] {
+            assert!(matches!(
+                action.await.unwrap(),
+                Err(CallControllerError::StaleCall)
+            ));
+        }
+        assert!(untouched(&*controller.shared.slot.lock().await, 7));
+        assert!(matches!(
+            cancelled.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(video.try_recv().is_err());
+        assert_eq!(controller.status(), test_joined());
+    }
+
+    #[tokio::test]
+    async fn observed_media_controls_reach_only_the_exact_join() {
+        let (_root, controller) = test_controller();
+        let TestCall {
+            running,
+            mut cancelled,
+            done,
+            mut video,
+        } = test_call(7, 7);
+        {
+            let mut slot = controller.shared.slot.lock().await;
+            install_test_call(&controller.shared, &mut slot, running);
+        }
+        // The exact join: Stop reaches this call's own capture worker.
+        let stopping = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                controller
+                    .stop_video_capture_for(&observed(7, 7), CaptureKind::Camera, &|| true)
+                    .await
+            })
+        };
+        let Some(CaptureCommand::Stop { kind, reply }) = video.recv().await else {
+            panic!("expected the observed join's Stop");
+        };
+        assert_eq!(kind, CaptureKind::Camera);
+        reply.send(Ok(())).unwrap();
+        stopping.await.unwrap().unwrap();
+        // Mute reaches the join's audio (not running in this fixture).
+        assert!(matches!(
+            controller
+                .set_microphone_muted_for(&observed(7, 7), true, &|| true)
+                .await,
+            Err(CallControllerError::Media(MediaError::ControlNotRunning))
+        ));
+        assert!(matches!(
+            controller
+                .set_deafened_for(&observed(7, 7), true, &|| false)
+                .await,
+            Err(CallControllerError::StaleCall)
+        ));
+
+        // A rejoin of the same call: the shown join's media is gone.
+        {
+            let mut slot = controller.shared.slot.lock().await;
+            let CallSlot::Running(running) = &mut *slot else {
+                unreachable!()
+            };
+            running.presentation = 8;
+            controller
+                .shared
+                .active_video_token
+                .store(8, Ordering::SeqCst);
+            controller
+                .shared
+                .active_audio_token
+                .store(8, Ordering::SeqCst);
+        }
+        assert_eq!(
+            controller.observe(&controller.status()).await,
+            Some(observed(7, 8))
+        );
+        assert!(matches!(
+            controller
+                .stop_video_capture_for(&observed(7, 7), CaptureKind::Camera, &|| true)
+                .await,
+            Err(CallControllerError::StaleCall)
+        ));
+        assert!(matches!(
+            controller
+                .set_microphone_muted_for(&observed(7, 7), false, &|| true)
+                .await,
+            Err(CallControllerError::StaleCall)
+        ));
+        assert!(matches!(
+            controller
+                .set_deafened_for(&observed(7, 8), true, &|| true)
+                .await,
+            Err(CallControllerError::Media(MediaError::ControlNotRunning))
+        ));
+        assert!(video.try_recv().is_err());
+        // Leave still names the call through its rejoin.
+        let leaving = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.end_call_for(&observed(7, 7), &|| true).await })
+        };
+        (&mut cancelled).await.unwrap();
+        // A leaving call's capture can no longer be addressed.
+        assert!(matches!(
+            controller
+                .stop_video_capture_for(&observed(7, 8), CaptureKind::Screen, &|| true)
+                .await,
+            Err(CallControllerError::StaleCall)
+        ));
+        done.send_replace(Some(Ok(())));
+        leaving.await.unwrap().unwrap();
+        assert!(video.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn observation_names_only_a_current_running_call() {
+        let (_root, controller) = test_controller();
+        assert_eq!(controller.observe(&controller.status()).await, None);
+        let room = || "!room:example.org".to_owned();
+        let account = || "account-a".to_owned();
+        let TestCall {
+            running,
+            done: _done,
+            ..
+        } = test_call(7, 9);
+        {
+            let mut slot = controller.shared.slot.lock().await;
+            install_test_call(&controller.shared, &mut slot, running);
+        }
+        // The call's own generation and its current join, read together.
+        let joined = controller.status();
+        assert_eq!(controller.observe(&joined).await, Some(observed(7, 9)));
+        assert_eq!(
+            controller.try_observe(&joined).unwrap(),
+            Some(observed(7, 9))
+        );
+        // A status that is no longer current names nothing.
+        let starting = CallStatus::Starting {
+            account_id: account(),
+            room_id: room(),
+        };
+        assert_eq!(controller.observe(&starting).await, None);
+        controller.shared.status.send_replace(starting.clone());
+        assert_eq!(controller.observe(&starting).await, Some(observed(7, 9)));
+        assert_eq!(controller.observe(&joined).await, None);
+        // A status naming another room never names the call in the slot.
+        let elsewhere = CallStatus::Starting {
+            account_id: account(),
+            room_id: "!other:example.org".into(),
+        };
+        controller.shared.status.send_replace(elsewhere.clone());
+        assert_eq!(controller.observe(&elsewhere).await, None);
+        // While the slot is busy the UI thread cannot tell, and says so.
+        controller.shared.status.send_replace(joined.clone());
+        {
+            let _held = controller.shared.slot.lock().await;
+            assert!(controller.try_observe(&joined).is_err());
+        }
+        // A leave under way is no longer observable.
+        {
+            let mut slot = controller.shared.slot.lock().await;
+            let CallSlot::Running(running) = &mut *slot else {
+                unreachable!()
+            };
+            running.cancel.take();
+        }
+        assert_eq!(controller.observe(&joined).await, None);
+        // Opening, leaving and a failed cleanup expose no exact generation.
+        for status in [
+            CallStatus::OpeningSlot {
+                account_id: account(),
+                room_id: room(),
+            },
+            CallStatus::Ending {
+                account_id: account(),
+                room_id: room(),
+            },
+            CallStatus::CleanupFailed {
+                account_id: account(),
+                room_id: room(),
+                reason: "leave status unknown".into(),
+            },
+            CallStatus::Idle,
+        ] {
+            controller.shared.status.send_replace(status.clone());
+            assert_eq!(controller.observe(&status).await, None);
+        }
     }
 
     #[test]

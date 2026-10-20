@@ -21,6 +21,7 @@ implemented and what still needs verification.
 - [Room media browser](ROOM_MEDIA.md).
 - [Room roles and permissions](ROOM_PERMISSIONS.md).
 - [Incoming calls](INCOMING_CALLS.md) and [voice spaces](VOICE_SPACES.md).
+- [The call bar](CALL_BAR.md) outside the call page.
 
 ## Build and contribute
 

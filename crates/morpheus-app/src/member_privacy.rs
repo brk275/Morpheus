@@ -123,6 +123,25 @@ pub(crate) fn is_open(ui: &AppWindow) -> bool {
     ui.global::<MemberPrivacy>().get_inspector().open
 }
 
+/// Opens the inspector for `user` from another surface (identity warnings),
+/// only if it may open now: the window's member-inspector admission (live
+/// account and room; no sign-in, account access, account switch, pending
+/// security, key or SAS step, or other modal) and the security gate are read
+/// synchronously first, and an open inspector is never replaced. The members
+/// list's own entry is unchanged. `true` when the inspector is open after.
+pub(crate) fn inspect_admitted(
+    ui: &AppWindow,
+    gate: &crate::security::SecurityGate,
+    user: &str,
+) -> bool {
+    let privacy = ui.global::<MemberPrivacy>();
+    if !ui.get_member_inspector_allowed() || gate.blocked() || privacy.get_inspector().open {
+        return false;
+    }
+    privacy.invoke_inspect(user.into());
+    privacy.get_inspector().open
+}
+
 /// Account change, logout, detach and shutdown: every member detail and
 /// ignore-list row goes now, without waiting for a task.
 pub(crate) fn clear_presentation(ui: &AppWindow) {
@@ -340,6 +359,7 @@ impl MemberPrivacyUi {
         }
         crate::matrix_links::clear(ui);
         crate::thread_browser::withdraw(ui);
+        crate::withdraw_call_bar(ui);
         let room = ui.get_active_room_id().to_string();
         let Some(selection) = self.live_account(ui) else {
             return;
@@ -785,6 +805,7 @@ impl MemberPrivacyUi {
         if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
             return;
         }
+        let mut reviewing = false;
         {
             let mut state = self.lock();
             let Some(panel) = state.panel.as_mut() else {
@@ -803,10 +824,17 @@ impl MemberPrivacyUi {
             {
                 panel.error.clear();
                 panel.review = Some(key.to_owned());
+                reviewing = true;
             } else {
                 panel.error = "That person is no longer in this list. Refresh and review it again."
                     .to_owned();
             }
+        }
+        // The review protects the call bar (MemberPrivacy.ignored.stage):
+        // a bar click still waiting is refused for good, synchronously,
+        // before the painted stage changes.
+        if reviewing {
+            crate::withdraw_call_bar(ui);
         }
         self.paint_panel(ui);
     }
@@ -858,6 +886,11 @@ impl MemberPrivacyUi {
                 }
             }
         };
+        // Sending keeps the call bar protected (MemberPrivacy.ignored.busy):
+        // withdrawn again, synchronously, before the painted state changes.
+        if started.is_some() {
+            crate::withdraw_call_bar(ui);
+        }
         self.paint_panel(ui);
         let Some((ids, user, baseline, selection, cancellation)) = started else {
             return;

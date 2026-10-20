@@ -897,6 +897,7 @@ fn show(
     });
     crate::matrix_links::clear(ui);
     crate::thread_browser::withdraw(ui);
+    crate::withdraw_call_bar(ui);
     ui.global::<SpaceExplorer>().set_open(true);
     step(ui, live, handle, Explorer::next_request);
 }

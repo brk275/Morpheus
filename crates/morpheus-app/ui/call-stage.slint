@@ -56,10 +56,26 @@ component StageAction inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <color> focus-color;
+    // While true the stage asks this control for keyboard focus (see
+    // CallStage.focus-stage); focus-granted reports that it took it.
+    in property <bool> focus-requested: false;
     out property <bool> has-hover: hit.has-hover;
     out property <bool> has-pressed: hit.pressed;
     callback activated();
+    callback focus-granted();
     forward-focus: keyboard-focus;
+    init => {
+        if root.focus-requested && root.enabled {
+            keyboard-focus.focus();
+            root.focus-granted();
+        }
+    }
+    changed focus-requested => {
+        if root.focus-requested && root.enabled {
+            keyboard-focus.focus();
+            root.focus-granted();
+        }
+    }
     accessible-role: button;
     accessible-label: root.label;
     accessible-enabled: root.enabled;
@@ -361,6 +377,20 @@ export component CallStage inherits Rectangle {
     property <int> focus-target: -1;
     // The tile to refocus after a pin change rebuilds the stage.
     property <int> restore-focus: -1;
+    // focus-stage found no tile: the participant list's own control takes
+    // focus once it exists, then this clears.
+    property <bool> roster-focus-requested: false;
+    // While true (set with the call page by the call bar's Return), keyboard
+    // focus moves to the stage (focus-stage); focus-taken reports that it
+    // actually arrived, so the request ends only then.
+    in property <bool> focus-wanted: false;
+    callback focus-taken();
+    init => {
+        if root.focus-wanted { root.focus-stage(); }
+    }
+    changed focus-wanted => {
+        if root.focus-wanted { root.focus-stage(); }
+    }
 
     // Featured mode: the featured tile above a row of page tiles, or beside
     // a column of them when the stage is much wider than it is tall.
@@ -413,6 +443,28 @@ export component CallStage inherits Rectangle {
             root.pin-tile(root.featured.id);
         }
         pinned
+    }
+
+    // Keyboard focus for a navigation that lands on the stage (the call
+    // bar's Return). The stage itself takes it at once (stage-focus), so it
+    // never stays on nothing, also on a narrow stage with nobody's video;
+    // then the featured tile, else the first tile on the page, takes it
+    // through the stage's own focus target, else the participant list's own
+    // Show or Hide control when the list fits. Should that tile be gone
+    // before it appears, focus simply stays on the stage. It only moves
+    // focus: nothing is pinned, paged, shown, hidden or activated.
+    public function focus-stage() {
+        root.roster-focus-requested = false;
+        stage-focus.focus();
+        if root.featured-visible {
+            root.restore-focus = -1;
+            root.focus-target = root.featured.id;
+        } else if root.count > 0 {
+            root.restore-focus = -1;
+            root.focus-target = root.tiles[0].id;
+        } else if root.roster-fits {
+            root.roster-focus-requested = true;
+        }
     }
 
     function tile-focus(id: int, on: bool) {
@@ -474,6 +526,34 @@ export component CallStage inherits Rectangle {
             wrap: word-wrap;
             horizontal-alignment: center;
         }
+    }
+
+    // The stage itself as a keyboard destination for focus-stage: visible
+    // (its own focus ring around the whole stage), announced, never a Tab
+    // stop and never taken by a click, so the call page's Tab order and
+    // pointer input are unchanged.
+    stage-focus := FocusScope {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        accessible-role: groupbox;
+        accessible-label: "Call stage, " + root.participants.length + " in call";
+        focus-gained(reason) => {
+            if root.focus-wanted { root.focus-taken(); }
+        }
+    }
+    if stage-focus.has-focus : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        border-radius: root.corner;
+        border-width: StyleTokens.focus-width;
+        border-color: root.palette.focus;
+        background: transparent;
     }
 
     if root.featured-visible : StageTile {
@@ -603,6 +683,8 @@ export component CallStage inherits Rectangle {
                 : self.has-hover ? root.button-hover : root.palette.panel;
             label: "Hide participant list";
             focus-color: root.palette.focus;
+            focus-requested: root.roster-focus-requested;
+            focus-granted => { root.roster-focus-requested = false; }
             activated => { root.show-roster = false; }
             hide-text := Text {
                 text: "Hide";
@@ -666,6 +748,8 @@ export component CallStage inherits Rectangle {
             : self.has-hover ? root.button-hover : root.palette.panel;
         label: "Show participant list, " + root.participants.length + " in call";
         focus-color: root.palette.focus;
+        focus-requested: root.roster-focus-requested;
+        focus-granted => { root.roster-focus-requested = false; }
         activated => { root.show-roster = true; }
         people-text := Text {
             text: "People · " + root.participants.length;

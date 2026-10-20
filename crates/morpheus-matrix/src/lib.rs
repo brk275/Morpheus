@@ -175,6 +175,13 @@ pub use own_verification::{
     OwnVerificationError, OwnVerificationPhase, OwnVerificationRequest, OwnVerificationResult,
     PendingOwnVerifications, VERIFICATION_REQUEST_LIFETIME, VerificationCancellation,
 };
+mod room_identity_warnings;
+pub use room_identity_warnings::{
+    IdentityWarning, IdentityWarningCancellation, IdentityWarningError, IdentityWarningKind,
+    IdentityWarningUpdate, IdentityWarningWatch, IdentityWarnings, MAX_IDENTITY_ID_DISPLAY_CHARS,
+    MAX_IDENTITY_NAME_CHARS, MAX_IDENTITY_WARNING_NAMES, MAX_IDENTITY_WARNINGS,
+    MAX_TRACKED_IDENTITY_WARNINGS,
+};
 
 use std::{
     collections::{HashMap, HashSet},

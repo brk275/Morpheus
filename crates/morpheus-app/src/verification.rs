@@ -498,6 +498,7 @@ fn request_own(window: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, acknowle
         return;
     };
     let operation = next_operation(window);
+    crate::withdraw_call_bar(window);
     window.set_sas_busy(true);
     window.set_sas_incoming_loading(false);
     window.set_sas_error("".into());
@@ -564,6 +565,7 @@ fn adopt(ui: &AppWindow, info: &OwnVerification) {
     ui.set_sas_other_user_id(info.own_user_id.as_str().into());
     ui.set_sas_request_initiator(info.we_started);
     ui.set_sas_compared(false);
+    crate::withdraw_call_bar(ui);
     ui.set_sas_stage(match info.phase {
         OwnVerificationPhase::Comparing => WAITING_FOR_VALUES,
         _ => WAITING_FOR_REQUEST,
@@ -658,6 +660,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             window.set_sas_notice("This request was already accepted here. Continuing it.".into());
             return;
         }
+        crate::withdraw_call_bar(&window);
         window.set_sas_busy(true);
         window.set_sas_incoming_loading(false);
         let admitted = admission(&accept_live);
@@ -719,6 +722,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             return;
         };
         let operation = next_operation(&window);
+        crate::withdraw_call_bar(&window);
         window.set_sas_busy(true);
         window.set_sas_error("".into());
         window.set_sas_notice("".into());
@@ -796,6 +800,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             return;
         };
         let operation = next_operation(&window);
+        crate::withdraw_call_bar(&window);
         window.set_sas_busy(true);
         let admitted = admission(&refresh_live);
         let live = refresh_live.clone();
@@ -964,6 +969,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             return;
         };
         let operation = next_operation(&window);
+        crate::withdraw_call_bar(&window);
         window.set_sas_busy(true);
         window.set_sas_error("".into());
         let admitted = admission(&start_live);
@@ -1019,6 +1025,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             return;
         };
         let operation = next_operation(&window);
+        crate::withdraw_call_bar(&window);
         window.set_sas_busy(true);
         window.set_sas_error("".into());
         let admitted = admission(&confirm_live);

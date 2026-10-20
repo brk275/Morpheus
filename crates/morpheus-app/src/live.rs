@@ -1942,6 +1942,7 @@ impl LiveUi {
             ui.set_room_actions_open(false);
             ui.set_member_confirm_open(false);
             ui.set_quick_switcher_open(false);
+            crate::withdraw_call_bar(&ui);
             ui.set_show_sign_in(true);
             ui.set_login_loading(false);
             ui.set_session_error("".into());
@@ -4140,6 +4141,8 @@ fn apply_snapshot(
         crate::room_media_browser::reset_window(ui);
         // So do typing names, Seen-by rows and read receipt state.
         crate::room_activity::clear(ui);
+        // So do its members' identity-change warnings and their details.
+        crate::identity_warnings::reset(ui);
         // So do the room's roles, staged permission changes and review.
         crate::room_permissions::reset_window(ui);
         crate::reset_attachment_view(ui);
@@ -4363,6 +4366,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     crate::voice_rosters::clear(ui);
     // Typing names and read receipts are account-private too.
     crate::room_activity::clear(ui);
+    // So are identity-change warnings and the members they name.
+    crate::identity_warnings::reset(ui);
     ui.set_room_actions_open(false);
     ui.set_room_action_busy(false);
     ui.set_room_action_error("".into());
@@ -4387,6 +4392,7 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     crate::room_addresses::clear(ui);
     // A link's read and join are withdrawn before its card is hidden.
     crate::matrix_links::clear(ui);
+    crate::withdraw_call_bar(ui);
     // The Leave dialog and its captured account are private to this context.
     crate::room_leave::clear_presentation(ui);
     ui.set_invitations(ModelRc::new(VecModel::<RoomItem>::default()));

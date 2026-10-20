@@ -620,6 +620,7 @@ fn show(ui: &AppWindow, card: &Card) {
         }
     });
     publish(ui, card);
+    crate::withdraw_call_bar(ui);
     ui.global::<MatrixLink>().set_open(true);
 }
 

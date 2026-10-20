@@ -539,9 +539,11 @@ pub(crate) fn clear(ui: &AppWindow) {
 }
 
 /// A protected surface's actual entry, before its flag changes. Withdraw
-/// any pending Leave dialog first, even if its view already hid. Lifecycle
-/// clear stays separate: a browser fallback must never cancel a new Leave.
+/// identity details and any pending Leave, even if its view already hid.
+/// Lifecycle clear stays separate: a browser fallback must never cancel
+/// a new Leave or identity dialog.
 pub(crate) fn withdraw(ui: &AppWindow) {
+    crate::identity_warnings::withdraw(ui);
     crate::room_leave::clear_presentation(ui);
     clear(ui);
 }
@@ -685,16 +687,20 @@ fn live_session(ui: &AppWindow) -> Option<AccountSelection> {
 }
 
 fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
-    // Mutual entry policy: an open Leave dialog owns the window. Refuse
-    // before clearing either surface or withdrawing a held link.
-    if crate::room_leave::is_open(ui) {
+    // Mutual entry policy: open Leave or identity details own the window. Refuse
+    // before clearing any surface or withdrawing a held link.
+    if crate::room_leave::is_open(ui) || crate::identity_warnings::is_open(ui) {
         return;
     }
+    crate::identity_warnings::withdraw(ui);
     // An admitted browser also cancels a latent Leave owner before it opens.
     crate::room_leave::clear_presentation(ui);
     // The browser's own entry: a Matrix link card, and a joined link's
-    // message still to come (its follow-up), end first, synchronously.
+    // message still to come (its follow-up), end first, synchronously. A
+    // call bar click still waiting for the call controller is refused for
+    // good too (the browser protects the bar), before any flag changes.
     crate::matrix_links::clear(ui);
+    crate::withdraw_call_bar(ui);
     clear(ui);
     let Some(selection) = current_selection(ui, live) else {
         return;

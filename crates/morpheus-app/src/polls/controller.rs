@@ -501,6 +501,7 @@ fn open_dialog(ui: &AppWindow, live: &Arc<LiveUi>) {
     publish_dialog(ui);
     crate::matrix_links::clear(ui);
     crate::thread_browser::withdraw(ui);
+    crate::withdraw_call_bar(ui);
     ui.set_poll_dialog_open(true);
 }
 

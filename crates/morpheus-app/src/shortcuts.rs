@@ -378,6 +378,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || ui.get_poll_dialog_open()
         || ui.global::<crate::RoomNotificationState>().get_open()
         || ui.global::<crate::RoomActivity>().get_seen_open()
+        || crate::identity_warnings::is_open(ui)
 }
 
 fn visible_rooms(ui: &AppWindow) -> Vec<RoomItem> {
@@ -444,6 +445,7 @@ fn open_picker(ui: &AppWindow) {
     // end first.
     crate::matrix_links::clear(ui);
     crate::thread_browser::withdraw(ui);
+    crate::withdraw_call_bar(ui);
     ui.set_quick_switcher_account_id(ui.get_active_account_local_id());
     ui.set_quick_switcher_account_index(ui.get_active_account_index());
     ui.set_quick_switcher_space_id(ui.get_active_space_id());
@@ -604,6 +606,9 @@ pub fn register(ui: &AppWindow, store: ConfigStore) {
     ui.on_shortcut_record(move |name| {
         let Some(ui) = weak.upgrade() else { return };
         if let Some(action) = named_action(name.as_str()) {
+            // Recording protects the call bar: a bar click still waiting is
+            // refused for good, synchronously, before the flag is set.
+            crate::withdraw_call_bar(&ui);
             ui.set_shortcut_recording(action.name().into());
             set_message(
                 format!(

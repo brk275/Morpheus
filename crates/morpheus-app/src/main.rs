@@ -10,6 +10,8 @@ mod attachment_workbench;
 mod attachments;
 mod audio_devices;
 #[cfg(feature = "native-calls")]
+mod call_bar;
+#[cfg(feature = "native-calls")]
 mod call_membership;
 #[cfg(feature = "native-calls")]
 mod call_recovery;
@@ -21,6 +23,7 @@ mod config_cli;
 mod device_sessions;
 mod draft_recovery;
 mod drafts;
+mod identity_warnings;
 mod image_previews;
 #[cfg(feature = "native-calls")]
 mod incoming_ring;
@@ -1273,6 +1276,15 @@ fn register_join_cancellation(ui: &AppWindow, room_join: JoinSlot, directory_joi
     });
 }
 
+/// Refuse, for good, every call bar action still waiting for the call
+/// controller (call_bar.rs). Every entry that opens a protected surface calls
+/// this synchronously before it sets its own flag, as it ends a shown link
+/// first (matrix_links::clear); page navigation does not. A no-op without
+/// native calls, where the bar registers no handler.
+pub(crate) fn withdraw_call_bar(ui: &AppWindow) {
+    slint::ComponentHandle::global::<CallBar>(ui).invoke_withdraw();
+}
+
 fn room_join_target(
     input: &str,
     canonical_alias: &str,
@@ -1395,6 +1407,9 @@ fn call_room_display(
 
 #[cfg(feature = "native-calls")]
 fn clear_native_capture(ui: &AppWindow) {
+    // A full authoritative write of both kinds (call_bar::capture_state_applied):
+    // every pending click is superseded, and nothing is busy.
+    call_bar::capture_state_applied(false, false);
     ui.set_native_camera_active(false);
     ui.set_native_screen_active(false);
     ui.set_native_camera_busy(false);
@@ -1405,6 +1420,7 @@ fn clear_native_capture(ui: &AppWindow) {
     ui.set_native_camera_source(SharedString::default());
     ui.set_native_screen_source(SharedString::default());
     ui.set_native_capture_error(SharedString::default());
+    call_bar::capture_error_written();
     ui.set_native_camera_error(SharedString::default());
     ui.set_native_screen_error(SharedString::default());
     ui.set_native_capture_picker_open(false);
@@ -1496,6 +1512,18 @@ fn capture_sources(picker_kind: i32) -> Result<Vec<(i32, String, String)>, Strin
 
 #[cfg(feature = "native-calls")]
 fn apply_capture_status(ui: &AppWindow, status: LocalVideoStatus) {
+    // A full authoritative write of both kinds (call_bar::capture_state_applied),
+    // with the busy values it shows below: every pending click is superseded.
+    call_bar::capture_state_applied(
+        matches!(
+            &status.camera.phase,
+            CapturePhase::Starting | CapturePhase::Stopping
+        ),
+        matches!(
+            &status.screen.phase,
+            CapturePhase::Selecting | CapturePhase::Starting | CapturePhase::Stopping
+        ),
+    );
     let camera_error = match &status.camera.phase {
         CapturePhase::Failed(error) => Some(error.as_str()),
         _ => None,
@@ -1542,6 +1570,7 @@ fn ask_to_leave_call(ui: &slint::Weak<AppWindow>, calls: &CallController, action
     if let Some(ui) = ui.upgrade() {
         matrix_links::clear(&ui);
         thread_browser::withdraw(&ui);
+        withdraw_call_bar(&ui);
         ui.set_native_leave_unconfirmed(matches!(status, CallStatus::CleanupFailed { .. }));
         ui.set_pending_account_index(action);
         ui.set_leave_call_dialog(true);
@@ -1676,6 +1705,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device_sessions::DeviceSessionsUi::register(&ui, live.clone(), runtime.handle());
     let member_privacy =
         member_privacy::MemberPrivacyUi::register(&ui, live.clone(), runtime.handle());
+    let identity_warnings =
+        identity_warnings::IdentityWarningsUi::register(&ui, live.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
@@ -1756,6 +1787,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         voice_rosters::VoiceRosterUi::register(&ui, live.clone(), runtime.handle());
     #[cfg(feature = "native-calls")]
     let applied_audio_token = Arc::new(AtomicU64::new(0));
+    // The capture generation whose camera and screen state the window shows,
+    // written on the UI thread by the capture watcher below.
+    #[cfg(feature = "native-calls")]
+    let applied_capture_token = Arc::new(AtomicU64::new(0));
     #[cfg(feature = "native-calls")]
     {
         let calls = calls.clone();
@@ -1769,6 +1804,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let leave_unconfirmed = matches!(current, CallStatus::CleanupFailed { .. });
                 let label = call_status_label(&current);
                 let room_id = call_room_id(&current).unwrap_or("").to_owned();
+                // The exact call this status names, read with it under the
+                // call slot's lock, for the persistent call bar.
+                let observed = calls.observe(&current).await;
                 let calls_for_ui = calls.clone();
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     if calls_for_ui.status() != current {
@@ -1787,12 +1825,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_native_call_status(label.into());
                     ui.set_native_call_room_id(room_id.into());
                     ui.set_native_call_room_display(room_display.into());
+                    // The persistent call bar shows this same fenced status,
+                    // bound to the exact call it describes.
+                    call_bar::present(&ui, call_bar::view_of(&current, observed));
                 });
                 if status.changed().await.is_err() {
                     break;
                 }
             }
         });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        // The bar's controls act only on the exact call they were shown for,
+        // with the click's own security and account context; the controller
+        // admits them under its slot's lock.
+        // Mute and Deafen also bind the window's applied audio generation,
+        // and Stop its applied capture generation.
+        let bar_live = live.clone();
+        call_bar::register(
+            &ui,
+            calls.clone(),
+            runtime.handle().clone(),
+            applied_audio_token.clone(),
+            applied_capture_token.clone(),
+            move |account_id| call_bar::live_admission(&bar_live, account_id),
+        );
     }
     #[cfg(feature = "native-calls")]
     {
@@ -1984,7 +2042,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let calls = calls.clone();
         let weak = ui.as_weak();
-        let applied_token = Arc::new(AtomicU64::new(0));
+        let applied_token = applied_capture_token.clone();
         runtime.spawn(async move {
             let mut capture = calls.subscribe_local_video();
             loop {
@@ -2290,6 +2348,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(selected) = selected else {
                 window
                     .set_native_capture_error("Capture source changed; refresh the picker".into());
+                call_bar::capture_error_written();
                 return;
             };
             let source = match kind {
@@ -2303,7 +2362,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let label = safe_capture_label(selected.name.as_str());
+            // This click owns only its own kind's busy flag (beside any other
+            // click of that kind; call_bar::capture_owner_begin) and the
+            // shared error text it clears.
+            let owned_kind = if kind == 0 {
+                CaptureKind::Camera
+            } else {
+                CaptureKind::Screen
+            };
+            let shown = if kind == 0 {
+                window.get_native_camera_busy()
+            } else {
+                window.get_native_screen_busy()
+            };
+            let owner = call_bar::capture_owner_begin(owned_kind, shown);
             window.set_native_capture_error(SharedString::default());
+            let error_written = call_bar::capture_error_written();
             if kind == 0 {
                 window.set_native_camera_busy(true);
             } else {
@@ -2312,20 +2386,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let calls = calls.clone();
             let weak = weak.clone();
             handle.spawn(async move {
-                if let Err(error) = calls.start_video_capture(token, source, label).await {
-                    let _ = weak.upgrade_in_event_loop(move |ui| {
-                        if calls.video_token() == token {
-                            if kind == 0 {
-                                ui.set_native_camera_busy(false);
-                            } else {
-                                ui.set_native_screen_busy(false);
-                            }
-                            ui.set_native_capture_error(
-                                safe_capture_label(&error.to_string()).into(),
-                            );
+                let result = calls.start_video_capture(token, source, label).await;
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    // The click gives up its ownership whatever the outcome.
+                    let rollback = call_bar::capture_owner_end(owned_kind, owner, result.is_err());
+                    let Err(error) = result else { return };
+                    // Only for the same call generation and while no full
+                    // update arrived since the click; the busy flag goes back
+                    // to its kind's authoritative baseline once no other
+                    // click of that kind is pending; the shared error only
+                    // while no newer writer owns it.
+                    if calls.video_token() != token
+                        || rollback == call_bar::CaptureRollback::Superseded
+                    {
+                        return;
+                    }
+                    if let call_bar::CaptureRollback::Restore(busy) = rollback {
+                        if kind == 0 {
+                            ui.set_native_camera_busy(busy);
+                        } else {
+                            ui.set_native_screen_busy(busy);
                         }
-                    });
-                }
+                    }
+                    if call_bar::capture_error_unchanged_since(error_written) {
+                        ui.set_native_capture_error(safe_capture_label(&error.to_string()).into());
+                        call_bar::capture_error_written();
+                    }
+                });
             });
         });
     }
@@ -2350,7 +2437,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if token == 0 {
                 return;
             }
+            // This click owns only its own kind's busy flag (beside any other
+            // click of that kind; call_bar::capture_owner_begin) and the
+            // shared error text it clears.
+            let owned_kind = if kind == 0 {
+                CaptureKind::Camera
+            } else {
+                CaptureKind::Screen
+            };
+            let shown = if kind == 0 {
+                window.get_native_camera_busy()
+            } else {
+                window.get_native_screen_busy()
+            };
+            let owner = call_bar::capture_owner_begin(owned_kind, shown);
             window.set_native_capture_error(SharedString::default());
+            let error_written = call_bar::capture_error_written();
             if kind == 0 {
                 window.set_native_camera_busy(true);
             } else {
@@ -2359,20 +2461,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let calls = calls.clone();
             let weak = weak.clone();
             handle.spawn(async move {
-                if let Err(error) = calls.stop_video_capture(token, capture_kind).await {
-                    let _ = weak.upgrade_in_event_loop(move |ui| {
-                        if calls.video_token() == token {
-                            if kind == 0 {
-                                ui.set_native_camera_busy(false);
-                            } else {
-                                ui.set_native_screen_busy(false);
-                            }
-                            ui.set_native_capture_error(
-                                safe_capture_label(&error.to_string()).into(),
-                            );
+                let result = calls.stop_video_capture(token, capture_kind).await;
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    // The click gives up its ownership whatever the outcome.
+                    let rollback = call_bar::capture_owner_end(owned_kind, owner, result.is_err());
+                    let Err(error) = result else { return };
+                    // Only for the same call generation and while no full
+                    // update arrived since the click; the busy flag goes back
+                    // to its kind's authoritative baseline once no other
+                    // click of that kind is pending; the shared error only
+                    // while no newer writer owns it.
+                    if calls.video_token() != token
+                        || rollback == call_bar::CaptureRollback::Superseded
+                    {
+                        return;
+                    }
+                    if let call_bar::CaptureRollback::Restore(busy) = rollback {
+                        if kind == 0 {
+                            ui.set_native_camera_busy(busy);
+                        } else {
+                            ui.set_native_screen_busy(busy);
                         }
-                    });
-                }
+                    }
+                    if call_bar::capture_error_unchanged_since(error_written) {
+                        ui.set_native_capture_error(safe_capture_label(&error.to_string()).into());
+                        call_bar::capture_error_written();
+                    }
+                });
             });
         });
     }
@@ -2516,6 +2631,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             room_addresses::clear(&ui);
             matrix_links::clear(&ui);
             thread_browser::withdraw(&ui);
+            withdraw_call_bar(&ui);
         }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
@@ -3845,6 +3961,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = weak.upgrade() {
             matrix_links::clear(&ui);
             thread_browser::withdraw(&ui);
+            withdraw_call_bar(&ui);
             ui.set_login_error("".into());
             ui.set_show_sign_in(true);
         }
@@ -4224,6 +4341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !logout_live.is_live.load(Ordering::Acquire) {
             if window.get_call_connected() {
                 window.set_pending_account_index(-3);
+                withdraw_call_bar(&window);
                 window.set_leave_call_dialog(true);
             } else {
                 window.set_show_sign_in(true);
@@ -4256,6 +4374,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !resume_live.is_live.load(Ordering::Acquire) {
             // The offline call preview has no Matrix account or destructive work.
             if let Some(window) = weak.upgrade() {
+                withdraw_call_bar(&window);
                 window.set_show_sign_in(true);
             }
             return;
@@ -4553,6 +4672,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui_result = ui.run();
     device_sessions.shutdown(&ui);
     member_privacy.shutdown(&ui);
+    identity_warnings.shutdown(&ui);
     pinned_messages.shutdown(&ui);
     room_media.shutdown(&ui);
     room_activity.shutdown(&ui);

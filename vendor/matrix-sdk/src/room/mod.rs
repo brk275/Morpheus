@@ -751,6 +751,28 @@ impl Room {
         IdentityStatusChanges::create_stream(self.clone()).await
     }
 
+    /// Like [`Room::subscribe_to_identity_status_changes`], but never requests
+    /// the member list from the homeserver.
+    ///
+    /// Membership is read only from the room members already stored on this
+    /// device ([`Room::members_no_sync`] and [`Room::get_member_no_sync`]),
+    /// and a stored member counts only while joined or invited: a member who
+    /// left or was banned is not reported again until they rejoin.
+    /// Identities are read from the local crypto store, as with
+    /// [`Room::subscribe_to_identity_status_changes`]. If this device's member
+    /// list is incomplete (see `are_members_synced`), members missing from it
+    /// are not reported. Nothing is pinned, verified or sent.
+    ///
+    /// A local read that fails is never taken for an empty answer: if the
+    /// stored members or their identities cannot be read for the initial
+    /// state, this returns that error; if a later read fails, the stream ends.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn subscribe_to_identity_status_changes_no_sync(
+        &self,
+    ) -> Result<impl Stream<Item = Vec<IdentityStatusChange>> + use<>> {
+        IdentityStatusChanges::create_stream_no_sync(self.clone()).await
+    }
+
     /// Subscribes to active live location shares in this room.
     ///
     /// Returns a [`LiveLocationsObserver`] that holds the current state and

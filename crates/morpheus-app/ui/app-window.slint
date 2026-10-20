@@ -44,12 +44,19 @@ export { NotificationRoomItem, NotificationRulesState, RoomNotificationState } f
 import { IgnoredUsersPanel, MemberInspector, MemberPrivacy } from "member-privacy.slint";
 // Rust drives member details and the ignore list through this global.
 export { IgnoredUserRow, IgnoredUsersView, MemberInspectorView, MemberPrivacy } from "member-privacy.slint";
+import { IdentityWarningRow, IdentityWarnings, IdentityWarningsDialog } from "identity-warnings.slint";
+// Rust drives the open room's identity-change warnings through this global.
+export { IdentityWarningItem, IdentityWarnings } from "identity-warnings.slint";
 import { RoomMedia, RoomMediaPanel } from "room-media.slint";
 // Rust drives the room media browser (the details panel's Media tab) through this global.
 export { RoomMedia, RoomMediaRow } from "room-media.slint";
 import { RoomPermissions, RoomPermissionsDialog } from "room-permissions.slint";
 // Rust drives the roles and permissions view of the room admin dialog through this global.
 export { PermissionRow, RoomPermissions } from "room-permissions.slint";
+import { CallBar, CallBarPalette, CallBarStrip, CallCapture, CallCaptureBadge }
+    from "call-bar.slint";
+// Rust drives the persistent call bar (call_bar.rs) through this global.
+export { CallBar } from "call-bar.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
 // One row of the pane arrangement editor, in the current order.
@@ -4108,6 +4115,9 @@ export component AppWindow inherits Window {
     in-out property <bool> native-leave-unconfirmed: false;
     // Native call stage; see call-stage.slint and src/call_stage.rs.
     in-out property <[CallTileItem]> native-call-tiles;
+    // Set with page 2 by the call bar's Return: the stage takes keyboard
+    // focus once it is shown, then this clears.
+    in-out property <bool> call-stage-focus-pending: false;
     in-out property <CallTileItem> native-call-featured;
     in-out property <bool> native-call-featured-visible: false;
     in-out property <[image]> native-call-frames;
@@ -4403,7 +4413,8 @@ export component AppWindow inherits Window {
         && !RoomNotificationState.open && !RoomActivity.seen-open
         && !root.quick-switcher-open && !root.people-open && !root.room-admin-open
         && !root.member-confirm-open && !root.native-capture-picker-open
-        && !root.leave-call-dialog && !root.image-preview-open && !root.poll-dialog-open;
+        && !root.leave-call-dialog && !root.image-preview-open && !root.poll-dialog-open
+        && !IdentityWarnings.open;
     property <bool> discovery-join-context-current: !root.directory-join-busy
         || (root.discovery-context-allowed && root.page == 3 && !root.room-actions-open && !SpaceExplorer.open);
     changed discovery-join-context-current => {
@@ -4433,14 +4444,17 @@ export component AppWindow inherits Window {
         && !RoomNotificationState.open && !RoomActivity.seen-open
         && !root.quick-switcher-open && !root.room-actions-open && !root.room-admin-open
         && !root.member-confirm-open && !root.native-capture-picker-open
-        && !root.leave-call-dialog && !root.image-preview-open && !root.poll-dialog-open);
+        && !root.leave-call-dialog && !root.image-preview-open && !root.poll-dialog-open
+        && !IdentityWarnings.open);
     changed people-context-current => {
         if !root.people-context-current { root.close-people(); }
     }
     // The inspector is another account-private modal. A lock, pending
     // security/key/SAS step or another modal closes it and cancels its read;
-    // returning focus must never jump behind the replacing modal.
-    property <bool> member-inspector-allowed: root.live-session && root.active-room-id != ""
+    // returning focus must never jump behind the replacing modal. Rust reads
+    // it synchronously before opening the inspector from another surface
+    // (member_privacy::inspect_admitted).
+    out property <bool> member-inspector-allowed: root.live-session && root.active-room-id != ""
         && !RoomLeave.view.open
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-switch-pending && !root.account-menu-open
@@ -4450,10 +4464,33 @@ export component AppWindow inherits Window {
         && !root.quick-switcher-open && !root.people-open
         && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open
         && !root.native-capture-picker-open && !root.leave-call-dialog
-        && !root.image-preview-open && !root.poll-dialog-open;
+        && !root.image-preview-open && !root.poll-dialog-open
+        && !IdentityWarnings.open;
     property <bool> member-inspector-current: !MemberPrivacy.inspector.open || root.member-inspector-allowed;
     changed member-inspector-current => {
         if !root.member-inspector-current { MemberPrivacy.close-inspector(); }
+    }
+    // Identity-change warnings belong to one live account and room; any change
+    // re-scopes them (identity-warnings.slint, src/identity_warnings.rs).
+    property <string> identity-scope: (root.live-session ? "live" : "") + "\n" + root.active-account-local-id + "\n" + root.active-room-id;
+    changed identity-scope => { IdentityWarnings.context-changed(); }
+    // Their details are another account-private modal on the conversation
+    // page: a lock, pending security/key/SAS step or another modal closes them.
+    out property <bool> identity-warnings-allowed: root.live-session && root.page == 0 && root.active-room-id != ""
+        && !ThreadBrowser.open && !RoomLeave.view.open
+        && !root.header-more-open
+        && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
+        && !root.account-switch-pending && !root.account-menu-open
+        && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy && root.sas-stage == 0
+        && !root.account-profile-open && !SpaceExplorer.open && !SpaceRooms.open && !RoomAddresses.open
+        && !RoomNotificationState.open && !RoomActivity.seen-open && !MemberPrivacy.inspector.open
+        && !root.quick-switcher-open && !root.people-open
+        && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open
+        && !root.native-capture-picker-open && !root.leave-call-dialog
+        && !root.image-preview-open && !root.poll-dialog-open;
+    property <bool> identity-warnings-current: !IdentityWarnings.open || root.identity-warnings-allowed;
+    changed identity-warnings-current => {
+        if !root.identity-warnings-current { IdentityWarnings.withdraw(); }
     }
     // Presentation only: show the thread tab of the side panel.
     public function show-thread-panel() {
@@ -4529,8 +4566,9 @@ export component AppWindow inherits Window {
     // activation and confirmation.
     public function open-account-menu() {
         if !RoomAddresses.open && !RoomLeave.view.open {
+            CallBar.withdraw();
             MatrixLink.withdraw();
-            ThreadBrowser.withdraw();
+            IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
             root.account-menu-open = true;
             account-trigger.focus();
         }
@@ -4541,7 +4579,7 @@ export component AppWindow inherits Window {
         if RoomLeave.view.open { return; }
         root.settings-search-focus-pending = true;
         MatrixLink.withdraw();
-        ThreadBrowser.withdraw();
+        IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
         root.page = 1;
         // Searching again returns to the last results instead of hiding them.
         if root.settings-search-query != "" { root.settings-search-dismissed = false; }
@@ -4848,14 +4886,14 @@ export component AppWindow inherits Window {
         } else if slot == 5 {
             root.show-transfer-panel();
         } else if slot == 6 {
-            if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2;
+            if RoomLeave.view.open { return; } MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 2;
         } else if slot == 7 {
             root.set-side-panel(!root.show-side-panel);
         } else if slot == 8 {
             // Withdraw held link navigation before the dialog flag.
             if root.room-leave-blocked || RoomLeave.view.open { return; }
             MatrixLink.withdraw();
-            ThreadBrowser.withdraw();
+            IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
             RoomLeave.start();
             root.header-leave-returns = RoomLeave.view.open;
         }
@@ -4887,8 +4925,9 @@ export component AppWindow inherits Window {
         if root.header-more-open {
             root.close-header-more(true);
         } else if root.header-more-allowed && root.header-overflow {
+            CallBar.withdraw();
             MatrixLink.withdraw();
-            ThreadBrowser.withdraw();
+            IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
             root.header-more-open = true;
         }
     }
@@ -5053,6 +5092,7 @@ export component AppWindow inherits Window {
             root.notification-highlight-error = "";
         }
         if root.page != 2 { root.native-capture-picker-open = false; }
+        if root.page != 2 { root.call-stage-focus-pending = false; }
         // A hidden stage pauses and stops decoding every remote video stream.
         root.native-call-stage-presented(root.page == 2);
         ThreadBrowser.context-changed();
@@ -5065,6 +5105,78 @@ export component AppWindow inherits Window {
     in-out property <bool> call-connected: false;
     in-out property <string> native-call-room-id;
     in-out property <string> native-call-room-display;
+    // The persistent call bar (call-bar.slint) shows this device's call on
+    // every page but the call page. A protected surface never shows it, only
+    // the generic CallCaptureBadge.
+    // The bar is protected under every surface that takes the window over:
+    // the same complete list as matrix-link-blocked below, without its page
+    // term (the bar stays available on every page but the call page, and in
+    // navigation), plus a shown link card. Keep the two lists in step. Every
+    // entry that opens one of these also calls CallBar.withdraw() (Rust:
+    // withdraw_call_bar) synchronously before setting its flag; the changed
+    // handler below is only the fallback. Two Settings states also protect
+    // it (matrix-link-blocked covers them through its page term, which this
+    // list omits so the bar stays in ordinary Settings): the inline
+    // ignored-users review or its send, and shortcut recording. The thread
+    // browser is one of the surfaces (thread_browser::show withdraws the bar
+    // synchronously at its entry, before its flags change), and so is the
+    // Leave dialog (room_leave's start withdraws it, after its own
+    // admission and before its view opens). The header's More menu also
+    // withdraws first at its admitted entry and protects the bar while open.
+    // Identity details do the same; their View member entry also retires a
+    // held action synchronously before closing details/opening the inspector.
+    out property <bool> call-bar-protected: !root.live-session || MatrixLink.open
+        || MemberPrivacy.ignored.stage != 0 || MemberPrivacy.ignored.busy
+        || root.shortcut-recording != ""
+        || root.show-sign-in || root.access-open || root.manage-accounts-open
+        || root.account-menu-open || root.account-switch-pending
+        || root.security-busy || root.security-recovery-key != "" || root.sas-busy
+        || root.sas-stage != 0
+        || root.account-profile-open || root.people-open || MemberPrivacy.inspector.open
+        || SpaceExplorer.open || SpaceRooms.open || RoomAddresses.open
+        || RoomNotificationState.open || RoomActivity.seen-open || root.quick-switcher-open
+        || root.room-actions-open || root.room-admin-open || root.member-confirm-open
+        || root.native-capture-picker-open || root.leave-call-dialog
+        || root.image-preview-open || root.poll-dialog-open || ThreadBrowser.open
+        || RoomLeave.view.open || root.header-more-open || IdentityWarnings.open;
+    out property <bool> call-bar-visible: CallBar.active && root.call-connected && root.page != 2
+        && !root.call-bar-protected;
+    // A bar click still waiting for the call controller is refused once a
+    // protected surface was shown, even after it closed (call_bar.rs).
+    changed call-bar-protected => {
+        if root.call-bar-protected {
+            CallBar.protected-shown();
+        }
+    }
+    property <bool> call-capture-live: root.native-camera-active || root.native-camera-busy
+        || root.native-screen-active || root.native-screen-busy;
+    property <CallCapture> call-capture: {
+        audio-ready: root.native-audio-ready,
+        microphone-muted: root.native-microphone-muted,
+        deafened: root.native-deafened,
+        camera-active: root.native-camera-active,
+        camera-busy: root.native-camera-busy,
+        camera-stopping: root.native-camera-stopping,
+        screen-active: root.native-screen-active,
+        screen-busy: root.native-screen-busy,
+        screen-selecting: root.native-screen-selecting,
+        screen-stopping: root.native-screen-stopping,
+    };
+    property <CallBarPalette> call-bar-palette: {
+        ink: root.ink,
+        muted: root.muted,
+        accent: root.accent,
+        surface: root.panel,
+        chip: root.elevated,
+        hover: root.hover,
+        divider: root.divider,
+        destructive: StyleTokens.roles.destructive.present
+            ? StyleTokens.roles.destructive.color : #d65163,
+        destructive-ink: StyleTokens.roles.destructive-ink.present
+            ? StyleTokens.roles.destructive-ink.color : #10131b,
+        disabled-ink: root.control-disabled-ink,
+        focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+    };
     in-out property <bool> leave-call-dialog: false;
     in-out property <bool> leave-call-busy: false;
     in-out property <int> pending-account-index: -1;
@@ -5113,7 +5225,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !MemberPrivacy.inspector.open && !root.image-preview-open && !SpaceRooms.open && !RoomAddresses.open && !MatrixLink.open && !RoomLeave.view.open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !MemberPrivacy.inspector.open && !root.image-preview-open && !SpaceRooms.open && !RoomAddresses.open && !MatrixLink.open && !RoomLeave.view.open && !IdentityWarnings.open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // A Matrix link (matrix-link.slint), and a joined link's message still to
     // come, are withdrawn when anything else takes over: another page, sign-in,
@@ -5137,7 +5249,8 @@ export component AppWindow inherits Window {
         || RoomNotificationState.open || RoomActivity.seen-open || root.quick-switcher-open
         || root.room-actions-open || root.room-admin-open || root.member-confirm-open
         || root.native-capture-picker-open || root.leave-call-dialog
-        || root.image-preview-open || root.poll-dialog-open || ThreadBrowser.open;
+        || root.image-preview-open || root.poll-dialog-open || ThreadBrowser.open
+        || IdentityWarnings.open;
     changed room-leave-blocked => {
         if root.room-leave-blocked && RoomLeave.view.open { RoomLeave.close(); }
     }
@@ -5150,7 +5263,7 @@ export component AppWindow inherits Window {
     // browser's own is not one of them). Each of those surfaces' entries also
     // withdraws the browser before it opens; this handler is the fallback.
     out property <bool> thread-browser-allowed: root.live-session && root.page == 0
-        && !RoomLeave.view.open
+        && !RoomLeave.view.open && !IdentityWarnings.open
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-menu-open && !root.account-switch-pending
         && !root.security-busy && root.security-recovery-key == "" && !root.sas-busy
@@ -5607,7 +5720,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 3;
-                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 3; root.open-discovery(); }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 3; root.open-discovery(); }
                 }
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
@@ -5619,7 +5732,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 2;
-                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
                 }
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
@@ -5631,7 +5744,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 1;
-                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
                 }
             }
         }
@@ -5687,8 +5800,9 @@ export component AppWindow inherits Window {
                                 root.room-action-mode = 0;
                                 root.room-action-input = "";
                                 root.room-action-error = "";
+                                CallBar.withdraw();
                                 MatrixLink.withdraw();
-                                ThreadBrowser.withdraw();
+                                IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                                 root.room-actions-open = true;
                             }
                         }
@@ -5736,9 +5850,9 @@ export component AppWindow inherits Window {
                                 activated => {
                                     if RoomLeave.view.open { return; }
                                     if index == 0 { root.active-space-id = ""; root.active-space-name = "Home"; root.select-space(""); root.page = 0; }
-                                    else if index == 1 { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 3; root.open-discovery(); }
-                                    else if index == 2 { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
-                                    else { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+                                    else if index == 1 { MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 3; root.open-discovery(); }
+                                    else if index == 2 { MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
+                                    else { MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
                                 }
                             }
                             if root.spaces.length > 0 : Text {
@@ -6121,7 +6235,7 @@ export component AppWindow inherits Window {
                                 // Withdraw held link navigation before the dialog flag.
                                 if root.room-leave-blocked || RoomLeave.view.open { return; }
                                 MatrixLink.withdraw();
-                                ThreadBrowser.withdraw();
+                                IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                                 RoomLeave.start();
                                 root.header-leave-returns = RoomLeave.view.open;
                             }
@@ -6246,6 +6360,17 @@ export component AppWindow inherits Window {
                     }
                 }
                 Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                // This device's native call on every page but the call page
+                // (call-bar.slint); never on a protected surface.
+                if root.call-bar-visible : CallBarStrip {
+                    text-scale: root.text-scale;
+                    palette: root.call-bar-palette;
+                    room: root.native-call-room-display;
+                    participants: root.native-call-participants.length;
+                    capture: root.call-capture;
+                    joined: root.native-call-joined;
+                    leave-unconfirmed: root.native-leave-unconfirmed;
+                }
                 if root.native-call-enabled && root.live-session && root.incoming-call-account-id == root.active-account-local-id && root.incoming-call-offers.length > 0 : ScrollView {
                     height: min(220px, root.incoming-call-offers.length * (102px * root.text-scale));
                     horizontal-stretch: 1;
@@ -6577,6 +6702,16 @@ export component AppWindow inherits Window {
                             }
                             Text { text: root.active-room-topic; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; min-width: 0px; }
                         }
+                    }
+                    // Members of this room whose identity changed
+                    // (identity-warnings.slint). No row when nobody is warned
+                    // about or the room was not checked.
+                    if root.live-session && root.active-room-id != "" && IdentityWarnings.summary != "" : IdentityWarningRow {
+                        ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                        outline: root.divider; text-scale: root.text-scale;
+                        // Focus may come back only while nothing replaced
+                        // this conversation (no protected surface or modal).
+                        allowed: root.identity-warnings-allowed;
                     }
                     if root.live-session && root.active-room-id != "" : HorizontalLayout {
                         height: max(39px, 32px * root.text-scale);
@@ -7003,8 +7138,9 @@ export component AppWindow inherits Window {
                                         root.room-admin-room-id = root.active-room-id;
                                         root.room-admin-error = "";
                                         root.room-admin-notice = "";
+                                        CallBar.withdraw();
                                         MatrixLink.withdraw();
-                                        ThreadBrowser.withdraw();
+                                        IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                                         root.room-admin-open = true;
                                     }
                                 }
@@ -10304,6 +10440,10 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.live-session : CallStage {
+                        // The call bar's Return hands keyboard focus to the
+                        // stage; the request ends once focus has arrived.
+                        focus-wanted: root.call-stage-focus-pending;
+                        focus-taken => { root.call-stage-focus-pending = false; }
                         vertical-stretch: 1;
                         tiles: root.native-call-tiles;
                         featured: root.native-call-featured;
@@ -10424,8 +10564,9 @@ export component AppWindow inherits Window {
                                     if root.native-camera-active { root.stop-native-capture(0); }
                                     else {
                                         root.native-capture-picker-kind = 0;
+                                        CallBar.withdraw();
                                         MatrixLink.withdraw();
-                                        ThreadBrowser.withdraw();
+                                        IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                                         root.native-capture-picker-open = true;
                                         root.refresh-native-capture-sources(0);
                                     }
@@ -10455,8 +10596,9 @@ export component AppWindow inherits Window {
                                     if root.native-screen-active || root.native-screen-selecting { root.stop-native-capture(1); }
                                     else {
                                         root.native-capture-picker-kind = 1;
+                                        CallBar.withdraw();
                                         MatrixLink.withdraw();
-                                        ThreadBrowser.withdraw();
+                                        IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                                         root.native-capture-picker-open = true;
                                         root.refresh-native-capture-sources(1);
                                     }
@@ -10480,7 +10622,7 @@ export component AppWindow inherits Window {
                                 activated => {
                                     if root.live-session {
                                         if root.native-call-enabled {
-                                            if root.native-leave-unconfirmed { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.pending-account-index = -4; root.leave-call-dialog = true; }
+                                            if root.native-leave-unconfirmed { CallBar.withdraw(); MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.pending-account-index = -4; root.leave-call-dialog = true; }
                                             else if root.call-connected { root.end-native-call(); }
                                             else { root.start-native-call(); }
                                         }
@@ -10833,8 +10975,9 @@ export component AppWindow inherits Window {
                                         root.member-confirm-value = root.member-selected-power;
                                         root.member-confirm-account-id = root.active-account-local-id;
                                         root.member-confirm-room-id = root.active-room-id;
+                                        CallBar.withdraw();
                                         MatrixLink.withdraw();
-                                        ThreadBrowser.withdraw();
+                                        IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                                         root.member-confirm-open = true;
                                     }
                                 }
@@ -10852,8 +10995,9 @@ export component AppWindow inherits Window {
                                         root.member-confirm-value = "";
                                         root.member-confirm-account-id = root.active-account-local-id;
                                         root.member-confirm-room-id = root.active-room-id;
+                                        CallBar.withdraw();
                                         MatrixLink.withdraw();
-                                        ThreadBrowser.withdraw();
+                                        IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                                         root.member-confirm-open = true;
                                     }
                                 }
@@ -10868,8 +11012,9 @@ export component AppWindow inherits Window {
                                         root.member-confirm-value = "";
                                         root.member-confirm-account-id = root.active-account-local-id;
                                         root.member-confirm-room-id = root.active-room-id;
+                                        CallBar.withdraw();
                                         MatrixLink.withdraw();
-                                        ThreadBrowser.withdraw();
+                                        IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                                         root.member-confirm-open = true;
                                     }
                                 }
@@ -10884,8 +11029,9 @@ export component AppWindow inherits Window {
                                         root.member-confirm-value = "";
                                         root.member-confirm-account-id = root.active-account-local-id;
                                         root.member-confirm-room-id = root.active-room-id;
+                                        CallBar.withdraw();
                                         MatrixLink.withdraw();
-                                        ThreadBrowser.withdraw();
+                                        IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                                         root.member-confirm-open = true;
                                     }
                                 }
@@ -11540,7 +11686,7 @@ export component AppWindow inherits Window {
                         label: "Open settings from account controls";
                         ink: root.ink; muted: root.muted; surface: root.window-sidebar;
                         hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                        activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+                        activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
                     }
                     if root.layout-customized : TextAction {
                         text: "Restore";
@@ -11556,7 +11702,13 @@ export component AppWindow inherits Window {
                     focus-color: root.accent;
                     label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
                     accessible-expanded: root.account-menu-open;
-                    activated => { if !RoomAddresses.open && !RoomLeave.view.open { root.account-menu-open = !root.account-menu-open; } }
+                    // Opening goes through open-account-menu, which withdraws
+                    // a waiting call-bar click before the menu shows.
+                    activated => {
+                        if !RoomAddresses.open && !RoomLeave.view.open {
+                            if root.account-menu-open { root.account-menu-open = false; } else { root.open-account-menu(); }
+                        }
+                    }
                     HorizontalLayout {
                         padding-left: root.account-column ? 13px : 11px;
                         padding-right: root.account-column ? 13px : 11px;
@@ -11595,7 +11747,7 @@ export component AppWindow inherits Window {
             icon: "⚙";
             label: "Open settings";
             ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
-            activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+            activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
         }
 
         // Drawn after every pane so it opens upward over them.
@@ -11653,8 +11805,9 @@ export component AppWindow inherits Window {
                     cancelled => { root.account-menu-open = false; account-trigger.focus(); }
                     activated => {
                         if root.call-connected {
+                            CallBar.withdraw();
                             MatrixLink.withdraw();
-                            ThreadBrowser.withdraw();
+                            IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                             root.pending-account-index = account.index;
                             root.leave-call-dialog = true;
                             root.account-menu-open = false;
@@ -11699,8 +11852,9 @@ export component AppWindow inherits Window {
                     cancelled => { root.account-menu-open = false; account-trigger.focus(); }
                     activated => {
                         if root.call-connected {
+                            CallBar.withdraw();
                             MatrixLink.withdraw();
-                            ThreadBrowser.withdraw();
+                            IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
                             root.pending-account-index = -2;
                             root.leave-call-dialog = true;
                             root.account-menu-open = false;
@@ -11723,7 +11877,7 @@ export component AppWindow inherits Window {
                     cancel-on-escape: true;
                     label: "Manage accounts";
                     cancelled => { root.account-menu-open = false; account-trigger.focus(); }
-                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); RoomAddresses.context-changed(); root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
+                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); RoomAddresses.context-changed(); root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
                     HorizontalLayout {
                         padding-left: 9px; padding-right: 9px; spacing: 9px;
                         VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "manage-accounts"; ink: root.ink; } }
@@ -11772,12 +11926,12 @@ export component AppWindow inherits Window {
             clicked => { root.close-header-more(true); }
         }
         if root.header-more-open && root.header-more-allowed && root.header-overflow : Rectangle {
-            property <length> row: max(root.density-mode == 0 ? 32px : root.density-mode == 2 ? 42px : 36px, 24px * root.text-scale + 12px);
+            property <length> header-menu-row-height: max(root.density-mode == 0 ? 32px : root.density-mode == 2 ? 42px : 36px, 24px * root.text-scale + 12px);
             property <int> rows: 8 - root.header-capacity + (root.header-leave-shown ? 0 : 1);
             x: max(8px, min(parent.width - self.width - 8px, header-more.absolute-position.x + header-more.width - self.width));
             y: header-more.absolute-position.y + header-more.height + 4px;
             width: min(parent.width - 16px, max(240px, 210px * root.text-scale));
-            height: max(0px, min(parent.height - self.y - 8px, 12px + self.rows * (self.row + 2px)));
+            height: max(0px, min(parent.height - self.y - 8px, 12px + self.rows * (self.header-menu-row-height + 2px)));
             background: root.elevated;
             border-color: root.divider;
             border-width: StyleTokens.line-width;
@@ -12006,7 +12160,8 @@ export component AppWindow inherits Window {
         + (root.member-confirm-open ? "1" : "0") + (root.native-capture-picker-open ? "1" : "0")
         + (root.leave-call-dialog ? "1" : "0") + (root.image-preview-open ? "1" : "0")
         + (root.poll-dialog-open ? "1" : "0") + (root.account-menu-open ? "1" : "0")
-        + (RoomAddresses.open ? "1" : "0") + (RoomLeave.view.open ? "1" : "0");
+        + (RoomAddresses.open ? "1" : "0") + (RoomLeave.view.open ? "1" : "0")
+        + (IdentityWarnings.open ? "1" : "0");
     changed space-management-context => { SpaceRooms.context-changed(); }
 
     // Managing a Space's rooms (space-management.slint); Rust owns its state.
@@ -12231,6 +12386,13 @@ export component AppWindow inherits Window {
     if RoomActivity.seen-open : SeenByDialog {
         x: 0px; y: 0px; width: root.width; height: root.height;
         ink: root.ink; muted: root.muted; accent: root.accent; surface: root.dialog-surface;
+        scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
+        text-scale: root.text-scale;
+    }
+    // Who in the open room has a changed identity. Modal; Rust fills the rows.
+    if IdentityWarnings.open && root.identity-warnings-allowed : IdentityWarningsDialog {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        colors: root.button-colors; surface: root.dialog-surface;
         scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
         text-scale: root.text-scale;
     }
@@ -13085,7 +13247,7 @@ export component AppWindow inherits Window {
         + (root.account-profile-open ? "1" : "0") + (SpaceExplorer.open ? "1" : "0")
         + (SpaceRooms.open ? "1" : "0") + (RoomNotificationState.open ? "1" : "0")
         + (RoomActivity.seen-open ? "1" : "0") + (MemberPrivacy.ignored.busy ? "1" : "0")
-        + "\n" + MemberPrivacy.ignored.stage;
+        + "\n" + MemberPrivacy.ignored.stage + (IdentityWarnings.open ? "1" : "0");
     changed room-addresses-context => { RoomAddresses.context-changed(); }
 
     // Room addresses (room-addresses.slint), over Room settings; Rust owns
@@ -13490,7 +13652,7 @@ export component AppWindow inherits Window {
                     height: 38px * root.text-scale; vertical-stretch: 0;
                     text: "Choose a saved account"; ink: root.ink; muted: root.muted;
                     surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.manage-accounts-open = true; root.manage-accounts(); }
+                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.manage-accounts-open = true; root.manage-accounts(); }
                 }
                 if root.account-access-notice != "" : Text {
                     text: root.account-access-notice; color: root.muted; font-size: 11px * root.text-scale;
@@ -14099,4 +14261,16 @@ export component AppWindow inherits Window {
         }
     }
 
+    // On a protected surface only this generic call and capture status shows
+    // (call-bar.slint): no room, account or participant name and no control.
+    if root.call-bar-protected && (CallBar.active || root.call-capture-live) : CallCaptureBadge {
+        x: parent.width - self.width - 16px;
+        y: 12px;
+        // Never wider than the window, at any text size.
+        available-width: parent.width - 32px;
+        text-scale: root.text-scale;
+        palette: root.call-bar-palette;
+        call-active: CallBar.active;
+        capture: root.call-capture;
+    }
 }

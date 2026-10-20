@@ -773,6 +773,7 @@ fn surface_allowed(ui: &AppWindow) -> bool {
         && !ui.get_poll_dialog_open()
         && !ui.global::<crate::RoomNotificationState>().get_open()
         && !ui.global::<crate::RoomActivity>().get_seen_open()
+        && !crate::identity_warnings::is_open(ui)
 }
 
 /// The selection of the account on screen, if it may still act.
@@ -826,6 +827,7 @@ fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, space_id: &str, nam
     });
     crate::matrix_links::clear(ui);
     crate::thread_browser::withdraw(ui);
+    crate::withdraw_call_bar(ui);
     let state = ui.global::<SpaceRooms>();
     state.set_space_id(space_id.into());
     state.set_title(label(name).into());

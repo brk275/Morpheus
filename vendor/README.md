@@ -9,7 +9,7 @@ provenance and regression tests when updating a dependency.
 | lru 0.16.4 | Backport panic-safe cache removal | [Patch notes](lru/MORPHEUS_PATCH.md) |
 | matrix-rtc-livekit | Secure authorization and media endpoints | [Patch notes](matrix-rtc-livekit/README.md) |
 | matrix-rtc-core 0.5.0-rc.2 | Bounded encrypted membership renewal for newly joined devices | [Patch notes](matrix-rtc-core/MORPHEUS_PATCH.md) |
-| matrix-sdk 0.19.1 | Typed search entry points; optional per-request response-body limit; generated recovery-key handoff | [Patch notes](matrix-sdk/MORPHEUS_PATCH.md) |
+| matrix-sdk 0.19.1 | Typed search entry points; optional per-request response-body limit; generated recovery-key handoff; opt-in stored-members identity status stream | [Patch notes](matrix-sdk/MORPHEUS_PATCH.md) |
 | matrix-sdk-ui 0.19.1 | Required room-state sync and poll end authorization | [Patch notes](matrix-sdk-ui/MORPHEUS_PATCH.md) |
 | matrix-sdk-base 0.19.1 | Preserve bounded encrypted keyless sticky receipts and their revocation | [Patch notes](matrix-sdk-base/MORPHEUS_PATCH.md) |
 | livekit-api 0.5.3 | Secure signaling, fallback endpoints, and authenticated redirects | [Patch notes](livekit-api/README.md) |

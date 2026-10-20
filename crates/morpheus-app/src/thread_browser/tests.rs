@@ -865,11 +865,45 @@ pub(crate) async fn assert_thread_browser_panel(
         "closing Leave never reopens the browser"
     );
 
+    // Identity details also own the window. Refused Show preserves both a
+    // held link follow-up and a latent Leave owner before any clear runs.
+    let warnings = ui.global::<crate::IdentityWarnings>();
+    warnings.set_open(true);
+    let pending_leave = morpheus_matrix::RoomLeaveCancellation::new();
+    let cancellation = pending_leave.clone();
+    leave.on_reset(move || cancellation.cancel());
+    let follow_up = crate::matrix_links::tests::install_follow_up();
+    state.invoke_show();
+    assert!(
+        warnings.get_open(),
+        "refused Show never withdraws identity details"
+    );
+    assert!(
+        !pending_leave.is_cancelled(),
+        "refused Show preserves latent Leave work"
+    );
+    assert!(
+        !follow_up.withdrawn(),
+        "refused Show preserves the link follow-up"
+    );
+    assert!(!state.get_open() && ROWS.with(|model| model.row_count()) == 0);
+    crate::identity_warnings::withdraw(ui);
+    assert!(
+        follow_up.admits(ui),
+        "the refused Show did not retire held authority"
+    );
+    crate::matrix_links::clear(ui);
+    leave.on_reset(|| {});
+    settle(ui).await;
+
     // Rust's guard and the Slint gate are the same set, state by state. Each
     // state is set and reset with no settle between, so no change handler
     // or overlay runs and later phases see nothing.
     assert!(!held(ui) && ui.get_thread_browser_allowed());
-    let every: [(&str, fn(&AppWindow, bool)); 31] = [
+    let every: [(&str, fn(&AppWindow, bool)); 32] = [
+        ("identity details", |ui, on| {
+            ui.global::<crate::IdentityWarnings>().set_open(on)
+        }),
         ("the Settings page", |ui, on| {
             ui.set_page(if on { 1 } else { 0 })
         }),

@@ -1762,7 +1762,7 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     slint::spawn_local(async move {
         let started = std::time::Instant::now();
         let phase = std::rc::Rc::new(AccountUiProgress::new(started));
-        // The original fourteen-scenario budget now covers 45 transitions,
+        // The original fourteen-scenario budget now covers 47 transitions,
         // including the thread browser and room leave. Keep a finite three-minute
         // whole budget and a separate phase cap that catches one stall sooner.
         let outcome = tokio::select! {
@@ -4269,6 +4269,11 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert_member_row_actions_fit(&ui).await;
     phase.set(75);
     assert_sas_values_leave_on_close_and_protection(&ui).await;
+    #[cfg(feature = "native-calls")]
+    {
+        phase.set(85);
+        assert_call_bar(&ui, &runtime).await;
+    }
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
@@ -4282,6 +4287,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert_moderation_stops_with_its_context(&ui, &live, &runtime).await;
     phase.set(74);
     assert_room_media_scope_and_privacy(&ui, &live, &runtime).await;
+    phase.set(86);
+    assert_identity_warnings_presentation(&ui, &live, &runtime).await;
     phase.set(76);
     assert_discovery_join_withdrawal(&ui, &live, &runtime).await;
     phase.set(82);
@@ -5005,6 +5012,1253 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     .expect("draft worker must release the profile before cleanup");
     drop(manager);
     directory.close().unwrap();
+}
+
+/// Whether any instantiated item's accessible label contains `needle`.
+#[cfg(feature = "native-calls")]
+fn any_label_contains(ui: &AppWindow, needle: &str) -> bool {
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut found = false;
+    root.visit_descendants(|item| {
+        let label = item.accessible_string_property(AccessibleStringProperty::Label);
+        if label.as_deref().is_some_and(|label| label.contains(needle)) {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// The call controller as phase 85's bar sees it: the current call as the
+/// controller would observe it, every action it admitted, and how many it
+/// refused. Like the controller, it admits an action at its hand-off only for
+/// exactly the observed call (media: exactly its shown join) and only while
+/// the click's own context holds; `hold` keeps the next hand-off waiting, as
+/// the controller's slot lock can. `fail` makes the next admitted action
+/// fail in the worker instead (counted in `failed`), as a capture worker's
+/// Stop can after it published Failed. `holds` keeps the next hand-off of
+/// one exact action waiting, so several can wait at once and be answered in
+/// a chosen order.
+#[cfg(feature = "native-calls")]
+struct FakeCallBarControls {
+    current: Mutex<crate::call_bar::CallView>,
+    hold: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    holds: Mutex<
+        Vec<(
+            crate::call_bar::BarAction,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    acted: Mutex<Vec<(crate::call_bar::BarAction, crate::calls::ObservedCall)>>,
+    refused: std::sync::atomic::AtomicUsize,
+    fail: Mutex<Option<crate::calls::CallControllerError>>,
+    failed: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "native-calls")]
+impl crate::call_bar::BarControls for Arc<FakeCallBarControls> {
+    fn current(&self) -> Option<crate::call_bar::CallView> {
+        Some(self.current.lock().unwrap().clone())
+    }
+
+    fn act(
+        &self,
+        action: crate::call_bar::BarAction,
+        observed: crate::calls::ObservedCall,
+        admit: crate::call_bar::Admit,
+    ) -> crate::call_bar::Acting {
+        let fake = self.clone();
+        Box::pin(async move {
+            let hold = fake.hold.lock().unwrap().take().or_else(|| {
+                let mut holds = fake.holds.lock().unwrap();
+                let at = holds.iter().position(|(held, _)| *held == action)?;
+                Some(holds.remove(at).1)
+            });
+            if let Some(hold) = hold {
+                let _ = hold.await;
+            }
+            let current = fake.current.lock().unwrap().call.clone();
+            let now = current.and_then(|call| call.observed);
+            let exact = now.is_some_and(|now| match action {
+                crate::call_bar::BarAction::Leave => {
+                    (now.call, &now.account_id, &now.room_id)
+                        == (observed.call, &observed.account_id, &observed.room_id)
+                }
+                _ => now == observed,
+            });
+            if exact && admit() {
+                if let Some(error) = fake.fail.lock().unwrap().take() {
+                    fake.failed.fetch_add(1, Ordering::SeqCst);
+                    return Err(error);
+                }
+                fake.acted.lock().unwrap().push((action, observed));
+                Ok(())
+            } else {
+                fake.refused.fetch_add(1, Ordering::SeqCst);
+                Err(crate::calls::CallControllerError::StaleCall)
+            }
+        })
+    }
+}
+
+/// Settle until `done` holds: a bar action finishes on the runtime, then on
+/// the UI thread.
+#[cfg(feature = "native-calls")]
+async fn settle_until(ui: &AppWindow, runtime: &Handle, done: impl Fn() -> bool) {
+    for _ in 0..400 {
+        settle(ui).await;
+        if done() {
+            return;
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = sender.send(());
+        });
+        let _ = receiver.await;
+    }
+    panic!("a call bar action did not finish");
+}
+
+/// Window-relative bounds of every text item showing exactly `text`.
+#[cfg(feature = "native-calls")]
+fn text_item_bounds(ui: &AppWindow, text: &str) -> Vec<Bounds> {
+    use slint::private_unstable_api::re_exports::{ComplexText, ItemRc, SimpleText, WindowInner};
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut found = Vec::new();
+    root.visit_descendants(|item| {
+        let shown = if let Some(simple) = item.downcast::<SimpleText>() {
+            simple.as_pin_ref().text().as_str() == text
+        } else if let Some(complex) = item.downcast::<ComplexText>() {
+            complex.as_pin_ref().text().as_str() == text
+        } else {
+            false
+        };
+        if shown {
+            found.push(item_bounds(item));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+/// Phase 85: the persistent call bar on the real window. It shows only
+/// outside the call page and never on a protected surface, where only the
+/// generic badge (no room name, no control) remains. Each control hands the
+/// exact call it was shown for, with the click's own context, to the
+/// controller (never the call page's unbound handlers): a replaced call, even
+/// in the same room and account, is refused both at the click and at the
+/// hand-off, as is a click whose security context changed while it waited.
+/// Mute and Deafen act only while the window's applied audio generation is
+/// the shown join, and Stop only while its applied capture generation is.
+/// Every surface in the window's protected list hides the bar, and a real
+/// entry withdraws a waiting click synchronously, even when the surface
+/// closes again before any change handler runs. Without an exact call Leave
+/// is disabled; Return only shows the call page and moves keyboard focus to
+/// its stage (a tile, else the participant list's control, else the stage
+/// itself on a narrow stage); and at the smallest window and 200% text its
+/// controls and indicators stay inside the window, in the top half.
+#[cfg(feature = "native-calls")]
+async fn assert_call_bar(ui: &AppWindow, runtime: &Handle) {
+    use crate::CallBar;
+    use crate::call_bar::{
+        self, Admit, BarAction,
+        tests::{clear_for_test, joined_view_for_test, observed_for_test, present_for_test},
+    };
+    use crate::calls::CallStatus;
+    use crate::local_video::CaptureKind;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    const CHANGED: &str = "The call or account changed before this was sent; nothing was done.";
+
+    let room = "!planning:example.org";
+    // Two calls of the same account and room: only their generations differ.
+    let first = observed_for_test("work", room, 7, 7);
+    let second = observed_for_test("work", room, 8, 8);
+    let fake = Arc::new(FakeCallBarControls {
+        current: Mutex::new(joined_view_for_test(&first)),
+        hold: Mutex::new(None),
+        holds: Mutex::new(Vec::new()),
+        acted: Mutex::new(Vec::new()),
+        refused: Default::default(),
+        fail: Mutex::new(None),
+        failed: Default::default(),
+    });
+    let acted = || fake.acted.lock().unwrap().clone();
+    let refused = || fake.refused.load(Ordering::SeqCst);
+    let failed = || fake.failed.load(Ordering::SeqCst);
+    let set_current = |view| *fake.current.lock().unwrap() = view;
+    let hold = || {
+        let (release, hold) = tokio::sync::oneshot::channel();
+        *fake.hold.lock().unwrap() = Some(hold);
+        release
+    };
+    // Each click's own hand-off, as send() starts it: a wait is for that
+    // hand-off's actual finish() publication, which only its own finish
+    // closure acknowledges, so no earlier delayed finish can satisfy it.
+    let handed_off = |click: &dyn Fn()| -> u64 {
+        let ids = call_bar::handoffs_for_test(click);
+        assert_eq!(ids.len(), 1, "the click handed off exactly once");
+        ids[0]
+    };
+    let not_handed_off = |click: &dyn Fn()| {
+        assert!(
+            call_bar::handoffs_for_test(click).is_empty(),
+            "nothing was handed off"
+        );
+    };
+    let finished = |id: u64| move || call_bar::handoff_finished_for_test(id);
+    // The click's own security context, as the live session's admission
+    // captures it: a security step started since the click refuses it, even
+    // after that step ended.
+    let security = Arc::new(AtomicU64::new(0));
+    let context = security.clone();
+    let admission = move |account_id: &str| {
+        let generation = context.load(Ordering::SeqCst);
+        let context = context.clone();
+        let admit = move || context.load(Ordering::SeqCst) == generation;
+        (account_id == "work").then(|| Arc::new(admit) as Admit)
+    };
+    // The audio and capture generations whose state the window shows, as
+    // main.rs's audio and capture watchers apply them: the first call's join
+    // for now.
+    let applied_audio = Arc::new(AtomicU64::new(first.presentation));
+    let applied_capture = Arc::new(AtomicU64::new(first.presentation));
+    call_bar::register(
+        ui,
+        fake.clone(),
+        runtime.clone(),
+        applied_audio.clone(),
+        applied_capture.clone(),
+        admission,
+    );
+    // The call page's own handlers: the bar never uses them.
+    let toggled = Rc::new(Cell::new(0));
+    let stopped = Rc::new(RefCell::new(Vec::new()));
+    let ended = Rc::new(Cell::new(0));
+    let counter = toggled.clone();
+    ui.on_toggle_native_microphone(move || counter.set(counter.get() + 1));
+    let kinds = stopped.clone();
+    ui.on_stop_native_capture(move |kind| kinds.borrow_mut().push(kind));
+    let counter = ended.clone();
+    ui.on_end_native_call(move || counter.set(counter.get() + 1));
+    let saved = (ui.get_live_session(), ui.get_page(), ui.get_show_sign_in());
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_font_scale_percent(100);
+    ui.set_show_sign_in(false);
+    ui.set_live_session(true);
+    ui.set_page(0);
+    // The published call state, as the status and capture watchers set it.
+    ui.set_call_connected(true);
+    ui.set_native_call_joined(true);
+    ui.set_native_call_room_display("Planning room".into());
+    ui.set_native_audio_ready(true);
+    ui.set_native_microphone_muted(false);
+    ui.set_native_camera_active(true);
+    present_for_test(ui, joined_view_for_test(&first));
+    settle(ui).await;
+    assert!(ui.get_call_bar_visible());
+    let bar = ui.global::<CallBar>();
+    assert_eq!(bar.get_status_text().as_str(), "Connected");
+    assert_eq!(bar.get_elapsed().as_str(), "0:00");
+    assert!(bar.get_can_leave() && bar.get_can_control());
+    // Indicators are the published capture state.
+    assert!(!control_bounds(ui, "Camera on").is_empty());
+    assert!(!control_bounds(ui, "Mic on").is_empty());
+    // A control hands its action for exactly the call it shows.
+    let op = handed_off(&|| click_control_once(ui, "Mute microphone"));
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), 1);
+    assert_eq!(acted(), [(BarAction::Mute(true), first.clone())]);
+    // Another call in the same room and account replaced it before the bar
+    // was told: nothing reaches the controller, and Return does not follow.
+    set_current(joined_view_for_test(&second));
+    not_handed_off(&|| {
+        click_control_once(ui, "Stop camera");
+        click_control_once(ui, "Leave call");
+        click_control_once(ui, "Return to the call page");
+        bar.invoke_mute();
+    });
+    settle(ui).await;
+    assert_eq!((acted().len(), refused(), ui.get_page()), (1, 0, 0));
+    assert!(!ui.get_native_camera_busy());
+    // The replacement arrives after the click, while its hand-off waits:
+    // the controller refuses Leave and Stop, and the bar says nothing was
+    // done.
+    set_current(joined_view_for_test(&first));
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_leave());
+    settle(ui).await;
+    set_current(joined_view_for_test(&second));
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(ui.get_session_error().as_str(), CHANGED);
+    assert_eq!((acted().len(), refused()), (1, 1));
+    ui.set_session_error("".into());
+    set_current(joined_view_for_test(&first));
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_stop_camera());
+    settle(ui).await;
+    assert!(ui.get_native_camera_busy());
+    set_current(joined_view_for_test(&second));
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert!(!ui.get_native_camera_busy());
+    assert_eq!(ui.get_native_capture_error().as_str(), CHANGED);
+    assert_eq!((acted().len(), refused()), (1, 2));
+    ui.set_native_capture_error("".into());
+    // The click's security context changes while it waits (a step starts
+    // and ends): refused, even though the call is still the same.
+    set_current(joined_view_for_test(&first));
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_leave());
+    settle(ui).await;
+    security.fetch_add(1, Ordering::SeqCst);
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(ui.get_session_error().as_str(), CHANGED);
+    assert_eq!((acted().len(), refused()), (1, 3));
+    ui.set_session_error("".into());
+    // A protected surface is shown and closed while a click waits: refused.
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    ui.set_show_sign_in(true);
+    settle(ui).await;
+    ui.set_show_sign_in(false);
+    settle(ui).await;
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(refused(), 4);
+    assert_eq!(acted().len(), 1);
+    // The matching call: Leave and Stop reach it.
+    let op = handed_off(&|| bar.invoke_leave());
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), 2);
+    let op = handed_off(&|| bar.invoke_stop_camera());
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), 3);
+    assert_eq!(
+        acted()[1..],
+        [
+            (BarAction::Leave, first.clone()),
+            (BarAction::Stop(CaptureKind::Camera), first.clone()),
+        ]
+    );
+    ui.set_native_camera_busy(false);
+    // Presented for the current call: Stop stops only that capture, never
+    // opens a picker, and Return shows the call page, where the bar is not.
+    present_for_test(ui, joined_view_for_test(&second));
+    set_current(joined_view_for_test(&second));
+    ui.set_native_screen_active(true);
+    settle(ui).await;
+    // The status shows the second call while the window still shows the
+    // first join's camera and screen state: Stop acts on nothing, since what
+    // it read is not that join's.
+    assert_eq!(applied_capture.load(Ordering::SeqCst), first.presentation);
+    not_handed_off(&|| {
+        bar.invoke_stop_camera();
+        bar.invoke_stop_share();
+    });
+    settle(ui).await;
+    assert_eq!((acted().len(), refused()), (3, 4));
+    let idle = !ui.get_native_camera_busy() && !ui.get_native_screen_busy();
+    assert!(idle, "nothing was sent");
+    // The second join's capture state is applied: each Stop reaches that
+    // join with its own kind.
+    applied_capture.store(second.presentation, Ordering::SeqCst);
+    // Each successful Stop gives up its ownership in its own finish(): both
+    // are acknowledged before any later Stop starts.
+    let op = handed_off(&|| bar.invoke_stop_camera());
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), 4);
+    let op = handed_off(&|| bar.invoke_stop_share());
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), 5);
+    assert_eq!(
+        acted()[3..],
+        [
+            (BarAction::Stop(CaptureKind::Camera), second.clone()),
+            (BarAction::Stop(CaptureKind::Screen), second.clone()),
+        ]
+    );
+    assert!(!ui.get_native_capture_picker_open());
+    ui.set_native_camera_busy(false);
+    ui.set_native_screen_busy(false);
+    ui.set_native_screen_active(false);
+    // A system screen picker is open (busy and selecting) when Stop share is
+    // pressed, and the worker's Stop fails. The worker publishes Failed
+    // before it answers, so the capture watcher applies that first (busy and
+    // selecting off) while the presentation still matches. The late failure
+    // must not put the click's old busy flag back.
+    {
+        use crate::local_video::{CapturePhase, CaptureState, LocalVideoStatus};
+        ui.set_native_screen_busy(true);
+        ui.set_native_screen_selecting(true);
+        *fake.fail.lock().unwrap() = Some(crate::calls::CallControllerError::WorkerStopped);
+        let release = hold();
+        let op = handed_off(&|| bar.invoke_stop_share());
+        settle(ui).await;
+        assert!(ui.get_native_screen_busy());
+        let failure = CaptureState {
+            phase: CapturePhase::Failed("synthetic stop failure".into()),
+            source: String::new(),
+        };
+        crate::apply_capture_status(
+            ui,
+            LocalVideoStatus {
+                token: second.presentation,
+                screen: failure,
+                ..Default::default()
+            },
+        );
+        assert!(!ui.get_native_screen_busy() && !ui.get_native_screen_selecting());
+        // Wait for this Stop's own finish() publication.
+        release.send(()).unwrap();
+        settle_until(ui, runtime, finished(op)).await;
+        assert_eq!(failed(), 1);
+        settle(ui).await;
+        assert!(!ui.get_native_screen_busy(), "no stale ShareStarting");
+        assert!(!ui.get_native_screen_selecting());
+        assert_eq!((acted().len(), refused()), (5, 4));
+        // Positive control: the picker is still selecting and nothing wrote
+        // the capture state while the Stop waited; refused at the hand-off,
+        // the click's busy flag (true) is put back, with the fixed text.
+        ui.set_native_screen_busy(true);
+        ui.set_native_screen_selecting(true);
+        let release = hold();
+        let op = handed_off(&|| bar.invoke_stop_share());
+        settle(ui).await;
+        set_current(joined_view_for_test(&first));
+        // Wait for this Stop's own finish() publication.
+        release.send(()).unwrap();
+        settle_until(ui, runtime, finished(op)).await;
+        assert_eq!(refused(), 5);
+        settle(ui).await;
+        assert!(ui.get_native_screen_busy() && ui.get_native_screen_selecting());
+        assert_eq!(ui.get_native_capture_error().as_str(), CHANGED);
+        ui.set_native_capture_error("".into());
+        set_current(joined_view_for_test(&second));
+        // Negative: the join was replaced (the watcher applied another
+        // presentation and reset its capture state) while the Stop waited;
+        // its refusal touches nothing of the new join.
+        let release = hold();
+        let op = handed_off(&|| bar.invoke_stop_share());
+        settle(ui).await;
+        applied_capture.store(second.presentation + 1, Ordering::SeqCst);
+        ui.set_native_screen_busy(false);
+        ui.set_native_screen_selecting(false);
+        set_current(joined_view_for_test(&first));
+        // Wait for this Stop's own finish() publication.
+        release.send(()).unwrap();
+        settle_until(ui, runtime, finished(op)).await;
+        assert_eq!(refused(), 6);
+        settle(ui).await;
+        assert!(!ui.get_native_screen_busy() && !ui.get_native_screen_selecting());
+        assert!(ui.get_native_capture_error().is_empty());
+        applied_capture.store(second.presentation, Ordering::SeqCst);
+        set_current(joined_view_for_test(&second));
+        // A Stop camera refused while it waited, after a newer click took the
+        // camera's busy flag (the call page's start writes it): the refusal
+        // never clears that newer flag.
+        ui.set_native_camera_active(true);
+        let release = hold();
+        let op = handed_off(&|| bar.invoke_stop_camera());
+        settle(ui).await;
+        let shown = ui.get_native_camera_busy();
+        let _newer = crate::call_bar::capture_owner_begin(CaptureKind::Camera, shown);
+        ui.set_native_camera_busy(true);
+        set_current(joined_view_for_test(&first));
+        // Wait for this Stop's own finish() publication.
+        release.send(()).unwrap();
+        settle_until(ui, runtime, finished(op)).await;
+        assert_eq!(refused(), 7);
+        settle(ui).await;
+        assert!(ui.get_native_camera_busy(), "the newer busy flag stays");
+        set_current(joined_view_for_test(&second));
+        crate::apply_capture_status(
+            ui,
+            LocalVideoStatus {
+                token: second.presentation,
+                ..Default::default()
+            },
+        );
+        ui.set_native_screen_error("".into());
+        ui.set_native_capture_error("".into());
+        assert!(!ui.get_native_camera_busy() && !ui.get_native_screen_busy());
+        // CB-CAP-01: a Stop camera and a Stop share wait at once, the real
+        // account menu opens and closes, and both are refused before they
+        // were queued (no capture update). Answered in either order, each
+        // puts back its own kind's flag: the other kind never takes it.
+        let hold_action = |action: BarAction| {
+            let (release, hold) = tokio::sync::oneshot::channel::<()>();
+            fake.holds.lock().unwrap().push((action, hold));
+            release
+        };
+        let stop_camera = BarAction::Stop(CaptureKind::Camera);
+        let stop_share = BarAction::Stop(CaptureKind::Screen);
+        ui.set_native_camera_active(true);
+        ui.set_native_screen_active(true);
+        settle(ui).await;
+        for camera_first in [true, false] {
+            let camera = hold_action(stop_camera);
+            let screen = hold_action(stop_share);
+            let camera_op = handed_off(&|| bar.invoke_stop_camera());
+            let screen_op = handed_off(&|| bar.invoke_stop_share());
+            settle(ui).await;
+            assert!(ui.get_native_camera_busy() && ui.get_native_screen_busy());
+            ui.invoke_open_account_menu();
+            ui.set_account_menu_open(false);
+            let before = refused();
+            let ((first_out, first_op), (second_out, second_op)) = if camera_first {
+                ((camera, camera_op), (screen, screen_op))
+            } else {
+                ((screen, screen_op), (camera, camera_op))
+            };
+            // Each Stop's own finish() publication, the first acknowledged
+            // before the second is released.
+            first_out.send(()).unwrap();
+            settle_until(ui, runtime, finished(first_op)).await;
+            assert!(!finished(second_op)(), "the second is still held");
+            assert_eq!(refused(), before + 1);
+            second_out.send(()).unwrap();
+            settle_until(ui, runtime, finished(second_op)).await;
+            assert_eq!(refused(), before + 2);
+            settle(ui).await;
+            let stuck = (ui.get_native_camera_busy(), ui.get_native_screen_busy());
+            assert_eq!(stuck, (false, false), "camera first: {camera_first}");
+            assert_eq!(ui.get_native_capture_error().as_str(), CHANGED);
+            ui.set_native_capture_error("".into());
+        }
+        // Duplicate same-kind Stops (Stop share stays enabled while the screen
+        // is shared): the second click saw the first one's optimistic busy
+        // flag. Both refused, answered in either order: the flag stays busy
+        // while one is still pending, then goes back to the authoritative
+        // false, never to the optimistic true.
+        for first_out in [true, false] {
+            let one = hold_action(stop_share);
+            let two = hold_action(stop_share);
+            let one_op = handed_off(&|| bar.invoke_stop_share());
+            let two_op = handed_off(&|| bar.invoke_stop_share());
+            settle(ui).await;
+            assert!(ui.get_native_screen_busy());
+            ui.invoke_open_account_menu();
+            ui.set_account_menu_open(false);
+            let before = refused();
+            let ((early, early_op), (late, late_op)) = if first_out {
+                ((one, one_op), (two, two_op))
+            } else {
+                ((two, two_op), (one, one_op))
+            };
+            // Each Stop's own finish() publication, the first acknowledged
+            // before the second is released.
+            early.send(()).unwrap();
+            settle_until(ui, runtime, finished(early_op)).await;
+            assert!(!finished(late_op)(), "the second is still held");
+            assert_eq!(refused(), before + 1);
+            settle(ui).await;
+            assert!(ui.get_native_screen_busy(), "the other click still owns it");
+            late.send(()).unwrap();
+            settle_until(ui, runtime, finished(late_op)).await;
+            assert_eq!(refused(), before + 2);
+            settle(ui).await;
+            assert!(!ui.get_native_screen_busy(), "first out: {first_out}");
+            ui.set_native_capture_error("".into());
+        }
+        // A newer full snapshot while both wait (the watcher applies both
+        // kinds): neither refusal puts back its old flag, not even the
+        // picker's selecting busy flag.
+        ui.set_native_screen_active(false);
+        ui.set_native_screen_busy(true);
+        ui.set_native_screen_selecting(true);
+        let camera = hold_action(stop_camera);
+        let screen = hold_action(stop_share);
+        let camera_op = handed_off(&|| bar.invoke_stop_camera());
+        let screen_op = handed_off(&|| bar.invoke_stop_share());
+        settle(ui).await;
+        crate::apply_capture_status(
+            ui,
+            LocalVideoStatus {
+                token: second.presentation,
+                camera: CaptureState {
+                    phase: CapturePhase::Active,
+                    source: String::new(),
+                },
+                ..Default::default()
+            },
+        );
+        set_current(joined_view_for_test(&first));
+        let before = refused();
+        // Each Stop's own finish() publication, the camera's acknowledged
+        // before the screen's is released.
+        camera.send(()).unwrap();
+        settle_until(ui, runtime, finished(camera_op)).await;
+        assert!(!finished(screen_op)(), "the screen Stop is still held");
+        assert_eq!(refused(), before + 1);
+        screen.send(()).unwrap();
+        settle_until(ui, runtime, finished(screen_op)).await;
+        assert_eq!(refused(), before + 2);
+        settle(ui).await;
+        assert!(!ui.get_native_camera_busy() && ui.get_native_camera_active());
+        assert!(!ui.get_native_screen_busy() && !ui.get_native_screen_selecting());
+        assert!(
+            ui.get_native_capture_error().is_empty(),
+            "no stale error text"
+        );
+        set_current(joined_view_for_test(&second));
+        // Back to the state the checks below expect: the camera on, and this
+        // regression's thirteen refusals left out of the totals they count.
+        ui.set_native_camera_active(true);
+        ui.set_native_screen_active(false);
+        fake.refused.fetch_sub(13, Ordering::SeqCst);
+    }
+    // The status shows the second call while the window still shows the
+    // first join's audio state: Mute and Deafen act on nothing, since the
+    // values they read are not that join's.
+    assert_eq!(applied_audio.load(Ordering::SeqCst), first.presentation);
+    not_handed_off(&|| {
+        bar.invoke_mute();
+        bar.invoke_deafen();
+    });
+    settle(ui).await;
+    assert_eq!((acted().len(), refused()), (5, 4));
+    // The second join's audio state is applied: now they act on it.
+    applied_audio.store(second.presentation, Ordering::SeqCst);
+    let op = handed_off(&|| bar.invoke_mute());
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), 6);
+    let op = handed_off(&|| bar.invoke_deafen());
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), 7);
+    assert_eq!(
+        acted()[5..],
+        [
+            (BarAction::Mute(true), second.clone()),
+            (BarAction::Deafen(true), second.clone()),
+        ]
+    );
+    // Return shows the call page, where the bar is not, and keyboard focus
+    // goes to the stage's tile.
+    ui.set_native_call_tiles(ModelRc::new(VecModel::from(vec![CallTileItem {
+        id: 3,
+        name: "Ada Lovelace".into(),
+        status: "joined".into(),
+        frame_slot: -1,
+        ..Default::default()
+    }])));
+    bar.invoke_return_to_call();
+    settle(ui).await;
+    assert_eq!(ui.get_page(), 2);
+    assert!(!ui.get_call_bar_visible());
+    assert!(control_bounds(ui, "Return to the call page").is_empty());
+    // The stage and its tile are built as the page shows.
+    let tile = "Ada Lovelace, joined";
+    settle_until(ui, runtime, || focused_control_has_label(ui, tile)).await;
+    assert!(!ui.get_call_stage_focus_pending());
+    ui.set_page(0);
+    ui.set_native_call_tiles(ModelRc::new(VecModel::from(Vec::<CallTileItem>::new())));
+    settle(ui).await;
+    // With no tile, focus goes to the participant list's own control on the
+    // stage (never the call page's Leave), inside the window.
+    bar.invoke_return_to_call();
+    settle(ui).await;
+    assert_eq!(ui.get_page(), 2);
+    let people = ui.get_native_call_participants().row_count();
+    let fallback = [
+        "Hide participant list".to_owned(),
+        format!("Show participant list, {people} in call"),
+    ];
+    let shown = fallback
+        .iter()
+        .any(|label| !control_bounds(ui, label).is_empty());
+    assert!(shown, "the stage keeps its participant list control");
+    let focused_fallback = || {
+        fallback
+            .iter()
+            .any(|label| focused_control_has_label(ui, label))
+    };
+    settle_until(ui, runtime, focused_fallback).await;
+    assert!(!focused_control_has_label(ui, "Leave native call"));
+    let window = ui.window().size().to_logical(ui.window().scale_factor());
+    let focused = focused_control_bounds(ui).expect("a focused control");
+    assert!(
+        focused.left >= 0.0
+            && focused.right <= window.width + 0.5
+            && focused.top >= 0.0
+            && focused.bottom <= window.height + 0.5,
+        "{focused:?}"
+    );
+    assert!(!ui.get_call_stage_focus_pending());
+    ui.set_page(0);
+    settle(ui).await;
+    // No exact call (an incomplete cleanup): Leave and the media controls
+    // are disabled and say so; Return still leads to the call page.
+    let cleanup = call_bar::view_of(
+        &CallStatus::CleanupFailed {
+            account_id: "work".into(),
+            room_id: room.into(),
+            reason: "leave status unknown".into(),
+        },
+        Some(second.clone()),
+    );
+    ui.set_native_leave_unconfirmed(true);
+    present_for_test(ui, cleanup.clone());
+    set_current(cleanup);
+    settle(ui).await;
+    assert!(!bar.get_can_leave() && !bar.get_can_control());
+    let unavailable = "Leave unavailable here: review the incomplete call cleanup on the call page";
+    assert!(!control_bounds(ui, unavailable).is_empty());
+    not_handed_off(&|| {
+        bar.invoke_leave();
+        bar.invoke_mute();
+    });
+    settle(ui).await;
+    assert_eq!((acted().len(), refused()), (7, 4));
+    bar.invoke_return_to_call();
+    settle(ui).await;
+    assert_eq!(ui.get_page(), 2);
+    ui.set_page(0);
+    ui.set_native_leave_unconfirmed(false);
+    present_for_test(ui, joined_view_for_test(&second));
+    set_current(joined_view_for_test(&second));
+    settle(ui).await;
+    // A protected surface: no bar, no room name, no action; only the
+    // generic badge, with what this device captures.
+    ui.set_show_sign_in(true);
+    settle(ui).await;
+    assert!(ui.get_call_bar_protected() && !ui.get_call_bar_visible());
+    let badge = control_bounds(ui, "Call active · Mic on · Camera on");
+    assert!(!badge.is_empty());
+    assert!(!any_label_contains(ui, "Planning room"));
+    not_handed_off(&|| {
+        bar.invoke_leave();
+        bar.invoke_mute();
+    });
+    settle(ui).await;
+    assert_eq!((acted().len(), refused()), (7, 4));
+    ui.set_show_sign_in(false);
+    settle(ui).await;
+    // Every surface that takes the window over protects the bar: the whole
+    // list in call-bar-protected (one list with matrix-link-blocked).
+    let surfaces: [(&str, fn(&AppWindow, bool)); 32] = [
+        ("no live session", |ui, on| ui.set_live_session(!on)),
+        ("link card", |ui, on| {
+            ui.global::<crate::MatrixLink>().set_open(on);
+        }),
+        ("sign-in", |ui, on| ui.set_show_sign_in(on)),
+        ("account access", |ui, on| ui.set_access_open(on)),
+        ("Manage accounts", |ui, on| ui.set_manage_accounts_open(on)),
+        ("account menu", |ui, on| ui.set_account_menu_open(on)),
+        ("account switch", |ui, on| ui.set_account_switch_pending(on)),
+        ("security step", |ui, on| ui.set_security_busy(on)),
+        ("recovery key", |ui, on| {
+            let key = if on {
+                "synthetic-key-not-a-credential"
+            } else {
+                ""
+            };
+            ui.set_security_recovery_key(key.into());
+        }),
+        ("verification busy", |ui, on| ui.set_sas_busy(on)),
+        ("verification stage", |ui, on| {
+            ui.set_sas_stage(if on { 4 } else { 0 })
+        }),
+        ("account profile", |ui, on| ui.set_account_profile_open(on)),
+        ("People", |ui, on| ui.set_people_open(on)),
+        ("member details", |ui, on| {
+            let inspector = crate::MemberInspectorView {
+                open: on,
+                ..Default::default()
+            };
+            ui.global::<crate::MemberPrivacy>().set_inspector(inspector);
+        }),
+        ("Space explorer", |ui, on| {
+            ui.global::<crate::SpaceExplorer>().set_open(on);
+        }),
+        ("Space rooms", |ui, on| {
+            ui.global::<crate::SpaceRooms>().set_open(on)
+        }),
+        ("room addresses", |ui, on| {
+            ui.global::<crate::RoomAddresses>().set_open(on);
+        }),
+        ("room notifications", |ui, on| {
+            ui.global::<crate::RoomNotificationState>().set_open(on);
+        }),
+        ("Seen by", |ui, on| {
+            ui.global::<crate::RoomActivity>().set_seen_open(on);
+        }),
+        ("Quick Switcher", |ui, on| ui.set_quick_switcher_open(on)),
+        ("room actions", |ui, on| ui.set_room_actions_open(on)),
+        ("room admin", |ui, on| ui.set_room_admin_open(on)),
+        ("member confirmation", |ui, on| {
+            ui.set_member_confirm_open(on)
+        }),
+        ("capture picker", |ui, on| {
+            ui.set_native_capture_picker_open(on)
+        }),
+        ("leave dialog", |ui, on| ui.set_leave_call_dialog(on)),
+        ("image preview", |ui, on| ui.set_image_preview_open(on)),
+        ("poll dialog", |ui, on| ui.set_poll_dialog_open(on)),
+        ("thread browser", |ui, on| {
+            ui.global::<crate::ThreadBrowser>().set_open(on);
+        }),
+        ("Leave dialog", |ui, on| {
+            let leave = ui.global::<crate::RoomLeave>();
+            let mut view = leave.get_view();
+            view.open = on;
+            leave.set_view(view);
+        }),
+        // The two Settings states (the bar is otherwise available there).
+        ("ignored-users review", |ui, on| {
+            let privacy = ui.global::<crate::MemberPrivacy>();
+            let mut ignored = privacy.get_ignored();
+            ignored.stage = if on { 1 } else { 0 };
+            privacy.set_ignored(ignored);
+        }),
+        ("ignored-users change sending", |ui, on| {
+            let privacy = ui.global::<crate::MemberPrivacy>();
+            let mut ignored = privacy.get_ignored();
+            ignored.busy = on;
+            privacy.set_ignored(ignored);
+        }),
+        ("shortcut recording", |ui, on| {
+            let recording = if on { "toggle_details_panel" } else { "" };
+            ui.set_shortcut_recording(recording.into());
+        }),
+    ];
+    for (name, set) in surfaces {
+        assert!(
+            !ui.get_call_bar_protected(),
+            "nothing protected before {name}"
+        );
+        set(ui, true);
+        let hidden = ui.get_call_bar_protected() && !ui.get_call_bar_visible();
+        assert!(hidden, "{name} protects the bar");
+        set(ui, false);
+    }
+    assert!(ui.get_call_bar_visible());
+    settle(ui).await;
+    // A modal opened and closed again while a click waits, with no change
+    // handler run in between (no settle): its real entry withdrew the click
+    // synchronously, so it stays refused although nothing is open now.
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    ui.invoke_open_account_menu();
+    assert!(ui.get_account_menu_open());
+    ui.set_account_menu_open(false);
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(refused(), 5);
+    assert_eq!(acted().len(), 7);
+    settle(ui).await;
+    // The same through the actual account trigger (pointer), not the public
+    // function: opening it withdraws the waiting click synchronously, so an
+    // immediate close with no settle cannot revive it.
+    let trigger = format!(
+        "Account menu for {}, {}",
+        ui.get_active_account_name(),
+        ui.get_active_account_handle()
+    );
+    // Focus elsewhere first, so the click reaches an unfocused trigger.
+    request_bridge_focus(ui, "Mute microphone");
+    settle(ui).await;
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    click_control_once(ui, &trigger);
+    assert!(
+        ui.get_account_menu_open(),
+        "the actual trigger opens the menu"
+    );
+    ui.set_account_menu_open(false);
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(refused(), 6);
+    assert_eq!(acted().len(), 7);
+    // The trigger's close toggle is kept (keyboard, on the focused trigger).
+    request_bridge_focus(ui, "Mute microphone");
+    settle(ui).await;
+    click_control_once(ui, &trigger);
+    assert!(ui.get_account_menu_open());
+    key(ui, Key::Return);
+    assert!(
+        !ui.get_account_menu_open(),
+        "the actual trigger closes the menu"
+    );
+    settle(ui).await;
+    // This case's refusal is left out of the totals the checks below count.
+    fake.refused.fetch_sub(1, Ordering::SeqCst);
+    // Shortcut recording in Settings protects the bar too, and its real
+    // entry withdraws a waiting click synchronously: opened and cancelled
+    // again with no change handler run in between, the click stays refused.
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    ui.invoke_shortcut_record("toggle_details_panel".into());
+    assert!(!ui.get_shortcut_recording().is_empty());
+    assert!(ui.get_call_bar_protected() && !ui.get_call_bar_visible());
+    ui.invoke_shortcut_cancel_recording();
+    assert!(ui.get_shortcut_recording().is_empty());
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(refused(), 6);
+    assert_eq!(acted().len(), 7);
+    settle(ui).await;
+    // The inline ignored-users review, entered as its real entry does
+    // (withdraw first, then the stage) and closed again with no settle:
+    // the waiting click stays refused.
+    let review = |ui: &AppWindow, stage: i32, busy: bool| {
+        let privacy = ui.global::<crate::MemberPrivacy>();
+        let mut ignored = privacy.get_ignored();
+        ignored.stage = stage;
+        ignored.busy = busy;
+        privacy.set_ignored(ignored);
+    };
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    crate::withdraw_call_bar(ui);
+    review(ui, 1, false);
+    assert!(ui.get_call_bar_protected());
+    review(ui, 0, false);
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(refused(), 7);
+    assert_eq!(acted().len(), 7);
+    settle(ui).await;
+    // While each of the three states is active: only the generic badge, no
+    // private bar, and no direct Return, Leave or media action.
+    let states: [(&str, fn(&AppWindow, bool)); 3] = [
+        ("ignored-users review", |ui, on| {
+            let privacy = ui.global::<crate::MemberPrivacy>();
+            let mut ignored = privacy.get_ignored();
+            ignored.stage = if on { 1 } else { 0 };
+            privacy.set_ignored(ignored);
+        }),
+        ("ignored-users change sending", |ui, on| {
+            let privacy = ui.global::<crate::MemberPrivacy>();
+            let mut ignored = privacy.get_ignored();
+            ignored.stage = if on { 2 } else { 0 };
+            ignored.busy = on;
+            privacy.set_ignored(ignored);
+        }),
+        ("shortcut recording", |ui, on| {
+            let recording = if on { "toggle_details_panel" } else { "" };
+            ui.set_shortcut_recording(recording.into());
+        }),
+    ];
+    for (name, set) in states {
+        set(ui, true);
+        settle(ui).await;
+        assert!(
+            ui.get_call_bar_protected() && !ui.get_call_bar_visible(),
+            "{name}"
+        );
+        assert!(
+            !control_bounds(ui, "Call active · Mic on · Camera on").is_empty(),
+            "{name}"
+        );
+        assert!(!any_label_contains(ui, "Planning room"), "{name}");
+        not_handed_off(&|| {
+            bar.invoke_return_to_call();
+            bar.invoke_leave();
+            bar.invoke_mute();
+            bar.invoke_stop_camera();
+        });
+        settle(ui).await;
+        assert_eq!(
+            (acted().len(), refused(), ui.get_page()),
+            (7, 7, 0),
+            "{name}"
+        );
+        set(ui, false);
+        settle(ui).await;
+    }
+    assert!(ui.get_call_bar_visible());
+    // The thread browser protects the bar too. Its entry (thread_browser::
+    // show, registered only from phase 89) withdraws the bar before its
+    // flags change; entered in that order and closed with no settle, a
+    // waiting click stays refused, and while it is open no direct Return,
+    // Leave or media action runs.
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    crate::withdraw_call_bar(ui);
+    ui.global::<crate::ThreadBrowser>().set_open(true);
+    assert!(ui.get_call_bar_protected() && !ui.get_call_bar_visible());
+    ui.global::<crate::ThreadBrowser>().set_open(false);
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(refused(), 8);
+    assert_eq!(acted().len(), 7);
+    ui.global::<crate::ThreadBrowser>().set_open(true);
+    settle(ui).await;
+    assert!(!control_bounds(ui, "Call active · Mic on · Camera on").is_empty());
+    not_handed_off(&|| {
+        bar.invoke_return_to_call();
+        bar.invoke_leave();
+        bar.invoke_mute();
+        bar.invoke_stop_camera();
+    });
+    settle(ui).await;
+    assert_eq!((acted().len(), refused(), ui.get_page()), (7, 8, 0));
+    ui.global::<crate::ThreadBrowser>().set_open(false);
+    settle(ui).await;
+    assert!(ui.get_call_bar_visible());
+    // The Leave dialog protects the bar too. Its admitted start (room_leave,
+    // replaced by phase 88's own handler here) withdraws the bar before its
+    // view opens; entered in that order and closed with no settle, a waiting
+    // click stays refused, and while it is open no direct action runs.
+    let leave_view = |ui: &AppWindow, open: bool| {
+        let leave = ui.global::<crate::RoomLeave>();
+        let mut view = leave.get_view();
+        view.open = open;
+        leave.set_view(view);
+    };
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    crate::withdraw_call_bar(ui);
+    leave_view(ui, true);
+    assert!(ui.get_call_bar_protected() && !ui.get_call_bar_visible());
+    leave_view(ui, false);
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(refused(), 9);
+    assert_eq!(acted().len(), 7);
+    leave_view(ui, true);
+    settle(ui).await;
+    assert!(!control_bounds(ui, "Call active · Mic on · Camera on").is_empty());
+    not_handed_off(&|| {
+        bar.invoke_return_to_call();
+        bar.invoke_leave();
+        bar.invoke_mute();
+        bar.invoke_stop_camera();
+    });
+    settle(ui).await;
+    assert_eq!((acted().len(), refused(), ui.get_page()), (7, 9, 0));
+    leave_view(ui, false);
+    settle(ui).await;
+    assert!(ui.get_call_bar_visible());
+    // The bar stays available in ordinary Settings.
+    ui.set_page(1);
+    settle(ui).await;
+    assert!(!ui.get_call_bar_protected() && ui.get_call_bar_visible());
+    ui.set_page(0);
+    settle(ui).await;
+    // The keyboard: Tab and Backtab walk the bar's controls in order (Deafen
+    // only where the bar is wide), and Tab leaves the bar after Leave.
+    let wide = !control_bounds(ui, "Deafen speaker").is_empty();
+    let order: Vec<&str> = [
+        "Mute microphone",
+        "Deafen speaker",
+        "Stop camera",
+        "Return to the call page",
+        "Leave call",
+    ]
+    .into_iter()
+    .filter(|label| wide || *label != "Deafen speaker")
+    .collect();
+    request_bridge_focus(ui, order[0]);
+    for label in &order[1..] {
+        key(ui, Key::Tab);
+        assert!(focused_control_has_label(ui, label), "Tab reaches {label}");
+    }
+    for label in order[..order.len() - 1].iter().rev() {
+        key(ui, Key::Backtab);
+        assert!(
+            focused_control_has_label(ui, label),
+            "Backtab reaches {label}"
+        );
+    }
+    request_bridge_focus(ui, "Leave call");
+    key(ui, Key::Tab);
+    let left = order
+        .iter()
+        .all(|label| !focused_control_has_label(ui, label));
+    assert!(left, "Tab leaves the bar after Leave");
+    key(ui, Key::Backtab);
+    assert!(focused_control_has_label(ui, "Leave call"));
+    settle(ui).await;
+    // The smallest windows, including the actual minimum, at 200% text with
+    // every capture indicator shown: every control and indicator is inside
+    // the window, in its top half, so the composer keeps its place.
+    ui.set_native_screen_active(true);
+    ui.set_font_scale_percent(200);
+    for (width, height) in [(940, 620), (640, 620)] {
+        let size = slint::PhysicalSize::new(width, height);
+        ui.window().set_size(size);
+        settle(ui).await;
+        let window = ui.window().size().to_logical(ui.window().scale_factor());
+        for label in [
+            "Mute microphone",
+            "Stop camera",
+            "Stop screen sharing",
+            "Return to the call page",
+            "Leave call",
+            "Mic on",
+            "Camera on",
+            "Sharing screen",
+        ] {
+            let bounds = control_bounds(ui, label);
+            assert!(
+                !bounds.is_empty(),
+                "{label} is shown at {width}x{height}, 200%"
+            );
+            for bounds in bounds {
+                assert!(
+                    bounds.left >= 0.0
+                        && bounds.right <= window.width + 0.5
+                        && bounds.top >= 0.0
+                        && bounds.bottom <= window.height / 2.0,
+                    "{label} at {width}x{height}, 200%: {bounds:?}"
+                );
+            }
+        }
+    }
+    // Return at the minimum window and 200% text with no tile: the stage is
+    // too narrow for its participant list, so the stage itself takes focus,
+    // visibly inside the window, and only then does the request end.
+    bar.invoke_return_to_call();
+    settle(ui).await;
+    assert_eq!(ui.get_page(), 2);
+    let people = ui.get_native_call_participants().row_count();
+    let stage = format!("Call stage, {people} in call");
+    settle_until(ui, runtime, || focused_control_has_label(ui, &stage)).await;
+    assert!(!focused_control_has_label(ui, "Leave native call"));
+    let window = ui.window().size().to_logical(ui.window().scale_factor());
+    let focused = focused_control_bounds(ui).expect("a focused control");
+    assert!(
+        focused.right > focused.left
+            && focused.bottom > focused.top
+            && focused.left >= 0.0
+            && focused.right <= window.width + 0.5
+            && focused.top >= 0.0
+            && focused.bottom <= window.height + 0.5,
+        "stage focus at 640x620, 200%: {focused:?}"
+    );
+    assert!(!ui.get_call_stage_focus_pending());
+    ui.set_page(0);
+    settle(ui).await;
+    // The protected badge at the minimum window and 200% text: inside the
+    // window, with its whole status shown (its words wrap, never elide).
+    ui.set_show_sign_in(true);
+    settle(ui).await;
+    let window = ui.window().size().to_logical(ui.window().scale_factor());
+    let summary = "Call active · Mic on · Camera on · Sharing screen";
+    let badges = control_bounds(ui, summary);
+    assert_eq!(badges.len(), 1, "one badge carries the summary");
+    let texts = text_item_bounds(ui, summary);
+    assert_eq!(texts.len(), 1, "the badge shows the whole summary");
+    let (badge, text) = (badges[0], texts[0]);
+    assert!(
+        badge.left >= 0.0 && badge.right <= window.width + 0.5 && badge.top >= 0.0,
+        "badge at 640x620, 200%: {badge:?}"
+    );
+    assert!(
+        text.left >= badge.left
+            && text.right <= badge.right + 0.5
+            && text.top >= badge.top - 0.5
+            && text.bottom <= badge.bottom + 0.5,
+        "badge text {text:?} inside {badge:?}"
+    );
+    ui.set_show_sign_in(false);
+    ui.set_native_screen_active(false);
+    // The call page's unbound handlers were never used by the bar.
+    assert!(stopped.borrow().is_empty());
+    assert_eq!((toggled.get(), ended.get()), (0, 0));
+    // The responsive header's actual More opener is another protected
+    // entry. Open and close by its accessibility action without a change
+    // handler between them: the held command must stay withdrawn. While it
+    // is open the private bar and direct media/navigation actions are held.
+    // This extends the existing fixture; all earlier command IDs are drained.
+    // Identity details use the same admitted-entry order: withdrawal before
+    // the visible flag, closed again without a change handler. The actual
+    // scoped showDetails/ViewMember choke points are checked in call_bar's
+    // existing entry-order test; this case exercises the real bar controller.
+    let identity = ui.global::<crate::IdentityWarnings>();
+    let identity_room = ui.get_active_room_id();
+    ui.set_active_room_id(room.into());
+    settle(ui).await;
+    assert!(ui.get_identity_warnings_allowed());
+    let acted_before_identity = acted().len();
+    let refused_before_identity = refused();
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    crate::withdraw_call_bar(ui);
+    identity.set_open(true);
+    assert!(ui.get_call_bar_protected() && !ui.get_call_bar_visible());
+    not_handed_off(&|| {
+        bar.invoke_return_to_call();
+        bar.invoke_leave();
+        bar.invoke_mute();
+        bar.invoke_stop_camera();
+    });
+    identity.set_open(false);
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), acted_before_identity);
+    assert_eq!(refused(), refused_before_identity + 1);
+    ui.set_active_room_id(identity_room);
+    // More's real opening must also retire the old identity focus intent.
+    settle(ui).await;
+    assert!(ui.get_header_overflow());
+    let acted_before_more = acted().len();
+    let refused_before_more = refused();
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    let more = control_with_label(ui, "More room actions");
+    identity.set_return_focus(true);
+    identity.set_awaiting_inspector(true);
+    assert!(identity.get_return_focus() && identity.get_awaiting_inspector());
+    more.accessible_action(&slint::private_unstable_api::re_exports::AccessibilityAction::Default);
+    assert!(ui.get_header_more_open());
+    assert!(!identity.get_return_focus() && !identity.get_awaiting_inspector());
+    assert!(ui.get_call_bar_protected() && !ui.get_call_bar_visible());
+    not_handed_off(&|| {
+        bar.invoke_return_to_call();
+        bar.invoke_leave();
+        bar.invoke_mute();
+        bar.invoke_stop_camera();
+    });
+    more.accessible_action(&slint::private_unstable_api::re_exports::AccessibilityAction::Default);
+    assert!(!ui.get_header_more_open());
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), acted_before_more);
+    assert_eq!(refused(), refused_before_more + 1);
+    assert!(stopped.borrow().is_empty());
+    assert_eq!((toggled.get(), ended.get()), (0, 0));
+    // The call ends: the bar and its timer go.
+    clear_for_test(ui);
+    settle(ui).await;
+    assert!(!bar.get_active() && bar.get_elapsed().is_empty());
+    assert!(!bar.get_can_leave() && !bar.get_can_control());
+    ui.set_call_connected(false);
+    ui.set_native_call_joined(false);
+    ui.set_native_call_room_display("".into());
+    ui.set_native_audio_ready(false);
+    ui.set_native_microphone_muted(true);
+    ui.set_native_camera_active(false);
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_live_session(saved.0);
+    ui.set_page(saved.1);
+    ui.set_show_sign_in(saved.2);
+    settle(ui).await;
 }
 
 /// Window-relative bounds of one real generated control: left, top, right,
@@ -8023,6 +9277,24 @@ async fn assert_responsive_header(ui: &AppWindow) {
         crate::matrix_links::clear(ui);
         settle(ui).await;
     }
+    // Identity details are a visible peer too: More refuses before any
+    // withdrawal, including the identity dialog's own focus-return intent.
+    let identity = ui.global::<crate::IdentityWarnings>();
+    identity.set_open(true);
+    identity.set_return_focus(true);
+    identity.set_awaiting_inspector(true);
+    let before_identity = resets.get();
+    activate_more(ui);
+    assert!(!ui.get_header_more_open());
+    assert!(identity.get_open());
+    assert!(identity.get_return_focus() && identity.get_awaiting_inspector());
+    assert_eq!(
+        resets.get(),
+        before_identity,
+        "visible identity details refuse first"
+    );
+    crate::identity_warnings::withdraw(ui);
+    settle(ui).await;
     // Admitted, it withdraws first: a joined link's message still to come
     // and a Leave owner whose view already hid. While it is open links and
     // the browser are held (a late admission ends for good) and Leave stays
@@ -8031,6 +9303,10 @@ async fn assert_responsive_header(ui: &AppWindow) {
     let before = resets.get();
     activate_more(ui);
     assert!(ui.get_header_more_open());
+    assert!(
+        !ui.get_identity_warnings_allowed(),
+        "More owns identity admission"
+    );
     assert!(
         follow_up.withdrawn(),
         "More's entry ended the link's follow-up"
@@ -8328,6 +9604,625 @@ async fn assert_responsive_header(ui: &AppWindow) {
     ui.set_details_reveal_open(reveal);
     ui.set_show_sign_in(sign_in);
     ui.invoke_focus_composer(false);
+    settle(ui).await;
+}
+
+/// Phase 86: identity-change warnings. First the row and details through
+/// stand-in callbacks: the row under the room header, the details' focus trap
+/// (member list, View member, Close), paused shortcuts, Escape with focus
+/// back on Details, View member routing only the exact listed ID through the
+/// production routing and guarded inspector entry, focus back on Details
+/// after the person closes the inspector, the bounds at 940x620 and 200% text
+/// with a long list (also across a text-scale change), a row that stays when
+/// every followed warning cleared but some could not be followed, protected
+/// withdrawal of the details and of the inspector that never pulls focus
+/// from the protected surface, the exact View member gate, and rescoping on
+/// room and account changes. Then the registered production controller with
+/// no account (nothing is ever checked): a reset clears every row
+/// synchronously, Details stays closed without a checked scope, and an
+/// unlisted ID is never routed. No account, network or vault is used.
+async fn assert_identity_warnings_presentation(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+) {
+    use crate::{IdentityWarningItem, IdentityWarnings, MemberInspectorView, MemberPrivacy};
+    use morpheus_matrix::{IdentityWarning, IdentityWarningKind, IdentityWarnings as Warnings};
+    use slint::private_unstable_api::re_exports::WindowInner;
+    use slint::{Model, ModelRc, VecModel};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    let focused_item = |ui: &AppWindow| {
+        WindowInner::from_pub(ui.window())
+            .focus_item
+            .borrow()
+            .upgrade()
+    };
+    // The account access surface (either of its titles) holds focus.
+    let in_access_dialog = |ui: &AppWindow| {
+        focused_control_has_label(ui, "Local app password")
+            || focused_control_has_label(ui, "Remove saved account")
+    };
+    let warnings = ui.global::<IdentityWarnings>();
+    let privacy = ui.global::<MemberPrivacy>();
+    let routed = Rc::new(RefCell::new(Vec::<String>::new()));
+    let scopes = Rc::new(Cell::new(0));
+    let weak = ui.as_weak();
+    warnings.on_show_details(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<IdentityWarnings>().set_open(true);
+        }
+    });
+    let weak = ui.as_weak();
+    warnings.on_close_details(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<IdentityWarnings>().set_open(false);
+        }
+    });
+    // View member uses the production routing: the details, the window's
+    // admission and the security gate are read when it is pressed, then the
+    // inspector's guarded entry. Only the scope's account check, which needs
+    // a real account, is left to the registered controller below.
+    let weak = ui.as_weak();
+    let sink = routed.clone();
+    let gate = live.security_gate.clone();
+    warnings.on_view_member(move |user| {
+        sink.borrow_mut().push(user.to_string());
+        if let Some(ui) = weak.upgrade() {
+            crate::identity_warnings::route_member(&ui, &gate, user.as_str());
+        }
+    });
+    let counted = scopes.clone();
+    warnings.on_context_changed(move || counted.set(counted.get() + 1));
+    // The inspector opens synchronously, as the production entry does; no
+    // member is read.
+    let inspected = Rc::new(RefCell::new(Vec::<String>::new()));
+    let sink = inspected.clone();
+    let weak = ui.as_weak();
+    privacy.on_inspect(move |user| {
+        sink.borrow_mut().push(user.to_string());
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<MemberPrivacy>()
+                .set_inspector(MemberInspectorView {
+                    open: true,
+                    loading: true,
+                    user_id: user,
+                    ..Default::default()
+                });
+        }
+    });
+    let weak = ui.as_weak();
+    privacy.on_close_inspector(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<MemberPrivacy>()
+                .set_inspector(MemberInspectorView::default());
+        }
+    });
+
+    let before = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_active_account_local_id(),
+        ui.get_active_room_id(),
+    );
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("work".into());
+    ui.set_active_room_id("!room:example.org".into());
+    settle(ui).await;
+
+    // The production text for what the SDK reported.
+    let reported = Warnings {
+        members: vec![
+            IdentityWarning {
+                user_id: "@sam:example.org".into(),
+                name: Some("Sam".into()),
+                kind: IdentityWarningKind::VerifiedChanged,
+            },
+            IdentityWarning {
+                user_id: "@pat:example.org".into(),
+                name: Some("Pat".into()),
+                kind: IdentityWarningKind::Changed,
+            },
+        ],
+        omitted: 0,
+        at_least: false,
+    };
+    let seed = |rows: Vec<IdentityWarningItem>, summary: &str| {
+        warnings.set_rows(ModelRc::new(VecModel::from(rows)));
+        warnings.set_summary(summary.into());
+        warnings.set_overflow("".into());
+    };
+    let two = || {
+        vec![
+            IdentityWarningItem {
+                user_id: "@sam:example.org".into(),
+                display_id: "@sam:example.org".into(),
+                label: "Sam".into(),
+                detail: "Identity changed after you verified it".into(),
+            },
+            IdentityWarningItem {
+                user_id: "@pat:example.org".into(),
+                display_id: "@pat:example.org".into(),
+                label: "Pat".into(),
+                detail: "Identity changed since it was first seen".into(),
+            },
+        ]
+    };
+    seed(two(), &crate::identity_warnings::summary(&reported));
+    settle(ui).await;
+    assert_eq!(
+        button_bounds(ui, "Show identity change details").len(),
+        1,
+        "one quiet row with Details"
+    );
+
+    let sam = "Member 1 of 2: Sam, @sam:example.org, Identity changed after you verified it";
+    let pat = "Member 2 of 2: Pat, @pat:example.org, Identity changed since it was first seen";
+    click_control_once(ui, "Show identity change details");
+    settle(ui).await;
+    assert!(warnings.get_open());
+    assert!(
+        focused_control_has_label(ui, sam),
+        "focus starts on the list"
+    );
+    key(ui, Key::DownArrow);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, pat));
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(ui, "View member details for Pat"));
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(ui, "Close identity changes"));
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(ui, pat), "Tab stays inside");
+    key(ui, Key::Backtab);
+    assert!(focused_control_has_label(ui, "Close identity changes"));
+    key(ui, Key::Backtab);
+    assert!(focused_control_has_label(ui, "View member details for Pat"));
+    key(ui, Key::Backtab);
+    assert!(focused_control_has_label(ui, pat), "Shift+Tab stays inside");
+    assert!(
+        !ui.invoke_dispatch_shortcut("p".into(), true, false, false, false),
+        "shortcuts pause while the details are open"
+    );
+    assert!(!ui.get_quick_switcher_open());
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!warnings.get_open());
+    assert!(focused_control_has_label(
+        ui,
+        "Show identity change details"
+    ));
+
+    // View member routes only the selected row's exact ID through the
+    // guarded inspector entry and closes the details; when the person closes
+    // the inspector, focus returns to the row. Details has focus again, so
+    // the keyboard opens it.
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert!(warnings.get_open());
+    key(ui, Key::End);
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(*routed.borrow(), ["@pat:example.org"]);
+    assert_eq!(*inspected.borrow(), ["@pat:example.org"]);
+    assert!(!warnings.get_open());
+    assert!(privacy.get_inspector().open);
+    assert!(!focused_control_has_label(
+        ui,
+        "Show identity change details"
+    ));
+    privacy.invoke_close_inspector();
+    settle(ui).await;
+    assert!(focused_control_has_label(
+        ui,
+        "Show identity change details"
+    ));
+
+    // The smallest window at 200% text: the dialog fits, its member list
+    // scrolls to the selected row, and the fixed Close stays inside it.
+    ui.window().set_size(slint::PhysicalSize::new(940, 620));
+    ui.set_font_scale_percent(200);
+    let many: Vec<IdentityWarningItem> = (0..30)
+        .map(|index| IdentityWarningItem {
+            user_id: format!("@m{index}:example.org").into(),
+            display_id: format!("@m{index}:example.org").into(),
+            label: format!("Member {index}").into(),
+            detail: "Identity changed since it was first seen".into(),
+        })
+        .collect();
+    seed(many, "30 members' identities changed.");
+    warnings.set_overflow("And 4 more members.".into());
+    settle(ui).await;
+    warnings.invoke_show_details();
+    settle(ui).await;
+    let panel = item_bounds(&control_with_label(ui, "Identity change details"));
+    assert!(
+        inside_window(ui, panel),
+        "the dialog fits the window: {panel:?}"
+    );
+    let close = item_bounds(&control_with_label(ui, "Close identity changes"));
+    assert!(
+        close.top >= panel.top - 0.5 && close.bottom <= panel.bottom + 0.5,
+        "Close stays inside the dialog: {close:?} in {panel:?}"
+    );
+    key(ui, Key::End);
+    settle(ui).await;
+    let last_row = "Member 29, @m29:example.org, Identity changed since it was first seen";
+    let last = item_bounds(&control_with_label(ui, last_row));
+    assert!(
+        last.top >= panel.top - 0.5 && last.bottom <= close.top + 0.5,
+        "the selected last row is scrolled into view: {last:?} above {close:?}"
+    );
+    // The list's own scroll area (the focused list, labelled with the
+    // selection) contains the whole selected row: the reveal uses the same
+    // row pitch as the layout, also after a text-scale change.
+    for percent in [200, 150, 200] {
+        ui.set_font_scale_percent(percent);
+        settle(ui).await;
+        let list = item_bounds(&control_with_label(
+            ui,
+            &format!("Member 30 of 30: {last_row}"),
+        ));
+        let close = item_bounds(&control_with_label(ui, "Close identity changes"));
+        let last = item_bounds(&control_with_label(ui, last_row));
+        assert!(
+            last.top >= list.top - 0.5 && last.bottom <= list.bottom + 0.5,
+            "{percent}%: the selected last row is inside the list: {last:?} in {list:?}"
+        );
+        assert!(
+            last.bottom <= close.top + 0.5,
+            "{percent}%: the selected last row is above Close: {last:?} above {close:?}"
+        );
+    }
+    key(ui, Key::Escape);
+    settle(ui).await;
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+
+    // Every followed warning cleared but some could not be followed: the
+    // row stays, with no count, and the details say only that.
+    let unfollowed = Warnings {
+        members: Vec::new(),
+        omitted: 0,
+        at_least: true,
+    };
+    seed(Vec::new(), &crate::identity_warnings::summary(&unfollowed));
+    warnings.set_overflow(crate::identity_warnings::overflow(&unfollowed).into());
+    settle(ui).await;
+    assert_eq!(
+        button_bounds(ui, "Show identity change details").len(),
+        1,
+        "the row stays while some warnings could not be followed"
+    );
+    warnings.invoke_show_details();
+    settle(ui).await;
+    assert!(warnings.get_open());
+    assert!(
+        focused_control_has_label(ui, "Close identity changes"),
+        "nothing to list: focus starts on Close"
+    );
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!warnings.get_open());
+    assert!(focused_control_has_label(
+        ui,
+        "Show identity change details"
+    ));
+    seed(two(), &crate::identity_warnings::summary(&reported));
+    settle(ui).await;
+
+    // A protected surface closes the details at once and keeps its own
+    // focus: nothing is pulled back to the row behind it, then or later.
+    warnings.invoke_show_details();
+    settle(ui).await;
+    assert!(warnings.get_open());
+    ui.set_access_open(true);
+    settle(ui).await;
+    assert!(
+        !warnings.get_open(),
+        "a protected surface closed the details"
+    );
+    assert!(in_access_dialog(ui), "the protected surface has focus");
+    let replaced = focused_item(ui);
+    settle(ui).await;
+    assert!(focused_item(ui) == replaced, "and keeps it");
+    ui.set_access_open(false);
+    settle(ui).await;
+    assert!(
+        !focused_control_has_label(ui, "Show identity change details"),
+        "no deferred return to the row"
+    );
+
+    // The same for the inspector opened from View member.
+    warnings.invoke_show_details();
+    settle(ui).await;
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(
+        inspected.borrow().last().map(String::as_str),
+        Some("@sam:example.org")
+    );
+    assert!(privacy.get_inspector().open && warnings.get_awaiting_inspector());
+    ui.set_access_open(true);
+    settle(ui).await;
+    assert!(
+        !privacy.get_inspector().open,
+        "a protected surface closed the inspector"
+    );
+    assert!(!warnings.get_awaiting_inspector());
+    assert!(in_access_dialog(ui), "the protected surface has focus");
+    let replaced = focused_item(ui);
+    settle(ui).await;
+    assert!(focused_item(ui) == replaced, "and keeps it");
+    ui.set_access_open(false);
+    settle(ui).await;
+    assert!(
+        !focused_control_has_label(ui, "Show identity change details"),
+        "no deferred return to the row"
+    );
+
+    // The exact View member gate, read when it is pressed: closed details, a
+    // protected surface the window's handlers have not applied yet, a held
+    // security gate, an inspector already open, and the inspector's own
+    // admission each refuse without a read; with nothing in the way exactly
+    // the one listed ID is routed.
+    let gate = &live.security_gate;
+    let route = |user: &str| crate::identity_warnings::route_member(ui, gate, user);
+    let reads = inspected.borrow().len();
+    warnings.set_open(false);
+    assert!(!route("@pat:example.org"), "closed details");
+    warnings.set_open(true);
+    ui.set_access_open(true);
+    assert!(
+        !route("@pat:example.org"),
+        "a protected surface, read at once"
+    );
+    ui.set_access_open(false);
+    let held = gate
+        .try_account_access()
+        .expect("the security gate is idle");
+    assert!(!route("@pat:example.org"), "a held security gate");
+    drop(held);
+    privacy.set_inspector(MemberInspectorView {
+        open: true,
+        ..Default::default()
+    });
+    assert!(!route("@pat:example.org"), "an inspector already open");
+    privacy.set_inspector(MemberInspectorView::default());
+    warnings.set_open(false);
+    ui.set_security_recovery_key("synthetic-key-not-a-credential".into());
+    assert!(
+        !crate::member_privacy::inspect_admitted(ui, gate, "@pat:example.org"),
+        "the inspector's own admission"
+    );
+    ui.set_security_recovery_key("".into());
+    assert_eq!(
+        inspected.borrow().len(),
+        reads,
+        "nothing was opened or read"
+    );
+    warnings.set_open(true);
+    assert!(route("@pat:example.org"));
+    assert_eq!(inspected.borrow()[reads..], ["@pat:example.org"]);
+    assert!(!warnings.get_open() && privacy.get_inspector().open);
+    settle(ui).await;
+    privacy.invoke_close_inspector();
+    settle(ui).await;
+    assert!(!warnings.get_awaiting_inspector());
+    assert!(focused_control_has_label(
+        ui,
+        "Show identity change details"
+    ));
+    // IWCOMP01: accepted IDs with a line break, a direction override, more
+    // than 255 bytes, non-ASCII and a tab, as production rows (no, blank or
+    // unreadable names are all `None` there; one safe name). The row's
+    // summary and every label read aloud carry only the bounded, escaped ID;
+    // View member hands the inspector the exact ID.
+    let long = format!("@{}:example.org", "a".repeat(300));
+    let hostile = [
+        ("@pat\nadmin:example.org", None),
+        ("@a\u{202e}gro.x:evil.org", Some("Ari")),
+        (long.as_str(), None),
+        ("@\u{fc}\u{2066}\tx:example.org", None),
+    ];
+    let members: Vec<IdentityWarning> = hostile
+        .iter()
+        .map(|&(user, name)| {
+            let typed = matrix_sdk::ruma::UserId::parse(user);
+            assert!(typed.is_ok(), "accepted as the SDK parses it: {user:?}");
+            IdentityWarning {
+                user_id: user.into(),
+                name: name.map(str::to_owned),
+                kind: IdentityWarningKind::Changed,
+            }
+        })
+        .collect();
+    let shown: Vec<String> = members.iter().map(IdentityWarning::display_id).collect();
+    let rows = members.iter().map(crate::identity_warnings::item).collect();
+    let alone = Warnings {
+        members: vec![members[0].clone()],
+        ..Warnings::default()
+    };
+    seed(rows, &crate::identity_warnings::summary(&alone));
+    settle(ui).await;
+    let check = "Check with them before sharing anything sensitive.";
+    let expected = format!("{}'s identity changed. {check}", shown[0]);
+    assert_eq!(warnings.get_summary().as_str(), expected);
+    for (index, row) in warnings.get_rows().iter().enumerate() {
+        assert_eq!(row.user_id.as_str(), hostile[index].0, "the exact key");
+        assert_eq!(row.display_id.as_str(), shown[index]);
+        let label = hostile[index].1.unwrap_or(shown[index].as_str());
+        assert_eq!(row.label.as_str(), label);
+    }
+    warnings.invoke_show_details();
+    settle(ui).await;
+    let detail = "Identity changed since it was first seen";
+    let first = format!("Member 1 of 4: {0}, {0}, {detail}", shown[0]);
+    assert!(focused_control_has_label(ui, &first), "{first:?}");
+    key(ui, Key::Tab);
+    let view_first = format!("View member details for {}", shown[0]);
+    assert!(focused_control_has_label(ui, &view_first));
+    key(ui, Key::Backtab);
+    key(ui, Key::DownArrow);
+    settle(ui).await;
+    let second = format!("Member 2 of 4: Ari, {}, {detail}", shown[1]);
+    assert!(focused_control_has_label(ui, &second));
+    for (index, id) in shown.iter().enumerate() {
+        let label = hostile[index].1.unwrap_or(id.as_str());
+        let row = format!("{label}, {id}, {detail}");
+        assert_eq!(labelled_bounds(ui, &row, None).len(), 1, "{row:?}");
+    }
+    let spoken = {
+        use slint::private_unstable_api::re_exports::{
+            AccessibleStringProperty, ItemRc, WindowInner,
+        };
+        use std::ops::ControlFlow;
+
+        let window = WindowInner::from_pub(ui.window());
+        let root = ItemRc::new_root(window.component());
+        let mut spoken = Vec::new();
+        let _ = root.visit_descendants(|item| {
+            let label = item.accessible_string_property(AccessibleStringProperty::Label);
+            if let Some(label) = label {
+                spoken.push(label.to_string());
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        spoken
+    };
+    for raw in [
+        "pat\nadmin",
+        "a\u{202e}gro",
+        "\u{fc}\u{2066}\tx",
+        long.as_str(),
+    ] {
+        assert!(!spoken.iter().any(|label| label.contains(raw)), "{raw:?}");
+    }
+    for id in shown.iter().map(String::as_str) {
+        assert!(spoken.iter().any(|label| label.contains(id)), "{id:?}");
+    }
+    key(ui, Key::Return);
+    settle(ui).await;
+    let exact = Some(hostile[1].0);
+    assert_eq!(routed.borrow().last().map(String::as_str), exact);
+    assert_eq!(inspected.borrow().last().map(String::as_str), exact);
+    assert!(!warnings.get_open() && privacy.get_inspector().open);
+    privacy.invoke_close_inspector();
+    settle(ui).await;
+    seed(two(), &crate::identity_warnings::summary(&reported));
+    settle(ui).await;
+
+    // A room or account change rescopes the warnings (production resets them).
+    let scoped = scopes.get();
+    ui.set_active_room_id("!other:example.org".into());
+    settle(ui).await;
+    ui.set_active_account_local_id("home".into());
+    settle(ui).await;
+    assert_eq!(scopes.get(), scoped + 2, "each change rescopes");
+    ui.set_active_account_local_id("work".into());
+    ui.set_active_room_id("!room:example.org".into());
+    settle(ui).await;
+
+    // The current window's modal lists include the details both ways: while
+    // they are open a Matrix link, discovery, the member inspector and
+    // mentions are blocked, and opening room addresses closes them.
+    warnings.set_open(true);
+    assert!(ui.get_identity_warnings_allowed());
+    let waiting = ui.get_matrix_link_blocked() && !ui.get_discovery_context_allowed();
+    assert!(waiting, "a Matrix link and discovery wait");
+    let refused = !ui.get_member_inspector_allowed() && !ui.get_mention_ui_allowed();
+    assert!(refused, "so do the member inspector and mentions");
+    assert!(!ui.get_thread_browser_allowed() && ui.get_room_leave_blocked());
+    let browser = ui.global::<crate::ThreadBrowser>();
+    warnings.set_open(false);
+    browser.set_open(true);
+    assert!(
+        !ui.get_identity_warnings_allowed(),
+        "Threads hold identity details admission"
+    );
+    browser.set_open(false);
+    let leave = ui.global::<crate::RoomLeave>();
+    leave.set_view(crate::RoomLeaveView {
+        open: true,
+        ..Default::default()
+    });
+    assert!(
+        !ui.get_identity_warnings_allowed(),
+        "Leave holds identity details admission"
+    );
+    leave.set_view(crate::RoomLeaveView::default());
+    warnings.set_open(true);
+    let addresses = ui.global::<crate::RoomAddresses>();
+    addresses.set_open(true);
+    let allowed = ui.get_identity_warnings_allowed();
+    assert!(!allowed, "room addresses are another modal");
+    settle(ui).await;
+    assert!(!warnings.get_open(), "and they close the details");
+    addresses.set_open(false);
+    settle(ui).await;
+
+    // The actual protected entry withdraws details and old focus intent
+    // synchronously, before Slint change handlers. The room warning row stays.
+    warnings.set_open(true);
+    warnings.set_return_focus(true);
+    warnings.set_awaiting_inspector(true);
+    let summary_before_entry = warnings.get_summary();
+    ui.invoke_open_account_menu();
+    assert!(ui.get_account_menu_open());
+    assert!(!warnings.get_open() && !warnings.get_return_focus());
+    assert!(!warnings.get_awaiting_inspector());
+    assert_eq!(warnings.get_summary(), summary_before_entry);
+    ui.set_account_menu_open(false);
+    settle(ui).await;
+    assert!(
+        !warnings.get_open(),
+        "closing the protected surface never reopens details"
+    );
+
+    // The production controller, with no account behind it.
+    let controller =
+        crate::identity_warnings::IdentityWarningsUi::register(ui, live.clone(), runtime);
+    seed(two(), &crate::identity_warnings::summary(&reported));
+    warnings.set_open(true);
+    warnings.set_overflow("And 1 more member.".into());
+    crate::identity_warnings::reset(ui);
+    // Synchronous: nothing of the previous scope survives this call.
+    assert!(!warnings.get_open());
+    assert_eq!(warnings.get_rows().row_count(), 0);
+    assert!(warnings.get_summary().is_empty() && warnings.get_overflow().is_empty());
+    settle(ui).await;
+    // Not checked (no live account): Details never opens, and View member
+    // never routes an ID that is not listed, even with the details forced
+    // open.
+    let reads = inspected.borrow().len();
+    seed(two(), "unchecked");
+    warnings.invoke_show_details();
+    warnings.invoke_view_member("@pat:example.org".into());
+    settle(ui).await;
+    assert!(!warnings.get_open());
+    warnings.set_open(true);
+    warnings.invoke_view_member("@pat:example.org".into());
+    assert_eq!(
+        inspected.borrow().len(),
+        reads,
+        "nothing routed without a scope"
+    );
+    assert!(warnings.get_open() && !privacy.get_inspector().open);
+    crate::identity_warnings::reset(ui);
+    settle(ui).await;
+
+    controller.shutdown(ui);
+    assert_eq!(warnings.get_rows().row_count(), 0);
+    ui.global::<MemberPrivacy>().on_inspect(|_| {});
+    let (page, live_session, account, room) = before;
+    ui.set_page(page);
+    ui.set_live_session(live_session);
+    ui.set_active_account_local_id(account);
+    ui.set_active_room_id(room);
     settle(ui).await;
 }
 

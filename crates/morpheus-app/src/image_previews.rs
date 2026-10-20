@@ -413,6 +413,7 @@ impl Opener {
         publish_position(ui, event);
         crate::matrix_links::clear(ui);
         crate::thread_browser::withdraw(ui);
+        crate::withdraw_call_bar(ui);
         ui.set_image_preview_open(true);
         controller
             .state

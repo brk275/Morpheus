@@ -361,6 +361,7 @@ fn show_key(ui: &AppWindow, key: &RecoveryKey) {
     ui.set_security_busy(false);
     ui.set_security_progress("".into());
     ui.set_security_key_revealed(false);
+    crate::withdraw_call_bar(ui);
     ui.set_security_recovery_key(key.reveal().into());
     ui.set_security_error("".into());
     ui.set_security_notice("Reveal and save this key now. It cannot be shown again.".into());
@@ -579,6 +580,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         // The reservation's generation: setup starts only while it holds.
         let generation = enable_gate.ringing_generation();
         let operation = next_operation(&window);
+        crate::withdraw_call_bar(&window);
         window.set_security_busy(true);
         set_outcome(&window, "", false);
         window.set_security_error("".into());
@@ -701,6 +703,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         }
         let generation = recover_gate.ringing_generation();
         let operation = next_operation(&window);
+        crate::withdraw_call_bar(&window);
         window.set_security_busy(true);
         set_outcome(&window, "", false);
         window.set_security_error("".into());

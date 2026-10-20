@@ -272,6 +272,154 @@ regression, ensuring the production helper is wired to the setting. Existing
 oversized-valid-JSON, 500 single-attempt and fixed-log push-rule regressions
 are retained unchanged.
 
+## Opt-in stored-members identity status stream
+
+STATUS: source only, composed onto the current root with the IW07 and IW08
+repairs below. Nothing has been built, formatted by tool, tested or run.
+Root reviews the SDK change and every caller independently before any
+hosted execution.
+
+Why: `Room::subscribe_to_identity_status_changes` builds its state through
+`Room`'s `RoomIdentityProvider`. Its `member_identities` and `is_member` call
+`members()` and `get_member()`, which run `sync_members()` and send
+GET `/rooms/{roomId}/members` whenever this device's member list is marked
+incomplete. A caller's own `are_members_synced()` check cannot exclude that
+request: the flag can change on another worker thread, or while the
+subscription awaits the client's OlmMachine read lock, before the SDK's own
+check. Its `is_member` also accepts any stored member, including one who
+left or was banned, so a later identity update of a departed member is
+reported again.
+
+What changed, narrowly (opt-in; existing behaviour preserved):
+
+- `src/room/identity_status_changes.rs`: a private `MemberSource` provider
+  and a shared private `create_stream_from`, which holds the unchanged
+  stream lifecycle (identity stream, member event handler, initial state,
+  default per-change processing). `MemberSource::Room` delegates every
+  method to `Room`'s existing `RoomIdentityProvider` implementation, which is not
+  modified, so `create_stream` and `Room::subscribe_to_identity_status_changes`
+  behave as before for every existing caller. `MemberSource::Stored`, used by
+  the new `pub(crate) create_stream_no_sync`, reads membership only from this
+  device's state store: `member_identities` uses
+  `members_no_sync(JOIN | INVITE)`, and `is_member` uses
+  `get_member_no_sync` and accepts only a Join or Invite membership.
+  `user_identity` delegates to the existing local lookup
+  (`Encryption::get_user_identity`, i.e. `OlmMachine::get_identity(user,
+  None)`: crypto store only, no wait for a key query) for both sources;
+  `state_of` keeps the trait default.
+- `src/room/mod.rs`: `Room::subscribe_to_identity_status_changes_no_sync()`
+  (`pub`), next to the existing method.
+- A local read that fails is never taken for an empty answer (IW07).
+  `RoomIdentityProvider` has no error path (it returns a list, `bool` or
+  `Option`), so `MemberSource::Stored` carries a private `StoredReads`
+  record of its first failed read. `member_identities` records a failed
+  `members_no_sync`; `is_member` a failed `get_member_no_sync`; the stored
+  source's `user_identity` calls the same `Encryption::get_user_identity` and
+  records a failed read instead of answering `None`. After building the
+  initial state, `create_stream_from` returns the recorded error for the
+  stored source, so `subscribe_to_identity_status_changes_no_sync` fails
+  rather than yielding a stream that reports nobody; after each later change
+  it ends the stream if a read failed while processing it. There is no
+  network fallback and no sync-flag, trust or key change.
+  `MemberSource::Room` never records anything, so `create_stream` and
+  `Room::subscribe_to_identity_status_changes` keep their upstream
+  behaviour, including its error suppression.
+- No public crypto `UserIdentity` exposure, no duplicated crypto logic, and
+  no dependency, feature, lock, unsafe, manifest or lockfile change. No sync
+  flag, trust, pin, send policy or key material is changed.
+
+Network: every await of the no-sync path reads this device's stores only:
+`Encryption::user_identities_stream` (OlmMachine read lock and the crypto
+store's broadcast), the room member event handler registration,
+`members_no_sync` and `get_member_no_sync` (state store) and
+`get_user_identity` (crypto store). None calls `sync_members`,
+`request_members`, a profile or keys-query API, or changes `members_synced`.
+If the stored member list is incomplete, members missing from it are not
+reported; the only caller keeps `are_members_synced()` for that truthfulness.
+
+Caller: Morpheus `crates/morpheus-matrix/src/room_identity_warnings.rs`
+only.
+
+Regression source (tests in `src/room/identity_status_changes.rs`):
+
+- With the member list not marked complete and the test's own non-pooled,
+  recording mock server: the initial state, a later identity update and one
+  after the list went from complete to incomplete are all reported, with
+  zero member-list requests and the flag still unset.
+- Contrast on the same setup: the syncing stream does request the member
+  list, so the request count is not vacuous.
+- A warned member who left (stored as Leave) is cleared, later identity
+  updates while gone are not reported, and rejoining reports again.
+- IW07: with the stored member list marked complete and the recording
+  server, a known empty state (Bob pinned) starts and reports nobody; once
+  Bob's stored member event cannot be read, the stored-members subscription
+  returns an error. No member-list request is made and the flag stays set.
+- IW07: on a running stored-members stream, an identity change of a member
+  whose stored event cannot be read ends the stream instead of being dropped
+  silently; no member-list request is made.
+- IW08: pin and verification updates queued before a persisted Leave or Ban
+  are reconciled when the stream is next polled. The old warning is removed,
+  identity changes and stale Join events while departed do not revive it,
+  and a valid active rejoin reports a new violation. A stale Leave before
+  that final Join does not remove the current active warning. Each case
+  keeps the member-list flag incomplete and makes zero member-list requests.
+- IW08: a readable departure followed by an unreadable active member makes
+  the rebuild end the stream before publishing a removal/all-clear, even
+  with the member-list flag marked complete; no member list is requested.
+- IW08 controls: the default syncing stream retains its queued pin/removal
+  and historical-member behavior. A direct publication-filter test excludes
+  our own ID from initial and incremental batches; it is not an end-to-end
+  own-identity stream fixture.
+- Test scaffolding only: `init` gains an `init_client` half and
+  `create_room_with_other_member` an explicit `members_synced` flag; the
+  existing tests' setups are unchanged in behaviour. IW07 adds
+  `make_stored_bob_member_unreadable`, which writes one unreadable copy of
+  Bob's member event into the test client's in-memory state store (whose
+  membership index keeps Bob's Join), with no sync or request. IW08 reuses
+  that mechanism for the own member to exercise a failed departure rebuild.
+
+IW08 processing is private to the stored-members opt-in. Before processing
+an event, it reads current local membership for affected retained identities.
+An actual departure triggers one rebuild of the opt-in `RoomIdentityState`
+from active stored members, and a before/after diff; a single rebuild also
+coalesces other departures already persisted. Both membership checks and
+the rebuild check the IW07 failure record before any result is published.
+Stale queued membership events cannot add an inactive member or remove an
+active rejoin. The default provider and its per-change state-machine call
+are unchanged. No new crypto crate boundary, classification override, trust
+write or network request is introduced. The diff uses the existing API's
+documented `Pinned` removal signal for a departed user; that signal does not
+assert or mutate the departed user's actual crypto state or trust.
+
+Cost and cancellation: each opt-in event snapshots K retained identities:
+Verified and both violation states, never Pinned (implicit/absent internally).
+The snapshot takes O(K) space/time; ordered-map construction and diffs add
+worst-case O(K log K) comparison work. A detected retained departure rebuilds
+once with O(room-size) local membership/crypto reads and before/after maps.
+Pending departures already reflected in the rebuilt state do not trigger repeated
+rebuilds. The underlying SDK member vector and identity state remain uncapped;
+the app's visible/retained warning caps are not an SDK memory bound. No new
+task is spawned: dropping the stream drops the rebuild future and the owned
+member-handler guard. Concurrent store updates are not an atomic snapshot;
+subsequent queued events reconcile them. No runtime resource or cancellation
+measurement is claimed here.
+
+Additionally modified vendored files (upstream c6ad52e blob -> current blob):
+
+| File | Upstream git blob | Current git blob |
+| --- | --- | --- |
+| src/room/identity_status_changes.rs | ab830b7fa437da3ef24e2b56474d81a6c2920744 | 8a32f7931a0e79fd26ebff767155a91c53889799 |
+| src/room/mod.rs | f979dc97d1667d661c91c0fac34a26206fc15572 | cc6d1b828a3db334814f6bc2ea06ced35360af5a |
+
+Current blobs are git blob IDs computed from the final file bytes (sha256
+c1d9991c76dd98074cdb94ed3fcdc7bd9ef6ff6b36e37af2dff0b24f52a424a8, 66510
+bytes, and 506306b392b09828d8b22a303424b8d8652b60d218899b0eda0b1dac4d051c6e,
+227283 bytes); the same computation reproduces both recorded upstream blobs.
+The upstream blobs are the `git_blob` values in `MORPHEUS_PROVENANCE.json`;
+those records are unchanged. `LICENSE` and the upstream headers are kept.
+`crates/morpheus-app/build.rs` hashes `vendor/`, so the persistence cohort
+changes with this patch.
+
 ## Formatter inheritance
 
 The regular `.rustfmt.toml` is copied byte-for-byte from the pinned upstream
