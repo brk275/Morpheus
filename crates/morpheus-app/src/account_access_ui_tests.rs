@@ -8783,6 +8783,7 @@ async fn assert_discovery_join_withdrawal(ui: &AppWindow, live: &Arc<LiveUi>, ru
 /// hand-off once a security step began and ended. The reset clears
 /// everything at once. No account, network or vault.
 async fn assert_room_permissions_editor(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    use crate::RoomPermissions;
     use crate::room_permissions::{HeldAnswer, HeldCore, RoomPermissionsUi};
     use morpheus_matrix::{
         EventClass, PermissionKey, PermissionLevel, PermissionThreshold, PermissionUser,
