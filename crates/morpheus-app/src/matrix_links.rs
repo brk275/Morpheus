@@ -650,7 +650,7 @@ pub(crate) fn open(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, href: &s
     }
     // A card opens now: the thread browser (a modal that blocks links while
     // it is open) ends first, with any page or retry it still holds.
-    crate::thread_browser::clear(ui);
+    crate::thread_browser::withdraw(ui);
     let operation = next_operation();
     let (shown, card) = match link {
         MessageLink::Unsupported { web: true } => {

@@ -748,6 +748,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
 /// presentation. Context hooks retire its operation owner on later changes.
 fn surface_allowed(ui: &AppWindow) -> bool {
     !crate::room_addresses::is_open(ui)
+        && !crate::room_leave::is_open(ui)
         && ui.get_live_session()
         && ui.get_page() == 0
         && !ui.get_show_sign_in()
@@ -824,7 +825,7 @@ fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, space_id: &str, nam
         });
     });
     crate::matrix_links::clear(ui);
-    crate::thread_browser::clear(ui);
+    crate::thread_browser::withdraw(ui);
     let state = ui.global::<SpaceRooms>();
     state.set_space_id(space_id.into());
     state.set_title(label(name).into());

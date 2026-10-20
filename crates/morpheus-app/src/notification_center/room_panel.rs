@@ -236,6 +236,7 @@ impl RoomPanel {
             return;
         };
         if crate::room_addresses::is_open(&ui)
+            || crate::room_leave::is_open(&ui)
             || !on_screen(&ui, account_id, room_id)
             || !self.live.is_live.load(Ordering::Acquire)
         {
@@ -271,7 +272,7 @@ impl RoomPanel {
             apply_local(&global, &config, account_id, room_id);
         }
         crate::matrix_links::clear(&ui);
-        crate::thread_browser::clear(&ui);
+        crate::thread_browser::withdraw(&ui);
         global.set_open(true);
         self.read(&ui, operation, selection, room_id.to_owned());
     }

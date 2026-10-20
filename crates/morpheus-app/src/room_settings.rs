@@ -309,7 +309,7 @@ impl RoomSettingsUi {
         self.matches_ui(&form, ui).then_some(form)
     }
     fn open(self: &Arc<Self>, ui: &AppWindow) {
-        if crate::room_addresses::is_open(ui) {
+        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
             return;
         }
         self.close(ui);
@@ -362,7 +362,7 @@ impl RoomSettingsUi {
         ui.set_room_admin_error("".into());
         ui.set_room_admin_notice("".into());
         crate::matrix_links::clear(ui);
-        crate::thread_browser::clear(ui);
+        crate::thread_browser::withdraw(ui);
         ui.set_room_admin_open(true);
         let this = self.clone();
         let watched = form.clone();

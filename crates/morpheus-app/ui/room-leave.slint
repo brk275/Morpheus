@@ -1,0 +1,191 @@
+// Leaving the open room (src/room_leave.rs). Rust owns every value and the
+// request; this file shows them and reports explicit choices. The dialog
+// names the exact room it leaves, and nothing here claims a server result.
+
+import { ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton } from "controls.slint";
+
+export struct RoomLeaveView {
+    open: bool,
+    // 0 reading this device's copy of the room, 1 review, 2 sending,
+    // 3 accepted and waiting for sync, 4 finished, 5 not possible
+    stage: int,
+    title: string,
+    // The room's name as this device has it: sanitized, bounded, not
+    // verified. Empty when the room has none.
+    name: string,
+    // The exact Matrix room ID a confirmation leaves.
+    room-id: string,
+    // What leaving does, in fixed sentences.
+    impact: string,
+    notice: string,
+    error: string,
+}
+
+export global RoomLeave {
+    in-out property <RoomLeaveView> view;
+    // Opens the dialog for the room and account shown now.
+    callback start();
+    callback confirm();
+    callback close();
+    // Account change, logout or detach cleared the view.
+    callback reset();
+}
+
+// The Leave dialog. Modal: clicks and scrolling stay inside, Tab and
+// Shift+Tab move between its two buttons, Up, Down, Page Up and Page Down
+// scroll its text, Escape withdraws it even while busy, and
+// shortcuts pause while it is open. Cancel has focus first.
+export component RoomLeaveDialog inherits Rectangle {
+    in property <ControlColors> colors;
+    in property <color> surface;
+    in property <color> scrim;
+    in property <float> text-scale: 1;
+    property <RoomLeaveView> view: RoomLeave.view;
+    property <int> stage: root.view.stage;
+    property <bool> can-close: true;
+    property <bool> reviewing: root.stage <= 1;
+    property <string> shown-name: root.view.name != "" ? root.view.name : root.view.room-id;
+    property <length> line-step: 24px * root.text-scale;
+    property <color> error-ink: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
+    background: root.scrim;
+    accessible-role: region;
+    accessible-label: "Leave room " + root.shown-name;
+    changed stage => {
+        if root.can-close {
+            first.focus();
+        } else {
+            keys.focus();
+        }
+    }
+    TouchArea {
+        scroll-event(event) => { accept }
+    }
+    keys := FocusScope {
+        init => { first.focus(); }
+        // Only the two buttons take focus, so Tab never leaves the dialog.
+        capture-key-pressed(event) => {
+            if event.text == Key.Tab || event.text == Key.Backtab {
+                if first.has-focus && second.enabled {
+                    second.focus();
+                } else if first.enabled {
+                    first.focus();
+                } else if second.enabled {
+                    second.focus();
+                } else {
+                    keys.focus();
+                }
+                accept
+            } else {
+                reject
+            }
+        }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                if root.can-close {
+                    RoomLeave.close();
+                }
+                accept
+            } else if event.text == Key.UpArrow || event.text == Key.PageUp {
+                body.content-y = min(0px, body.content-y + (event.text == Key.PageUp ? body.visible-height : root.line-step));
+                accept
+            } else if event.text == Key.DownArrow || event.text == Key.PageDown {
+                body.content-y = max(min(0px, body.visible-height - body.content-height), body.content-y - (event.text == Key.PageDown ? body.visible-height : root.line-step));
+                accept
+            } else {
+                reject
+            }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 32px, 460px * root.text-scale);
+            // The buttons stay on screen; the text above them scrolls when
+            // large text or a short window does not leave room for all of it.
+            height: min(parent.height - 32px, content.preferred-height + actions.preferred-height + 44px);
+            background: root.surface;
+            border-radius: StyleTokens.radius * 1.2;
+            clip: true;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+                body := ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    content-width: self.visible-width;
+                    content := VerticalLayout {
+                        width: parent.width;
+                        alignment: start;
+                        spacing: 8px;
+                        Text {
+                            text: root.view.title;
+                            color: root.colors.ink;
+                            font-size: 16px * root.text-scale;
+                            font-weight: 750;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.view.name != "" ? root.view.name : "This room has no name";
+                            color: root.view.name != "" ? root.colors.ink : root.colors.muted;
+                            font-size: 13px * root.text-scale;
+                            font-weight: 700;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "Matrix room ID: " + root.view.room-id;
+                            color: root.colors.muted;
+                            font-size: 11px * root.text-scale;
+                            wrap: char-wrap;
+                        }
+                        if root.view.impact != "" : Text {
+                            text: root.view.impact;
+                            color: root.colors.ink;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                        }
+                        if root.view.notice != "" : Text {
+                            text: root.view.notice;
+                            color: root.colors.muted;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                        if root.view.error != "" : Text {
+                            text: root.view.error;
+                            color: root.error-ink;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                    }
+                }
+                actions := HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    // Cancel while reviewing; Close afterwards, even while
+                    // sending. Withdrawal never claims to undo a request
+                    // already handed to the homeserver.
+                    first := TokenButton {
+                        colors: root.colors;
+                        text-scale: root.text-scale;
+                        enabled: root.can-close;
+                        text: root.reviewing ? "Cancel" : "Close";
+                        label: root.reviewing ? "Cancel and stay in " + root.shown-name : "Close";
+                        activated => { RoomLeave.close(); }
+                    }
+                    second := TokenButton {
+                        colors: root.colors;
+                        text-scale: root.text-scale;
+                        primary: true;
+                        visible: root.reviewing;
+                        enabled: root.stage == 1;
+                        text: "Leave";
+                        label: "Leave " + root.shown-name + " (" + root.view.room-id + ")";
+                        activated => { RoomLeave.confirm(); }
+                    }
+                }
+            }
+        }
+    }
+}

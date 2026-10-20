@@ -460,7 +460,7 @@ fn edit_dialog(ui: &AppWindow, edit: impl FnOnce(&mut PollDraft)) {
 }
 
 fn open_dialog(ui: &AppWindow, live: &Arc<LiveUi>) {
-    if ui.get_poll_dialog_open() || ui.get_composer_mode() != 0 {
+    if crate::room_leave::is_open(ui) || ui.get_poll_dialog_open() || ui.get_composer_mode() != 0 {
         return;
     }
     let Some((account_id, room_id)) = scope(ui) else {
@@ -500,7 +500,7 @@ fn open_dialog(ui: &AppWindow, live: &Arc<LiveUi>) {
     global.set_dialog_answers(ModelRc::new(VecModel::from(rows)));
     publish_dialog(ui);
     crate::matrix_links::clear(ui);
-    crate::thread_browser::clear(ui);
+    crate::thread_browser::withdraw(ui);
     ui.set_poll_dialog_open(true);
 }
 

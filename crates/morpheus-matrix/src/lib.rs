@@ -15,9 +15,14 @@ pub use media::{
     ImagePreviewDownload, MAX_ATTACHMENT_BYTES, MAX_IMAGE_PREVIEW_BYTES, QueuedAttachment,
 };
 mod room_activity;
+mod room_leave;
 pub use room_activity::{
     ActivityCancellation, ActivityMember, MAX_RECEIPT_EVENTS, Reader, ReceiptOutcome, ReceiptScope,
     SeenBy, Typing, TypingWatch,
+};
+pub use room_leave::{
+    MAX_ROOM_LEAVE_NAME_CHARS, RoomLeaveAccepted, RoomLeaveCancellation, RoomLeaveError,
+    RoomLeaveObservation, RoomLeaveReview,
 };
 mod image_packs;
 pub use image_packs::{
@@ -2783,12 +2788,15 @@ impl AccountManager {
             .await?)
     }
 
+    /// One exact-room leave; membership changes here only when sync brings it.
     pub async fn leave_room(&self, room_id: &str) -> Result<()> {
-        let state = self.state.lock().await;
-        selected_room(&state, room_id)?
-            .leave()
+        let room = {
+            let state = self.state.lock().await;
+            selected_room(&state, room_id)?
+        };
+        room_leave::leave_request(&room.client(), room.room_id())
             .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+            .map_err(|error| MatrixCoreError::Sdk(room_leave::leave_error(&error).to_string()))
     }
 
     pub async fn accept_invite(&self, room_id: &str) -> Result<()> {
@@ -2805,16 +2813,21 @@ impl AccountManager {
     }
 
     pub async fn reject_invite(&self, room_id: &str) -> Result<()> {
-        let state = self.state.lock().await;
-        let room = selected_room(&state, room_id)?;
-        if room.state() != RoomState::Invited {
-            return Err(MatrixCoreError::InvalidRegistry(
-                "room is not an invitation".into(),
-            ));
-        }
-        room.leave()
+        let room = {
+            let state = self.state.lock().await;
+            let room = selected_room(&state, room_id)?;
+            if room.state() != RoomState::Invited {
+                return Err(MatrixCoreError::InvalidRegistry(
+                    "room is not an invitation".into(),
+                ));
+            }
+            room
+        };
+        // Until the full invitations feature lands, this legacy path also
+        // leaves only the invitation, never its attacker-named predecessors.
+        room_leave::leave_request(&room.client(), room.room_id())
             .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+            .map_err(|error| MatrixCoreError::Sdk(room_leave::leave_error(&error).to_string()))
     }
 
     /// Invite through the selected account's bounded invite (`moderation`):

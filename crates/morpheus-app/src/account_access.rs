@@ -163,6 +163,13 @@ impl AccountAccessUi {
     }
 
     fn open(&self, action: Action, challenge: Option<ActivationChallenge>, label: String) {
+        if self
+            .ui
+            .upgrade()
+            .is_some_and(|ui| crate::room_leave::is_open(&ui))
+        {
+            return;
+        }
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let current_generation = self.generation.clone();
         let mode = match &action {
@@ -188,7 +195,7 @@ impl AccountAccessUi {
             }
             crate::room_addresses::clear(&ui);
             crate::matrix_links::clear(&ui);
-            crate::thread_browser::clear(&ui);
+            crate::thread_browser::withdraw(&ui);
             clear_passwords(&ui);
             ui.set_access_mode(mode);
             ui.set_access_target(label.into());
@@ -208,7 +215,7 @@ impl AccountAccessUi {
                 if pending {
                     crate::room_addresses::clear(&ui);
                     crate::matrix_links::clear(&ui);
-                    crate::thread_browser::clear(&ui);
+                    crate::thread_browser::withdraw(&ui);
                 }
                 ui.set_account_switch_pending(pending);
             }
@@ -220,7 +227,7 @@ impl AccountAccessUi {
                     if pending {
                         crate::room_addresses::clear(&ui);
                         crate::matrix_links::clear(&ui);
-                        crate::thread_browser::clear(&ui);
+                        crate::thread_browser::withdraw(&ui);
                     }
                     ui.set_account_switch_pending(pending);
                 }
@@ -425,6 +432,7 @@ impl AccountAccessUi {
                         if result.complete {
                             crate::room_addresses::forget_account(&id);
                             crate::room_permissions::forget_account(&id);
+                            crate::room_leave::forget_account(&id);
                             crate::room_settings::forget_access_account(&id);
                             access.live.forget_removed_account_joins(&id);
                             if let Err(error) = access.live.voice_spaces.clear_logged_out_account(&id) {

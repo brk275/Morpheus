@@ -377,7 +377,7 @@ struct Opener {
 impl Opener {
     /// Replace whatever the viewer shows with one explicitly requested image.
     fn open(&self, ui: &AppWindow, event: &str, filename: &str) {
-        if crate::room_addresses::is_open(ui) {
+        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
             return;
         }
         if !ui.get_live_session() || event.is_empty() || ui.get_active_room_id().is_empty() {
@@ -412,7 +412,7 @@ impl Opener {
         ui.set_image_preview_loading(true);
         publish_position(ui, event);
         crate::matrix_links::clear(ui);
-        crate::thread_browser::clear(ui);
+        crate::thread_browser::withdraw(ui);
         ui.set_image_preview_open(true);
         controller
             .state

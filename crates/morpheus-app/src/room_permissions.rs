@@ -432,6 +432,9 @@ impl<C: PermissionsCore> RoomPermissionsUi<C> {
     }
 
     fn open(self: &Arc<Self>, ui: &AppWindow, account: String, room: String) {
+        if crate::room_leave::is_open(ui) {
+            return;
+        }
         // The exact selection of the account shown, captured here.
         let Some(selection) = self.core.selection(&account) else {
             return;

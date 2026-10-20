@@ -3469,6 +3469,108 @@ async fn assert_seen_by_modal_guard(ui: &AppWindow) {
     settle(ui).await;
 }
 
+/// Generated-window presentation only. Core admission/cancellation and sync
+/// retention are exercised separately in room_leave's controller/core tests.
+async fn assert_room_leave_modal_guard(ui: &AppWindow) {
+    use crate::{RoomLeave, RoomLeaveView};
+    use slint::private_unstable_api::re_exports::AccessibilityAction;
+    use std::{cell::Cell, rc::Rc};
+
+    let old_page = ui.get_page();
+    let old_live = ui.get_live_session();
+    let old_room = ui.get_active_room_id();
+    let old_scale = ui.get_font_scale_percent();
+    let old_size = ui.window().size();
+    let closed = Rc::new(Cell::new(0));
+    let observed = closed.clone();
+    let leave = ui.global::<RoomLeave>();
+    let weak = ui.as_weak();
+    leave.on_close(move || {
+        observed.set(observed.get() + 1);
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<RoomLeave>().set_view(RoomLeaveView::default());
+        }
+    });
+    let name = "Long synthetic room name ".repeat(5);
+    let room = format!("!{}:example.org", "synthetic".repeat(24));
+    let review = RoomLeaveView {
+        open: true,
+        stage: 1,
+        title: "Leave this room?".into(),
+        name: name.clone().into(),
+        room_id: room.clone().into(),
+        impact: "Only this exact room is left; a server response is not proof of local sync. "
+            .repeat(16)
+            .into(),
+        ..Default::default()
+    };
+    let weak = ui.as_weak();
+    let opened = review.clone();
+    leave.on_start(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<RoomLeave>().set_view(opened.clone());
+        }
+    });
+    ui.set_live_session(true);
+    ui.set_page(0);
+    ui.set_active_room_id("!leave-presentation:example.org".into());
+    let cancel = format!("Cancel and stay in {name}");
+    let confirm = format!("Leave {name} ({room})");
+    for scale in [100, 200] {
+        ui.window().set_size(slint::PhysicalSize::new(640, 620));
+        ui.set_font_scale_percent(scale);
+        settle(ui).await;
+        assert!(!ui.get_room_leave_blocked());
+        control_with_label(ui, "Leave this room…").accessible_action(&AccessibilityAction::Default);
+        settle(ui).await;
+        assert!(leave.get_view().open);
+        assert!(ui.get_matrix_link_blocked() && ui.get_sas_protected());
+        assert!(focused_control_has_label(ui, &cancel));
+        for label in [&cancel, &confirm] {
+            assert!(
+                inside_window(ui, item_bounds(&control_with_label(ui, label))),
+                "the fixed Leave footer must fit at {scale}%"
+            );
+        }
+        for (tab, label) in [(Key::Tab, &confirm), (Key::Backtab, &cancel)] {
+            key(ui, tab);
+            assert!(focused_control_has_label(ui, label));
+        }
+        assert!(!ui.invoke_dispatch_shortcut("d".into(), true, false, true, false));
+        ui.invoke_open_account_menu();
+        assert!(!ui.get_account_menu_open());
+        let page = ui.get_page();
+        ui.invoke_focus_settings_search();
+        assert_eq!(ui.get_page(), page);
+        key(ui, Key::PageDown);
+        assert!(inside_window(
+            ui,
+            item_bounds(&control_with_label(ui, &cancel))
+        ));
+
+        let before = closed.get();
+        let mut busy = review.clone();
+        busy.stage = 2;
+        leave.set_view(busy);
+        settle(ui).await;
+        assert!(focused_control_has_label(ui, "Close"));
+        key(ui, Key::Escape);
+        settle(ui).await;
+        assert!(!leave.get_view().open);
+        assert_eq!(closed.get(), before + 1, "busy Escape must withdraw");
+        assert!(focused_control_has_label(ui, "Leave this room…"));
+    }
+    leave.on_start(|| {});
+    leave.on_close(|| {});
+    leave.set_view(RoomLeaveView::default());
+    ui.set_active_room_id(old_room);
+    ui.set_live_session(old_live);
+    ui.set_page(old_page);
+    ui.set_font_scale_percent(old_scale);
+    ui.window().set_size(old_size);
+    settle(ui).await;
+}
+
 /// Style profiles on the real generated window. Save current look stores the
 /// look only. A preview changes the window and saves nothing; Cancel restores
 /// the look exactly. A newer look, an account switch or a Settings save ends
@@ -4041,6 +4143,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_shortcut_customization(&ui, directory.path()).await;
     phase.set(30);
     assert_seen_by_modal_guard(&ui).await;
+    phase.set(88);
+    assert_room_leave_modal_guard(&ui).await;
     phase.set(18);
     assert_style_profiles(&ui, directory.path()).await;
     phase.set(19);
@@ -4098,6 +4202,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     phase.set(89);
     crate::thread_browser::register(&ui, live.clone(), runtime.clone());
     crate::thread_browser::tests::assert_thread_browser_panel(&ui, &live, &runtime).await;
+    #[cfg(feature = "native-calls")]
+    crate::incoming_ring::ui::assert_answered_call_withdraws_leave(&ui).await;
     #[cfg(feature = "native-calls")]
     crate::voice_rosters::assert_unowned_presentation_is_cleared(&ui, live.clone(), &runtime);
     // This suite tests the actual dialog/controller boundary, not credentials.

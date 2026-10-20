@@ -47,6 +47,7 @@ mod polls;
 mod preview_capture;
 mod room_activity;
 mod room_addresses;
+mod room_leave;
 mod room_media_browser;
 mod room_organization;
 mod room_permissions;
@@ -1540,7 +1541,7 @@ fn ask_to_leave_call(ui: &slint::Weak<AppWindow>, calls: &CallController, action
     }
     if let Some(ui) = ui.upgrade() {
         matrix_links::clear(&ui);
-        thread_browser::clear(&ui);
+        thread_browser::withdraw(&ui);
         ui.set_native_leave_unconfirmed(matches!(status, CallStatus::CleanupFailed { .. }));
         ui.set_pending_account_index(action);
         ui.set_leave_call_dialog(true);
@@ -1712,6 +1713,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     let mut incoming_calls =
         incoming_ring::ui::IncomingUi::bind(&ui, runtime.handle(), live.clone(), calls.clone());
+    // Leave never tears down an active or ringing call of this account.
+    #[cfg(feature = "native-calls")]
+    let leave_fence: room_leave::CallFence = {
+        let calls = calls.clone();
+        let ringing = incoming_calls.ringing_in();
+        Arc::new(move |account: &str, room: &str| {
+            let active = match calls.status() {
+                CallStatus::OpeningSlot {
+                    account_id,
+                    room_id,
+                }
+                | CallStatus::Starting {
+                    account_id,
+                    room_id,
+                }
+                | CallStatus::Ending {
+                    account_id,
+                    room_id,
+                }
+                | CallStatus::CleanupFailed {
+                    account_id,
+                    room_id,
+                    ..
+                } => account_id == account && room_id == room,
+                CallStatus::Joined { account_id, call }
+                | CallStatus::Reconnecting {
+                    account_id, call, ..
+                } => account_id == account && call.room_id == room,
+                _ => false,
+            };
+            room_leave::RoomCall::of(active, ringing(account, room))
+        })
+    };
+    #[cfg(not(feature = "native-calls"))]
+    let leave_fence: room_leave::CallFence =
+        Arc::new(|_: &str, _: &str| room_leave::RoomCall::of(false, false));
+    let room_leave =
+        room_leave::RoomLeaveUi::register(&ui, live.clone(), runtime.handle(), leave_fence);
     #[cfg(feature = "native-calls")]
     let voice_presence =
         voice_rosters::VoiceRosterUi::register(&ui, live.clone(), runtime.handle());
@@ -2476,7 +2515,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             space_management::clear(&ui);
             room_addresses::clear(&ui);
             matrix_links::clear(&ui);
-            thread_browser::clear(&ui);
+            thread_browser::withdraw(&ui);
         }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
@@ -2573,7 +2612,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !voice_live.is_live.load(Ordering::Acquire) {
             window.invoke_open_room(room_id);
             matrix_links::clear(&window);
-            thread_browser::clear(&window);
+            thread_browser::withdraw(&window);
             window.set_page(2);
             return;
         }
@@ -2613,7 +2652,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
                         matrix_links::clear(&window);
-                        thread_browser::clear(&window);
+                        thread_browser::withdraw(&window);
                         window.set_page(2);
                         #[cfg(feature = "native-calls")]
                         if !calls.status().blocks_account_switch() {
@@ -3788,6 +3827,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     let add_calls = calls.clone();
     ui.on_add_account(move || {
+        if weak.upgrade().is_some_and(|ui| room_leave::is_open(&ui)) {
+            return;
+        }
         if let Some(ui) = weak.upgrade() {
             room_addresses::clear(&ui);
         }
@@ -3802,7 +3844,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(ui) = weak.upgrade() {
             matrix_links::clear(&ui);
-            thread_browser::clear(&ui);
+            thread_browser::withdraw(&ui);
             ui.set_login_error("".into());
             ui.set_show_sign_in(true);
         }
@@ -4147,6 +4189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     live.voice_spaces.forget_account(&account_id).await;
                     live.forget_account_drafts(&account_id);
                     room_permissions::forget_account(&account_id);
+                    room_leave::forget_account(&account_id);
                     room_settings::forget_access_account(&account_id);
                     space_management::forget_account(&account_id);
                     live.forget_removed_account_joins(&account_id);
@@ -4515,6 +4558,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     room_activity.shutdown(&ui);
     room_permissions.shutdown(&ui);
     room_settings.shutdown(&ui);
+    room_leave.shutdown(&ui);
     moderation.shutdown();
     image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]

@@ -215,6 +215,9 @@ fn result_item(hit: SearchHit) -> SettingsResult {
 /// token, or the value field of one typography or geometry metric. Unknown
 /// or unavailable IDs do nothing. Returns whether a destination was requested.
 pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
+    if crate::room_leave::is_open(ui) {
+        return false;
+    }
     if let Some(token) = registry::color_result(id) {
         // Selecting is presentation only; the file is not touched.
         crate::appearance_editor::select_token(ui, token);
@@ -255,7 +258,7 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
             );
             ui.set_account_menu_open(false);
             crate::matrix_links::clear(ui);
-            crate::thread_browser::clear(ui);
+            crate::thread_browser::withdraw(ui);
             ui.set_manage_accounts_open(true);
             // The same read-only refresh the account menu's entry runs.
             ui.invoke_manage_accounts();
@@ -275,7 +278,7 @@ pub(super) const METRIC_VALUE_REVEAL: &str = "appearance.metric_value";
 
 fn request_settings_reveal(ui: &AppWindow) {
     crate::matrix_links::clear(ui);
-    crate::thread_browser::clear(ui);
+    crate::thread_browser::withdraw(ui);
     ui.set_page(1);
     let serial = ui.get_settings_reveal_serial();
     ui.set_settings_reveal_serial(serial.checked_add(1).unwrap_or(1).max(1));

@@ -540,7 +540,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
 // Room settings (mode0) is an allowed predecessor: Manage addresses opens
 // over it. All other protected native presentations withdraw this form.
 fn surface_allowed(ui: &AppWindow) -> bool {
-    ui.get_live_session()
+    !crate::room_leave::is_open(ui)
+        && ui.get_live_session()
         && (ui.get_page() == 0 || ui.get_page() == 1)
         && !ui.get_show_sign_in()
         && !ui.get_access_open()
@@ -649,7 +650,7 @@ fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, room_id: &str, name
         });
     });
     crate::matrix_links::clear(ui);
-    crate::thread_browser::clear(ui);
+    crate::thread_browser::withdraw(ui);
     let state = ui.global::<RoomAddresses>();
     state.set_room_name(label(name).into());
     state.set_open(true);

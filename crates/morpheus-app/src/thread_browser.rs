@@ -538,6 +538,14 @@ pub(crate) fn clear(ui: &AppWindow) {
     state.set_can_retry(false);
 }
 
+/// A protected surface's actual entry, before its flag changes. Withdraw
+/// any pending Leave dialog first, even if its view already hid. Lifecycle
+/// clear stays separate: a browser fallback must never cancel a new Leave.
+pub(crate) fn withdraw(ui: &AppWindow) {
+    crate::room_leave::clear_presentation(ui);
+    clear(ui);
+}
+
 /// Whether the browser is open.
 pub(crate) fn is_open(ui: &AppWindow) -> bool {
     ui.global::<ThreadBrowser>().get_open()
@@ -612,7 +620,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     let weak = ui.as_weak();
     state.on_withdraw(move || {
         if let Some(ui) = weak.upgrade() {
-            clear(&ui);
+            withdraw(&ui);
         }
     });
 }
@@ -677,6 +685,13 @@ fn live_session(ui: &AppWindow) -> Option<AccountSelection> {
 }
 
 fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
+    // Mutual entry policy: an open Leave dialog owns the window. Refuse
+    // before clearing either surface or withdrawing a held link.
+    if crate::room_leave::is_open(ui) {
+        return;
+    }
+    // An admitted browser also cancels a latent Leave owner before it opens.
+    crate::room_leave::clear_presentation(ui);
     // The browser's own entry: a Matrix link card, and a joined link's
     // message still to come (its follow-up), end first, synchronously.
     crate::matrix_links::clear(ui);

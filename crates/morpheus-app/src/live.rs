@@ -4387,6 +4387,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     crate::room_addresses::clear(ui);
     // A link's read and join are withdrawn before its card is hidden.
     crate::matrix_links::clear(ui);
+    // The Leave dialog and its captured account are private to this context.
+    crate::room_leave::clear_presentation(ui);
     ui.set_invitations(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_results(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_open(false);

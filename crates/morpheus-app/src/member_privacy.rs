@@ -335,11 +335,11 @@ impl MemberPrivacyUi {
     }
 
     fn inspect(self: &Arc<Self>, ui: &AppWindow, user: &str) {
-        if crate::room_addresses::is_open(ui) {
+        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
             return;
         }
         crate::matrix_links::clear(ui);
-        crate::thread_browser::clear(ui);
+        crate::thread_browser::withdraw(ui);
         let room = ui.get_active_room_id().to_string();
         let Some(selection) = self.live_account(ui) else {
             return;
@@ -782,7 +782,7 @@ impl MemberPrivacyUi {
     }
 
     fn review_unignore(&self, ui: &AppWindow, key: &str) {
-        if crate::room_addresses::is_open(ui) {
+        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
             return;
         }
         {
@@ -821,7 +821,7 @@ impl MemberPrivacyUi {
     }
 
     fn confirm_unignore(self: &Arc<Self>, ui: &AppWindow) {
-        if crate::room_addresses::is_open(ui) {
+        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
             return;
         }
         // The admission fence the core rechecks right before the write.

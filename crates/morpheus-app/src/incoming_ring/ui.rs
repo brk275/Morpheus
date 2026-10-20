@@ -145,34 +145,12 @@ impl IncomingUi {
                                 match result {
                                     Ok(info) => {
                                         let current = calls_for_ui.status();
-                                        // A just-answered join may already be recovering.
-                                        if matches!(&current, crate::calls::CallStatus::Joined { account_id, call }
-                                            | crate::calls::CallStatus::Reconnecting { account_id, call, .. }
-                                            if account_id == selection.account_id() && call == &info)
-                                        {
-                                            // Show controls for the exact answered call.
-                                            // A queued success cannot reopen an ended or
-                                            // superseded call, or use the selected room.
-                                            let display = crate::call_room_display(
-                                                &info.room_id,
-                                                ui.get_native_call_room_id().as_str(),
-                                                ui.get_native_call_room_display().as_str(),
-                                                ui.get_active_room_id().as_str(),
-                                                ui.get_active_room_name().as_str(),
-                                            );
-                                            ui.set_native_call_room_id(info.room_id.into());
-                                            ui.set_native_call_room_display(display.into());
-                                            ui.set_native_call_status(crate::call_status_label(&current).into());
-                                            ui.set_call_connected(true);
-                                            ui.set_native_call_joined(true);
-                                            ui.set_native_leave_unconfirmed(false);
-                                            ui.set_incoming_call_notice("".into());
-                                            crate::matrix_links::clear(&ui);
-                                            crate::thread_browser::clear(&ui);
-                                            ui.set_page(2);
-                                        } else {
-                                            ui.set_incoming_call_notice("The call is no longer active.".into());
-                                        }
+                                        show_answered_call(
+                                            &ui,
+                                            selection.account_id(),
+                                            &current,
+                                            info,
+                                        );
                                     }
                                     Err(message) => ui.set_incoming_call_notice(message.into()),
                                 }
@@ -255,6 +233,17 @@ impl IncomingUi {
         }
     }
 
+    /// A read-only predicate over the current account's exact-room offers.
+    pub(crate) fn ringing_in(&self) -> impl Fn(&str, &str) -> bool + Send + Sync + 'static {
+        let offers = self.worker.handle();
+        move |account: &str, room: &str| {
+            offers
+                .snapshot()
+                .iter()
+                .any(|offer| offer.account_id == account && offer.room_id == room)
+        }
+    }
+
     /// Revoke synchronously before waiting for any other shutdown operation.
     pub(crate) fn shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
@@ -292,6 +281,183 @@ impl Drop for IncomingUi {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Apply only the exact answered call that is still joined or recovering.
+/// The protected page entry retires pending Leave synchronously, before its
+/// flag can defer cancellation to Slint's change handler.
+fn show_answered_call(
+    ui: &AppWindow,
+    account_id: &str,
+    current: &crate::calls::CallStatus,
+    info: CallInfo,
+) {
+    // A just-answered join may already be recovering. A queued success cannot
+    // reopen an ended or superseded call, or use the selected room instead.
+    if matches!(current, crate::calls::CallStatus::Joined { account_id: current_account, call }
+        | crate::calls::CallStatus::Reconnecting { account_id: current_account, call, .. }
+        if current_account == account_id && call == &info)
+    {
+        let display = crate::call_room_display(
+            &info.room_id,
+            ui.get_native_call_room_id().as_str(),
+            ui.get_native_call_room_display().as_str(),
+            ui.get_active_room_id().as_str(),
+            ui.get_active_room_name().as_str(),
+        );
+        ui.set_native_call_room_id(info.room_id.into());
+        ui.set_native_call_room_display(display.into());
+        ui.set_native_call_status(crate::call_status_label(current).into());
+        ui.set_call_connected(true);
+        ui.set_native_call_joined(true);
+        ui.set_native_leave_unconfirmed(false);
+        ui.set_incoming_call_notice("".into());
+        crate::matrix_links::clear(ui);
+        crate::thread_browser::withdraw(ui);
+        ui.set_page(2);
+    } else {
+        ui.set_incoming_call_notice("The call is no longer active.".into());
+    }
+}
+
+/// Existing generated-window phase only: run the actual success presentation
+/// with a retained reset owner and a held cancellation-first waiter. The
+/// waiter models acquisition; it is not RoomLeaveUi or a core HTTP fixture.
+#[cfg(test)]
+pub(crate) async fn assert_answered_call_withdraws_leave(ui: &AppWindow) {
+    use crate::{
+        RoomLeave, RoomLeaveView,
+        calls::{CallInterruption, CallStatus},
+    };
+    use morpheus_matrix::RoomLeaveCancellation;
+    use std::{cell::Cell, rc::Rc};
+
+    let before = (
+        ui.get_page(),
+        ui.get_native_call_room_id(),
+        ui.get_native_call_room_display(),
+        ui.get_native_call_status(),
+        ui.get_call_connected(),
+        ui.get_native_call_joined(),
+        ui.get_native_leave_unconfirmed(),
+        ui.get_incoming_call_notice(),
+        ui.global::<RoomLeave>().get_view(),
+    );
+    let info = CallInfo {
+        room_id: "!answered-other-room:example.org".into(),
+        slot_id: "m.call#room".into(),
+        membership_id: "answered-membership".into(),
+        local_identity: "answered-identity".into(),
+    };
+    for hidden in [false, true] {
+        for recovering in [false, true] {
+            ui.set_page(0);
+            let cancellation = RoomLeaveCancellation::new();
+            let retained = cancellation.clone();
+            let resets = Rc::new(Cell::new(0));
+            let observed = resets.clone();
+            let weak = ui.as_weak();
+            ui.global::<RoomLeave>().on_reset(move || {
+                let ui = weak.upgrade().unwrap();
+                assert_eq!(ui.get_page(), 0, "reset precedes the protected page flag");
+                observed.set(observed.get() + 1);
+                retained.cancel();
+            });
+            ui.global::<RoomLeave>().set_view(RoomLeaveView {
+                open: !hidden,
+                stage: 2,
+                ..Default::default()
+            });
+            // Hold acquisition, then release it only after the actual callback
+            // entry and an immediate return to the conversation. No change
+            // handler is settled between those page assignments.
+            let acquisition = tokio::sync::Mutex::new(());
+            let hold = acquisition.lock().await;
+            let dispatched = Cell::new(0);
+            let waiting = async {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => false,
+                    _guard = acquisition.lock() => {
+                        dispatched.set(dispatched.get() + 1);
+                        true
+                    }
+                }
+            };
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            let current = if recovering {
+                CallStatus::Reconnecting {
+                    account_id: "account-a".into(),
+                    call: info.clone(),
+                    interruption: CallInterruption::Signaling,
+                }
+            } else {
+                CallStatus::Joined {
+                    account_id: "account-a".into(),
+                    call: info.clone(),
+                }
+            };
+            show_answered_call(ui, "account-a", &current, info.clone());
+            assert!(
+                cancellation.is_cancelled(),
+                "the actual entry retires even a hidden owner"
+            );
+            assert_eq!(resets.get(), 1);
+            assert!(!ui.global::<RoomLeave>().get_view().open);
+            assert_eq!(ui.get_page(), 2);
+            assert_eq!(ui.get_native_call_room_id().as_str(), info.room_id.as_str());
+            ui.set_page(0);
+            drop(hold);
+            assert!(
+                !waiting.await,
+                "withdrawal wins even when acquisition becomes ready too"
+            );
+            assert_eq!(dispatched.get(), 0);
+        }
+    }
+    // The extracted callback keeps the full account/join CAS. Rejected
+    // completions cannot withdraw another owner's Leave or change its page.
+    let mut superseded = info.clone();
+    superseded.membership_id = "newer-membership".into();
+    for current in [
+        CallStatus::Idle,
+        CallStatus::Joined {
+            account_id: "account-b".into(),
+            call: info.clone(),
+        },
+        CallStatus::Joined {
+            account_id: "account-a".into(),
+            call: superseded,
+        },
+        CallStatus::CleanupFailed {
+            account_id: "account-a".into(),
+            room_id: info.room_id.clone(),
+            reason: "fixture".into(),
+        },
+    ] {
+        let cancellation = RoomLeaveCancellation::new();
+        let retained = cancellation.clone();
+        ui.global::<RoomLeave>().on_reset(move || retained.cancel());
+        ui.global::<RoomLeave>().set_view(RoomLeaveView {
+            open: true,
+            ..Default::default()
+        });
+        show_answered_call(ui, "account-a", &current, info.clone());
+        assert!(!cancellation.is_cancelled());
+        assert!(ui.global::<RoomLeave>().get_view().open);
+        assert_eq!(ui.get_page(), 0);
+    }
+    ui.global::<RoomLeave>().on_reset(|| {});
+    ui.global::<RoomLeave>().set_view(before.8);
+    ui.set_page(before.0);
+    ui.set_native_call_room_id(before.1);
+    ui.set_native_call_room_display(before.2);
+    ui.set_native_call_status(before.3);
+    ui.set_call_connected(before.4);
+    ui.set_native_call_joined(before.5);
+    ui.set_native_leave_unconfirmed(before.6);
+    ui.set_incoming_call_notice(before.7);
 }
 
 async fn answer_once(

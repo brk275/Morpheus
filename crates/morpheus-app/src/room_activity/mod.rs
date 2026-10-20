@@ -706,7 +706,7 @@ impl RoomActivityUi {
     /// Public read receipts at or after one event of the conversation or of
     /// the open thread, from this device's store. Never a claim beyond them.
     fn show_seen_by(self: &Arc<Self>, ui: &AppWindow, event: &str, thread: bool) {
-        if crate::room_addresses::is_open(ui) {
+        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
             return;
         }
         let Some(context) = self.current_context(ui) else {
@@ -747,7 +747,7 @@ impl RoomActivityUi {
         activity.set_seen_title(title.into());
         activity.set_seen_state(1);
         crate::matrix_links::clear(ui);
-        crate::thread_browser::clear(ui);
+        crate::thread_browser::withdraw(ui);
         activity.set_seen_open(true);
         let this = self.clone();
         let task = self.runtime.spawn(async move {

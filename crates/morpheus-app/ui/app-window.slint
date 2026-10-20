@@ -19,6 +19,8 @@ import { ActionRect, ControlColors, HoverSurface, TextAction, TokenButton, Token
 export { BaseColorSet, ColorRole, StyleTokens, ThemeRoleSet, ThemeStateSet } from "style-tokens.slint";
 import { RoomOrganizationButton, RoomOrganizationState, RoomSectionHeader } from "room-organization.slint";
 export { RoomOrganizationState } from "room-organization.slint";
+import { RoomLeave, RoomLeaveDialog } from "room-leave.slint";
+export { RoomLeave, RoomLeaveView } from "room-leave.slint";
 import { VoicePresencePill, VoiceRosters } from "voice-rosters.slint";
 export { VoiceParticipant, VoicePresence, VoiceRosters } from "voice-rosters.slint";
 import { SpaceExplorer, SpaceExplorerPanel } from "space-explorer.slint";
@@ -3279,7 +3281,7 @@ export component AppWindow inherits Window {
             && !root.account-menu-open && !root.room-actions-open && !root.room-admin-open
             && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog
             && !root.quick-switcher-open && !root.image-preview-open && root.security-recovery-key == ""
-            && !SpaceRooms.open && !RoomAddresses.open && !MatrixLink.open {
+            && !SpaceRooms.open && !RoomAddresses.open && !MatrixLink.open && !RoomLeave.view.open {
             account-trigger.focus();
         }
         root.navigation-mode = mode;
@@ -3417,7 +3419,7 @@ export component AppWindow inherits Window {
     property <length> layout-row-height: max(48px, 30px * root.text-scale + 18px);
     // A modal, lock, recovery or account switch owns the window: no gesture
     // starts, and one in progress is discarded.
-    property <bool> pane-gesture-allowed: !RoomAddresses.open && !(root.show-sign-in || root.access-open || root.account-switch-pending
+    property <bool> pane-gesture-allowed: !RoomLeave.view.open && !RoomAddresses.open && !(root.show-sign-in || root.access-open || root.account-switch-pending
         || root.security-recovery-key != "" || root.leave-call-dialog || root.manage-accounts-open
         || root.account-menu-open || root.native-capture-picker-open || root.member-confirm-open
         || root.room-admin-open || root.room-actions-open || root.quick-switcher-open
@@ -4004,7 +4006,7 @@ export component AppWindow inherits Window {
     in-out property <bool> sas-request-uncertain: false;
     property <length> sas-inbox-row-h: max(44px, 30px * root.text-scale + 14px);
     // While any of these holds, no SAS value stays in the window.
-    out property <bool> sas-protected: RoomAddresses.open || root.security-busy || root.access-open
+    out property <bool> sas-protected: RoomLeave.view.open || RoomAddresses.open || root.security-busy || root.access-open
         || root.account-switch-pending || root.show-sign-in || !root.live-session
         || root.security-recovery-key != "";
     changed sas-protected => {
@@ -4327,6 +4329,7 @@ export component AppWindow inherits Window {
     // Their own two surfaces are checked separately so replacing one can
     // withdraw its exact pending operation synchronously.
     out property <bool> discovery-context-allowed: root.live-session && (root.page == 0 || root.page == 3)
+        && !RoomLeave.view.open
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-switch-pending && !root.account-menu-open
         && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy && root.sas-stage == 0
@@ -4356,6 +4359,7 @@ export component AppWindow inherits Window {
     // A lock, account replacement or another modal cancels the exact People
     // window immediately; no pending result restores its private content.
     property <bool> people-context-current: !root.people-open || (root.live-session
+        && !RoomLeave.view.open
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-switch-pending && !root.account-menu-open
         && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy
@@ -4371,6 +4375,7 @@ export component AppWindow inherits Window {
     // security/key/SAS step or another modal closes it and cancels its read;
     // returning focus must never jump behind the replacing modal.
     property <bool> member-inspector-allowed: root.live-session && root.active-room-id != ""
+        && !RoomLeave.view.open
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-switch-pending && !root.account-menu-open
         && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy && root.sas-stage == 0
@@ -4457,7 +4462,7 @@ export component AppWindow inherits Window {
     // Opens the menu and focuses its trigger; each entry keeps its own
     // activation and confirmation.
     public function open-account-menu() {
-        if !RoomAddresses.open {
+        if !RoomAddresses.open && !RoomLeave.view.open {
             MatrixLink.withdraw();
             ThreadBrowser.withdraw();
             root.account-menu-open = true;
@@ -4467,6 +4472,7 @@ export component AppWindow inherits Window {
     property <bool> settings-search-focus-pending: false;
     property <int> settings-search-focus-request: 0;
     public function focus-settings-search() {
+        if RoomLeave.view.open { return; }
         root.settings-search-focus-pending = true;
         MatrixLink.withdraw();
         ThreadBrowser.withdraw();
@@ -4626,6 +4632,7 @@ export component AppWindow inherits Window {
     // The room header's notification panel shows only for the live account
     // and the room open now, and never over account access or security.
     property <bool> room-notifications-current: RoomNotificationState.open && root.live-session
+        && !RoomLeave.view.open
         && RoomNotificationState.account-id == root.active-account-local-id
         && RoomNotificationState.room-id == root.active-room-id && root.active-room-id != ""
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
@@ -4742,7 +4749,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !MemberPrivacy.inspector.open && !root.image-preview-open && !SpaceRooms.open && !RoomAddresses.open && !MatrixLink.open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !MemberPrivacy.inspector.open && !root.image-preview-open && !SpaceRooms.open && !RoomAddresses.open && !MatrixLink.open && !RoomLeave.view.open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // A Matrix link (matrix-link.slint), and a joined link's message still to
     // come, are withdrawn when anything else takes over: another page, sign-in,
@@ -4752,7 +4759,9 @@ export component AppWindow inherits Window {
     // own may still show. Each entry also withdraws the link synchronously
     // before it opens; this handler is the fallback for a route that does not.
     out property <bool> matrix-link-protected: !root.live-session || root.matrix-link-blocked;
-    out property <bool> matrix-link-blocked: root.page != 0
+    // Leave uses the same complete protected-surface inventory at its entry.
+    out property <bool> matrix-link-blocked: root.room-leave-blocked || RoomLeave.view.open;
+    out property <bool> room-leave-blocked: root.page != 0
         || root.show-sign-in || root.access-open || root.manage-accounts-open
         || root.account-menu-open || root.account-switch-pending
         || root.security-busy || root.security-recovery-key != "" || root.sas-busy
@@ -4763,6 +4772,9 @@ export component AppWindow inherits Window {
         || root.room-actions-open || root.room-admin-open || root.member-confirm-open
         || root.native-capture-picker-open || root.leave-call-dialog
         || root.image-preview-open || root.poll-dialog-open || ThreadBrowser.open;
+    changed room-leave-blocked => {
+        if root.room-leave-blocked && RoomLeave.view.open { RoomLeave.close(); }
+    }
     changed matrix-link-protected => { if root.matrix-link-protected { MatrixLink.withdraw(); } }
     // The thread browser (thread-browser.slint) may show and act only while
     // this holds; Rust's thread_browser::held reads it, so the two are one
@@ -4772,6 +4784,7 @@ export component AppWindow inherits Window {
     // browser's own is not one of them). Each of those surfaces' entries also
     // withdraws the browser before it opens; this handler is the fallback.
     out property <bool> thread-browser-allowed: root.live-session && root.page == 0
+        && !RoomLeave.view.open
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-menu-open && !root.account-switch-pending
         && !root.security-busy && root.security-recovery-key == "" && !root.sas-busy
@@ -5228,7 +5241,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 3;
-                    activated => { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 3; root.open-discovery(); }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 3; root.open-discovery(); }
                 }
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
@@ -5240,7 +5253,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 2;
-                    activated => { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
                 }
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
@@ -5252,7 +5265,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 1;
-                    activated => { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
                 }
             }
         }
@@ -5304,6 +5317,7 @@ export component AppWindow inherits Window {
                             label: "Create or join a Matrix room";
                             ink: root.icon-navigation-ink; surface: transparent; hover-surface: root.hover;
                             activated => {
+                                if RoomLeave.view.open { return; }
                                 root.room-action-mode = 0;
                                 root.room-action-input = "";
                                 root.room-action-error = "";
@@ -5354,6 +5368,7 @@ export component AppWindow inherits Window {
                                 label: index == 0 ? "Home and all rooms" : index == 1 ? "Explore public Matrix rooms" : index == 2 ? "Open call stage" : "Open settings";
                                 focus-state-changed(focused) => { root.navigation-focus-changed(1, "route:" + index, focused); }
                                 activated => {
+                                    if RoomLeave.view.open { return; }
                                     if index == 0 { root.active-space-id = ""; root.active-space-name = "Home"; root.select-space(""); root.page = 0; }
                                     else if index == 1 { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 3; root.open-discovery(); }
                                     else if index == 2 { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
@@ -5706,6 +5721,30 @@ export component AppWindow inherits Window {
                             }
                         }
                         }
+                        // Review and leave only the exact room shown now.
+                        if root.page == 0 : VerticalLayout {
+                            width: StyleTokens.icon-button-size; alignment: center;
+                            IconAction {
+                            icon: "log-out"; label: "Leave this room…"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
+                            enabled: root.live-session && root.active-room-id != "" && !root.room-leave-blocked;
+                            property <bool> returns-focus;
+                            property <bool> leave-open: RoomLeave.view.open;
+                            changed leave-open => {
+                                if !self.leave-open && self.returns-focus {
+                                    self.returns-focus = false;
+                                    if !root.matrix-link-blocked && !MatrixLink.open { self.focus(); }
+                                }
+                            }
+                            activated => {
+                                // Withdraw held link navigation before the dialog flag.
+                                if root.room-leave-blocked || RoomLeave.view.open { return; }
+                                MatrixLink.withdraw();
+                                ThreadBrowser.withdraw();
+                                RoomLeave.start();
+                                self.returns-focus = RoomLeave.view.open;
+                            }
+                        }
+                        }
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
@@ -5738,7 +5777,7 @@ export component AppWindow inherits Window {
                             icon: "thread"; label: "Browse threads in this room"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             selected: ThreadBrowser.open;
                             enabled: root.live-session && root.active-room-id != "";
-                            activated => { ThreadBrowser.show(); }
+                            activated => { if !RoomLeave.view.open { ThreadBrowser.show(); } }
                         }
                         }
                         if root.page == 0 : VerticalLayout {
@@ -5763,7 +5802,7 @@ export component AppWindow inherits Window {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
                             icon: "calls"; label: "Open current room call stage"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
-                            activated => { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
+                            activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
                         }
                         }
                         if root.page == 0 : VerticalLayout {
@@ -6525,8 +6564,9 @@ export component AppWindow inherits Window {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "⌫"; label: "Redact message from " + message.sender;
                                     ink: root.icon-message-ink; surface: transparent; hover-surface: root.hover;
-                                    enabled: !RoomAddresses.open && root.live-session && !root.room-admin-busy;
+                                    enabled: !RoomLeave.view.open && !RoomAddresses.open && root.live-session && !root.room-admin-busy;
                                     activated => {
+                                        if RoomLeave.view.open { return; }
                                         root.room-admin-mode = 2;
                                         root.room-admin-event-id = message.event-id;
                                         root.room-admin-event-preview = message.sender + ": " + message.body;
@@ -9951,6 +9991,7 @@ export component AppWindow inherits Window {
                                 accessible-checked: root.native-camera-active;
                                 enabled: root.native-call-enabled && root.native-call-joined && !root.native-camera-busy;
                                 activated => {
+                                    if RoomLeave.view.open { return; }
                                     if root.native-camera-active { root.stop-native-capture(0); }
                                     else {
                                         root.native-capture-picker-kind = 0;
@@ -9981,6 +10022,7 @@ export component AppWindow inherits Window {
                                 accessible-checked: root.native-screen-active;
                                 enabled: root.native-call-enabled && root.native-call-joined && (!root.native-screen-busy || root.native-screen-selecting);
                                 activated => {
+                                    if RoomLeave.view.open { return; }
                                     if root.native-screen-active || root.native-screen-selecting { root.stop-native-capture(1); }
                                     else {
                                         root.native-capture-picker-kind = 1;
@@ -10189,7 +10231,7 @@ export component AppWindow inherits Window {
                                 x: 7px; width: parent.width - 14px; height: parent.height;
                                 text <=> root.member-invite-user-id;
                                 color: root.ink; font-size: 11px * root.text-scale;
-                                enabled: !RoomAddresses.open && !root.member-action-busy;
+                                enabled: !RoomLeave.view.open && !RoomAddresses.open && !root.member-action-busy;
                                 accessible-label: "Matrix user ID to invite to this room";
                                 accepted => {
                                     if root.member-invite-user-id != "" && !root.member-action-busy {
@@ -10202,7 +10244,7 @@ export component AppWindow inherits Window {
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                             outline: root.divider; text-scale: root.text-scale;
                             text: "Invite";
-                            enabled: !RoomAddresses.open && !root.member-action-busy && root.member-invite-user-id != "";
+                            enabled: !RoomLeave.view.open && !RoomAddresses.open && !root.member-action-busy && root.member-invite-user-id != "";
                             accessible-label: "Invite Matrix user to this room";
                             activated => { root.submit-member-action(0, root.member-invite-user-id, ""); }
                         }
@@ -10295,7 +10337,7 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 0; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
                                 background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                                 focus-color: root.accent;
-                                enabled: !RoomAddresses.open && !root.member-action-busy;
+                                enabled: !RoomLeave.view.open && !RoomAddresses.open && !root.member-action-busy;
                                 label: "Manage room member " + member.name + " · " + member.user-id;
                                 activated => {
                                     root.member-selected-user-id = member.user-id;
@@ -10347,13 +10389,13 @@ export component AppWindow inherits Window {
                                         x: 7px; width: parent.width - 14px; height: parent.height;
                                         text <=> root.member-selected-power;
                                         color: root.ink; font-size: 11px * root.text-scale;
-                                        enabled: !RoomAddresses.open && !root.member-action-busy && !root.member-selected-creator;
+                                        enabled: !RoomLeave.view.open && !RoomAddresses.open && !root.member-action-busy && !root.member-selected-creator;
                                         accessible-label: "Power level for selected room member";
                                     }
                                 }
                                 Button {
                                     width: 72px; text: "Set power";
-                                    enabled: !RoomAddresses.open && !root.member-action-busy && !root.member-selected-creator && root.member-selected-power != "";
+                                    enabled: !RoomLeave.view.open && !RoomAddresses.open && !root.member-action-busy && !root.member-selected-creator && root.member-selected-power != "";
                                     accessible-label: "Review power level change for " + root.member-selected-name;
                                     clicked => {
                                         root.member-confirm-kind = 4;
@@ -10372,7 +10414,7 @@ export component AppWindow inherits Window {
                                 height: 34px; spacing: 6px;
                                 if root.member-selected-membership == "ban" : Button {
                                     text: "Unban";
-                                    enabled: !RoomAddresses.open && !root.member-action-busy;
+                                    enabled: !RoomLeave.view.open && !RoomAddresses.open && !root.member-action-busy;
                                     accessible-label: "Review unban of " + root.member-selected-name;
                                     clicked => {
                                         root.member-confirm-kind = 3;
@@ -10388,7 +10430,7 @@ export component AppWindow inherits Window {
                                 }
                                 if root.member-selected-membership != "ban" : Button {
                                     text: "Kick";
-                                    enabled: !RoomAddresses.open && !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
+                                    enabled: !RoomLeave.view.open && !RoomAddresses.open && !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
                                     accessible-label: "Review kick of " + root.member-selected-name;
                                     clicked => {
                                         root.member-confirm-kind = 1;
@@ -10404,7 +10446,7 @@ export component AppWindow inherits Window {
                                 }
                                 if root.member-selected-membership != "ban" : Button {
                                     text: "Ban";
-                                    enabled: !RoomAddresses.open && !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
+                                    enabled: !RoomLeave.view.open && !RoomAddresses.open && !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
                                     accessible-label: "Review ban of " + root.member-selected-name;
                                     clicked => {
                                         root.member-confirm-kind = 2;
@@ -11069,7 +11111,7 @@ export component AppWindow inherits Window {
                         label: "Open settings from account controls";
                         ink: root.ink; muted: root.muted; surface: root.window-sidebar;
                         hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                        activated => { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+                        activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
                     }
                     if root.layout-customized : TextAction {
                         text: "Restore";
@@ -11085,7 +11127,7 @@ export component AppWindow inherits Window {
                     focus-color: root.accent;
                     label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
                     accessible-expanded: root.account-menu-open;
-                    activated => { if !RoomAddresses.open { root.account-menu-open = !root.account-menu-open; } }
+                    activated => { if !RoomAddresses.open && !RoomLeave.view.open { root.account-menu-open = !root.account-menu-open; } }
                     HorizontalLayout {
                         padding-left: root.account-column ? 13px : 11px;
                         padding-right: root.account-column ? 13px : 11px;
@@ -11124,7 +11166,7 @@ export component AppWindow inherits Window {
             icon: "⚙";
             label: "Open settings";
             ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
-            activated => { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+            activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
         }
 
         // Drawn after every pane so it opens upward over them.
@@ -11252,7 +11294,7 @@ export component AppWindow inherits Window {
                     cancel-on-escape: true;
                     label: "Manage accounts";
                     cancelled => { root.account-menu-open = false; account-trigger.focus(); }
-                    activated => { MatrixLink.withdraw(); ThreadBrowser.withdraw(); RoomAddresses.context-changed(); root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); RoomAddresses.context-changed(); root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
                     HorizontalLayout {
                         padding-left: 9px; padding-right: 9px; spacing: 9px;
                         VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "manage-accounts"; ink: root.ink; } }
@@ -11359,7 +11401,7 @@ export component AppWindow inherits Window {
         + (root.member-confirm-open ? "1" : "0") + (root.native-capture-picker-open ? "1" : "0")
         + (root.leave-call-dialog ? "1" : "0") + (root.image-preview-open ? "1" : "0")
         + (root.poll-dialog-open ? "1" : "0") + (root.account-menu-open ? "1" : "0")
-        + (RoomAddresses.open ? "1" : "0");
+        + (RoomAddresses.open ? "1" : "0") + (RoomLeave.view.open ? "1" : "0");
     changed space-management-context => { SpaceRooms.context-changed(); }
 
     // Managing a Space's rooms (space-management.slint); Rust owns its state.
@@ -11966,6 +12008,13 @@ export component AppWindow inherits Window {
         }
     }
 
+    // Leaving owns the window until Close/Escape or a protected context ends it.
+    if RoomLeave.view.open : RoomLeaveDialog {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        colors: root.button-colors; surface: root.dialog-surface;
+        scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
+        text-scale: root.text-scale;
+    }
     if root.room-admin-open && root.room-admin-mode == 0 : FocusScope {
         focus-on-tab-navigation: false;
         init => { settings-close.focus(); }
@@ -12035,9 +12084,9 @@ export component AppWindow inherits Window {
                                 height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
                                 background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                                 label: root.room-settings-dirty ? "Roles and permissions; save or refresh your settings edits first" : "Open this room's roles and permissions";
-                                enabled: !RoomAddresses.open && !RoomAccessState.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty;
+                                enabled: !RoomLeave.view.open && !RoomAddresses.open && !RoomAccessState.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty;
                                 activated => {
-                                    if !RoomAddresses.open && !RoomAccessState.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty {
+                                    if !RoomLeave.view.open && !RoomAddresses.open && !RoomAccessState.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty {
                                         root.room-admin-mode = 3;
                                     }
                                 }
@@ -12194,8 +12243,8 @@ export component AppWindow inherits Window {
                                 height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
                                 background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                                 label: "Open history visibility, guest access and directory listing";
-                                enabled: !RoomAddresses.open && root.room-settings-loaded && !root.room-admin-busy && root.room-settings-confirmation == 0;
-                                activated => { if !RoomAddresses.open { RoomAccessState.open-panel(); } }
+                                enabled: !RoomLeave.view.open && !RoomAddresses.open && root.room-settings-loaded && !root.room-admin-busy && root.room-settings-confirmation == 0;
+                                activated => { if !RoomLeave.view.open && !RoomAddresses.open { RoomAccessState.open-panel(); } }
 
                                 Text { x: 12px; width: parent.width - 24px; text: "Access and visibility…"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                             }
@@ -12836,7 +12885,7 @@ export component AppWindow inherits Window {
                     height: 38px * root.text-scale; vertical-stretch: 0;
                     text: "Choose a saved account"; ink: root.ink; muted: root.muted;
                     surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                    activated => { MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.manage-accounts-open = true; root.manage-accounts(); }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.manage-accounts-open = true; root.manage-accounts(); }
                 }
                 if root.account-access-notice != "" : Text {
                     text: root.account-access-notice; color: root.muted; font-size: 11px * root.text-scale;

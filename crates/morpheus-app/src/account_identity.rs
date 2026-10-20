@@ -512,6 +512,7 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
 /// No account, security, call or dialog flow is in the way.
 fn unobstructed(ui: &AppWindow, live: &LiveUi) -> bool {
     !crate::room_addresses::is_open(ui)
+        && !crate::room_leave::is_open(ui)
         && ui.get_live_session()
         && live.is_live.load(Ordering::Acquire)
         && !live.security_gate.blocked()
@@ -610,7 +611,7 @@ fn open(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     // The identity being edited, from the switcher, until the server answers.
     ui.set_account_profile_user_id(ui.get_active_account_handle());
     crate::matrix_links::clear(ui);
-    crate::thread_browser::clear(ui);
+    crate::thread_browser::withdraw(ui);
     ui.set_account_profile_open(true);
     read(ui, live, runtime, true);
 }

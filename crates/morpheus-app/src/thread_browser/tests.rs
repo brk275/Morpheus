@@ -757,7 +757,18 @@ pub(crate) async fn assert_thread_browser_panel(
         "the switcher never opens over the browser"
     );
     assert!(state.get_open(), "and the browser keeps its rows");
+    // The real protected-entry withdrawal cancels a latent Leave owner
+    // before that surface opens. This token is a view-only stand-in; no
+    // RoomLeaveUi, manager admission or HTTP request is used in this phase.
+    let pending_leave = morpheus_matrix::RoomLeaveCancellation::new();
+    let cancellation = pending_leave.clone();
+    ui.global::<crate::RoomLeave>()
+        .on_reset(move || cancellation.cancel());
     ui.invoke_open_account_menu();
+    assert!(
+        pending_leave.is_cancelled(),
+        "entry cancels Leave synchronously"
+    );
     assert!(held(ui), "the account menu opened through its real entry");
     assert!(!state.get_open(), "its entry withdrew the browser first");
     assert_eq!(
@@ -772,6 +783,7 @@ pub(crate) async fn assert_thread_browser_panel(
         !state.get_open(),
         "nothing comes back after the account menu"
     );
+    ui.global::<crate::RoomLeave>().on_reset(|| {});
 
     // A Matrix link and the browser hold each other. A link does nothing
     // over an open browser holding a page (the link's real entry,
@@ -823,11 +835,41 @@ pub(crate) async fn assert_thread_browser_panel(
     clear(ui);
     settle(ui).await;
 
+    // Mutual entry refusal: the shared Leave admission includes the browser,
+    // and the browser's actual Show refuses without closing an open Leave.
+    open("", false, true);
+    settle(ui).await;
+    assert!(
+        ui.get_room_leave_blocked(),
+        "the browser holds Leave admission"
+    );
+    assert!(
+        ui.get_matrix_link_blocked(),
+        "the same browser still holds links"
+    );
+    clear(ui);
+    let leave = ui.global::<crate::RoomLeave>();
+    leave.set_view(crate::RoomLeaveView {
+        open: true,
+        ..Default::default()
+    });
+    assert!(held(ui), "Leave holds browser admission synchronously");
+    state.invoke_show();
+    assert!(leave.get_view().open, "refused Show never withdraws Leave");
+    assert!(!state.get_open(), "Show cannot open over Leave");
+    assert_eq!(ROWS.with(|model| model.row_count()), 0);
+    leave.set_view(crate::RoomLeaveView::default());
+    settle(ui).await;
+    assert!(
+        !held(ui) && !state.get_open(),
+        "closing Leave never reopens the browser"
+    );
+
     // Rust's guard and the Slint gate are the same set, state by state. Each
     // state is set and reset with no settle between, so no change handler
     // or overlay runs and later phases see nothing.
     assert!(!held(ui) && ui.get_thread_browser_allowed());
-    let every: [(&str, fn(&AppWindow, bool)); 30] = [
+    let every: [(&str, fn(&AppWindow, bool)); 31] = [
         ("the Settings page", |ui, on| {
             ui.set_page(if on { 1 } else { 0 })
         }),
@@ -896,6 +938,13 @@ pub(crate) async fn assert_thread_browser_panel(
         }),
         ("a Matrix link card", |ui, on| {
             ui.global::<crate::MatrixLink>().set_open(on)
+        }),
+        ("Leave", |ui, on| {
+            ui.global::<crate::RoomLeave>()
+                .set_view(crate::RoomLeaveView {
+                    open: on,
+                    ..Default::default()
+                });
         }),
     ];
     for (name, set) in every {
