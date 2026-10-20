@@ -31,25 +31,34 @@ All three choices are off by default (`[activity]` in `config.toml`, or
   edited in the last 5 seconds, the room is told you are typing; the SDK sends
   at most one notice per 3 seconds and each lasts 4. It stops on idle, blur
   (including the window becoming inactive), an empty composer, sending, a room,
-  thread, page or account change, account lock, and turning the setting off,
-  which also drops a notice not yet sent. One worker sends them: keystrokes
-  only update its state. A stop goes only to the account and room the notice
-  was sent for; if that account is no longer selected the stop is not sent and
-  the server ends the notice after its 4 seconds.
+  thread, page or account change, account lock, and turning the setting off.
+  Blur, an emptied or sent composer, a hidden conversation, a room or account
+  change and turning the setting off also drop a notice not yet sent. One
+  worker sends them: keystrokes only update its state. A stop goes only to the
+  account and room the notice was sent for. It is not sent while account
+  access is locked or once that account is no longer selected; the server then
+  ends the notice after its 4 seconds.
 - **Send public read receipts.** When on, receipts are `m.read`, visible to the
   room. When off, every receipt Morpheus sends is `m.read.private`.
-- **Mark messages read as I view them.** A receipt moves only to the event a
+- **Mark messages read as I view them.** This is the only way Morpheus moves
+  your read position on its own. A receipt moves only to the event a
   live conversation (or the open thread) shows as its last row while scrolled
   to the bottom, after it stayed there for 1.5 seconds, while the window is
   shown, not minimized and a composer has keyboard focus. Merely opening or
   caching a room, scrolling through older history and a view focused on an
   older event never move it. At most one request per view at a time and one
   every 3 seconds; the SDK never moves a receipt backwards. Thread views send
-  thread receipts; the conversation sends main-timeline receipts.
+  thread receipts; the conversation sends main-timeline receipts. A newer
+  bottom message, leaving the bottom, losing focus, hiding the conversation,
+  another room, thread or account, and changing either receipt setting
+  withdraw a receipt that is still waiting: nothing is sent for it. A receipt
+  already handed to the Matrix SDK cannot be recalled.
 - **Mark as read** (room menu, or Menu / Shift+F10 on a room row). Moves the
   fully-read marker and a read receipt (private unless public receipts are on)
-  to the room's latest event. Unread counts change when sync brings the
-  server's result; Morpheus never clears a badge on its own.
+  to the room's latest event. Turning public read receipts off, or quitting,
+  withdraws it while it is still waiting; leaving the room does not. Unread
+  counts change when sync brings the server's result; Morpheus never clears a
+  badge on its own.
 
 ## Limits
 

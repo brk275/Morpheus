@@ -129,6 +129,15 @@ impl Composer {
     }
 }
 
+/// Whether a typing start not yet sent is still wanted: some composer is
+/// focused and holds text. Blur, an emptied or sent composer, or focus moving
+/// to an empty composer drop it before it goes out.
+pub(super) fn start_wanted(composers: &[Composer]) -> bool {
+    composers
+        .iter()
+        .any(|composer| composer.focused && composer.has_text)
+}
+
 /// A typing start that may still be active.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Started {
@@ -294,6 +303,33 @@ mod tests {
         assert_eq!(typing_step(true, &typing, moved, now), TypingStep::Stop);
         // Nothing to stop when nothing was started.
         assert_eq!(typing_step(true, &empty, None, now), TypingStep::Nothing);
+    }
+
+    #[test]
+    fn an_unsent_typing_start_is_dropped_on_blur_empty_send_or_focus_move() {
+        let now = Instant::now();
+        let typing = typing_now(now);
+        assert!(start_wanted(&[typing, Composer::default()]));
+        // Blur, including the window becoming inactive.
+        let blurred = Composer {
+            focused: false,
+            ..typing
+        };
+        assert!(!start_wanted(&[blurred, Composer::default()]));
+        // Emptied or sent.
+        let empty = Composer {
+            has_text: false,
+            ..typing
+        };
+        assert!(!start_wanted(&[empty, Composer::default()]));
+        // Focus moved from the room composer to an empty thread composer.
+        let thread = Composer {
+            focused: true,
+            ..Composer::default()
+        };
+        assert!(!start_wanted(&[blurred, thread]));
+        // Still typing in the thread composer.
+        assert!(start_wanted(&[blurred, typing]));
     }
 
     #[test]

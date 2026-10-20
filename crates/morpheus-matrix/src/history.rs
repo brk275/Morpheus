@@ -388,18 +388,20 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn runtime() -> tokio::runtime::Runtime {
+    pub(crate) fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
     }
 
-    async fn fixture(account: Option<AccountInfo>) -> (PathBuf, Arc<AccountManager>, AccountInfo) {
+    pub(crate) async fn fixture(
+        account: Option<AccountInfo>,
+    ) -> (PathBuf, Arc<AccountManager>, AccountInfo) {
         let directory =
             std::env::temp_dir().join(format!("morpheus-history-read-{}", Uuid::new_v4()));
         let manager = Arc::new(AccountManager::open(&directory).unwrap());

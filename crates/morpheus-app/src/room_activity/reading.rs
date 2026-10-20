@@ -1,26 +1,32 @@
-//! Automatic read receipts, only when read tracking was chosen in Settings:
-//! for the event a live conversation (or the open thread) shows as its last
-//! row while scrolled to the bottom, once it stayed there for READ_SETTLE,
-//! and only while the window is shown, not minimized and has keyboard focus
-//! in a composer. A room or cached timeline that is merely open, a view
-//! scrolled into older history and a view focused on an older event never
-//! move a receipt. Every condition is checked again on the UI thread right
-//! before sending. Private unless public receipts were chosen. One request
-//! per view at a time, at most every READ_INTERVAL; the SDK only ever moves a
-//! receipt forwards.
+//! Automatic read receipts, the only automatic receipt sender, and only when
+//! read tracking was chosen in Settings: for the event a live conversation
+//! (or the open thread) shows as its last row while scrolled to the bottom,
+//! once it stayed there for READ_SETTLE, and only while the window is shown,
+//! not minimized and has keyboard focus in a composer. A room or cached
+//! timeline that is merely open, a view scrolled into older history and a
+//! view focused on an older event never move a receipt. Every condition is
+//! checked again on the UI thread right before sending. Private unless public
+//! receipts were chosen. One request per view at a time, at most every
+//! READ_INTERVAL; the SDK only ever moves a receipt forwards.
 //!
-//! Kept in this one file (plus the two `read-view` reports in the window) so
-//! that a single automatic path remains when another receipt worker is
-//! integrated; see the handoff.
+//! Each request carries an `ActivityCancellation`. A newer bottom event or
+//! none, a failed gate check, lost composer focus, a hidden conversation,
+//! another room, thread or account, and any change to read tracking or public
+//! receipts revoke it at once: a request still waiting for its timeline, or
+//! not yet handed to the SDK, is withdrawn and nothing is sent. One already
+//! handed to the SDK cannot be recalled; it is only no longer waited for.
+//!
+//! Kept in this one file (plus the two `read-view` reports in the window).
 
 use std::{
     sync::{Arc, atomic::Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use morpheus_matrix::{ActivityCancellation, MatrixCoreError, ReceiptOutcome};
 use slint::{ComponentHandle, Model, Timer, TimerMode};
 
-use super::{Context, MAIN, RoomActivityUi, THREAD, model};
+use super::{Context, MAIN, RoomActivityUi, State, THREAD, model};
 use crate::AppWindow;
 
 thread_local! {
@@ -36,14 +42,36 @@ pub(super) fn stop_timer(slot: usize) {
     TIMERS.with(|timers| timers[slot].stop());
 }
 
-/// One view's automatic receipt state.
+/// Withdraws both views' requests: a gate they depended on was lost.
+pub(super) fn revoke_all(state: &mut State) {
+    state.views.iter_mut().for_each(View::revoke);
+}
+
+/// One view's automatic receipt state. Replacing or dropping it withdraws
+/// its request.
 #[derive(Default)]
 pub(super) struct View {
     shown: Option<Shown>,
-    /// The last receipt attempted for this view; never shown as delivered.
+    /// The last receipt handed to the SDK for this view, or refused before
+    /// that; never shown as delivered.
     sent: Option<(String, Instant)>,
-    /// The running request.
-    sending: Option<u64>,
+    /// The running request and what withdraws it.
+    sending: Option<(u64, ActivityCancellation)>,
+}
+
+impl View {
+    /// Nothing more of the running request is handed to the SDK.
+    pub(super) fn revoke(&mut self) {
+        if let Some((_, cancellation)) = self.sending.take() {
+            cancellation.cancel();
+        }
+    }
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        self.revoke();
+    }
 }
 
 /// The event a view reported at its bottom, for which context and thread,
@@ -56,7 +84,7 @@ struct Shown {
 }
 
 enum Plan {
-    Wait(std::time::Duration),
+    Wait(Duration),
     Send(Arc<Context>, String, String, bool),
 }
 
@@ -74,21 +102,28 @@ impl RoomActivityUi {
                 String::new()
             };
             let view = &mut state.views[slot];
-            match context {
+            let reported = match context {
                 Some(context) if !event.is_empty() && (!thread || !scope.is_empty()) => {
-                    let same = view.shown.as_ref().is_some_and(|shown| {
-                        shown.context == context && shown.thread == scope && shown.event == event
-                    });
-                    if !same {
-                        view.shown = Some(Shown {
-                            context,
-                            thread: scope,
-                            event: event.to_owned(),
-                            since: Instant::now(),
-                        });
-                    }
+                    Some((context, scope))
                 }
-                _ => view.shown = None,
+                _ => None,
+            };
+            let same = match (&reported, &view.shown) {
+                (Some((context, scope)), Some(shown)) => {
+                    shown.context == *context && shown.thread == *scope && shown.event == event
+                }
+                _ => false,
+            };
+            if !same {
+                // A newer bottom event, or none: the old one's request goes
+                // before anything else happens.
+                view.revoke();
+                view.shown = reported.map(|(context, thread)| Shown {
+                    context,
+                    thread,
+                    event: event.to_owned(),
+                    since: Instant::now(),
+                });
             }
         }
         if event.is_empty() {
@@ -126,7 +161,8 @@ impl RoomActivityUi {
         let room = ui.get_active_room_id();
         let thread_root = ui.get_thread_root_id();
         let plan = {
-            let state = self.lock();
+            let mut guard = self.lock();
+            let state = &mut *guard;
             let view = &state.views[slot];
             let Some(shown) = view.shown.as_ref() else {
                 return;
@@ -149,8 +185,13 @@ impl RoomActivityUi {
                     && last.as_ref().is_some_and(|last| last.as_str() == shown.event),
                 same_scope: current.is_some() && same_thread,
             };
-            // A later report, focus or setting change checks again.
-            if !model::may_mark_read(&gate) || view.sending.is_some() {
+            if !model::may_mark_read(&gate) {
+                // Every lost gate withdraws the running request. A later
+                // report, focus or setting change checks again.
+                state.views[slot].revoke();
+                return;
+            }
+            if view.sending.is_some() {
                 return;
             }
             let sent = view.sent.as_ref().map(|(event, at)| (event.as_str(), *at));
@@ -193,42 +234,88 @@ impl RoomActivityUi {
         event: String,
         public: bool,
     ) {
+        let cancellation = ActivityCancellation::new();
         let op = {
             let mut state = self.lock();
             state.read_op = state.read_op.wrapping_add(1);
             let op = state.read_op;
-            let view = &mut state.views[slot];
-            view.sending = Some(op);
-            view.sent = Some((event.clone(), Instant::now()));
+            state.views[slot].sending = Some((op, cancellation.clone()));
             op
         };
         let this = self.clone();
         self.runtime.spawn(async move {
             let manager = this.live.manager.clone();
             let root = (!thread.is_empty()).then_some(thread.as_str());
-            // The outcome is not shown anywhere; a failure is retried only
-            // for a newer event.
-            let _ = manager
+            let outcome = manager
                 .send_viewed_receipt_selected(
                     &context.selection,
                     &context.room,
                     root,
                     &event,
                     public,
+                    &cancellation,
                 )
                 .await;
             let weak = this.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                {
-                    let mut state = this.lock();
-                    let view = &mut state.views[slot];
-                    if view.sending != Some(op) {
-                        return;
-                    }
-                    view.sending = None;
-                }
-                this.read_check(&ui, slot);
+                this.finish_read(&ui, slot, op, event, outcome);
             });
         });
+    }
+
+    /// The outcome is never shown. A withdrawn request sent nothing, so the
+    /// view may send once its gates hold again; anything else reached the
+    /// SDK or failed and is not repeated for that event.
+    fn finish_read(
+        self: &Arc<Self>,
+        ui: &AppWindow,
+        slot: usize,
+        op: u64,
+        event: String,
+        outcome: Result<ReceiptOutcome, MatrixCoreError>,
+    ) {
+        {
+            let mut state = self.lock();
+            let view = &mut state.views[slot];
+            // Revoked or replaced meanwhile: nothing here depends on it.
+            if !view.sending.as_ref().is_some_and(|(id, _)| *id == op) {
+                return;
+            }
+            view.sending = None;
+            if !matches!(outcome, Ok(ReceiptOutcome::Withdrawn)) {
+                view.sent = Some((event, Instant::now()));
+            }
+        }
+        self.read_check(ui, slot);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaving_or_replacing_a_view_withdraws_its_request() {
+        // A newer bottom event, no bottom event or a failed gate check.
+        let cancellation = ActivityCancellation::new();
+        let mut view = View::default();
+        view.sending = Some((1, cancellation.clone()));
+        view.revoke();
+        assert!(cancellation.is_cancelled() && view.sending.is_none());
+        // Another room, thread or account, or a hidden conversation, replaces
+        // the views; the replaced request is withdrawn with it.
+        let replaced = ActivityCancellation::new();
+        let mut views: [View; 2] = Default::default();
+        views[THREAD].sending = Some((2, replaced.clone()));
+        drop(std::mem::take(&mut views[THREAD]));
+        assert!(replaced.is_cancelled());
+        // Lost focus or a changed receipt setting withdraws both views.
+        let mut state = State::default();
+        let main = ActivityCancellation::new();
+        let thread = ActivityCancellation::new();
+        state.views[MAIN].sending = Some((3, main.clone()));
+        state.views[THREAD].sending = Some((4, thread.clone()));
+        revoke_all(&mut state);
+        assert!(main.is_cancelled() && thread.is_cancelled());
     }
 }

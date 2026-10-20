@@ -16,7 +16,8 @@ pub use media::{
 };
 mod room_activity;
 pub use room_activity::{
-    ActivityMember, MAX_RECEIPT_EVENTS, Reader, ReceiptScope, SeenBy, Typing, TypingWatch,
+    ActivityCancellation, ActivityMember, MAX_RECEIPT_EVENTS, Reader, ReceiptOutcome, ReceiptScope,
+    SeenBy, Typing, TypingWatch,
 };
 mod image_packs;
 pub use image_packs::{

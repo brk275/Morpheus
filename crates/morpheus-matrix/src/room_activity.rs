@@ -9,10 +9,24 @@
 //! `Unthreaded`) and only ever moves a receipt forwards. No request is built
 //! here and nothing is logged.
 //!
+//! A receipt write carries an [`ActivityCancellation`]. Until the request is
+//! handed to the SDK, cancelling withdraws it: the timeline lookup (which can
+//! wait on the account lock and a timeline build) is dropped and nothing is
+//! sent. Cancelling once the SDK has started only stops waiting for it; a
+//! request the homeserver already received cannot be recalled.
+//!
 //! Incoming names and IDs are untrusted server data: bounded here, sanitized
 //! by the app, and never a verification claim.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use matrix_sdk::{
     Room,
@@ -24,7 +38,7 @@ use matrix_sdk::{
     },
 };
 use matrix_sdk_ui::Timeline;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use crate::{AccountManager, AccountSelection, MatrixCoreError, Result, account_room};
 
@@ -64,6 +78,61 @@ impl ReceiptScope {
             ],
         })
     }
+}
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+/// Withdraws one queued receipt or read marker write. It takes effect up to
+/// the moment the request is handed to the SDK; cancelling never recalls a
+/// request the homeserver may already have received.
+#[derive(Clone, Default)]
+pub struct ActivityCancellation(Arc<CancellationState>);
+
+impl ActivityCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Resolves once any clone is cancelled.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// What became of one receipt or read marker write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptOutcome {
+    /// The homeserver accepted it.
+    Sent,
+    /// The SDK sent nothing: it would not have moved this account's receipt
+    /// forwards.
+    NotNeeded,
+    /// Cancelled before anything was handed to the SDK: nothing was sent.
+    Withdrawn,
+    /// Cancelled after the SDK had started: it may or may not have reached
+    /// the homeserver, and nothing waits for the answer.
+    Interrupted,
 }
 
 /// Someone in the room, as the server and this device's store describe them.
@@ -212,25 +281,27 @@ impl AccountManager {
     /// "Mark as read", only ever on the user's explicit choice: the
     /// fully-read marker (unthreaded) and a read receipt on the live
     /// timeline's latest event, public only when `public`. Nothing calls it
-    /// automatically. Returns whether anything was sent; the SDK skips a
-    /// receipt that would not move forwards. Unread counts change only when
-    /// sync reports the server's result.
+    /// automatically. The SDK skips a receipt that would not move forwards.
+    /// Unread counts change only when sync reports the server's result.
+    /// `cancellation` withdraws it up to the moment it is handed to the SDK.
     pub async fn explicit_mark_read_selected(
         &self,
         selection: &AccountSelection,
         room_id: &str,
         public: bool,
-    ) -> Result<bool> {
+        cancellation: &ActivityCancellation,
+    ) -> Result<ReceiptOutcome> {
         let receipt = receipt_type(public);
-        let timeline = self.activity_timeline(selection, room_id, None).await?;
-        let marked = async {
+        let lookup = Box::pin(self.activity_timeline(selection, room_id, None));
+        let marked = send_unless_cancelled(cancellation, lookup, |timeline| async move {
+            ensure_current(selection)?;
             let marker = timeline.mark_as_read(SendReceiptType::FullyRead).await;
             let marker = marker.map_err(|_| MatrixCoreError::Sdk("read marker failed".into()))?;
             ensure_current(selection)?;
             let read = timeline.mark_as_read(receipt).await;
             let read = read.map_err(|_| MatrixCoreError::Sdk("read receipt failed".into()))?;
-            Ok::<_, MatrixCoreError>(marker || read)
-        };
+            Ok::<bool, MatrixCoreError>(marker || read)
+        });
         tokio::time::timeout(2 * WRITE_LIMIT, marked)
             .await
             .map_err(|_| MatrixCoreError::Sdk("marking as read timed out".into()))?
@@ -240,8 +311,8 @@ impl AccountManager {
     /// None: receipt thread `Main`) or in one thread (`Thread(root)`): send a
     /// read receipt there, private unless `public`. The SDK skips it unless it
     /// moves this account's receipt forwards, and never targets this
-    /// account's own event. No fully-read marker moves. Returns whether a
-    /// receipt was sent.
+    /// account's own event. No fully-read marker moves. `cancellation`
+    /// withdraws it up to the moment it is handed to the SDK.
     pub async fn send_viewed_receipt_selected(
         &self,
         selection: &AccountSelection,
@@ -249,15 +320,20 @@ impl AccountManager {
         thread_root: Option<&str>,
         event_id: &str,
         public: bool,
-    ) -> Result<bool> {
+        cancellation: &ActivityCancellation,
+    ) -> Result<ReceiptOutcome> {
         let receipt = receipt_type(public);
         let event = crate::parse_event_id(event_id)?;
-        let timeline = self.activity_timeline(selection, room_id, thread_root).await?;
-        let read = timeline.send_single_receipt(receipt, event);
-        tokio::time::timeout(WRITE_LIMIT, read)
-            .await
-            .map_err(|_| MatrixCoreError::Sdk("read receipt timed out".into()))?
-            .map_err(|_| MatrixCoreError::Sdk("read receipt failed".into()))
+        let lookup = Box::pin(self.activity_timeline(selection, room_id, thread_root));
+        send_unless_cancelled(cancellation, lookup, |timeline| async move {
+            ensure_current(selection)?;
+            let read = timeline.send_single_receipt(receipt, event);
+            tokio::time::timeout(WRITE_LIMIT, read)
+                .await
+                .map_err(|_| MatrixCoreError::Sdk("read receipt timed out".into()))?
+                .map_err(|_| MatrixCoreError::Sdk("read receipt failed".into()))
+        })
+        .await
     }
 
     /// Other people's public read receipts on `events` (this event first,
@@ -318,6 +394,41 @@ impl AccountManager {
     }
 }
 
+/// Looks up what a write needs, then writes, unless `cancellation` fires
+/// first. While the lookup runs, cancelling drops it and nothing is sent. The
+/// last check is made right before `send` hands the request to the SDK; once
+/// it has, cancelling only stops waiting, because a request the homeserver
+/// may already have received cannot be recalled.
+async fn send_unless_cancelled<T, L, S, F>(
+    cancellation: &ActivityCancellation,
+    lookup: L,
+    send: S,
+) -> Result<ReceiptOutcome>
+where
+    L: Future<Output = Result<T>>,
+    S: FnOnce(T) -> F,
+    F: Future<Output = Result<bool>>,
+{
+    let found = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Ok(ReceiptOutcome::Withdrawn),
+        found = lookup => found?,
+    };
+    if cancellation.is_cancelled() {
+        return Ok(ReceiptOutcome::Withdrawn);
+    }
+    let sending = send(found);
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Ok(ReceiptOutcome::Interrupted),
+        sent = sending => Ok(if sent? {
+            ReceiptOutcome::Sent
+        } else {
+            ReceiptOutcome::NotNeeded
+        }),
+    }
+}
+
 fn ensure_current(selection: &AccountSelection) -> Result<()> {
     if selection.is_current() {
         Ok(())
@@ -370,6 +481,103 @@ async fn typing_members(room: &Room, users: Vec<OwnedUserId>) -> Typing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::tests::{fixture, runtime};
+    use futures_util::task::noop_waker_ref;
+    use std::{
+        pin::pin,
+        sync::atomic::AtomicUsize,
+        task::{Context, Poll},
+    };
+
+    #[test]
+    fn a_receipt_waiting_for_its_timeline_is_withdrawn_before_it_is_sent() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let selection = manager.account_selection(&account.id).unwrap();
+            let room = "!activity:example.org";
+            let event = "$viewed:example.org";
+            // Holding the account lock delays the timeline lookup, as an account
+            // transition or a slow timeline build does.
+            let state = manager.state.lock().await;
+            let cancel = ActivityCancellation::new();
+            let mut write = Box::pin(
+                manager.send_viewed_receipt_selected(&selection, room, None, event, true, &cancel),
+            );
+            let mut context = Context::from_waker(noop_waker_ref());
+            assert!(write.as_mut().poll(&mut context).is_pending());
+            // Leaving the view, losing focus or turning receipts off revokes it
+            // while the selection stays current.
+            cancel.cancel();
+            let outcome = tokio::time::timeout(Duration::from_secs(2), write).await;
+            assert_eq!(outcome.unwrap().unwrap(), ReceiptOutcome::Withdrawn);
+            drop(state);
+            // Not cancelled, the same write runs on to the room lookup, so the
+            // withdrawal above came before anything reached the SDK.
+            let open = ActivityCancellation::new();
+            let reached = manager
+                .send_viewed_receipt_selected(&selection, room, None, event, true, &open)
+                .await;
+            assert!(matches!(reached, Err(MatrixCoreError::RoomNotFound(_))));
+            drop(manager);
+            std::fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
+    fn nothing_is_handed_to_the_sdk_once_a_write_is_cancelled() {
+        let mut context = Context::from_waker(noop_waker_ref());
+        let handed = AtomicUsize::new(0);
+        // Cancelled while the lookup waits: withdrawn, never handed over.
+        let cancel = ActivityCancellation::new();
+        let waiting = std::future::pending::<Result<()>>();
+        let mut write = pin!(send_unless_cancelled(&cancel, waiting, |()| {
+            handed.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(true))
+        }));
+        assert!(write.as_mut().poll(&mut context).is_pending());
+        cancel.cancel();
+        let polled = write.as_mut().poll(&mut context);
+        assert!(matches!(polled, Poll::Ready(Ok(ReceiptOutcome::Withdrawn))));
+        // Cancelled as the lookup completes: the last check before the SDK
+        // withdraws it.
+        let cancel = ActivityCancellation::new();
+        let completing = std::future::poll_fn(|_| {
+            cancel.cancel();
+            Poll::Ready(Ok(()))
+        });
+        let mut write = pin!(send_unless_cancelled(&cancel, completing, |()| {
+            handed.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(true))
+        }));
+        let polled = write.as_mut().poll(&mut context);
+        assert!(matches!(polled, Poll::Ready(Ok(ReceiptOutcome::Withdrawn))));
+        assert_eq!(handed.load(Ordering::SeqCst), 0);
+        // Cancelled after the SDK started: only reported as interrupted.
+        let cancel = ActivityCancellation::new();
+        let found = std::future::ready(Ok(()));
+        let mut write = pin!(send_unless_cancelled(&cancel, found, |()| {
+            handed.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<bool>>()
+        }));
+        assert!(write.as_mut().poll(&mut context).is_pending());
+        assert_eq!(handed.load(Ordering::SeqCst), 1);
+        cancel.cancel();
+        let polled = write.as_mut().poll(&mut context);
+        assert!(matches!(polled, Poll::Ready(Ok(ReceiptOutcome::Interrupted))));
+        // Not cancelled: the SDK's own answer.
+        for (sent, outcome) in [
+            (true, ReceiptOutcome::Sent),
+            (false, ReceiptOutcome::NotNeeded),
+        ] {
+            let cancel = ActivityCancellation::new();
+            let found = std::future::ready(Ok(()));
+            let write = pin!(send_unless_cancelled(&cancel, found, |()| {
+                std::future::ready(Ok(sent))
+            }));
+            let polled = write.poll(&mut context);
+            assert!(matches!(polled, Poll::Ready(Ok(got)) if got == outcome));
+        }
+    }
 
     #[test]
     fn a_room_event_never_counts_a_thread_receipt() {

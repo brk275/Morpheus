@@ -8,9 +8,13 @@
 //! and the Seen-by rows synchronously on the UI thread. Outgoing typing and
 //! public receipts are off unless chosen in Settings. Typing goes through one
 //! worker: composer events only update its state and wake it, so no
-//! keystroke starts a task or a request, and turning typing off drops a start
-//! not yet sent. Typed text never reaches this module, and nothing here logs
-//! names, IDs or server responses.
+//! keystroke starts a task or a request. A typing start not yet sent is
+//! dropped when typing is turned off, the composer empties, is sent or loses
+//! focus, the conversation is hidden, or the room or account changes. Read
+//! receipts are withdrawn the same way (see reading.rs and Mark as read). A
+//! request already handed to the SDK cannot be recalled. Typed text never
+//! reaches this module, and nothing here logs names, IDs or server
+//! responses.
 
 mod model;
 mod reading;
@@ -24,7 +28,10 @@ use std::{
 };
 
 use morpheus_config::{Config, ConfigStore};
-use morpheus_matrix::{AccountSelection, MAX_RECEIPT_EVENTS, MatrixCoreError, ReceiptScope};
+use morpheus_matrix::{
+    AccountSelection, ActivityCancellation, MAX_RECEIPT_EVENTS, MatrixCoreError, ReceiptOutcome,
+    ReceiptScope,
+};
 use slint::{ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
 use tokio::{runtime::Handle, sync::Notify, task::JoinHandle};
 
@@ -73,8 +80,9 @@ struct State {
     seen_op: u64,
     /// The Seen-by view shows a thread reply.
     seen_thread: bool,
-    /// The running Mark as read.
-    marking: Option<u64>,
+    /// The running Mark as read, what withdraws it, and whether its receipt
+    /// is public.
+    marking: Option<(u64, ActivityCancellation, bool)>,
     mark_op: u64,
     notice_op: u64,
     /// Automatic receipts of the conversation and of the thread.
@@ -266,7 +274,14 @@ impl RoomActivityUi {
     /// while the runtime still runs. The server ends it after 4 seconds
     /// otherwise; nothing claims the stop arrived.
     pub(crate) fn shutdown(&self, ui: &AppWindow) {
-        self.lock().stopping = true;
+        {
+            let mut state = self.lock();
+            state.stopping = true;
+            // Nothing more is handed to the SDK after the window closed.
+            if let Some((_, cancellation, _)) = state.marking.as_ref() {
+                cancellation.cancel();
+            }
+        }
         self.reset(ui);
     }
 
@@ -392,6 +407,10 @@ impl RoomActivityUi {
         if thread_changed {
             reading::stop_timer(THREAD);
         }
+        if !chat_shown {
+            // Hidden conversation: an unsent typing start is dropped.
+            self.cancel_start.notify_waiters();
+        }
         if close_seen {
             self.close_seen_by(ui);
         }
@@ -407,13 +426,28 @@ impl RoomActivityUi {
         self.read_recheck(ui);
     }
 
-    fn preferences_changed(&self, ui: &AppWindow) {
+    /// Turning typing off drops an unsent start. Any change to read tracking
+    /// or public receipts withdraws both views' automatic requests, which
+    /// are then checked again under the new choice; turning public receipts
+    /// off also withdraws a public Mark as read not yet handed to the SDK.
+    fn preferences_changed(self: &Arc<Self>, ui: &AppWindow) {
         let prefs = preferences(ui);
         let typing_off = {
             let mut state = self.lock();
-            let typing_off = state.prefs.send_typing && !prefs.send_typing;
+            let before = state.prefs;
             state.prefs = prefs;
-            typing_off
+            let receipts_changed = before.read_tracking != prefs.read_tracking
+                || before.public_receipts != prefs.public_receipts;
+            if receipts_changed {
+                reading::revoke_all(&mut state);
+            }
+            if before.public_receipts
+                && !prefs.public_receipts
+                && let Some((_, cancellation, true)) = state.marking.as_ref()
+            {
+                cancellation.cancel();
+            }
+            before.send_typing && !prefs.send_typing
         };
         if typing_off {
             self.cancel_start.notify_waiters();
@@ -422,10 +456,25 @@ impl RoomActivityUi {
             reading::stop_timers();
         }
         self.wake.notify_one();
+        self.read_recheck(ui);
     }
 
+    /// Applies one composer event. Once no composer is both focused and
+    /// non-empty, a typing start not yet sent is dropped; once none has
+    /// focus, automatic receipts have lost their active-window gate and are
+    /// withdrawn.
     fn composer(&self, thread: bool, change: impl FnOnce(&mut Composer)) {
-        change(&mut self.lock().composers[usize::from(thread)]);
+        let typing = {
+            let mut state = self.lock();
+            change(&mut state.composers[usize::from(thread)]);
+            if !state.composers.iter().any(|composer| composer.focused) {
+                reading::revoke_all(&mut state);
+            }
+            model::start_wanted(&state.composers)
+        };
+        if !typing {
+            self.cancel_start.notify_waiters();
+        }
         self.wake.notify_one();
     }
 
@@ -516,9 +565,12 @@ impl RoomActivityUi {
     }
 
     /// The one typing worker. A start goes out with the account selection of
-    /// its context only; a stop goes to the account and room the start was
-    /// for, and fails (never switching accounts) once that selection ended,
-    /// leaving the server to end the start after its 4 seconds.
+    /// its context only, and is dropped unsent when typing stops being wanted
+    /// before it goes out. A stop goes to the account and room the start was
+    /// for; it is not sent while account access is locked, and fails (never
+    /// switching accounts) once that selection ended. In both cases the
+    /// server ends the start after its 4 seconds; nothing claims a stop
+    /// arrived.
     async fn typing_worker(self: Arc<Self>) {
         loop {
             // Registered before deciding, so a disable or switch after the
@@ -545,6 +597,11 @@ impl RoomActivityUi {
                 }
                 (TypingStep::Stop, Some(context)) => {
                     self.lock().started = None;
+                    // Nothing is sent while account access is locked; the
+                    // server ends the start within its 4 seconds.
+                    if self.live.security_gate.blocked() {
+                        continue;
+                    }
                     let manager = self.live.manager.clone();
                     let _ = manager
                         .send_typing_selected(&context.selection, &context.room, false)
@@ -676,8 +733,10 @@ impl RoomActivityUi {
 
     /// Mark as read, chosen by the user for one room of the active account:
     /// the private fully-read marker plus a read receipt, public only when
-    /// public receipts were chosen. One at a time. Unread counts change only
-    /// when sync brings the server's result.
+    /// public receipts were chosen. One at a time. Turning public receipts off,
+    /// or closing the window, withdraws it until it is handed to the SDK;
+    /// leaving the room does not, since the user asked for that room. Unread
+    /// counts change only when sync brings the server's result.
     fn mark_read(self: &Arc<Self>, ui: &AppWindow, room: &str) {
         let live = ui.get_live_session() && self.live.is_live.load(Ordering::Acquire);
         if !live || room.is_empty() || self.live.security_gate.blocked() {
@@ -687,14 +746,16 @@ impl RoomActivityUi {
         let Some(selection) = self.live.manager.account_selection(&account) else {
             return;
         };
+        let cancellation = ActivityCancellation::new();
         let (op, public) = {
             let mut state = self.lock();
             if state.marking.is_some() || state.stopping {
                 return;
             }
             state.mark_op = state.mark_op.wrapping_add(1);
-            state.marking = Some(state.mark_op);
-            (state.mark_op, state.prefs.public_receipts)
+            let (op, public) = (state.mark_op, state.prefs.public_receipts);
+            state.marking = Some((op, cancellation.clone(), public));
+            (op, public)
         };
         ui.global::<RoomActivity>().set_marking(true);
         let this = self.clone();
@@ -702,7 +763,7 @@ impl RoomActivityUi {
         self.runtime.spawn(async move {
             let manager = this.live.manager.clone();
             let marked = manager
-                .explicit_mark_read_selected(&selection, &room, public)
+                .explicit_mark_read_selected(&selection, &room, public, &cancellation)
                 .await;
             let weak = this.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -716,11 +777,11 @@ impl RoomActivityUi {
         ui: &AppWindow,
         selection: &AccountSelection,
         op: u64,
-        marked: Result<bool, MatrixCoreError>,
+        marked: Result<ReceiptOutcome, MatrixCoreError>,
     ) {
         {
             let mut state = self.lock();
-            if state.marking != Some(op) {
+            if !state.marking.as_ref().is_some_and(|(id, ..)| *id == op) {
                 return;
             }
             state.marking = None;
@@ -732,8 +793,14 @@ impl RoomActivityUi {
             return;
         }
         let notice = match marked {
-            Ok(true) => "Marked as read. Unread counts update when the server confirms.",
-            Ok(false) => "Nothing new to mark as read.",
+            Ok(ReceiptOutcome::Sent) => {
+                "Marked as read. Unread counts update when the server confirms."
+            }
+            Ok(ReceiptOutcome::NotNeeded) => "Nothing new to mark as read.",
+            Ok(ReceiptOutcome::Withdrawn) => "Mark as read was stopped before anything was sent.",
+            Ok(ReceiptOutcome::Interrupted) => {
+                "Mark as read was stopped; it may already have reached the server."
+            }
             Err(MatrixCoreError::SelectedAccountChanged) => return,
             Err(_) => "Could not mark as read. Try again.",
         };
