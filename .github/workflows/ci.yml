@@ -19,6 +19,12 @@ jobs:
       MORPHEUS_EXPECTED_ARCH: X64
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        env:
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
         with:
           ref: f9c3a3cfc42eb20ec57d754fd585e385453517ac
           path: candidate
@@ -77,7 +83,7 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_TERM_COLOR: never
           SLINT_EMIT_DEBUG_INFO: "1"
-        shell: python
+        shell: python -I {0}
         run: |
           import hashlib, json, os, pathlib, queue, re, signal, subprocess, tempfile, threading, time
           assert os.environ.get('GITHUB_ACTIONS') == 'true'
@@ -110,78 +116,184 @@ jobs:
           # The SDK test ctor defaults to verbose mock credential traces on failure.
           # Keep every test/assertion and scanner; suppress only tracing output.
           environment['RUST_LOG']='off'
-          def bounded(args, name, seconds, limit=64*1024*1024):
+          import stat, sys
+          # The supervisor owns the process group until cleanup, including successful exit.
+          # A private pipe carries only the direct command's numeric exit status; descendants
+          # never inherit it. Windows starts the command only after Job assignment.
+          SUPERVISOR = """import json, os, subprocess, sys
+          fd=int(sys.argv[1])
+          if os.name=='nt':
+              import msvcrt
+              fd=msvcrt.open_osfhandle(fd,os.O_WRONLY)
+          args=json.loads(sys.stdin.buffer.readline(65536))
+          code=subprocess.Popen(args,stdin=subprocess.DEVNULL,close_fds=True).wait()
+          os.write(fd,(str(code)+'\\n').encode('ascii')); os.close(fd)
+          sys.stdin.buffer.read(1)
+          """
+          def windows_job():
+              import ctypes
+              from ctypes import wintypes as w
+              api=ctypes.WinDLL('kernel32',use_last_error=True)
+              class Basic(ctypes.Structure):
+                  _fields_=[('process_time',ctypes.c_longlong),('job_time',ctypes.c_longlong),
+                      ('flags',w.DWORD),('minimum',ctypes.c_size_t),('maximum',ctypes.c_size_t),
+                      ('active',w.DWORD),('affinity',ctypes.c_size_t),('priority',w.DWORD),('scheduling',w.DWORD)]
+              class Limits(ctypes.Structure):
+                  _fields_=[('basic',Basic),('io',ctypes.c_ulonglong*6),('process_memory',ctypes.c_size_t),
+                      ('job_memory',ctypes.c_size_t),('peak_process',ctypes.c_size_t),('peak_job',ctypes.c_size_t)]
+              api.CreateJobObjectW.argtypes=[ctypes.c_void_p,w.LPCWSTR]; api.CreateJobObjectW.restype=w.HANDLE
+              api.SetInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD]
+              api.SetInformationJobObject.restype=w.BOOL
+              api.AssignProcessToJobObject.argtypes=[w.HANDLE,w.HANDLE]; api.AssignProcessToJobObject.restype=w.BOOL
+              api.TerminateJobObject.argtypes=[w.HANDLE,w.UINT]; api.TerminateJobObject.restype=w.BOOL
+              api.QueryInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD,ctypes.c_void_p]
+              api.QueryInformationJobObject.restype=w.BOOL
+              api.CloseHandle.argtypes=[w.HANDLE]; api.CloseHandle.restype=w.BOOL
+              handle=api.CreateJobObjectW(None,None)
+              if not handle: raise OSError('job_create_failed')
+              limits=Limits(); limits.basic.flags=0x2000 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+              if not api.SetInformationJobObject(handle,9,ctypes.byref(limits),ctypes.sizeof(limits)):
+                  api.CloseHandle(handle); raise OSError('job_limits_failed')
+              return api,handle
+
+          def regular_bytes(path,limit):
+              # Do not open a FIFO, follow a symlink/reparse point, or read an unbounded file.
+              before=path.lstat()
+              if (not stat.S_ISREG(before.st_mode) or before.st_size>limit
+                  or getattr(before,'st_file_attributes',0)&0x400): raise ValueError('unsafe_regular_file')
+              flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_CLOEXEC',0)
+              descriptor=os.open(path,flags)
+              with os.fdopen(descriptor,'rb') as stream:
+                  opened=os.fstat(stream.fileno())
+                  if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)
+                      or getattr(opened,'st_file_attributes',0)&0x400): raise ValueError('changed_regular_file')
+                  data=stream.read(limit+1); after=os.fstat(stream.fileno())
+                  if (len(data)>limit or len(data)!=after.st_size
+                      or (opened.st_size,opened.st_mtime_ns)!=(after.st_size,after.st_mtime_ns)):
+                      raise ValueError('changed_regular_file')
+                  return data
+
+          def bounded(args,name,seconds,limit=64*1024*1024,cwd=None):
               directory=logs/name; directory.mkdir(mode=0o700)
               log=directory/'output.log'
-              # A bounded queue works with anonymous pipes on Windows as well as POSIX;
-              # never use unbounded communicate() or a terminal-only size check.
-              blocks=queue.Queue(maxsize=8)
-              stop=threading.Event()
-              error=[]
-              kwargs={'start_new_session':True} if os.name!='nt' else {
-                  'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP}
-              child=subprocess.Popen(args,cwd=workspace,stdin=subprocess.DEVNULL,
-                  stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=environment,**kwargs)
-              def reader():
-                  try:
-                      while not stop.is_set():
-                          block=os.read(child.stdout.fileno(),65536)
-                          while not stop.is_set():
-                              try: blocks.put(block,timeout=0.2); break
-                              except queue.Full: pass
-                          if not block: return
-                  except OSError:
-                      error.append(True)
-              thread=threading.Thread(target=reader,daemon=True); thread.start()
-              deadline=time.monotonic()+seconds
-              reason=None; size=0; code=None
-              with log.open('xb') as output:
-                  try:
-                      while True:
-                          remaining=deadline-time.monotonic()
-                          if remaining<=0: reason='deadline'; break
-                          try: block=blocks.get(timeout=min(0.2,remaining))
-                          except queue.Empty:
-                              if not thread.is_alive(): reason='process_error'; break
-                              continue
-                          if not block: break
-                          size+=len(block)
-                          if size>limit: reason='output_limit'; break
-                          output.write(block)
-                      if reason is None:
-                          code=child.wait(timeout=min(10,max(0.01,deadline-time.monotonic())))
-                  except (OSError,subprocess.SubprocessError):
-                      reason='process_error'
-                  finally:
-                      stop.set()
-                      # Keep the direct child unreaped until process-tree termination.
-                      # Even EOF can precede exit; do not signal a recycled PID/group.
-                      if child.returncode is None:
-                          if os.name=='nt':
+              blocks=queue.Queue(maxsize=8); status=queue.Queue(maxsize=1)
+              stop=threading.Event(); errors=[]; code=None; reason=None; cleaned=False; cleanup_ok=False
+              read_fd,write_fd=os.pipe(); job=None; child=None; threads=[]
+              kwargs={'start_new_session':True,'pass_fds':(write_fd,)}
+              status_arg=write_fd
+              if os.name=='nt':
+                  import msvcrt
+                  job=windows_job(); status_arg=msvcrt.get_osfhandle(write_fd)
+                  os.set_handle_inheritable(status_arg,True)
+                  startup=subprocess.STARTUPINFO(); startup.lpAttributeList={'handle_list':[status_arg]}
+                  kwargs={'startupinfo':startup,'close_fds':True}
+              def cleanup():
+                  nonlocal cleaned,cleanup_ok
+                  if cleaned: return
+                  cleaned=True
+                  if job:
+                      import ctypes
+                      class Accounting(ctypes.Structure):
+                          _fields_=[('times',ctypes.c_longlong*4),('faults',ctypes.c_uint32),
+                              ('total',ctypes.c_uint32),('active',ctypes.c_uint32),('terminated',ctypes.c_uint32)]
+                      try:
+                          if not job[0].TerminateJobObject(job[1],1): raise OSError('job_terminate_failed')
+                          until=time.monotonic()+10
+                          while True:
+                              accounting=Accounting()
+                              if not job[0].QueryInformationJobObject(job[1],1,ctypes.byref(accounting),ctypes.sizeof(accounting),None):
+                                  raise OSError('job_query_failed')
+                              if accounting.active==0: break
+                              if time.monotonic()>=until: raise OSError('job_cleanup_deadline')
+                              time.sleep(0.05)
+                      finally:
+                          if not job[0].CloseHandle(job[1]): raise OSError('job_close_failed')
+                  elif child is not None:
+                      # No poll()/wait() before this signal: the supervisor still reserves
+                      # its group identity even if it exited unexpectedly.
+                      try: os.killpg(child.pid,signal.SIGKILL)
+                      except ProcessLookupError: pass
+                  cleanup_ok=True
+              try:
+                  with log.open('x+b') as output:
+                      try:
+                          child=subprocess.Popen([sys.executable,'-I','-c',SUPERVISOR,str(status_arg)],
+                              cwd=cwd or workspace,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT,env=environment,**kwargs)
+                          if job and not job[0].AssignProcessToJobObject(job[1],int(child._handle)):
+                              # The supervisor is waiting for input; no command was started.
+                              child.kill(); raise OSError('job_assignment_failed')
+                          if os.name=='nt': os.set_handle_inheritable(status_arg,False)
+                          os.close(write_fd); write_fd=None
+                          def reader():
                               try:
-                                  subprocess.run(['taskkill','/PID',str(child.pid),'/T','/F'],
-                                      stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.DEVNULL,env=environment,timeout=10,check=False)
-                              except (OSError,subprocess.SubprocessError):
-                                  reason=reason or 'process_error'
-                              if child.poll() is None: child.kill()
-                          else:
-                              try: os.killpg(child.pid,signal.SIGKILL)
-                              except ProcessLookupError: pass
-                          try: child.wait(timeout=10)
-                          except subprocess.SubprocessError: reason=reason or 'process_error'
-                      thread.join(timeout=2)
-                      if thread.is_alive(): reason=reason or 'process_error'
-                      child.stdout.close()
-              # Validate the persisted limit even when a very fast child has exited.
-              if error: reason=reason or 'process_error'
-              if log.stat().st_size>limit: reason='output_limit'
-              return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
+                                  while not stop.is_set():
+                                      block=os.read(child.stdout.fileno(),65536)
+                                      while not stop.is_set():
+                                          try: blocks.put(block,timeout=0.2); break
+                                          except queue.Full: pass
+                                      if not block: return
+                              except OSError:
+                                  if not stop.is_set(): errors.append(True)
+                          def read_status():
+                              try:
+                                  data=b''
+                                  while len(data)<=32 and not data.endswith(b'\n'):
+                                      block=os.read(read_fd,33-len(data))
+                                      if not block: break
+                                      data+=block
+                                  status.put(int(data) if re.fullmatch(rb'-?[0-9]{1,10}\n',data) else None)
+                              except (OSError,ValueError): status.put(None)
+                          threads=[threading.Thread(target=reader,daemon=True),threading.Thread(target=read_status,daemon=True)]
+                          for thread in threads: thread.start()
+                          payload=(json.dumps(args,separators=(',',':'))+'\n').encode('utf-8')
+                          if len(payload)>65535: raise ValueError('command_too_large')
+                          child.stdin.write(payload); child.stdin.flush()
+                          deadline=time.monotonic()+seconds
+                          while True:
+                              if not cleaned:
+                                  try: returned=status.get_nowait()
+                                  except queue.Empty: pass
+                                  else:
+                                      if returned is None: reason='process_error'; break
+                                      code=returned; cleanup()
+                                      # Drain buffered output after killing remaining descendants.
+                                      deadline=min(deadline,time.monotonic()+10)
+                              remaining=deadline-time.monotonic()
+                              if remaining<=0: reason='deadline'; break
+                              try: block=blocks.get(timeout=min(0.2,remaining))
+                              except queue.Empty: continue
+                              if not block:
+                                  if code is None: reason='process_error'
+                                  break
+                              if output.tell()+len(block)>limit: reason='output_limit'; break
+                              output.write(block)
+                      except (OSError,ValueError,subprocess.SubprocessError): reason='process_error'
+                      finally:
+                          try: cleanup()
+                          except OSError: reason='cleanup_failed'
+                          if not cleanup_ok: reason='cleanup_failed'
+                          if child is not None:
+                              try: child.wait(timeout=10)
+                              except subprocess.SubprocessError: reason='cleanup_failed'
+                              child.stdin.close()
+                          stop.set()
+                          if write_fd is not None: os.close(write_fd); write_fd=None
+                          for thread in threads: thread.join(timeout=2)
+                          if any(thread.is_alive() for thread in threads): reason='cleanup_failed'
+                          if child is not None: child.stdout.close()
+                          os.close(read_fd)
+                      output.flush(); output.seek(0); captured=output.read(limit+1)
+                      if not stat.S_ISREG(os.fstat(output.fileno()).st_mode) or len(captured)>limit:
+                          reason='output_limit'; captured=b''
+              finally:
+                  if write_fd is not None: os.close(write_fd)
+              if errors: reason=reason or 'process_error'
+              # Parsing and scanning consume these same captured bytes, never a reopened path.
+              return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
           source='f9c3a3cfc42eb20ec57d754fd585e385453517ac'
-          assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
-          assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -193,8 +305,7 @@ jobs:
           # candidate process. Candidate output cannot authorize a new scanner.
           def scanner_intact():
               try:
-                  with (private/'verified-scanner-archive').open('rb') as saved:
-                      data=saved.read(32*1024*1024+1)
+                  data=regular_bytes(private/'verified-scanner-archive',32*1024*1024)
                   if len(data)>32*1024*1024 or hashlib.sha256(data).hexdigest()!=archive_digests[(os.environ['RUNNER_OS'],os.environ['RUNNER_ARCH'])]: return False
                   if os.name=='nt':
                       with zipfile.ZipFile(io.BytesIO(data)) as packaged:
@@ -206,13 +317,86 @@ jobs:
                           member=packaged.getmember('gitleaks')
                           if not member.isfile() or member.size>64*1024*1024: return False
                           expected=packaged.extractfile(member).read(64*1024*1024+1)
-                  with scanner.open('rb') as binary: actual=binary.read(64*1024*1024+1)
-                  with config.open('rb') as rules: fixed=rules.read(1024)
-                  with ignore.open('rb') as exclusions: empty=exclusions.read(1)
+                  actual=regular_bytes(scanner,64*1024*1024)
+                  fixed=regular_bytes(config,1024)
+                  empty=regular_bytes(ignore,0)
                   return (len(expected)<=64*1024*1024 and hashlib.sha256(actual).digest()==hashlib.sha256(expected).digest()
                       and fixed==b'[extend]\nuseDefault = true\n' and empty==b'')
               except Exception: return False
           config=private/'default.toml'; ignore=private/'empty.ignore'
+          # Anchor every tracked input to the immutable reviewed Git tree before execution.
+          # Compare content directly, without Git index stat caches, filters or ignore rules.
+          git_args=['git','--no-pager','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
+              '-c','core.attributesFile='+os.devnull,'-c','core.useReplaceRefs=false']
+          identity=bounded(git_args+['rev-parse','HEAD'],'execution-source-identity',15,4096)
+          listing=bounded(git_args+['ls-tree','-r','-l','-z',source],'execution-source-tree',15,1024*1024)
+          if (identity['reason'] or identity['code']!=0 or identity['captured'].strip()!=source.encode('ascii')
+              or listing['reason'] or listing['code']!=0):
+              print(json.dumps({'check':'tracked_input_integrity','status':'failed'})); raise SystemExit(1)
+          tracked=[]; total=0
+          for row in listing['captured'].split(b'\0'):
+              if not row: continue
+              header,raw_path=row.split(b'\t',1); mode,kind,blob,length=header.split()
+              path=pathlib.PurePosixPath(os.fsdecode(raw_path)); size=int(length)
+              if (mode not in (b'100644',b'100755') or kind!=b'blob' or path.is_absolute()
+                  or not path.parts or any(part in ('.','..') for part in path.parts)
+                  or size>32*1024*1024): raise SystemExit('tracked_input_shape_failed')
+              total+=size
+              if len(tracked)>=10000 or total>256*1024*1024: raise SystemExit('tracked_input_bound_failed')
+              tracked.append((path,mode,blob,size))
+          if not tracked: raise SystemExit('tracked_input_empty')
+          lock_digest='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
+          pinned_head=regular_bytes(workspace/'.git/HEAD',4096)
+          if pinned_head.strip()!=source.encode('ascii'): raise SystemExit('tracked_input_head_failed')
+          def tracked_intact():
+              try:
+                  if regular_bytes(workspace/'.git/HEAD',4096)!=pinned_head: return False
+                  if hashlib.sha256(regular_bytes(workspace/'Cargo.lock',1024*1024)).hexdigest()!=lock_digest: return False
+                  for path,mode,blob,size in tracked:
+                      parent=workspace
+                      for component in path.parts[:-1]:
+                          parent=parent/component; metadata=parent.lstat()
+                          if (not stat.S_ISDIR(metadata.st_mode)
+                              or getattr(metadata,'st_file_attributes',0)&0x400): return False
+                      file=workspace/path
+                      data=regular_bytes(file,size)
+                      if len(data)!=size: return False
+                      # Git's blob identity binds the direct bytes and size to the reviewed commit.
+                      if hashlib.sha1(b'blob '+str(size).encode('ascii')+b'\0'+data).hexdigest().encode('ascii')!=blob: return False
+                      if os.name!='nt' and bool(file.lstat().st_mode&stat.S_IXUSR)!=(mode==b'100755'): return False
+                  return True
+              except (OSError,ValueError): return False
+          if not tracked_intact():
+              print(json.dumps({'check':'tracked_input_integrity','status':'failed'})); raise SystemExit(1)
+          if not scanner_intact():
+              print(json.dumps({'check':'scanner_integrity','status':'failed'})); raise SystemExit(1)
+          # Retain independently verified scanner bytes in this owner process. Reconstruct
+          # controls only after command cleanup, in a fresh directory that did not exist
+          # during candidate execution. Explicitly scan one sealed regular file, not its
+          # candidate-writable original directory (which could inject .gitleaksignore).
+          scanner_bytes=regular_bytes(scanner,64*1024*1024)
+          def scan_captured(result,name):
+              with tempfile.TemporaryDirectory(prefix='morpheus-sealed-',dir=os.environ['RUNNER_TEMP']) as fresh:
+                  sealed=pathlib.Path(fresh); sealed.chmod(0o700)
+                  binary=sealed/scanner.name; rules=sealed/'default.toml'; exclusions=sealed/'empty.ignore'
+                  capture=sealed/'output.log'; report=sealed/'report.json'
+                  for path,data in ((binary,scanner_bytes),(rules,b'[extend]\nuseDefault = true\n'),
+                      (exclusions,b''),(capture,result['captured'])):
+                      with path.open('xb') as stream: stream.write(data)
+                      path.chmod(0o500 if path==binary else 0o400)
+                  if regular_bytes(capture,64*1024*1024)!=result['captured']: return False
+                  scanned=bounded([str(binary),'dir',str(capture),'--redact=100','--ignore-gitleaks-allow',
+                      '--no-banner','--max-target-megabytes','0','--config',str(rules),
+                      '--gitleaks-ignore-path',str(exclusions),'--report-format','json','--report-path',str(report)],
+                      name+'-scan',60,8*1024*1024,cwd=sealed)
+                  try:
+                      return (scanned['reason'] is None and scanned['code']==0
+                          and regular_bytes(capture,64*1024*1024)==result['captured']
+                          and regular_bytes(rules,1024)==b'[extend]\nuseDefault = true\n'
+                          and regular_bytes(exclusions,0)==b''
+                          and hashlib.sha256(regular_bytes(binary,64*1024*1024)).digest()==hashlib.sha256(scanner_bytes).digest()
+                          and json.loads(regular_bytes(report,8*1024*1024))==[])
+                  except (OSError,ValueError): return False
           # Failure-only closed diagnostics: emit known marker IDs and exact locked
           # package identities, never a server/build response, path or raw log line.
           import tomllib
@@ -277,25 +461,22 @@ jobs:
           # Stop at the first concrete failure; diagnose it before further native work.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
+              if not tracked_intact():
+                  print(json.dumps({'check':name,'status':'failed','reason':'tracked_input_integrity_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True)); raise SystemExit(1)
               result=bounded(args,name,seconds)
-              report=private/(name+'-scan.json')
-              if not scanner_intact():
-                  print(json.dumps({'check':name,'status':'failed','reason':'scanner_integrity_failed',
-                      'source':source,'raw_logs_public':False},sort_keys=True),flush=True)
-                  raise SystemExit(1)
-              scanned=bounded([str(scanner),'dir',str(result['log'].parent),
-                  '--redact=100','--ignore-gitleaks-allow','--no-banner','--max-target-megabytes','0',
-                  '--config',str(config),'--gitleaks-ignore-path',str(ignore),
-                  '--report-format','json','--report-path',str(report)],name+'-scan',60,8*1024*1024)
-              try:
-                  clean=(scanned['reason'] is None and scanned['code']==0
-                      and report.stat().st_size<=8*1024*1024 and json.loads(report.read_text(encoding='utf-8'))==[])
-              except (OSError,ValueError): clean=False
+              if result['reason']=='cleanup_failed':
+                  print(json.dumps({'check':name,'status':'failed','reason':'cleanup_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True)); raise SystemExit(1)
+              if not tracked_intact() or not scanner_intact():
+                  print(json.dumps({'check':name,'status':'failed','reason':'input_or_scanner_integrity_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True)); raise SystemExit(1)
+              clean=scan_captured(result,name)
               if not clean:
                   print(json.dumps({'check':name,'status':'failed','reason':'private_log_scan_failed',
                       'source':source,'raw_logs_public':False},sort_keys=True),flush=True)
                   raise SystemExit(1)
-              output=result['log'].read_text(encoding='utf-8',errors='replace')
+              output=result['captured'].decode('utf-8',errors='replace')
               passed=result['reason'] is None and result['code']==0
               record={'check':name,'status':'passed' if passed else 'failed','reason':result['reason'],
                   'source':source,'exit_code':result['code'],'log_bytes':result['bytes'],
@@ -325,25 +506,31 @@ jobs:
                   record['live_account_case_skipped']=True
               record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
               if not passed:
-                  # Only bounded compiler error excerpts from independently scanned output.
-                  # Expose bounded compiler errors after the independent full-output scan,
-                  # with controls/absolute runner paths removed. No raw log upload.
-                  diagnostics=[]
+                  # Compiler diagnostics leave this process only after the independent scan.
+                  # Exclude panic/assertion/authentication bodies. Keep compiler type-chain notes
+                  # needed to diagnose Send/Sync constraints, bounded to 4 KiB in total.
+                  diagnostics=[]; diagnostic_bytes=0
                   for line in output.splitlines():
-                      line=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
+                      line=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',line)
                       stripped=line.strip()
-                      if not (stripped.startswith(('error:', 'error[', 'Error:', 'error occurred', 'Caused by:',
-                          "process didn't exit successfully:", 'thread ', 'called `',
-                          'fatal error:', 'fatal runtime error:', 'note: run with',
-                          '--- stdout', '--- stderr', 'signal:', 'MORPHEUS_SLINT_CONST_REFERENCE'))
-                          or ('-->' in stripped and '.slint:' in stripped)
-                          or ('Unknown property' in stripped) or ('Unknown element' in stripped)
-                          or ('Cannot access' in stripped) or ('No such property' in stripped)):
-                          continue
-                      line=line.replace(str(workspace), '<candidate>').replace(str(private), '<private>')
+                      type_note=re.match(r'^(?:=\s*)?(?:note|help): (?:required (?:because|by)|within `|the trait |consider (?:removing|using|further)|future (?:created|is)|this (?:value|type))',stripped)
+                      source_span=re.match(r'^(?:-->|:::)\s+[^\r\n]{1,1000}\.(?:rs|slint):[0-9]{1,7}:[0-9]{1,5}',stripped)
+                      compiler_error=re.match(r'^error(?:\[E[0-9]{4}\])?: (?:could not compile|aborting|failed to run custom build command|cannot|expected|unexpected|unresolved|unknown|Unknown|No such|Cannot|invalid|unterminated|mismatched|attribute|proc macro|item|recursion|reached|linking)',stripped)
+                      coded_error=re.match(r'^error\[E[0-9]{4}\]: ',stripped)
+                      if not (compiler_error or coded_error or stripped.startswith(('fatal error:',
+                          'MORPHEUS_SLINT_CONST_REFERENCE')) or type_note or source_span
+                          or 'Unknown property' in stripped or 'Unknown element' in stripped
+                          or 'Cannot access' in stripped or 'No such property' in stripped): continue
+                      for value in sorted({str(workspace),str(private),os.environ.get('RUNNER_TEMP',''),
+                          environment.get('HOME',''),environment.get('USERPROFILE',''),
+                          environment.get('CARGO_HOME',''),environment.get('RUSTUP_HOME','')},key=len,reverse=True):
+                          if value: line=line.replace(value,'<runner>')
+                      line=re.sub(r"(?i)[a-z]:[\\/][^\s'\"`<>]+",'<runner-path>',line)
+                      line=re.sub(r"(?<![A-Za-z0-9_.>])/(?:[^\s'\"`<>]+)",'<runner-path>',line)
                       line=''.join(ch for ch in line if ord(ch)>=32 and ord(ch)!=127)[:1000]
-                      diagnostics.append(line)
-                      if len(diagnostics)>=32: break
+                      encoded=line.encode('utf-8')
+                      if diagnostic_bytes+len(encoded)>4096 or len(diagnostics)>=32: break
+                      diagnostics.append(line); diagnostic_bytes+=len(encoded)
                   record['compiler_diagnostics']=diagnostics
                   crates=set(re.findall(r"failed to run custom build command for `([A-Za-z0-9_-]+) v([0-9][A-Za-z0-9.+_-]*)`",output))
                   # Only fixed tool families and package names from the reviewed lock
@@ -421,6 +608,12 @@ jobs:
                       'crates/morpheus-app/ui/pinned-messages.slint',
                       'crates/morpheus-matrix/src/lib.rs',
                       'crates/morpheus-matrix/src/pinned_messages.rs')
+                  # All current Rust/Slint files in the reviewed tracked source tree,
+                  # including theme_studio/{mod,fonts,packs}.rs and new compiled modules.
+                  source_files=tuple(sorted(set(source_files)|{str(path) for path,_mode,_blob,_size in tracked
+                      if str(path).startswith(('crates/morpheus-app/src/','crates/morpheus-app/ui/',
+                          'crates/morpheus-config/src/','crates/morpheus-matrix/src/','crates/morpheus-rtc/src/'))
+                      and path.suffix in ('.rs','.slint')}))
                   locations=[]; public_identifiers=set()
                   for path in source_files:
                       file=workspace/path
