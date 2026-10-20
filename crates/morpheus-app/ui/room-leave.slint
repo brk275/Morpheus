@@ -53,10 +53,14 @@ export component RoomLeaveDialog inherits Rectangle {
     accessible-role: region;
     accessible-label: "Leave room " + root.shown-name;
     changed stage => {
-        if root.can-close {
-            first.focus();
-        } else {
-            keys.focus();
+        // Closing also resets the stage. A closing dialog must not take
+        // focus back from the control that opened it.
+        if root.view.open {
+            if root.can-close {
+                first.focus();
+            } else {
+                keys.focus();
+            }
         }
     }
     TouchArea {

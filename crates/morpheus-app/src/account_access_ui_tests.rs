@@ -1762,7 +1762,7 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     slint::spawn_local(async move {
         let started = std::time::Instant::now();
         let phase = std::rc::Rc::new(AccountUiProgress::new(started));
-        // The original fourteen-scenario budget now covers 44 transitions,
+        // The original fourteen-scenario budget now covers 45 transitions,
         // including the thread browser and room leave. Keep a finite three-minute
         // whole budget and a separate phase cap that catches one stall sooner.
         let outcome = tokio::select! {
@@ -4291,6 +4291,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     phase.set(89);
     crate::thread_browser::register(&ui, live.clone(), runtime.clone());
     crate::thread_browser::tests::assert_thread_browser_panel(&ui, &live, &runtime).await;
+    phase.set(92);
+    assert_responsive_header(&ui).await;
     #[cfg(feature = "native-calls")]
     crate::incoming_ring::ui::assert_answered_call_withdraws_leave(&ui).await;
     #[cfg(feature = "native-calls")]
@@ -7487,6 +7489,845 @@ async fn assert_room_notification_panel(ui: &AppWindow) {
     ui.set_live_session(live);
     ui.set_active_account_local_id(account);
     ui.set_active_room_id(room);
+    settle(ui).await;
+}
+
+const HEADER_MORE: &str = "More room actions";
+const HEADER_MENU: &str = "Room actions that do not fit";
+const HEADER_ROOM: &str = "A long synthetic room name that the responsive header keeps readable";
+const HEADER_TOPIC: &str = "A synthetic topic that gives way before the room name";
+const HEADER_LEAVE: &str = "Leave this room…";
+
+/// The eight header actions that may fold, in header order, with the labels
+/// the header gives them now.
+fn header_foldable_labels(ui: &AppWindow) -> Vec<String> {
+    let muted = ui
+        .global::<crate::RoomNotificationState>()
+        .get_header_muted();
+    let transfers = ui.get_transfer_active_count();
+    vec![
+        if muted {
+            "Room notifications, muted"
+        } else {
+            "Room notifications"
+        }
+        .to_owned(),
+        "Edit room settings".to_owned(),
+        "Show pinned messages".to_owned(),
+        "Browse threads in this room".to_owned(),
+        "Browse this room's media".to_owned(),
+        if transfers > 0 {
+            format!("Show transfers, {transfers} in progress")
+        } else {
+            "Show transfers".to_owned()
+        },
+        "Open current room call stage".to_owned(),
+        if ui.get_show_side_panel() {
+            "Hide details panel"
+        } else {
+            "Show details panel"
+        }
+        .to_owned(),
+    ]
+}
+
+fn header_organize_label(ui: &AppWindow) -> String {
+    let state = ui.global::<crate::RoomOrganizationState>();
+    let suffix = if state.get_active_favourite() {
+        ", in Favorites"
+    } else if state.get_active_low_priority() {
+        ", low priority"
+    } else {
+        ""
+    };
+    format!("Organize {}{suffix}", ui.get_active_room_name())
+}
+
+fn bounds_within(inner: Bounds, outer: Bounds) -> bool {
+    inner.left >= outer.left - 0.5
+        && inner.right <= outer.right + 0.5
+        && inner.top >= outer.top - 0.5
+        && inner.bottom <= outer.bottom + 0.5
+}
+
+/// The items on the conversation header's row: centred on the room name and
+/// clear of the details pane, whose tabs reuse some labels.
+fn on_header_row(ui: &AppWindow, items: Vec<Bounds>) -> Vec<Bounds> {
+    let name = control_bounds(ui, &format!("Current room: {}", ui.get_active_room_name()));
+    assert_eq!(name.len(), 1, "one room name in the header");
+    let centre = (name[0].top + name[0].bottom) / 2.0;
+    let details = control_bounds(ui, "Conversation details");
+    items
+        .into_iter()
+        .filter(|item| ((item.top + item.bottom) / 2.0 - centre).abs() < 1.0)
+        .filter(|item| {
+            !details
+                .iter()
+                .any(|pane| item.right > pane.left + 0.5 && item.left < pane.right - 0.5)
+        })
+        .collect()
+}
+
+fn header_buttons(ui: &AppWindow, label: &str) -> Vec<Bounds> {
+    on_header_row(ui, button_bounds(ui, label))
+}
+
+/// Buttons labelled `label` in the open "More room actions" menu.
+fn header_menu_buttons(ui: &AppWindow, label: &str) -> Vec<Bounds> {
+    let menus = control_bounds(ui, HEADER_MENU);
+    button_bounds(ui, label)
+        .into_iter()
+        .filter(|item| menus.iter().any(|menu| bounds_within(*item, *menu)))
+        .collect()
+}
+
+/// One real pointer click at the centre of drawn bounds.
+fn click_bounds(ui: &AppWindow, bounds: Bounds) {
+    let position = slint::LogicalPosition::new(
+        (bounds.left + bounds.right) / 2.0,
+        (bounds.top + bounds.bottom) / 2.0,
+    );
+    assert!(
+        inside_window(ui, bounds),
+        "click inside the window: {bounds:?}"
+    );
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position,
+        button: slint::platform::PointerEventButton::Left,
+    });
+}
+
+/// The header row as drawn: a readable room name, then Organization, the
+/// drawn foldable actions with Search and More, each at most once, in header
+/// order, apart, inside the window and within the conversation canvas (never
+/// under the details pane). Returns the labels of the foldable actions drawn.
+fn assert_header_row(ui: &AppWindow, case: &str) -> Vec<String> {
+    let scale = ui.get_font_scale_percent() as f32 / 100.0;
+    let name = control_bounds(ui, &format!("Current room: {}", ui.get_active_room_name()))[0];
+    assert!(inside_window(ui, name), "{case}: room name {name:?}");
+    assert!(
+        name.right - name.left >= 48.0 * scale - 0.5,
+        "{case}: the room name stays readable: {name:?}"
+    );
+    let labels = header_foldable_labels(ui);
+    let mut row = vec![header_organize_label(ui)];
+    row.extend(labels[..2].iter().cloned());
+    // Leave sits between room settings and Search while it is shown.
+    row.push(HEADER_LEAVE.to_owned());
+    row.push("Search messages".to_owned());
+    row.extend(labels[2..].iter().cloned());
+    row.push(HEADER_MORE.to_owned());
+    let mut previous = name;
+    let mut shown = Vec::new();
+    for label in &row {
+        let drawn = header_buttons(ui, label);
+        assert!(drawn.len() <= 1, "{case}: {label} is drawn once");
+        let Some(&bounds) = drawn.first() else {
+            continue;
+        };
+        assert!(inside_window(ui, bounds), "{case}: {label} {bounds:?}");
+        assert!(
+            bounds.left >= previous.right - 0.5,
+            "{case}: {label} {bounds:?} after {previous:?}"
+        );
+        if labels.contains(label) {
+            shown.push(label.clone());
+        }
+        previous = bounds;
+    }
+    for fixed in [header_organize_label(ui), "Search messages".to_owned()] {
+        assert_eq!(
+            header_buttons(ui, &fixed).len(),
+            1,
+            "{case}: {fixed} never folds"
+        );
+    }
+    // The canvas starts 24 px, the glyph and an 11 px gap before the name and
+    // keeps a 16 px edge: the row ends inside it.
+    let canvas = ui.get_pane_conversation_w();
+    assert!(
+        previous.right <= name.left - 51.0 + canvas + 0.5,
+        "{case}: the row {previous:?} ends inside the {canvas} px canvas from {name:?}"
+    );
+    shown
+}
+
+async fn open_header_more(ui: &AppWindow) {
+    let more = header_buttons(ui, HEADER_MORE);
+    assert_eq!(more.len(), 1, "one More control");
+    click_bounds(ui, more[0]);
+    settle(ui).await;
+    // The first available item takes focus a tick after the menu exists.
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(2));
+    settle(ui).await;
+    assert!(ui.get_header_more_open(), "More opens its menu");
+}
+
+/// Phase 92: the conversation header at the width it actually has, with no
+/// account, core or network. Comfortable, every action is one click in the
+/// header. Cramped (the minimum window, 200 % text, the largest configured
+/// icons, an open details panel), Organization and Search stay, every other
+/// action is reachable exactly once, in the header or in one flat "More room
+/// actions" menu, and a menu item runs its icon's action after the menu has
+/// closed. Folding while focused moves focus to More without acting; Escape
+/// and every context change close the menu.
+async fn assert_responsive_header(ui: &AppWindow) {
+    use slint::private_unstable_api::re_exports::AccessibilityAction;
+    use std::{cell::Cell, rc::Rc};
+
+    let tokens = ui.global::<crate::StyleTokens>();
+    let threads = ui.global::<crate::ThreadBrowser>();
+    let before = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_show_sign_in(),
+        ui.get_active_account_local_id(),
+        ui.get_active_room_id(),
+        ui.get_active_room_name(),
+        ui.get_active_room_topic(),
+        ui.get_show_side_panel(),
+        ui.get_side_panel_tab(),
+        ui.get_details_reveal_open(),
+        ui.get_font_scale_percent(),
+        ui.window().size(),
+        tokens.get_icon_size(),
+    );
+    ui.set_show_sign_in(false);
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("header-a".into());
+    ui.set_active_room_id("!header:example.org".into());
+    ui.set_active_room_name(HEADER_ROOM.into());
+    ui.set_active_room_topic(HEADER_TOPIC.into());
+    ui.set_show_side_panel(false);
+    ui.set_details_reveal_open(false);
+    ui.set_font_scale_percent(100);
+    tokens.set_icon_size(18.0);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    settle(ui).await;
+
+    // Comfortable: every action and the topic, one click each, no More.
+    assert!(ui.get_header_full());
+    assert_eq!(assert_header_row(ui, "comfortable").len(), 8);
+    assert!(header_buttons(ui, HEADER_MORE).is_empty());
+    assert_eq!(on_header_row(ui, control_bounds(ui, HEADER_TOPIC)).len(), 1);
+    let pins = header_buttons(ui, "Show pinned messages");
+    click_bounds(ui, pins[0]);
+    settle(ui).await;
+    assert!(ui.get_show_side_panel() && ui.get_side_panel_tab() == 3);
+    // Beside the open details panel with the largest configured icons the
+    // eleven actions no longer fit beside a readable name; the icons the
+    // vector icon phase draws there (room settings and the details panel)
+    // and Leave stay in the header.
+    tokens.set_icon_size(28.0);
+    settle(ui).await;
+    let shown = assert_header_row(ui, "beside details, large icons");
+    for label in ["Edit room settings", "Hide details panel"] {
+        assert!(
+            shown.contains(&label.to_owned()),
+            "{label} stays drawn beside details"
+        );
+    }
+    assert_eq!(header_buttons(ui, HEADER_LEAVE).len(), 1);
+    tokens.set_icon_size(18.0);
+
+    for (case, width, scale, icon, side) in [
+        ("minimum window", 640, 100, 18.0, false),
+        ("minimum window at 200 %", 640, 200, 18.0, false),
+        ("cramped pane, large icons", 1100, 100, 28.0, true),
+        ("cramped pane, large icons at 200 %", 1100, 200, 28.0, true),
+    ] {
+        ui.window().set_size(slint::PhysicalSize::new(width, 620));
+        ui.set_font_scale_percent(scale);
+        tokens.set_icon_size(icon);
+        ui.set_show_side_panel(side);
+        settle(ui).await;
+        settle(ui).await;
+        assert!(!ui.get_header_full(), "{case}: actions fold");
+        let shown = assert_header_row(ui, case);
+        assert_eq!(header_buttons(ui, HEADER_MORE).len(), 1, "{case}: one More");
+        assert_eq!(shown.len() as i32, ui.get_header_capacity(), "{case}");
+        assert!(on_header_row(ui, control_bounds(ui, HEADER_TOPIC)).is_empty());
+        let labels = header_foldable_labels(ui);
+        let folded: Vec<String> = labels
+            .iter()
+            .filter(|label| !shown.contains(label))
+            .cloned()
+            .collect();
+        assert!(
+            folded.contains(&"Edit room settings".to_owned()),
+            "{case}: settings folds first"
+        );
+        assert!(ui.get_header_leave_shown(), "{case}: Leave keeps its place");
+        assert_eq!(
+            header_buttons(ui, HEADER_LEAVE).len(),
+            1,
+            "{case}: Leave is drawn once"
+        );
+
+        open_header_more(ui).await;
+        let menu = control_bounds(ui, HEADER_MENU);
+        assert_eq!(menu.len(), 1, "{case}: one menu");
+        assert!(inside_window(ui, menu[0]), "{case}: menu {:?}", menu[0]);
+        for label in &labels {
+            let listed = header_menu_buttons(ui, label);
+            assert_eq!(
+                header_buttons(ui, label).len() + listed.len(),
+                1,
+                "{case}: {label} is reachable exactly once"
+            );
+            assert_eq!(
+                !listed.is_empty(),
+                folded.contains(label),
+                "{case}: {label} listed"
+            );
+            for item in listed {
+                assert!(inside_window(ui, item), "{case}: {label} {item:?}");
+            }
+        }
+        assert!(
+            header_menu_buttons(ui, HEADER_LEAVE).is_empty(),
+            "{case}: Leave not listed"
+        );
+        // Keyboard: the first listed action has focus; Down, End, Tab (which
+        // wraps inside the menu) and Backtab move through the listed ones.
+        let last = folded.last().unwrap();
+        assert!(
+            focused_control_has_label(ui, &folded[0]),
+            "{case}: first item"
+        );
+        key(ui, Key::DownArrow);
+        settle(ui).await;
+        assert!(focused_control_has_label(
+            ui,
+            &folded[1.min(folded.len() - 1)]
+        ));
+        key(ui, Key::End);
+        settle(ui).await;
+        assert!(focused_control_has_label(ui, last), "{case}: End");
+        key(ui, Key::Tab);
+        settle(ui).await;
+        assert!(
+            focused_control_has_label(ui, &folded[0]),
+            "{case}: Tab wraps"
+        );
+        key(ui, Key::Backtab);
+        settle(ui).await;
+        assert!(focused_control_has_label(ui, last), "{case}: Backtab wraps");
+        assert!(
+            !ui.invoke_dispatch_shortcut("p".into(), true, false, false, false),
+            "{case}: shortcuts pause while the menu is open"
+        );
+        assert!(!ui.get_quick_switcher_open());
+        // Escape closes it, focus back on More, nothing run.
+        let state = (
+            ui.get_page(),
+            ui.get_show_side_panel(),
+            ui.get_side_panel_tab(),
+        );
+        key(ui, Key::Escape);
+        settle(ui).await;
+        assert!(!ui.get_header_more_open(), "{case}: Escape closes");
+        assert!(control_bounds(ui, HEADER_MENU).is_empty());
+        assert!(
+            focused_control_has_label(ui, HEADER_MORE),
+            "{case}: focus on More"
+        );
+        assert_eq!(
+            state,
+            (
+                ui.get_page(),
+                ui.get_show_side_panel(),
+                ui.get_side_panel_tab()
+            )
+        );
+        // Return on More reopens it. A listed action runs as its icon does,
+        // after the menu has closed: pins and transfers keep their focus
+        // flags and details tabs (opening the panel only narrows the canvas,
+        // so what was folded stays folded).
+        key(ui, Key::Return);
+        settle(ui).await;
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(2));
+        settle(ui).await;
+        assert!(ui.get_header_more_open(), "{case}: Return opens");
+        let mut ran = 0;
+        for (label, tab) in [(&labels[2], 3), (&labels[5], 4)] {
+            if !folded.contains(label) {
+                continue;
+            }
+            if !ui.get_header_more_open() {
+                open_header_more(ui).await;
+            }
+            let item = header_menu_buttons(ui, label);
+            assert_eq!(item.len(), 1, "{case}: {label} is listed");
+            click_bounds(ui, item[0]);
+            settle(ui).await;
+            assert!(!ui.get_header_more_open(), "{case}: the menu closes first");
+            assert!(
+                ui.get_show_side_panel() && ui.get_side_panel_tab() == tab,
+                "{case}: {label}"
+            );
+            assert_eq!(ui.get_page(), 0);
+            ran += 1;
+        }
+        assert!(ran > 0, "{case}: a listed action ran from More");
+    }
+
+    // An action folded while focused hands focus to More and runs nothing;
+    // once nothing is folded, More hands it to Search.
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_font_scale_percent(100);
+    tokens.set_icon_size(18.0);
+    ui.set_show_side_panel(false);
+    settle(ui).await;
+    assert!(ui.get_header_full());
+    request_bridge_focus(ui, "Edit room settings");
+    let state = (
+        ui.get_page(),
+        ui.get_show_side_panel(),
+        ui.get_room_admin_open(),
+    );
+    ui.window().set_size(slint::PhysicalSize::new(640, 620));
+    settle(ui).await;
+    settle(ui).await;
+    assert!(!ui.get_header_full());
+    assert!(
+        focused_control_has_label(ui, HEADER_MORE),
+        "folded focus moves to More"
+    );
+    assert!(header_buttons(ui, "Edit room settings").is_empty());
+    assert!(!ui.get_header_more_open(), "folding opens nothing");
+    assert_eq!(
+        state,
+        (
+            ui.get_page(),
+            ui.get_show_side_panel(),
+            ui.get_room_admin_open()
+        )
+    );
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    settle(ui).await;
+    settle(ui).await;
+    assert!(ui.get_header_full());
+    assert!(
+        focused_control_has_label(ui, "Search messages"),
+        "then to Search"
+    );
+
+    // The thread browser's focus return reaches More while threads is folded.
+    ui.window().set_size(slint::PhysicalSize::new(640, 620));
+    ui.set_font_scale_percent(200);
+    settle(ui).await;
+    settle(ui).await;
+    assert!(header_buttons(ui, "Browse threads in this room").is_empty());
+    ui.invoke_focus_composer(false);
+    settle(ui).await;
+    threads.set_return_focus(threads.get_return_focus() + 1);
+    settle(ui).await;
+    assert!(
+        focused_control_has_label(ui, HEADER_MORE),
+        "thread return to More"
+    );
+
+    // The call stage from More: the menu closes, then the icon's protected
+    // withdraw and page change run.
+    open_header_more(ui).await;
+    let call = header_menu_buttons(ui, "Open current room call stage");
+    click_bounds(ui, call[0]);
+    settle(ui).await;
+    assert!(!ui.get_header_more_open());
+    assert_eq!(ui.get_page(), 2);
+    assert!(!threads.get_open());
+    ui.set_page(0);
+    settle(ui).await;
+
+    // The menu closes with its context: another page, account or room, a
+    // surface that owns the window, or sign-in; a blocked More cannot open.
+    for change in 0..5 {
+        ui.invoke_focus_composer(false);
+        settle(ui).await;
+        open_header_more(ui).await;
+        match change {
+            0 => ui.set_page(1),
+            1 => ui.set_active_account_local_id("header-b".into()),
+            2 => ui.set_active_room_id("!header-other:example.org".into()),
+            3 => ui.set_account_menu_open(true),
+            _ => ui.set_show_sign_in(true),
+        }
+        settle(ui).await;
+        assert!(
+            !ui.get_header_more_open(),
+            "context change {change} closes the menu"
+        );
+        assert!(control_bounds(ui, HEADER_MENU).is_empty());
+        if change == 1 || change == 2 {
+            assert!(
+                focused_control_has_label(ui, HEADER_MORE),
+                "change {change}"
+            );
+        }
+        if change == 3 {
+            request_bridge_focus(ui, HEADER_MORE);
+            key(ui, Key::Return);
+            settle(ui).await;
+            assert!(!ui.get_header_more_open(), "a blocked More stays closed");
+        }
+        ui.set_account_menu_open(false);
+        ui.set_show_sign_in(false);
+        ui.set_page(0);
+        ui.set_active_account_local_id("header-a".into());
+        ui.set_active_room_id("!header:example.org".into());
+        settle(ui).await;
+    }
+
+    // Opening More is a protected entry. Refused while another surface is
+    // up (a Leave dialog, the thread browser, a link card), it does nothing:
+    // that surface stays as it was and no Leave owner is withdrawn for More.
+    // The accessibility action is the same entry as a click or Return.
+    let leave = ui.global::<crate::RoomLeave>();
+    let resets = Rc::new(Cell::new(0));
+    let counted = resets.clone();
+    leave.on_reset(move || counted.set(counted.get() + 1));
+    let activate_more = |ui: &AppWindow| {
+        control_with_label(ui, HEADER_MORE).accessible_action(&AccessibilityAction::Default);
+    };
+    for surface in 0..3 {
+        match surface {
+            0 => leave.set_view(crate::RoomLeaveView {
+                open: true,
+                ..Default::default()
+            }),
+            1 => threads.set_open(true),
+            _ => ui.global::<crate::MatrixLink>().set_open(true),
+        }
+        settle(ui).await;
+        let before = resets.get();
+        activate_more(ui);
+        settle(ui).await;
+        assert!(!ui.get_header_more_open(), "surface {surface} refuses More");
+        assert_eq!(resets.get(), before, "a refused More withdraws nothing");
+        let kept = match surface {
+            0 => leave.get_view().open,
+            1 => threads.get_open(),
+            _ => crate::matrix_links::is_open(ui),
+        };
+        assert!(kept, "surface {surface} stays open after the refusal");
+        leave.set_view(crate::RoomLeaveView::default());
+        crate::thread_browser::clear(ui);
+        crate::matrix_links::clear(ui);
+        settle(ui).await;
+    }
+    // Admitted, it withdraws first: a joined link's message still to come
+    // and a Leave owner whose view already hid. While it is open links and
+    // the browser are held (a late admission ends for good) and Leave stays
+    // available in the menu; closing, even at once, revives nothing.
+    let follow_up = crate::matrix_links::tests::install_follow_up();
+    let before = resets.get();
+    activate_more(ui);
+    assert!(ui.get_header_more_open());
+    assert!(
+        follow_up.withdrawn(),
+        "More's entry ended the link's follow-up"
+    );
+    assert_eq!(
+        resets.get(),
+        before + 1,
+        "and withdrew a latent Leave owner"
+    );
+    settle(ui).await;
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(2));
+    settle(ui).await;
+    assert!(ui.get_matrix_link_blocked() && crate::thread_browser::held(ui));
+    assert!(
+        !ui.get_room_leave_blocked(),
+        "Leave's own admission is unchanged"
+    );
+    let late = crate::matrix_links::tests::install_follow_up();
+    assert!(!late.admits(ui), "no late navigation over the menu");
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!ui.get_header_more_open());
+    assert!(
+        !late.admits(ui) && follow_up.withdrawn(),
+        "closing revives nothing"
+    );
+    let quick = crate::matrix_links::tests::install_follow_up();
+    activate_more(ui);
+    activate_more(ui);
+    assert!(!ui.get_header_more_open() && quick.withdrawn());
+    settle(ui).await;
+    assert!(
+        !quick.admits(ui),
+        "an immediate open and close revives nothing"
+    );
+
+    // Leave folds into More only when the room name's shortest readable
+    // width leaves it no room (here icons far beyond the configured range).
+    // Its item keeps Leave's availability, withdraws before the dialog flag,
+    // opens the dialog once the menu has closed, and the dialog's end gives
+    // focus back to More.
+    let starts = Rc::new(Cell::new(0));
+    let started = starts.clone();
+    let weak = ui.as_weak();
+    leave.on_start(move || {
+        started.set(started.get() + 1);
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<crate::RoomLeave>()
+                .set_view(crate::RoomLeaveView {
+                    open: true,
+                    stage: 1,
+                    title: "Leave this room?".into(),
+                    name: HEADER_ROOM.into(),
+                    room_id: "!header:example.org".into(),
+                    ..Default::default()
+                });
+        }
+    });
+    let weak = ui.as_weak();
+    leave.on_close(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<crate::RoomLeave>()
+                .set_view(crate::RoomLeaveView::default());
+        }
+    });
+    tokens.set_icon_size(60.0);
+    settle(ui).await;
+    settle(ui).await;
+    assert!(!ui.get_header_leave_shown() && header_buttons(ui, HEADER_LEAVE).is_empty());
+    let _ = assert_header_row(ui, "Leave folded");
+    ui.set_live_session(false);
+    settle(ui).await;
+    ui.invoke_focus_composer(false);
+    settle(ui).await;
+    open_header_more(ui).await;
+    let item = header_menu_buttons(ui, HEADER_LEAVE);
+    assert_eq!(item.len(), 1, "an unavailable Leave is still listed");
+    click_bounds(ui, item[0]);
+    settle(ui).await;
+    assert!(
+        ui.get_header_more_open() && starts.get() == 0,
+        "and does nothing"
+    );
+    key(ui, Key::Escape);
+    settle(ui).await;
+    ui.set_live_session(true);
+    settle(ui).await;
+    let before = resets.get();
+    open_header_more(ui).await;
+    let item = header_menu_buttons(ui, HEADER_LEAVE);
+    assert_eq!(item.len(), 1, "Leave is listed once");
+    click_bounds(ui, item[0]);
+    settle(ui).await;
+    assert!(
+        !ui.get_header_more_open(),
+        "the menu closes before Leave starts"
+    );
+    assert!(leave.get_view().open && starts.get() == 1);
+    assert_eq!(
+        resets.get(),
+        before + 2,
+        "More's entry and Leave's own withdraw ran"
+    );
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!leave.get_view().open);
+    assert!(
+        focused_control_has_label(ui, HEADER_MORE),
+        "Leave gives focus back to More"
+    );
+    // The header owns the focus return of a dialog it opened. Opened from the
+    // drawn icon, then folded by a resize while the dialog has focus (28 px
+    // icons at 200 %, a 360 px canvas beside the revealed details panel),
+    // Escape returns focus to More. Opened from More and drawn again by the
+    // time it ends, focus returns to the Leave icon. A protected context that
+    // ends the dialog keeps its own focus, and nothing returns later.
+    tokens.set_icon_size(28.0);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.invoke_show_transfer_panel();
+    settle(ui).await;
+    settle(ui).await;
+    assert!(ui.get_header_leave_shown());
+    let icon = header_buttons(ui, HEADER_LEAVE);
+    assert_eq!(icon.len(), 1, "Leave is drawn beside the details panel");
+    click_bounds(ui, icon[0]);
+    settle(ui).await;
+    assert!(leave.get_view().open && !focused_control_has_label(ui, HEADER_LEAVE));
+    ui.window().set_size(slint::PhysicalSize::new(640, 620));
+    settle(ui).await;
+    settle(ui).await;
+    assert!(!ui.get_header_leave_shown() && header_buttons(ui, HEADER_LEAVE).is_empty());
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!leave.get_view().open);
+    assert!(
+        focused_control_has_label(ui, HEADER_MORE),
+        "the folded opener's return"
+    );
+    open_header_more(ui).await;
+    let item = header_menu_buttons(ui, HEADER_LEAVE);
+    assert_eq!(item.len(), 1, "the folded Leave is listed");
+    click_bounds(ui, item[0]);
+    settle(ui).await;
+    assert!(leave.get_view().open && !ui.get_header_more_open());
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    settle(ui).await;
+    settle(ui).await;
+    let icon = header_buttons(ui, HEADER_LEAVE);
+    assert_eq!(icon.len(), 1, "Leave is drawn again");
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!leave.get_view().open);
+    assert!(
+        focused_control_has_label(ui, HEADER_LEAVE),
+        "the drawn icon takes the return"
+    );
+    ui.invoke_focus_composer(false);
+    settle(ui).await;
+    click_bounds(ui, icon[0]);
+    settle(ui).await;
+    assert!(leave.get_view().open);
+    ui.set_show_sign_in(true);
+    settle(ui).await;
+    assert!(!leave.get_view().open, "sign-in ends the dialog");
+    for label in [HEADER_LEAVE, HEADER_MORE] {
+        assert!(
+            !focused_control_has_label(ui, label),
+            "sign-in keeps its focus"
+        );
+    }
+    ui.set_show_sign_in(false);
+    settle(ui).await;
+    assert!(
+        !focused_control_has_label(ui, HEADER_LEAVE),
+        "nothing returns later"
+    );
+    ui.window().set_size(slint::PhysicalSize::new(640, 620));
+    ui.set_show_side_panel(false);
+    settle(ui).await;
+    leave.on_start(|| {});
+    leave.on_close(|| {});
+    leave.on_reset(|| {});
+    leave.set_view(crate::RoomLeaveView::default());
+    tokens.set_icon_size(18.0);
+    settle(ui).await;
+    settle(ui).await;
+
+    // Without a live session the room actions are unavailable in the menu as
+    // in the header: a click on one neither acts nor closes the menu.
+    ui.set_show_side_panel(false);
+    ui.set_live_session(false);
+    settle(ui).await;
+    settle(ui).await;
+    if focused_control_has_label(ui, HEADER_MORE) {
+        key(ui, Key::Return);
+        settle(ui).await;
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(2));
+        settle(ui).await;
+    } else {
+        open_header_more(ui).await;
+    }
+    assert!(ui.get_header_more_open());
+    assert!(focused_control_has_label(
+        ui,
+        "Open current room call stage"
+    ));
+    let pins = header_menu_buttons(ui, "Show pinned messages");
+    assert_eq!(pins.len(), 1, "an unavailable action is still listed");
+    click_bounds(ui, pins[0]);
+    settle(ui).await;
+    assert!(ui.get_header_more_open() && !ui.get_show_side_panel());
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!ui.get_header_more_open());
+    assert!(focused_control_has_label(ui, HEADER_MORE));
+
+    // Signed out at a medium width the enabled call stage and details panel
+    // stay drawn and every folded action is unavailable. Opened by a click or
+    // by the accessibility action (focus elsewhere), the menu still lists
+    // them all, More holds focus, and Tab and Shift+Tab stay on More.
+    ui.window().set_size(slint::PhysicalSize::new(940, 620));
+    ui.set_font_scale_percent(100);
+    settle(ui).await;
+    settle(ui).await;
+    assert!(!ui.get_header_full() && ui.get_header_capacity() >= 4);
+    let shown = assert_header_row(ui, "signed out, medium width");
+    for drawn in ["Open current room call stage", "Show details panel"] {
+        assert!(shown.contains(&drawn.to_owned()), "{drawn} stays drawn");
+    }
+    let folded: Vec<String> = header_foldable_labels(ui)
+        .into_iter()
+        .filter(|label| !shown.contains(label))
+        .collect();
+    assert!(!folded.is_empty(), "actions fold at this width");
+    for by_click in [true, false] {
+        if by_click {
+            open_header_more(ui).await;
+        } else {
+            request_bridge_focus(ui, "Open current room call stage");
+            control_with_label(ui, HEADER_MORE).accessible_action(&AccessibilityAction::Default);
+            settle(ui).await;
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(2));
+            settle(ui).await;
+            assert!(
+                ui.get_header_more_open(),
+                "the accessibility action opens More"
+            );
+        }
+        assert!(
+            focused_control_has_label(ui, HEADER_MORE),
+            "More holds focus"
+        );
+        for label in &folded {
+            assert_eq!(
+                header_menu_buttons(ui, label).len(),
+                1,
+                "{label} stays listed"
+            );
+        }
+        for tab in [Key::Tab, Key::Backtab, Key::Tab] {
+            key(ui, tab);
+            settle(ui).await;
+            assert!(ui.get_header_more_open(), "Tab never leaves the open menu");
+            assert!(
+                focused_control_has_label(ui, HEADER_MORE),
+                "focus stays on More"
+            );
+        }
+        key(ui, Key::Escape);
+        settle(ui).await;
+        assert!(!ui.get_header_more_open() && focused_control_has_label(ui, HEADER_MORE));
+    }
+
+    let (page, live, sign_in, account, room, name, topic, side, tab, reveal, scale, size, icon) =
+        before;
+    tokens.set_icon_size(icon);
+    ui.set_font_scale_percent(scale);
+    ui.window().set_size(size);
+    ui.set_active_account_local_id(account);
+    ui.set_active_room_id(room);
+    ui.set_active_room_name(name);
+    ui.set_active_room_topic(topic);
+    ui.set_live_session(live);
+    match tab {
+        0 => ui.invoke_show_members_panel(),
+        1 => ui.invoke_show_thread_panel(),
+        2 => ui.invoke_focus_room_search(),
+        3 => ui.invoke_show_pinned_panel(),
+        4 => ui.invoke_show_transfer_panel(),
+        5 => ui.invoke_show_room_media(),
+        _ => panic!("unexpected details tab"),
+    }
+    ui.set_page(page);
+    ui.set_show_side_panel(side);
+    ui.set_details_reveal_open(reveal);
+    ui.set_show_sign_in(sign_in);
+    ui.invoke_focus_composer(false);
     settle(ui).await;
 }
 

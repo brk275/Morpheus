@@ -293,6 +293,19 @@ modes and misspelled fields reject the edit. Settings and file changes use the
 same live-reload path; an invalid edit retains the last valid appearance.
 Appearance starting points preserve this independent choice.
 
+The header lays out from the width the conversation pane actually has, beside
+the details panel and the other panes. When not every action fits (a small
+window, large text, a large `icon_size` or an open details panel), the room
+name keeps a readable width, the topic gives way first, and the lower-priority
+actions move into one **More room actions** menu at the end of the header, in
+their header order. Room organization and Search always stay in the header,
+and **Leave this room…** stays while the room name keeps its shortest readable
+width beside it. Each menu item is the same action, with the same label, state
+and availability; an unavailable one is listed greyed out. The menu closes
+before an action runs. Up, Down, Home and End move through the available
+items, Tab stays in the menu, and Escape closes it and returns focus to More.
+More does not open while another panel or dialog owns the window.
+
 All modes retain the active room name, room settings/search/call/details
 controls, call notices, voice-room controls, status and error messages. The
 complete room topic remains available in Room settings. This setting affects

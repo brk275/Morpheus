@@ -355,6 +355,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || ui.get_show_sign_in()
         || ui.get_page() == 1
         || ui.get_account_menu_open()
+        || ui.get_header_more_open()
         || ui.get_manage_accounts_open()
         || ui.get_access_open()
         || ui.get_room_actions_open()

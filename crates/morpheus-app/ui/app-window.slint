@@ -694,6 +694,72 @@ component IconAction inherits Rectangle {
     }
 }
 
+// One item of the conversation header's "More room actions" menu: a header
+// action that does not fit, with the same icon, label, selected state and
+// availability as its icon. The menu moves focus by slot (focus-target and
+// focus-serial), since its items live in conditional subtrees.
+component HeaderMoreItem inherits ActionRect {
+    in property <string> icon;
+    in property <bool> selected: false;
+    in property <color> ink;
+    in property <color> icon-ink;
+    in property <color> muted;
+    in property <color> hover-surface;
+    in property <float> text-scale: 1;
+    in property <int> density-mode: 1;
+    in property <int> slot: -1;
+    in property <int> focus-target: -1;
+    in property <int> focus-serial: 0;
+    changed focus-serial => {
+        if root.focus-target == root.slot { root.focus(); }
+    }
+    property <color> disabled-ink: StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.muted;
+    // Disabled, then selected, then the caller's ink, as IconAction draws.
+    property <color> glyph-ink: !root.enabled ? root.disabled-ink
+        : root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.icon-ink;
+    property <color> text-ink: !root.enabled ? root.disabled-ink
+        : root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+    height: max(root.density-mode == 0 ? 32px : root.density-mode == 2 ? 42px : 36px, 24px * root.text-scale + 12px);
+    border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8;
+    background: root.selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface) : transparent;
+    focus-color: root.ink;
+    cancel-on-escape: true;
+    trap-tab: true;
+    HoverSurface {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        visible: !root.selected;
+        highlighted: root.enabled && root.has-hover;
+        background: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface;
+    }
+    Rectangle {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        background: root.enabled && root.has-pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent;
+    }
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 9px;
+        VerticalLayout {
+            alignment: center;
+            MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: root.icon; ink: root.glyph-ink; }
+        }
+        Text {
+            text: root.label;
+            color: root.text-ink;
+            font-size: 12px * root.text-scale;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            min-width: 0px;
+            overflow: elide;
+            accessible-role: none;
+        }
+        if root.selected : VerticalLayout {
+            alignment: center;
+            MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "check"; ink: root.glyph-ink; }
+        }
+    }
+}
+
 // The same row renders grouped and combined navigation. `direct` is carried
 // from the originating model, never guessed from the display name or icon.
 component NavigationRoomRow inherits ActionRect {
@@ -4662,6 +4728,304 @@ export component AppWindow inherits Window {
         }
     }
 
+    // The conversation header (page 0) at the width it actually has: the main
+    // canvas beside the details panel, whatever the pane order, details side
+    // and window size, with the configured icon button size and text scale.
+    // When its actions do not all fit, the lower-priority ones fold into ONE
+    // flat "More room actions" menu, in their header order. Organization (the
+    // room's star, itself a menu) and Search never fold, and Leave stays while
+    // the room name keeps its shortest readable width beside it. The room name
+    // keeps a readable width; the topic gives way first. An action runs the
+    // same way as an icon or as a More item, with the same guard, label and
+    // state.
+    //
+    // Slots: 0 notifications, 1 room settings, 2 pins, 3 threads, 4 media,
+    // 5 transfers, 6 call stage, 7 details panel, and 8 Leave, which is drawn
+    // between room settings and Search (header-menu-slot gives the order on
+    // screen and in the menu). The widths come from the canvas and the
+    // measured texts, never from the header's own layout, so nothing binds to
+    // itself.
+    property <length> header-width: main-area.width - main-area.panel-width;
+    // One action and its gap in the header row (spacing 11 px).
+    property <length> header-slot: StyleTokens.icon-button-size + 11px;
+    property <length> header-glyph: header-glyph-probe.preferred-width;
+    property <length> header-name-wanted: header-name-probe.preferred-width;
+    // While every action fits, the name keeps at least a short readable start;
+    // once actions fold, it keeps a longer one (within what the row has left
+    // after the glyph and the actions that do not fold).
+    property <length> header-name-floor: min(root.header-name-wanted, 48px * root.text-scale);
+    // Every action, the divider and the topic's place fit: no More menu. The
+    // row is the 40 px padding, the glyph, the name, eleven actions and their
+    // gaps (and, unless the header is minimal, the divider with its gaps).
+    out property <bool> header-full: root.header-width >= (root.conversation-header-mode == 2 ? 51px : 74px)
+        + root.header-glyph + root.header-name-floor + 11 * root.header-slot;
+    // Leave stays beside Organization, Search and More while the name keeps
+    // its floor; only a pane too narrow for that folds it.
+    out property <bool> header-leave-shown: root.header-full
+        || root.header-width - 51px - root.header-glyph - root.header-name-floor >= 4 * root.header-slot;
+    // The actions that do not fold now: Organization, Search, More, and Leave
+    // while it is shown.
+    property <int> header-fixed: root.header-leave-shown ? 4 : 3;
+    property <length> header-name-reserve: max(0px, min(min(root.header-name-wanted, 112px * root.text-scale),
+        root.header-width - 51px - root.header-glyph - root.header-fixed * root.header-slot));
+    property <length> header-name-min: root.header-full ? root.header-name-floor : root.header-name-reserve;
+    // How many of slots 0-7 stay in the header (by header-rank).
+    out property <int> header-capacity: root.header-full ? 8
+        : max(0, min(7, floor((root.header-width - 51px - root.header-glyph - root.header-name-reserve) / root.header-slot) - root.header-fixed));
+    out property <bool> header-overflow: root.page == 0 && !root.header-full;
+    // The foldable action that has keyboard focus, or -1.
+    property <int> header-focus: -1;
+    out property <bool> header-more-open: false;
+    property <int> header-search-focus-request: 0;
+    // Which of slots 0-7 fold last: the details panel, then notifications,
+    // room settings, the call stage, threads, pins, media; transfers fold
+    // first.
+    pure function header-rank(slot: int) -> int {
+        slot == 7 ? 0 : slot == 0 ? 1 : slot == 1 ? 2 : slot == 6 ? 3 : slot == 3 ? 4 : slot == 2 ? 5 : slot == 4 ? 6 : 7
+    }
+    pure function header-fits(slot: int) -> bool {
+        slot == 8 ? root.header-leave-shown : root.header-rank(slot) < root.header-capacity
+    }
+    // Drawn in the header, else listed in More. A focused action stays until
+    // focus has moved to More (changed header-layout), so folding never
+    // drops focus and never acts.
+    pure function header-shows(slot: int) -> bool {
+        root.header-fits(slot) || root.header-focus == slot
+    }
+    pure function header-icon(slot: int) -> string {
+        slot == 0 ? (RoomNotificationState.header-muted ? "notifications-off" : "notifications")
+            : slot == 1 ? "settings" : slot == 2 ? "pin" : slot == 3 ? "thread" : slot == 4 ? "media"
+            : slot == 5 ? "transfers" : slot == 6 ? "calls" : slot == 7 ? "details-panel" : "log-out"
+    }
+    pure function header-label(slot: int) -> string {
+        slot == 0 ? (RoomNotificationState.header-muted ? "Room notifications, muted" : "Room notifications")
+            : slot == 1 ? "Edit room settings" : slot == 2 ? "Show pinned messages"
+            : slot == 3 ? "Browse threads in this room" : slot == 4 ? "Browse this room's media"
+            : slot == 5 ? (root.transfer-active-count > 0 ? "Show transfers, " + root.transfer-active-count + " in progress" : "Show transfers")
+            : slot == 6 ? "Open current room call stage"
+            : slot == 7 ? (root.show-side-panel ? "Hide details panel" : "Show details panel")
+            : "Leave this room…"
+    }
+    pure function header-selected(slot: int) -> bool {
+        slot == 0 ? root.room-notifications-current
+            : slot == 2 ? root.show-side-panel && root.side-panel-tab == 3
+            : slot == 3 ? ThreadBrowser.open
+            : slot == 4 ? root.room-media-visible
+            : slot == 5 ? root.show-side-panel && root.side-panel-tab == 4
+            : slot == 7 ? root.show-side-panel
+            : false
+    }
+    pure function header-enabled(slot: int) -> bool {
+        slot == 8 ? root.live-session && root.active-room-id != "" && !root.room-leave-blocked
+            : slot <= 4 ? root.live-session && root.active-room-id != "" : slot == 5 ? root.live-session : true
+    }
+    // The header opened Leave (its drawn icon or its More item) and owns the
+    // focus return when the dialog ends. Root state, so the return survives
+    // the icon folding (and its subtree going) while the dialog is open.
+    property <bool> header-leave-returns: false;
+    // Asks the drawn Leave icon to take focus.
+    property <int> header-leave-focus-request: 0;
+    // Every foldable header action as a More item, and slots 0-7 as icons too:
+    // the same callback, guard and focus flags. The call stage keeps its
+    // protected withdraw of a Matrix link and the thread browser; Leave keeps
+    // its admission, withdraws and start (its icon runs the same statements).
+    function header-action(slot: int) {
+        if root.page != 0 || !root.header-enabled(slot) {
+            return;
+        }
+        if slot == 0 {
+            RoomNotificationState.request-open(root.active-account-local-id, root.active-room-id);
+        } else if slot == 1 {
+            root.open-room-settings();
+        } else if slot == 2 {
+            if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
+            root.show-side-panel = true;
+            root.side-panel-tab = 3;
+        } else if slot == 3 {
+            if !RoomLeave.view.open { ThreadBrowser.show(); }
+        } else if slot == 4 {
+            root.show-room-media();
+        } else if slot == 5 {
+            root.show-transfer-panel();
+        } else if slot == 6 {
+            if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2;
+        } else if slot == 7 {
+            root.set-side-panel(!root.show-side-panel);
+        } else if slot == 8 {
+            // Withdraw held link navigation before the dialog flag.
+            if root.room-leave-blocked || RoomLeave.view.open { return; }
+            MatrixLink.withdraw();
+            ThreadBrowser.withdraw();
+            RoomLeave.start();
+            root.header-leave-returns = RoomLeave.view.open;
+        }
+    }
+    function header-focus-changed(slot: int, focused: bool) {
+        if focused {
+            root.header-focus = slot;
+        } else if root.header-focus == slot {
+            root.header-focus = -1;
+        }
+    }
+    // More, or Search once nothing is folded.
+    function focus-header-more() {
+        if root.header-overflow { header-more.focus(); } else { root.header-search-focus-request += 1; }
+    }
+    // More may open, and stay open, only on the conversation page while no
+    // other surface owns the window: the complete list Leave admission uses
+    // (room-leave-blocked, which includes the thread browser), an open Leave
+    // and a shown Matrix link card. Refused, More does nothing at all: a
+    // surface that is up keeps what it shows and holds.
+    property <bool> header-more-allowed: root.page == 0 && !root.room-leave-blocked && !RoomLeave.view.open && !MatrixLink.open;
+    // The only way More opens (its own activation: click, Return/Space or
+    // the accessibility action). Admitted, it is a protected entry: before its
+    // flag changes, a Matrix link's held navigation (a joined link's message
+    // still to come), the thread browser's work and a Leave owner that no
+    // longer shows are withdrawn synchronously, so nothing joins, reveals or
+    // comes back once the menu has taken the window or closed again.
+    function toggle-header-more() {
+        if root.header-more-open {
+            root.close-header-more(true);
+        } else if root.header-more-allowed && root.header-overflow {
+            MatrixLink.withdraw();
+            ThreadBrowser.withdraw();
+            root.header-more-open = true;
+        }
+    }
+    function close-header-more(refocus: bool) {
+        if root.header-more-open {
+            root.header-more-open = false;
+            root.header-menu-current = -1;
+            if refocus { root.focus-header-more(); }
+        }
+    }
+    // Keyboard focus inside the More menu, by slot. Its items live in
+    // conditional subtrees, so each one focuses itself on a new serial.
+    property <int> header-menu-target: -1;
+    property <int> header-menu-serial: 0;
+    // The More item that has keyboard focus, or -1.
+    property <int> header-menu-current: -1;
+    // The slot at a position on screen and in the menu (0-8), and back.
+    pure function header-menu-slot(position: int) -> int {
+        position <= 1 ? position : position == 2 ? 8 : position - 1
+    }
+    pure function header-menu-position(slot: int) -> int {
+        slot <= 1 ? slot : slot == 8 ? 2 : slot + 1
+    }
+    // Listed in More and available now.
+    pure function header-listed(slot: int) -> bool {
+        !root.header-shows(slot) && root.header-enabled(slot)
+    }
+    // The slot of the next listed, available item after menu position `from`
+    // (step 1) or before it (step 8), wrapping; -1 when there is none.
+    pure function header-menu-step(from: int, step: int) -> int {
+        let first = mod(from + step, 9);
+        let second = mod(first + step, 9);
+        let third = mod(second + step, 9);
+        let fourth = mod(third + step, 9);
+        let fifth = mod(fourth + step, 9);
+        let sixth = mod(fifth + step, 9);
+        let seventh = mod(sixth + step, 9);
+        let eighth = mod(seventh + step, 9);
+        let ninth = mod(eighth + step, 9);
+        return root.header-listed(root.header-menu-slot(first)) ? root.header-menu-slot(first)
+            : root.header-listed(root.header-menu-slot(second)) ? root.header-menu-slot(second)
+            : root.header-listed(root.header-menu-slot(third)) ? root.header-menu-slot(third)
+            : root.header-listed(root.header-menu-slot(fourth)) ? root.header-menu-slot(fourth)
+            : root.header-listed(root.header-menu-slot(fifth)) ? root.header-menu-slot(fifth)
+            : root.header-listed(root.header-menu-slot(sixth)) ? root.header-menu-slot(sixth)
+            : root.header-listed(root.header-menu-slot(seventh)) ? root.header-menu-slot(seventh)
+            : root.header-listed(root.header-menu-slot(eighth)) ? root.header-menu-slot(eighth)
+            : root.header-listed(root.header-menu-slot(ninth)) ? root.header-menu-slot(ninth) : -1;
+    }
+    function focus-header-menu(slot: int) {
+        if slot >= 0 {
+            root.header-menu-target = slot;
+            root.header-menu-serial += 1;
+        }
+    }
+    // As the menu opens its first available item takes focus. With every
+    // listed action unavailable More itself holds it (the menu may have been
+    // opened by the accessibility action, with focus elsewhere).
+    function focus-header-menu-first() {
+        let first = root.header-menu-step(8, 1);
+        if first >= 0 {
+            root.focus-header-menu(first);
+        } else if root.header-more-open {
+            header-more.focus();
+        }
+    }
+    // From the focused item; from nothing, Down goes to the first and Up to
+    // the last.
+    function header-menu-move(step: int) {
+        let from = root.header-menu-current >= 0 ? root.header-menu-position(root.header-menu-current) : step == 1 ? 8 : 0;
+        root.focus-header-menu(root.header-menu-step(from, step));
+    }
+    function header-menu-focus-changed(slot: int, focused: bool) {
+        if focused {
+            root.header-menu-current = slot;
+        } else if root.header-menu-current == slot {
+            root.header-menu-current = -1;
+        }
+    }
+    // A More item: the menu closes and focus is back on More first; then the
+    // action runs exactly as its icon does (it may move focus on).
+    function choose-header-more(slot: int) {
+        root.close-header-more(true);
+        root.header-action(slot);
+    }
+    changed header-more-allowed => {
+        if !root.header-more-allowed { root.close-header-more(false); }
+    }
+    // A width change retires the menu (focus back on More, or Search) and an
+    // action folded while focused hands focus to More without acting.
+    property <int> header-layout: root.header-capacity * 2 + (root.header-leave-shown ? 1 : 0);
+    changed header-layout => {
+        let folded = root.header-focus >= 0 && !root.header-fits(root.header-focus);
+        if root.header-more-open {
+            root.close-header-more(true);
+        } else if folded || (root.header-full && header-more.has-focus) {
+            root.focus-header-more();
+        }
+        if folded { root.header-focus = -1; }
+    }
+    // Another account or room: the menu was shown for the old one.
+    property <string> header-room-context: root.active-account-local-id + "\n" + root.active-room-id;
+    changed header-room-context => { root.close-header-more(true); }
+    // Leaving the conversation page drops the folded state with the header.
+    property <bool> header-on-page: root.page == 0;
+    changed header-on-page => {
+        root.header-focus = -1;
+        root.close-header-more(false);
+    }
+    // A panel opened from a folded action gives focus back to More, under
+    // the same condition as the action's own icon.
+    changed room-notification-focus-request => {
+        if root.page == 0 && !root.header-shows(0) { root.focus-header-more(); }
+    }
+    property <int> header-thread-return: ThreadBrowser.return-focus;
+    changed header-thread-return => {
+        if root.page == 0 && !root.header-shows(3) { root.focus-header-more(); }
+    }
+    // Leave's dialog ended: whichever header control opened it, focus goes to
+    // the Leave icon if it is drawn now, else to More. Never while another
+    // surface owns the window (the guard the icon used): a protected context
+    // that ended the dialog keeps its focus, and the ownership ends here
+    // either way, so nothing returns later.
+    property <bool> header-leave-open: RoomLeave.view.open;
+    changed header-leave-open => {
+        if !root.header-leave-open && root.header-leave-returns {
+            root.header-leave-returns = false;
+            if !root.matrix-link-blocked && !MatrixLink.open {
+                if root.header-shows(8) {
+                    root.header-leave-focus-request += 1;
+                } else {
+                    root.focus-header-more();
+                }
+            }
+        }
+    }
+
     in-out property <bool> room-actions-open: false;
     in-out property <int> room-action-mode: 0; // 0 private room, 1 join, 2 Space
     in-out property <string> room-action-input;
@@ -4760,7 +5124,9 @@ export component AppWindow inherits Window {
     // before it opens; this handler is the fallback for a route that does not.
     out property <bool> matrix-link-protected: !root.live-session || root.matrix-link-blocked;
     // Leave uses the same complete protected-surface inventory at its entry.
-    out property <bool> matrix-link-blocked: root.room-leave-blocked || RoomLeave.view.open;
+    // The header's More menu holds links too while it is open (it is not in
+    // Leave's list: More closes before its Leave item runs).
+    out property <bool> matrix-link-blocked: root.room-leave-blocked || RoomLeave.view.open || root.header-more-open;
     out property <bool> room-leave-blocked: root.page != 0
         || root.show-sign-in || root.access-open || root.manage-accounts-open
         || root.account-menu-open || root.account-switch-pending
@@ -4795,7 +5161,7 @@ export component AppWindow inherits Window {
         && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open
         && !root.native-capture-picker-open && !root.leave-call-dialog
         && !root.image-preview-open && !root.poll-dialog-open && root.shortcut-recording == ""
-        && !MatrixLink.open;
+        && !MatrixLink.open && !root.header-more-open;
     changed thread-browser-allowed => { if !root.thread-browser-allowed { ThreadBrowser.context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -5640,9 +6006,20 @@ export component AppWindow inherits Window {
                 Rectangle {
                     height: max(64px, 40px * root.text-scale + 24px) + StyleTokens.icon-button-growth;
                     background: transparent;
+                    // Measured only, never drawn or read out: the page 0 glyph
+                    // and the whole room name in the header's fonts
+                    // (header-glyph, header-name-wanted).
+                    Rectangle {
+                        width: 0px; height: 0px; clip: true;
+                        header-glyph-probe := Text { text: "#"; font-size: 20px * root.text-scale; accessible-role: none; }
+                        header-name-probe := Text { text: root.active-room-name; font-size: 16px * root.text-scale; font-weight: 750; accessible-role: none; }
+                    }
                     HorizontalLayout {
                         padding-left: 24px;
-                        padding-right: 16px;
+                        // More keeps its place at the end of the row, zero wide
+                        // unless actions fold; its 11 px gap counts toward the
+                        // 16 px edge.
+                        padding-right: root.header-overflow ? 16px : 5px;
                         padding-top: 14px;
                         padding-bottom: 14px;
                         spacing: 11px;
@@ -5658,7 +6035,10 @@ export component AppWindow inherits Window {
                             font-size: 16px * root.text-scale;
                             font-weight: 750;
                             vertical-alignment: center;
-                            min-width: 0px;
+                            // On the conversation page the name keeps a readable
+                            // start, and takes the topic's place once actions fold.
+                            horizontal-stretch: root.page == 0 && !root.header-full ? 1 : 0;
+                            min-width: root.page == 0 ? root.header-name-min : 0px;
                             overflow: elide;
                             accessible-label: root.page == 0 ? "Current room: " + root.active-room-name : self.text;
                         }
@@ -5669,12 +6049,14 @@ export component AppWindow inherits Window {
                             font-weight: 750;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
-                            min-width: 0px;
+                            min-width: root.header-name-min;
                             overflow: elide;
                             accessible-label: "Current room: " + root.active-room-name;
                         }
-                        if root.page != 0 || root.conversation-header-mode != 2 : Rectangle { width: 1px; height: 24px; background: root.divider; }
-                        if root.page != 0 || root.conversation-header-mode != 2 : Text {
+                        // The topic gives way first: it elides, and leaves once
+                        // actions fold.
+                        if root.page != 0 || (root.conversation-header-mode != 2 && root.header-full) : Rectangle { width: 1px; height: 24px; background: root.divider; }
+                        if root.page != 0 || (root.conversation-header-mode != 2 && root.header-full) : Text {
                             text: root.page == 0 ? root.active-room-topic : root.page == 1 ? "Make Morpheus yours" : root.page == 3 ? "Public rooms on your Matrix homeserver" : "The Workshop";
                             color: root.muted;
                             font-size: 12px * root.text-scale;
@@ -5694,125 +6076,172 @@ export component AppWindow inherits Window {
                                 focus-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.ink;
                             }
                         }
-                        if root.page == 0 : VerticalLayout {
+                        // Each foldable action below is drawn while it fits
+                        // (header-shows) and is otherwise a More item; both run
+                        // header-action with the same label, state and guard.
+                        if root.page == 0 && root.header-shows(0) : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
                             // A panel the person closed returns focus here.
                             property <int> focus-request: root.room-notification-focus-request;
                             changed focus-request => { self.focus(); }
                             // Stable IDs of the native icon set, which draws them once merged.
-                            icon: RoomNotificationState.header-muted ? "notifications-off" : "notifications";
-                            label: RoomNotificationState.header-muted ? "Room notifications, muted" : "Room notifications";
+                            icon: root.header-icon(0);
+                            label: root.header-label(0);
                             ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
-                            selected: root.room-notifications-current;
-                            enabled: root.live-session && root.active-room-id != "";
-                            activated => {
-                                RoomNotificationState.request-open(root.active-account-local-id, root.active-room-id);
-                            }
+                            selected: root.header-selected(0);
+                            enabled: root.header-enabled(0);
+                            focus-state-changed(focused) => { root.header-focus-changed(0, focused); }
+                            activated => { root.header-action(0); }
                         }
                         }
-                        if root.page == 0 : VerticalLayout {
+                        if root.page == 0 && root.header-shows(1) : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "settings"; label: "Edit room settings"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
-                            enabled: root.live-session && root.active-room-id != "";
-                            activated => {
-                                root.open-room-settings();
-                            }
+                            icon: root.header-icon(1); label: root.header-label(1); ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
+                            enabled: root.header-enabled(1);
+                            focus-state-changed(focused) => { root.header-focus-changed(1, focused); }
+                            activated => { root.header-action(1); }
                         }
                         }
-                        // Review and leave only the exact room shown now.
-                        if root.page == 0 : VerticalLayout {
+                        // Review and leave only the exact room shown now. It
+                        // stays while the name keeps its floor (slot 8).
+                        if root.page == 0 && root.header-shows(8) : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
                             icon: "log-out"; label: "Leave this room…"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             enabled: root.live-session && root.active-room-id != "" && !root.room-leave-blocked;
-                            property <bool> returns-focus;
-                            property <bool> leave-open: RoomLeave.view.open;
-                            changed leave-open => {
-                                if !self.leave-open && self.returns-focus {
-                                    self.returns-focus = false;
-                                    if !root.matrix-link-blocked && !MatrixLink.open { self.focus(); }
-                                }
-                            }
+                            focus-state-changed(focused) => { root.header-focus-changed(8, focused); }
+                            // The dialog's end returns focus here through the
+                            // header (header-leave-returns), even if this icon
+                            // folded and came back meanwhile.
+                            property <int> focus-request: root.header-leave-focus-request;
+                            changed focus-request => { self.focus(); }
                             activated => {
                                 // Withdraw held link navigation before the dialog flag.
                                 if root.room-leave-blocked || RoomLeave.view.open { return; }
                                 MatrixLink.withdraw();
                                 ThreadBrowser.withdraw();
                                 RoomLeave.start();
-                                self.returns-focus = RoomLeave.view.open;
+                                root.header-leave-returns = RoomLeave.view.open;
                             }
                         }
                         }
+                        // Search never folds; it also takes the focus More gives
+                        // up when nothing is folded any more.
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
+                            property <int> focus-request: root.header-search-focus-request;
+                            changed focus-request => { self.focus(); }
                             icon: "search"; label: "Search messages"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 2;
                             enabled: root.live-session;
                             activated => { root.focus-room-search(); }
                         }
                         }
-                        if root.page == 0 : VerticalLayout {
+                        if root.page == 0 && root.header-shows(2) : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "pin"; label: "Show pinned messages"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
-                            selected: root.show-side-panel && root.side-panel-tab == 3;
-                            enabled: root.live-session && root.active-room-id != "";
-                            activated => {
-                                if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
-                                root.show-side-panel = true;
-                                root.side-panel-tab = 3;
-                            }
+                            icon: root.header-icon(2); label: root.header-label(2); ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
+                            selected: root.header-selected(2);
+                            enabled: root.header-enabled(2);
+                            focus-state-changed(focused) => { root.header-focus-changed(2, focused); }
+                            activated => { root.header-action(2); }
                         }
                         }
                         // The thread browser (thread-browser.slint) opens here
-                        // and gives focus back here when it closes itself.
-                        if root.page == 0 : VerticalLayout {
+                        // and gives focus back here when it closes itself (to
+                        // More while this action is folded).
+                        if root.page == 0 && root.header-shows(3) : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             property <int> thread-browser-return: ThreadBrowser.return-focus;
                             changed thread-browser-return => { thread-browser-trigger.focus(); }
                             thread-browser-trigger := IconAction {
-                            icon: "thread"; label: "Browse threads in this room"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
-                            selected: ThreadBrowser.open;
-                            enabled: root.live-session && root.active-room-id != "";
-                            activated => { if !RoomLeave.view.open { ThreadBrowser.show(); } }
+                            icon: root.header-icon(3); label: root.header-label(3); ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
+                            selected: root.header-selected(3);
+                            enabled: root.header-enabled(3);
+                            focus-state-changed(focused) => { root.header-focus-changed(3, focused); }
+                            activated => { root.header-action(3); }
                         }
                         }
-                        if root.page == 0 : VerticalLayout {
+                        if root.page == 0 && root.header-shows(4) : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "media"; label: "Browse this room's media"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
-                            selected: root.room-media-visible;
-                            enabled: root.live-session && root.active-room-id != "";
-                            activated => { root.show-room-media(); }
+                            icon: root.header-icon(4); label: root.header-label(4); ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
+                            selected: root.header-selected(4);
+                            enabled: root.header-enabled(4);
+                            focus-state-changed(focused) => { root.header-focus-changed(4, focused); }
+                            activated => { root.header-action(4); }
                         }
                         }
-                        if root.page == 0 : VerticalLayout {
+                        if root.page == 0 && root.header-shows(5) : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "transfers"; label: root.transfer-active-count > 0 ? "Show transfers, " + root.transfer-active-count + " in progress" : "Show transfers"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
-                            selected: root.show-side-panel && root.side-panel-tab == 4;
-                            enabled: root.live-session;
-                            activated => { root.show-transfer-panel(); }
+                            icon: root.header-icon(5); label: root.header-label(5); ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
+                            selected: root.header-selected(5);
+                            enabled: root.header-enabled(5);
+                            focus-state-changed(focused) => { root.header-focus-changed(5, focused); }
+                            activated => { root.header-action(5); }
                         }
                         }
-                        if root.page == 0 : VerticalLayout {
+                        if root.page == 0 && root.header-shows(6) : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "calls"; label: "Open current room call stage"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
-                            activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
+                            icon: root.header-icon(6); label: root.header-label(6); ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
+                            focus-state-changed(focused) => { root.header-focus-changed(6, focused); }
+                            activated => { root.header-action(6); }
                         }
                         }
-                        if root.page == 0 : VerticalLayout {
+                        if root.page == 0 && root.header-shows(7) : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "details-panel"; label: root.show-side-panel ? "Hide details panel" : "Show details panel";
+                            icon: root.header-icon(7); label: root.header-label(7);
                             ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
-                            selected: root.show-side-panel;
-                            activated => { root.set-side-panel(!root.show-side-panel); }
+                            selected: root.header-selected(7);
+                            focus-state-changed(focused) => { root.header-focus-changed(7, focused); }
+                            activated => { root.header-action(7); }
                         }
+                        }
+                        // "More room actions": the actions that do not fit, in
+                        // one flat menu (drawn over the panes, below). For a
+                        // menu whose listed actions are all unavailable focus
+                        // stays on More: Escape there closes the menu, and Tab
+                        // and Shift+Tab stay on More.
+                        VerticalLayout {
+                            width: root.header-overflow ? StyleTokens.icon-button-size : 0px; alignment: center;
+                            FocusScope {
+                                width: root.header-overflow ? StyleTokens.icon-button-size : 0px;
+                                height: StyleTokens.icon-button-size;
+                                focus-on-click: false;
+                                focus-on-tab-navigation: false;
+                                key-pressed(event) => {
+                                    if root.header-more-open && event.text == Key.Escape {
+                                        root.close-header-more(true);
+                                        return accept;
+                                    }
+                                    // While the menu is open Tab and Shift+Tab never
+                                    // leave it: to an available item, or with none
+                                    // focus stays on More.
+                                    if root.header-more-open && (event.text == Key.Tab || event.text == Key.Backtab) {
+                                        root.header-menu-move(event.text == Key.Backtab || event.modifiers.shift ? 8 : 1);
+                                        return accept;
+                                    }
+                                    reject
+                                }
+                                header-more := IconAction {
+                                    width: parent.width;
+                                    // Zero wide but kept while it has focus, so the
+                                    // window does not drop that focus before
+                                    // header-layout hands it to Search.
+                                    visible: root.header-overflow || self.has-focus;
+                                    icon: "more"; label: root.header-overflow ? "More room actions" : "";
+                                    ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
+                                    selected: root.header-more-open;
+                                    enabled: root.header-overflow;
+                                    activated => { root.toggle-header-more(); }
+                                }
+                            }
                         }
                     }
                 }
@@ -11330,6 +11759,182 @@ export component AppWindow inherits Window {
                         padding-left: 9px; padding-right: 9px; spacing: 9px;
                         VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "log-out"; ink: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; } }
                         Text { text: "Log out"; color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                    }
+                }
+            }
+        }
+
+        // The conversation header's "More room actions" menu: one flat list of
+        // the actions that do not fit, in header order, drawn over the panes
+        // below its trigger. A click anywhere else only closes it.
+        if root.header-more-open && root.header-more-allowed && root.header-overflow : TouchArea {
+            x: 0px; y: 0px; width: parent.width; height: parent.height;
+            clicked => { root.close-header-more(true); }
+        }
+        if root.header-more-open && root.header-more-allowed && root.header-overflow : Rectangle {
+            property <length> row: max(root.density-mode == 0 ? 32px : root.density-mode == 2 ? 42px : 36px, 24px * root.text-scale + 12px);
+            property <int> rows: 8 - root.header-capacity + (root.header-leave-shown ? 0 : 1);
+            x: max(8px, min(parent.width - self.width - 8px, header-more.absolute-position.x + header-more.width - self.width));
+            y: header-more.absolute-position.y + header-more.height + 4px;
+            width: min(parent.width - 16px, max(240px, 210px * root.text-scale));
+            height: max(0px, min(parent.height - self.y - 8px, 12px + self.rows * (self.row + 2px)));
+            background: root.elevated;
+            border-color: root.divider;
+            border-width: StyleTokens.line-width;
+            border-radius: StyleTokens.radius * 1.2;
+            drop-shadow-color: StyleTokens.roles.shadow.present ? StyleTokens.roles.shadow.color : #00000044;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 7px;
+            accessible-role: groupbox;
+            accessible-label: "Room actions that do not fit";
+            // The account menu's opt-in fade-in: immediate at 0 ms and under
+            // reduced motion.
+            property <bool> entered: false;
+            Timer { interval: 1ms; running: !parent.entered && parent.opacity < 1; triggered => { parent.entered = true; } }
+            opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
+            animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
+            // The first available item takes focus once the items exist
+            // (conditional children become focusable after one tick). With
+            // none available focus stays on More, where Escape closes too.
+            Timer {
+                interval: 1ms;
+                running: true;
+                triggered => { self.running = false; root.focus-header-menu-first(); }
+            }
+            // A click inside the menu that reaches no available item does
+            // nothing (it neither acts nor closes the menu).
+            TouchArea { width: parent.width; height: parent.height; }
+            // Up and Down move between the available items, Home and End go
+            // to the first and last; Tab stays in the menu and Escape closes
+            // it (each item).
+            FocusScope {
+                width: parent.width;
+                height: parent.height;
+                focus-on-click: false;
+                focus-on-tab-navigation: false;
+                key-pressed(event) => {
+                    if event.text == Key.DownArrow { root.header-menu-move(1); return accept; }
+                    if event.text == Key.UpArrow { root.header-menu-move(8); return accept; }
+                    if event.text == Key.Home { root.focus-header-menu(root.header-menu-step(8, 1)); return accept; }
+                    if event.text == Key.End { root.focus-header-menu(root.header-menu-step(0, 8)); return accept; }
+                    reject
+                }
+                ScrollView {
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        width: parent.width;
+                        padding: 6px;
+                        spacing: 2px;
+                        if !root.header-shows(0) : HeaderMoreItem {
+                            slot: 0; icon: root.header-icon(0); label: root.header-label(0);
+                            selected: root.header-selected(0); enabled: root.header-enabled(0);
+                            ink: root.ink; icon-ink: root.icon-header-ink; muted: root.muted; hover-surface: root.hover;
+                            text-scale: root.text-scale; density-mode: root.density-mode;
+                            focus-target: root.header-menu-target; focus-serial: root.header-menu-serial;
+                            focus-state-changed(focused) => { root.header-menu-focus-changed(0, focused); }
+                            next-focus => { root.header-menu-move(1); }
+                            previous-focus => { root.header-menu-move(8); }
+                            cancelled => { root.close-header-more(true); }
+                            activated => { root.choose-header-more(0); }
+                        }
+                        if !root.header-shows(1) : HeaderMoreItem {
+                            slot: 1; icon: root.header-icon(1); label: root.header-label(1);
+                            selected: root.header-selected(1); enabled: root.header-enabled(1);
+                            ink: root.ink; icon-ink: root.icon-header-ink; muted: root.muted; hover-surface: root.hover;
+                            text-scale: root.text-scale; density-mode: root.density-mode;
+                            focus-target: root.header-menu-target; focus-serial: root.header-menu-serial;
+                            focus-state-changed(focused) => { root.header-menu-focus-changed(1, focused); }
+                            next-focus => { root.header-menu-move(1); }
+                            previous-focus => { root.header-menu-move(8); }
+                            cancelled => { root.close-header-more(true); }
+                            activated => { root.choose-header-more(1); }
+                        }
+                        if !root.header-shows(8) : HeaderMoreItem {
+                            slot: 8; icon: root.header-icon(8); label: root.header-label(8);
+                            selected: root.header-selected(8); enabled: root.header-enabled(8);
+                            ink: root.ink; icon-ink: root.icon-header-ink; muted: root.muted; hover-surface: root.hover;
+                            text-scale: root.text-scale; density-mode: root.density-mode;
+                            focus-target: root.header-menu-target; focus-serial: root.header-menu-serial;
+                            focus-state-changed(focused) => { root.header-menu-focus-changed(8, focused); }
+                            next-focus => { root.header-menu-move(1); }
+                            previous-focus => { root.header-menu-move(8); }
+                            cancelled => { root.close-header-more(true); }
+                            activated => { root.choose-header-more(8); }
+                        }
+                        if !root.header-shows(2) : HeaderMoreItem {
+                            slot: 2; icon: root.header-icon(2); label: root.header-label(2);
+                            selected: root.header-selected(2); enabled: root.header-enabled(2);
+                            ink: root.ink; icon-ink: root.icon-header-ink; muted: root.muted; hover-surface: root.hover;
+                            text-scale: root.text-scale; density-mode: root.density-mode;
+                            focus-target: root.header-menu-target; focus-serial: root.header-menu-serial;
+                            focus-state-changed(focused) => { root.header-menu-focus-changed(2, focused); }
+                            next-focus => { root.header-menu-move(1); }
+                            previous-focus => { root.header-menu-move(8); }
+                            cancelled => { root.close-header-more(true); }
+                            activated => { root.choose-header-more(2); }
+                        }
+                        if !root.header-shows(3) : HeaderMoreItem {
+                            slot: 3; icon: root.header-icon(3); label: root.header-label(3);
+                            selected: root.header-selected(3); enabled: root.header-enabled(3);
+                            ink: root.ink; icon-ink: root.icon-header-ink; muted: root.muted; hover-surface: root.hover;
+                            text-scale: root.text-scale; density-mode: root.density-mode;
+                            focus-target: root.header-menu-target; focus-serial: root.header-menu-serial;
+                            focus-state-changed(focused) => { root.header-menu-focus-changed(3, focused); }
+                            next-focus => { root.header-menu-move(1); }
+                            previous-focus => { root.header-menu-move(8); }
+                            cancelled => { root.close-header-more(true); }
+                            activated => { root.choose-header-more(3); }
+                        }
+                        if !root.header-shows(4) : HeaderMoreItem {
+                            slot: 4; icon: root.header-icon(4); label: root.header-label(4);
+                            selected: root.header-selected(4); enabled: root.header-enabled(4);
+                            ink: root.ink; icon-ink: root.icon-header-ink; muted: root.muted; hover-surface: root.hover;
+                            text-scale: root.text-scale; density-mode: root.density-mode;
+                            focus-target: root.header-menu-target; focus-serial: root.header-menu-serial;
+                            focus-state-changed(focused) => { root.header-menu-focus-changed(4, focused); }
+                            next-focus => { root.header-menu-move(1); }
+                            previous-focus => { root.header-menu-move(8); }
+                            cancelled => { root.close-header-more(true); }
+                            activated => { root.choose-header-more(4); }
+                        }
+                        if !root.header-shows(5) : HeaderMoreItem {
+                            slot: 5; icon: root.header-icon(5); label: root.header-label(5);
+                            selected: root.header-selected(5); enabled: root.header-enabled(5);
+                            ink: root.ink; icon-ink: root.icon-header-ink; muted: root.muted; hover-surface: root.hover;
+                            text-scale: root.text-scale; density-mode: root.density-mode;
+                            focus-target: root.header-menu-target; focus-serial: root.header-menu-serial;
+                            focus-state-changed(focused) => { root.header-menu-focus-changed(5, focused); }
+                            next-focus => { root.header-menu-move(1); }
+                            previous-focus => { root.header-menu-move(8); }
+                            cancelled => { root.close-header-more(true); }
+                            activated => { root.choose-header-more(5); }
+                        }
+                        if !root.header-shows(6) : HeaderMoreItem {
+                            slot: 6; icon: root.header-icon(6); label: root.header-label(6);
+                            selected: root.header-selected(6); enabled: root.header-enabled(6);
+                            ink: root.ink; icon-ink: root.icon-header-ink; muted: root.muted; hover-surface: root.hover;
+                            text-scale: root.text-scale; density-mode: root.density-mode;
+                            focus-target: root.header-menu-target; focus-serial: root.header-menu-serial;
+                            focus-state-changed(focused) => { root.header-menu-focus-changed(6, focused); }
+                            next-focus => { root.header-menu-move(1); }
+                            previous-focus => { root.header-menu-move(8); }
+                            cancelled => { root.close-header-more(true); }
+                            activated => { root.choose-header-more(6); }
+                        }
+                        if !root.header-shows(7) : HeaderMoreItem {
+                            slot: 7; icon: root.header-icon(7); label: root.header-label(7);
+                            selected: root.header-selected(7); enabled: root.header-enabled(7);
+                            ink: root.ink; icon-ink: root.icon-header-ink; muted: root.muted; hover-surface: root.hover;
+                            text-scale: root.text-scale; density-mode: root.density-mode;
+                            focus-target: root.header-menu-target; focus-serial: root.header-menu-serial;
+                            focus-state-changed(focused) => { root.header-menu-focus-changed(7, focused); }
+                            next-focus => { root.header-menu-move(1); }
+                            previous-focus => { root.header-menu-move(8); }
+                            cancelled => { root.close-header-more(true); }
+                            activated => { root.choose-header-more(7); }
+                        }
                     }
                 }
             }

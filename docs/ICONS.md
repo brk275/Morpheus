@@ -36,7 +36,7 @@ Add IDs only. Never rename or reuse one.
 - **Details and panes:** `members`, `thread`, `pin`, `files`, `transfers`, `media`, `details-panel`, `layout`
 - **Composer:** `attach`, `send`, `emoji`, `sticker`, `poll`
 - **Calls:** `mic`, `mic-off`, `headphones`, `headphones-off`, `camera`, `camera-off`, `screen-share`, `screen-share-stop`, `call-leave`, `chat`
-- **Common actions:** `add`, `remove`, `close`, `check`, `refresh`, `download`, `reply`, `react`, `redact`, `edit`, `chevron-up`, `chevron-down`, `chevrons-left`, `chevrons-right`, `arrow-left`, `arrow-up`, `arrow-down`
+- **Common actions:** `add`, `remove`, `close`, `check`, `refresh`, `download`, `reply`, `react`, `redact`, `edit`, `chevron-up`, `chevron-down`, `more`, `chevrons-left`, `chevrons-right`, `arrow-left`, `arrow-up`, `arrow-down`
 
 ## Legacy captions
 
