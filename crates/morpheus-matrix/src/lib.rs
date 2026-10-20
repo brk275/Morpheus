@@ -126,7 +126,7 @@ use eyeball_im::Vector;
 use futures_util::StreamExt;
 use matrix_sdk::{
     Client, ComposerDraft, ComposerDraftType, DraftAttachment, DraftAttachmentContent,
-    DraftThumbnail, RoomState, StateStore,
+    DraftThumbnail, RoomState,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     encryption::{

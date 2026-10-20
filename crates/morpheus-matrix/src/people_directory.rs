@@ -2,10 +2,14 @@
 //! starting a direct conversation with one of them.
 //!
 //! The search is the homeserver's own user directory, asked through the
-//! account's authenticated SDK client with a typed request: one attempt, a
-//! bounded query, result count, response body and time. No other server or
-//! URL is contacted, no avatar is fetched, and nothing about the query is
-//! logged. A complete Matrix user ID needs no directory result.
+//! account's authenticated SDK client with a typed request: one directory
+//! attempt, a bounded query, result count, response body and time. Token
+//! refresh and its replay are disabled for this read so they cannot escape
+//! that response bound. Ordinary account sync can still refresh the session.
+//! The SDK may separately discover its homeserver's supported versions; this
+//! feature's response bound does not cover that metadata request. No avatar
+//! is fetched, and nothing about the query is logged. A complete Matrix user
+//! ID needs no directory result.
 //!
 //! An existing direct conversation is found from this device's joined rooms
 //! and the account's `m.direct` data; "several" and "none known here" are
@@ -34,12 +38,15 @@ use matrix_sdk::{
     Client, HttpError,
     config::RequestConfig,
     ruma::{
-        DirectUserIdentifier, OwnedUserId, RoomId, UInt, UserId,
+        OwnedUserId, RoomId, UInt, UserId,
         api::{
             client::{room::create_room, user_directory::search_users},
             error::ErrorKind,
         },
-        events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent},
+        events::{
+            InitialStateEvent, direct::DirectUserIdentifier,
+            room::encryption::RoomEncryptionEventContent,
+        },
     },
 };
 use tokio::{sync::Notify, time};
@@ -79,6 +86,8 @@ pub enum PeopleError {
     OwnAccount,
     #[error("The user directory is unavailable. Try again later.")]
     Unavailable,
+    #[error("This account's authorization was not accepted. Let it reconnect, then try again.")]
+    AuthorizationRequired,
     #[error("The homeserver is limiting requests. Wait, then try again.")]
     RateLimited,
     #[error("The request timed out.")]
@@ -292,6 +301,7 @@ fn request_failure(error: &HttpError) -> PeopleError {
         return PeopleError::InvalidResponse;
     }
     match error.as_client_api_error() {
+        Some(api) if api.status_code.as_u16() == 401 => PeopleError::AuthorizationRequired,
         Some(api)
             if api.status_code.as_u16() == 429
                 || matches!(api.error_kind(), Some(ErrorKind::LimitExceeded(_))) =>
@@ -333,19 +343,20 @@ async fn guarded<T>(
     Ok(result)
 }
 
-/// Retries off, authenticated, bounded: for the directory search, a read.
-/// A 401 token refresh may replay it once, which is harmless for a read.
+/// One bounded directory attempt, without a hidden token-refresh request
+/// or replay. The original 401 returns to the window; no sign-out is
+/// broadcast by this request, and ordinary account sync can still refresh.
 fn single_attempt(timeout: Duration, max_bytes: u64) -> RequestConfig {
     RequestConfig::new()
         .retry_limit(0)
+        .disable_auth_refresh()
         .timeout(timeout)
         .force_auth()
         .max_response_bytes(max_bytes)
 }
 
-/// The creation's settings: `single_attempt` plus no token-refresh replay,
-/// so a 401 ends the attempt instead of resending a mutation that may have
-/// applied.
+/// Keep the creation's no-refresh policy explicit as well: a 401 ends its
+/// attempt instead of resending a mutation that may have applied.
 fn single_wire_attempt(timeout: Duration, max_bytes: u64) -> RequestConfig {
     single_attempt(timeout, max_bytes).disable_auth_refresh()
 }
@@ -670,25 +681,44 @@ mod tests {
         assert!(shown.contains("retry_limit: 0") || shown.contains("retry_limit: Some(0)"));
         assert!(shown.contains("force_auth: true"));
         assert!(shown.contains("65536"));
-        // The creation alone also refuses the token-refresh replay.
+        assert!(shown.contains("disable_auth_refresh: true"));
+        // The creation also refuses the token-refresh replay.
         let create = format!(
             "{:?}",
             single_wire_attempt(CREATE_TIMEOUT, MAX_CREATE_RESPONSE_BYTES)
         );
         assert!(create.contains("retry_limit: 0") || create.contains("retry_limit: Some(0)"));
         assert!(create.contains("16384"));
-        assert_ne!(
-            create,
-            format!(
-                "{:?}",
-                single_attempt(CREATE_TIMEOUT, MAX_CREATE_RESPONSE_BYTES)
-            )
-        );
+        assert!(create.contains("disable_auth_refresh: true"));
         assert_eq!(
             request_failure(&HttpError::ResponseTooLarge { limit: 1 }),
             PeopleError::InvalidResponse
         );
         // Fixed wording carries no query or identifier.
         assert!(!PeopleError::CreateUnknown.to_string().contains('@'));
+    }
+
+    #[test]
+    fn rejected_authorization_returns_a_fixed_read_error() {
+        use matrix_sdk::ruma::api::{
+            client::uiaa::UiaaResponse,
+            error::{Error, ErrorBody, FromHttpResponseError, StandardErrorBody},
+        };
+        for wire_kind in ["M_UNKNOWN_TOKEN", "M_MISSING_TOKEN", "M_UNKNOWN"] {
+            let body: StandardErrorBody = serde_json::from_value(serde_json::json!({
+                "errcode": wire_kind, "error": "private authorization reply", "soft_logout": true
+            }))
+            .unwrap();
+            let error = HttpError::Api(Box::new(FromHttpResponseError::Server(
+                UiaaResponse::MatrixError(Error::new(
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    ErrorBody::Standard(body),
+                )),
+            )));
+            let public = request_failure(&error);
+            assert_eq!(public, PeopleError::AuthorizationRequired);
+            assert!(!public.to_string().contains("private"));
+            assert!(!format!("{public:?}").contains(wire_kind));
+        }
     }
 }
