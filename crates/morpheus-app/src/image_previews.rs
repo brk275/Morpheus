@@ -377,6 +377,9 @@ struct Opener {
 impl Opener {
     /// Replace whatever the viewer shows with one explicitly requested image.
     fn open(&self, ui: &AppWindow, event: &str, filename: &str) {
+        if crate::room_addresses::is_open(ui) {
+            return;
+        }
         if !ui.get_live_session() || event.is_empty() || ui.get_active_room_id().is_empty() {
             return;
         }

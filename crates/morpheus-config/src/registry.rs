@@ -2464,6 +2464,23 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             "block list",
         ],
     )),
+    live(target(
+        "rooms.addresses",
+        "Rooms",
+        "Settings › Room addresses",
+        "Room addresses",
+        "List the open room's addresses, add or remove ones on your homeserver, and choose the published ones.",
+        &[
+            "address",
+            "addresses",
+            "room address",
+            "alias",
+            "aliases",
+            "canonical alias",
+            "main address",
+            "published address",
+        ],
+    )),
     target(
         "media.image_previews",
         "Media",

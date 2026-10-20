@@ -261,6 +261,9 @@ impl<M: Moderator> ModerationUi<M> {
     }
 
     fn member(self: &Arc<Self>, window: &AppWindow, kind: i32, user_id: &str, value: &str) {
+        if crate::room_addresses::is_open(window) {
+            return;
+        }
         if !self.live.is_live.load(Ordering::Acquire) || window.get_member_action_busy() {
             return;
         }
@@ -411,6 +414,9 @@ impl<M: Moderator> ModerationUi<M> {
     }
 
     fn redact(self: &Arc<Self>, window: &AppWindow, value: &str) {
+        if crate::room_addresses::is_open(window) {
+            return;
+        }
         if !window.get_room_admin_open()
             || window.get_room_admin_mode() != 2
             || !self.live.is_live.load(Ordering::Acquire)

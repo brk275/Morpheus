@@ -747,7 +747,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
 /// No form opens or confirms behind account access or a protected native
 /// presentation. Context hooks retire its operation owner on later changes.
 fn surface_allowed(ui: &AppWindow) -> bool {
-    ui.get_live_session()
+    !crate::room_addresses::is_open(ui)
+        && ui.get_live_session()
         && ui.get_page() == 0
         && !ui.get_show_sign_in()
         && !ui.get_access_open()

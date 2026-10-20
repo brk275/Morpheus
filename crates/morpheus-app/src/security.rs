@@ -1,13 +1,27 @@
 //! Account-scoped security controls for the native Settings view.
 //! Recovery material is shown only in the current UI session and is never
 //! logged or written to Morpheus configuration, drafts, or the account store.
+//!
+//! Status, setup and recovery go through `morpheus_matrix::account_recovery`
+//! for the exact account selection; the manager's state is never held across
+//! a request. Setup and recovery reserve the security gate first and keep
+//! the account transition for their whole run, as before, and are never
+//! cancelled or timed out once they start. The status is read again after
+//! every outcome and described as the SDK reports it: a request that
+//! returned does not mean every message's key came back. A generated key is
+//! never dropped: if its account is not shown when it arrives, it is held
+//! until that account's Security page shows it, and the gate stays reserved
+//! until the person confirms they saved it.
 
 use std::sync::{
     Arc,
     atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
-use morpheus_matrix::{BackupStatus, DeviceVerificationStatus, RecoveryStatus, SecurityInfo};
+use morpheus_matrix::{
+    AccountRecoveryError, BackupStatus, DeviceVerificationStatus, RecoveryKey, RecoveryOverview,
+    RecoveryProgress, RecoveryStatus, SecurityInfo, SetupConfirmation,
+};
 use slint::{CloseRequestResponse, ComponentHandle};
 use tokio::runtime::Handle;
 use zeroize::Zeroizing;
@@ -72,6 +86,12 @@ impl SecurityGate {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 Some(n.saturating_add(1))
             });
+    }
+
+    /// Whether the recovery reservation taken at `generation` still holds:
+    /// reserved for recovery, and no other security step began since.
+    fn recovery_owned(&self, generation: u64) -> bool {
+        self.0.load(Ordering::Acquire) == SECURITY_BUSY && self.ringing_generation() == generation
     }
 
     fn key_pending(&self) {
@@ -176,13 +196,6 @@ fn same_view(ui: &AppWindow, account_id: &str, operation: i32) -> bool {
         && ui.get_security_operation() == operation
 }
 
-async fn active_account_is(live: &LiveUi, account_id: &str) -> bool {
-    live.manager
-        .active_account()
-        .await
-        .is_some_and(|account| account.id == account_id)
-}
-
 fn status_labels(info: SecurityInfo) -> (&'static str, &'static str, &'static str, bool) {
     let device = match info.device_verification {
         DeviceVerificationStatus::Unknown => "Checking",
@@ -212,12 +225,165 @@ fn status_labels(info: SecurityInfo) -> (&'static str, &'static str, &'static st
     )
 }
 
-fn apply_status(ui: &AppWindow, info: SecurityInfo) {
-    let (device, recovery, backup, can_enable) = status_labels(info);
+/// A generated recovery key whose account was not shown when it arrived:
+/// kept (zeroized on drop), with how far its setup is known to have got,
+/// until that account's Security page shows both.
+type PendingKey = (String, RecoveryKey, SetupConfirmation);
+static PENDING_KEY: std::sync::Mutex<Option<PendingKey>> = std::sync::Mutex::new(None);
+
+/// Status lines for one overview: device, recovery, key backup (with
+/// whether one exists on the server), identity keys, and whether setup is
+/// offered. A part that is not known says so.
+fn overview_labels(info: &RecoveryOverview) -> (String, String, String, String, bool) {
+    let (device, recovery, backup, can_enable) = status_labels(SecurityInfo {
+        device_verification: info.device,
+        recovery: info.recovery,
+        backup: info.backup,
+    });
+    let server = match info.backup_on_server {
+        Some(true) => "a backup exists on the server",
+        Some(false) => "no backup on the server",
+        None => "server backup not known",
+    };
+    let identity = match info.cross_signing {
+        Some(keys) => format!("Cross-signing keys on this device: {} of 3", keys.count()),
+        None => "Cross-signing keys on this device: not known yet".to_owned(),
+    };
+    (
+        device.to_owned(),
+        recovery.to_owned(),
+        format!("{backup} ({server})"),
+        identity,
+        can_enable,
+    )
+}
+
+fn apply_overview(ui: &AppWindow, info: &RecoveryOverview) {
+    let (device, recovery, backup, identity, can_enable) = overview_labels(info);
     ui.set_security_device_status(device.into());
     ui.set_security_recovery_status(recovery.into());
     ui.set_security_backup_status(backup.into());
+    ui.set_security_identity_status(identity.into());
     ui.set_security_can_enable(can_enable);
+}
+
+fn progress_text(progress: RecoveryProgress) -> String {
+    match progress {
+        RecoveryProgress::Starting => "Starting recovery setup…".to_owned(),
+        RecoveryProgress::CreatingBackup => "Creating a key backup on your homeserver…".to_owned(),
+        RecoveryProgress::CreatingRecoveryKey => {
+            "Creating your recovery key and storing your encrypted secrets…".to_owned()
+        }
+        RecoveryProgress::BackingUp { backed_up, total } => {
+            format!("Backing up message keys: {backed_up} of {total}…")
+        }
+        RecoveryProgress::UploadIncomplete => {
+            "Some message keys are not backed up yet; they are uploaded later.".to_owned()
+        }
+        RecoveryProgress::Finishing => "Finishing recovery setup…".to_owned(),
+    }
+}
+
+/// The notice and the error for a recovery outcome, from the state read
+/// after it. Never claims that every message's key came back.
+fn recovery_outcome(
+    result: &Result<(), AccountRecoveryError>,
+    overview: Option<&RecoveryOverview>,
+) -> (String, String) {
+    let state = overview.map(|info| {
+        let (_, recovery, backup, identity, _) = overview_labels(info);
+        format!("{identity} · Recovery: {recovery} · Key backup: {backup}.")
+    });
+    let complete = overview.is_some_and(|info| {
+        info.recovery == RecoveryStatus::Enabled
+            && info.cross_signing.is_some_and(|keys| keys.complete())
+            && matches!(
+                info.backup,
+                BackupStatus::Enabled | BackupStatus::Downloading
+            )
+    });
+    match (result, state) {
+        (Ok(()), Some(state)) if complete => (
+            format!(
+                "Recovery finished. {state} Older messages decrypt as their keys download; \
+                 messages whose keys were never backed up stay unreadable."
+            ),
+            String::new(),
+        ),
+        (Ok(()), Some(state)) => (
+            String::new(),
+            format!(
+                "Recovery finished but is not complete yet. {state} Refresh in a moment; if it \
+                 stays incomplete, enter your recovery key again."
+            ),
+        ),
+        (Ok(()), None) => (
+            String::new(),
+            "Recovery returned, but the resulting state could not be read. Refresh status \
+             before trying again."
+                .to_owned(),
+        ),
+        (Err(error), state) => {
+            let retry = match error {
+                AccountRecoveryError::KeyNotAccepted | AccountRecoveryError::NotSetUp => {
+                    " You can try again with another key or passphrase."
+                }
+                AccountRecoveryError::SecurityBusy | AccountRecoveryError::AccountChanged => "",
+                _ => " Check the state below, then try again only if it is still incomplete.",
+            };
+            let state = state.map(|state| format!(" {state}")).unwrap_or_default();
+            (String::new(), format!("{error}{retry}{state}"))
+        }
+    }
+}
+
+/// What an unconfirmed setup's outcome says; `None` when setup is
+/// confirmed. Never claims the key is in use, nor that it is not.
+fn setup_outcome(confirmation: SetupConfirmation) -> Option<&'static str> {
+    match confirmation {
+        SetupConfirmation::Confirmed => None,
+        SetupConfirmation::FinalStepFailed => Some(
+            "Setup created your recovery key and then reported an error, so it is unconfirmed. \
+             Save the key first; then check the status, which is read again after you refresh.",
+        ),
+        SetupConfirmation::StorageUnknown => Some(
+            "Setup created your recovery key but failed while storing it, so whether your \
+             account now depends on this key is not known. Save the key first: your homeserver \
+             may already use it. Then refresh and check the status; set up recovery again only \
+             after the key is saved, because a new setup replaces it.",
+        ),
+    }
+}
+
+/// Put a generated key in the one-time key dialog. The gate is already
+/// reserved for it; only "I saved this key" releases it.
+fn show_key(ui: &AppWindow, key: &RecoveryKey) {
+    ui.set_security_busy(false);
+    ui.set_security_progress("".into());
+    ui.set_security_key_revealed(false);
+    ui.set_security_recovery_key(key.reveal().into());
+    ui.set_security_error("".into());
+    ui.set_security_notice("Reveal and save this key now. It cannot be shown again.".into());
+}
+
+/// Show a held key once its account is the one shown.
+fn show_pending_key(ui: &AppWindow) {
+    if !ui.get_security_recovery_key().is_empty() {
+        return;
+    }
+    let account = ui.get_active_account_local_id().to_string();
+    let mut held = PENDING_KEY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if held.as_ref().is_some_and(|(owner, _, _)| *owner == account)
+        && let Some((_, key, confirmation)) = held.take()
+    {
+        show_key(ui, &key);
+        // Kept with the key, and through refreshes (see `set_outcome`).
+        if let Some(text) = setup_outcome(confirmation) {
+            set_outcome(ui, text, true);
+        }
+    }
 }
 
 /// Clear all account-specific status and secret fields on account change,
@@ -243,6 +409,18 @@ pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
     ui.set_security_recovery_input("".into());
     ui.set_security_recovery_key("".into());
     ui.set_security_key_revealed(false);
+    ui.set_security_identity_status("".into());
+    ui.set_security_progress("".into());
+    set_outcome(ui, "", false);
+}
+
+/// The last setup or recovery outcome. Status reads never touch it; it
+/// stays until the person dismisses it, a new setup or recovery starts, or
+/// the account changes, so an automatic refresh cannot erase an unresolved
+/// failure or uncertainty.
+fn set_outcome(ui: &AppWindow, text: &str, is_error: bool) {
+    ui.set_security_outcome(text.into());
+    ui.set_security_outcome_error(is_error);
 }
 
 /// A recovery operation must finish and a newly generated key must be saved
@@ -329,6 +507,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         let Some(window) = weak.upgrade() else {
             return;
         };
+        show_pending_key(&window);
         if !window.get_live_session() || window.get_security_busy() {
             return;
         }
@@ -336,24 +515,28 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if account_id.is_empty() {
             return;
         }
+        let Some(selection) = refresh_live.manager.account_selection(&account_id) else {
+            return;
+        };
         let operation = next_operation(&window);
         window.set_security_loading(true);
+        // Clears only an earlier status-read error, never an operation's
+        // outcome (see `set_outcome`).
         window.set_security_error("".into());
         let live = refresh_live.clone();
         let weak = weak.clone();
+        // A read: no account transition is held, so it never delays a switch.
         refresh_handle.spawn(async move {
-            let _transition = live.account_transition.lock().await;
-            if !active_account_is(&live, &account_id).await {
-                return;
-            }
-            let result = live.manager.security_info().await;
+            let manager = live.manager.clone();
+            let result = manager.recovery_overview_selected(&selection).await;
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if !same_view(&window, &account_id, operation) {
+                if !same_view(&window, &account_id, operation) || !selection.is_current() {
                     return;
                 }
                 window.set_security_loading(false);
                 match result {
-                    Ok(info) => apply_status(&window, info),
+                    Ok(info) => apply_overview(&window, &info),
+                    Err(AccountRecoveryError::AccountChanged) => {}
                     Err(_) => window.set_security_error(
                         "Could not load account security status. Try Refresh.".into(),
                     ),
@@ -383,65 +566,93 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if account_id.is_empty() {
             return;
         }
+        let Some(selection) = enable_live.manager.account_selection(&account_id) else {
+            return;
+        };
         if !enable_gate.begin() {
             return;
         }
+        // The reservation's generation: setup starts only while it holds.
+        let generation = enable_gate.ringing_generation();
         let operation = next_operation(&window);
         window.set_security_busy(true);
+        set_outcome(&window, "", false);
         window.set_security_error("".into());
+        window.set_security_progress("".into());
         window.set_security_notice("Keep Morpheus open while recovery is set up.".into());
         let live = enable_live.clone();
         let gate = enable_gate.clone();
         let weak = weak.clone();
         enable_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
-            if !active_account_is(&live, &account_id).await {
-                gate.reset();
-                let _ = weak.upgrade_in_event_loop(move |window| {
-                    if same_view(&window, &account_id, operation) {
-                        window.set_security_busy(false);
-                        window.set_security_notice("".into());
-                        window.set_security_error(
-                            "Account changed before recovery setup began. Refresh status.".into(),
-                        );
+            let admitted = {
+                let gate = gate.clone();
+                move || gate.recovery_owned(generation)
+            };
+            let progress_weak = weak.clone();
+            let progress_account = account_id.clone();
+            let report = move |progress: RecoveryProgress| {
+                let account = progress_account.clone();
+                let _ = progress_weak.upgrade_in_event_loop(move |window| {
+                    if same_view(&window, &account, operation) && window.get_security_busy() {
+                        window.set_security_progress(progress_text(progress).into());
                     }
                 });
-                return;
-            }
-            // The SDK returns the key only here. Do not cancel this future
-            // with a UI timeout after setup may have started on the server.
-            let result = live.manager.enable_recovery(None, false).await;
-            let status = if result.is_ok() {
-                live.manager.security_info().await.ok()
-            } else {
-                None
             };
-            if result.is_ok() {
+            // The SDK returns the key only at the end. Once started this is
+            // never cancelled or timed out, so the key cannot be lost.
+            let manager = live.manager.clone();
+            let result = manager
+                .enable_recovery_selected(&selection, &admitted, &report)
+                .await;
+            // The key is held for its account before anything else, so no UI
+            // path (a closed window, another account shown) can lose it; the
+            // gate stays reserved until "I saved this key".
+            // An unconfirmed setup's key is held the same way: the server
+            // may already depend on it.
+            let result = result.map(|enabled| {
                 gate.key_pending();
-            }
+                let mut held = PENDING_KEY
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *held = Some((account_id.clone(), enabled.key, enabled.confirmation));
+                enabled.overview
+            });
             let gate_for_ui = gate.clone();
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if !same_view(&window, &account_id, operation) {
-                    return;
-                }
-                window.set_security_busy(false);
-                if let Some(info) = status {
-                    apply_status(&window, info);
-                }
                 match result {
-                    Ok(key) => {
-                        window.set_security_key_revealed(false);
-                        window.set_security_recovery_key(key.reveal().into());
-                        window.set_security_notice(
-                            "Reveal and save this key now. It cannot be shown again.".into(),
-                        );
+                    Ok(overview) => {
+                        // Shown now for its account, with any uncertainty;
+                        // otherwise when that account's Security page next
+                        // refreshes.
+                        if window.get_active_account_local_id().as_str() == account_id {
+                            if let Some(info) = overview.as_ref() {
+                                apply_overview(&window, info);
+                            }
+                            show_pending_key(&window);
+                        }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         gate_for_ui.reset();
+                        if !same_view(&window, &account_id, operation) {
+                            return;
+                        }
+                        window.set_security_busy(false);
+                        window.set_security_progress("".into());
                         window.set_security_notice("".into());
-                        window.set_security_error(
-                            "Could not set up recovery. Refresh status before trying again.".into(),
-                        );
+                        let text = match error {
+                            AccountRecoveryError::Unconfirmed => {
+                                "Recovery setup did not finish and may have partly applied. The \
+                                 status is being read again; once it shows recovery still \
+                                 disabled, you can retry setup."
+                                    .to_owned()
+                            }
+                            other => other.to_string(),
+                        };
+                        // Kept through the refresh below (see `set_outcome`).
+                        set_outcome(&window, &text, true);
+                        // What the account has now, not what was attempted.
+                        window.invoke_refresh_security();
                     }
                 }
             });
@@ -457,8 +668,11 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             return;
         };
         // The Slint action clears its password field before invoking us;
-        // clear it again for callers outside that widget.
+        // clear it again for callers outside that widget. The typed value
+        // goes straight into zeroizing memory.
         window.set_security_recovery_input("".into());
+        let secret = Zeroizing::new(value.to_string());
+        drop(value);
         if window.get_security_busy()
             || !window.get_live_session()
             || window.get_sas_stage() != 0
@@ -467,7 +681,6 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         {
             return;
         }
-        let secret = Zeroizing::new(value.to_string());
         if secret.trim().is_empty() {
             window.set_security_error("Enter a recovery key or passphrase.".into());
             return;
@@ -476,63 +689,59 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if account_id.is_empty() {
             return;
         }
+        let Some(selection) = recover_live.manager.account_selection(&account_id) else {
+            return;
+        };
         if !recover_gate.begin() {
             return;
         }
+        let generation = recover_gate.ringing_generation();
         let operation = next_operation(&window);
         window.set_security_busy(true);
+        set_outcome(&window, "", false);
         window.set_security_error("".into());
+        window.set_security_progress("Importing your encrypted secrets…".into());
         window.set_security_notice("Keep Morpheus open while recovery runs.".into());
         let live = recover_live.clone();
         let gate = recover_gate.clone();
         let weak = weak.clone();
         recover_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
-            if !active_account_is(&live, &account_id).await {
-                gate.reset();
-                let _ = weak.upgrade_in_event_loop(move |window| {
-                    if same_view(&window, &account_id, operation) {
-                        window.set_security_busy(false);
-                        window.set_security_notice("".into());
-                        window.set_security_error(
-                            "Account changed before recovery began. Refresh status.".into(),
-                        );
-                    }
-                });
-                return;
-            }
-            let result = live.manager.recover_account(secret.as_str()).await;
-            let status = if result.is_ok() {
-                live.manager.security_info().await.ok()
-            } else {
-                None
+            let admitted = {
+                let gate = gate.clone();
+                move || gate.recovery_owned(generation)
             };
-            let gate_for_ui = gate.clone();
+            // Never cancelled or timed out once started; never retried here.
+            let manager = live.manager.clone();
+            let (result, overview) = manager
+                .recover_selected(&selection, &admitted, secret)
+                .await;
             let _ = weak.upgrade_in_event_loop(move |window| {
+                gate.reset();
                 if !same_view(&window, &account_id, operation) {
                     return;
                 }
-                gate_for_ui.reset();
                 window.set_security_busy(false);
-                if let Some(info) = status {
-                    apply_status(&window, info);
+                window.set_security_progress("".into());
+                if let Some(info) = overview.as_ref() {
+                    apply_overview(&window, info);
                 }
-                match result {
-                    Ok(()) => {
-                        window.set_security_notice(
-                            "Recovery completed. Refresh status if key backup is still updating."
-                                .into(),
-                        );
-                    }
-                    Err(_) => {
-                        window.set_security_notice("".into());
-                        window.set_security_error(
-                            "Recovery failed. Check the key or passphrase and try again.".into(),
-                        );
-                    }
+                let (notice, error) = recovery_outcome(&result, overview.as_ref());
+                window.set_security_notice("".into());
+                if error.is_empty() {
+                    set_outcome(&window, &notice, false);
+                } else {
+                    set_outcome(&window, &error, true);
                 }
             });
         });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_dismiss_security_outcome(move || {
+        if let Some(window) = weak.upgrade() {
+            set_outcome(&window, "", false);
+        }
     });
 
     let weak = ui.as_weak();
@@ -692,5 +901,146 @@ mod tests {
         let lease = gate.try_restart().unwrap();
         drop(lease);
         assert!(!gate.ringing_allowed(current));
+    }
+
+    fn overview(
+        recovery: RecoveryStatus,
+        backup: BackupStatus,
+        keys: Option<u8>,
+    ) -> RecoveryOverview {
+        RecoveryOverview {
+            device: DeviceVerificationStatus::Verified,
+            recovery,
+            backup,
+            backup_on_server: Some(true),
+            cross_signing: keys.map(|count| morpheus_matrix::CrossSigningKeys {
+                master: count >= 1,
+                self_signing: count >= 2,
+                user_signing: count >= 3,
+            }),
+        }
+    }
+
+    /// A recovery that returned is described by the state read after it:
+    /// complete only when recovery, all three identity keys and the backup
+    /// are in place, and even then never "all history".
+    #[test]
+    fn recovery_outcomes_never_claim_more_than_the_state_shows() {
+        let complete = overview(RecoveryStatus::Enabled, BackupStatus::Downloading, Some(3));
+        let (notice, error) = recovery_outcome(&Ok(()), Some(&complete));
+        assert!(error.is_empty());
+        assert!(notice.contains("3 of 3") && notice.contains("never backed up stay unreadable"));
+        assert!(!notice.to_lowercase().contains("all "));
+        for partial in [
+            overview(RecoveryStatus::Incomplete, BackupStatus::Enabled, Some(3)),
+            overview(RecoveryStatus::Enabled, BackupStatus::Unknown, Some(3)),
+            overview(RecoveryStatus::Enabled, BackupStatus::Enabled, Some(2)),
+            overview(RecoveryStatus::Enabled, BackupStatus::Enabled, None),
+        ] {
+            let (notice, error) = recovery_outcome(&Ok(()), Some(&partial));
+            assert!(notice.is_empty(), "{partial:?}");
+            assert!(error.contains("not complete"), "{partial:?}");
+        }
+        let (notice, error) = recovery_outcome(&Ok(()), None);
+        assert!(notice.is_empty() && error.contains("could not be read"));
+        // A wrong key invites another try; an uncertain outcome points at
+        // the state first; neither claims success.
+        let (notice, error) =
+            recovery_outcome(&Err(AccountRecoveryError::KeyNotAccepted), Some(&complete));
+        assert!(notice.is_empty() && error.contains("try again"));
+        let (_, error) = recovery_outcome(&Err(AccountRecoveryError::Unconfirmed), None);
+        assert!(error.contains("Check the state"));
+        let (_, error) = recovery_outcome(
+            &Err(AccountRecoveryError::BackupNotRestored),
+            Some(&complete),
+        );
+        assert!(error.contains("Nothing was deleted") && error.contains("3 of 3"));
+    }
+
+    #[test]
+    fn status_lines_say_what_is_not_known() {
+        let mut unknown = overview(RecoveryStatus::Unknown, BackupStatus::Unknown, None);
+        unknown.backup_on_server = None;
+        let (_, recovery, backup, identity, can_enable) = overview_labels(&unknown);
+        assert_eq!(recovery, "Checking");
+        assert!(backup.contains("not known") && identity.contains("not known"));
+        assert!(!can_enable);
+        let disabled = overview(RecoveryStatus::Disabled, BackupStatus::Unknown, Some(0));
+        let (_, _, backup, identity, can_enable) = overview_labels(&disabled);
+        assert!(can_enable && identity.contains("0 of 3") && backup.contains("exists"));
+        let counted = progress_text(RecoveryProgress::BackingUp {
+            backed_up: 3,
+            total: 9,
+        });
+        assert!(counted.contains("3 of 9"));
+        assert!(progress_text(RecoveryProgress::UploadIncomplete).contains("later"));
+    }
+
+    /// A key from a setup that failed while storing it is never presented
+    /// as in use, nor as unused: the outcome says it is not known, asks for
+    /// the key to be saved first, and warns that a new setup replaces it.
+    #[test]
+    fn an_unconfirmed_setup_keeps_its_uncertainty_with_the_key() {
+        assert_eq!(setup_outcome(SetupConfirmation::Confirmed), None);
+        let final_step = setup_outcome(SetupConfirmation::FinalStepFailed).unwrap();
+        assert!(final_step.contains("unconfirmed") && final_step.contains("Save the key first"));
+        let storage = setup_outcome(SetupConfirmation::StorageUnknown).unwrap();
+        assert!(storage.contains("is not known") && storage.contains("Save the key first"));
+        assert!(storage.contains("may already use it") && storage.contains("replaces it"));
+        for claim in ["was saved", "is in use", "is set up", "nothing"] {
+            assert!(!storage.to_lowercase().contains(claim), "{claim}");
+        }
+        // The key and its outcome stay reserved until acknowledged: no new
+        // setup can start meanwhile, and an error path never releases it.
+        let gate = SecurityGate::default();
+        assert!(gate.begin());
+        gate.key_pending();
+        gate.reset();
+        assert!(!gate.begin(), "no new setup while the key is pending");
+        gate.acknowledge_key();
+        assert!(gate.begin());
+    }
+
+    /// A recovery that failed turning the key backup on, after the identity
+    /// came back, is described by the state read afterwards and never says
+    /// nothing was imported.
+    #[test]
+    fn a_late_backup_failure_shows_the_recovered_identity() {
+        let identity = overview(RecoveryStatus::Incomplete, BackupStatus::Unknown, Some(3));
+        let late = Err(AccountRecoveryError::BackupNotEnabled);
+        let (notice, error) = recovery_outcome(&late, Some(&identity));
+        assert!(notice.is_empty());
+        assert!(error.contains("may have been recovered") && error.contains("3 of 3"));
+        assert!(error.contains("Check the state below"));
+        assert!(!error.to_lowercase().contains("nothing was imported"));
+        let unread = Err(AccountRecoveryError::RecoveryDataUnreadable);
+        let (_, error) = recovery_outcome(&unread, None);
+        assert!(error.contains("could not be read") && error.contains("Nothing was imported"));
+    }
+
+    /// Setup and recovery start only under their own reservation; a pending
+    /// key keeps the gate reserved through any error path until the person
+    /// acknowledges it, and a newer reservation never admits an older run.
+    #[test]
+    fn the_recovery_reservation_fences_only_its_own_run() {
+        let gate = Arc::new(SecurityGate::default());
+        assert!(gate.begin());
+        let generation = gate.ringing_generation();
+        assert!(gate.recovery_owned(generation));
+        gate.key_pending();
+        assert!(!gate.recovery_owned(generation));
+        gate.reset();
+        assert!(gate.blocked(), "an error path never releases a pending key");
+        assert_eq!(close_response(&gate), CloseRequestResponse::KeepWindowShown);
+        gate.acknowledge_key();
+        assert!(!gate.blocked());
+        assert!(gate.begin());
+        assert!(
+            !gate.recovery_owned(generation),
+            "an older run is not admitted"
+        );
+        assert!(gate.recovery_owned(gate.ringing_generation()));
+        gate.reset();
+        assert!(!gate.blocked());
     }
 }

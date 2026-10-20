@@ -418,8 +418,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         client.send_queue().set_enabled(false).await;
+        let e2ee = crate::account_recovery::E2eeReadiness::of(&client);
         let loaded = Arc::new(LoadedAccount {
             client,
+            e2ee,
             timelines: Mutex::new(HashMap::new()),
             composed_edits: Mutex::new(HashMap::new()),
             pending_sends: Mutex::new(HashMap::new()),

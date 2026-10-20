@@ -11,9 +11,11 @@
 //! level or explorer (A-B-A included) is dropped. Detaching, switching or
 //! closing clears every private name and row synchronously.
 //!
-//! Joins go through `LiveUi::join_explorer_target` (the guarded directory
-//! join path) and Open through the existing `select-space` / `open-room`
-//! routing. Nothing here edits a Space or its links.
+//! Joins go through `LiveUi::join_target_for` (the one bounded join for the
+//! exact selection, shared with the directory) and Open through the
+//! existing `select-space` / `open-room` routing. Nothing here edits a Space
+//! or its links. Closing or clearing the explorer withdraws its join: before
+//! the hand-off nothing is sent, after it nothing is opened.
 
 use std::{
     cell::{Cell, RefCell},
@@ -30,7 +32,10 @@ use morpheus_matrix::{
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::runtime::Handle;
 
-use crate::{AppWindow, SpaceExplorer, SpaceExplorerCrumb, SpaceExplorerRow, live::LiveUi};
+use crate::{
+    AppWindow, SpaceExplorer, SpaceExplorerCrumb, SpaceExplorerRow,
+    live::{JoinAsked, LiveUi},
+};
 
 #[cfg(test)]
 mod tests;
@@ -435,9 +440,7 @@ impl Explorer {
             };
             return joinable.then(|| JoinTarget {
                 room_id: level.space_id.clone(),
-                name: level.name.clone(),
                 via: level.via.clone(),
-                is_space: true,
                 restricted: status == Some(Status::Restricted),
             });
         }
@@ -445,9 +448,7 @@ impl Explorer {
         let status = row.status();
         status.joinable().then(|| JoinTarget {
             room_id: row.room_id.clone(),
-            name: row.name.clone(),
             via: row.via.clone(),
-            is_space: row.is_space,
             restricted: status == Status::Restricted,
         })
     }
@@ -578,12 +579,12 @@ fn label(text: &str, fallback: &str) -> String {
     }
 }
 
+/// What a join needs: whether it is a Space, and its name, come from sync
+/// once it is joined (LiveUi::join_target_for), never from the preview.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JoinTarget {
     pub(crate) room_id: String,
-    pub(crate) name: String,
     pub(crate) via: Vec<String>,
-    pub(crate) is_space: bool,
     pub(crate) restricted: bool,
 }
 
@@ -603,8 +604,38 @@ impl JoinTarget {
     }
     /// A fixed sentence; the homeserver's reason is never shown.
     fn failure(&self, error: &MatrixCoreError) -> &'static str {
+        use morpheus_matrix::JoinError;
         match error {
-            MatrixCoreError::SelectedAccountChanged => "The account changed before joining.",
+            MatrixCoreError::SelectedAccountChanged
+            | MatrixCoreError::Join(JoinError::AccountChanged) => {
+                "The account changed before joining. Nothing was sent."
+            }
+            MatrixCoreError::Join(JoinError::Cancelled) => {
+                "The join was cancelled before it was sent. Nothing was sent."
+            }
+            MatrixCoreError::Join(JoinError::Blocked) => {
+                "Finish the current security step first. Nothing was sent."
+            }
+            MatrixCoreError::Join(JoinError::Unavailable) => {
+                "This account cannot join rooms right now. Nothing was sent."
+            }
+            MatrixCoreError::Join(JoinError::Pending) => {
+                "A join of this room is still waiting for its reply. Nothing more was sent."
+            }
+            MatrixCoreError::Join(JoinError::EarlierUnknown) => {
+                "An earlier join of this room may or may not have happened. Further joins of it are paused in this session. Check your room list. Nothing was sent."
+            }
+            MatrixCoreError::Join(JoinError::UnresolvedLimit) => {
+                "Other joins still need checking. Further joins are paused in this session. Nothing was sent."
+            }
+            // Never taken as this room: nothing opens.
+            MatrixCoreError::Join(JoinError::UnexpectedRoom) => {
+                "The homeserver answered for a different room, so nothing was opened. Check your room list before joining again."
+            }
+            // Sent, and no definite reply: never "could not join".
+            MatrixCoreError::Join(error) if error.may_have_joined() => {
+                "No reply arrived, so you may or may not have joined. Check your room list before joining again."
+            }
             _ if self.restricted => {
                 "Could not join. Only members of certain Spaces or rooms can join this one."
             }
@@ -625,6 +656,9 @@ thread_local! {
     // started for an earlier one is ever taken.
     static OPERATION: Cell<u64> = const { Cell::new(0) };
     static ROWS: Rc<VecModel<SpaceExplorerRow>> = Rc::new(VecModel::default());
+    // The explorer's join in progress, with its operation number; closing
+    // the explorer (or anything that clears it) withdraws it.
+    static JOINING: RefCell<Option<(u64, JoinAsked)>> = const { RefCell::new(None) };
     static CRUMBS: Rc<VecModel<SpaceExplorerCrumb>> = Rc::new(VecModel::default());
 }
 
@@ -639,6 +673,11 @@ fn next_operation() -> u64 {
 /// End the explorer and forget every name and row it showed, now.
 pub(crate) fn clear(ui: &AppWindow) {
     next_operation();
+    // Before its hand-off nothing is sent; after it nothing is opened, and
+    // its outcome stays with LiveUi's join record.
+    if let Some((_, asked)) = JOINING.with(|joining| joining.borrow_mut().take()) {
+        asked.withdraw();
+    }
     SESSION.with(|session| *session.borrow_mut() = None);
     ROWS.with(|rows| rows.set_vec(Vec::new()));
     CRUMBS.with(|crumbs| crumbs.set_vec(Vec::new()));
@@ -661,6 +700,13 @@ pub(crate) fn clear(ui: &AppWindow) {
 /// Whether the explorer is open.
 pub(crate) fn is_open(ui: &AppWindow) -> bool {
     ui.global::<SpaceExplorer>().get_open()
+}
+
+#[cfg(test)]
+pub(crate) fn hold_join_for_test(ui: &AppWindow, asked: JoinAsked) {
+    clear(ui);
+    JOINING.with(|joining| *joining.borrow_mut() = Some((next_operation(), asked)));
+    ui.global::<SpaceExplorer>().set_open(true);
 }
 
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
@@ -788,7 +834,12 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
 
 /// The selection of the account on screen, if it may still read.
 fn current_selection(ui: &AppWindow, live: &LiveUi) -> Option<AccountSelection> {
-    if !live.is_live.load(Ordering::Acquire) || !ui.get_live_session() {
+    if crate::room_addresses::is_open(ui)
+        || !live.is_live.load(Ordering::Acquire)
+        || !ui.get_discovery_context_allowed()
+        || ui.get_room_actions_open()
+        || live.security_gate.blocked()
+    {
         return None;
     }
     let account_id = ui.get_active_account_local_id();
@@ -803,6 +854,10 @@ fn current_selection(ui: &AppWindow, live: &LiveUi) -> Option<AccountSelection> 
 /// The open session's selection while it is still the account on screen.
 /// A departed selection clears the explorer.
 fn live_session(ui: &AppWindow) -> Option<AccountSelection> {
+    if !ui.get_discovery_context_allowed() || ui.get_room_actions_open() {
+        clear(ui);
+        return None;
+    }
     let selection = SESSION.with(|session| {
         session
             .borrow()
@@ -937,21 +992,26 @@ fn join(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, room_id: &str) {
     let Some(target) = target else {
         return;
     };
+    // The navigation and security generations at this click.
+    let asked = live.join_asked();
+    JOINING.with(|joining| *joining.borrow_mut() = Some((ticket, asked.clone())));
     let (live, task) = (live.clone(), handle.clone());
     let weak = ui.as_weak();
     handle.spawn(async move {
         let link = target.link();
-        let joining = live.join_explorer_target(
-            &selection,
-            &link,
-            Some(target.is_space),
-            &target.name,
-            weak.clone(),
-        );
+        let joining = live.join_target_for(&selection, &link, &asked, weak.clone());
+        // This caller bound also covers inherited SDK metadata setup. SDK
+        // admission conservatively marks uncertainty, not proof of wire IO.
         let result = tokio::time::timeout(JOIN_TIMEOUT, joining)
             .await
-            .unwrap_or(Err(MatrixCoreError::Sdk("timed out".into())));
+            .unwrap_or_else(|_| Err(asked.expired().into()));
         let _ = weak.upgrade_in_event_loop(move |ui| {
+            JOINING.with(|joining| {
+                let mut joining = joining.borrow_mut();
+                if joining.as_ref().is_some_and(|(owner, _)| *owner == ticket) {
+                    *joining = None;
+                }
+            });
             if live_session(&ui).is_none() {
                 return;
             }

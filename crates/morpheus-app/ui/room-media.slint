@@ -161,6 +161,11 @@ export component RoomMediaPanel inherits FocusScope {
     property <length> row-gap: 4px;
     property <length> pitch: root.row-height + root.row-gap;
     property <length> line-height: 16px * root.text-scale;
+    // Intrinsic space for the fixed footer and one whole row. It must
+    // not depend on the height the parent later allocates to this panel.
+    property <length> reserved-height: 24px + 16px + footer.preferred-height + root.pitch;
+    min-height: root.reserved-height + root.line-height + 4px;
+    preferred-height: self.min-height;
     property <int> count: RoomMedia.rows.length;
     property <bool> has-current: root.available && root.current >= 0 && root.current < root.count;
     // Rows wholly in view, at least one.
@@ -188,6 +193,13 @@ export component RoomMediaPanel inherits FocusScope {
         } else if top + root.row-height > -list.viewport-y + list.visible-height {
             list.viewport-y = -(top + root.row-height - list.visible-height);
         }
+    }
+    function reveal-header(offset: length, extent: length) {
+        let shown = -body.viewport-y;
+        let target = offset < shown ? offset
+            : offset + extent > shown + body.visible-height
+                ? min(offset, offset + extent - body.visible-height) : shown;
+        body.viewport-y = -max(0px, min(target, max(0px, body.viewport-height - body.visible-height)));
     }
     function move-to(index: int) {
         if root.count > 0 {
@@ -252,88 +264,98 @@ export component RoomMediaPanel inherits FocusScope {
     }
 
     Rectangle {
+        // Positioned content uses the allocated panel geometry without
+        // feeding its height-dependent scroll cap back into our intrinsic size.
+        x: 0px; y: 0px;
+        width: root.width; height: root.height;
         background: root.palette.panel;
         VerticalLayout {
             padding: 12px;
             spacing: 8px;
-            title := Text {
-                text: "Media";
-                color: root.palette.ink;
-                font-size: 15px * root.text-scale;
-                font-weight: 750;
-                overflow: elide;
-            }
-            search-box := Rectangle {
-                height: max(32px, 16px * root.text-scale + 14px);
-                background: root.palette.input-surface;
-                border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
-                border-width: search-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
-                border-color: search-input.has-focus ? root.palette.focus : root.palette.input-border;
-                HorizontalLayout {
-                    padding-left: StyleTokens.input-padding * root.text-scale;
-                    padding-right: StyleTokens.input-padding * root.text-scale;
-                    Rectangle {
-                        // The typed search must not widen the panel.
-                        min-width: 0px;
-                        clip: true;
-                        search-input := TextInput {
-                            width: parent.width;
-                            height: parent.height;
-                            text <=> RoomMedia.query;
-                            color: root.palette.ink;
-                            selection-background-color: root.palette.selection;
-                            selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
-                            font-size: 12px * root.text-scale;
-                            vertical-alignment: center;
-                            single-line: true;
-                            enabled: root.available;
-                            accessible-label: "Search loaded media; arrows select, Enter shows it in the conversation, Escape clears or closes";
-                            edited => { root.edited(self.text); }
-                            accepted => { root.open-current(); }
-                        }
-                        if RoomMedia.query == "" : Text {
-                            width: parent.width;
-                            height: parent.height;
-                            text: "Search loaded media";
-                            color: root.palette.muted;
-                            font-size: 12px * root.text-scale;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            accessible-role: none;
-                        }
-                    }
-                }
-            }
-            kind-select := TokenSelect {
-                model: ["All media", "Images", "Videos", "Audio", "Files"];
-                current-index <=> RoomMedia.kind;
-                enabled: root.available;
-                colors: root.select-colors;
-                text-scale: root.text-scale;
-                accessible-label: "Kind of media shown";
-                selected(value) => {
-                    root.current = 0;
-                    list.viewport-y = 0;
-                    RoomMedia.filter(RoomMedia.query, self.current-index);
-                }
-            }
-            // The words that can grow: the coverage line, an error and the
-            // empty notes. They scroll inside a region that never takes the
-            // room the list's first row and the footer need, so at the
-            // minimum window height with 200% text one whole row and every
-            // action stay on screen.
+            // The header controls and growing coverage/error text share a
+            // bounded scroll region. One whole list row and the fixed footer
+            // keep their space even at the minimum height with 200% text.
             body := ScrollView {
                 min-height: root.line-height + 4px;
                 preferred-height: body-content.preferred-height;
-                max-height: max(self.min-height,
-                    root.height - 24px - 40px - title.preferred-height - search-box.height
-                        - kind-select.preferred-height - footer.preferred-height - root.pitch);
+                max-height: max(self.min-height, root.height - root.reserved-height);
                 vertical-stretch: 0;
                 viewport-width: self.visible-width;
                 viewport-height: body-content.preferred-height;
                 body-content := VerticalLayout {
                     width: body.visible-width;
                     spacing: 4px;
+                    title := Text {
+                        text: "Media";
+                        color: root.palette.ink;
+                        font-size: 15px * root.text-scale;
+                        font-weight: 750;
+                        overflow: elide;
+                    }
+                    search-box := Rectangle {
+                        height: max(32px, 16px * root.text-scale + 14px);
+                        background: root.palette.input-surface;
+                        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+                        border-width: search-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+                        border-color: search-input.has-focus ? root.palette.focus : root.palette.input-border;
+                        HorizontalLayout {
+                            padding-left: StyleTokens.input-padding * root.text-scale;
+                            padding-right: StyleTokens.input-padding * root.text-scale;
+                            Rectangle {
+                                // The typed search must not widen the panel.
+                                min-width: 0px;
+                                clip: true;
+                                search-input := TextInput {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    text <=> RoomMedia.query;
+                                    color: root.palette.ink;
+                                    selection-background-color: root.palette.selection;
+                                    selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                                    font-size: 12px * root.text-scale;
+                                    vertical-alignment: center;
+                                    single-line: true;
+                                    enabled: root.available;
+                                    accessible-label: "Search loaded media; arrows select, Enter shows it in the conversation, Escape clears or closes";
+                                    changed has-focus => {
+                                        if self.has-focus {
+                                            root.reveal-header(search-box.absolute-position.y - body-content.absolute-position.y, search-box.height);
+                                        }
+                                    }
+                                    edited => { root.edited(self.text); }
+                                    accepted => { root.open-current(); }
+                                }
+                                if RoomMedia.query == "" : Text {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    text: "Search loaded media";
+                                    color: root.palette.muted;
+                                    font-size: 12px * root.text-scale;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    accessible-role: none;
+                                }
+                            }
+                        }
+                    }
+                    kind-select := TokenSelect {
+                        model: ["All media", "Images", "Videos", "Audio", "Files"];
+                        current-index <=> RoomMedia.kind;
+                        enabled: root.available;
+                        colors: root.select-colors;
+                        text-scale: root.text-scale;
+                        accessible-label: "Kind of media shown";
+                        changed has-focus => {
+                            if self.has-focus {
+                                root.reveal-header(self.absolute-position.y - body-content.absolute-position.y, self.height);
+                            }
+                        }
+                        selected(value) => {
+                            root.current = 0;
+                            list.viewport-y = 0;
+                            RoomMedia.filter(RoomMedia.query, self.current-index);
+                        }
+                    }
                     Rectangle {
                         height: status-text.height;
                         status-text := Text {

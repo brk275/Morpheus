@@ -235,7 +235,10 @@ impl RoomPanel {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
-        if !on_screen(&ui, account_id, room_id) || !self.live.is_live.load(Ordering::Acquire) {
+        if crate::room_addresses::is_open(&ui)
+            || !on_screen(&ui, account_id, room_id)
+            || !self.live.is_live.load(Ordering::Acquire)
+        {
             return;
         }
         let Some(selection) = self.live.manager.account_selection(account_id) else {

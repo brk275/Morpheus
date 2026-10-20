@@ -31,8 +31,8 @@ pub use polls::{
 };
 mod discovery;
 pub use discovery::{
-    MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery, ResolvedRoomAlias,
-    parse_matrix_link_target,
+    JoinCancellation, JoinError, MAX_JOIN_VIA, MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage,
+    PublicRoomsQuery, ResolvedRoomAlias, parse_matrix_link_target,
 };
 mod space_management;
 pub use space_management::{
@@ -84,6 +84,10 @@ pub use room_settings::{
     RoomSettingsCancellation, RoomSettingsError, RoomSettingsPermissions, RoomSettingsSession,
     RoomSettingsSnapshot,
 };
+pub use room_settings::{
+    MAX_ALIAS_LOCALPART_CHARS, MAX_ALTERNATIVE_ADDRESSES, MAX_ROOM_ADDRESSES, PublishEdit,
+    RoomAddress, RoomAddressError, RoomAddressesSession, RoomAddressesSnapshot, new_local_address,
+};
 mod pinned_messages;
 pub use pinned_messages::{
     MAX_PINNED_DISPLAY, MAX_PINNED_EVENTS, MAX_PINNED_SENDER_CHARS, MAX_PINNED_TEXT_CHARS,
@@ -133,6 +137,11 @@ pub use device_sessions::{
     RenameOutcome, SignOutBlocker, SignOutChallenge, SignOutMethod, SignOutStep,
     bounded_device_name,
 };
+mod account_recovery;
+pub use account_recovery::{
+    AccountRecoveryError, AccountRecoveryResult, CrossSigningKeys, EnabledRecovery,
+    RecoveryOverview, RecoveryProgress, SetupConfirmation,
+};
 mod own_verification;
 pub use own_verification::{
     MAX_PENDING_VERIFICATIONS, MAX_VERIFICATION_DEVICE_NAME_CHARS, OwnVerification,
@@ -164,7 +173,7 @@ use matrix_sdk::{
     room::Room,
     room::edit::EditedContent,
     ruma::{
-        EventId, RoomId, RoomOrAliasId, ServerName, UserId,
+        EventId, RoomId, ServerName, UserId,
         api::{
             FeatureFlag,
             client::{room::create_room, space::get_hierarchy},
@@ -306,6 +315,9 @@ pub enum MatrixCoreError {
     Keyring(String),
     #[error("Matrix SDK error: {0}")]
     Sdk(String),
+    /// A join that did not complete (fixed sentences, no homeserver text).
+    #[error(transparent)]
+    Join(#[from] JoinError),
     #[error("{0} login is not implemented yet")]
     UnsupportedLogin(&'static str),
 }
@@ -1031,6 +1043,9 @@ struct StoredSecret {
 
 struct LoadedAccount {
     client: Client,
+    /// This client's own encryption setup after sign-in, started when the
+    /// client is loaded; the only evidence that setup settled.
+    e2ee: account_recovery::E2eeReadiness,
     timelines: Mutex<HashMap<String, Arc<Timeline>>>,
     composed_edits: Mutex<HashMap<(String, String), composed_adapter::PendingEdit>>,
     /// Authoritative recovery state per draft scope, mirrored from the last
@@ -2723,17 +2738,27 @@ impl AccountManager {
         Ok(room.room_id().to_string())
     }
 
+    /// The active account joins a room by ID or alias, through the one
+    /// bounded request of join_room_for (no routes, no local state change;
+    /// the room appears once sync shows it). No app path calls this; local
+    /// fixtures do.
     pub async fn join_room(&self, room_or_alias_id: &str) -> Result<String> {
-        let state = self.state.lock().await;
-        let loaded = selected_loaded(&state)?;
-        let id = RoomOrAliasId::parse(room_or_alias_id)
-            .map_err(|e| MatrixCoreError::InvalidRoomId(e.to_string()))?;
-        let room = loaded
-            .client
-            .join_room_by_id_or_alias(&id, &[])
+        let account = self
+            .active_account()
             .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        Ok(room.room_id().to_string())
+            .ok_or(MatrixCoreError::NoActiveAccount)?;
+        let selection = self
+            .account_selection(&account.id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        let target = MatrixLinkTarget::Room {
+            room_or_alias_id: room_or_alias_id.to_owned(),
+            event_id: None,
+            via_servers: Vec::new(),
+        };
+        let cancellation = discovery::JoinCancellation::new();
+        Ok(self
+            .join_room_for(&selection, &target, &cancellation, || true)
+            .await?)
     }
 
     pub async fn leave_room(&self, room_id: &str) -> Result<()> {
@@ -3025,13 +3050,17 @@ impl AccountManager {
         wait_for_backup_upload: bool,
     ) -> Result<RecoveryKey> {
         let state = self.state.lock().await;
-        let client = &selected_loaded(&state)?.client;
+        let loaded = selected_loaded(&state)?;
+        let client = &loaded.client;
         // Cross-signing is bootstrapped by the SDK after login. Export its
-        // secrets into recovery only after that initialization has settled.
-        client
-            .encryption()
-            .wait_for_e2ee_initialization_tasks()
-            .await;
+        // secrets into recovery only after that initialization settled for
+        // this loaded client, by its own readiness owner: another wait on
+        // the SDK's task would return at once and prove nothing.
+        if !loaded.e2ee.settled().await {
+            return Err(MatrixCoreError::Sdk(
+                "Encryption is not ready on this device yet".into(),
+            ));
+        }
         let recovery = client.encryption().recovery();
         let mut enable = recovery.enable();
         if wait_for_backup_upload {
@@ -3220,6 +3249,9 @@ impl LoadedAccount {
         store_passphrase: String,
         profile_lock: Arc<fs::File>,
     ) -> Self {
+        // First, before the client is shared: the SDK gives its setup task
+        // to the first waiter only.
+        let e2ee = account_recovery::E2eeReadiness::of(&client);
         let (incoming_verification_tx, _) = watch::channel(Vec::<VerificationInfo>::new());
         let verification_book = Arc::new(own_verification::VerificationBook::default());
         if let Some(own_user_id) = client.user_id().map(ToOwned::to_owned) {
@@ -3302,6 +3334,7 @@ impl LoadedAccount {
         });
         Self {
             client,
+            e2ee,
             timelines: Mutex::new(HashMap::new()),
             composed_edits: Mutex::new(HashMap::new()),
             pending_sends: Mutex::new(HashMap::new()),

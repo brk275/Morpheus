@@ -186,6 +186,7 @@ impl AccountAccessUi {
             if current_generation.load(Ordering::Acquire) != generation {
                 return;
             }
+            crate::room_addresses::clear(&ui);
             clear_passwords(&ui);
             ui.set_access_mode(mode);
             ui.set_access_target(label.into());
@@ -202,6 +203,9 @@ impl AccountAccessUi {
     fn show_switch_pending(self: &Arc<Self>, generation: u64, pending: bool) {
         if let Some(ui) = self.ui.upgrade() {
             if self.switch_generation.load(Ordering::Acquire) == generation {
+                if pending {
+                    crate::room_addresses::clear(&ui);
+                }
                 ui.set_account_switch_pending(pending);
             }
         } else {
@@ -209,6 +213,9 @@ impl AccountAccessUi {
             let _ = self.ui.upgrade_in_event_loop(move |ui| {
                 // A completed request must not re-enable a newer switch.
                 if access.switch_generation.load(Ordering::Acquire) == generation {
+                    if pending {
+                        crate::room_addresses::clear(&ui);
+                    }
                     ui.set_account_switch_pending(pending);
                 }
             });
@@ -410,6 +417,8 @@ impl AccountAccessUi {
                         crate::space_management::forget_account(&id);
                         access.live.voice_spaces.forget_account(&id).await;
                         if result.complete {
+                            crate::room_addresses::forget_account(&id);
+                            access.live.forget_removed_account_joins(&id);
                             if let Err(error) = access.live.voice_spaces.clear_logged_out_account(&id) {
                                 return Ok(format!("Account removed. Some appearance preferences could not be removed: {error}"));
                             }

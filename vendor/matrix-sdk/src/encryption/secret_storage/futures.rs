@@ -12,11 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{future::IntoFuture, pin::Pin};
+use std::{
+    fmt,
+    future::IntoFuture,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 
 use futures_core::Future;
 use matrix_sdk_base::crypto::secret_storage::SecretStorageKey;
 use ruma::events::secret_storage::default_key::SecretStorageDefaultKeyEventContent;
+use zeroize::Zeroizing;
 
 use super::{Result, SecretStorage, SecretStore};
 
@@ -25,6 +31,45 @@ use super::{Result, SecretStorage, SecretStore};
 pub struct CreateStore<'a> {
     pub(super) secret_storage: &'a SecretStorage,
     pub(super) passphrase: Option<&'a str>,
+    // MORPHEUS PATCH (generated key handoff).
+    pub(super) key_handoff: Option<GeneratedKeyHandoff>,
+}
+
+/// MORPHEUS PATCH (generated key handoff): receives the key a new
+/// [`SecretStore`] is protected with, encoded like
+/// [`SecretStore::secret_storage_key()`], as soon as the key is generated and
+/// before anything about it is sent to the homeserver.
+///
+/// Creating a store uploads the key's description, then the secrets
+/// encrypted with it, then makes it the default key. Each of those requests
+/// can take effect on the server and still end in an error, after which the
+/// creation fails and drops the key. A caller holding a handoff still has
+/// the key in that case. The key is held in zeroizing memory; this type's
+/// `Debug` output never contains it.
+#[derive(Clone, Default)]
+pub struct GeneratedKeyHandoff(Arc<Mutex<Option<Zeroizing<String>>>>);
+
+impl GeneratedKeyHandoff {
+    /// An empty handoff.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The generated key, taken out of the handoff. `None` if no key was
+    /// generated yet, or it was already taken.
+    pub fn take(&self) -> Option<Zeroizing<String>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).take()
+    }
+
+    fn put(&self, key: Zeroizing<String>) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(key);
+    }
+}
+
+impl fmt::Debug for GeneratedKeyHandoff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GeneratedKeyHandoff").finish_non_exhaustive()
+    }
 }
 
 impl<'a> CreateStore<'a> {
@@ -34,6 +79,16 @@ impl<'a> CreateStore<'a> {
     /// method for more info.
     pub fn with_passphrase(mut self, passphrase: &'a str) -> Self {
         self.passphrase = Some(passphrase);
+
+        self
+    }
+
+    /// MORPHEUS PATCH (generated key handoff): put the new key into
+    /// `handoff` right after it is generated, before the first request.
+    ///
+    /// See [`GeneratedKeyHandoff`].
+    pub fn hand_key_to(mut self, handoff: GeneratedKeyHandoff) -> Self {
+        self.key_handoff = Some(handoff);
 
         self
     }
@@ -47,7 +102,7 @@ impl<'a> IntoFuture for CreateStore<'a> {
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { secret_storage, passphrase } = self;
+        let Self { secret_storage, passphrase, key_handoff } = self;
 
         Box::pin(async move {
             // Prevent multiple simultaneous calls to this method.
@@ -62,6 +117,13 @@ impl<'a> IntoFuture for CreateStore<'a> {
             } else {
                 SecretStorageKey::new()
             };
+
+            // MORPHEUS PATCH (generated key handoff): from here on any request
+            // may take effect on the server before an error is returned, so
+            // the key leaves this future first.
+            if let Some(handoff) = &key_handoff {
+                handoff.put(Zeroizing::new(new_key.to_base58()));
+            }
 
             let content = new_key.event_content().to_owned();
 

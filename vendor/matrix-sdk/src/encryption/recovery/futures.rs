@@ -24,7 +24,10 @@ use tracing::{Instrument, Span, warn};
 
 use super::{EnableProgress, Recovery, RecoveryError, Result};
 use crate::{
-    encryption::{backups::UploadState, secret_storage::SecretStore},
+    encryption::{
+        backups::UploadState,
+        secret_storage::{GeneratedKeyHandoff, SecretStore},
+    },
     utils::ChannelObservable,
 };
 
@@ -35,6 +38,8 @@ pub struct Enable<'a> {
     pub(super) progress: ChannelObservable<EnableProgress>,
     pub(super) wait_for_backups_upload: bool,
     pub(super) passphrase: Option<&'a str>,
+    // MORPHEUS PATCH (generated key handoff).
+    pub(super) key_handoff: Option<GeneratedKeyHandoff>,
     tracing_span: Span,
 }
 
@@ -45,6 +50,7 @@ impl<'a> Enable<'a> {
             progress: Default::default(),
             wait_for_backups_upload: false,
             passphrase: None,
+            key_handoff: None,
             tracing_span: Span::current(),
         }
     }
@@ -77,6 +83,21 @@ impl<'a> Enable<'a> {
 
         self
     }
+
+    /// MORPHEUS PATCH (generated key handoff): hand the new recovery key to
+    /// `handoff` as soon as it is generated, before secret storage is
+    /// written.
+    ///
+    /// If this future then fails, it never reaches
+    /// [`EnableProgress::Done`], yet the server may already store secrets
+    /// encrypted with that key, or use it as the default key. The handoff
+    /// keeps the key for the caller in that case. Nothing else about
+    /// enabling recovery changes.
+    pub fn hand_key_to(mut self, handoff: GeneratedKeyHandoff) -> Self {
+        self.key_handoff = Some(handoff);
+
+        self
+    }
 }
 
 impl<'a> IntoFuture for Enable<'a> {
@@ -84,7 +105,14 @@ impl<'a> IntoFuture for Enable<'a> {
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { recovery, progress, wait_for_backups_upload, passphrase, tracing_span } = self;
+        let Self {
+            recovery,
+            progress,
+            wait_for_backups_upload,
+            passphrase,
+            key_handoff,
+            tracing_span,
+        } = self;
 
         let future = async move {
             if !recovery.client.encryption().backups().are_enabled().await {
@@ -105,6 +133,13 @@ impl<'a> IntoFuture for Enable<'a> {
                 secret_storage.create_secret_store().with_passphrase(passphrase)
             } else {
                 secret_storage.create_secret_store()
+            };
+
+            // MORPHEUS PATCH (generated key handoff).
+            let create_store = if let Some(handoff) = key_handoff {
+                create_store.hand_key_to(handoff)
+            } else {
+                create_store
             };
 
             let store: SecretStore = create_store.await?;

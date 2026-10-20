@@ -335,6 +335,9 @@ impl MemberPrivacyUi {
     }
 
     fn inspect(self: &Arc<Self>, ui: &AppWindow, user: &str) {
+        if crate::room_addresses::is_open(ui) {
+            return;
+        }
         let room = ui.get_active_room_id().to_string();
         let Some(selection) = self.live_account(ui) else {
             return;
@@ -777,6 +780,9 @@ impl MemberPrivacyUi {
     }
 
     fn review_unignore(&self, ui: &AppWindow, key: &str) {
+        if crate::room_addresses::is_open(ui) {
+            return;
+        }
         {
             let mut state = self.lock();
             let Some(panel) = state.panel.as_mut() else {
@@ -813,6 +819,9 @@ impl MemberPrivacyUi {
     }
 
     fn confirm_unignore(self: &Arc<Self>, ui: &AppWindow) {
+        if crate::room_addresses::is_open(ui) {
+            return;
+        }
         // The admission fence the core rechecks right before the write.
         let generation = self.live.security_gate.ringing_generation();
         let started = {

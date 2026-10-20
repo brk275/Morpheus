@@ -27,6 +27,8 @@ import { RoomActivity, SeenByDialog, SeenByRow, TypingFooter } from "room-activi
 export { RoomActivity, SeenByRow } from "room-activity.slint";
 import { SpaceRooms, SpaceRoomsPanel } from "space-management.slint";
 export { SpaceRoomEntry, SpaceRooms } from "space-management.slint";
+import { RoomAddresses, RoomAddressesPanel } from "room-addresses.slint";
+export { RoomAddressEntry, RoomAddresses } from "room-addresses.slint";
 import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "device-sessions.slint";
 import { NotificationRules, RoomNotificationPanel, RoomNotificationState } from "notification-settings.slint";
 // Rust drives the notification rules and the room panel through these globals.
@@ -3268,7 +3270,7 @@ export component AppWindow inherits Window {
             && !root.account-menu-open && !root.room-actions-open && !root.room-admin-open
             && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog
             && !root.quick-switcher-open && !root.image-preview-open && root.security-recovery-key == ""
-            && !SpaceRooms.open {
+            && !SpaceRooms.open && !RoomAddresses.open {
             account-trigger.focus();
         }
         root.navigation-mode = mode;
@@ -3400,7 +3402,7 @@ export component AppWindow inherits Window {
     property <length> layout-row-height: max(48px, 30px * root.text-scale + 18px);
     // A modal, lock, recovery or account switch owns the window: no gesture
     // starts, and one in progress is discarded.
-    property <bool> pane-gesture-allowed: !(root.show-sign-in || root.access-open || root.account-switch-pending
+    property <bool> pane-gesture-allowed: !RoomAddresses.open && !(root.show-sign-in || root.access-open || root.account-switch-pending
         || root.security-recovery-key != "" || root.leave-call-dialog || root.manage-accounts-open
         || root.account-menu-open || root.native-capture-picker-open || root.member-confirm-open
         || root.room-admin-open || root.room-actions-open || root.quick-switcher-open
@@ -3949,6 +3951,13 @@ export component AppWindow inherits Window {
     in-out property <string> security-device-status: "Unknown";
     in-out property <string> security-recovery-status: "Unknown";
     in-out property <string> security-backup-status: "Unknown";
+    // Cross-signing keys this device holds, as last read (src/security.rs).
+    in-out property <string> security-identity-status;
+    // Progress of a running recovery setup or recovery; empty otherwise.
+    in-out property <string> security-progress;
+    // The last setup or recovery outcome; status reads never change it.
+    in-out property <string> security-outcome;
+    in-out property <bool> security-outcome-error: false;
     in-out property <bool> security-can-enable: false;
     in-out property <bool> security-loading: false;
     in-out property <bool> security-busy: false;
@@ -3980,7 +3989,7 @@ export component AppWindow inherits Window {
     in-out property <bool> sas-request-uncertain: false;
     property <length> sas-inbox-row-h: max(44px, 30px * root.text-scale + 14px);
     // While any of these holds, no SAS value stays in the window.
-    out property <bool> sas-protected: root.security-busy || root.access-open
+    out property <bool> sas-protected: RoomAddresses.open || root.security-busy || root.access-open
         || root.account-switch-pending || root.show-sign-in || !root.live-session
         || root.security-recovery-key != "";
     changed sas-protected => {
@@ -4177,6 +4186,9 @@ export component AppWindow inherits Window {
     }
 
     callback submit-room-action(int, string);
+    // Withdraw the dialog's join in progress (a real Close, Cancel or Escape):
+    // nothing is sent before its hand-off, nothing opened after it.
+    callback cancel-room-join();
     callback respond-invite(string, bool);
     callback send-message(string);
     callback open-message-link(string);
@@ -4290,13 +4302,44 @@ export component AppWindow inherits Window {
     callback people-open-dm();
     callback people-ask-start();
     callback people-confirm-start();
+    // Discovery joins and the explorer may act only on the live Home or
+    // directory surface, never behind another protected native modal.
+    // Their own two surfaces are checked separately so replacing one can
+    // withdraw its exact pending operation synchronously.
+    out property <bool> discovery-context-allowed: root.live-session && (root.page == 0 || root.page == 3)
+        && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
+        && !root.account-switch-pending && !root.account-menu-open
+        && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy && root.sas-stage == 0
+        && !root.account-profile-open && !MemberPrivacy.inspector.open && !SpaceRooms.open && !RoomAddresses.open
+        && !RoomNotificationState.open && !RoomActivity.seen-open
+        && !root.quick-switcher-open && !root.people-open && !root.room-admin-open
+        && !root.member-confirm-open && !root.native-capture-picker-open
+        && !root.leave-call-dialog && !root.image-preview-open && !root.poll-dialog-open;
+    property <bool> discovery-join-context-current: !root.directory-join-busy
+        || (root.discovery-context-allowed && root.page == 3 && !root.room-actions-open && !SpaceExplorer.open);
+    changed discovery-join-context-current => {
+        if !root.discovery-join-context-current { root.cancel-discovery-join(); }
+    }
+    property <bool> room-join-context-current: !(root.room-actions-open && root.room-action-mode == 1)
+        || (root.discovery-context-allowed && !SpaceExplorer.open);
+    changed room-join-context-current => {
+        if !root.room-join-context-current {
+            root.cancel-room-join();
+            root.room-actions-open = false;
+        }
+    }
+    property <bool> explorer-context-current: !SpaceExplorer.open
+        || (root.discovery-context-allowed && !root.room-actions-open);
+    changed explorer-context-current => {
+        if !root.explorer-context-current { SpaceExplorer.close(); }
+    }
     // A lock, account replacement or another modal cancels the exact People
     // window immediately; no pending result restores its private content.
     property <bool> people-context-current: !root.people-open || (root.live-session
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-switch-pending && !root.account-menu-open
         && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy
-        && !root.account-profile-open && !SpaceExplorer.open && !MemberPrivacy.inspector.open && !SpaceRooms.open
+        && !root.account-profile-open && !SpaceExplorer.open && !MemberPrivacy.inspector.open && !SpaceRooms.open && !RoomAddresses.open
         && !RoomNotificationState.open && !RoomActivity.seen-open
         && !root.quick-switcher-open && !root.room-actions-open && !root.room-admin-open
         && !root.member-confirm-open && !root.native-capture-picker-open
@@ -4311,7 +4354,7 @@ export component AppWindow inherits Window {
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-switch-pending && !root.account-menu-open
         && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy && root.sas-stage == 0
-        && !root.account-profile-open && !SpaceExplorer.open && !SpaceRooms.open
+        && !root.account-profile-open && !SpaceExplorer.open && !SpaceRooms.open && !RoomAddresses.open
         && !RoomNotificationState.open && !RoomActivity.seen-open
         && !root.quick-switcher-open && !root.people-open
         && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open
@@ -4394,8 +4437,10 @@ export component AppWindow inherits Window {
     // Opens the menu and focuses its trigger; each entry keeps its own
     // activation and confirmation.
     public function open-account-menu() {
-        root.account-menu-open = true;
-        account-trigger.focus();
+        if !RoomAddresses.open {
+            root.account-menu-open = true;
+            account-trigger.focus();
+        }
     }
     property <bool> settings-search-focus-pending: false;
     property <int> settings-search-focus-request: 0;
@@ -4479,6 +4524,7 @@ export component AppWindow inherits Window {
     callback return-to-live();
     callback load-newer-focused();
     callback join-discovery-target(string, string, string, string, bool);
+    callback cancel-discovery-join();
     // Pane arrangement edits (stable pane IDs: spaces, rooms, conversation,
     // details); Rust validates and saves them to config.toml [layout].
     callback move-pane(string, int);
@@ -4503,6 +4549,7 @@ export component AppWindow inherits Window {
     callback refresh-security();
     callback enable-recovery();
     callback recover-account(string);
+    callback dismiss-security-outcome();
     callback copy-recovery-key();
     callback dismiss-recovery-key();
     callback request-own-verification();
@@ -4558,7 +4605,7 @@ export component AppWindow inherits Window {
         && RoomNotificationState.account-id == root.active-account-local-id
         && RoomNotificationState.room-id == root.active-room-id && root.active-room-id != ""
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
-        && root.security-recovery-key == "" && !root.account-profile-open && !SpaceExplorer.open && !SpaceRooms.open
+        && root.security-recovery-key == "" && !root.account-profile-open && !SpaceExplorer.open && !SpaceRooms.open && !RoomAddresses.open
         && !root.people-open && !MemberPrivacy.inspector.open;
     // Another account or room, a lock or a detach clears the panel's rows.
     changed room-notifications-current => {
@@ -4670,7 +4717,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !MemberPrivacy.inspector.open && !root.image-preview-open && !SpaceRooms.open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !MemberPrivacy.inspector.open && !root.image-preview-open && !SpaceRooms.open && !RoomAddresses.open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -6397,7 +6444,7 @@ export component AppWindow inherits Window {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "⌫"; label: "Redact message from " + message.sender;
                                     ink: root.icon-message-ink; surface: transparent; hover-surface: root.hover;
-                                    enabled: root.live-session && !root.room-admin-busy;
+                                    enabled: !RoomAddresses.open && root.live-session && !root.room-admin-busy;
                                     activated => {
                                         root.room-admin-mode = 2;
                                         root.room-admin-event-id = message.event-id;
@@ -6759,15 +6806,15 @@ export component AppWindow inherits Window {
                                 x: StyleTokens.input-padding; y: 2px; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height - 4px;
                                 text <=> root.directory-join-input;
                                 color: root.ink; font-size: 12px * root.text-scale;
-                                enabled: root.live-session && !root.directory-join-busy;
+                                enabled: root.discovery-context-allowed && !root.room-actions-open && !SpaceExplorer.open && !root.directory-join-busy;
                                 accessible-label: "Room ID, room alias, or Matrix link to join";
-                                accepted => { if root.live-session && !root.directory-join-busy { root.join-discovery-target(root.directory-join-input, "", "", "", false); } }
+                                accepted => { if root.discovery-context-allowed && !root.room-actions-open && !SpaceExplorer.open && !root.directory-join-busy { root.join-discovery-target(root.directory-join-input, "", "", "", false); } }
                             }
                         }
                         TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                             width: 93px; text: root.directory-join-busy ? "Joining…" : "Join";
                             label: "Join room by Matrix link or alias";
-                            enabled: root.live-session && !root.directory-join-busy;
+                            enabled: root.discovery-context-allowed && !root.room-actions-open && !SpaceExplorer.open && !root.directory-join-busy;
                             activated => { root.join-discovery-target(root.directory-join-input, "", "", "", false); }
                         }
                     }
@@ -6839,7 +6886,7 @@ export component AppWindow inherits Window {
                                 TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                                     width: 76px; text: root.directory-join-busy && root.directory-joining-room-id == room.id ? "Joining…" : "Join";
                                     label: "Join public room " + room.title;
-                                    enabled: root.live-session && !root.directory-join-busy;
+                                    enabled: root.discovery-context-allowed && !root.room-actions-open && !SpaceExplorer.open && !root.directory-join-busy;
                                     activated => { root.join-discovery-target(room.id, room.canonical-alias, room.route-server, room.title, room.is-space); }
                                 }
                             }
@@ -9011,8 +9058,10 @@ export component AppWindow inherits Window {
                         if root.live-session : VerticalLayout {
                             spacing: 11px;
                             Rectangle {
-                                height: 116px; border-radius: StyleTokens.radius * 1; background: root.elevated;
-                                VerticalLayout {
+                                // Grows with the wrapped status and identity lines.
+                                height: max(116px, security-status-card.preferred-height);
+                                border-radius: StyleTokens.radius * 1; background: root.elevated;
+                                security-status-card := VerticalLayout {
                                     padding: 14px; spacing: 5px;
                                     HorizontalLayout {
                                         Text { text: "Account security"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-stretch: 1; }
@@ -9046,10 +9095,26 @@ export component AppWindow inherits Window {
                                         color: root.muted; font-size: 12px * root.text-scale;
                                         accessible-label: "Device security status: " + root.security-device-status;
                                     }
-                                    Text { text: "Recovery: " + root.security-recovery-status + "  ·  Key backup: " + root.security-backup-status; color: root.muted; font-size: 12px * root.text-scale; accessible-live-region: polite; }
+                                    Text { text: "Recovery: " + root.security-recovery-status + "  ·  Key backup: " + root.security-backup-status; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                                    if root.security-identity-status != "" : Text { text: root.security-identity-status; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                                    // A read in progress is said, so the lines above are not taken as current.
+                                    if root.security-loading : Text { text: "Reading the current status…"; color: root.muted; font-size: 12px * root.text-scale; accessible-live-region: polite; }
                                 }
                             }
+                            if root.security-progress != "" : Text { text: root.security-progress; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                             if root.security-error != "" : Text { text: root.security-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                            if root.security-outcome != "" : HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    text: root.security-outcome; horizontal-stretch: 1; wrap: word-wrap;
+                                    color: root.security-outcome-error ? (StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483) : (StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent);
+                                    font-size: 12px * root.text-scale; accessible-live-region: polite;
+                                }
+                                Button {
+                                    text: "Dismiss"; accessible-label: "Dismiss this recovery outcome";
+                                    clicked => { root.dismiss-security-outcome(); }
+                                }
+                            }
                             if root.security-notice != "" : Text { text: root.security-notice; color: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                             Timer {
                                 interval: 3s;
@@ -9314,6 +9379,51 @@ export component AppWindow inherits Window {
                                         revealed(id) => { root.settings-revealed-id = id; }
                                     }
                                 }
+                            }
+                        }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                        Text { text: "Room addresses"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Addresses such as #name:server lead to a room. The open room's addresses are listed here and under Room settings; adding, removing and publishing are separate changes, each reviewed first. Only addresses on your homeserver are added or removed."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        // Read-only and focusable: search reveals this row whether or
+                        // not a room is open, and never claims the button below.
+                        room-addresses-status := ThemedTextInput {
+                            property <int> reveal-request: root.reveal-request("rooms.addresses");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "rooms.addresses"; }
+                                }
+                            }
+                            text: root.live-session && root.active-room-id != "" ? "Open room: " + root.active-room-name : "Open a room first to see its addresses.";
+                            read-only: true; single-line: false; wrap: word-wrap;
+                            color: root.muted; font-size: 12px * root.text-scale;
+                            accessible-label: "Room addresses status: " + self.text;
+                        }
+                        HorizontalLayout {
+                            alignment: start;
+                            TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                // The address panel closed over this page: the keyboard
+                                // comes back here.
+                                property <int> addresses-closed: RoomAddresses.closed;
+                                changed addresses-closed => {
+                                    if root.page == 1 && !root.room-admin-open && self.enabled { self.focus(); }
+                                }
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                text: "Manage addresses…";
+                                label: "Manage the addresses of the open room, " + root.active-room-name;
+                                enabled: root.live-session && root.active-room-id != "";
+                                activated => { RoomAddresses.show(root.active-room-id, root.active-room-name); }
                             }
                         }
                         Rectangle { height: StyleTokens.line-width; background: root.divider; }
@@ -9970,7 +10080,7 @@ export component AppWindow inherits Window {
                                 x: 7px; width: parent.width - 14px; height: parent.height;
                                 text <=> root.member-invite-user-id;
                                 color: root.ink; font-size: 11px * root.text-scale;
-                                enabled: !root.member-action-busy;
+                                enabled: !RoomAddresses.open && !root.member-action-busy;
                                 accessible-label: "Matrix user ID to invite to this room";
                                 accepted => {
                                     if root.member-invite-user-id != "" && !root.member-action-busy {
@@ -9983,7 +10093,7 @@ export component AppWindow inherits Window {
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                             outline: root.divider; text-scale: root.text-scale;
                             text: "Invite";
-                            enabled: !root.member-action-busy && root.member-invite-user-id != "";
+                            enabled: !RoomAddresses.open && !root.member-action-busy && root.member-invite-user-id != "";
                             accessible-label: "Invite Matrix user to this room";
                             activated => { root.submit-member-action(0, root.member-invite-user-id, ""); }
                         }
@@ -10076,7 +10186,7 @@ export component AppWindow inherits Window {
                                 horizontal-stretch: 0; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
                                 background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                                 focus-color: root.accent;
-                                enabled: !root.member-action-busy;
+                                enabled: !RoomAddresses.open && !root.member-action-busy;
                                 label: "Manage room member " + member.name + " · " + member.user-id;
                                 activated => {
                                     root.member-selected-user-id = member.user-id;
@@ -10128,13 +10238,13 @@ export component AppWindow inherits Window {
                                         x: 7px; width: parent.width - 14px; height: parent.height;
                                         text <=> root.member-selected-power;
                                         color: root.ink; font-size: 11px * root.text-scale;
-                                        enabled: !root.member-action-busy && !root.member-selected-creator;
+                                        enabled: !RoomAddresses.open && !root.member-action-busy && !root.member-selected-creator;
                                         accessible-label: "Power level for selected room member";
                                     }
                                 }
                                 Button {
                                     width: 72px; text: "Set power";
-                                    enabled: !root.member-action-busy && !root.member-selected-creator && root.member-selected-power != "";
+                                    enabled: !RoomAddresses.open && !root.member-action-busy && !root.member-selected-creator && root.member-selected-power != "";
                                     accessible-label: "Review power level change for " + root.member-selected-name;
                                     clicked => {
                                         root.member-confirm-kind = 4;
@@ -10151,7 +10261,7 @@ export component AppWindow inherits Window {
                                 height: 34px; spacing: 6px;
                                 if root.member-selected-membership == "ban" : Button {
                                     text: "Unban";
-                                    enabled: !root.member-action-busy;
+                                    enabled: !RoomAddresses.open && !root.member-action-busy;
                                     accessible-label: "Review unban of " + root.member-selected-name;
                                     clicked => {
                                         root.member-confirm-kind = 3;
@@ -10165,7 +10275,7 @@ export component AppWindow inherits Window {
                                 }
                                 if root.member-selected-membership != "ban" : Button {
                                     text: "Kick";
-                                    enabled: !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
+                                    enabled: !RoomAddresses.open && !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
                                     accessible-label: "Review kick of " + root.member-selected-name;
                                     clicked => {
                                         root.member-confirm-kind = 1;
@@ -10179,7 +10289,7 @@ export component AppWindow inherits Window {
                                 }
                                 if root.member-selected-membership != "ban" : Button {
                                     text: "Ban";
-                                    enabled: !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
+                                    enabled: !RoomAddresses.open && !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
                                     accessible-label: "Review ban of " + root.member-selected-name;
                                     clicked => {
                                         root.member-confirm-kind = 2;
@@ -10858,7 +10968,7 @@ export component AppWindow inherits Window {
                     focus-color: root.accent;
                     label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
                     accessible-expanded: root.account-menu-open;
-                    activated => { root.account-menu-open = !root.account-menu-open; }
+                    activated => { if !RoomAddresses.open { root.account-menu-open = !root.account-menu-open; } }
                     HorizontalLayout {
                         padding-left: root.account-column ? 13px : 11px;
                         padding-right: root.account-column ? 13px : 11px;
@@ -11021,7 +11131,7 @@ export component AppWindow inherits Window {
                     cancel-on-escape: true;
                     label: "Manage accounts";
                     cancelled => { root.account-menu-open = false; account-trigger.focus(); }
-                    activated => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
+                    activated => { RoomAddresses.context-changed(); root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
                     HorizontalLayout {
                         padding-left: 9px; padding-right: 9px; spacing: 9px;
                         VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "manage-accounts"; ink: root.ink; } }
@@ -11127,7 +11237,8 @@ export component AppWindow inherits Window {
         + (root.room-actions-open ? "1" : "0") + (root.room-admin-open ? "1" : "0")
         + (root.member-confirm-open ? "1" : "0") + (root.native-capture-picker-open ? "1" : "0")
         + (root.leave-call-dialog ? "1" : "0") + (root.image-preview-open ? "1" : "0")
-        + (root.poll-dialog-open ? "1" : "0") + (root.account-menu-open ? "1" : "0");
+        + (root.poll-dialog-open ? "1" : "0") + (root.account-menu-open ? "1" : "0")
+        + (RoomAddresses.open ? "1" : "0");
     changed space-management-context => { SpaceRooms.context-changed(); }
 
     // Managing a Space's rooms (space-management.slint); Rust owns its state.
@@ -11559,6 +11670,10 @@ export component AppWindow inherits Window {
         init => { room-action-input.focus(); }
         capture-key-pressed(event) => {
             if root.room-action-busy && (event.text == Key.Tab || event.text == Key.Backtab) {
+                // A join stays withdrawable: Tab moves between Close and Cancel.
+                if root.room-action-mode == 1 {
+                    if room-action-cancel.has-focus { room-action-close.focus(); } else { room-action-cancel.focus(); }
+                }
                 accept
             } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && room-action-close.has-focus {
                 if root.live-session { room-action-submit.focus(); }
@@ -11570,7 +11685,8 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         key-pressed(event) => {
-            if event.text == Key.Escape && !root.room-action-busy {
+            if event.text == Key.Escape && (!root.room-action-busy || root.room-action-mode == 1) {
+                if root.room-action-busy { root.cancel-room-join(); }
                 root.room-actions-open = false;
                 room-action-trigger.focus();
                 accept
@@ -11598,9 +11714,13 @@ export component AppWindow inherits Window {
                         Text { text: "Rooms and Spaces"; color: root.ink; font-size: 19px * root.text-scale; font-weight: 750; horizontal-stretch: 1; }
                         room-action-close := Button {
                             width: 34px; height: 31px; text: "×";
-                            enabled: !root.room-action-busy;
-                            accessible-label: "Close room actions";
-                            clicked => { root.room-actions-open = false; room-action-trigger.focus(); }
+                            // A join in progress can always be withdrawn.
+                            enabled: !root.room-action-busy || root.room-action-mode == 1;
+                            accessible-label: root.room-action-busy ? "Cancel the join and close room actions" : "Close room actions";
+                            clicked => {
+                                if root.room-action-busy { root.cancel-room-join(); }
+                                root.room-actions-open = false; room-action-trigger.focus();
+                            }
                         }
                     }
                     HorizontalLayout {
@@ -11635,7 +11755,12 @@ export component AppWindow inherits Window {
                             font-size: 13px * root.text-scale;
                             enabled: !root.room-action-busy;
                             accessible-label: root.room-action-mode == 1 ? "Room ID, alias, or Matrix link" : "Room or Space name";
-                            accepted => { if !root.room-action-busy { root.submit-room-action(root.room-action-mode, root.room-action-input); } }
+                            accepted => {
+                                if !root.room-action-busy {
+                                    root.submit-room-action(root.room-action-mode, root.room-action-input);
+                                    if root.room-action-busy && root.room-action-mode == 1 { room-action-cancel.focus(); }
+                                }
+                            }
                         }
                     }
                     Text {
@@ -11654,16 +11779,25 @@ export component AppWindow inherits Window {
                         room-action-cancel := Button {
                             width: 88px;
                             text: "Cancel";
-                            enabled: !root.room-action-busy;
-                            clicked => { root.room-actions-open = false; room-action-trigger.focus(); }
+                            enabled: !root.room-action-busy || root.room-action-mode == 1;
+                            accessible-label: root.room-action-busy ? "Cancel the join" : "Cancel";
+                            clicked => {
+                                if root.room-action-busy { root.cancel-room-join(); }
+                                root.room-actions-open = false; room-action-trigger.focus();
+                            }
                         }
                         room-action-submit := Button {
                             width: 134px;
                             primary: true;
                             text: root.room-action-busy ? "Working…" : root.room-action-mode == 1 ? "Join room" : root.room-action-mode == 2 ? "Create Space" : "Create room";
                             accessible-label: root.room-action-mode == 1 ? "Join Matrix room" : root.room-action-mode == 2 ? "Create private Matrix Space" : "Create private Matrix room";
-                            enabled: root.live-session && !root.room-action-busy;
-                            clicked => { root.submit-room-action(root.room-action-mode, root.room-action-input); }
+                            enabled: root.live-session && !root.room-action-busy
+                                && (root.room-action-mode != 1 || (root.discovery-context-allowed && !SpaceExplorer.open));
+                            clicked => {
+                                root.submit-room-action(root.room-action-mode, root.room-action-input);
+                                // The keyboard stays on a control that can withdraw the join.
+                                if root.room-action-busy && root.room-action-mode == 1 { room-action-cancel.focus(); }
+                            }
                         }
                     }
                 }
@@ -11674,6 +11808,9 @@ export component AppWindow inherits Window {
     if root.room-admin-open && root.room-admin-mode == 0 : FocusScope {
         focus-on-tab-navigation: false;
         init => { settings-close.focus(); }
+        // The address panel closed: its opener takes the keyboard back.
+        property <int> addresses-closed: RoomAddresses.closed;
+        changed addresses-closed => { settings-addresses.focus(); }
         capture-key-pressed(event) => {
             if event.text == Key.Escape {
                 if root.room-settings-confirmation != 0 {
@@ -11866,6 +12003,21 @@ export component AppWindow inherits Window {
                                 Text { x: 12px; width: parent.width - 24px; text: "Save join rule"; color: parent.enabled ? root.accent-ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                             }
                             Text { text: "Public access requires confirmation. Directory listing is a separate setting and is not changed here. Unknown rules remain read-only."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                            // Room addresses (room-addresses.slint) open over this form.
+                            Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                            Text { text: "Room addresses"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; }
+                            Text { text: "Addresses such as #name:server lead to this room. Adding, removing and publishing are separate changes, each reviewed first."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                            settings-addresses := ActionRect {
+                                height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
+                                background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
+                                label: "Manage the addresses of this room";
+                                enabled: !root.room-admin-busy && root.room-settings-confirmation == 0
+                                    && root.room-admin-account-id == root.active-account-local-id
+                                    && root.room-admin-room-id == root.active-room-id;
+                                activated => { RoomAddresses.show(root.room-admin-room-id, root.active-room-name); }
+
+                                Text { x: 12px; width: parent.width - 24px; text: "Manage addresses…"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            }
                         }
                     }
                     if root.room-admin-busy : Text { text: "Working… You can close this form to cancel pending work."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
@@ -12016,6 +12168,53 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // Any visible-context transition withdraws pending address work. The
+    // callback cancels its owner synchronously before hiding the panel.
+    // Rust also keeps click-captured navigation/security epochs, so ABA
+    // transitions cannot revive an old confirmation after a blocked wait.
+    property <string> room-addresses-context: root.active-account-local-id + "\n" + root.active-room-id
+        + "\n" + root.active-space-id + "\n" + root.page + "\n" + root.navigation-mode
+        + "\n" + (root.live-session ? "1" : "0") + (root.show-sign-in ? "1" : "0")
+        + (root.access-open ? "1" : "0") + (root.account-switch-pending ? "1" : "0")
+        + (root.manage-accounts-open ? "1" : "0") + (root.security-busy ? "1" : "0")
+        + (root.security-recovery-key != "" ? "1" : "0") + (root.sas-busy ? "1" : "0")
+        + "\n" + root.sas-stage + (root.account-menu-open ? "1" : "0")
+        + (root.quick-switcher-open ? "1" : "0") + (root.room-actions-open ? "1" : "0")
+        + (root.room-admin-open ? "1" : "0") + "\n" + root.room-admin-mode
+        + "\n" + root.room-admin-account-id + "\n" + root.room-admin-room-id
+        + (root.room-admin-busy ? "1" : "0") + "\n" + root.room-settings-confirmation
+        + (root.member-confirm-open ? "1" : "0") + (root.native-capture-picker-open ? "1" : "0")
+        + (root.leave-call-dialog ? "1" : "0") + (root.image-preview-open ? "1" : "0")
+        + (root.poll-dialog-open ? "1" : "0")
+        + (MemberPrivacy.inspector.open ? "1" : "0") + (root.people-open ? "1" : "0")
+        + (root.account-profile-open ? "1" : "0") + (SpaceExplorer.open ? "1" : "0")
+        + (SpaceRooms.open ? "1" : "0") + (RoomNotificationState.open ? "1" : "0")
+        + (RoomActivity.seen-open ? "1" : "0") + (MemberPrivacy.ignored.busy ? "1" : "0")
+        + "\n" + MemberPrivacy.ignored.stage;
+    changed room-addresses-context => { RoomAddresses.context-changed(); }
+
+    // Room addresses (room-addresses.slint), over Room settings; Rust owns
+    // its state.
+    if RoomAddresses.open : RoomAddressesPanel {
+        text-scale: root.text-scale;
+        button-colors: root.button-colors;
+        palette: {
+            ink: root.ink,
+            muted: root.muted,
+            accent: root.accent,
+            surface: root.dialog-surface,
+            elevated: root.elevated,
+            hover: root.hover,
+            divider: root.divider,
+            error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+            selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover,
+            selection-ink: StyleTokens.roles.selection-ink.color,
+            has-selection-ink: StyleTokens.roles.selection-ink.present,
+            focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+            scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa,
+        };
     }
 
     if root.member-confirm-open : FocusScope {

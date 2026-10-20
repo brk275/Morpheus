@@ -298,6 +298,9 @@ impl RoomSettingsUi {
         self.matches_ui(&form, ui).then_some(form)
     }
     fn open(self: &Arc<Self>, ui: &AppWindow) {
+        if crate::room_addresses::is_open(ui) {
+            return;
+        }
         self.close(ui);
         if !ui.get_live_session() || !self.live.is_live.load(Ordering::Acquire) {
             return;

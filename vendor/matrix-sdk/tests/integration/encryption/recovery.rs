@@ -1030,3 +1030,185 @@ async fn test_reset_identity() {
 
     server.verify().await;
 }
+
+/// MORPHEUS PATCH (generated key handoff): a recovery setup whose last
+/// request took effect on the server but failed hands over the generated
+/// key, and that key opens the secret storage the server now points at. The
+/// failed request is sent once, never retried.
+#[async_test]
+async fn test_recovery_setup_hands_over_the_key_when_its_last_request_fails() {
+    use futures_util::FutureExt;
+    use matrix_sdk::encryption::secret_storage::GeneratedKeyHandoff;
+    use ruma::events::secret::request::SecretName;
+
+    type Stored = Arc<Mutex<std::collections::HashMap<String, Value>>>;
+
+    /// Records the body of each PUT to `event_type`, as the server keeps
+    /// it, and answers with `status`.
+    async fn stored_put(
+        server: &wiremock::MockServer,
+        user_id: &UserId,
+        event_type: &str,
+        stored: &Stored,
+        status: u16,
+    ) -> wiremock::MockGuard {
+        let stored = stored.clone();
+        let name = event_type.to_owned();
+        let answer = if status == 200 {
+            ResponseTemplate::new(200).set_body_json(json!({}))
+        } else {
+            ResponseTemplate::new(status)
+                .set_body_json(json!({ "errcode": "M_UNKNOWN", "error": "Unknown error" }))
+        };
+        Mock::given(method("PUT"))
+            .and(path(format!("_matrix/client/r0/user/{user_id}/account_data/{event_type}")))
+            .and(header("authorization", "Bearer 1234"))
+            .and(move |request: &wiremock::Request| {
+                let content: Value = request.body_json().expect("The body should be a JSON body");
+                stored.lock().unwrap().insert(name.clone(), content);
+                true
+            })
+            .respond_with(answer)
+            .expect(1)
+            .mount_as_scoped(server)
+            .await
+    }
+
+    /// Answers a GET of `event_type` with what the server stored, if any.
+    async fn stored_get(
+        server: &wiremock::MockServer,
+        user_id: &UserId,
+        event_type: &str,
+        stored: &Stored,
+    ) -> wiremock::MockGuard {
+        let stored = stored.clone();
+        let name = event_type.to_owned();
+        Mock::given(method("GET"))
+            .and(path(format!("_matrix/client/r0/user/{user_id}/account_data/{event_type}")))
+            .and(header("authorization", "Bearer 1234"))
+            .respond_with(move |_: &wiremock::Request| match stored.lock().unwrap().get(&name) {
+                Some(content) => ResponseTemplate::new(200).set_body_json(content),
+                None => ResponseTemplate::new(404).set_body_json(json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "Account data not found"
+                })),
+            })
+            .mount_as_scoped(server)
+            .await
+    }
+
+    let user_id = user_id!("@example:morpheus.localhost");
+    let (client, server) = test_client(user_id).await;
+    let stored: Stored = Default::default();
+
+    // Creating the key backup, as in `enable()`.
+    let mut guards = Vec::new();
+    for event_type in ["m.key_backup", "m.org.matrix.custom.backup_disabled"] {
+        guards.push(stored_put(&server, user_id, event_type, &stored, 200).await);
+    }
+    guards.push(
+        Mock::given(method("GET"))
+            .and(path("_matrix/client/r0/room_keys/version"))
+            .and(header("authorization", "Bearer 1234"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "errcode": "M_NOT_FOUND",
+                "error": "No current backup version"
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await,
+    );
+    guards.push(
+        Mock::given(method("POST"))
+            .and(path("_matrix/client/unstable/room_keys/version"))
+            .and(header("authorization", "Bearer 1234"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "version": "1" })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await,
+    );
+
+    // The new key's description, under the generated key ID.
+    let key_ids = Arc::new(Mutex::new(Vec::new()));
+    guards.push(
+        Mock::given(method("PUT"))
+            .and(path_regex(format!(
+                r"_matrix/client/r0/user/{user_id}/account_data/m.secret_storage.key.[A-Za-z0-9]+"
+            )))
+            .and(header("authorization", "Bearer 1234"))
+            .and({
+                let stored = stored.clone();
+                let key_ids = key_ids.clone();
+                move |request: &wiremock::Request| {
+                    let content: Value =
+                        request.body_json().expect("The body should be a JSON body");
+                    let event_type = request.url.path().rsplit('/').next().unwrap().to_owned();
+                    key_ids.lock().unwrap().push(event_type.clone());
+                    stored.lock().unwrap().insert(event_type, content);
+                    true
+                }
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await,
+    );
+
+    // The secrets, encrypted with the new key: each one is read, then
+    // written back with the new key's entry.
+    for event_type in [
+        "m.cross_signing.master",
+        "m.cross_signing.self_signing",
+        "m.cross_signing.user_signing",
+        "m.megolm_backup.v1",
+    ] {
+        guards.push(stored_get(&server, user_id, event_type, &stored).await);
+        guards.push(stored_put(&server, user_id, event_type, &stored, 200).await);
+    }
+    guards.push(stored_get(&server, user_id, "m.secret_storage.default_key", &stored).await);
+
+    // The default key: the server takes it, then the request fails.
+    let default_key = "m.secret_storage.default_key";
+    guards.push(stored_put(&server, user_id, default_key, &stored, 500).await);
+
+    let handoff = GeneratedKeyHandoff::new();
+    let encryption = client.encryption();
+    let recovery = encryption.recovery();
+    let enable = recovery.enable().hand_key_to(handoff.clone());
+    let mut progress = enable.subscribe_to_progress();
+    assert!(enable.await.is_err(), "Setting up recovery should fail at the default key");
+    while let Some(Some(update)) = progress.next().now_or_never() {
+        let update = update.expect("No progress update should be missed");
+        assert!(!matches!(update, EnableProgress::Done { .. }), "Setup should never be done");
+    }
+
+    let key = handoff.take().expect("The generated key should be handed over");
+    assert!(handoff.take().is_none(), "The handed-over key should be taken only once");
+    assert!(!format!("{handoff:?}").contains(key.as_str()));
+
+    // The server now points at the new key, and holds the secrets with it.
+    let key_type = key_ids.lock().unwrap().pop().expect("The key should be described once");
+    let key_id = key_type.strip_prefix("m.secret_storage.key.").unwrap().to_owned();
+    {
+        let stored = stored.lock().unwrap();
+        assert_eq!(stored[default_key]["key"], key_id.as_str());
+        assert!(stored["m.cross_signing.master"]["encrypted"].get(&key_id).is_some());
+    }
+
+    // Each request so far was sent exactly once.
+    server.verify().await;
+    drop(guards);
+
+    // The handed-over key opens that storage and decrypts what it holds.
+    let _default = stored_get(&server, user_id, default_key, &stored).await;
+    let _key = stored_get(&server, user_id, &key_type, &stored).await;
+    let _master = stored_get(&server, user_id, "m.cross_signing.master", &stored).await;
+    let store = client
+        .encryption()
+        .secret_storage()
+        .open_secret_store(&key)
+        .await
+        .expect("The handed-over key should open the server's secret storage");
+    let master = store.get_secret(SecretName::CrossSigningMasterKey).await.unwrap();
+    assert!(master.is_some(), "The handed-over key should decrypt the stored secrets");
+}

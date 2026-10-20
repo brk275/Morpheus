@@ -279,3 +279,79 @@ repository root; it restores settings these crates inherited before vendoring.
 No formatting checks are disabled. Stable formatting normalizes local patch
 layout; the SDK event-cache redecryptor doc comment also loses one trailing
 space. Original source inventories remain unchanged in the provenance record.
+
+## Generated secret-storage key handoff (recovery setup)
+
+Validation uses the focused SDK regression below and native application
+checks. Source review, formatting and hosted results are recorded separately;
+this note does not certify release readiness.
+
+Why: `Recovery::enable()` creates secret storage through `CreateStore`. That
+future generates a new secret-storage key, uploads its description
+(`m.secret_storage.key.<id>`), exports the cross-signing and backup secrets
+encrypted with it, then makes it the default key
+(`m.secret_storage.default_key`). Each of those requests can take effect on
+the server and still return an error (for example, the server stores the
+default key and the answer is lost). On any such error `CreateStore` fails and
+drops the key, `Enable` returns before it sends `EnableProgress::Done`, and
+the caller never sees the key, although the server may already point at it.
+Morpheus cannot rebuild this flow from outside the crate: `SecretStore`'s
+fields and `Recovery`'s backup and state steps are private.
+
+What changed, narrowly:
+
+- `secret_storage::GeneratedKeyHandoff` (new, public): a cloneable handle to
+  one `Zeroizing<String>` slot. `take()` returns the key once. Its `Debug`
+  output never contains the key. The lock is a std mutex; a poisoned lock is
+  recovered, never a panic.
+- `CreateStore::hand_key_to(handoff)` (new builder, public) and a private
+  `key_handoff` field (`None` by default). When set, the key is put into the
+  handoff right after it is generated, encoded as
+  `SecretStore::secret_storage_key()` encodes it (base58), and before the
+  first request. Without a handoff nothing differs from upstream.
+- `Enable::hand_key_to(handoff)` (new builder, public) and a private
+  `key_handoff` field (`None` by default), passed to the `CreateStore` it
+  creates. `Reset` and `RecoverAndReset` are unchanged and take no handoff.
+- `SecretStorage::create_secret_store()` initializes the new field to `None`;
+  `secret_storage::mod` re-exports `GeneratedKeyHandoff`.
+
+Unchanged: key generation (`SecretStorageKey::new` and
+`new_from_passphrase`), encryption, the key description, the order and
+content of every request, serialization, the store lock, the client's
+request configuration and retries, progress updates, errors, and the
+returned key. The handoff adds no request, no log line and no error path.
+`zeroize` was already a dependency of this crate. No manifest, feature, lock,
+build script, dependency or unsafe code changed.
+
+Callers: only `crates/morpheus-matrix/src/account_recovery.rs`
+(`enable_recovery_selected`). It keeps the handed-over key as unconfirmed
+when setup fails before `Done`, and never retries setup.
+
+Regression source (`tests/integration/encryption/recovery.rs`,
+`test_recovery_setup_hands_over_the_key_when_its_last_request_fails`), on the
+crate's existing wiremock harness: the backup and every secret are stored,
+the server takes the default key, then that request answers 500. Setup fails
+without `Done`; the handoff yields the key once and its `Debug` output does
+not contain it; the stored default key names the uploaded key description
+and the stored master key is encrypted for it; every request was sent
+exactly once (no retry); and the handed-over key opens the server's secret
+storage and decrypts the stored master key.
+
+Formatting follows the upstream `rustfmt.toml` at the pinned revision
+(100 columns, comments wrapped at 80, `use_small_heuristics = "Max"`), like
+the surrounding upstream code. The root integration retains the regular
+`.rustfmt.toml` described in Formatter inheritance above.
+
+Additionally modified vendored files (upstream c6ad52e blob -> current blob):
+
+| File | Upstream git blob | Current git blob |
+| --- | --- | --- |
+| src/encryption/secret_storage/futures.rs | b206b7c49824ecc7519f9c87c4df61d2d54441ad | 3eaa3b345d3cf08d474003094c6bf5a822cf43da |
+| src/encryption/secret_storage/mod.rs | 213970804af065e76f7f3de9fc1d5c2d3603e875 | d262704881742032d3f5219dfee3bca5ebec387c |
+| src/encryption/recovery/futures.rs | 8ac3f2b6e32b6b747f14545e74eec8fbde97948f | 9e8ee76b3a5b21ff67d12b6ea728d842b68d32f7 |
+| tests/integration/encryption/recovery.rs | 3ebbd24cda63a2a89d8daf6b7e6c1baeb96b45bc | b0a25be4a7f779584e88ff28edcd830e65ba9e5d |
+
+The upstream blobs are the `git_blob` values in `MORPHEUS_PROVENANCE.json`;
+those records are unchanged. `LICENSE` and the upstream headers are kept.
+`crates/morpheus-app/build.rs` hashes `vendor/`, so the persistence cohort
+changes with this patch.

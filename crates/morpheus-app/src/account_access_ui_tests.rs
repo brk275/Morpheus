@@ -3852,6 +3852,127 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     settle(ui).await;
 }
 
+// Uses the existing generated-window event loop and actual registered close/
+// context callbacks. No sign-in, SDK request or credential vault is opened.
+async fn assert_room_addresses_bounded_close_and_context(
+    ui: &AppWindow,
+    live: Arc<LiveUi>,
+    runtime: &Handle,
+) {
+    use crate::{RoomAddressEntry, RoomAddresses};
+    crate::room_addresses::register(ui, live, runtime.clone());
+    let old_page = ui.get_page();
+    let old_live = ui.get_live_session();
+    let old_scale = ui.get_font_scale_percent();
+    let old_size = ui.window().size();
+    ui.set_show_sign_in(false);
+    ui.set_page(0);
+    for scale in [100, 200] {
+        ui.window().set_size(slint::PhysicalSize::new(640, 620));
+        ui.set_font_scale_percent(scale);
+        settle(ui).await;
+        let state = ui.global::<RoomAddresses>();
+        state.set_room_name("A long synthetic room name for address review".into());
+        state.set_own_server("long-synthetic-homeserver.example.org".into());
+        state.set_new_local("synthetic-address".into());
+        state.set_summary("A bounded list with a long homeserver and more addresses than can be shown. The homeserver did not list its addresses; only published addresses are known. ".repeat(3).into());
+        state.set_error(
+            "Synthetic fixed error shown with the observed state. "
+                .repeat(4)
+                .into(),
+        );
+        state.set_notice(
+            "Reading current state is not proof that an earlier unanswered write finished. "
+                .repeat(4)
+                .into(),
+        );
+        state.set_can_publish(true);
+        state.set_publish_editable(true);
+        state.set_rows(ModelRc::new(VecModel::from(vec![RoomAddressEntry {
+            alias: "#synthetic:example.org".into(),
+            shown: "#synthetic:example.org".into(),
+            detail: "A long synthetic published address detail".into(),
+            local: true,
+            listed: true,
+            main: false,
+            alternative: false,
+        }])));
+        state.set_open(true);
+        settle(ui).await;
+        let whole = |label: &str| {
+            let size = ui.window().size().to_logical(ui.window().scale_factor());
+            let bounds = button_bounds(ui, label);
+            assert_eq!(bounds.len(), 1);
+            let b = bounds[0];
+            assert!(
+                b.left >= 0.0
+                    && b.top >= 0.0
+                    && b.right <= size.width + 0.5
+                    && b.bottom <= size.height + 0.5
+                    && b.right > b.left
+                    && b.bottom > b.top,
+                "address fixed action must remain wholly inside its generated window"
+            );
+        };
+        assert!(
+            ui.get_sas_protected(),
+            "the address panel protects verification"
+        );
+        whole("Close the addresses of this room");
+        whole("Done with the addresses of this room");
+        whole("Read this room's addresses again");
+        tab_to_control(ui, "Review adding this address on your homeserver");
+        settle(ui).await;
+        whole("Review adding this address on your homeserver");
+        assert!(focused_control_has_label(
+            ui,
+            "Review adding this address on your homeserver"
+        ));
+        state.set_review_title(
+            "Review a long exact synthetic address before making the change".into(),
+        );
+        state.set_review_lines(ModelRc::new(VecModel::from(vec![
+            SharedString::from("A long synthetic review explains an exact room and alias without claiming a compare-and-swap or rollback. ".repeat(14)),
+        ])));
+        state.set_confirm_label("Save published addresses".into());
+        state.set_reviewing(true);
+        settle(ui).await;
+        whole("Cancel this change");
+        whole(
+            "Save published addresses: Review a long exact synthetic address before making the change",
+        );
+        key(ui, Key::End);
+        settle(ui).await;
+        whole("Cancel this change");
+        whole("Done with the addresses of this room");
+        state.set_busy(true);
+        settle(ui).await;
+        whole("Close and withdraw this address change");
+        // This is the actual Escape path while busy, not callback invocation.
+        key(ui, Key::Escape);
+        settle(ui).await;
+        assert!(!state.get_open() && !state.get_busy() && !state.get_reviewing());
+        state.set_open(true);
+        state.set_busy(true);
+        settle(ui).await;
+        // A protected presentation cancels before the address view hides;
+        // context clearing must not increment focus-return to its old opener.
+        let closed = state.get_closed();
+        ui.set_access_open(true);
+        settle(ui).await;
+        assert!(!state.get_open() && !state.get_busy());
+        assert_eq!(state.get_closed(), closed);
+        ui.set_access_open(false);
+        settle(ui).await;
+    }
+    crate::room_addresses::clear(ui);
+    ui.set_font_scale_percent(old_scale);
+    ui.set_live_session(old_live);
+    ui.set_page(old_page);
+    ui.window().set_size(old_size);
+    settle(ui).await;
+}
+
 async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell<u8>>) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
@@ -3937,11 +4058,16 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
         directory.path().join("config.toml"),
     )));
     let live = LiveUi::new(manager.clone(), runtime.clone(), ui.as_weak(), voices);
+    phase.set(80);
+    assert_room_addresses_bounded_close_and_context(&ui, live.clone(), &runtime).await;
+    phase.set(15);
     assert_pane_navigation_epoch(&ui, &live, directory.path()).await;
     phase.set(73);
     assert_moderation_stops_with_its_context(&ui, &live, &runtime).await;
     phase.set(74);
     assert_room_media_scope_and_privacy(&ui, &live, &runtime).await;
+    phase.set(76);
+    assert_discovery_join_withdrawal(&ui, &live, &runtime).await;
     #[cfg(feature = "native-calls")]
     crate::voice_rosters::assert_unowned_presentation_is_cleared(&ui, live.clone(), &runtime);
     // This suite tests the actual dialog/controller boundary, not credentials.
@@ -6638,7 +6764,7 @@ async fn assert_pane_navigation_epoch(
 async fn assert_room_media_scope_and_privacy(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     use crate::room_media_browser::{HeldLoader, RoomMediaBrowser};
     use morpheus_matrix::{RoomMediaItem, RoomMediaKind, RoomMediaPage};
-    use slint::private_unstable_api::re_exports::AccessibilityAction;
+    use slint::private_unstable_api::re_exports::{AccessibilityAction, Flickable};
     use std::{cell::RefCell, rc::Rc, sync::atomic::Ordering};
 
     async fn within(wait: impl std::future::Future<Output = ()>) {
@@ -6752,6 +6878,130 @@ async fn assert_room_media_scope_and_privacy(ui: &AppWindow, live: &Arc<LiveUi>,
     until(ui, |ui| rows(ui) == 1).await;
     assert!(media.get_summary().contains("1 item from the 50 messages"));
     assert!(media.get_can_load_older());
+    // Long coverage/error text must scroll without displacing the actual
+    // first row or fixed actions at the minimum height and 200% text.
+    let layout_before = (
+        ui.window().size(),
+        ui.get_font_scale_percent(),
+        ui.get_details_width(),
+        media.get_summary(),
+        media.get_error(),
+    );
+    ui.window().set_size(slint::PhysicalSize::new(1280, 620));
+    ui.set_font_scale_percent(200);
+    ui.set_details_width(200);
+    media.set_summary("Synthetic coverage describes the loaded messages and the older media that has not been read. ".repeat(12).into());
+    media.set_error(
+        "A synthetic read error leaves the loaded row available. "
+            .repeat(8)
+            .into(),
+    );
+    settle(ui).await;
+    assert_eq!(ui.window().size(), slint::PhysicalSize::new(1280, 620));
+    let pane = item_bounds(&control_with_label(ui, "Conversation details"));
+    let panel_label = format!("Media in {}", ui.get_active_room_name());
+    let panel = item_bounds(&control_with_label(ui, &panel_label));
+    let list = item_bounds(&control_with_label(
+        ui,
+        &format!("{panel_label}, newest first"),
+    ));
+    let whole = |label: &str| {
+        let found = control_bounds(ui, label);
+        assert_eq!(found.len(), 1, "one actual media item: {label}");
+        let bounds = found[0];
+        assert!(
+            inside_window(ui, bounds)
+                && bounds.left >= pane.left - 0.5
+                && bounds.right <= pane.right + 0.5
+                && bounds.top >= panel.top - 0.5
+                && bounds.bottom <= pane.bottom + 0.5
+                && bounds.bottom <= panel.bottom + 0.5,
+            "media item {label} is whole inside its allocated pane: {bounds:?}, panel={panel:?}, pane={pane:?}"
+        );
+        bounds
+    };
+    assert!(inside_window(ui, pane) && inside_window(ui, panel));
+    assert!(panel.top >= pane.top - 0.5 && panel.bottom <= pane.bottom + 0.5);
+    let first = whole("beach.png, Image · 2.0 KB · image/png, Ana");
+    assert!(
+        first.top >= list.top - 0.5 && first.bottom <= list.bottom + 0.5,
+        "the complete first row is inside the real media list: {first:?}, list={list:?}"
+    );
+    for label in [
+        "Show beach.png in the conversation".to_owned(),
+        "View beach.png".to_owned(),
+        "Save beach.png".to_owned(),
+        format!("Load older media of {}", ui.get_active_room_name()),
+        "Close the media list".to_owned(),
+    ] {
+        let action = whole(&label);
+        assert!(
+            first.bottom <= action.top + 0.5,
+            "the first row does not overlap {label}"
+        );
+    }
+    let search_label = "Search loaded media; arrows select, Enter shows it in the conversation, Escape clears or closes";
+    tab_to_control(ui, search_label);
+    settle(ui).await;
+    let search = control_with_label(ui, search_label);
+    let mut header_viewports = Vec::new();
+    for node in geometry_nodes(ui) {
+        if node.downcast::<Flickable>().is_none() {
+            continue;
+        }
+        let mut contains_search = false;
+        let _ = node.visit_descendants(|item| {
+            if item == &search {
+                contains_search = true;
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        });
+        if contains_search {
+            header_viewports.push(item_bounds(&node));
+        }
+    }
+    assert_eq!(
+        header_viewports.len(),
+        1,
+        "the header shares one real scroll viewport"
+    );
+    let header_viewport = header_viewports[0];
+    let fixed_close = whole("Close the media list");
+    let scroll_position = slint::LogicalPosition::new(
+        (header_viewport.left + header_viewport.right) / 2.0,
+        header_viewport.bottom - 10.0,
+    );
+    for label in ["Kind of media shown", search_label] {
+        ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position: scroll_position,
+            delta_x: 0.0,
+            delta_y: -5_000.0,
+        });
+        settle(ui).await;
+        assert!(
+            item_bounds(&search).bottom < header_viewport.top,
+            "the actual body wheel scroll moved the header out of view"
+        );
+        tab_to_control(ui, label);
+        settle(ui).await;
+        assert!(focused_control_has_label(ui, label));
+        let header = whole(label);
+        assert!(
+            header.top >= header_viewport.top - 0.5
+                && header.bottom <= header_viewport.bottom + 0.5,
+            "keyboard focus reveals the whole header control: {header:?}, viewport={header_viewport:?}"
+        );
+        assert_eq!(whole("Close the media list"), fixed_close);
+        assert_eq!(whole("beach.png, Image · 2.0 KB · image/png, Ana"), first);
+    }
+    media.set_summary(layout_before.3);
+    media.set_error(layout_before.4);
+    ui.set_details_width(layout_before.2);
+    ui.set_font_scale_percent(layout_before.1);
+    ui.window().set_size(layout_before.0);
+    settle(ui).await;
     // View and Save hand on a listed row only.
     media.invoke_view("$photo:example.org".into());
     media.invoke_save("$photo:example.org".into());
@@ -8348,5 +8598,145 @@ async fn assert_sas_values_leave_on_close_and_protection(ui: &AppWindow) {
     ui.set_page(saved.0);
     ui.set_live_session(saved.1);
     ui.set_show_sign_in(saved.2);
+    settle(ui).await;
+}
+
+/// Actual generated join controls and the production withdrawal handlers,
+/// with held operation metadata only: no account/client or HTTP is used.
+async fn assert_discovery_join_withdrawal(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    use slint::private_unstable_api::re_exports::{AccessibilityAction, AccessibleStringProperty};
+    let saved = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_show_sign_in(),
+        ui.get_room_action_mode(),
+        live.is_live.load(Ordering::Acquire),
+    );
+    let room: JoinSlot = Arc::default();
+    let directory: JoinSlot = Arc::default();
+    register_join_cancellation(ui, room.clone(), directory.clone());
+    crate::space_explorer::register(ui, live.clone(), runtime.clone());
+    let submissions = Rc::new(std::cell::Cell::new(0));
+    let count = submissions.clone();
+    let (weak, owner, live_for_click) = (ui.as_weak(), room.clone(), live.clone());
+    ui.on_submit_room_action(move |mode, _| {
+        assert_eq!(mode, 1);
+        count.set(count.get() + 1);
+        if let Some(ui) = weak.upgrade() {
+            let operation = ui.get_room_action_operation().wrapping_add(1);
+            *owner.lock().unwrap() = Some((operation, live_for_click.join_asked()));
+            ui.set_room_action_operation(operation);
+            ui.set_room_action_busy(true);
+        }
+    });
+    live.is_live.store(true, Ordering::Release);
+    ui.set_live_session(true);
+    ui.set_show_sign_in(false);
+    ui.set_page(0);
+    ui.set_room_action_mode(1);
+    for escape in [true, false] {
+        ui.set_room_actions_open(true);
+        settle(ui).await;
+        assert!(ui.get_discovery_context_allowed());
+        control_with_label(ui, "Join Matrix room").accessible_action(&AccessibilityAction::Default);
+        settle(ui).await;
+        let asked = room.lock().unwrap().as_ref().unwrap().1.clone();
+        assert!(focused_control_has_label(ui, "Cancel the join"));
+        assert_eq!(
+            control_with_label(ui, "Join Matrix room")
+                .accessible_string_property(AccessibleStringProperty::Enabled)
+                .as_deref(),
+            Some("false")
+        );
+        if escape {
+            key(ui, Key::Escape);
+        } else {
+            control_with_label(ui, "Cancel the join and close room actions")
+                .accessible_action(&AccessibilityAction::Default);
+        }
+        settle(ui).await;
+        assert!(asked.withdrawn_for_test());
+        assert!(!ui.get_room_actions_open() && !ui.get_room_action_busy());
+        assert!(room.lock().unwrap().is_none());
+    }
+    assert_eq!(
+        submissions.get(),
+        2,
+        "Close and Escape must not submit another join"
+    );
+    ui.set_room_actions_open(true);
+    settle(ui).await;
+    control_with_label(ui, "Join Matrix room").accessible_action(&AccessibilityAction::Default);
+    let asked = room.lock().unwrap().as_ref().unwrap().1.clone();
+    ui.set_sas_stage(1);
+    settle(ui).await;
+    assert!(asked.withdrawn_for_test() && !ui.get_room_actions_open());
+    assert_eq!(submissions.get(), 3, "protection withdraws, never resends");
+    ui.set_sas_stage(0);
+
+    let directory_entries = Rc::new(std::cell::Cell::new(0));
+    let count = directory_entries.clone();
+    let (weak, owner, live_for_click) = (ui.as_weak(), directory.clone(), live.clone());
+    ui.on_join_discovery_target(move |_, _, _, _, _| {
+        count.set(count.get() + 1);
+        if let Some(ui) = weak.upgrade() {
+            let operation = ui.get_directory_join_operation().wrapping_add(1);
+            *owner.lock().unwrap() = Some((operation, live_for_click.join_asked()));
+            ui.set_directory_join_operation(operation);
+            ui.set_directory_join_busy(true);
+        }
+    });
+    ui.set_page(3);
+    settle(ui).await;
+    control_with_label(ui, "Join room by Matrix link or alias")
+        .accessible_action(&AccessibilityAction::Default);
+    let asked = directory.lock().unwrap().as_ref().unwrap().1.clone();
+    ui.set_access_open(true);
+    settle(ui).await;
+    assert!(asked.withdrawn_for_test() && !ui.get_directory_join_busy());
+    assert!(directory.lock().unwrap().is_none());
+    assert_eq!(
+        control_with_label(ui, "Join room by Matrix link or alias")
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("false")
+    );
+    assert_eq!(directory_entries.get(), 1);
+    ui.set_access_open(false);
+    settle(ui).await;
+    control_with_label(ui, "Join room by Matrix link or alias")
+        .accessible_action(&AccessibilityAction::Default);
+    let asked = directory.lock().unwrap().as_ref().unwrap().1.clone();
+    ui.set_page(1);
+    settle(ui).await;
+    assert!(asked.withdrawn_for_test() && !ui.get_directory_join_busy());
+    assert_eq!(directory_entries.get(), 2, "page exit sends nothing extra");
+
+    ui.set_page(0);
+    let asked = live.join_asked();
+    crate::space_explorer::hold_join_for_test(ui, asked.clone());
+    settle(ui).await;
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(asked.withdrawn_for_test() && !crate::space_explorer::is_open(ui));
+    let asked = live.join_asked();
+    crate::space_explorer::hold_join_for_test(ui, asked.clone());
+    ui.set_sas_stage(1);
+    settle(ui).await;
+    assert!(asked.withdrawn_for_test() && !crate::space_explorer::is_open(ui));
+    assert_eq!(submissions.get(), 3);
+    assert_eq!(
+        directory_entries.get(),
+        2,
+        "explorer Close never invokes another join entry"
+    );
+    ui.set_sas_stage(0);
+    ui.on_submit_room_action(|_, _| {});
+    ui.on_join_discovery_target(|_, _, _, _, _| {});
+    ui.set_room_action_mode(saved.3);
+    ui.set_page(saved.0);
+    ui.set_live_session(saved.1);
+    ui.set_show_sign_in(saved.2);
+    live.is_live.store(saved.4, Ordering::Release);
     settle(ui).await;
 }

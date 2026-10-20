@@ -511,7 +511,8 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
 
 /// No account, security, call or dialog flow is in the way.
 fn unobstructed(ui: &AppWindow, live: &LiveUi) -> bool {
-    ui.get_live_session()
+    !crate::room_addresses::is_open(ui)
+        && ui.get_live_session()
         && live.is_live.load(Ordering::Acquire)
         && !live.security_gate.blocked()
         && !ui.get_show_sign_in()

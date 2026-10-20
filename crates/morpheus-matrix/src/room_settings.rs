@@ -135,6 +135,14 @@ pub enum RoomSettingsError {
 }
 type Result<T> = std::result::Result<T, RoomSettingsError>;
 
+// A room's addresses: aliases and the published addresses, on the same
+// bounded requests, raw state and form contracts as the settings above.
+mod room_addresses;
+pub use room_addresses::{
+    MAX_ALIAS_LOCALPART_CHARS, MAX_ALTERNATIVE_ADDRESSES, MAX_ROOM_ADDRESSES, PublishEdit,
+    RoomAddress, RoomAddressError, RoomAddressesSession, RoomAddressesSnapshot, new_local_address,
+};
+
 #[derive(Default)]
 struct CancellationState {
     cancelled: AtomicBool,
@@ -903,13 +911,14 @@ fn request_failure(error: HttpError) -> RoomSettingsError {
         RoomSettingsError::Unavailable
     }
 }
-/// One state read: no SDK retries, a timeout, and refused while its body
-/// arrives once it grows past what `parse_state` accepts, rather than read
-/// in full first. Room settings, Space placement and its power-level checks
-/// all read state through it.
+/// One state read: no SDK retries or authentication refresh/replay, a
+/// timeout, and refused while its body arrives once it grows past what
+/// `parse_state` accepts, rather than read in full first. Room settings,
+/// Space placement and its power-level checks all read state through it.
 fn read_config() -> RequestConfig {
     RequestConfig::new()
         .retry_limit(0)
+        .disable_auth_refresh()
         .timeout(REQUEST_TIMEOUT)
         .max_response_bytes(MAX_STATE_BYTES as u64)
 }
@@ -2177,6 +2186,11 @@ mod tests {
         /// The power-level read with this number waits until it is reset.
         hold_power_read: Arc<AtomicUsize>,
         hold_writes: Arc<AtomicBool>,
+        // Address regressions reuse this same bounded fixture transport.
+        state_read_reply: Arc<StdMutex<Option<(u16, String)>>>,
+        refused_state_reads: Arc<AtomicUsize>,
+        refresh_reads: Arc<AtomicUsize>,
+        alias_reads: Arc<AtomicUsize>,
         stopped: Arc<AtomicBool>,
     }
 
@@ -2322,6 +2336,15 @@ mod tests {
         let not_found = json!({"errcode": "M_NOT_FOUND", "error": "x"});
         let (status, reply) = if path.starts_with("/_matrix/client/versions") {
             (200, json!({"versions": ["v1.15"]}).to_string())
+        } else if path.contains("/refresh") {
+            served.refresh_reads.fetch_add(1, Ordering::SeqCst);
+            (
+                200,
+                json!({"access_token":"synthetic renewed token"}).to_string(),
+            )
+        } else if path.contains("/directory/room/") {
+            served.alias_reads.fetch_add(1, Ordering::SeqCst);
+            (404, not_found.to_string())
         } else if path.contains("/sync") {
             let next = served.syncs.lock().unwrap().pop_front();
             (
@@ -2365,6 +2388,9 @@ mod tests {
                         (200, json!({"event_id": "$written"}).to_string())
                     }
                 }
+            } else if let Some(reply) = served.state_read_reply.lock().unwrap().clone() {
+                served.refused_state_reads.fetch_add(1, Ordering::SeqCst);
+                reply
             } else {
                 if kind == "m.room.power_levels" {
                     let read = served.power_reads.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2457,6 +2483,13 @@ mod tests {
     async fn signed_in(
         server: &SettingsServer,
     ) -> (std::path::PathBuf, Arc<AccountManager>, crate::AccountInfo) {
+        signed_in_with_refresh(server, false).await
+    }
+
+    async fn signed_in_with_refresh(
+        server: &SettingsServer,
+        refresh: bool,
+    ) -> (std::path::PathBuf, Arc<AccountManager>, crate::AccountInfo) {
         let account = crate::AccountInfo {
             id: uuid::Uuid::new_v4().to_string(),
             user_id: ME.into(),
@@ -2464,6 +2497,20 @@ mod tests {
             homeserver: server.url.clone(),
         };
         let (directory, manager, account) = fixture(Some(account)).await;
+        if refresh {
+            let client = matrix_sdk::Client::builder()
+                .homeserver_url(&server.url)
+                .handle_refresh_tokens()
+                .build()
+                .await
+                .unwrap();
+            client.send_queue().set_enabled(false).await;
+            let mut state = manager.state.lock().await;
+            // The fixture has not shared its LoadedAccount with any worker.
+            Arc::get_mut(state.loaded.get_mut(&account.id).unwrap())
+                .unwrap()
+                .client = client;
+        }
         let client = {
             let state = manager.state.lock().await;
             state.loaded[&account.id].client.clone()
@@ -2475,7 +2522,7 @@ mod tests {
             },
             tokens: matrix_sdk::SessionTokens {
                 access_token: "synthetic access token".into(),
-                refresh_token: None,
+                refresh_token: refresh.then(|| "synthetic refresh token".to_owned()),
             },
         };
         let restored = client
@@ -2503,6 +2550,166 @@ mod tests {
         session
             .unwrap()
             .with_admission(Arc::new(move || gate.load(Ordering::SeqCst)))
+    }
+
+    #[test]
+    fn addresses_withdraw_during_manager_or_permission_wait_and_reject_epoch_aba() {
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in(&server).await;
+            let selection = manager.account_selection(&account.id).unwrap();
+            let token = RoomSettingsCancellation::new();
+            let held = manager.state.lock().await;
+            let close = async {
+                tokio::task::yield_now().await;
+                token.cancel();
+            };
+            let (result, ()) = tokio::join!(
+                manager.open_room_addresses_for(&selection, ROOM, token.clone(), Arc::new(|| true)),
+                close
+            );
+            assert!(matches!(result, Err(RoomAddressError::Cancelled)));
+            drop(held);
+            let epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let expected = epoch.clone();
+            let token = RoomSettingsCancellation::new();
+            let session = manager
+                .open_room_addresses_for(
+                    &selection,
+                    ROOM,
+                    token.clone(),
+                    Arc::new(move || expected.load(Ordering::SeqCst) == 0),
+                )
+                .await
+                .unwrap();
+            for withdraw in [false, true] {
+                server.served.hold_power.store(true, Ordering::SeqCst);
+                let count = server.power_reads();
+                let revoke = async {
+                    server.wait_for_power_reads(count + 1).await;
+                    if withdraw {
+                        token.cancel();
+                    } else {
+                        epoch.store(2, Ordering::SeqCst);
+                    }
+                    server.served.hold_power.store(false, Ordering::SeqCst);
+                };
+                let (result, ()) =
+                    tokio::join!(session.edit_published(PublishEdit::ClearMain), revoke);
+                assert_eq!(
+                    result.err(),
+                    Some(if withdraw {
+                        RoomAddressError::Cancelled
+                    } else {
+                        RoomAddressError::SecurityBusy
+                    })
+                );
+                epoch.store(0, Ordering::SeqCst);
+            }
+            assert!(server.writes().is_empty());
+            drop(session);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn addresses_cancel_after_dispatch_keeps_unknown_and_promotion_checks_mapping() {
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in(&server).await;
+            let selection = manager.account_selection(&account.id).unwrap();
+            let token = RoomSettingsCancellation::new();
+            let session = manager
+                .open_room_addresses_for(&selection, ROOM, token.clone(), Arc::new(|| true))
+                .await
+                .unwrap();
+            server.served.hold_writes.store(true, Ordering::SeqCst);
+            let close = async {
+                server.wait_for_writes(1).await;
+                token.cancel();
+            };
+            let (result, ()) = tokio::join!(session.edit_published(PublishEdit::ClearMain), close);
+            assert_eq!(result.err(), Some(RoomAddressError::Unknown));
+            assert_eq!(server.writes().len(), 1);
+            drop(session);
+            server.served.hold_writes.store(false, Ordering::SeqCst);
+            server.served.state.lock().unwrap().insert(
+                ("m.room.canonical_alias".into(), "".into()),
+                r##"{"alt_aliases":["#old:example.org"],"extension":1.10}"##.into(),
+            );
+            let session = manager
+                .open_room_addresses_for(
+                    &selection,
+                    ROOM,
+                    RoomSettingsCancellation::new(),
+                    Arc::new(|| true),
+                )
+                .await
+                .unwrap();
+            let result = session
+                .edit_published(PublishEdit::SetMain("#old:example.org".into()))
+                .await;
+            assert_eq!(result.err(), Some(RoomAddressError::NotFound));
+            assert_eq!(server.served.alias_reads.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                server.writes().len(),
+                1,
+                "promotion must not publish an unresolved mapping"
+            );
+            drop(session);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn settings_expired_sign_in_does_not_refresh_or_replay_its_bounded_state_read() {
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in_with_refresh(&server, true).await;
+            *server.served.state_read_reply.lock().unwrap() = Some((
+                401,
+                json!({"errcode":"M_UNKNOWN_TOKEN","error":"synthetic private text"}).to_string(),
+            ));
+            let selection = manager.account_selection(&account.id).unwrap();
+            let result = manager
+                .open_room_settings_for(&selection, ROOM, RoomSettingsCancellation::new())
+                .await;
+            // The family's existing fixed category is preserved; no server body.
+            assert!(matches!(result, Err(RoomSettingsError::Unavailable)));
+            assert_eq!(server.served.refused_state_reads.load(Ordering::SeqCst), 1);
+            assert_eq!(server.served.refresh_reads.load(Ordering::SeqCst), 0);
+            assert!(server.writes().is_empty());
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn addresses_expired_sign_in_does_not_refresh_or_replay_its_bounded_read() {
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in_with_refresh(&server, true).await;
+            *server.served.state_read_reply.lock().unwrap() = Some((
+                401,
+                json!({"errcode":"M_UNKNOWN_TOKEN","error":"synthetic private text"}).to_string(),
+            ));
+            let selection = manager.account_selection(&account.id).unwrap();
+            let result = manager
+                .open_room_addresses_for(
+                    &selection,
+                    ROOM,
+                    RoomSettingsCancellation::new(),
+                    Arc::new(|| true),
+                )
+                .await;
+            assert!(matches!(result, Err(RoomAddressError::SignInExpired)));
+            assert_eq!(server.served.refresh_reads.load(Ordering::SeqCst), 0);
+            assert!(server.writes().is_empty());
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
     }
 
     #[test]

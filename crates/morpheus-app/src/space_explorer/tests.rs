@@ -297,7 +297,7 @@ fn the_shown_space_is_joinable_only_as_its_own_rule_allows() {
     let target = explorer
         .join_target(ROOT)
         .expect("a restricted Space may be tried");
-    assert!(target.restricted && target.is_space);
+    assert!(target.restricted && target.room_id == ROOT);
 }
 
 #[test]
@@ -354,13 +354,45 @@ fn statuses_decide_what_may_be_joined_or_opened() {
     // A restricted join failure names the rule, never the server's text.
     let target = JoinTarget {
         room_id: "!r:example.org".into(),
-        name: "Room".into(),
         via: Vec::new(),
-        is_space: false,
         restricted: true,
     };
     let failure = target.failure(&MatrixCoreError::Sdk("M_FORBIDDEN: secret".into()));
     assert!(failure.contains("certain Spaces") && !failure.contains("secret"));
+    let refused = MatrixCoreError::Join(morpheus_matrix::JoinError::NotAllowed);
+    assert!(target.failure(&refused).contains("certain Spaces"));
+    // Sent without a definite reply: never "could not join".
+    let unknown = MatrixCoreError::Join(morpheus_matrix::JoinError::OutcomeUnknown);
+    let failure = target.failure(&unknown);
+    assert!(failure.contains("may or may not have joined") && !failure.contains("Could not"));
+    let changed = MatrixCoreError::Join(morpheus_matrix::JoinError::AccountChanged);
+    assert!(target.failure(&changed).contains("Nothing was sent"));
+    // Withdrawn, refused by the gate, stalled, or not resent: each says what
+    // was sent. Another room answering is never "joined" or "could not".
+    for (error, said) in [
+        (morpheus_matrix::JoinError::Cancelled, "Nothing was sent"),
+        (morpheus_matrix::JoinError::Blocked, "Nothing was sent"),
+        (morpheus_matrix::JoinError::Unavailable, "Nothing was sent"),
+        (morpheus_matrix::JoinError::Pending, "Nothing more was sent"),
+        (
+            morpheus_matrix::JoinError::EarlierUnknown,
+            "may or may not have happened",
+        ),
+        (
+            morpheus_matrix::JoinError::UnresolvedLimit,
+            "Nothing was sent",
+        ),
+        (
+            morpheus_matrix::JoinError::UnexpectedRoom,
+            "nothing was opened",
+        ),
+    ] {
+        let failure = target.failure(&MatrixCoreError::Join(error));
+        assert!(
+            failure.contains(said) && !failure.contains("Could not"),
+            "{failure}"
+        );
+    }
     // A target without route servers is routed through its own server.
     let MatrixLinkTarget::Room { via_servers, .. } = target.link() else {
         panic!("a room target");
@@ -457,11 +489,13 @@ async fn a_departed_selection_neither_reads_nor_joins_after_a_b_a() {
         via_servers: vec!["example.org".into()],
     };
     let joined = live
-        .join_explorer_target(&departed, &target, Some(true), "Space", Weak::default())
+        .join_target_for(&departed, &target, &live.join_asked(), Weak::default())
         .await;
     assert!(matches!(
         joined,
-        Err(MatrixCoreError::SelectedAccountChanged)
+        Err(MatrixCoreError::Join(
+            morpheus_matrix::JoinError::AccountChanged
+        ))
     ));
     manager.stop().await;
     drop(live);
