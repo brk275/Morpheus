@@ -1,16 +1,16 @@
 # TEMPORARY owner-reviewed layout contracts. NEVER MERGE this workflow.
-name: Reviewed native compile diagnosis
-run-name: Reviewed native compile diagnosis - 7240440
+name: Reviewed affected native checks
+run-name: Reviewed affected native checks - c7d0e12
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: compile-diagnosis-7240440-${{ github.ref }}
+  group: affected-native-c7d0e12-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
-    name: Native compile diagnosis Linux x64
+    name: Native affected checks Linux x64
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 72404407d2cb11777b39f6d6d122629f225a7ae4
+          ref: c7d0e125e8a99c574e97d9e9715ca5ba0ec855d9
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='72404407d2cb11777b39f6d6d122629f225a7ae4'
+          source='c7d0e125e8a99c574e97d9e9715ca5ba0ec855d9'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
@@ -265,7 +265,14 @@ jobs:
               for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
                   known_test_ids.add(prefix+function)
           checks=[
-              ('compile_diagnosis', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', '--no-run'], 2700, None, set()),
+              ('workspace_layout', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'workspace_layout::tests::', '--', '--test-threads=1'], 2700, {'workspace_layout::tests::hidden_and_collapsed_panes_restore_to_the_default', 'workspace_layout::tests::the_account_control_stays_bottom_left_in_every_arrangement', 'workspace_layout::tests::presets_change_only_the_arrangement_and_are_recognized', 'workspace_layout::tests::narrow_windows_give_way_in_order_and_keep_the_conversation', 'workspace_layout::tests::the_default_arrangement_matches_the_classic_layout', 'workspace_layout::tests::a_dragged_width_commits_once_clamped_and_never_over_an_external_change', 'workspace_layout::tests::a_dragged_pane_lands_exactly_once_at_its_insertion_position', 'workspace_layout::tests::reordering_keeps_hidden_collapsed_and_widths_and_refuses_stale_orders'}, set()),
+              ('core_space_explorer', ['cargo', 'test', '--locked', '-p', 'morpheus-matrix', '--lib', 'space_explorer::tests::', '--', '--test-threads=1'], 2700, {'space_explorer::tests::untrusted_fields_are_bounded_plain_text_without_media', 'space_explorer::tests::a_page_without_its_parent_still_respects_the_room_limit', 'space_explorer::tests::a_level_page_separates_the_space_and_keeps_each_room_once', 'space_explorer::tests::pages_links_and_tokens_are_bounded'}, set()),
+              ('app_space_explorer', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'space_explorer::tests::', '--', '--test-threads=1', '--skip', 'a_departed_selection_neither_reads_nor_joins_after_a_b_a'], 2700, {'space_explorer::tests::statuses_decide_what_may_be_joined_or_opened', 'space_explorer::tests::results_for_a_departed_level_or_explorer_are_dropped', 'space_explorer::tests::a_cycle_goes_back_instead_of_reading_again', 'space_explorer::tests::a_room_in_several_spaces_is_joined_everywhere_it_is_listed', 'space_explorer::tests::links_the_server_does_not_describe_are_listed_and_extras_are_not', 'space_explorer::tests::search_filters_the_loaded_level_and_navigation_clears_it', 'space_explorer::tests::a_partial_page_or_repeated_cursor_never_invents_missing_children', 'space_explorer::tests::the_shown_space_is_joinable_only_as_its_own_rule_allows', 'space_explorer::tests::pages_follow_the_token_and_keep_each_room_once', 'space_explorer::tests::depth_pages_and_rows_are_bounded'}, set()),
+              ('sdk_push_rule_writes', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'notification_settings::tests::test_push_rule_', '--', '--test-threads=1'], 2700, {'notification_settings::tests::test_push_rule_errors_do_not_log_server_reply_text', 'notification_settings::tests::test_push_rule_writes_reject_oversized_valid_json', 'notification_settings::tests::test_push_rule_failure_is_not_retried'}, set()),
+              ('voice_rosters', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'voice_rosters::', '--', '--test-threads=1'], 2700, {'voice_rosters::tests::only_the_current_scope_selection_and_watcher_may_store_a_roster', 'voice_rosters::tests::unsupported_rooms_stop_while_a_missing_slot_claims_nothing', 'voice_rosters::tests::releasing_a_watcher_stops_and_aborts_its_work', 'voice_rosters::tests::finished_watchers_recover_and_changed_modes_restart_without_a_loop', 'voice_rosters::model::tests::rooms_watched_are_bounded_unique_and_follow_visibility', 'voice_rosters::model::tests::people_are_one_per_user_with_bounded_sanitized_labels', 'voice_rosters::model::tests::presence_never_overstates_and_goes_stale', 'voice_rosters::model::tests::only_passive_dialects_get_a_roster'}, set()),
+              ('passive_observer', ['cargo', 'test', '--locked', '-p', 'morpheus-rtc', '--features', 'native-devices', '--lib', 'observer::tests::', '--', '--test-threads=1'], 2700, {'observer::tests::stable_slot_request_matches_the_pinned_writer_without_ruma_aliasing', 'observer::tests::closed_or_malformed_stable_slot_never_reads_an_unstable_open_slot', 'observer::tests::exact_missing_stable_state_reads_and_validates_the_unstable_slot', 'observer::tests::unavailable_auth_or_non_missing_errors_never_try_an_alias', 'observer::tests::missing_or_closed_unstable_state_cannot_rearm_a_missing_slot', 'observer::tests::slot_requires_explicit_open_known_encryption_and_call_application', 'observer::tests::selected_dialect_never_accepts_the_other_wire_slot_or_legacy', 'observer::tests::membership_claims_and_dual_keys_cannot_conflict', 'observer::tests::absent_current_reference_is_pending_but_duplicates_and_invalid_entries_are_fatal', 'observer::tests::missing_reference_never_masks_a_later_invalid_or_duplicate_participation', 'observer::tests::roster_requires_actual_encrypted_device_and_current_refresh_identity', 'observer::tests::debug_redacts_identity_and_opaque_ids_are_bounded'}, set()),
+              ('app_transfer_private_ui', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', '--', '--exact', '--test-threads=1'], 2700, {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}, set()),
+              ('native_app_build', ['cargo', 'build', '--locked', '-p', 'morpheus-app', '--features', 'native-calls'], 2400, None, set()),
           ]
           for _name, _args, _seconds, required, _ignored in checks:
               if required is not None: known_test_ids.update(required)
@@ -316,9 +323,11 @@ jobs:
                       and ignored==allowed_ignored and required<=okay)
                   record.update({'complete_test_accounting':complete,'tests_passed':a,'tests_failed':b,
                       'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
+              if name=='app_space_explorer':
+                  record['live_account_case_skipped']=True
               record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
               if not passed:
-                  # This job compiles reviewed public source only, never runs tests.
+                  # Only bounded compiler error excerpts from independently scanned output.
                   # Expose bounded compiler errors after the independent full-output scan,
                   # with controls/absolute runner paths removed. No raw log upload.
                   diagnostics=[]
