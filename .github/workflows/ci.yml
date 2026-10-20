@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed compiler diagnostic - 9dd17a0 - ${{ inputs.platform }}
+run-name: Reviewed beta catch-up - 9c995fc - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -10,11 +10,11 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, macos-arm64, macos-intel, windows, linux]
+        options: [all, macos-arm64, macos-intel, windows, linux, remaining-native]
 permissions:
   contents: read
 concurrency:
-  group: beta-native-9dd17a0-${{ github.ref }}
+  group: beta-native-9c995fc-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -31,7 +31,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef
+          ref: 9c995fcf7fb519f1a0f0e926f520f2aeb863e8e8
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = 9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef
+          test "$(git -C candidate rev-parse HEAD)" = 9c995fcf7fb519f1a0f0e926f520f2aeb863e8e8
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -60,10 +60,10 @@ jobs:
   native:
     needs: security
     name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["all","macos-arm64","macos-intel","windows","linux"]'), inputs.platform)
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["all","macos-arm64","macos-intel","windows","linux","remaining-native"]'), inputs.platform)
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
+      matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || inputs.platform == 'remaining-native' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -78,7 +78,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef
+          ref: 9c995fcf7fb519f1a0f0e926f520f2aeb863e8e8
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -317,7 +317,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef'
+          source='9c995fcf7fb519f1a0f0e926f520f2aeb863e8e8'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -658,7 +658,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef'
+          source='9c995fcf7fb519f1a0f0e926f520f2aeb863e8e8'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -887,6 +887,25 @@ jobs:
               'tests::registry_rejects_path_like_account_ids',
               'tests::sso_redirect_must_be_private_loopback_listener',
           }
+          # Exact new regression IDs from the reviewed source cohort. Broad suites
+          # remain unchanged; a filtered/ignored/missing repair case cannot pass.
+          needed_matrix.update({
+              'room_settings::tests::settings_expired_sign_in_does_not_refresh_or_replay_its_bounded_state_read',
+              'room_settings::tests::addresses_expired_sign_in_does_not_refresh_or_replay_its_bounded_read',
+              'room_settings::room_addresses::tests::address_reads_are_feature_local_single_attempt_without_auth_refresh',
+              'discovery::tests::nothing_is_sent_unless_the_exact_selection_and_the_caller_admit_it',
+              'discovery::tests::a_held_join_cancelled_after_its_hand_off_is_unknown_and_never_resent',
+              'discovery::tests::a_typed_room_id_is_joined_exactly_and_an_alias_takes_its_answer',
+              'account_recovery::tests::every_generated_key_is_kept_with_how_far_setup_got',
+              'account_recovery::tests::a_late_backup_import_failure_never_claims_nothing_was_imported',
+              'account_recovery::tests::a_replaced_client_waits_for_its_own_encryption_setup',
+              'account_recovery::tests::critical_operations_are_fenced_before_they_start',
+          })
+          needed_app.update({
+              'room_addresses::tests::retained_receipts_never_settle_unknown_from_reads_or_resurrect_after_removal',
+              'room_addresses::tests::accepted_receipt_needs_later_fresh_read_and_saturation_never_evicts',
+              'room_addresses::tests::dropping_the_actual_completion_owner_keeps_the_existing_receipt_unknown',
+          })
           needed_rtc={
               'tests::build_capability_matches_feature','tests::device_capability_matches_features',
               'audio_device::tests::signaling_gate_withholds_audio_without_an_owner_or_revocation',
@@ -915,6 +934,14 @@ jobs:
               ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib','--','--test-threads=1'],20*60,needed_config,set()),
               ('rtc_unit',['cargo','test','--locked','-p','morpheus-rtc','--features','native-devices','--lib','--','--test-threads=1'],30*60,needed_rtc,set()),
           ]
+          if os.environ.get('RUNNER_OS')=='Linux':
+              # New opt-in SDK key handoff: a loopback mock's final default-key PUT
+              # takes effect and fails. Its retained key must still open the store.
+              checks.append(('recovery_key_handoff',
+                  ['cargo','test','--locked','-p','matrix-sdk','--features','testing',
+                      '--test','integration','encryption::recovery::test_recovery_setup_hands_over_the_key_when_its_last_request_fails',
+                      '--','--exact','--test-threads=1'],20*60,
+                  {'encryption::recovery::test_recovery_setup_hands_over_the_key_when_its_last_request_fails'},set()))
           for _name, _args, _seconds, required, _ignored in checks:
               if required is not None: known_test_ids.update(required)
           if os.environ.get('RUNNER_OS')=='Linux':
