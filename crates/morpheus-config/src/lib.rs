@@ -4389,10 +4389,10 @@ mod tests {
     fn every_editor_metric_is_a_bounded_field_with_one_accessor() {
         use registry::{MetricGroup, metric_field, metric_fields};
         let defaults = Config::default();
-        let mut count = 0;
+        let mut keys = std::collections::BTreeSet::new();
         for (field, editor) in metric_fields() {
-            count += 1;
             let key = field.key;
+            assert!(keys.insert(key), "duplicate editor metric: {key}");
             let (minimum, maximum) = field.integer_range().expect("metrics are integers");
             assert!(minimum >= 0 && minimum < maximum, "{key}");
             assert!(!editor.label.is_empty() && !field.inactive, "{key}");
@@ -4437,7 +4437,32 @@ mod tests {
             assert!(!config.set_metric(key, MetricValue::Inherited).unwrap());
             assert_eq!(config, defaults, "{key} reset left another change");
         }
-        assert_eq!(count, 17);
+        assert_eq!(
+            keys,
+            [
+                "appearance.panel_fade_ms",
+                "appearance.popup_fade_ms",
+                "geometry.avatar_roundness",
+                "geometry.avatar_size",
+                "geometry.border_width",
+                "geometry.composer_padding",
+                "geometry.composer_radius",
+                "geometry.control_padding",
+                "geometry.control_radius",
+                "geometry.focus_width",
+                "geometry.icon_size",
+                "geometry.input_padding",
+                "geometry.input_radius",
+                "typography.body_weight",
+                "typography.composer_size",
+                "typography.line_height_percent",
+                "typography.sender_size",
+                "typography.sidebar_size",
+                "typography.timestamp_size",
+            ]
+            .into_iter()
+            .collect()
+        );
         // Fields without editor metadata are not metrics.
         for key in [
             "typography.message_size",
