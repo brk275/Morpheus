@@ -48,6 +48,7 @@ mod room_activity;
 mod room_addresses;
 mod room_media_browser;
 mod room_organization;
+mod room_permissions;
 mod room_settings;
 mod security;
 mod sender_palette_editor;
@@ -1630,6 +1631,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
     let room_settings =
         room_settings::RoomSettingsUi::register(&ui, live.clone(), runtime.handle());
+    let room_permissions = room_permissions::RoomPermissionsUi::register(
+        &ui,
+        live.clone(),
+        runtime.handle(),
+        manager.clone(),
+    );
     let pinned_messages =
         pinned_messages::PinnedMessagesUi::register(&ui, live.clone(), runtime.handle());
     let room_media = room_media_browser::RoomMediaBrowser::register(
@@ -4007,6 +4014,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     live.voice_spaces.forget_account(&account_id).await;
                     live.forget_account_drafts(&account_id);
+                    room_permissions::forget_account(&account_id);
                     space_management::forget_account(&account_id);
                     live.forget_removed_account_joins(&account_id);
                     live.clear_feed().await;
@@ -4372,6 +4380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pinned_messages.shutdown(&ui);
     room_media.shutdown(&ui);
     room_activity.shutdown(&ui);
+    room_permissions.shutdown(&ui);
     room_settings.shutdown(&ui);
     moderation.shutdown();
     image_previews.shutdown(&ui);

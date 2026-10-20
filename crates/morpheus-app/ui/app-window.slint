@@ -39,6 +39,9 @@ export { IgnoredUserRow, IgnoredUsersView, MemberInspectorView, MemberPrivacy } 
 import { RoomMedia, RoomMediaPanel } from "room-media.slint";
 // Rust drives the room media browser (the details panel's Media tab) through this global.
 export { RoomMedia, RoomMediaRow } from "room-media.slint";
+import { RoomPermissions, RoomPermissionsDialog } from "room-permissions.slint";
+// Rust drives the roles and permissions view of the room admin dialog through this global.
+export { PermissionRow, RoomPermissions } from "room-permissions.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
 // One row of the pane arrangement editor, in the current order.
@@ -3331,6 +3334,12 @@ export component AppWindow inherits Window {
     in-out property <string> room-admin-error;
     in-out property <string> room-admin-notice;
     in-out property <int> room-admin-operation: 0;
+    // The roles and permissions view (room_permissions, mode 3): shown, and
+    // the account and room it belongs to.
+    property <bool> room-permissions-visible: root.room-admin-open && root.room-admin-mode == 3;
+    changed room-permissions-visible => { RoomPermissions.shown(root.room-permissions-visible); }
+    property <string> room-permissions-scope: root.active-account-local-id + "\n" + root.active-room-id + "\n" + (root.live-session ? "1" : "0");
+    changed room-permissions-scope => { RoomPermissions.context-changed(); }
     in-out property <string> room-settings-form-id;
     in-out property <bool> room-settings-loaded: false;
     in-out property <bool> room-settings-dirty: false;
@@ -11862,6 +11871,24 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1;
                         VerticalLayout {
                             padding-right: 12px; spacing: 10px;
+                            // Leaving for roles and permissions closes this form; with
+                            // unsaved edits it waits until they are saved or refreshed away.
+                            // Room addresses open over this form: while they are, this
+                            // refuses both by its enabled state and in the activation itself,
+                            // so a queued activation cannot switch the view under them.
+                            ActionRect {
+                                height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
+                                background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
+                                label: root.room-settings-dirty ? "Roles and permissions; save or refresh your settings edits first" : "Open this room's roles and permissions";
+                                enabled: !RoomAddresses.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty;
+                                activated => {
+                                    if !RoomAddresses.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty {
+                                        root.room-admin-mode = 3;
+                                    }
+                                }
+
+                                Text { x: 12px; width: parent.width - 24px; text: "Roles and permissions…"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            }
                             Text { text: "Room name"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
                             Rectangle {
                                 min-height: 42px * root.text-scale; background: root.elevated; border-radius: StyleTokens.radius * 0.8;
@@ -12076,6 +12103,34 @@ export component AppWindow inherits Window {
         }
     }
 
+
+    if root.room-admin-open && root.room-admin-mode == 3 : RoomPermissionsDialog {
+        text-scale: root.text-scale;
+        controls: root.button-colors;
+        palette: {
+            ink: root.ink,
+            muted: root.muted,
+            surface: root.dialog-surface,
+            elevated: root.elevated,
+            hover: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover,
+            outline: root.divider,
+            focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+            selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : Palette.selection-background,
+            selection-ink: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground,
+            has-selection-ink: true,
+            accent: root.accent,
+            error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+            warning: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+            scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa,
+            input-surface: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated,
+            input-border: StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.divider,
+        };
+        // Back reopens room settings, read fresh; Close ends the dialog.
+        // Both end the editor synchronously first, so a held read or save
+        // can no longer act for a view that is already closing.
+        back => { RoomPermissions.reset(); root.room-admin-mode = 0; root.open-room-settings(); }
+        close => { RoomPermissions.reset(); root.room-admin-open = false; root.dismiss-room-settings(); }
+    }
 
     if root.room-admin-open && root.room-admin-mode == 2 : FocusScope {
         init => { admin-close.focus(); }

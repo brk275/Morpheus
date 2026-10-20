@@ -764,6 +764,16 @@ impl RoomSettingsSession {
     }
 }
 
+// The native room permissions editor, on the same session and helpers.
+mod room_permissions;
+pub use room_permissions::{
+    EventClass, MAX_PERMISSION_CHANGES, MAX_PERMISSION_EVENTS, MAX_PERMISSION_USERS,
+    PermissionChange, PermissionKey, PermissionLevel, PermissionProblem, PermissionTarget,
+    PermissionThreshold, PermissionUser, PermissionsBaseline, PermissionsEdit, PermissionsError,
+    PermissionsReadOnly, PermissionsReview, PermissionsSaved, ReviewedChange,
+    RoomPermissionsSnapshot, RoomPermissionsView, event_class, review_permissions,
+};
+
 fn ensure_scope(
     selection: &AccountSelection,
     cancellation: &RoomSettingsCancellation,

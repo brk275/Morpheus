@@ -3998,6 +3998,8 @@ fn apply_snapshot(
         crate::room_media_browser::reset_window(ui);
         // So do typing names, Seen-by rows and read receipt state.
         crate::room_activity::clear(ui);
+        // So do the room's roles, staged permission changes and review.
+        crate::room_permissions::reset_window(ui);
         crate::reset_attachment_view(ui);
         // All-room results stay with their account across rooms, which is
         // how opening a hit in another room keeps the list it came from.
@@ -4210,6 +4212,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     ui.invoke_reset_pinned_messages();
     // So are the media browser's rows.
     crate::room_media_browser::reset_window(ui);
+    // So are the room's roles and staged permission changes.
+    crate::room_permissions::reset_window(ui);
     // So is who is in this account's voice rooms.
     #[cfg(feature = "native-calls")]
     crate::voice_rosters::clear(ui);

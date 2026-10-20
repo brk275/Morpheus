@@ -115,6 +115,13 @@ mod moderation;
 pub use moderation::{
     MemberAction, ModerationCancellation, ModerationError, ModerationOutcome, ModerationScope,
 };
+pub use room_settings::{
+    EventClass, MAX_PERMISSION_CHANGES, MAX_PERMISSION_EVENTS, MAX_PERMISSION_USERS,
+    PermissionChange, PermissionKey, PermissionLevel, PermissionProblem, PermissionTarget,
+    PermissionThreshold, PermissionUser, PermissionsBaseline, PermissionsEdit, PermissionsError,
+    PermissionsReadOnly, PermissionsReview, PermissionsSaved, ReviewedChange,
+    RoomPermissionsSnapshot, RoomPermissionsView, event_class, review_permissions,
+};
 pub use room_tags::{
     ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, RoomTagState,
     TagKnowledge, TagOrder,

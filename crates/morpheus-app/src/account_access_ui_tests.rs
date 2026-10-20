@@ -4068,6 +4068,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_room_media_scope_and_privacy(&ui, &live, &runtime).await;
     phase.set(76);
     assert_discovery_join_withdrawal(&ui, &live, &runtime).await;
+    phase.set(82);
+    assert_room_permissions_editor(&ui, &live, &runtime).await;
     #[cfg(feature = "native-calls")]
     crate::voice_rosters::assert_unowned_presentation_is_cleared(&ui, live.clone(), &runtime);
     // This suite tests the actual dialog/controller boundary, not credentials.
@@ -8738,5 +8740,354 @@ async fn assert_discovery_join_withdrawal(ui: &AppWindow, live: &Arc<LiveUi>, ru
     ui.set_live_session(saved.1);
     ui.set_show_sign_in(saved.2);
     live.is_live.store(saved.4, Ordering::Release);
+    settle(ui).await;
+}
+
+/// The roles and permissions view through its registered callbacks and the
+/// window's own hooks (mode 3 of the room admin dialog, its scope handlers
+/// and the live reset), with the core's reads and saves held. A read that
+/// returns after the room changed and came back is not shown. Staging
+/// works only on a listed row this account may change. Lowering your own
+/// level is never sent without its confirmation. A save is refused at its
+/// hand-off once a security step began and ended. The reset clears
+/// everything at once. No account, network or vault.
+async fn assert_room_permissions_editor(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    use crate::room_permissions::{HeldAnswer, HeldCore, RoomPermissionsUi};
+    use morpheus_matrix::{
+        EventClass, PermissionKey, PermissionLevel, PermissionThreshold, PermissionUser,
+        RoomPermissionsSnapshot,
+    };
+    use std::sync::atomic::Ordering;
+
+    const ME: &str = "@casey:example.org";
+    async fn within(wait: impl std::future::Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the held permissions core answers");
+    }
+    async fn until(ui: &AppWindow, done: impl Fn(&AppWindow) -> bool) {
+        let wait = async {
+            while !done(ui) {
+                settle(ui).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the permissions view reaches the window");
+    }
+    fn state(ui: &AppWindow) -> i32 {
+        ui.global::<RoomPermissions>().get_state()
+    }
+    fn person(id: &str, level: i64, editable: bool) -> PermissionUser {
+        PermissionUser {
+            user_id: id.into(),
+            display_name: id.into(),
+            level: PermissionLevel::Level(level),
+            editable,
+            own: id == ME,
+        }
+    }
+    async fn reopen(ui: &AppWindow) {
+        ui.set_room_admin_open(false);
+        settle(ui).await;
+        ui.set_room_admin_mode(3);
+        ui.set_room_admin_open(true);
+        settle(ui).await;
+    }
+
+    let account = ui.get_active_account_local_id();
+    let room = ui.get_active_room_id();
+    let was_session = ui.get_live_session();
+    let shown = "!perms:example.org";
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("permissions-account".into());
+    ui.set_active_room_id(shown.into());
+    settle(ui).await;
+    let was_live = live.is_live.swap(true, Ordering::AcqRel);
+    let ban = PermissionThreshold {
+        key: PermissionKey::Ban,
+        level: 50,
+        explicit: true,
+        class: EventClass::NotEvent,
+        editable: true,
+    };
+    let snapshot = RoomPermissionsSnapshot {
+        room_id: shown.into(),
+        room_version: "10".into(),
+        own_user: ME.into(),
+        own_level: PermissionLevel::Level(100),
+        can_change: true,
+        change_level: 50,
+        users_default: 0,
+        own_explicit: true,
+        exact_users: [
+            (ME, 100),
+            ("@peer:example.org", 100),
+            ("@dana:example.org", 50),
+        ]
+        .into_iter()
+        .map(|(id, level)| (id.to_owned(), level))
+        .collect(),
+        has_complete_state: true,
+        thresholds: vec![ban],
+        users: vec![
+            person(ME, 100, true),
+            person("@peer:example.org", 100, false),
+            person("@dana:example.org", 50, true),
+        ],
+        omitted_users: 0,
+        omitted_events: 0,
+        read_only: None,
+    };
+    let base = snapshot.clone();
+
+    // The settings form's way into mode 3 refuses while room addresses are
+    // open over that form; with them closed the same action opens mode 3.
+    // This runs before the editor is registered, so no read is started.
+    {
+        use crate::RoomAddresses;
+        use slint::private_unstable_api::re_exports::AccessibilityAction;
+        let opener = "Open this room's roles and permissions";
+        let saved = (
+            ui.get_room_admin_busy(),
+            ui.get_room_settings_confirmation(),
+            ui.get_room_settings_dirty(),
+        );
+        ui.set_room_admin_busy(false);
+        ui.set_room_settings_confirmation(0);
+        ui.set_room_settings_dirty(false);
+        ui.set_room_admin_mode(0);
+        ui.set_room_admin_open(true);
+        settle(ui).await;
+        ui.global::<RoomAddresses>().set_open(true);
+        settle(ui).await;
+        assert!(ui.global::<RoomAddresses>().get_open());
+        control_with_label(ui, opener).accessible_action(&AccessibilityAction::Default);
+        settle(ui).await;
+        assert_eq!(
+            ui.get_room_admin_mode(),
+            0,
+            "refused while room addresses are open"
+        );
+        ui.global::<RoomAddresses>().set_open(false);
+        settle(ui).await;
+        control_with_label(ui, opener).accessible_action(&AccessibilityAction::Default);
+        settle(ui).await;
+        assert_eq!(ui.get_room_admin_mode(), 3);
+        ui.set_room_admin_open(false);
+        ui.set_room_admin_mode(0);
+        ui.set_room_admin_busy(saved.0);
+        ui.set_room_settings_confirmation(saved.1);
+        ui.set_room_settings_dirty(saved.2);
+        settle(ui).await;
+    }
+
+    let core = Arc::new(HeldCore::new(snapshot));
+    let _editor = RoomPermissionsUi::register(ui, live.clone(), runtime, core.clone());
+    let global = ui.global::<RoomPermissions>();
+
+    // Mode 3 opens the view; its read is held while the room changes and
+    // comes back, unsettled: equal final strings fire no change, and the
+    // navigation epoch the editor opened in marks the read stale.
+    ui.set_room_admin_mode(3);
+    ui.set_room_admin_open(true);
+    settle(ui).await;
+    within(core.wait_calls(1)).await;
+    live.invalidate_navigation();
+    ui.set_active_room_id("!elsewhere:example.org".into());
+    live.invalidate_navigation();
+    ui.set_active_room_id(shown.into());
+    core.release();
+    within(core.wait_answered(1)).await;
+    until(ui, |ui| state(ui) == 3).await;
+    assert_eq!(global.get_rows().row_count(), 0);
+
+    // Opened again with nothing changed, the read is shown.
+    reopen(ui).await;
+    within(core.wait_calls(2)).await;
+    core.release();
+    until(ui, |ui| state(ui) == 2).await;
+    assert_eq!(global.get_rows().row_count(), 3);
+    // Only a listed row this account may change can be staged.
+    global.invoke_stage("u:@peer:example.org".into(), "10".into());
+    assert_eq!(global.get_staged(), 0);
+    assert!(!global.get_error().is_empty());
+    global.invoke_stage("u:@nobody:example.org".into(), "10".into());
+    assert_eq!(global.get_staged(), 0);
+    global.invoke_stage("u:@dana:example.org".into(), "75".into());
+    global.invoke_stage(format!("u:{ME}").into(), "50".into());
+    assert_eq!(global.get_staged(), 2);
+
+    // The review asks to confirm your own demotion; without it nothing is
+    // sent, even when Save is invoked directly.
+    global.invoke_review();
+    assert!(global.get_review_open());
+    assert!(global.get_review_needs_confirmation());
+    global.invoke_save();
+    assert!(global.get_review_open());
+    assert!(!global.get_busy());
+    // Confirmed, the save is held while a security step begins and ends:
+    // its admission refuses it at the hand-off.
+    global.set_review_confirmed(true);
+    global.invoke_save();
+    assert!(global.get_busy());
+    within(core.wait_calls(3)).await;
+    let gate = &live.security_gate;
+    drop(gate.try_account_access().expect("the gate is idle"));
+    core.release_save();
+    within(core.wait_answered(3)).await;
+    until(ui, |ui| !ui.global::<RoomPermissions>().get_busy()).await;
+    assert!(core.sent.lock().unwrap().is_empty());
+    assert!(!global.get_error().is_empty());
+
+    // A fresh view: one staged change, reviewed and saved, is sent once.
+    reopen(ui).await;
+    within(core.wait_calls(4)).await;
+    core.release();
+    until(ui, |ui| state(ui) == 2).await;
+    global.invoke_stage("u:@dana:example.org".into(), "75".into());
+    global.invoke_review();
+    assert!(!global.get_review_needs_confirmation());
+    global.invoke_save();
+    within(core.wait_calls(5)).await;
+    core.release_save();
+    within(core.wait_answered(5)).await;
+    until(ui, |ui| !ui.global::<RoomPermissions>().get_busy()).await;
+    let sent = core.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].changes.len(), 1);
+    assert!(!sent[0].own_demotion_confirmed);
+    assert!(global.get_notice().starts_with("Saved 1 change."));
+    assert_eq!(global.get_staged(), 0);
+
+    // Escape ends the editor before the view hides: a read still held when
+    // it is pressed never shows. (Close and Back call the same reset first.)
+    reopen(ui).await;
+    within(core.wait_calls(6)).await;
+    key(ui, Key::Escape);
+    assert_eq!(global.get_state(), 0, "reset before the dialog hides");
+    assert_eq!(global.get_rows().row_count(), 0);
+    core.release();
+    within(core.wait_answered(6)).await;
+    settle(ui).await;
+    assert_eq!(global.get_state(), 0, "the held read is not shown");
+    // Accepted but not shown by its read-back: the room stays paused until
+    // a read started after the answer shows the exact change; a read of the
+    // old state does not release it.
+    reopen(ui).await;
+    within(core.wait_calls(7)).await;
+    core.release();
+    until(ui, |ui| state(ui) == 2).await;
+    *core.answer.lock().unwrap() = Some(HeldAnswer::AcceptedNotShown);
+    global.invoke_stage("u:@dana:example.org".into(), "80".into());
+    global.invoke_review();
+    global.invoke_save();
+    within(core.wait_calls(8)).await;
+    core.release_save();
+    within(core.wait_answered(8)).await;
+    until(ui, |ui| !ui.global::<RoomPermissions>().get_busy()).await;
+    assert!(global.get_refresh_required());
+    assert!(global.get_notice().contains("no read since"));
+    global.invoke_refresh();
+    within(core.wait_calls(9)).await;
+    core.release();
+    within(core.wait_answered(9)).await;
+    until(ui, |ui| state(ui) == 2).await;
+    assert!(
+        global.get_refresh_required(),
+        "the old state does not settle it"
+    );
+    let mut shows_it = base.clone();
+    shows_it.exact_users.insert("@dana:example.org".into(), 80);
+    for row in &mut shows_it.users {
+        if row.user_id == "@dana:example.org" {
+            row.level = PermissionLevel::Level(80);
+        }
+    }
+    core.set_snapshot(shows_it);
+    global.invoke_refresh();
+    within(core.wait_calls(10)).await;
+    core.release();
+    until(ui, |ui| {
+        state(ui) == 2 && !ui.global::<RoomPermissions>().get_refresh_required()
+    })
+    .await;
+    assert!(global.get_notice().contains("now shows"));
+    core.set_snapshot(base.clone());
+
+    // No answer: the room stays paused while the view stays open, after
+    // Close and reopen, after a fresh read of the old state and after
+    // Refresh. Nothing is sent again, whatever is invoked.
+    *core.answer.lock().unwrap() = Some(HeldAnswer::Unknown);
+    global.invoke_stage("u:@dana:example.org".into(), "70".into());
+    global.invoke_review();
+    global.invoke_save();
+    within(core.wait_calls(11)).await;
+    core.release_save();
+    within(core.wait_answered(11)).await;
+    until(ui, |ui| !ui.global::<RoomPermissions>().get_busy()).await;
+    let sent = core.sent.lock().unwrap().len();
+    assert!(global.get_refresh_required());
+    assert!(global.get_notice().contains("got no answer"));
+    global.invoke_reset();
+    reopen(ui).await;
+    within(core.wait_calls(12)).await;
+    core.release();
+    until(ui, |ui| state(ui) == 2).await;
+    assert!(
+        global.get_refresh_required(),
+        "paused across close and reopen"
+    );
+    assert!(global.get_notice().contains("got no answer"));
+    global.invoke_refresh();
+    within(core.wait_calls(13)).await;
+    core.release();
+    within(core.wait_answered(13)).await;
+    until(ui, |ui| state(ui) == 2).await;
+    assert!(
+        global.get_refresh_required(),
+        "a fresh read of the old state keeps it paused"
+    );
+    global.invoke_stage("u:@dana:example.org".into(), "90".into());
+    global.invoke_review();
+    assert!(!global.get_review_open());
+    global.invoke_save();
+    assert!(!global.get_busy());
+    assert_eq!(core.sent.lock().unwrap().len(), sent, "no second write");
+    // Partial account removal uses this same production draft cleanup, but
+    // it must not discard a permission save whose server outcome is unknown.
+    live.forget_account_drafts("permissions-account");
+    global.invoke_refresh();
+    within(core.wait_calls(14)).await;
+    core.release();
+    within(core.wait_answered(14)).await;
+    until(ui, |ui| state(ui) == 2).await;
+    assert!(
+        global.get_refresh_required(),
+        "draft cleanup retains the unknown save"
+    );
+    assert!(global.get_notice().contains("got no answer"));
+    global.invoke_review();
+    global.invoke_save();
+    assert_eq!(
+        core.sent.lock().unwrap().len(),
+        sent,
+        "cleanup never permits a second write"
+    );
+    // Removing the account forgets its receipts.
+    crate::room_permissions::forget_account("permissions-account");
+
+    // The live reset hook clears every row before it returns.
+    crate::room_permissions::reset_window(ui);
+    assert_eq!(global.get_rows().row_count(), 0);
+    assert_eq!(global.get_state(), 0);
+
+    ui.set_room_admin_open(false);
+    ui.set_room_admin_mode(0);
+    live.is_live.store(was_live, Ordering::Release);
+    ui.set_active_account_local_id(account);
+    ui.set_active_room_id(room);
+    ui.set_live_session(was_session);
     settle(ui).await;
 }
