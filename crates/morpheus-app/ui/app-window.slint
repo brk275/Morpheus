@@ -10157,6 +10157,8 @@ export component AppWindow inherits Window {
         room-notification-panel := RoomNotificationPanel {
             x: max(8px, parent.width - self.width - 16px);
             y: max(64px, 40px * root.text-scale + 24px) + StyleTokens.icon-button-growth + 4px;
+            // Never taller than the window below the header; the body scrolls.
+            available-height: parent.height - self.y - 12px;
             palette: {
                 ink: root.ink,
                 muted: root.muted,

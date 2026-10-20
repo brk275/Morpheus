@@ -6327,6 +6327,29 @@ async fn assert_room_notification_panel(ui: &AppWindow) {
     assert!(!global.get_open());
     assert!(focused_control_has_label(ui, "Room notifications"));
 
+    // At the smallest window and 200% text the panel stays inside the
+    // window, its body scrolls, and a control reached by keyboard is shown.
+    ui.window().set_size(slint::PhysicalSize::new(940, 620));
+    ui.set_font_scale_percent(200);
+    settle(ui).await;
+    global.invoke_request_open("work".into(), "!room:example.org".into());
+    settle(ui).await;
+    let panel = item_bounds(&control_with_label(ui, "Notifications for Team room"));
+    assert!(inside_window(ui, panel), "the panel fits the window: {panel:?}");
+    key(ui, Key::Backtab);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Open notification settings for every room"));
+    let focused = focused_control_bounds(ui).expect("a focused panel control");
+    assert!(
+        focused.top >= panel.top && focused.bottom <= panel.bottom,
+        "the last control is scrolled into the panel: {focused:?} in {panel:?}"
+    );
+    key(ui, Key::Escape);
+    settle(ui).await;
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    settle(ui).await;
+
     for change in 0..3 {
         global.invoke_request_open("work".into(), "!room:example.org".into());
         settle(ui).await;
@@ -6344,7 +6367,7 @@ async fn assert_room_notification_panel(ui: &AppWindow) {
         ui.set_active_room_id("!room:example.org".into());
         settle(ui).await;
     }
-    assert_eq!(closes.get(), 4);
+    assert_eq!(closes.get(), 5);
 
     let (page, live, account, room) = before;
     ui.set_page(page);

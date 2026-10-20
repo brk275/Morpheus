@@ -995,6 +995,9 @@ export component RoomNotificationPanel inherits Rectangle {
     // The first and last controls hold focus; the window wraps Tab here.
     out property <bool> at-start: close-action.has-focus;
     out property <bool> at-end: settings-action.has-focus;
+    // The height below the room header the window can give; past it the
+    // body scrolls and the header with its close action stays in place.
+    in property <length> available-height: 10000px;
     // The person closed the panel: ×; the window returns focus to the bell.
     callback dismissed();
     property <bool> choosable: root.live && !RoomNotificationState.loading
@@ -1005,6 +1008,15 @@ export component RoomNotificationPanel inherits Rectangle {
     }
     public function focus-last() {
         settings-action.focus();
+    }
+    // Scroll the body so a control that took focus at absolute `top` is in
+    // view; one already in view stays where it is.
+    function reveal(top: length) {
+        let shown-top = scroller.absolute-position.y;
+        let control = max(48px, 40px * root.text-scale);
+        if top < shown-top || top + control > shown-top + scroller.height {
+            scroller.viewport-y = -max(0px, min(top - body.absolute-position.y - 8px, scroller.viewport-height - scroller.height));
+        }
     }
     pure function level-name(level: int) -> string {
         return level == 1 ? "All messages" : level == 2 ? "Mentions and keywords" : level == 3 ? "Muted" : "Unknown";
@@ -1031,8 +1043,10 @@ export component RoomNotificationPanel inherits Rectangle {
         return "Now: " + root.level-name(RoomNotificationState.effective)
             + (RoomNotificationState.mode == 0 ? ", the account default" : ", set for this room");
     }
+    property <length> natural-height: header.preferred-height + body.preferred-height + 36px;
     width: min(380px, 300px * root.text-scale + 80px);
-    height: panel-layout.preferred-height;
+    height: min(root.natural-height, max(min(root.natural-height, 160px), root.available-height));
+    clip: true;
     border-radius: root.radius;
     border-width: 1px;
     border-color: root.palette.divider;
@@ -1044,10 +1058,10 @@ export component RoomNotificationPanel inherits Rectangle {
         width: parent.width;
         height: parent.height;
     }
-    panel-layout := VerticalLayout {
+    VerticalLayout {
         padding: 14px;
         spacing: 8px;
-        HorizontalLayout {
+        header := HorizontalLayout {
             spacing: 8px;
             Text {
                 text: "Notifications · " + RoomNotificationState.room-name;
@@ -1079,130 +1093,160 @@ export component RoomNotificationPanel inherits Rectangle {
                 }
             }
         }
-        Text {
-            text: root.status();
-            color: RoomNotificationState.error != "" ? root.palette.error : root.palette.muted;
-            font-size: 11px * root.text-scale;
-            wrap: word-wrap;
-            accessible-live-region: polite;
-        }
-        if root.live && RoomNotificationState.error != "" && !RoomNotificationState.loading: RuleOption {
-            palette: root.palette;
-            text-scale: root.text-scale;
-            text: "Read again";
-            label: "Read this room's notification level again";
-            selected: false;
-            checkable: false;
-            activated => {
-                RoomNotificationState.retry();
-            }
-        }
-        RuleOption {
-            palette: root.palette;
-            text-scale: root.text-scale;
-            text: "Account default" + (RoomNotificationState.default-level == 0 ? "" : " (" + root.level-name(RoomNotificationState.default-level) + ")");
-            label: "Follow the account's default level for " + (RoomNotificationState.direct ? "direct messages" : "rooms");
-            selected: RoomNotificationState.effective != 0 && RoomNotificationState.mode == 0;
-            enabled: root.choosable;
-            horizontal-stretch: 1;
-            activated => {
-                RoomNotificationState.choose(0);
-            }
-        }
-        for level in [1, 2, 3]: RuleOption {
-            palette: root.palette;
-            text-scale: root.text-scale;
-            text: root.level-name(level);
-            label: root.level-name(level) + " in this room";
-            selected: RoomNotificationState.effective != 0 && RoomNotificationState.mode == level;
-            enabled: root.choosable;
-            horizontal-stretch: 1;
-            activated => {
-                RoomNotificationState.choose(level);
-            }
-        }
-        Text {
-            text: "The level is your account's Matrix push rule for this room and applies on all its devices. Calls in this room still ring here; turn call alerts off for the whole account in Notification settings.";
-            color: root.palette.muted;
-            font-size: 10px * root.text-scale;
-            wrap: word-wrap;
-        }
-        if !RoomNotificationState.account-on: Text {
-            text: "Desktop notifications are off for this account, so this room shows none either.";
-            color: root.palette.muted;
-            font-size: 10px * root.text-scale;
-            wrap: word-wrap;
-        }
-        Rectangle {
-            height: 1px;
-            background: root.palette.divider;
-        }
-        Text {
-            text: "On this device";
-            color: root.palette.ink;
-            font-size: 12px * root.text-scale;
-            font-weight: 700;
-        }
-        LocalSwitch {
-            palette: root.palette;
-            text-scale: root.text-scale;
-            title: "Sound";
-            detail: !RoomNotificationState.sounds-on ? "Sounds are off for every room" : RoomNotificationState.quiet ? "Silent for this room" : "Plays as for other rooms";
-            label: "Play a sound for this room's notifications";
-            checked: RoomNotificationState.sounds-on && !RoomNotificationState.quiet;
-            enabled: root.live && RoomNotificationState.sounds-on;
-            activated => {
-                RoomNotificationState.set-quiet(!RoomNotificationState.quiet);
-            }
-        }
-        LocalSwitch {
-            palette: root.palette;
-            text-scale: root.text-scale;
-            title: "Message preview";
-            detail: !RoomNotificationState.previews-on ? "Previews are off for every room" : RoomNotificationState.hide-preview ? "Never shown for this room" : "Shown as for other rooms";
-            label: "Show message text in this room's notifications";
-            checked: RoomNotificationState.previews-on && !RoomNotificationState.hide-preview;
-            enabled: root.live && RoomNotificationState.previews-on;
-            activated => {
-                RoomNotificationState.set-hide-preview(!RoomNotificationState.hide-preview);
-            }
-        }
-        LocalSwitch {
-            palette: root.palette;
-            text-scale: root.text-scale;
-            title: "Highlight words";
-            detail: !RoomNotificationState.highlights-set ? "No highlight words are set" : RoomNotificationState.no-highlights ? "Not marked in this room; mentions and keywords still are" : "Marked as in other rooms";
-            label: "Mark this room's notifications that contain your highlight words";
-            checked: RoomNotificationState.highlights-set && !RoomNotificationState.no-highlights;
-            enabled: root.live && RoomNotificationState.highlights-set;
-            activated => {
-                RoomNotificationState.set-no-highlights(!RoomNotificationState.no-highlights);
-            }
-        }
-        if RoomNotificationState.local-error != "": Text {
-            text: RoomNotificationState.local-error;
-            color: root.palette.error;
-            font-size: 10px * root.text-scale;
-            wrap: word-wrap;
-            accessible-live-region: polite;
-        }
-        settings-action := RuleAction {
-            label: "Open notification settings for every room";
-            focus-color: root.palette.focus;
-            height: max(28px, 22px * root.text-scale);
-            border-radius: 7px;
-            background: self.has-hover ? root.palette.hover : transparent;
-            activated => {
-                RoomNotificationState.open-settings();
-            }
-            Text {
-                width: parent.width;
-                height: parent.height;
-                text: "All notification settings";
-                color: root.palette.accent;
-                font-size: 11px * root.text-scale;
-                horizontal-alignment: left;
-                vertical-alignment: center;
+        scroller := Flickable {
+            vertical-stretch: 1;
+            viewport-width: self.width;
+            viewport-height: body.preferred-height;
+            body := VerticalLayout {
+                width: scroller.width;
+                spacing: 8px;
+                Text {
+                    text: root.status();
+                    color: RoomNotificationState.error != "" ? root.palette.error : root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if root.live && RoomNotificationState.error != "" && !RoomNotificationState.loading: RuleOption {
+                    palette: root.palette;
+                    text-scale: root.text-scale;
+                    text: "Read again";
+                    label: "Read this room's notification level again";
+                    focused-at(offset) => {
+                        root.reveal(offset);
+                    }
+                    selected: false;
+                    checkable: false;
+                    activated => {
+                        RoomNotificationState.retry();
+                    }
+                }
+                RuleOption {
+                    palette: root.palette;
+                    text-scale: root.text-scale;
+                    text: "Account default" + (RoomNotificationState.default-level == 0 ? "" : " (" + root.level-name(RoomNotificationState.default-level) + ")");
+                    label: "Follow the account's default level for " + (RoomNotificationState.direct ? "direct messages" : "rooms");
+                    focused-at(offset) => {
+                        root.reveal(offset);
+                    }
+                    selected: RoomNotificationState.effective != 0 && RoomNotificationState.mode == 0;
+                    enabled: root.choosable;
+                    horizontal-stretch: 1;
+                    activated => {
+                        RoomNotificationState.choose(0);
+                    }
+                }
+                for level in [1, 2, 3]: RuleOption {
+                    palette: root.palette;
+                    text-scale: root.text-scale;
+                    text: root.level-name(level);
+                    label: root.level-name(level) + " in this room";
+                    focused-at(offset) => {
+                        root.reveal(offset);
+                    }
+                    selected: RoomNotificationState.effective != 0 && RoomNotificationState.mode == level;
+                    enabled: root.choosable;
+                    horizontal-stretch: 1;
+                    activated => {
+                        RoomNotificationState.choose(level);
+                    }
+                }
+                Text {
+                    text: "The level is your account's Matrix push rule for this room and applies on all its devices. Calls in this room still ring here; turn call alerts off for the whole account in Notification settings.";
+                    color: root.palette.muted;
+                    font-size: 10px * root.text-scale;
+                    wrap: word-wrap;
+                }
+                if !RoomNotificationState.account-on: Text {
+                    text: "Desktop notifications are off for this account, so this room shows none either.";
+                    color: root.palette.muted;
+                    font-size: 10px * root.text-scale;
+                    wrap: word-wrap;
+                }
+                Rectangle {
+                    height: 1px;
+                    background: root.palette.divider;
+                }
+                Text {
+                    text: "On this device";
+                    color: root.palette.ink;
+                    font-size: 12px * root.text-scale;
+                    font-weight: 700;
+                }
+                LocalSwitch {
+                    palette: root.palette;
+                    text-scale: root.text-scale;
+                    title: "Sound";
+                    detail: !RoomNotificationState.sounds-on ? "Sounds are off for every room" : RoomNotificationState.quiet ? "Silent for this room" : "Plays as for other rooms";
+                    label: "Play a sound for this room's notifications";
+                    focused-at(offset) => {
+                        root.reveal(offset);
+                    }
+                    checked: RoomNotificationState.sounds-on && !RoomNotificationState.quiet;
+                    enabled: root.live && RoomNotificationState.sounds-on;
+                    activated => {
+                        RoomNotificationState.set-quiet(!RoomNotificationState.quiet);
+                    }
+                }
+                LocalSwitch {
+                    palette: root.palette;
+                    text-scale: root.text-scale;
+                    title: "Message preview";
+                    detail: !RoomNotificationState.previews-on ? "Previews are off for every room" : RoomNotificationState.hide-preview ? "Never shown for this room" : "Shown as for other rooms";
+                    label: "Show message text in this room's notifications";
+                    focused-at(offset) => {
+                        root.reveal(offset);
+                    }
+                    checked: RoomNotificationState.previews-on && !RoomNotificationState.hide-preview;
+                    enabled: root.live && RoomNotificationState.previews-on;
+                    activated => {
+                        RoomNotificationState.set-hide-preview(!RoomNotificationState.hide-preview);
+                    }
+                }
+                LocalSwitch {
+                    palette: root.palette;
+                    text-scale: root.text-scale;
+                    title: "Highlight words";
+                    detail: !RoomNotificationState.highlights-set ? "No highlight words are set" : RoomNotificationState.no-highlights ? "Not marked in this room; mentions and keywords still are" : "Marked as in other rooms";
+                    label: "Mark this room's notifications that contain your highlight words";
+                    focused-at(offset) => {
+                        root.reveal(offset);
+                    }
+                    checked: RoomNotificationState.highlights-set && !RoomNotificationState.no-highlights;
+                    enabled: root.live && RoomNotificationState.highlights-set;
+                    activated => {
+                        RoomNotificationState.set-no-highlights(!RoomNotificationState.no-highlights);
+                    }
+                }
+                if RoomNotificationState.local-error != "": Text {
+                    text: RoomNotificationState.local-error;
+                    color: root.palette.error;
+                    font-size: 10px * root.text-scale;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                settings-action := RuleAction {
+                    label: "Open notification settings for every room";
+                    focused-at(offset) => {
+                        root.reveal(offset);
+                    }
+                    focus-color: root.palette.focus;
+                    height: max(28px, 22px * root.text-scale);
+                    border-radius: 7px;
+                    background: self.has-hover ? root.palette.hover : transparent;
+                    activated => {
+                        RoomNotificationState.open-settings();
+                    }
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: "All notification settings";
+                        color: root.palette.accent;
+                        font-size: 11px * root.text-scale;
+                        horizontal-alignment: left;
+                        vertical-alignment: center;
+                    }
+                }
             }
         }
     }

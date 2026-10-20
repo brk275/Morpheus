@@ -136,7 +136,10 @@ Another room or account, one of those screens, a lock or a detach closes it
 and clears what it showed; a result for an earlier opening, including after a
 quick switch from A to B and back to A, is discarded. Escape, × or a click
 outside closes it and returns focus to the bell, or to the Settings entry.
-Tab stays inside the panel, and shortcuts pause while it is open.
+Tab stays inside the panel, and shortcuts pause while it is open. The panel
+is never taller than the window below the header: at a small window or large
+text its title and close action stay in place, the rest scrolls, and a control
+reached by keyboard is scrolled into view.
 
 ## Read state and withdrawal
 
