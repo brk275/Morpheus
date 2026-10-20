@@ -65,6 +65,15 @@ export component VoicePresencePill inherits Rectangle {
     property <int> opened-context: -1;
     property <int> roster-context: VoiceRosters.context;
     property <bool> roster-current: VoiceRosters.expanded-room == root.room-id && root.shown;
+    // Observe the popup from its parent: Slint lowers this read to a
+    // parent-owned property, including closes caused by an outside click.
+    property <bool> roster-open: roster.is-open;
+    changed roster-open => {
+        if !root.roster-open && root.opened-context == VoiceRosters.context
+            && VoiceRosters.expanded-room == root.room-id {
+            VoiceRosters.collapse();
+        }
+    }
     changed roster-context => { roster.close(); }
     changed roster-current => { if !root.roster-current { roster.close(); } }
     property <color> voice: StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1;
@@ -130,12 +139,6 @@ export component VoicePresencePill inherits Rectangle {
         // participant list scrolls; Join and Close remain outside it.
         height: min(500px, (220px + max(1, min(6, VoiceRosters.participants.length)) * 34px) * root.text-scale);
         close-policy: close-on-click-outside;
-        changed is-open => {
-            if !self.is-open && root.opened-context == VoiceRosters.context
-                && VoiceRosters.expanded-room == root.room-id {
-                VoiceRosters.collapse();
-            }
-        }
         Rectangle {
             background: root.surface;
             border-radius: StyleTokens.radius * 0.8;
