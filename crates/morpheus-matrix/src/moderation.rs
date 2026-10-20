@@ -596,9 +596,7 @@ async fn event_sender(
         .with_request_config(read_config())
         .await
         .map_err(|error| read_failure(&error))?;
-    let sent: Sent = response
-        .event
-        .deserialize_as()
+    let sent: Sent = serde_json::from_str(response.event.json().get())
         .map_err(|_| ModerationError::Unreadable)?;
     let elsewhere = sent
         .room_id
@@ -1085,6 +1083,13 @@ mod tests {
                 cancellation: &cancellation,
                 admission: &|| true,
             };
+            // The endpoint returns $msg: it cannot authorize a different
+            // event's redaction, even when the sender could be read.
+            let mismatched = manager
+                .redact_event_selected(&scope, ROOM, "$different", None)
+                .await;
+            assert_eq!(mismatched, Err(ModerationError::Unreadable));
+            assert!(server.writes().is_empty());
             let dana = "@dana:example.org";
             let actions = [
                 MemberAction::Invite,
