@@ -1032,11 +1032,18 @@ mod tests {
         }
     }
 
-    /// The room key (`one`, `two`) a request line names.
+    /// The exact synthetic room segment, whether its punctuation is raw
+    /// (as in pinned Ruma) or percent-encoded. Never match another URL field.
     fn room_key(line: &str) -> Option<String> {
+        let target = line.split_whitespace().nth(1)?;
+        let segment = target.split("/rooms/").nth(1)?.split('/').next()?;
+        let room_id = segment
+            .replace("%21", "!")
+            .replace("%3A", ":")
+            .replace("%3a", ":");
         ["one", "two"]
             .into_iter()
-            .find(|room| line.contains(&format!("%21{room}%3A")))
+            .find(|room| room_id == format!("!{room}:localhost"))
             .map(str::to_owned)
     }
 

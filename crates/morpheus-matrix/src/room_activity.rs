@@ -123,6 +123,12 @@ impl ActivityCancellation {
 
     /// Resolves once any clone is cancelled or the deadline passes.
     pub async fn cancelled(&self) {
+        // A past deadline is ready now, even before Tokio's timer wheel has
+        // observed it. Otherwise an immediately-ready lookup could win and
+        // report its error instead of the queued write's withdrawal.
+        if self.is_cancelled() {
+            return;
+        }
         let expired = async {
             match self.0.deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
@@ -449,11 +455,14 @@ where
     let found = tokio::select! {
         biased;
         () = cancellation.cancelled() => return Ok(ReceiptOutcome::Withdrawn),
-        found = lookup => found?,
+        found = lookup => found,
     };
+    // Cancellation also wins when the lookup completes at the same time,
+    // including when its result is an error. No SDK work has started yet.
     if cancellation.is_cancelled() {
         return Ok(ReceiptOutcome::Withdrawn);
     }
+    let found = found?;
     let sending = send(found);
     tokio::select! {
         biased;
@@ -597,6 +606,21 @@ mod tests {
     fn nothing_is_handed_to_the_sdk_once_a_write_is_cancelled() {
         let mut context = Context::from_waker(noop_waker_ref());
         let handed = AtomicUsize::new(0);
+        // An already elapsed idle deadline is ready on its first poll, with
+        // no timer tick or runtime needed. Neither lookup nor send is polled.
+        let expired = ActivityCancellation::until(Instant::now());
+        let looked_up = AtomicUsize::new(0);
+        let immediate = std::future::poll_fn(|_| {
+            looked_up.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Err::<(), _>(MatrixCoreError::SelectedAccountChanged))
+        });
+        let mut write = pin!(send_unless_cancelled(&expired, immediate, |()| {
+            handed.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(true))
+        }));
+        let polled = write.as_mut().poll(&mut context);
+        assert!(matches!(polled, Poll::Ready(Ok(ReceiptOutcome::Withdrawn))));
+        assert_eq!(looked_up.load(Ordering::SeqCst), 0);
         // Cancelled while the lookup waits: withdrawn, never handed over.
         let cancel = ActivityCancellation::new();
         let waiting = std::future::pending::<Result<()>>();
@@ -621,6 +645,31 @@ mod tests {
         }));
         let polled = write.as_mut().poll(&mut context);
         assert!(matches!(polled, Poll::Ready(Ok(ReceiptOutcome::Withdrawn))));
+        assert_eq!(handed.load(Ordering::SeqCst), 0);
+        // A lookup error completing with cancellation is still withdrawn.
+        // A real account error without cancellation remains an account error.
+        for cancelled in [true, false] {
+            let cancel = ActivityCancellation::new();
+            let completing = std::future::poll_fn(|_| {
+                if cancelled {
+                    cancel.cancel();
+                }
+                Poll::Ready(Err::<(), _>(MatrixCoreError::SelectedAccountChanged))
+            });
+            let mut write = pin!(send_unless_cancelled(&cancel, completing, |()| {
+                handed.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(true))
+            }));
+            let polled = write.as_mut().poll(&mut context);
+            if cancelled {
+                assert!(matches!(polled, Poll::Ready(Ok(ReceiptOutcome::Withdrawn))));
+            } else {
+                assert!(matches!(
+                    polled,
+                    Poll::Ready(Err(MatrixCoreError::SelectedAccountChanged))
+                ));
+            }
+        }
         assert_eq!(handed.load(Ordering::SeqCst), 0);
         // Cancelled after the SDK started: only reported as interrupted.
         let cancel = ActivityCancellation::new();

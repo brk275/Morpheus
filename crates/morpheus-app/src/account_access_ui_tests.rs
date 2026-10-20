@@ -743,7 +743,7 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
         let bounds_before = focused_control_bounds(ui);
         key(ui, Key::Space);
         let persisted = store.load().unwrap().appearance.reduce_motion;
-        if !persisted {
+        if !persisted || bounds_before.is_none_or(|bounds| !inside_window(ui, bounds)) {
             let (calls, requested, saved) = crate::appearance::take_motion_probe();
             let numeric = |bounds: Option<Bounds>| {
                 bounds.map(|bounds| [bounds.left, bounds.top, bounds.right, bounds.bottom])
