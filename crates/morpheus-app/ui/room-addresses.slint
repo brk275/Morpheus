@@ -306,9 +306,8 @@ export component RoomAddressesPanel inherits FocusScope {
                     }
                 }
                 Rectangle {
-                    height: 34px * max(1, root.text-scale);
+                    height: RoomAddresses.reviewing ? 0px : 34px * max(1, root.text-scale);
                     visible: !RoomAddresses.reviewing;
-                    max-height: RoomAddresses.reviewing ? 0px : 100000px;
                     background: root.palette.elevated;
                     border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
                     border-width: StyleTokens.line-width;
@@ -335,7 +334,6 @@ export component RoomAddressesPanel inherits FocusScope {
                 addresses-list := ListView {
                     height: RoomAddresses.reviewing ? 0px : min(220px, max(50px, root.count * (root.row-height + root.row-gap)));
                     visible: !RoomAddresses.reviewing;
-                    min-height: 0px;
                     horizontal-scrollbar-policy: always-off;
                     accessible-role: AccessibleRole.list;
                     accessible-label: "This room's addresses";
