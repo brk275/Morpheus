@@ -87,7 +87,7 @@ export global SpaceExplorer {
 }
 
 component ExplorerRowView inherits Rectangle {
-    in property <SpaceExplorerRow> row;
+    in property <SpaceExplorerRow> entry;
     in property <bool> current;
     in property <bool> busy;
     in property <float> text-scale: 1;
@@ -100,8 +100,8 @@ component ExplorerRowView inherits Rectangle {
     border-radius: StyleTokens.radius * 0.8;
     accessible-role: list-item;
     accessible-item-selected: root.current;
-    accessible-label: (root.row.is-space ? "Space " : "Room ") + root.row.name + ", " + root.row.status
-        + (root.row.detail != "" ? ", " + root.row.detail : "");
+    accessible-label: (root.entry.is-space ? "Space " : "Room ") + root.entry.name + ", " + root.entry.status
+        + (root.entry.detail != "" ? ", " + root.entry.detail : "");
     TouchArea {
         width: parent.width; height: parent.height;
         clicked => { root.chosen(); }
@@ -113,11 +113,11 @@ component ExplorerRowView inherits Rectangle {
             alignment: center;
             Rectangle {
                 width: 32px * min(1.4, root.text-scale); height: self.width;
-                border-radius: root.row.is-space ? StyleTokens.radius * 0.6 : self.width / 2;
+                border-radius: root.entry.is-space ? StyleTokens.radius * 0.6 : self.width / 2;
                 background: root.palette.hover;
                 accessible-role: none;
                 Text {
-                    text: root.row.initials;
+                    text: root.entry.initials;
                     color: root.palette.ink;
                     font-size: 13px * root.text-scale; font-weight: 700;
                     horizontal-alignment: center; vertical-alignment: center;
@@ -127,37 +127,37 @@ component ExplorerRowView inherits Rectangle {
         VerticalLayout {
             horizontal-stretch: 1; alignment: center; spacing: 2px;
             Text {
-                text: (root.row.is-space ? "◇ " : "# ") + root.row.name;
+                text: (root.entry.is-space ? "◇ " : "# ") + root.entry.name;
                 color: root.inked ? root.palette.selection-ink : root.palette.ink;
                 font-size: 13px * root.text-scale; font-weight: 700; overflow: elide;
             }
             Text {
-                text: root.row.status + (root.row.detail != "" ? " · " + root.row.detail : "");
+                text: root.entry.status + (root.entry.detail != "" ? " · " + root.entry.detail : "");
                 color: root.inked ? root.palette.selection-ink : root.palette.accent;
                 font-size: 11px * root.text-scale; overflow: elide;
             }
-            if root.row.topic != "" : Text {
-                text: root.row.topic;
+            if root.entry.topic != "" : Text {
+                text: root.entry.topic;
                 color: root.inked ? root.palette.selection-ink : root.palette.muted;
                 font-size: 11px * root.text-scale; overflow: elide;
             }
         }
-        if root.row.can-browse : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
-            text: root.row.in-trail ? "Go to" : "Browse ›";
-            label: (root.row.in-trail ? "Go back to Space " : "Browse Space ") + root.row.name;
-            activated => { SpaceExplorer.browse(root.row.id); }
+        if root.entry.can-browse : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+            text: root.entry.in-trail ? "Go to" : "Browse ›";
+            label: (root.entry.in-trail ? "Go back to Space " : "Browse Space ") + root.entry.name;
+            activated => { SpaceExplorer.browse(root.entry.id); }
         }
-        if root.row.can-join : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+        if root.entry.can-join : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
             primary: true;
-            text: SpaceExplorer.joining-id == root.row.id ? "Joining…" : "Join";
-            label: "Join " + (root.row.is-space ? "Space " : "room ") + root.row.name;
+            text: SpaceExplorer.joining-id == root.entry.id ? "Joining…" : "Join";
+            label: "Join " + (root.entry.is-space ? "Space " : "room ") + root.entry.name;
             enabled: !root.busy;
-            activated => { SpaceExplorer.join(root.row.id); }
+            activated => { SpaceExplorer.join(root.entry.id); }
         }
-        if root.row.can-open : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+        if root.entry.can-open : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
             text: "Open";
-            label: "Open " + (root.row.is-space ? "Space " : "room ") + root.row.name;
-            activated => { SpaceExplorer.open-room(root.row.id); }
+            label: "Open " + (root.entry.is-space ? "Space " : "room ") + root.entry.name;
+            activated => { SpaceExplorer.open-room(root.entry.id); }
         }
     }
 }
@@ -382,7 +382,7 @@ export component SpaceExplorerPanel inherits FocusScope {
                         height: root.row-height + root.row-gap;
                         ExplorerRowView {
                             y: 0px; height: root.row-height;
-                            row: row;
+                            entry: row;
                             current: index == root.current;
                             busy: root.busy;
                             text-scale: root.text-scale;
