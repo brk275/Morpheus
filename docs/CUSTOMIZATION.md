@@ -595,8 +595,10 @@ presentation preference; it is not written to Matrix.
 
 ## Notifications
 
-The Notifications section edits desktop notifications, sounds, message previews
-and local highlight words or phrases. Each highlight is trimmed, repeated
+The Notifications section edits desktop notifications, sounds, message previews,
+room and sender names in banners, local highlight words or phrases, a switch
+for the visible account only, the account's default levels, Matrix keywords
+and searchable per-room levels. Each highlight is trimmed, repeated
 whitespace is collapsed, duplicates are rejected without regard to case, and
 hidden control or direction characters are rejected. The editor accepts up to 32
 highlights of at most 64 characters each. Saved changes appear in the app when
@@ -609,12 +611,30 @@ The corresponding TOML fields are:
 enabled = true
 sounds = true
 show_message_preview = false
+show_room_and_sender = true
 highlight_words = ["release", "urgent"]
 ```
 
 Message previews are off by default because a desktop banner may show
-decrypted text. Matrix push rules and operating-system notification settings
+decrypted text. With `show_room_and_sender = false` a banner names only the
+account and never previews text. Per-room levels and default levels are Matrix
+push rules, chosen in the same section; see [notifications](NOTIFICATIONS.md). Matrix push rules and operating-system notification settings
 still decide whether a banner or sound is delivered.
+
+The bell in the room header opens one room's panel: its level, and three
+switches for this device that can only make that room quieter or more
+private. They are stored per account and room, separately from any room
+appearance:
+
+```toml
+[account_overrides."<local account ID>".room_notifications."!room:example.org"]
+quiet = true          # no sound for this room
+hide_preview = true   # never preview its text
+no_highlights = true  # local highlight words do not mark it
+```
+
+A room appears only while one of its switches is on, at most 256 rooms per
+account; unknown keys and invalid room IDs are rejected like any other field.
 
 ## Theme files
 

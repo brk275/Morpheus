@@ -1,0 +1,1209 @@
+// Notification privacy, Matrix default levels and per-room rules for the
+// visible account. Rust (notification_center::rules) owns every value in
+// NotificationRulesState; this file only presents it and reports choices.
+
+// One joined room's rule. `room-id` routes a choice and is never shown;
+// `name` is sanitized in Rust.
+export struct NotificationRoomItem {
+    room-id: string,
+    name: string,
+    // 0 follows the account default, 1 all messages, 2 mentions and
+    // keywords, 3 muted.
+    mode: int,
+    // The level that applies now: 1, 2 or 3.
+    effective: int,
+    direct: bool,
+    // A change for this room is waiting for the homeserver.
+    pending: bool,
+}
+
+// Room rules and defaults are the account's push rules on its homeserver;
+// they apply on every device of the account.
+export global NotificationRulesState {
+    in-out property <bool> show-room-and-sender: true;
+    // The visible account's own switch; off silences only this account.
+    in-out property <bool> account-enabled: true;
+    // At most 100 rooms matching the search, sorted like the room list.
+    in-out property <[NotificationRoomItem]> rooms;
+    // Rooms matching the search, including ones past the listed bound.
+    in-out property <int> matching: 0;
+    // Joined rooms of the account.
+    in-out property <int> total: 0;
+    in-out property <bool> loading: false;
+    in-out property <string> error;
+    in-out property <string> notice;
+    // 0 unknown, 1 all messages, 2 mentions and keywords.
+    in-out property <int> default-group: 0;
+    in-out property <int> default-direct: 0;
+    // Encrypted and unencrypted rooms of this kind have different defaults;
+    // the encrypted one is shown and a choice sets both.
+    in-out property <bool> default-group-mixed: false;
+    in-out property <bool> default-direct-mixed: false;
+    in-out property <bool> defaults-busy: false;
+    // The account's Matrix keyword rules, and the keyword being typed.
+    in-out property <[string]> keywords;
+    in-out property <string> keyword-input;
+    in-out property <string> keyword-error;
+    in-out property <bool> keywords-busy: false;
+    // Load the visible account's rules again.
+    callback refresh();
+    // The room search box's text; Rust clears it with its own query when
+    // the section is reloaded or shows another account.
+    in-out property <string> query;
+    // The search text changed.
+    callback search(string);
+    // Room ID and level: 0 default, 1 all, 2 mentions and keywords, 3 mute.
+    callback choose-room-mode(string, int);
+    // Two-person rooms (true) or group rooms (false), level 1 or 2.
+    callback choose-default(bool, int);
+    callback set-show-room-and-sender(bool);
+    callback set-account-enabled(bool);
+    callback add-keyword(string);
+    callback remove-keyword(string);
+}
+
+// The window's resolved theme roles; optional StyleTokens roles are resolved
+// by the window before they reach this file.
+export struct NotificationPalette {
+    ink: color,
+    muted: color,
+    panel: color,
+    elevated: color,
+    hover: color,
+    accent: color,
+    divider: color,
+    error: color,
+    selection: color,
+    // Used only when the theme defines selection ink.
+    selection-ink: color,
+    has-selection-ink: bool,
+    focus: color,
+}
+
+// A focusable action with the window's keyboard path: Tab reaches it,
+// Return or Space activates it, a click focuses it first.
+component RuleAction inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
+    in property <color> focus-color;
+    out property <bool> has-hover: hit.has-hover;
+    out property <bool> has-focus: keyboard-focus.has-focus;
+    callback activated();
+    // Focus arrived, at this absolute y; the page scrolls it into view.
+    callback focused-at(length);
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-checkable: root.checkable;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        if root.enabled {
+            root.activated();
+        }
+    }
+    @children
+    keyboard-focus := FocusScope {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        focus-on-click: true;
+        enabled: root.enabled;
+        focus-gained(reason) => {
+            root.focused-at(root.absolute-position.y);
+        }
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled {
+                    root.activated();
+                }
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    hit := TouchArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            keyboard-focus.focus();
+            root.activated();
+        }
+    }
+    if keyboard-focus.has-focus: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        border-radius: root.border-radius;
+        border-width: 2px;
+        border-color: root.focus-color;
+        background: transparent;
+    }
+}
+
+// One choice of a segmented level control.
+component RuleOption inherits RuleAction {
+    in property <string> text;
+    in property <bool> selected;
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    checkable: true;
+    checked: root.selected;
+    focus-color: root.palette.focus;
+    min-width: option-layout.min-width;
+    preferred-width: option-layout.preferred-width;
+    horizontal-stretch: 0;
+    min-height: max(30px, 22px * root.text-scale);
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: root.selected ? root.palette.accent : root.palette.divider;
+    background: root.selected ? root.palette.selection : (root.enabled && root.has-hover ? root.palette.hover : root.palette.panel);
+    option-layout := HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        Text {
+            text: root.text;
+            color: root.selected && root.palette.has-selection-ink ? root.palette.selection-ink : (root.enabled ? root.palette.ink : root.palette.muted);
+            font-size: 11px * root.text-scale;
+            font-weight: root.selected ? 700 : 500;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// The default level of group rooms or of two-person rooms.
+component DefaultLevelRow inherits Rectangle {
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> radius: 10px;
+    in property <bool> direct;
+    // 0 unknown, 1 all messages, 2 mentions and keywords.
+    in property <int> level;
+    in property <bool> mixed;
+    // Signed in: the choices take focus, so search can reveal them while
+    // rules load. A choice is reported only while `choosable`.
+    in property <bool> live;
+    in property <bool> choosable;
+    out property <bool> first-focused: all-option.has-focus;
+    callback choose(int);
+    callback focused-at(length);
+    public function focus-first() {
+        all-option.focus();
+    }
+
+    property <string> kind-name: root.direct ? "direct messages" : "rooms";
+    min-height: max(56px, 40px * root.text-scale);
+    border-radius: root.radius;
+    background: root.palette.elevated;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.direct ? "Direct messages" : "Rooms";
+                color: root.palette.ink;
+                font-size: 12px * root.text-scale;
+                font-weight: 700;
+            }
+            Text {
+                text: (root.direct ? "Rooms with exactly two members" : "Rooms with more members") + (root.mixed ? " · unencrypted rooms differ" : "");
+                color: root.palette.muted;
+                font-size: 10px * root.text-scale;
+                wrap: word-wrap;
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 4px;
+            all-option := RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "All";
+                label: "All messages by default in " + root.kind-name;
+                selected: root.level == 1;
+                enabled: root.live;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    if root.choosable {
+                        root.choose(1);
+                    }
+                }
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Mentions";
+                label: "Only mentions and keywords by default in " + root.kind-name;
+                selected: root.level == 2;
+                enabled: root.live;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    if root.choosable {
+                        root.choose(2);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One room's rule: follow the default, all messages, mentions and
+// keywords, or mute.
+component RoomRuleRow inherits Rectangle {
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> radius: 10px;
+    in property <NotificationRoomItem> room;
+    in property <bool> choosable;
+    callback choose(int);
+    callback focused-at(length);
+
+    pure function level-name(level: int) -> string {
+        if level == 1 {
+            return "All messages";
+        }
+        if level == 2 {
+            return "Mentions and keywords";
+        }
+        if level == 3 {
+            return "Muted";
+        }
+        return "Not loaded";
+    }
+    pure function detail() -> string {
+        if root.room.pending {
+            return "Saving…";
+        }
+        return (root.room.mode == 0 ? "Default · " : "This room · ") + root.level-name(root.room.effective) + (root.room.direct ? " · Direct message" : "");
+    }
+
+    min-height: max(56px, 40px * root.text-scale);
+    border-radius: root.radius;
+    background: root.palette.elevated;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.room.name;
+                color: root.palette.ink;
+                font-size: 12px * root.text-scale;
+                font-weight: 700;
+                overflow: elide;
+            }
+            Text {
+                text: root.detail();
+                color: root.palette.muted;
+                font-size: 10px * root.text-scale;
+                overflow: elide;
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 4px;
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Default";
+                label: "Use the default level in " + root.room.name;
+                selected: root.room.mode == 0;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(0);
+                }
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "All";
+                label: "All messages in " + root.room.name;
+                selected: root.room.mode == 1;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(1);
+                }
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Mentions";
+                label: "Only mentions and keywords in " + root.room.name;
+                selected: root.room.mode == 2;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(2);
+                }
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Mute";
+                label: "Mute " + root.room.name;
+                selected: root.room.mode == 3;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(3);
+                }
+            }
+        }
+    }
+}
+
+// The Notifications section's privacy switch, default levels and searchable
+// room rules. The window reveals a control by raising its request counter;
+// the control then reports its absolute position and its registry ID.
+export component NotificationRules inherits VerticalLayout {
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> radius: 10px;
+    // Signed in to a live account.
+    in property <bool> live;
+    // The visible account; a change reloads its rules.
+    in property <string> account-key;
+    in property <string> account-handle;
+    // Desktop notifications are on for all accounts.
+    in property <bool> all-enabled: true;
+    in property <int> account-reveal;
+    in property <int> identity-reveal;
+    in property <int> defaults-reveal;
+    in property <int> keywords-reveal;
+    in property <int> rooms-reveal;
+    // The room open in the conversation, if any; its own panel holds this
+    // device's sound, preview and highlight switches.
+    in property <bool> room-open;
+    in property <string> room-name;
+    in property <int> room-panel-reveal;
+    // Scroll so a control at this absolute y is visible.
+    callback reveal(length);
+    // A revealed control took focus.
+    callback revealed(string);
+    // Open the open room's notification panel; nothing is written.
+    callback open-room-panel();
+
+    property <bool> rules-ready: root.live && !NotificationRulesState.loading;
+    property <bool> keywords-ready: root.rules-ready && !NotificationRulesState.keywords-busy;
+
+    function submit-keyword() {
+        if root.keywords-ready && NotificationRulesState.keyword-input != "" {
+            NotificationRulesState.add-keyword(NotificationRulesState.keyword-input);
+        }
+    }
+
+    pure function status() -> string {
+        if !root.live {
+            return "";
+        }
+        if NotificationRulesState.loading {
+            return "Loading rules…";
+        }
+        if NotificationRulesState.error != "" {
+            return NotificationRulesState.error;
+        }
+        if NotificationRulesState.notice != "" {
+            return NotificationRulesState.notice;
+        }
+        if NotificationRulesState.total == 0 {
+            return "No joined rooms";
+        }
+        if NotificationRulesState.matching == 0 {
+            return "No rooms match";
+        }
+        if NotificationRulesState.matching > NotificationRulesState.rooms.length {
+            return "Showing " + NotificationRulesState.rooms.length + " of " + NotificationRulesState.matching + " matching rooms; refine the search";
+        }
+        return NotificationRulesState.matching + " of " + NotificationRulesState.total + " rooms";
+    }
+
+    spacing: 10px;
+
+    init => {
+        NotificationRulesState.refresh();
+    }
+    changed account-key => {
+        NotificationRulesState.refresh();
+    }
+    changed live => {
+        NotificationRulesState.refresh();
+    }
+    changed account-reveal => {
+        if root.account-reveal > 0 {
+            root.reveal(account-switch.absolute-position.y);
+            account-switch.focus();
+            if account-switch.has-focus {
+                root.revealed("notifications.account");
+            }
+        }
+    }
+    changed identity-reveal => {
+        if root.identity-reveal > 0 {
+            root.reveal(identity.absolute-position.y);
+            identity.focus();
+            if identity.has-focus {
+                root.revealed("notifications.identity");
+            }
+        }
+    }
+    changed defaults-reveal => {
+        if root.defaults-reveal > 0 {
+            root.reveal(group-defaults.absolute-position.y);
+            group-defaults.focus-first();
+            if group-defaults.first-focused {
+                root.revealed("notifications.defaults");
+            }
+        }
+    }
+    changed keywords-reveal => {
+        if root.keywords-reveal > 0 {
+            root.reveal(keyword-input.absolute-position.y);
+            keyword-input.focus();
+            if keyword-input.has-focus {
+                root.revealed("notifications.keywords");
+            }
+        }
+    }
+    changed rooms-reveal => {
+        if root.rooms-reveal > 0 {
+            root.reveal(search-input.absolute-position.y);
+            search-input.focus();
+            if search-input.has-focus {
+                root.revealed("notifications.rooms");
+            }
+        }
+    }
+    // Without an open room the entry is disabled, so the room search takes
+    // focus instead; neither opens or changes anything.
+    changed room-panel-reveal => {
+        if root.room-panel-reveal > 0 {
+            if root.live && root.room-open {
+                root.reveal(room-panel-entry.absolute-position.y);
+                room-panel-entry.focus();
+                if room-panel-entry.has-focus {
+                    root.revealed("notifications.this_room");
+                }
+            } else {
+                root.reveal(search-input.absolute-position.y);
+                search-input.focus();
+                if search-input.has-focus {
+                    root.revealed("notifications.this_room");
+                }
+            }
+        }
+    }
+
+    account-switch := RuleAction {
+        height: max(68px, 50px * root.text-scale);
+        border-radius: root.radius;
+        background: root.palette.elevated;
+        focus-color: root.palette.focus;
+        enabled: root.live;
+        label: "Desktop notifications for this account, " + root.account-handle;
+        checkable: true;
+        checked: root.live && NotificationRulesState.account-enabled;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        activated => {
+            NotificationRulesState.set-account-enabled(!NotificationRulesState.account-enabled);
+        }
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 12px;
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                spacing: 3px;
+                Text {
+                    text: "This account";
+                    color: root.palette.ink;
+                    font-size: 13px * root.text-scale;
+                    font-weight: 700;
+                }
+                Text {
+                    text: !root.live ? "Sign in to choose notifications for an account" : (!NotificationRulesState.account-enabled ? root.account-handle + " · Off; other accounts are unaffected" : (root.all-enabled ? root.account-handle + " · On" : root.account-handle + " · On, but desktop notifications are off for all accounts"));
+                    color: root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                }
+            }
+            Text {
+                text: root.live && NotificationRulesState.account-enabled ? "✓" : "○";
+                color: root.palette.accent;
+                font-size: 20px * root.text-scale;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    identity := RuleAction {
+        height: max(68px, 50px * root.text-scale);
+        border-radius: root.radius;
+        background: root.palette.elevated;
+        focus-color: root.palette.focus;
+        label: "Show room and sender names in desktop notifications";
+        checkable: true;
+        checked: NotificationRulesState.show-room-and-sender;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        activated => {
+            NotificationRulesState.set-show-room-and-sender(!NotificationRulesState.show-room-and-sender);
+        }
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 12px;
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                spacing: 3px;
+                Text {
+                    text: "Room and sender names";
+                    color: root.palette.ink;
+                    font-size: 13px * root.text-scale;
+                    font-weight: 700;
+                }
+                Text {
+                    text: NotificationRulesState.show-room-and-sender ? "Shown with the account" : "Hidden; banners name only the account and never preview text";
+                    color: root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                }
+            }
+            Text {
+                text: NotificationRulesState.show-room-and-sender ? "✓" : "○";
+                color: root.palette.accent;
+                font-size: 20px * root.text-scale;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    Text {
+        text: "Default level";
+        color: root.palette.ink;
+        font-size: 13px * root.text-scale;
+        font-weight: 700;
+    }
+    Text {
+        text: root.live ? "Matrix rules on your homeserver; they apply on all devices of this account. Mentions and keywords notify unless a room is muted." : "Sign in to choose notification levels for rooms.";
+        color: root.palette.muted;
+        font-size: 11px * root.text-scale;
+        wrap: word-wrap;
+    }
+    group-defaults := DefaultLevelRow {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        radius: root.radius;
+        direct: false;
+        live: root.live;
+        level: NotificationRulesState.default-group;
+        mixed: NotificationRulesState.default-group-mixed;
+        choosable: root.rules-ready && !NotificationRulesState.defaults-busy;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        choose(choice) => {
+            NotificationRulesState.choose-default(false, choice);
+        }
+    }
+    DefaultLevelRow {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        radius: root.radius;
+        direct: true;
+        live: root.live;
+        level: NotificationRulesState.default-direct;
+        mixed: NotificationRulesState.default-direct-mixed;
+        choosable: root.rules-ready && !NotificationRulesState.defaults-busy;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        choose(choice) => {
+            NotificationRulesState.choose-default(true, choice);
+        }
+    }
+
+    Text {
+        text: "Keywords";
+        color: root.palette.ink;
+        font-size: 13px * root.text-scale;
+        font-weight: 700;
+    }
+    Text {
+        text: "Matrix keywords notify in every room that is not muted, including rooms set to mentions and keywords, on all devices of this account.";
+        color: root.palette.muted;
+        font-size: 11px * root.text-scale;
+        wrap: word-wrap;
+    }
+    HorizontalLayout {
+        height: max(38px, 26px * root.text-scale);
+        spacing: 8px;
+        Rectangle {
+            horizontal-stretch: 1;
+            border-radius: 8px;
+            background: root.palette.panel;
+            border-width: 1px;
+            border-color: keyword-input.has-focus ? root.palette.accent : root.palette.divider;
+            keyword-input := TextInput {
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                vertical-alignment: center;
+                single-line: true;
+                text <=> NotificationRulesState.keyword-input;
+                // Typing is fine while rules load; adding waits for them.
+                enabled: root.live;
+                color: root.palette.ink;
+                font-size: 12px * root.text-scale;
+                accessible-label: "New Matrix keyword";
+                changed has-focus => {
+                    if self.has-focus {
+                        root.reveal(self.absolute-position.y);
+                    }
+                }
+                edited => {
+                    NotificationRulesState.keyword-error = "";
+                }
+                accepted => {
+                    root.submit-keyword();
+                }
+            }
+            if keyword-input.text == "": Text {
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                vertical-alignment: center;
+                text: "Add a keyword";
+                color: root.palette.muted;
+                font-size: 12px * root.text-scale;
+                accessible-role: none;
+            }
+        }
+        RuleOption {
+            palette: root.palette;
+            text-scale: root.text-scale;
+            text: "Add";
+            label: "Add Matrix keyword";
+            selected: false;
+            checkable: false;
+            enabled: root.keywords-ready && NotificationRulesState.keyword-input != "";
+            focused-at(offset) => {
+                root.reveal(offset);
+            }
+            activated => {
+                root.submit-keyword();
+            }
+        }
+    }
+    if NotificationRulesState.keyword-error != "": Text {
+        text: NotificationRulesState.keyword-error;
+        color: root.palette.error;
+        font-size: 11px * root.text-scale;
+        wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    for keyword in NotificationRulesState.keywords: Rectangle {
+        min-height: max(36px, 26px * root.text-scale);
+        border-radius: 8px;
+        background: root.palette.elevated;
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 6px;
+            padding-top: 3px;
+            padding-bottom: 3px;
+            spacing: 8px;
+            Text {
+                text: keyword;
+                color: root.palette.ink;
+                font-size: 12px * root.text-scale;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Remove";
+                label: "Remove Matrix keyword " + keyword;
+                selected: false;
+                checkable: false;
+                enabled: root.keywords-ready;
+                focused-at(offset) => {
+                    root.reveal(offset);
+                }
+                activated => {
+                    NotificationRulesState.remove-keyword(keyword);
+                }
+            }
+        }
+    }
+
+    Text {
+        text: "Rooms";
+        color: root.palette.ink;
+        font-size: 13px * root.text-scale;
+        font-weight: 700;
+    }
+    room-panel-entry := RuleAction {
+        height: max(52px, 38px * root.text-scale);
+        border-radius: root.radius;
+        background: self.has-hover && self.enabled ? root.palette.hover : root.palette.elevated;
+        focus-color: root.palette.focus;
+        enabled: root.live && root.room-open;
+        label: root.room-open ? "Open notifications for " + root.room-name : "Open a room to choose its sound, preview and highlights";
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        activated => {
+            root.open-room-panel();
+        }
+        VerticalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            alignment: center;
+            spacing: 3px;
+            Text {
+                text: root.room-open ? "This room: " + root.room-name : "This room";
+                color: root.live && root.room-open ? root.palette.ink : root.palette.muted;
+                font-size: 12px * root.text-scale;
+                font-weight: 700;
+                overflow: elide;
+            }
+            Text {
+                text: root.room-open ? "Level, and sound, preview and highlights on this device" : "Open a room to choose its sound, preview and highlights on this device";
+                color: root.palette.muted;
+                font-size: 11px * root.text-scale;
+                wrap: word-wrap;
+            }
+        }
+    }
+    Rectangle {
+        height: max(38px, 26px * root.text-scale);
+        border-radius: 8px;
+        background: root.palette.panel;
+        border-width: 1px;
+        border-color: search-input.has-focus ? root.palette.accent : root.palette.divider;
+        search-input := TextInput {
+            x: 10px;
+            width: parent.width - 20px;
+            height: parent.height;
+            vertical-alignment: center;
+            single-line: true;
+            enabled: root.live;
+            text <=> NotificationRulesState.query;
+            color: root.palette.ink;
+            font-size: 12px * root.text-scale;
+            accessible-label: "Search rooms for notification rules";
+            changed has-focus => {
+                if self.has-focus {
+                    root.reveal(self.absolute-position.y);
+                }
+            }
+            edited => {
+                NotificationRulesState.search(self.text);
+            }
+            key-pressed(event) => {
+                if event.text == Key.Escape && self.text != "" {
+                    self.text = "";
+                    NotificationRulesState.search("");
+                    accept
+                } else {
+                    reject
+                }
+            }
+        }
+        if search-input.text == "": Text {
+            x: 10px;
+            width: parent.width - 20px;
+            height: parent.height;
+            vertical-alignment: center;
+            text: "Search rooms";
+            color: root.palette.muted;
+            font-size: 12px * root.text-scale;
+            accessible-role: none;
+        }
+    }
+    Text {
+        text: root.status();
+        color: NotificationRulesState.error != "" ? root.palette.error : root.palette.muted;
+        font-size: 11px * root.text-scale;
+        wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    for entry in NotificationRulesState.rooms: RoomRuleRow {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        radius: root.radius;
+        room: entry;
+        choosable: root.rules-ready && !entry.pending;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        choose(choice) => {
+            NotificationRulesState.choose-room-mode(entry.room-id, choice);
+        }
+    }
+}
+
+// The room header's notification panel for the room open in the
+// conversation. Rust (notification_center::room_panel) owns every value: the
+// level is the account's Matrix push rule for the room, read and written
+// through the selection-fenced core API; the device switches are this
+// device's account_overrides.<account>.room_notifications entry.
+export global RoomNotificationState {
+    in-out property <bool> open: false;
+    // Routing only, never shown: the window closes the panel the moment
+    // these stop being the live account and the open room.
+    in-out property <string> account-id;
+    in-out property <string> room-id;
+    // Sanitized in Rust.
+    in-out property <string> room-name;
+    in-out property <bool> loading: false;
+    in-out property <string> error;
+    in-out property <string> notice;
+    // The room's own rule: 0 follows the account default, 1 all messages,
+    // 2 mentions and keywords, 3 muted.
+    in-out property <int> mode: 0;
+    // The level that applies now, 1 to 3; 0 while unknown.
+    in-out property <int> effective: 0;
+    // The account default for this kind of room: 0 unknown, 1 or 2.
+    in-out property <int> default-level: 0;
+    in-out property <bool> direct: false;
+    // A level change is waiting for the homeserver.
+    in-out property <bool> pending: false;
+    // This device only; each removes something from the room's banners.
+    in-out property <bool> quiet: false;
+    in-out property <bool> hide-preview: false;
+    in-out property <bool> no-highlights: false;
+    in-out property <string> local-error;
+    // The ceilings the device switches cannot raise.
+    in-out property <bool> sounds-on: true;
+    in-out property <bool> previews-on: false;
+    in-out property <bool> highlights-set: false;
+    // Desktop notifications are on for all accounts and for this one.
+    in-out property <bool> account-on: true;
+    // The open room's level is Muted, as last read or confirmed.
+    in-out property <bool> header-muted: false;
+    // Open the panel for exactly this account and room; Rust refuses any
+    // other than the live account and the room open now.
+    callback request-open(string, string);
+    // The header now shows this account and room; the bell rereads its level
+    // from the SDK's copy of the push rules.
+    callback room-shown(string, string);
+    // Level: 0 account default, 1 all, 2 mentions and keywords, 3 mute.
+    callback choose(int);
+    callback set-quiet(bool);
+    callback set-hide-preview(bool);
+    callback set-no-highlights(bool);
+    callback retry();
+    callback close();
+    // Settings › Notifications › Rooms; nothing is written.
+    callback open-settings();
+}
+
+// One device switch of the room panel.
+component LocalSwitch inherits RuleAction {
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    in property <string> title;
+    in property <string> detail;
+    checkable: true;
+    // A wrapped detail line grows the row instead of being clipped.
+    min-height: max(48px, 34px * root.text-scale, switch-layout.preferred-height);
+    border-radius: 8px;
+    background: root.enabled && root.has-hover ? root.palette.hover : root.palette.panel;
+    focus-color: root.palette.focus;
+    switch-layout := HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.title;
+                color: root.enabled ? root.palette.ink : root.palette.muted;
+                font-size: 12px * root.text-scale;
+                font-weight: 700;
+            }
+            Text {
+                text: root.detail;
+                color: root.palette.muted;
+                font-size: 10px * root.text-scale;
+                wrap: word-wrap;
+            }
+        }
+        Text {
+            text: root.checked ? "✓" : "○";
+            color: root.enabled ? root.palette.accent : root.palette.muted;
+            font-size: 18px * root.text-scale;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// The panel's body. The window places it below the room header, traps Tab
+// inside it and closes it on Escape, a click outside or a context change.
+export component RoomNotificationPanel inherits Rectangle {
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> radius: 10px;
+    // Signed in to a live account.
+    in property <bool> live;
+    // The first and last controls hold focus; the window wraps Tab here.
+    out property <bool> at-start: close-action.has-focus;
+    out property <bool> at-end: settings-action.has-focus;
+    // The person closed the panel: ×; the window returns focus to the bell.
+    callback dismissed();
+    property <bool> choosable: root.live && !RoomNotificationState.loading
+        && RoomNotificationState.error == "" && !RoomNotificationState.pending
+        && RoomNotificationState.effective != 0;
+    public function focus-first() {
+        close-action.focus();
+    }
+    public function focus-last() {
+        settings-action.focus();
+    }
+    pure function level-name(level: int) -> string {
+        return level == 1 ? "All messages" : level == 2 ? "Mentions and keywords" : level == 3 ? "Muted" : "Unknown";
+    }
+    pure function status() -> string {
+        if !root.live {
+            return "Sign in to change this room's notifications.";
+        }
+        if RoomNotificationState.loading {
+            return "Reading this room's level…";
+        }
+        if RoomNotificationState.error != "" {
+            return RoomNotificationState.error;
+        }
+        if RoomNotificationState.pending {
+            return "Waiting for the homeserver to confirm…";
+        }
+        if RoomNotificationState.notice != "" {
+            return RoomNotificationState.notice;
+        }
+        if RoomNotificationState.effective == 0 {
+            return "";
+        }
+        return "Now: " + root.level-name(RoomNotificationState.effective)
+            + (RoomNotificationState.mode == 0 ? ", the account default" : ", set for this room");
+    }
+    width: min(380px, 300px * root.text-scale + 80px);
+    height: panel-layout.preferred-height;
+    border-radius: root.radius;
+    border-width: 1px;
+    border-color: root.palette.divider;
+    background: root.palette.elevated;
+    accessible-role: region;
+    accessible-label: "Notifications for " + RoomNotificationState.room-name;
+    // Clicks on the panel's own background stay in the panel.
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+    }
+    panel-layout := VerticalLayout {
+        padding: 14px;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Notifications · " + RoomNotificationState.room-name;
+                color: root.palette.ink;
+                font-size: 14px * root.text-scale;
+                font-weight: 750;
+                overflow: elide;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            close-action := RuleAction {
+                label: "Close room notifications";
+                focus-color: root.palette.focus;
+                width: max(28px, 22px * root.text-scale);
+                height: self.width;
+                border-radius: 6px;
+                background: self.has-hover ? root.palette.hover : transparent;
+                activated => {
+                    root.dismissed();
+                }
+                Text {
+                    width: parent.width;
+                    height: parent.height;
+                    text: "×";
+                    color: root.palette.muted;
+                    font-size: 15px * root.text-scale;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Text {
+            text: root.status();
+            color: RoomNotificationState.error != "" ? root.palette.error : root.palette.muted;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        if root.live && RoomNotificationState.error != "" && !RoomNotificationState.loading: RuleOption {
+            palette: root.palette;
+            text-scale: root.text-scale;
+            text: "Read again";
+            label: "Read this room's notification level again";
+            selected: false;
+            checkable: false;
+            activated => {
+                RoomNotificationState.retry();
+            }
+        }
+        RuleOption {
+            palette: root.palette;
+            text-scale: root.text-scale;
+            text: "Account default" + (RoomNotificationState.default-level == 0 ? "" : " (" + root.level-name(RoomNotificationState.default-level) + ")");
+            label: "Follow the account's default level for " + (RoomNotificationState.direct ? "direct messages" : "rooms");
+            selected: RoomNotificationState.effective != 0 && RoomNotificationState.mode == 0;
+            enabled: root.choosable;
+            horizontal-stretch: 1;
+            activated => {
+                RoomNotificationState.choose(0);
+            }
+        }
+        for level in [1, 2, 3]: RuleOption {
+            palette: root.palette;
+            text-scale: root.text-scale;
+            text: root.level-name(level);
+            label: root.level-name(level) + " in this room";
+            selected: RoomNotificationState.effective != 0 && RoomNotificationState.mode == level;
+            enabled: root.choosable;
+            horizontal-stretch: 1;
+            activated => {
+                RoomNotificationState.choose(level);
+            }
+        }
+        Text {
+            text: "The level is your account's Matrix push rule for this room and applies on all its devices. Calls in this room still ring here; turn call alerts off for the whole account in Notification settings.";
+            color: root.palette.muted;
+            font-size: 10px * root.text-scale;
+            wrap: word-wrap;
+        }
+        if !RoomNotificationState.account-on: Text {
+            text: "Desktop notifications are off for this account, so this room shows none either.";
+            color: root.palette.muted;
+            font-size: 10px * root.text-scale;
+            wrap: word-wrap;
+        }
+        Rectangle {
+            height: 1px;
+            background: root.palette.divider;
+        }
+        Text {
+            text: "On this device";
+            color: root.palette.ink;
+            font-size: 12px * root.text-scale;
+            font-weight: 700;
+        }
+        LocalSwitch {
+            palette: root.palette;
+            text-scale: root.text-scale;
+            title: "Sound";
+            detail: !RoomNotificationState.sounds-on ? "Sounds are off for every room" : RoomNotificationState.quiet ? "Silent for this room" : "Plays as for other rooms";
+            label: "Play a sound for this room's notifications";
+            checked: RoomNotificationState.sounds-on && !RoomNotificationState.quiet;
+            enabled: root.live && RoomNotificationState.sounds-on;
+            activated => {
+                RoomNotificationState.set-quiet(!RoomNotificationState.quiet);
+            }
+        }
+        LocalSwitch {
+            palette: root.palette;
+            text-scale: root.text-scale;
+            title: "Message preview";
+            detail: !RoomNotificationState.previews-on ? "Previews are off for every room" : RoomNotificationState.hide-preview ? "Never shown for this room" : "Shown as for other rooms";
+            label: "Show message text in this room's notifications";
+            checked: RoomNotificationState.previews-on && !RoomNotificationState.hide-preview;
+            enabled: root.live && RoomNotificationState.previews-on;
+            activated => {
+                RoomNotificationState.set-hide-preview(!RoomNotificationState.hide-preview);
+            }
+        }
+        LocalSwitch {
+            palette: root.palette;
+            text-scale: root.text-scale;
+            title: "Highlight words";
+            detail: !RoomNotificationState.highlights-set ? "No highlight words are set" : RoomNotificationState.no-highlights ? "Not marked in this room; mentions and keywords still are" : "Marked as in other rooms";
+            label: "Mark this room's notifications that contain your highlight words";
+            checked: RoomNotificationState.highlights-set && !RoomNotificationState.no-highlights;
+            enabled: root.live && RoomNotificationState.highlights-set;
+            activated => {
+                RoomNotificationState.set-no-highlights(!RoomNotificationState.no-highlights);
+            }
+        }
+        if RoomNotificationState.local-error != "": Text {
+            text: RoomNotificationState.local-error;
+            color: root.palette.error;
+            font-size: 10px * root.text-scale;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        settings-action := RuleAction {
+            label: "Open notification settings for every room";
+            focus-color: root.palette.focus;
+            height: max(28px, 22px * root.text-scale);
+            border-radius: 7px;
+            background: self.has-hover ? root.palette.hover : transparent;
+            activated => {
+                RoomNotificationState.open-settings();
+            }
+            Text {
+                width: parent.width;
+                height: parent.height;
+                text: "All notification settings";
+                color: root.palette.accent;
+                font-size: 11px * root.text-scale;
+                horizontal-alignment: left;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

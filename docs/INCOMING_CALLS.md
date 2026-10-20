@@ -11,6 +11,9 @@ The native-call build now includes an original, quiet two-note ringtone. This
 implementation has been source-reviewed; native compilation, regression tests
 and actual audible output have not yet been verified.
 
+- A room's message notification level (all messages, mentions and keywords,
+  or muted) does not change whether its calls ring; see
+  [notifications](NOTIFICATIONS.md#one-room-the-header-bell).
 - Sound requires both notifications and sounds to be enabled for the account.
   It uses the configured speaker, or the default speaker when none is selected.
   An unavailable selected device does not fall back to another speaker.

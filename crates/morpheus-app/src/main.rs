@@ -32,6 +32,8 @@ mod message_metadata;
 mod message_search;
 mod metric_editor;
 mod navigation;
+mod navigation_target;
+mod notification_center;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
@@ -880,6 +882,7 @@ fn apply_room_sort(ui: &AppWindow) {
 
 fn apply_notification_settings(ui: &AppWindow, config: &Config) {
     ui.set_notifications_enabled(config.notifications.enabled);
+    notification_center::apply_config(ui, config);
     ui.set_notification_sounds(config.notifications.sounds);
     ui.set_notification_show_preview(config.notifications.show_message_preview);
     ui.set_notification_highlight_words(ModelRc::new(VecModel::from(
@@ -1787,6 +1790,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime.handle(),
     );
     let _room_organizer = room_organization::register(&ui, live.clone(), runtime.handle().clone());
+    let _notification_controls = notification_center::register(
+        &ui,
+        live.clone(),
+        notifications.clone(),
+        store.clone(),
+        runtime.handle(),
+    );
 
     let watch = store.watch_with_theme(Duration::from_millis(700));
     let weak = ui.as_weak();

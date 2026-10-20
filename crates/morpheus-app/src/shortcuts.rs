@@ -368,6 +368,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || ui.get_image_preview_open()
         || !ui.get_shortcut_recording().is_empty()
         || ui.get_poll_dialog_open()
+        || ui.global::<crate::RoomNotificationState>().get_open()
 }
 
 fn visible_rooms(ui: &AppWindow) -> Vec<RoomItem> {

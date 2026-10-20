@@ -223,13 +223,15 @@ impl VoiceSpaces {
     }
 
     /// Remove one removed or logged-out account's local presentation
-    /// preferences: voice spaces, call modes and its appearance overrides.
-    /// Other accounts and global preferences are untouched.
+    /// preferences: voice spaces, call modes, its appearance overrides and
+    /// its rooms' notification behavior. Other accounts and global
+    /// preferences are untouched.
     pub fn clear_logged_out_account(&self, account_id: &str) -> Result<(), ConfigError> {
         let mut config = self.store.load()?;
         let changed = config.clear_local_voice_rooms(account_id)
             | config.clear_room_call_modes(account_id)
-            | config.clear_account_appearance(account_id);
+            | config.clear_account_appearance(account_id)
+            | config.clear_room_notifications(account_id);
         if changed {
             self.store.save(&config)?;
         }

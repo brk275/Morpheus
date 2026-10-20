@@ -306,6 +306,7 @@ impl Config {
                     ));
                 }
             }
+            validate_room_notifications(&overrides.room_notifications)?;
             if overrides
                 .element_call_matrix_2_0_rooms
                 .iter()
@@ -586,6 +587,60 @@ impl Config {
                 .get(account_id)
                 .and_then(|overrides| overrides.notifications_enabled)
                 .unwrap_or(true)
+    }
+
+    /// The local notification behavior of one room of an account. A room or
+    /// account with nothing of its own removes nothing.
+    pub fn room_notification_local(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> RoomNotificationLocal {
+        self.account_overrides
+            .get(account_id)
+            .and_then(|overrides| overrides.room_notifications.get(room_id))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Set one room's local notification behavior. A value that removes
+    /// nothing drops the room, and an account left with nothing of its own is
+    /// dropped too. Validation, including the room ID and the per-account
+    /// bound, happens when the configuration is saved.
+    pub fn set_room_notification_local(
+        &mut self,
+        account_id: &str,
+        room_id: &str,
+        local: RoomNotificationLocal,
+    ) {
+        let overrides = self
+            .account_overrides
+            .entry(account_id.to_owned())
+            .or_default();
+        if local.is_default() {
+            overrides.room_notifications.remove(room_id);
+        } else {
+            overrides.room_notifications.insert(room_id.to_owned(), local);
+        }
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+    }
+
+    /// Remove one account's per-room notification behavior, and nothing of
+    /// any other account; its room IDs do not outlive a logout or removal.
+    /// The entry itself goes once nothing else remains in it. Returns whether
+    /// anything changed.
+    pub fn clear_room_notifications(&mut self, account_id: &str) -> bool {
+        let Some(overrides) = self.account_overrides.get_mut(account_id) else {
+            return false;
+        };
+        let changed = !overrides.room_notifications.is_empty();
+        overrides.room_notifications.clear();
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+        changed
     }
 
     /// The color overrides `account_id` sees: the global `[colors]` table,
@@ -1330,6 +1385,9 @@ pub struct Notifications {
     pub enabled: bool,
     pub sounds: bool,
     pub show_message_preview: bool,
+    /// Room names and senders in desktop banners. Off, a banner names only
+    /// the account and never previews message text.
+    pub show_room_and_sender: bool,
     pub highlight_words: Vec<String>,
 }
 
@@ -1339,6 +1397,7 @@ impl Default for Notifications {
             enabled: true,
             sounds: true,
             show_message_preview: false,
+            show_room_and_sender: true,
             highlight_words: Vec::new(),
         }
     }
@@ -1420,6 +1479,68 @@ pub struct AccountOverrides {
     /// display name or Matrix ID: only the local account ID keys them.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
+    /// Local notification behavior for single rooms of this account, keyed
+    /// by Matrix room ID. It is separate from the room's level, which is the
+    /// account's server push rule, and separate from any room appearance: it
+    /// can only make that room's banners quieter or more private than the
+    /// global and account settings allow. At most
+    /// [`MAX_ROOM_NOTIFICATION_OVERRIDES`] rooms per account.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub room_notifications: BTreeMap<String, RoomNotificationLocal>,
+}
+
+/// Most rooms with their own local notification behavior per account.
+pub const MAX_ROOM_NOTIFICATION_OVERRIDES: usize = 256;
+
+/// One room's local notification behavior. Each switch only removes
+/// something from that room's banners; none can raise a global ceiling such
+/// as notifications, sounds or previews being off. It holds no credentials,
+/// paths or message content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoomNotificationLocal {
+    /// No sound for this room's banners.
+    #[serde(skip_serializing_if = "is_false")]
+    pub quiet: bool,
+    /// Never preview message text from this room, even when previews are on.
+    #[serde(skip_serializing_if = "is_false")]
+    pub hide_preview: bool,
+    /// Local highlight words do not mark this room's banners; Matrix
+    /// mentions and keywords still do.
+    #[serde(skip_serializing_if = "is_false")]
+    pub no_highlights: bool,
+}
+
+impl RoomNotificationLocal {
+    /// Whether the room removes nothing (and so is not stored).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One account's room notification table. Neither the account ID nor a room
+/// ID is ever part of a field path.
+fn validate_room_notifications(
+    rooms: &BTreeMap<String, RoomNotificationLocal>,
+) -> Result<(), ConfigError> {
+    const FIELD: &str = "account_overrides.<account>.room_notifications";
+    if rooms.len() > MAX_ROOM_NOTIFICATION_OVERRIDES {
+        return Err(field_error(
+            FIELD,
+            Problem::Range {
+                minimum: 0,
+                maximum: MAX_ROOM_NOTIFICATION_OVERRIDES as u32,
+            },
+        ));
+    }
+    if rooms.keys().any(|room_id| validate_room_id(room_id).is_err()) {
+        return Err(field_error(FIELD, Problem::RoomId));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2437,6 +2558,72 @@ mod tests {
     }
 
     #[test]
+    fn room_notification_behavior_is_bounded_separate_and_sparse() {
+        let mut config = Config::default();
+        let quiet = RoomNotificationLocal {
+            quiet: true,
+            ..Default::default()
+        };
+        config.set_room_notification_local("work", "!a:example.org", quiet);
+        config.validate().unwrap();
+        assert_eq!(config.room_notification_local("work", "!a:example.org"), quiet);
+        // Other rooms and accounts remove nothing.
+        assert!(config.room_notification_local("work", "!b:example.org").is_default());
+        assert!(config.room_notification_local("home", "!a:example.org").is_default());
+        // Only switched-on keys are written, under their own table.
+        let written = toml::to_string(&config).unwrap();
+        assert!(written.contains("quiet = true"), "{written}");
+        assert!(!written.contains("hide_preview") && !written.contains("no_highlights"));
+        assert!(!written.contains("room_appearance"));
+        let reread: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reread, config);
+        // A room that removes nothing is dropped, and so is an emptied account.
+        config.set_room_notification_local("work", "!a:example.org", Default::default());
+        assert!(!config.account_overrides.contains_key("work"));
+        // Invalid room IDs, unknown keys and too many rooms are rejected.
+        let mut bad = Config::default();
+        bad.set_room_notification_local("work", "not a room", quiet);
+        assert!(bad.validate().is_err());
+        assert!(
+            toml::from_str::<Config>(
+                "[account_overrides.work.room_notifications.\"!a:example.org\"]\nring = true\n"
+            )
+            .is_err()
+        );
+        let mut many = Config::default();
+        for index in 0..=MAX_ROOM_NOTIFICATION_OVERRIDES {
+            many.set_room_notification_local("work", &format!("!r{index}:example.org"), quiet);
+        }
+        assert!(many.validate().is_err());
+        many.set_room_notification_local("work", "!r0:example.org", Default::default());
+        many.validate().unwrap();
+    }
+
+    #[test]
+    fn a_logged_out_accounts_room_notification_behavior_is_cleared_alone() {
+        let quiet = RoomNotificationLocal {
+            quiet: true,
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.set_room_notification_local("work", "!a:example.org", quiet);
+        config.set_room_notification_local("home", "!a:example.org", quiet);
+        let work = config.account_overrides.get_mut("work").unwrap();
+        work.notifications_enabled = Some(false);
+        assert!(config.clear_room_notifications("work"));
+        assert!(!config.clear_room_notifications("work"));
+        // The account keeps its other preferences; other accounts keep theirs.
+        assert!(config.account_overrides["work"].room_notifications.is_empty());
+        assert_eq!(config.account_overrides["work"].notifications_enabled, Some(false));
+        assert_eq!(config.room_notification_local("home", "!a:example.org"), quiet);
+        // An entry left with nothing is removed.
+        assert!(config.clear_room_notifications("home"));
+        assert!(!config.account_overrides.contains_key("home"));
+        assert!(!config.clear_room_notifications("unknown"));
+    }
+
+    #[test]
+
     fn invalid_shortcut_save_preserves_the_last_valid_file_and_reload_recovers() {
         let directory = tempfile::tempdir().unwrap();
         let store = ConfigStore::at(directory.path().join("config.toml"));
@@ -4293,6 +4480,14 @@ mod tests {
                 Some("account_overrides") if path.get(2).is_some_and(|key| key == "colors") => {
                     "account_overrides.<account>.colors.<token>".into()
                 }
+                Some("account_overrides")
+                    if path.get(2).is_some_and(|key| key == "room_notifications") =>
+                {
+                    format!(
+                        "account_overrides.<account>.room_notifications.<room>.{}",
+                        path[4..].join(".")
+                    )
+                }
                 Some("account_overrides") => {
                     format!("account_overrides.<account>.{}", path[2..].join("."))
                 }
@@ -4329,6 +4524,14 @@ mod tests {
                 legacy_element_call_rooms: vec!["!b:example.org".into()],
                 element_call_matrix_2_0_rooms: vec!["!c:example.org".into()],
                 colors: BTreeMap::from([("link".into(), "#123456".into())]),
+                room_notifications: BTreeMap::from([(
+                    "!d:example.org".into(),
+                    RoomNotificationLocal {
+                        quiet: true,
+                        hide_preview: true,
+                        no_highlights: true,
+                    },
+                )]),
             },
         );
         full.validate().unwrap();
@@ -4367,7 +4570,8 @@ mod tests {
             let key = key
                 .replace("<account>", "account")
                 .replace("<token>", name)
-                .replace("<action>", name);
+                .replace("<action>", name)
+                .replace("<room>", "\"!room:example.org\"");
             match key.rsplit_once('.') {
                 Some((table, leaf)) => format!("[{table}]\n{leaf} = {value}\n"),
                 None => format!("{key} = {value}\n"),

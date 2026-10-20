@@ -76,10 +76,15 @@ pub use pinned_messages::{
     PinnedMessagesCancellation, PinnedMessagesError, PinnedRoomChange, PinnedState,
     room_updates_affect_pinned,
 };
+mod notification_rules;
 mod rich_text;
 mod room_tags;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
+pub use notification_rules::{
+    MAX_NOTIFICATION_KEYWORDS, MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_ROOMS,
+    NotificationDefaults, NotificationMode, RoomNotificationRule, RoomUnreadCounts,
+};
 pub use room_tags::{
     ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, TagKnowledge,
     TagOrder,

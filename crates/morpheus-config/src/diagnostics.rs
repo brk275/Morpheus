@@ -404,6 +404,7 @@ fn segment_matches(pattern: &str, segment: &str) -> bool {
             .any(|(name, _)| *name == segment),
         "<action>" => ShortcutAction::parse(segment).is_some(),
         "<account>" => true,
+        "<room>" => crate::is_room_id(segment),
         literal => literal == segment,
     }
 }
@@ -426,8 +427,9 @@ fn shown_path(file: FileKind, segments: &[String]) -> String {
             shown.push("<unknown>");
             break;
         };
-        shown.push(if pattern[depth] == "<account>" {
-            "<account>"
+        // Account and room IDs are never shown, only their placeholders.
+        shown.push(if matches!(pattern[depth], "<account>" | "<room>") {
+            pattern[depth]
         } else {
             // Equal to the matched schema name.
             pattern_name(pattern[depth], segment)

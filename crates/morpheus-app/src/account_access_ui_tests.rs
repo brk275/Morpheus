@@ -3797,6 +3797,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_vector_icons(&ui).await;
     phase.set(28);
     assert_public_profile_projection(&ui).await;
+    phase.set(21);
+    assert_room_notification_panel(&ui).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
@@ -6251,5 +6253,103 @@ async fn assert_pane_navigation_epoch(
     apply_config(ui, &config, None);
     ui.set_live_session(was_live);
     ui.set_preview_session(was_preview);
+    settle(ui).await;
+}
+
+/// The room header's bell opens its panel only for the live account and the
+/// room open now. The panel keeps Tab inside, pauses shortcuts, closes on
+/// Escape with focus back on the bell, and closes and clears on another room,
+/// another account or an access screen. Stand-ins replace the controller, so
+/// nothing reads a homeserver or writes configuration.
+async fn assert_room_notification_panel(ui: &AppWindow) {
+    use crate::RoomNotificationState;
+    use std::{cell::Cell, rc::Rc};
+
+    let global = ui.global::<RoomNotificationState>();
+    let opens = Rc::new(Cell::new(0));
+    let closes = Rc::new(Cell::new(0));
+    let weak = ui.as_weak();
+    let counted = opens.clone();
+    global.on_request_open(move |account_id, room_id| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        counted.set(counted.get() + 1);
+        let global = ui.global::<RoomNotificationState>();
+        global.set_account_id(account_id);
+        global.set_room_id(room_id);
+        global.set_room_name("Team room".into());
+        global.set_effective(2);
+        global.set_open(true);
+    });
+    let weak = ui.as_weak();
+    let counted = closes.clone();
+    global.on_close(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        counted.set(counted.get() + 1);
+        let global = ui.global::<RoomNotificationState>();
+        global.set_open(false);
+        global.set_account_id("".into());
+        global.set_room_id("".into());
+        global.set_room_name("".into());
+    });
+    let before = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_active_account_local_id(),
+        ui.get_active_room_id(),
+    );
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("work".into());
+    ui.set_active_room_id("!room:example.org".into());
+    settle(ui).await;
+
+    click_control_once(ui, "Room notifications");
+    settle(ui).await;
+    assert_eq!(opens.get(), 1);
+    assert!(global.get_open());
+    assert!(focused_control_has_label(ui, "Close room notifications"));
+    key(ui, Key::Backtab);
+    assert!(focused_control_has_label(ui, "Open notification settings for every room"));
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(ui, "Close room notifications"));
+    assert!(
+        !ui.invoke_dispatch_shortcut("p".into(), true, false, false, false),
+        "shortcuts pause while the room panel is open"
+    );
+    assert!(!ui.get_quick_switcher_open());
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert_eq!(closes.get(), 1);
+    assert!(!global.get_open());
+    assert!(focused_control_has_label(ui, "Room notifications"));
+
+    for change in 0..3 {
+        global.invoke_request_open("work".into(), "!room:example.org".into());
+        settle(ui).await;
+        assert!(global.get_open());
+        match change {
+            0 => ui.set_active_room_id("!other:example.org".into()),
+            1 => ui.set_active_account_local_id("home".into()),
+            _ => ui.set_access_open(true),
+        }
+        settle(ui).await;
+        assert!(!global.get_open(), "context change {change} kept the panel");
+        assert!(global.get_room_name().is_empty() && global.get_room_id().is_empty());
+        ui.set_access_open(false);
+        ui.set_active_account_local_id("work".into());
+        ui.set_active_room_id("!room:example.org".into());
+        settle(ui).await;
+    }
+    assert_eq!(closes.get(), 4);
+
+    let (page, live, account, room) = before;
+    ui.set_page(page);
+    ui.set_live_session(live);
+    ui.set_active_account_local_id(account);
+    ui.set_active_room_id(room);
     settle(ui).await;
 }

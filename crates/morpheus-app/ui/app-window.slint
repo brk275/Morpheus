@@ -22,6 +22,9 @@ export { VoiceParticipant, VoicePresence, VoiceRosters } from "voice-rosters.sli
 import { SpaceExplorer, SpaceExplorerPanel } from "space-explorer.slint";
 export { SpaceExplorer, SpaceExplorerCrumb, SpaceExplorerRow } from "space-explorer.slint";
 import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "device-sessions.slint";
+import { NotificationRules, RoomNotificationPanel, RoomNotificationState } from "notification-settings.slint";
+// Rust drives the notification rules and the room panel through these globals.
+export { NotificationRoomItem, NotificationRulesState, RoomNotificationState } from "notification-settings.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
 // One row of the pane arrangement editor, in the current order.
@@ -4141,6 +4144,37 @@ export component AppWindow inherits Window {
     callback submit-account-access();
     callback cancel-account-access();
 
+    // The room header's notification panel shows only for the live account
+    // and the room open now, and never over account access or security.
+    property <bool> room-notifications-current: RoomNotificationState.open && root.live-session
+        && RoomNotificationState.account-id == root.active-account-local-id
+        && RoomNotificationState.room-id == root.active-room-id && root.active-room-id != ""
+        && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
+        && root.security-recovery-key == "" && !root.account-profile-open && !SpaceExplorer.open;
+    // Another account or room, a lock or a detach clears the panel's rows.
+    changed room-notifications-current => {
+        if !root.room-notifications-current && RoomNotificationState.open {
+            RoomNotificationState.close();
+        }
+    }
+    property <int> room-notification-focus-request: 0;
+    // The header bell rereads the level of each room it shows.
+    property <string> notification-room-key: root.live-session ? root.active-account-local-id + "\n" + root.active-room-id : "";
+    changed notification-room-key => {
+        RoomNotificationState.room-shown(root.active-account-local-id, root.active-room-id);
+    }
+    // The person closed the panel: focus returns to what opened it.
+    function close-room-notifications() {
+        RoomNotificationState.close();
+        if root.page == 0 {
+            root.room-notification-focus-request += 1;
+        } else if root.page == 1 {
+            // Opened from Settings: its entry, which only reveals the panel.
+            root.settings-reveal-id = "notifications.this_room";
+            root.settings-reveal-serial += 1;
+        }
+    }
+
     in-out property <bool> room-actions-open: false;
     in-out property <int> room-action-mode: 0; // 0 private room, 1 join, 2 Space
     in-out property <string> room-action-input;
@@ -5076,6 +5110,23 @@ export component AppWindow inherits Window {
                                 ink: root.icon-ink; hover: root.hover; radius: StyleTokens.radius * 0.9;
                                 focus-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.ink;
                             }
+                        }
+                        if root.page == 0 : VerticalLayout {
+                            width: StyleTokens.icon-button-size; alignment: center;
+                            IconAction {
+                            // A panel the person closed returns focus here.
+                            property <int> focus-request: root.room-notification-focus-request;
+                            changed focus-request => { self.focus(); }
+                            // Stable IDs of the native icon set, which draws them once merged.
+                            icon: RoomNotificationState.header-muted ? "notifications-off" : "notifications";
+                            label: RoomNotificationState.header-muted ? "Room notifications, muted" : "Room notifications";
+                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            selected: root.room-notifications-current;
+                            enabled: root.live-session && root.active-room-id != "";
+                            activated => {
+                                RoomNotificationState.request-open(root.active-account-local-id, root.active-room-id);
+                            }
+                        }
                         }
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
@@ -7873,7 +7924,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Notifications"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
-                        Text { text: "Notifications are shown for the active account while Morpheus runs. These preferences are shared by all accounts; room rules still come from Matrix."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        Text { text: "Notifications are shown for the active account while Morpheus runs. Notifications, sounds, previews, highlight words and room and sender names apply to all accounts. This account, default levels, keywords and room levels belong to the active account; levels and keywords are its Matrix push rules."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         ActionRect {
                             height: 68px; border-radius: StyleTokens.radius * 1; background: root.elevated; focus-color: root.accent;
                             property <int> reveal-request: root.reveal-request("notifications.desktop");
@@ -8008,6 +8059,39 @@ export component AppWindow inherits Window {
                                     activated => { root.remove-highlight-word(word); }
                                 }
                             }
+                        }
+                        NotificationRules {
+                            palette: {
+                                ink: root.ink,
+                                muted: root.muted,
+                                panel: root.panel,
+                                elevated: root.elevated,
+                                hover: root.hover,
+                                accent: root.accent,
+                                divider: root.divider,
+                                error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483,
+                                selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover,
+                                selection-ink: StyleTokens.roles.selection-ink.color,
+                                has-selection-ink: StyleTokens.roles.selection-ink.present,
+                                focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+                            };
+                            text-scale: root.text-scale;
+                            radius: StyleTokens.radius;
+                            live: root.live-session;
+                            account-key: root.active-account-local-id;
+                            account-handle: root.active-account-handle;
+                            all-enabled: root.notifications-enabled;
+                            account-reveal: root.reveal-request("notifications.account");
+                            identity-reveal: root.reveal-request("notifications.identity");
+                            defaults-reveal: root.reveal-request("notifications.defaults");
+                            keywords-reveal: root.reveal-request("notifications.keywords");
+                            rooms-reveal: root.reveal-request("notifications.rooms");
+                            room-open: root.live-session && root.active-room-id != "";
+                            room-name: root.active-room-name;
+                            room-panel-reveal: root.reveal-request("notifications.this_room");
+                            open-room-panel => { RoomNotificationState.request-open(root.active-account-local-id, root.active-room-id); }
+                            reveal(offset) => { settings-scroll.reveal(offset - settings-content.absolute-position.y); }
+                            revealed(id) => { root.settings-revealed-id = id; }
                         }
                         Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Accounts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
@@ -10043,6 +10127,54 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    if root.room-notifications-current : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { room-notification-panel.focus-first(); }
+        // Tab stays inside the panel while it is open.
+        capture-key-pressed(event) => {
+            if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && room-notification-panel.at-start {
+                room-notification-panel.focus-last();
+                accept
+            } else if event.text == Key.Tab && !event.modifiers.shift && room-notification-panel.at-end {
+                room-notification-panel.focus-first();
+                accept
+            } else { reject }
+        }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close-room-notifications();
+                accept
+            } else { reject }
+        }
+        // A click outside the panel closes it and reaches nothing behind it.
+        TouchArea {
+            width: parent.width; height: parent.height;
+            clicked => { root.close-room-notifications(); }
+        }
+        room-notification-panel := RoomNotificationPanel {
+            x: max(8px, parent.width - self.width - 16px);
+            y: max(64px, 40px * root.text-scale + 24px) + StyleTokens.icon-button-growth + 4px;
+            palette: {
+                ink: root.ink,
+                muted: root.muted,
+                panel: root.panel,
+                elevated: root.dialog-surface,
+                hover: root.hover,
+                accent: root.accent,
+                divider: root.divider,
+                error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483,
+                selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover,
+                selection-ink: StyleTokens.roles.selection-ink.color,
+                has-selection-ink: StyleTokens.roles.selection-ink.present,
+                focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+            };
+            text-scale: root.text-scale;
+            radius: StyleTokens.radius;
+            live: root.live-session;
+            dismissed => { root.close-room-notifications(); }
         }
     }
 

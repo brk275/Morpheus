@@ -1527,6 +1527,12 @@ pub const FIELDS: &[FieldSpec] = &[
         "Decrypted text in desktop notifications.",
     ),
     field(
+        "notifications.show_room_and_sender",
+        Bool,
+        "true",
+        "Room names and senders in desktop notifications; off names only the account.",
+    ),
+    field(
         "notifications.highlight_words",
         FieldKind::TextList,
         "[]",
@@ -1615,6 +1621,24 @@ pub const FIELDS: &[FieldSpec] = &[
         FieldKind::Color,
         "(none)",
         "Color override while this local account is active, drawn over [colors]; removing the account removes it.",
+    ),
+    field(
+        "account_overrides.<account>.room_notifications.<room>.quiet",
+        Bool,
+        "false",
+        "No sound for this room's notifications on this account. At most 256 rooms per account; the room's level is its Matrix push rule, set in Settings or the room header.",
+    ),
+    field(
+        "account_overrides.<account>.room_notifications.<room>.hide_preview",
+        Bool,
+        "false",
+        "Never preview message text from this room, even when previews are on; it cannot turn previews on.",
+    ),
+    field(
+        "account_overrides.<account>.room_notifications.<room>.no_highlights",
+        Bool,
+        "false",
+        "Local highlight words do not mark this room's notifications; Matrix mentions and keywords still do.",
     ),
     field(
         "colors.<token>",
@@ -2054,6 +2078,62 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Words and phrases that mark a notification as a highlight.",
         &["keywords", "mentions", "highlight", "alert words"],
     ),
+    live(target(
+        "notifications.account",
+        "Notifications",
+        "Settings › Notifications",
+        "Notifications for this account",
+        "Turn desktop notifications and call alerts off for the active account only.",
+        &["account", "silence", "mute account", "per account", "work account"],
+    )),
+    target(
+        "notifications.identity",
+        "Notifications",
+        "Settings › Notifications",
+        "Room and sender in notifications",
+        "Show or hide room names and senders in desktop notifications.",
+        &["privacy", "lock screen", "sender", "room name", "hide"],
+    ),
+    live(target(
+        "notifications.defaults",
+        "Notifications",
+        "Settings › Notifications › Defaults",
+        "Default notification level",
+        "All messages, or mentions and keywords, for rooms and direct messages.",
+        &["default", "direct messages", "dm", "group", "all messages"],
+    )),
+    live(target(
+        "notifications.keywords",
+        "Notifications",
+        "Settings › Notifications › Keywords",
+        "Notification keywords",
+        "Matrix keywords that notify in rooms set to mentions and keywords, on all devices.",
+        &["keyword", "keywords", "alert words", "push rules", "mentions and keywords"],
+    )),
+    live(target(
+        "notifications.rooms",
+        "Notifications",
+        "Settings › Notifications › Rooms",
+        "Room notification rules",
+        "Search rooms and choose all messages, mentions and keywords, or mute.",
+        &["mute", "mentions", "keywords", "per room", "push rules", "room notifications"],
+    )),
+    live(target(
+        "notifications.this_room",
+        "Notifications",
+        "Settings › Notifications › Rooms",
+        "This room's notifications",
+        "Open the open room's panel: its level, and its sound, preview and highlights on this device.",
+        &[
+            "this room",
+            "bell",
+            "quiet room",
+            "room sound",
+            "room preview",
+            "room highlights",
+            "silence room",
+        ],
+    )),
     accounts(
         target(
             "accounts.manage",
@@ -2574,6 +2654,21 @@ mod tests {
                 .iter()
                 .all(|target| target.requires == Requirement::Always)
         );
+    }
+
+    #[test]
+    fn the_open_rooms_notification_panel_is_a_live_settings_destination() {
+        let all = |_| true;
+        let first = |query: &str| search_settings(query, all).first().map(|target| target.id);
+        for query in ["bell", "quiet room", "room highlights", "this room"] {
+            assert_eq!(first(query), Some("notifications.this_room"), "{query}");
+        }
+        // It only reveals a control, and only while signed in.
+        let target = setting_target("notifications.this_room").unwrap();
+        assert_eq!(target.route, Route::Settings);
+        assert_eq!(target.requires, Requirement::LiveSession);
+        let offline = |requirement| requirement == Requirement::Always;
+        assert!(search_settings("bell", offline).is_empty());
     }
 
     #[test]
