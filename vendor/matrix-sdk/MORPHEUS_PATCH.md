@@ -227,3 +227,47 @@ also omits the typed error body. Existing HTTP request spans are unchanged. Exis
 unchanged. Focused mock-server regressions cover oversized valid JSON and a
 single failed request. A failed multi-command update may have partly reached
 the server; callers must reconcile through sync and must not claim rollback.
+
+## Opt-in authentication refresh and replay suppression
+
+STATUS: source only; no local build or execution. Focused SDK tests and the
+affected native targets still require independently reviewed hosted runs.
+
+`RequestConfig::disable_auth_refresh()` opts a request out of the SDK's
+unknown-token handler. This is independent of HTTP backoff: `retry_limit(0)`
+does not prevent the upstream `SendRequest` path from refreshing credentials
+after a 401 and sending the mutation again. The new boolean defaults to
+`false`, preserving all existing request behavior, and its diagnostic output
+contains only the boolean. `SendRequest` checks the effective per-request
+configuration, or the client default when none was supplied, before calling
+the handler. An opted-out request returns its original 401 without refreshing,
+replaying, or broadcasting the handler's unknown-token session change. The
+original request is still authenticated; `send_inner` still marks its rejected
+access token as expired. Another request may refresh the session normally.
+The path builder's version discovery already uses its upstream failsafe mode
+without token refresh; this patch does not change it.
+
+Only the notification-settings mutating command helper opts out in this
+patch, alongside its existing zero HTTP retries, 30-second timeout and 64 KiB
+response cap. Callers implementing other uncertain mutations may explicitly
+choose the same per-request setting after their own source review; ordinary
+reads, sync, media, OAuth and authentication defaults are unchanged. The common
+gate covers Matrix and OAuth unknown-token handling without altering either
+refresh implementation. No dependency, manifest, lockfile, feature or unsafe
+code changed. The SDK patch changes the existing persistence cohort hash.
+
+Changed source files are `src/config/request.rs`, `src/client/futures.rs`,
+`src/notification_settings/mod.rs` and
+`tests/integration/refresh_token.rs`; their original upstream provenance remains
+the pinned revision recorded above. The notification helper's response limit
+and fixed operation logs are retained.
+
+Regression source adds actual loopback mock-server cases for a create-room
+request with automatic refresh enabled: opted out returns its original
+unknown-token 401 after one request, emits no session-change signal, preserves
+the fixture credentials, and logs neither token nor reflected reply text;
+default behavior still performs one refresh and one successful replay even
+with zero HTTP retries. A push-rule mutation has the same opted-out 401
+regression, ensuring the production helper is wired to the setting. Existing
+oversized-valid-JSON, 500 single-attempt and fixed-log push-rule regressions
+are retained unchanged.
