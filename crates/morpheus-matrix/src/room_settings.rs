@@ -2388,7 +2388,10 @@ mod tests {
                 404,
                 json!({"errcode": "M_UNRECOGNIZED", "error": "x"}).to_string(),
             )
-        } else if method == "POST" && path.contains("/upload") {
+        } else if method == "POST"
+            && (path.split('?').next() == Some("/_matrix/media/v3/upload")
+                || path.split('?').next() == Some("/_matrix/client/v1/media/upload"))
+        {
             served.uploads.fetch_add(1, Ordering::SeqCst);
             if served.hold_uploads.load(Ordering::SeqCst) {
                 while !served.stopped.load(Ordering::SeqCst) {
@@ -2994,7 +2997,9 @@ mod tests {
         let avatar = r#"{"url":"mxc://example.org/a","info":{"w":1},"org.example.x":1}"#;
         let cleared = RoomAvatarEventContent::new();
         let cleared = edited_content(Some(avatar), &["url", "info"], cleared).unwrap();
-        assert_eq!(cleared.get(), r#"{"org.example.x":1}"#);
+        // The pinned Ruma serializer represents a cleared avatar as url:null.
+        // Its image metadata is removed; the extension remains byte-for-byte.
+        assert_eq!(cleared.get(), r#"{"url":null,"org.example.x":1}"#);
         // Leaving a restricted rule drops its allow list.
         let restricted = r#"{"join_rule":"restricted","allow":[]}"#;
         let invite = RoomJoinRulesEventContent::new(JoinRule::Invite);

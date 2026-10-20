@@ -954,7 +954,9 @@ mod tests {
                 200,
                 event("m.room.message", "@dana:example.org", "$msg", content),
             )
-        } else if method == "POST" || method == "PUT" {
+        } else if (method == "POST" || method == "PUT")
+            && path.starts_with("/_matrix/client/v3/rooms/")
+        {
             let label = if path.contains("/redact/") {
                 "redact".to_owned()
             } else if let Some(kind) = path.split("/state/").nth(1) {
