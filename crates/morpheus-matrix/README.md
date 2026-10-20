@@ -79,6 +79,11 @@ remaining acceptance checks recorded in the feature matrix.
   room ID joined exactly, withdrawable with `JoinCancellation` until it is
   handed off; the room appears once sync shows it, `await_joined_for`)
   support room aliases and Matrix links.
+  An unresolved join pauses further attempts for that account and typed
+  target during this app session; closing an unseen warning never permits
+  a resend. The bounded receipt ledger pauses new targets when full.
+  The join POST has its own timeout/body/retry limits; SDK metadata setup
+  before that POST is not covered by those per-request limits.
 - Room operations include `create_private_room`, `create_dm`, `join_room`,
   `leave_room`, `invite_user`, `kick_user`, `ban_user`, `unban_user`,
   `rename_room`, and `set_room_topic`. `room_members_for` lists joined,

@@ -404,6 +404,7 @@ impl AccountAccessUi {
                         access.live.forget_account_drafts(&id);
                         access.live.voice_spaces.forget_account(&id).await;
                         if result.complete {
+                            access.live.forget_removed_account_joins(&id);
                             if let Err(error) = access.live.voice_spaces.clear_logged_out_account(&id) {
                                 return Ok(format!("Account removed. Some appearance preferences could not be removed: {error}"));
                             }

@@ -135,7 +135,13 @@ impl JoinAsked {
 /// account and typed room or address, whatever the Join a room dialog, the
 /// directory or the Space explorer shows, hides or reopens since.
 #[derive(Default)]
-struct JoinOutcomes(std::sync::Mutex<HashMap<(String, String), JoinOutcome>>);
+struct JoinOutcomes(std::sync::Mutex<JoinLedger>);
+
+#[derive(Default)]
+struct JoinLedger {
+    next: u64,
+    entries: HashMap<(String, String), (u64, JoinOutcome)>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JoinOutcome {
@@ -143,50 +149,63 @@ enum JoinOutcome {
     Unknown,
 }
 
-/// Joins remembered at most; unknown ones are forgotten first.
+/// Joins remembered at most. Unresolved entries are never evicted to make
+/// another mutation possible; a full ledger pauses new joins instead.
 const MAX_JOIN_OUTCOMES: usize = 64;
 
 impl JoinOutcomes {
-    fn outcomes(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), JoinOutcome>> {
+    fn outcomes(&self) -> std::sync::MutexGuard<'_, JoinLedger> {
         self.0.lock().unwrap_or_else(|error| error.into_inner())
     }
 
     /// Start a join of `key`. Refused while another is in flight. An earlier
-    /// unknown outcome is reported once instead, sending nothing, so the
-    /// next join is the user's informed choice, never a blind resend.
-    fn begin(&self, key: &(String, String)) -> Result<(), JoinError> {
+    /// unknown outcome pauses further attempts. Returning an error is not
+    /// acknowledgment: its UI may have closed before that error is shown.
+    fn begin(&self, key: &(String, String), current: impl FnOnce() -> bool) -> Result<u64, JoinError> {
         let mut outcomes = self.outcomes();
-        match outcomes.get(key) {
+        // Removal revokes the selection before forgetting its entries. A
+        // queued old caller cannot insert after that forget barrier.
+        if !current() {
+            return Err(JoinError::AccountChanged);
+        }
+        match outcomes.entries.get(key).map(|(_, outcome)| outcome) {
             Some(JoinOutcome::InFlight) => return Err(JoinError::Pending),
-            Some(JoinOutcome::Unknown) => {
-                outcomes.remove(key);
-                return Err(JoinError::EarlierUnknown);
-            }
+            Some(JoinOutcome::Unknown) => return Err(JoinError::EarlierUnknown),
             None => {}
         }
-        if outcomes.len() >= MAX_JOIN_OUTCOMES {
-            outcomes.retain(|_, outcome| *outcome == JoinOutcome::InFlight);
-            if outcomes.len() >= MAX_JOIN_OUTCOMES {
-                return Err(JoinError::Pending);
-            }
+        if outcomes.entries.len() >= MAX_JOIN_OUTCOMES {
+            return Err(JoinError::UnresolvedLimit);
         }
-        outcomes.insert(key.clone(), JoinOutcome::InFlight);
-        Ok(())
+        let Some(receipt) = outcomes.next.checked_add(1) else {
+            return Err(JoinError::UnresolvedLimit);
+        };
+        outcomes.next = receipt;
+        outcomes.entries.insert(key.clone(), (receipt, JoinOutcome::InFlight));
+        Ok(receipt)
     }
 
     /// The join of `key` ended: kept as unknown when it may have happened.
-    fn settle(&self, key: &(String, String), unknown: bool) {
+    fn settle(&self, key: &(String, String), receipt: u64, unknown: bool) {
         let mut outcomes = self.outcomes();
-        if unknown {
-            outcomes.insert(key.clone(), JoinOutcome::Unknown);
-        } else {
-            outcomes.remove(key);
+        // Actual account removal may have forgotten this receipt. A late
+        // completion must neither recreate it nor settle a newer operation.
+        if outcomes.entries.get(key).map(|(owner, _)| *owner) != Some(receipt) {
+            return;
         }
+        if unknown {
+            outcomes.entries.insert(key.clone(), (receipt, JoinOutcome::Unknown));
+        } else {
+            outcomes.entries.remove(key);
+        }
+    }
+
+    fn forget_account(&self, account: &str) {
+        self.outcomes().entries.retain(|(owner, _), _| owner != account);
     }
 
     #[cfg(test)]
     fn get(&self, key: &(String, String)) -> Option<JoinOutcome> {
-        self.outcomes().get(key).copied()
+        self.outcomes().entries.get(key).map(|(_, outcome)| *outcome)
     }
 }
 
@@ -196,6 +215,7 @@ impl JoinOutcomes {
 struct JoinRecord<'a> {
     outcomes: &'a JoinOutcomes,
     key: (String, String),
+    receipt: u64,
     cancellation: JoinCancellation,
     settled: bool,
 }
@@ -204,11 +224,13 @@ impl<'a> JoinRecord<'a> {
     fn new(
         outcomes: &'a JoinOutcomes,
         key: (String, String),
+        receipt: u64,
         cancellation: JoinCancellation,
     ) -> Self {
         Self {
             outcomes,
             key,
+            receipt,
             cancellation,
             settled: false,
         }
@@ -216,15 +238,26 @@ impl<'a> JoinRecord<'a> {
 
     fn settle(mut self, unknown: bool) {
         self.settled = true;
-        self.outcomes.settle(&self.key, unknown);
+        self.outcomes.settle(&self.key, self.receipt, unknown);
     }
 }
 
 impl Drop for JoinRecord<'_> {
     fn drop(&mut self) {
         if !self.settled {
-            self.outcomes.settle(&self.key, self.cancellation.sent());
+            self.outcomes.settle(&self.key, self.receipt, self.cancellation.sent());
         }
+    }
+}
+
+/// Waiting for an independently owned navigation never abandons its
+/// rollback. A caller timeout/drop withdraws it; the task settles its own
+/// admitted snapshot before releasing the barrier.
+struct JoinNavigationWait(JoinAsked);
+
+impl Drop for JoinNavigationWait {
+    fn drop(&mut self) {
+        self.0.withdraw();
     }
 }
 
@@ -290,6 +323,9 @@ struct RevealOwner<'a> {
     gate: SnapshotGate,
     /// The room the reveal committed; its snapshot shows exactly this room.
     room_id: String,
+    /// A joined Space owns the Space snapshot instead of one exact room.
+    /// Its selected room is chosen by the ordinary visibility rules.
+    space_id: Option<String>,
     /// Held for its guard; released once the snapshot was shown.
     _barrier: Option<tokio::sync::RwLockWriteGuard<'a, ()>>,
 }
@@ -1610,8 +1646,15 @@ impl LiveUi {
         });
     }
 
+    /// Clear private draft buffers even when local removal is incomplete.
     pub fn forget_account_drafts(&self, account_id: &str) {
         self.drafts.forget_account(account_id);
+    }
+
+    /// Metadata only. Call after complete local removal or successful
+    /// logout, never for a pause, account switch or incomplete removal.
+    pub(crate) fn forget_removed_account_joins(&self, account_id: &str) {
+        self.join_outcomes.forget_account(account_id);
     }
 
     pub async fn flush_drafts(&self) -> Result<(), MatrixCoreError> {
@@ -1841,8 +1884,9 @@ impl LiveUi {
     /// fences every step. Nothing local changes until sync shows the room
     /// joined (see joined_navigation); then it opens through the guarded
     /// navigation as its own task, so no caller's bound can drop it between
-    /// a commit and its give-back. Ok(true) when it is opening, Ok(false)
-    /// when it was joined but has not arrived through sync yet.
+    /// a commit and its give-back. The requester retains withdrawal until
+    /// its actual snapshot finishes. Ok(true) when it was shown, Ok(false)
+    /// when sync has not arrived or opening was withdrawn/superseded.
     pub(crate) async fn join_target_for(
         self: &Arc<Self>,
         selection: &AccountSelection,
@@ -1860,8 +1904,8 @@ impl LiveUi {
             return Err(JoinError::InvalidTarget.into());
         };
         let key = (selection.account_id().to_owned(), room_or_alias_id.clone());
-        self.join_outcomes.begin(&key)?;
-        let record = JoinRecord::new(&self.join_outcomes, key, asked.cancellation.clone());
+        let receipt = self.join_outcomes.begin(&key, || selection.is_current())?;
+        let record = JoinRecord::new(&self.join_outcomes, key, receipt, asked.cancellation.clone());
         // The gate as it was at the click, not as it is now.
         let (gate, is_live, security) = (
             self.security_gate.clone(),
@@ -1882,11 +1926,18 @@ impl LiveUi {
         let Some(open) = joined_navigation(synced) else {
             return Ok(false);
         };
+        // Keep the actual UI's withdrawal slot until navigation has finished
+        // its admitted snapshot, rather than just until this task is spawned.
+        let _waiting = JoinNavigationWait(asked.clone());
+        let (finished, completion) = tokio::sync::oneshot::channel();
         let (live, selection, asked) = (self.clone(), selection.clone(), asked.clone());
         tokio::spawn(async move {
-            live.open_joined(selection, room_id, open, asked, ui).await;
+            let result = live.open_joined(selection, room_id, open, asked, ui).await;
+            let _ = finished.send(result);
         });
-        Ok(true)
+        // The join itself was confirmed above. An unavailable/withdrawn
+        // open is not a failed join and must not be reported as one.
+        Ok(matches!(completion.await, Ok(Ok(true))))
     }
 
     /// Open a room or Space that sync shows joined, only while its selection
@@ -1894,8 +1945,7 @@ impl LiveUi {
     /// the click (`asked`): a room as an owned reveal (reveal_room_for:
     /// committed exactly under the join's own authority, which a withdrawal
     /// revokes, shown only through its own admitted snapshot, given back
-    /// otherwise), a Space the way choosing it in the sidebar does
-    /// (select_space_for).
+    /// otherwise), a joined Space through the same owned snapshot barrier.
     async fn open_joined(
         self: Arc<Self>,
         selection: AccountSelection,
@@ -1903,24 +1953,43 @@ impl LiveUi {
         open: JoinedNavigation,
         asked: JoinAsked,
         ui: Weak<AppWindow>,
-    ) {
-        if asked.cancellation.is_cancelled()
-            || !selection.is_current()
-            || !self.navigation_is_current(asked.navigation)
-        {
-            return;
-        }
-        let epoch = self.invalidate_navigation();
-        let _ = match open {
+    ) -> Result<bool, MatrixCoreError> {
+        // Close can end the wait for the transition immediately, without
+        // dropping an already committed reveal or its give-back work.
+        let _transition = tokio::select! {
+            biased;
+            _ = asked.cancellation.cancelled() => return Ok(false),
+            transition = selection.guard(self.account_transition.lock()) => {
+                let Some(transition) = transition else { return Ok(false); };
+                transition
+            }
+        };
+        // Do not invalidate the current feed while waiting for a held
+        // transition: Close or a newer navigation may already have won.
+        let epoch = {
+            let withdrawn = asked.authority.state();
+            if *withdrawn || asked.cancellation.is_cancelled()
+                || !selection.is_current()
+                || !self.navigation_is_current(asked.navigation)
+            {
+                return Ok(false);
+            }
+            self.invalidate_navigation()
+        };
+        let opened = match open {
             JoinedNavigation::Room => {
-                self.reveal_room_for(selection, room_id, epoch, asked.authority, ui)
+                self.reveal_room_locked(&selection, room_id, epoch, &asked.authority, &ui)
                     .await
             }
             JoinedNavigation::Space => {
-                self.select_space_for(selection.account_id(), room_id, epoch, ui)
+                self.reveal_joined_space_locked(&selection, room_id, epoch, &asked.authority, &ui)
                     .await
             }
         };
+        if !matches!(opened, Ok(true)) {
+            self.reopen_unrevealed(&selection, epoch, ui).await;
+        }
+        opened
     }
 
     async fn complete_room_action(
@@ -2191,6 +2260,7 @@ impl LiveUi {
         let mut owner = RevealOwner {
             gate,
             room_id: room_id.clone(),
+            space_id: None,
             _barrier: Some(barrier),
         };
         let refreshed = self.refresh_owned(ui.clone(), Some(&mut owner)).await;
@@ -2223,6 +2293,80 @@ impl LiveUi {
         #[cfg(test)]
         self.pauses.reach("reveal.before_release").await;
         drop(barrier);
+    }
+
+    /// The joined-Space counterpart of reveal_room_locked. Keep the same
+    /// snapshot barrier until this exact selection/authority has shown its
+    /// Space, or restore only this unshown commit before releasing it.
+    async fn reveal_joined_space_locked(
+        self: &Arc<Self>,
+        selection: &AccountSelection,
+        space_id: String,
+        navigation: u64,
+        authority: &NavigationAuthority,
+        ui: &Weak<AppWindow>,
+    ) -> Result<bool, MatrixCoreError> {
+        if authority.withdrawn() || !selection.is_current()
+            || !self.navigation_is_current(navigation)
+            || self.require_active_account(selection.account_id()).await.is_err()
+        {
+            return Ok(false);
+        }
+        let barrier = self.snapshot_barrier.write().await;
+        let rooms = self.manager.rooms_snapshot().await?;
+        if !rooms.iter().any(|room| room.room_id == space_id && room.is_space
+            && room.membership == RoomMembership::Joined)
+        {
+            return Err(MatrixCoreError::RoomNotFound(space_id));
+        }
+        let Some(previous) = self
+            .commit_joined_space(selection, &space_id, navigation, authority).await
+        else {
+            return Ok(false);
+        };
+        let mut owner = RevealOwner {
+            gate: SnapshotGate {
+                authority: authority.clone(), selection: selection.clone(), navigation,
+            },
+            room_id: String::new(),
+            space_id: Some(space_id.clone()),
+            _barrier: Some(barrier),
+        };
+        let shown = self.refresh_owned(ui.clone(), Some(&mut owner)).await;
+        if !matches!(shown, Ok(true)) {
+            // The transition and barrier still exclude another navigation's
+            // commit. Check the installed Space under both selection locks;
+            // never replace any selection that is no longer this commit's.
+            let mut space = self.selected_space.lock().await;
+            let mut room = self.selected_room.lock().await;
+            if space.as_deref() == Some(space_id.as_str()) {
+                *space = previous.0;
+                *room = previous.1;
+            }
+            drop(room);
+            drop(space);
+            drop(owner._barrier.take());
+        }
+        shown
+    }
+
+    async fn commit_joined_space(
+        &self,
+        selection: &AccountSelection,
+        space_id: &str,
+        navigation: u64,
+        authority: &NavigationAuthority,
+    ) -> Option<(Option<String>, Option<String>)> {
+        let mut space = self.selected_space.lock().await;
+        let mut room = self.selected_room.lock().await;
+        let withdrawn = authority.state();
+        if *withdrawn || !selection.is_current() || !self.navigation_is_current(navigation) {
+            return None;
+        }
+        let previous = (space.clone(), room.clone());
+        *space = Some(space_id.to_owned());
+        *room = None;
+        Some(previous)
     }
 
     /// A reveal that showed nothing after navigate() moved the navigation
@@ -2476,7 +2620,11 @@ impl LiveUi {
         // since the reveal read it), nothing is written, so the reveal gives
         // the previous room and Space back instead of showing another room.
         if let Some(owner) = owner.as_ref() {
-            if selected.as_deref() != Some(owner.room_id.as_str()) {
+            if let Some(space) = &owner.space_id {
+                if selected_space.as_deref() != Some(space.as_str()) {
+                    return Err(MatrixCoreError::RoomNotFound(space.clone()));
+                }
+            } else if selected.as_deref() != Some(owner.room_id.as_str()) {
                 return Err(MatrixCoreError::RoomNotFound(owner.room_id.clone()));
             }
             *self.selected_space.lock().await = selected_space.clone();
@@ -2557,6 +2705,12 @@ impl LiveUi {
             *self.feed_key.lock().await = None;
             if let Some(message) = draft_error.take() {
                 show_error(&ui, message);
+            }
+            // A joined Space may have no visible room. Its admitted empty
+            // snapshot must retire the old room's feed, too, after the UI
+            // has captured its draft and accepted this owned selection.
+            if owner.space_id.is_some() && selected.is_none() {
+                self.clear_feed().await;
             }
         }
         if let Some(room_id) = selected {
@@ -5137,6 +5291,60 @@ mod stale_observer_tests {
             .account_selection(&a_account.id)
             .expect("Selection missing");
 
+        // Actual postjoin dispatch must stay withdrawable while the account
+        // transition is held. It neither waits for that lock to be released
+        // after Close nor invalidates the old room's feed while waiting.
+        *live.selected_room.lock().await = Some(a_room.clone());
+        for kind in [JoinedNavigation::Room, JoinedNavigation::Space] {
+            let transition = live.account_transition.lock().await;
+            let asked = live.join_asked();
+            let navigation = live.current_navigation_epoch();
+            let generation = live.generation.load(Ordering::Acquire);
+            let opening = tokio::spawn(live.clone().open_joined(
+                selection.clone(), "!not-opened:example.org".into(), kind,
+                asked.clone(), Weak::default(),
+            ));
+            tokio::task::yield_now().await;
+            asked.withdraw();
+            let result = tokio::time::timeout(Duration::from_secs(2), opening)
+                .await.expect("Close must wake a held postjoin transition").unwrap();
+            assert!(matches!(result, Ok(false)));
+            assert_eq!(live.current_navigation_epoch(), navigation);
+            assert_eq!(live.generation.load(Ordering::Acquire), generation);
+            assert_eq!(live.selected_room.lock().await.as_deref(), Some(a_room.as_str()));
+            assert!(live.selected_space.lock().await.is_none());
+            drop(transition);
+        }
+        // A newer navigation requested while the join waits keeps its own
+        // epoch. Releasing the transition cannot implicitly open the old join.
+        let transition = live.account_transition.lock().await;
+        let asked = live.join_asked();
+        let opening = tokio::spawn(live.clone().open_joined(
+            selection.clone(), "!old:example.org".into(), JoinedNavigation::Space,
+            asked, Weak::default(),
+        ));
+        let newer = live.invalidate_navigation();
+        drop(transition);
+        assert!(matches!(opening.await.unwrap(), Ok(false)));
+        assert_eq!(live.current_navigation_epoch(), newer);
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(a_room.as_str()));
+        // Withdrawal also wins after an individual selection lock was held,
+        // at the synchronous Space commit boundary rather than just entry.
+        let held_room = live.selected_room.lock().await;
+        let authority = NavigationAuthority::default();
+        let committing = tokio::spawn({
+            let (live, selection, authority) = (live.clone(), selection.clone(), authority.clone());
+            async move {
+                live.commit_joined_space(&selection, "!new-space:example.org", newer, &authority).await
+            }
+        });
+        tokio::task::yield_now().await;
+        authority.withdraw();
+        drop(held_room);
+        assert!(committing.await.unwrap().is_none());
+        assert!(live.selected_space.lock().await.is_none());
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(a_room.as_str()));
+
         let authority = NavigationAuthority::default();
         let gate = SnapshotGate {
             authority: authority.clone(),
@@ -6687,41 +6895,81 @@ mod join_tests {
         assert!(!JoinError::Unavailable.may_have_joined());
     }
 
-    /// One join per account and typed room at a time, and an unknown
-    /// outcome survives the UI: the next join of that room reports it once
-    /// and sends nothing, so a resend is always the user's informed choice.
+    /// Unknown is not consumed by returning an error: Close/reopen or a
+    /// discarded error callback is not an informed choice to send again.
     #[test]
     fn one_join_per_room_and_an_unknown_one_is_never_resent_unseen() {
         let outcomes = JoinOutcomes::default();
         let key = ("a".to_owned(), "!room:example.org".to_owned());
         let other_account = ("b".to_owned(), "!room:example.org".to_owned());
-        assert_eq!(outcomes.begin(&key), Ok(()));
-        assert_eq!(outcomes.begin(&key), Err(JoinError::Pending));
-        assert_eq!(outcomes.begin(&other_account), Ok(()), "accounts are apart");
+        let first = outcomes.begin(&key, || true).unwrap();
+        assert_eq!(outcomes.begin(&key, || true), Err(JoinError::Pending));
+        outcomes.begin(&other_account, || true).expect("accounts are apart");
         // A definite answer forgets it.
-        outcomes.settle(&key, false);
+        outcomes.settle(&key, first, false);
         assert_eq!(outcomes.get(&key), None);
         // An unknown one is kept whatever the UI shows or hides since.
-        assert_eq!(outcomes.begin(&key), Ok(()));
-        outcomes.settle(&key, true);
+        let uncertain = outcomes.begin(&key, || true).unwrap();
+        outcomes.settle(&key, uncertain, true);
         assert_eq!(outcomes.get(&key), Some(JoinOutcome::Unknown));
-        let earlier = outcomes.begin(&key).unwrap_err();
-        assert_eq!(earlier, JoinError::EarlierUnknown);
-        assert!(earlier.to_string().contains("Nothing was sent"));
-        // Reported once: the next one is the user's choice.
-        assert_eq!(outcomes.begin(&key), Ok(()));
+        for _ in 0..3 {
+            let earlier = outcomes.begin(&key, || true).unwrap_err();
+            assert_eq!(earlier, JoinError::EarlierUnknown);
+            assert!(earlier.to_string().contains("Nothing was sent"));
+            assert!(earlier.to_string().contains("paused"));
+            assert_eq!(outcomes.get(&key), Some(JoinOutcome::Unknown));
+        }
         // A record dropped before its hand-off (a caller's bound) leaves
         // nothing behind: nothing was sent.
+        let unsent_key = ("a".to_owned(), "!unsent:example.org".to_owned());
+        let receipt = outcomes.begin(&unsent_key, || true).unwrap();
         let unsent = JoinCancellation::new();
-        drop(JoinRecord::new(&outcomes, key.clone(), unsent));
-        assert_eq!(outcomes.get(&key), None);
-        // Bounded: unknown outcomes give way, joins in flight do not.
-        for n in 0..MAX_JOIN_OUTCOMES {
-            let key = ("c".to_owned(), format!("!r{n}:example.org"));
-            outcomes.begin(&key).unwrap();
-            outcomes.settle(&key, true);
+        drop(JoinRecord::new(&outcomes, unsent_key.clone(), receipt, unsent));
+        assert_eq!(outcomes.get(&unsent_key), None);
+        // Bounded without evicting either uncertainty or in-flight work.
+        for n in 0..MAX_JOIN_OUTCOMES - 2 {
+            let another = ("c".to_owned(), format!("!r{n}:example.org"));
+            let receipt = outcomes.begin(&another, || true).unwrap();
+            outcomes.settle(&another, receipt, true);
         }
-        assert_eq!(outcomes.begin(&key), Ok(()));
+        assert_eq!(outcomes.outcomes().entries.len(), MAX_JOIN_OUTCOMES);
+        assert_eq!(outcomes.begin(&unsent_key, || true), Err(JoinError::UnresolvedLimit));
+        assert_eq!(outcomes.begin(&key, || true), Err(JoinError::EarlierUnknown));
+        assert_eq!(outcomes.get(&key), Some(JoinOutcome::Unknown));
         assert_eq!(outcomes.get(&other_account), Some(JoinOutcome::InFlight));
+    }
+
+    #[test]
+    fn account_removal_forgets_only_its_receipts_and_old_completions_cannot_reinsert() {
+        let outcomes = JoinOutcomes::default();
+        let a = ("a".to_owned(), "!room:example.org".to_owned());
+        let b = ("b".to_owned(), "!room:example.org".to_owned());
+        let old = outcomes.begin(&a, || true).unwrap();
+        let other = outcomes.begin(&b, || true).unwrap();
+        outcomes.settle(&b, other, true);
+        outcomes.forget_account("a");
+        outcomes.settle(&a, old, true);
+        assert_eq!(outcomes.get(&a), None, "a late result cannot recreate removed data");
+        assert_eq!(outcomes.begin(&a, || false), Err(JoinError::AccountChanged));
+        assert_eq!(outcomes.get(&a), None, "a revoked queued caller cannot insert after removal");
+        let renewed = outcomes.begin(&a, || true).unwrap();
+        assert_ne!(old, renewed);
+        outcomes.settle(&a, old, true);
+        assert_eq!(outcomes.get(&a), Some(JoinOutcome::InFlight));
+        drop(JoinRecord::new(&outcomes, a.clone(), old, JoinCancellation::new()));
+        assert_eq!(outcomes.get(&a), Some(JoinOutcome::InFlight));
+        outcomes.settle(&a, renewed, true);
+        assert_eq!(outcomes.get(&a), Some(JoinOutcome::Unknown));
+        assert_eq!(outcomes.get(&b), Some(JoinOutcome::Unknown), "other accounts are untouched");
+    }
+
+    #[test]
+    fn dropping_the_navigation_wait_withdraws_the_still_owned_open() {
+        let asked = JoinAsked::at(&crate::security::SecurityGate::default(), 3);
+        let waiting = JoinNavigationWait(asked.clone());
+        assert!(!asked.authority.withdrawn());
+        drop(waiting);
+        assert!(asked.authority.withdrawn());
+        assert!(asked.cancellation.is_cancelled());
     }
 }

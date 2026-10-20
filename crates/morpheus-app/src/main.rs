@@ -4098,6 +4098,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     live.voice_spaces.forget_account(&account_id).await;
                     live.forget_account_drafts(&account_id);
+                    live.forget_removed_account_joins(&account_id);
                     live.clear_feed().await;
                     live.account_detached(ui.clone()).await;
                     let _ = ui.upgrade_in_event_loop(move |ui| {

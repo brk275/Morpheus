@@ -375,6 +375,7 @@ fn statuses_decide_what_may_be_joined_or_opened() {
         (morpheus_matrix::JoinError::Unavailable, "Nothing was sent"),
         (morpheus_matrix::JoinError::Pending, "Nothing more was sent"),
         (morpheus_matrix::JoinError::EarlierUnknown, "may or may not have happened"),
+        (morpheus_matrix::JoinError::UnresolvedLimit, "Nothing was sent"),
         (morpheus_matrix::JoinError::UnexpectedRoom, "nothing was opened"),
     ] {
         let failure = target.failure(&MatrixCoreError::Join(error));
@@ -476,7 +477,7 @@ async fn a_departed_selection_neither_reads_nor_joins_after_a_b_a() {
         via_servers: vec!["example.org".into()],
     };
     let joined = live
-        .join_target_for(&departed, &target, Weak::default())
+        .join_target_for(&departed, &target, &live.join_asked(), Weak::default())
         .await;
     assert!(matches!(
         joined,

@@ -623,7 +623,10 @@ impl JoinTarget {
                 "A join of this room is still waiting for its reply. Nothing more was sent."
             }
             MatrixCoreError::Join(JoinError::EarlierUnknown) => {
-                "An earlier join of this room may or may not have happened. Check your room list; joining again sends it once more."
+                "An earlier join of this room may or may not have happened. Further joins of it are paused in this session. Check your room list. Nothing was sent."
+            }
+            MatrixCoreError::Join(JoinError::UnresolvedLimit) => {
+                "Other joins still need checking. Further joins are paused in this session. Nothing was sent."
             }
             // Never taken as this room: nothing opens.
             MatrixCoreError::Join(JoinError::UnexpectedRoom) => {

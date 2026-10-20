@@ -23,6 +23,8 @@
 //! account's client, under the manager's lock) is bounded and withdrawable.
 //! A typed room ID is joined exactly: a reply naming another room is never
 //! taken as that room.
+//! The join configuration limits the final POST; SDK metadata/cache setup
+//! before that POST has its own behavior and is not globally capped here.
 //!
 //! `disable_auth_refresh()` is root's SDK change d4c5d08, not in this base
 //! (c7d0e12): this module compiles only once combined with it.
@@ -81,10 +83,13 @@ pub enum JoinError {
     Cancelled,
     #[error("A join of this room is still waiting for its reply. Nothing more was sent.")]
     Pending,
+    #[error("Other joins still need checking. Further joins are paused in this session. Nothing was sent.")]
+    UnresolvedLimit,
     /// An earlier join of the same room for this account had no definite
-    /// reply; this one sent nothing, so the next one is the user's choice.
+    /// reply. Further joins of this key stay paused; a lost UI error must
+    /// never silently authorize resending it.
     #[error(
-        "An earlier join of this room may or may not have happened. Check your room list; joining again sends it once more. Nothing was sent."
+        "An earlier join of this room may or may not have happened. Further joins of it are paused in this session. Check your room list. Nothing was sent."
     )]
     EarlierUnknown,
     #[error("You are not allowed to join that room. Nothing was joined.")]
@@ -167,7 +172,7 @@ impl JoinCancellation {
 
     /// Wait until withdrawn. Registration precedes the state check, so a
     /// withdrawal cannot be missed while going to sleep.
-    async fn cancelled(&self) {
+    pub async fn cancelled(&self) {
         loop {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
