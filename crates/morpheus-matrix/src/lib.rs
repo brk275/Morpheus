@@ -50,6 +50,12 @@ pub use space_explorer::{
     MAX_SPACE_TOKEN_BYTES, MAX_SPACE_TOPIC_CHARS, SPACE_LEVEL_PAGE_LIMIT, SpaceLevelEntry,
     SpaceLevelError, SpaceLevelPage,
 };
+mod thread_browser;
+pub use thread_browser::{
+    MAX_CACHED_EXAMINED, MAX_CACHED_THREAD_ROOTS, MAX_THREAD_EXCERPT_CHARS,
+    MAX_THREAD_SENDER_CHARS, THREAD_PAGE_LIMIT, ThreadLatestReply, ThreadListError, ThreadRootKind,
+    ThreadRootPage, ThreadRootSummary,
+};
 mod history;
 pub use history::{FocusedView, HistoryReveal};
 mod search;

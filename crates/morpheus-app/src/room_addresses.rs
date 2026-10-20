@@ -649,6 +649,7 @@ fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, room_id: &str, name
         });
     });
     crate::matrix_links::clear(ui);
+    crate::thread_browser::clear(ui);
     let state = ui.global::<RoomAddresses>();
     state.set_room_name(label(name).into());
     state.set_open(true);

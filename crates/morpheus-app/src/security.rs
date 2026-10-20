@@ -432,11 +432,13 @@ pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool 
         return true;
     }
     if gate.0.load(Ordering::Acquire) == SECURITY_RESTART_PENDING {
+        crate::thread_browser::clear(ui);
         ui.set_page(1);
         ui.set_security_error("Wait for the application restart before changing accounts.".into());
         return true;
     }
     if gate.0.load(Ordering::Acquire) == SECURITY_BUSY {
+        crate::thread_browser::clear(ui);
         ui.set_page(1);
         ui.set_security_error(
             "Wait for the security operation to finish before changing accounts.".into(),
@@ -444,6 +446,7 @@ pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool 
         return true;
     }
     if gate.0.load(Ordering::Acquire) == SECURITY_KEY_PENDING {
+        crate::thread_browser::clear(ui);
         ui.set_page(1);
         ui.set_security_error(
             "Save and acknowledge the new recovery key before changing accounts.".into(),
@@ -477,6 +480,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                     "Wait for the account operation to finish before closing Morpheus.".into(),
                 );
             } else if close_gate.0.load(Ordering::Acquire) == SECURITY_BUSY {
+                crate::thread_browser::clear(&window);
                 window.set_page(1);
                 window.set_security_error(
                     "Recovery is still running. Keep Morpheus open until it finishes.".into(),

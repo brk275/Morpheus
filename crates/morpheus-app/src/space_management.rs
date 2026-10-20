@@ -824,6 +824,7 @@ fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, space_id: &str, nam
         });
     });
     crate::matrix_links::clear(ui);
+    crate::thread_browser::clear(ui);
     let state = ui.global::<SpaceRooms>();
     state.set_space_id(space_id.into());
     state.set_title(label(name).into());

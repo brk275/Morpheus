@@ -896,6 +896,7 @@ fn show(
         });
     });
     crate::matrix_links::clear(ui);
+    crate::thread_browser::clear(ui);
     ui.global::<SpaceExplorer>().set_open(true);
     step(ui, live, handle, Explorer::next_request);
 }

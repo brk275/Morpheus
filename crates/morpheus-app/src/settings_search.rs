@@ -255,6 +255,7 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
             );
             ui.set_account_menu_open(false);
             crate::matrix_links::clear(ui);
+            crate::thread_browser::clear(ui);
             ui.set_manage_accounts_open(true);
             // The same read-only refresh the account menu's entry runs.
             ui.invoke_manage_accounts();
@@ -274,6 +275,7 @@ pub(super) const METRIC_VALUE_REVEAL: &str = "appearance.metric_value";
 
 fn request_settings_reveal(ui: &AppWindow) {
     crate::matrix_links::clear(ui);
+    crate::thread_browser::clear(ui);
     ui.set_page(1);
     let serial = ui.get_settings_reveal_serial();
     ui.set_settings_reveal_serial(serial.checked_add(1).unwrap_or(1).max(1));

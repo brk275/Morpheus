@@ -574,8 +574,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
 /// Space explorer and Space rooms, room addresses, room notifications, Seen
 /// by, the quick switcher, room actions, room administration with its
 /// permissions and redaction, member actions, the capture picker, leaving a
-/// call, the image preview, polls). Each of their entries also withdraws
-/// the link synchronously first (clear). The session ending is the link
+/// call, the image preview, polls, the thread browser). Each of their
+/// entries also withdraws the link synchronously first (clear). The session ending is the link
 /// modal's own exception: its signed-out card may still show, while the
 /// follow-up's authority ends with the session it captured. Integration
 /// seam: root's modal guard registry, once there is one, replaces the list.
@@ -648,6 +648,9 @@ pub(crate) fn open(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, href: &s
     if surface_blocked(ui) {
         return true;
     }
+    // A card opens now: the thread browser (a modal that blocks links while
+    // it is open) ends first, with any page or retry it still holds.
+    crate::thread_browser::clear(ui);
     let operation = next_operation();
     let (shown, card) = match link {
         MessageLink::Unsupported { web: true } => {
@@ -1400,6 +1403,16 @@ pub(crate) mod tests {
         ui.set_live_session(live_session);
         ui.set_show_sign_in(sign_in);
         settle(ui).await;
+    }
+
+    /// A joined link's message still to come, installed the way finish_join
+    /// installs its follow-up authority (ended by the next clear and by any
+    /// surface up at its admission). The thread browser's phase-89 case
+    /// checks that the browser's own entry ends it.
+    pub(crate) fn install_follow_up() -> NavigationAuthority {
+        let authority = NavigationAuthority::default().blocked_by(surface_blocked);
+        FOLLOW_UP.with(|slot| *slot.borrow_mut() = Some(authority.clone()));
+        authority
     }
 
     /// A message link's confirmed join completing as the join's queued

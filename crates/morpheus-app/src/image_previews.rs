@@ -412,6 +412,7 @@ impl Opener {
         ui.set_image_preview_loading(true);
         publish_position(ui, event);
         crate::matrix_links::clear(ui);
+        crate::thread_browser::clear(ui);
         ui.set_image_preview_open(true);
         controller
             .state

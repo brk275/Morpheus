@@ -275,6 +275,7 @@ fn open(ui: &AppWindow, live: &LiveUi, prefill: &str) {
         .collect();
     ui.set_people_query(prefill.as_str().into());
     crate::matrix_links::clear(ui);
+    crate::thread_browser::clear(ui);
     ui.set_people_open(true);
     project(ui);
 }

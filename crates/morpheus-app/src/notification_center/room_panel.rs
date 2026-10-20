@@ -271,6 +271,7 @@ impl RoomPanel {
             apply_local(&global, &config, account_id, room_id);
         }
         crate::matrix_links::clear(&ui);
+        crate::thread_browser::clear(&ui);
         global.set_open(true);
         self.read(&ui, operation, selection, room_id.to_owned());
     }

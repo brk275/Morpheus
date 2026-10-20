@@ -188,6 +188,7 @@ impl AccountAccessUi {
             }
             crate::room_addresses::clear(&ui);
             crate::matrix_links::clear(&ui);
+            crate::thread_browser::clear(&ui);
             clear_passwords(&ui);
             ui.set_access_mode(mode);
             ui.set_access_target(label.into());
@@ -207,6 +208,7 @@ impl AccountAccessUi {
                 if pending {
                     crate::room_addresses::clear(&ui);
                     crate::matrix_links::clear(&ui);
+                    crate::thread_browser::clear(&ui);
                 }
                 ui.set_account_switch_pending(pending);
             }
@@ -218,6 +220,7 @@ impl AccountAccessUi {
                     if pending {
                         crate::room_addresses::clear(&ui);
                         crate::matrix_links::clear(&ui);
+                        crate::thread_browser::clear(&ui);
                     }
                     ui.set_account_switch_pending(pending);
                 }

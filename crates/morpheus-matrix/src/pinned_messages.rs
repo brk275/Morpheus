@@ -833,7 +833,7 @@ impl PinnedMessage {
     }
 }
 
-fn classify(id: &EventId, event: &TimelineEvent, encrypted: bool) -> PinnedMessage {
+pub(crate) fn classify(id: &EventId, event: &TimelineEvent, encrypted: bool) -> PinnedMessage {
     let raw = event.raw();
     if raw.json().get().len() > MAX_EVENT_BYTES {
         return PinnedMessage::placeholder(id.to_owned(), PinnedMessageKind::Unsupported);

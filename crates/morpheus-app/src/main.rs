@@ -63,6 +63,7 @@ mod startup_error;
 mod stickers;
 mod style_profiles;
 mod theme_studio;
+mod thread_browser;
 mod thread_history;
 // Instrumented release builds only (see build.rs); unit tests cover its pure checks.
 #[cfg(any(test, morpheus_timeline_acceptance))]
@@ -1539,6 +1540,7 @@ fn ask_to_leave_call(ui: &slint::Weak<AppWindow>, calls: &CallController, action
     }
     if let Some(ui) = ui.upgrade() {
         matrix_links::clear(&ui);
+        thread_browser::clear(&ui);
         ui.set_native_leave_unconfirmed(matches!(status, CallStatus::CleanupFailed { .. }));
         ui.set_pending_account_index(action);
         ui.set_leave_call_dialog(true);
@@ -2474,6 +2476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             space_management::clear(&ui);
             room_addresses::clear(&ui);
             matrix_links::clear(&ui);
+            thread_browser::clear(&ui);
         }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
@@ -2570,6 +2573,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !voice_live.is_live.load(Ordering::Acquire) {
             window.invoke_open_room(room_id);
             matrix_links::clear(&window);
+            thread_browser::clear(&window);
             window.set_page(2);
             return;
         }
@@ -2609,6 +2613,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
                         matrix_links::clear(&window);
+                        thread_browser::clear(&window);
                         window.set_page(2);
                         #[cfg(feature = "native-calls")]
                         if !calls.status().blocks_account_switch() {
@@ -2886,6 +2891,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     space_management::register(&ui, live.clone(), runtime.handle().clone());
     room_addresses::register(&ui, live.clone(), runtime.handle().clone());
     thread_history::register(&ui, live.clone(), runtime.handle().clone());
+    thread_browser::register(&ui, live.clone(), runtime.handle().clone());
     account_identity::register(&ui, live.clone(), runtime.handle().clone());
     people_directory::register(&ui, live.clone(), runtime.handle().clone());
 
@@ -3796,6 +3802,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(ui) = weak.upgrade() {
             matrix_links::clear(&ui);
+            thread_browser::clear(&ui);
             ui.set_login_error("".into());
             ui.set_show_sign_in(true);
         }

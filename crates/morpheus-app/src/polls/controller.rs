@@ -500,6 +500,7 @@ fn open_dialog(ui: &AppWindow, live: &Arc<LiveUi>) {
     global.set_dialog_answers(ModelRc::new(VecModel::from(rows)));
     publish_dialog(ui);
     crate::matrix_links::clear(ui);
+    crate::thread_browser::clear(ui);
     ui.set_poll_dialog_open(true);
 }
 
