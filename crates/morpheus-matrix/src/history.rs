@@ -428,6 +428,7 @@ pub(crate) mod tests {
             recovery_gate: Mutex::new(RecoveryGate::default()),
             recovery_ready: watch::channel(false).0,
             incoming_verification_tx: watch::channel(Vec::new()).0,
+            verification_book: Default::default(),
             notification_handler_registered: Mutex::new(false),
             token_task: Mutex::new(None),
         });

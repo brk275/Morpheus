@@ -3930,6 +3930,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_people_window_privacy(&ui).await;
     phase.set(72);
     assert_member_row_actions_fit(&ui).await;
+    phase.set(75);
+    assert_sas_values_leave_on_close_and_protection(&ui).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
@@ -8297,5 +8299,54 @@ async fn assert_member_row_actions_fit(ui: &AppWindow) {
     ui.set_show_side_panel(saved.3);
     ui.set_font_scale_percent(saved.4);
     ui.window().set_size(size);
+    settle(ui).await;
+}
+
+/// The SAS comparison values leave the real generated window the moment the
+/// verification view closes (leaving Settings) or protection starts (a
+/// security step, account access, a pending switch, sign-in), whatever the
+/// controller does later. Synthetic values only; no account is used.
+async fn assert_sas_values_leave_on_close_and_protection(ui: &AppWindow) {
+    let saved = (ui.get_page(), ui.get_live_session(), ui.get_show_sign_in());
+    let protections: [(&str, fn(&AppWindow, bool)); 4] = [
+        ("security step", |ui, on| ui.set_security_busy(on)),
+        ("account access", |ui, on| ui.set_access_open(on)),
+        ("pending switch", |ui, on| ui.set_account_switch_pending(on)),
+        ("sign-in", |ui, on| ui.set_show_sign_in(on)),
+    ];
+    let show_values = |ui: &AppWindow| {
+        ui.set_sas_stage(4);
+        ui.set_sas_emoji("synthetic emoji".into());
+        ui.set_sas_decimals("1111 \u{b7} 2222 \u{b7} 3333".into());
+        ui.set_sas_compared(true);
+    };
+    ui.set_live_session(true);
+    ui.set_show_sign_in(false);
+    ui.set_page(1);
+    settle(ui).await;
+    show_values(ui);
+    ui.set_page(0);
+    assert_eq!(ui.get_sas_emoji(), "", "leaving Settings clears the emoji");
+    assert_eq!(
+        ui.get_sas_decimals(),
+        "",
+        "leaving Settings clears the numbers"
+    );
+    assert!(!ui.get_sas_compared());
+    ui.set_page(1);
+    for (name, protect) in protections {
+        show_values(ui);
+        assert!(!ui.get_sas_protected(), "{name}: not protected before");
+        protect(ui, true);
+        assert!(ui.get_sas_protected(), "{name}: protected");
+        assert_eq!(ui.get_sas_emoji(), "", "{name} clears the emoji");
+        assert_eq!(ui.get_sas_decimals(), "", "{name} clears the numbers");
+        assert!(!ui.get_sas_compared(), "{name} clears the comparison");
+        protect(ui, false);
+    }
+    ui.set_sas_stage(0);
+    ui.set_page(saved.0);
+    ui.set_live_session(saved.1);
+    ui.set_show_sign_in(saved.2);
     settle(ui).await;
 }

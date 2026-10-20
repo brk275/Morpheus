@@ -353,6 +353,15 @@ export struct NavigationRoomItem {
     direct: bool,
 }
 
+// One incoming own-device verification request (src/verification.rs).
+// `flow-id` routes actions only; title and detail are plain, bounded text.
+export struct VerificationRequestItem {
+    flow-id: string,
+    title: string,
+    detail: string,
+    can-review: bool,
+}
+
 export struct MemberItem {
     user-id: string,
     name: string,
@@ -3960,9 +3969,28 @@ export component AppWindow inherits Window {
     in-out property <string> sas-error;
     in-out property <string> sas-notice;
     in-out property <int> sas-operation: 0;
-    in-out property <string> sas-incoming-flow-id;
-    in-out property <string> sas-incoming-user-id;
     in-out property <bool> sas-incoming-loading: false;
+    // Verification inbox: requests from this account's other devices.
+    in-out property <[VerificationRequestItem]> sas-inbox-items;
+    in-out property <int> sas-inbox-index: -1;
+    // What the bounded inbox does not show; empty when it shows all.
+    in-out property <string> sas-inbox-note;
+    // A request for verification of this device may have been sent without
+    // its ID coming back: no new one until the person acknowledges that.
+    in-out property <bool> sas-request-uncertain: false;
+    property <length> sas-inbox-row-h: max(44px, 30px * root.text-scale + 14px);
+    // While any of these holds, no SAS value stays in the window.
+    out property <bool> sas-protected: root.security-busy || root.access-open
+        || root.account-switch-pending || root.show-sign-in || !root.live-session
+        || root.security-recovery-key != "";
+    changed sas-protected => {
+        if root.sas-protected {
+            root.sas-emoji = "";
+            root.sas-decimals = "";
+            root.sas-compared = false;
+            root.verification-protected();
+        }
+    }
     // Settings › Security & recovery › Devices: device-sessions.slint, owned
     // by device_sessions.rs. Row keys only route requests to that controller.
     in-out property <DeviceSessionsView> device-sessions-view;
@@ -4495,7 +4523,11 @@ export component AppWindow inherits Window {
     // Leaving Settings ends the list and any sign-out step.
     callback device-sessions-left();
     callback refresh-incoming-verification();
-    callback accept-incoming-verification();
+    callback accept-incoming-verification(string);
+    callback decline-incoming-verification(string);
+    // The verification view closed or protection started: clear SAS values.
+    callback verification-protected();
+    callback request-own-verification-anyway();
     callback refresh-sas-verification();
     callback start-sas-verification();
     callback confirm-sas-verification();
@@ -4570,7 +4602,11 @@ export component AppWindow inherits Window {
             // Leaving Settings ends a recording, so shortcuts never stay paused.
             if root.shortcut-recording != "" { root.shortcut-cancel-recording(); }
             root.security-recovery-input = "";
+            // Leaving Settings closes the verification view: its values go now.
             root.sas-compared = false;
+            root.sas-emoji = "";
+            root.sas-decimals = "";
+            root.verification-protected();
             root.device-sessions-left();
             root.notification-highlight-error = "";
         }
@@ -9017,16 +9053,20 @@ export component AppWindow inherits Window {
                             if root.security-notice != "" : Text { text: root.security-notice; color: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                             Timer {
                                 interval: 3s;
-                                running: root.page == 1 && !root.sas-busy && (root.sas-stage == 1 || root.sas-stage == 3 || root.sas-stage == 5);
+                                running: root.page == 1 && !root.sas-protected && !root.sas-busy && (root.sas-stage == 1 || root.sas-stage == 3 || root.sas-stage == 5);
                                 triggered => { root.refresh-sas-verification(); }
                             }
                             Timer {
                                 interval: 3s;
-                                running: root.page == 1 && root.sas-stage == 0 && !root.sas-incoming-loading && !root.security-busy;
+                                running: root.page == 1 && !root.sas-protected && root.sas-stage == 0 && !root.sas-incoming-loading && !root.security-busy;
                                 triggered => { root.refresh-incoming-verification(); }
                             }
                             Rectangle {
-                                height: (root.sas-stage == 4 ? 380px : root.sas-stage == 0 ? (root.sas-incoming-flow-id == "" ? 160px : 222px) : 250px) * root.text-scale;
+                                height: root.sas-stage == 4 ? 380px * root.text-scale
+                                    : root.sas-stage == 0 ? 160px * root.text-scale + (root.sas-request-uncertain ? 96px * root.text-scale : 0px) + (root.sas-inbox-items.length == 0 ? 0px
+                                        : 76px * root.text-scale + min(4, root.sas-inbox-items.length) * root.sas-inbox-row-h
+                                            + (root.sas-inbox-note == "" ? 0px : 34px * root.text-scale))
+                                    : 250px * root.text-scale;
                                 border-radius: StyleTokens.radius * 1; background: root.elevated;
                                 VerticalLayout {
                                     padding: 14px; spacing: 7px;
@@ -9035,24 +9075,78 @@ export component AppWindow inherits Window {
                                         text: "Start here, then approve on another signed-in, verified device of this account. Compare the values on both devices before confirming.";
                                         color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                                     }
-                                    if root.sas-stage == 0 && root.sas-incoming-flow-id != "" : HorizontalLayout {
-                                        spacing: 8px;
+                                    // ---- Verification inbox (src/verification.rs) ----
+                                    // Requests from this account's other devices: select one, then
+                                    // review or decline it. Rows are plain text built in Rust.
+                                    if root.sas-stage == 0 && root.sas-inbox-items.length > 0 : VerticalLayout {
+                                        spacing: 6px;
                                         Text {
-                                            text: "Another device on this account requested verification.";
+                                            text: root.sas-inbox-items.length == 1 ? "1 request from another device of this account"
+                                                : root.sas-inbox-items.length + " requests from other devices of this account";
                                             color: root.accent; font-size: 11px * root.text-scale;
-                                            wrap: word-wrap; horizontal-stretch: 1;
-                                            accessible-live-region: polite;
+                                            wrap: word-wrap; accessible-live-region: polite;
+                                        }
+                                        if root.sas-inbox-note != "" : Text {
+                                            text: root.sas-inbox-note; color: root.muted;
+                                            font-size: 10px * root.text-scale; wrap: word-wrap;
+                                        }
+                                        sas-inbox-list := ListView {
+                                            height: min(4, root.sas-inbox-items.length) * root.sas-inbox-row-h;
+                                            horizontal-scrollbar-policy: always-off;
+                                            for item[index] in root.sas-inbox-items : ActionRect {
+                                                width: sas-inbox-list.visible-width; height: root.sas-inbox-row-h - 4px;
+                                                border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
+                                                background: index == root.sas-inbox-index ? root.hover : root.panel;
+                                                border-width: StyleTokens.line-width;
+                                                border-color: index == root.sas-inbox-index ? root.accent : root.divider;
+                                                focus-color: root.accent;
+                                                label: "Verification request from " + item.title + ". " + item.detail;
+                                                accessible-checkable: true; accessible-checked: index == root.sas-inbox-index;
+                                                enabled: !root.sas-busy;
+                                                activated => { root.sas-inbox-index = index; }
+                                                VerticalLayout {
+                                                    padding-left: 8px; padding-right: 8px; alignment: center; spacing: 2px;
+                                                    Text { text: item.title; color: root.ink; font-size: 11px * root.text-scale; font-weight: 700; overflow: elide; }
+                                                    Text { text: item.detail; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
+                                                }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px; alignment: start;
+                                            Button {
+                                                text: root.sas-busy ? "Working…" : "Review selected";
+                                                enabled: !root.sas-busy && !root.security-busy
+                                                    && root.sas-inbox-index >= 0 && root.sas-inbox-index < root.sas-inbox-items.length
+                                                    && root.sas-inbox-items[root.sas-inbox-index].can-review;
+                                                accessible-label: "Review the selected verification request";
+                                                clicked => { root.accept-incoming-verification(root.sas-inbox-items[root.sas-inbox-index].flow-id); }
+                                            }
+                                            Button {
+                                                text: "Decline";
+                                                enabled: !root.sas-busy
+                                                    && root.sas-inbox-index >= 0 && root.sas-inbox-index < root.sas-inbox-items.length;
+                                                accessible-label: "Decline the selected verification request";
+                                                clicked => { root.decline-incoming-verification(root.sas-inbox-items[root.sas-inbox-index].flow-id); }
+                                            }
+                                        }
+                                    }
+                                    // ---- end verification inbox ----
+                                    if root.sas-stage == 0 && root.sas-request-uncertain : VerticalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: "A verification request may already have reached your other devices. Check them first; send a new request only if none arrived.";
+                                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                                         }
                                         Button {
-                                            text: root.sas-busy ? "Accepting…" : "Review request";
-                                            enabled: !root.sas-busy && !root.security-busy;
-                                            accessible-label: "Accept incoming verification request from another device on this account";
-                                            clicked => { root.accept-incoming-verification(); }
+                                            text: root.sas-busy ? "Starting…" : "I checked; send a new request";
+                                            enabled: !root.sas-busy && !root.security-busy && root.security-recovery-key == "" && root.security-device-status == "Unverified";
+                                            accessible-label: "I checked my other devices; send a new verification request";
+                                            clicked => { root.request-own-verification-anyway(); }
                                         }
                                     }
                                     if root.sas-stage == 0 : Button {
                                         width: 178px; text: root.sas-busy ? "Starting…" : "Verify with another device";
-                                        enabled: !root.sas-busy && !root.security-busy && root.security-recovery-key == "" && root.security-device-status == "Unverified";
+                                        enabled: !root.sas-busy && !root.security-busy && !root.sas-request-uncertain && root.security-recovery-key == "" && root.security-device-status == "Unverified";
                                         accessible-label: "Request SAS verification from another device on this Matrix account";
                                         clicked => { root.request-own-verification(); }
                                     }
@@ -9063,6 +9157,7 @@ export component AppWindow inherits Window {
                                             : root.sas-stage == 2 ? "The other device accepted. Start the short authentication string comparison."
                                             : root.sas-stage == 3 ? "Waiting for the other device to accept the comparison. Keep both devices open."
                                             : root.sas-stage == 4 ? "Compare every shown emoji or all three numbers with the other device. Confirm only if they match exactly."
+                                            : root.sas-stage == 6 ? "The other device moved this verification to a method Morpheus does not support, such as a QR code. Cancel it here, then start again with emoji comparison."
                                             : "Your confirmation was sent. Waiting for the other device to finish.";
                                         color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
                                     }

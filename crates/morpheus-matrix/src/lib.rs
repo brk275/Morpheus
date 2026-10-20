@@ -133,6 +133,12 @@ pub use device_sessions::{
     RenameOutcome, SignOutBlocker, SignOutChallenge, SignOutMethod, SignOutStep,
     bounded_device_name,
 };
+mod own_verification;
+pub use own_verification::{
+    MAX_PENDING_VERIFICATIONS, MAX_VERIFICATION_DEVICE_NAME_CHARS, OwnVerification,
+    OwnVerificationError, OwnVerificationPhase, OwnVerificationRequest, OwnVerificationResult,
+    PendingOwnVerifications, VERIFICATION_REQUEST_LIFETIME, VerificationCancellation,
+};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -524,6 +530,10 @@ pub struct VerificationInfo {
     pub is_ready: bool,
     pub is_done: bool,
     pub is_cancelled: bool,
+    /// When the requesting device says it sent an incoming request (its own
+    /// clock, ms since the Unix epoch); `None` when not known.
+    #[serde(default)]
+    pub sent_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1039,6 +1049,11 @@ struct LoadedAccount {
     /// True once discovery for the current selection has finished.
     recovery_ready: watch::Sender<bool>,
     incoming_verification_tx: watch::Sender<Vec<VerificationInfo>>,
+    /// This loaded account's own-device verification bookkeeping (sent
+    /// flows, an in-flight request, overflow of the incoming record). It
+    /// belongs to this exact loaded account. A late completion can update
+    /// only its captured book, never a replacement loaded account's book.
+    verification_book: Arc<own_verification::VerificationBook>,
     token_task: Mutex<Option<SyncTask>>,
     notification_handler_registered: Mutex<bool>,
 }
@@ -3206,12 +3221,15 @@ impl LoadedAccount {
         profile_lock: Arc<fs::File>,
     ) -> Self {
         let (incoming_verification_tx, _) = watch::channel(Vec::<VerificationInfo>::new());
+        let verification_book = Arc::new(own_verification::VerificationBook::default());
         if let Some(own_user_id) = client.user_id().map(ToOwned::to_owned) {
             let incoming_tx = incoming_verification_tx.clone();
+            let book = verification_book.clone();
             client.add_event_handler(
                 move |event: ToDeviceKeyVerificationRequestEvent, client: Client| {
                     let own_user_id = own_user_id.clone();
                     let incoming_tx = incoming_tx.clone();
+                    let book = book.clone();
                     async move {
                         if event.sender != own_user_id {
                             return;
@@ -3223,16 +3241,17 @@ impl LoadedAccount {
                         else {
                             return;
                         };
-                        let info = verification_info(&request);
+                        let mut info = verification_info(&request);
                         if info.is_done || info.is_cancelled {
                             return;
                         }
+                        // The request's own timestamp, for a truthful age.
+                        info.sent_at_ms = Some(u64::from(event.content.timestamp.get()));
+                        // Bounded: the oldest recorded flows go first.
+                        // A dropped one is remembered for this loaded account.
                         incoming_tx.send_modify(|known| {
-                            if !known
-                                .iter()
-                                .any(|existing| existing.flow_id == info.flow_id)
-                            {
-                                known.push(info);
+                            if own_verification::record_incoming(known, info) {
+                                book.mark_incoming_overflow();
                             }
                         });
                     }
@@ -3291,6 +3310,7 @@ impl LoadedAccount {
             recovery_gate: Mutex::new(RecoveryGate::default()),
             recovery_ready: watch::channel(false).0,
             incoming_verification_tx,
+            verification_book,
             notification_handler_registered: Mutex::new(false),
             token_task: Mutex::new(Some(SyncTask {
                 shutdown: Some(shutdown),
@@ -4042,6 +4062,7 @@ fn verification_info(request: &VerificationRequest) -> VerificationInfo {
         is_ready: request.is_ready(),
         is_done: request.is_done(),
         is_cancelled: request.is_cancelled(),
+        sent_at_ms: None,
     }
 }
 
