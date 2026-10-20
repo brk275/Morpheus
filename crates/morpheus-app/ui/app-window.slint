@@ -2007,7 +2007,7 @@ component FontBrowser inherits VerticalLayout {
             text <=> root.query; single-line: true;
             color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
             accessible-label: "Search installed font families";
-            edited(text) => { root.query-edited(text); }
+            edited => { root.query-edited(self.text); }
         }
     }
     HorizontalLayout {
@@ -3635,9 +3635,6 @@ export component AppWindow inherits Window {
     // One bounded read of the active account's own profile for its switcher
     // label; Rust runs it when Manage accounts opens (see below).
     callback account-profile-label-refresh();
-    changed manage-accounts-open => {
-        if root.manage-accounts-open { root.account-profile-label-refresh(); }
-    }
     callback open-account-profile();
     callback close-account-profile();
     callback account-profile-name-edited();
@@ -4635,7 +4632,11 @@ export component AppWindow inherits Window {
         if !root.access-open { root.return-account-focus(); }
     }
     changed manage-accounts-open => {
-        if !root.manage-accounts-open { root.return-account-focus(); }
+        if root.manage-accounts-open {
+            root.account-profile-label-refresh();
+        } else {
+            root.return-account-focus();
+        }
     }
     // A completed final-account removal may refresh the saved rows after its
     // dialog closes. Do not leave focus on the now-removed sign-in shortcut.
