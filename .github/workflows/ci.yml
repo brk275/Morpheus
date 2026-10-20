@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - 128e997 - ${{ inputs.platform }}
+run-name: Reviewed native candidate - 9dd17a0 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-128e997-${{ github.ref }}
+  group: beta-native-9dd17a0-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -31,7 +31,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 128e997f865861d3fc7cdfbe3172094635241fb1
+          ref: 9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = 128e997f865861d3fc7cdfbe3172094635241fb1
+          test "$(git -C candidate rev-parse HEAD)" = 9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -78,7 +78,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 128e997f865861d3fc7cdfbe3172094635241fb1
+          ref: 9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -317,7 +317,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='128e997f865861d3fc7cdfbe3172094635241fb1'
+          source='9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -658,7 +658,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='128e997f865861d3fc7cdfbe3172094635241fb1'
+          source='9dd17a0f0b2aca7a5323ac829d9fd42564edc7ef'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -814,6 +814,14 @@ jobs:
               for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
                   known_test_ids.add(prefix+function)
           needed_app={
+              'verification::tests::confirmation_requires_explicit_human_comparison',
+              'verification::tests::verification_acts_only_on_the_unprotected_settings_page',
+              'verification::tests::expiry_comes_from_the_request_and_is_never_restarted',
+              'verification::tests::a_forgotten_flow_is_unconfirmed_and_another_method_is_unsupported',
+              'space_management::tests::form_clear_and_replacement_cancel_only_the_owned_space_write',
+              'space_management::tests::receipt_saturation_refuses_new_mutations_without_eviction_or_empty_scopes',
+              'room_media_browser::tests::failed_or_discarded_loads_cannot_bypass_the_event_budget',
+              'room_media_browser::tests::partial_and_unreadable_coverage_survives_later_pages',
               'people_directory::tests::a_busy_creation_refuses_every_new_step_so_its_completion_still_applies',
               'people_directory::tests::an_exact_id_is_offered_first_and_never_twice',
               'people_directory::tests::a_created_room_is_never_reported_failed_for_its_listing',
@@ -840,6 +848,24 @@ jobs:
               'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
           }
           needed_matrix={
+              'own_verification::tests::requests_are_reserved_per_loaded_account_and_settled_truthfully',
+              'own_verification::tests::late_completions_and_overflow_stay_with_their_loaded_account',
+              'own_verification::tests::steps_are_fenced_before_hand_off_and_unknown_after',
+              'own_verification::tests::recorded_flows_and_listings_are_bounded_with_truthful_counts',
+              'room_activity::tests::a_typing_start_waiting_for_the_account_lock_expires_at_its_idle_deadline',
+              'member_privacy::tests::the_strict_reader_fails_closed_on_any_duplicate_key',
+              'member_privacy::tests::a_change_copies_untouched_raw_json_byte_for_byte',
+              'member_privacy::tests::a_change_whose_admission_ends_before_the_write_sends_nothing',
+              'moderation::tests::every_action_is_one_bounded_request_and_a_level_change_keeps_other_bytes',
+              'moderation::tests::a_held_account_lock_ends_with_the_cancellation_or_the_selection',
+              'moderation::tests::after_the_hand_off_a_stop_or_failure_is_unknown_and_a_changed_baseline_sends_nothing',
+              'space_management::tests::a_closed_space_form_withdraws_the_actual_manager_wait',
+              'space_management::tests::the_production_dispatch_rechecks_held_preflight_authority_and_keeps_unknown_after_start',
+              'space_management::tests::unknown_fields_survive_byte_for_byte_including_big_and_decimal_numbers',
+              'room_media_browser::tests::an_overlong_page_stops_at_the_gap_even_if_the_server_reports_the_start',
+              'room_media_browser::tests::a_final_one_event_budget_is_sent_as_one_and_zero_sends_nothing',
+              'room_media_browser::tests::page_admission_rechecks_joined_membership_after_the_previous_wait',
+              'room_media_browser::tests::an_unknown_token_never_refreshes_or_replays_the_history_page',
               'people_directory::tests::cancelled_or_revoked_people_lookup_releases_a_held_manager_wait',
               'people_directory::tests::ended_application_admission_refuses_before_request_work_is_polled',
               'people_directory::tests::queries_and_exact_ids_are_bounded',
