@@ -647,6 +647,7 @@ fn read(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, reset_name: bool) 
                         editor.server = Some(profile);
                         editor.name_uncertain = false;
                     });
+                    publish_remove_flag(&ui);
                     if with(|editor| matches!(editor.avatar, AvatarDraft::Keep)) {
                         show_image(&ui, preview.as_ref());
                     }
@@ -791,6 +792,18 @@ fn can_remove_name(server: Option<&OwnProfile>, name_uncertain: bool) -> bool {
 /// name field itself ended Unknown; any other outcome keeps the previous.
 fn name_uncertain_after(name: Option<FieldOutcome>, previous: bool) -> bool {
     previous || name == Some(FieldOutcome::Unknown)
+}
+
+/// Whether the editor offers Remove display name now.
+fn remove_offered(editor: &Editor) -> bool {
+    can_remove_name(editor.server.as_ref(), editor.name_uncertain)
+}
+
+/// Publish the Remove flag from the editor's state (server copy plus name
+/// uncertainty), after every read and save outcome.
+fn publish_remove_flag(ui: &AppWindow) {
+    let offered = with(|editor| remove_offered(editor));
+    ui.set_account_profile_server_has_name(offered);
 }
 
 fn show_dirty(ui: &AppWindow) {
@@ -1172,6 +1185,10 @@ fn finish_save(
         // the held name uncertain; an avatar outcome never touches it.
         with(|editor| editor.name_uncertain = name_uncertain_after(name, editor.name_uncertain));
     }
+    // Whatever the outcome, Remove follows the editor's own state: an
+    // uncertain name keeps Remove reachable even when the last known name
+    // was absent.
+    publish_remove_flag(ui);
     // A failed, unknown or unsent avatar change stays drafted for a retry.
     if avatar == Some(FieldOutcome::Saved) {
         ui.set_account_profile_avatar_state(0);
@@ -1517,6 +1534,28 @@ mod tests {
         assert_eq!(name_change("", Some(&raw(None)), false), Ok(None));
         // And an uncertain name with an empty field sends nothing either.
         assert_eq!(name_change("", Some(&raw(Some("Synthetic"))), true), Ok(None));
+    }
+
+    #[test]
+    fn an_uncertain_name_keeps_remove_offered_after_an_absent_name() {
+        // Last read: no name. A name send then ended Unknown with no
+        // read-back: Remove must be offered from the editor's own state.
+        let editor = Editor {
+            server: Some(raw(None)),
+            name_uncertain: true,
+            ..Editor::default()
+        };
+        assert!(remove_offered(&editor));
+        let certain = Editor {
+            server: Some(raw(None)),
+            ..Editor::default()
+        };
+        assert!(!remove_offered(&certain));
+        let named = Editor {
+            server: Some(raw(Some("   "))),
+            ..Editor::default()
+        };
+        assert!(remove_offered(&named));
     }
 
     #[test]
