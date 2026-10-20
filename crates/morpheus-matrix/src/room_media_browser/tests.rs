@@ -157,7 +157,7 @@ fn hostile_names_and_types_become_bounded_plain_text() {
         );
         assert_eq!(file.mime_type, expected);
     }
-    let huge = "x/".to_owned() + &"y".repeat(MAX_MEDIA_TYPE_CHARS);
+    let huge = format!("x/{}", "y".repeat(MAX_MEDIA_TYPE_CHARS));
     assert_eq!(media_type(&huge), "");
 }
 

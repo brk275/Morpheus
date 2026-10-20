@@ -3882,6 +3882,7 @@ async fn assert_room_addresses_bounded_close_and_context(
     runtime: &Handle,
 ) {
     use crate::{RoomAddressEntry, RoomAddresses};
+    use slint::SharedString;
     crate::room_addresses::register(ui, live, runtime.clone());
     let old_page = ui.get_page();
     let old_live = ui.get_live_session();
@@ -6786,6 +6787,7 @@ async fn assert_pane_navigation_epoch(
 /// progress refuses a load; the reset and Close clear every row at once;
 /// View and Save act on a listed row only. No account, network or vault.
 async fn assert_room_media_scope_and_privacy(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    use crate::RoomMedia;
     use crate::room_media_browser::{HeldLoader, RoomMediaBrowser};
     use morpheus_matrix::{RoomMediaItem, RoomMediaKind, RoomMediaPage};
     use slint::private_unstable_api::re_exports::{AccessibilityAction, Flickable};
@@ -8628,7 +8630,9 @@ async fn assert_sas_values_leave_on_close_and_protection(ui: &AppWindow) {
 /// Actual generated join controls and the production withdrawal handlers,
 /// with held operation metadata only: no account/client or HTTP is used.
 async fn assert_discovery_join_withdrawal(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    use crate::{JoinSlot, register_join_cancellation};
     use slint::private_unstable_api::re_exports::{AccessibilityAction, AccessibleStringProperty};
+    use std::rc::Rc;
     let saved = (
         ui.get_page(),
         ui.get_live_session(),
