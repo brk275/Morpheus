@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed beta catch-up - 485e0d2 - ${{ inputs.platform }}
+run-name: Reviewed beta catch-up - 931b7b9 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -12,15 +12,15 @@ on:
         default: all
         options: [all, macos-arm64, macos-intel, windows, linux, remaining-native]
       checks:
-        description: Full checks, or only repaired Linux test suites
+        description: Full checks, repaired Linux suites, or the affected account UI scenario
         type: choice
         required: true
         default: full
-        options: [full, failed-linux]
+        options: [full, failed-linux, account-ui, product-linux]
 permissions:
   contents: read
 concurrency:
-  group: beta-native-485e0d2-${{ github.ref }}
+  group: beta-native-931b7b9-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -37,7 +37,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 485e0d24167a3837ab4818b76c005f2473e7cb95
+          ref: 931b7b9b6c3fb88956506e22be239583a3419e1b
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -50,7 +50,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = 485e0d24167a3837ab4818b76c005f2473e7cb95
+          test "$(git -C candidate rev-parse HEAD)" = 931b7b9b6c3fb88956506e22be239583a3419e1b
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -85,7 +85,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 485e0d24167a3837ab4818b76c005f2473e7cb95
+          ref: 931b7b9b6c3fb88956506e22be239583a3419e1b
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -324,7 +324,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='485e0d24167a3837ab4818b76c005f2473e7cb95'
+          source='931b7b9b6c3fb88956506e22be239583a3419e1b'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -665,7 +665,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='485e0d24167a3837ab4818b76c005f2473e7cb95'
+          source='931b7b9b6c3fb88956506e22be239583a3419e1b'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -974,13 +974,26 @@ jobs:
           # successful production/RTC/config/SDK evidence on Linux, and reruns only
           # the two failed suites plus formatting. Other native platforms stay full.
           scope=os.environ.get('MORPHEUS_CHECK_SCOPE','full')
-          if scope not in ('full','failed-linux'):
+          if scope not in ('full','failed-linux','account-ui','product-linux'):
               raise SystemExit('unknown_check_scope')
           if scope=='failed-linux':
               if os.environ.get('RUNNER_OS')!='Linux':
                   raise SystemExit('failed_linux_requires_linux')
               checks=[check for check in checks if check[0] in
                   {'format','app_unit_controller','matrix_unit'}]
+          if scope=='account-ui':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('account_ui_requires_linux')
+              ui_test='account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'
+              checks=[check for check in checks if check[0]=='format']+[
+                  ('account_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                      '--bin','morpheus-app',ui_test,'--','--exact','--test-threads=1'],
+                      40*60,{ui_test},set())]
+          if scope=='product-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('product_linux_requires_linux')
+              checks=[check for check in checks if check[0] in
+                  {'format','native_app_build','app_unit_controller','matrix_unit'}]
           # All four platform scopes use this exact stable reviewed candidate.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
@@ -1155,6 +1168,9 @@ jobs:
                   missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
                   record['failure_diagnostics']={
                       'ui_timeout_phases':[int(phase) for phase in re.findall(r'morpheus-ui-timeout-phase=([0-9]{1,3})', output)[:8]],
+                  'ui_phase_timings':[{'phase':int(phase),'elapsed_ms':int(elapsed),'phase_ms':int(duration)}
+                      for phase,elapsed,duration in re.findall(
+                          r'MORPHEUS_UI_PHASE phase=([0-9]{1,3}) elapsed_ms=([0-9]{1,7}) phase_ms=([0-9]{1,7})',output)[:64]],
                       'transfer_focus_state':[{'page':int(page),'panel':panel=='true','tab':int(tab),'pending':pending=='true','headings':int(headings)}
                           for page,panel,tab,pending,headings in re.findall(r'MORPHEUS_TRANSFER_FOCUS_STATE page=([0-9]{1,2}) panel=(true|false) tab=([0-9]{1,2}) pending=(true|false) headings=([0-9]{1,3})',output)[:8]],
                       'ui_settings_target_failures':[{'stage':int(stage),'index':int(index),'live':live=='true'}
