@@ -76,7 +76,15 @@ what the SDK evaluates before an event reaches Morpheus. A change is shown as
 saved only after the homeserver accepts it, and is applied to local delivery at
 once, until sync brings the updated rules to the SDK (at most two minutes);
 from then on the SDK's push actions decide, so keyword matches in a room set to
-mentions and keywords notify. Saving a default updates the rooms that follow it
+mentions and keywords notify. A change the homeserver did not confirm may have
+reached it in part: one change can be several rules (a default level is one
+for encrypted and one for unencrypted rooms), and the first can land before a
+later one fails or times out. Morpheus then says the change was not confirmed
+and that part of it may have reached the homeserver, never that nothing
+changed or that it was rolled back, keeps the controls available, and reads
+the levels, defaults and keywords again once sync brings the homeserver's rules
+(waiting at most a minute), because this device's copy of the rules is
+authoritative only after sync. Saving a default updates the rooms that follow it
 without clearing the search or a room change still waiting for the homeserver.
 The list shows at most 100 matching rooms at a time and reads at most 2,000
 rooms, the first ones by name. Reopening the section, or showing another
@@ -109,8 +117,9 @@ Matrix push rule, so it applies on all of the account's devices. Choosing the
 account default removes only that room's own rules; every other rule, the
 account defaults and the keywords stay. One change runs at a time, for exactly
 the account and room shown when it was chosen. It is shown as saved only after
-the homeserver accepts it; a change it did not confirm is reported as such
-with a reread offered, never as undone. A change sent before the panel closed
+the homeserver accepts it; a change it did not confirm is reported as possibly
+partly applied, never as undone or unchanged, the levels stay available, and
+the level is read again once sync brings the rules. A change sent before the panel closed
 still completes, and the Settings list, the bell and local delivery follow the
 accepted rule.
 

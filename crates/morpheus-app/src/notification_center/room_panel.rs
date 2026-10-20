@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex, MutexGuard, atomic::Ordering};
 
 use morpheus_config::{Config, ConfigStore, MAX_ROOM_NOTIFICATION_OVERRIDES, RoomNotificationLocal};
 use morpheus_matrix::{
-    AccountSelection, MatrixCoreError, NotificationDefaults, NotificationMode, RoomNotificationRule,
+    AccountSelection, MatrixCoreError, NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT,
+    RoomNotificationRule,
 };
 use slint::{ComponentHandle, Weak};
 use tokio::runtime::Handle;
@@ -31,8 +32,11 @@ const MAX_NAME_CHARS: usize = 80;
 
 const READ_FAILED: &str = "This room's level could not be read. Read it again, or try later.";
 const NOT_JOINED: &str = "This room is no longer joined on this account.";
-const NOT_CONFIRMED: &str =
-    "The homeserver did not confirm the change. Read the level again to see what applies.";
+// A change the homeserver did not confirm may have reached it in part; the
+// panel says so, keeps its levels available and reads them again once sync
+// brings the homeserver's rules.
+const NOT_CONFIRMED: &str = "The homeserver did not confirm the whole change; part of it may have reached it. The level shown updates when sync brings its rules.";
+const SYNCED: &str = "Read again: the level shown is the one sync brought most recently.";
 const LOCAL_FULL: &str =
     "Up to 256 rooms per account can have their own device settings; clear another room first.";
 const LOCAL_FAILED: &str =
@@ -336,7 +340,9 @@ impl RoomPanel {
             return;
         };
         let global = ui.global::<RoomNotificationState>();
-        if global.get_loading() || !global.get_error().is_empty() {
+        // An unconfirmed change keeps the levels available; a level that
+        // could not be read does not offer them (no rule is known).
+        if global.get_loading() {
             return;
         }
         let operation = {
@@ -377,7 +383,7 @@ impl RoomPanel {
     }
 
     fn finish_choice(
-        &self,
+        self: &Arc<Self>,
         ui: &AppWindow,
         operation: u64,
         selection: &AccountSelection,
@@ -421,8 +427,36 @@ impl RoomPanel {
                 self.show_rule(&global, rule);
             }
             Err(MatrixCoreError::RoomNotFound(_)) => global.set_error(NOT_JOINED.into()),
-            Err(_) => global.set_error(NOT_CONFIRMED.into()),
+            Err(_) => {
+                global.set_error(NOT_CONFIRMED.into());
+                self.resync(operation, selection.clone());
+            }
         }
+    }
+
+    /// After a change the homeserver did not confirm, wait (bounded) for
+    /// sync to bring its rules, then read the room's level again for the same
+    /// opening, so the panel shows what the homeserver holds. Nothing is sent.
+    fn resync(self: &Arc<Self>, operation: u64, selection: AccountSelection) {
+        let panel = self.clone();
+        self.runtime.spawn(async move {
+            let synced = panel
+                .live
+                .manager
+                .wait_for_push_rules_sync_selected(&selection, PUSH_RULE_SYNC_WAIT)
+                .await;
+            if synced.is_err() {
+                return;
+            }
+            let weak = panel.ui.clone();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if panel.owns(&ui, operation, &selection) {
+                    let room_id = panel.state().room_id.clone();
+                    panel.read(&ui, operation, selection, room_id);
+                    ui.global::<RoomNotificationState>().set_notice(SYNCED.into());
+                }
+            });
+        });
     }
 
     /// Save one device switch for the room shown, through the same
@@ -643,9 +677,10 @@ mod tests {
 
     #[test]
     fn failure_wording_is_fixed_and_never_claims_an_undo() {
-        for message in [READ_FAILED, NOT_JOINED, NOT_CONFIRMED, LOCAL_FULL, LOCAL_FAILED] {
+        for message in [READ_FAILED, NOT_JOINED, NOT_CONFIRMED, SYNCED, LOCAL_FULL, LOCAL_FAILED] {
             let lower = message.to_lowercase();
-            for claim in ["undone", "reverted", "rolled back", "cancelled"] {
+            let claims = ["undone", "reverted", "rolled back", "cancelled", "unchanged", "keeps"];
+            for claim in claims {
                 assert!(!lower.contains(claim), "{message}");
             }
             assert!(!message.contains('!') && !message.contains('@'), "{message}");

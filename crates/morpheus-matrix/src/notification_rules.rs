@@ -21,6 +21,9 @@ use super::*;
 
 /// Bound on one push-rule or receipt round trip.
 const RULE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest wait for sync to bring the push rules again after a change the
+/// homeserver did not confirm.
+pub const PUSH_RULE_SYNC_WAIT: Duration = Duration::from_secs(60);
 /// Upper bound on rooms described by one listing.
 pub const MAX_NOTIFICATION_ROOMS: usize = 2_000;
 /// Matrix keyword rules Morpheus adds at most, and their length in characters.
@@ -28,8 +31,9 @@ pub const MAX_NOTIFICATION_KEYWORDS: usize = 32;
 pub const MAX_NOTIFICATION_KEYWORD_CHARS: usize = 64;
 
 /// Fixed wording for a push-rule or receipt request the homeserver refused or
-/// that failed on the way. The SDK error, which can carry server text, is
-/// never passed on.
+/// that failed on the way. It never claims nothing changed: a multi-rule
+/// change can reach the homeserver in part. The SDK error, which can carry
+/// server text, is never passed on.
 fn refused<E>(what: &'static str) -> impl FnOnce(E) -> MatrixCoreError {
     move |_| MatrixCoreError::Sdk(what.into())
 }
@@ -243,15 +247,42 @@ impl AccountManager {
                 Some(mode) => settings
                     .set_room_notification_mode(room.room_id(), mode.into())
                     .await
-                    .map_err(refused("the room notification level was not changed"))?,
+                    .map_err(refused("the room notification level was not confirmed"))?,
                 None => settings
                     .delete_user_defined_room_rules(room.room_id())
                     .await
-                    .map_err(refused("the room notification level was not reset"))?,
+                    .map_err(refused("resetting the room notification level was not confirmed"))?,
             }
             Ok(describe_room(&settings, &room).await)
         })
         .await
+    }
+
+    /// Wait, at most `bound`, for sync to bring the selected account's push
+    /// rules again. After a change the homeserver did not confirm, part of
+    /// it may have reached it; the SDK's copy of the rules says so only once
+    /// sync delivers them, so a read after this shows what the homeserver
+    /// holds. Returns whether an update arrived; nothing is sent.
+    pub async fn wait_for_push_rules_sync_selected(
+        &self,
+        selection: &AccountSelection,
+        bound: Duration,
+    ) -> Result<bool> {
+        let client = self.rule_client(selection).await?;
+        // Its event handler lives as long as `settings`.
+        let settings = client.notification_settings().await;
+        let mut changes = settings.subscribe_to_changes();
+        let waited = selection
+            .guard(tokio::time::timeout(bound, changes.recv()))
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        if !self.owns_rule_selection(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(matches!(
+            waited,
+            Ok(Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)))
+        ))
     }
 
     /// The account's default levels for group rooms and two-person rooms.
@@ -293,7 +324,7 @@ impl AccountManager {
                         mode.into(),
                     )
                     .await
-                    .map_err(refused("the default notification level was not changed"))?;
+                    .map_err(refused("the default notification level was not confirmed"))?;
             }
             Ok(read_defaults(&settings).await)
         })
@@ -340,7 +371,7 @@ impl AccountManager {
             settings
                 .add_keyword(keyword)
                 .await
-                .map_err(refused("the notification keyword was not added"))?;
+                .map_err(refused("adding the notification keyword was not confirmed"))?;
             Ok(sorted_keywords(&settings).await)
         })
         .await
@@ -359,7 +390,7 @@ impl AccountManager {
             settings
                 .remove_keyword(&keyword)
                 .await
-                .map_err(refused("the notification keyword was not removed"))?;
+                .map_err(refused("removing the notification keyword was not confirmed"))?;
             Ok(sorted_keywords(&settings).await)
         })
         .await
@@ -380,7 +411,7 @@ impl AccountManager {
             timeline
                 .mark_as_read(ReceiptType::ReadPrivate)
                 .await
-                .map_err(refused("the read marker was not sent"))
+                .map_err(refused("the read marker was not confirmed"))
         })
         .await
     }
@@ -398,7 +429,7 @@ impl AccountManager {
             timeline
                 .mark_as_read(ReceiptType::ReadPrivate)
                 .await
-                .map_err(refused("the read marker was not sent"))
+                .map_err(refused("the read marker was not confirmed"))
         })
         .await
     }
@@ -523,12 +554,24 @@ mod tests {
 
     #[test]
     fn refused_requests_report_fixed_wording_without_server_text() {
-        let error = refused::<String>("the room notification level was not changed")(
+        let error = refused::<String>("the room notification level was not confirmed")(
             "M_FORBIDDEN https://server.example/secret?token=abc".to_owned(),
         );
         let shown = error.to_string();
-        assert!(shown.contains("the room notification level was not changed"));
+        assert!(shown.contains("the room notification level was not confirmed"));
         assert!(!shown.contains("M_FORBIDDEN") && !shown.contains("token"));
+        // A multi-rule change can land in part: no wording claims it did not.
+        let production = include_str!("notification_rules.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for claim in [
+            concat!("was not ", "changed"),
+            concat!("was not ", "reset"),
+            concat!("rolled ", "back"),
+        ] {
+            assert!(!production.contains(claim), "{claim}");
+        }
     }
 
     #[test]

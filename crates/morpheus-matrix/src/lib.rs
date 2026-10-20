@@ -88,7 +88,8 @@ pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
 pub use notification_rules::{
     MAX_NOTIFICATION_KEYWORDS, MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_ROOMS,
-    NotificationDefaults, NotificationMode, RoomNotificationRule, RoomUnreadCounts,
+    NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT, RoomNotificationRule,
+    RoomUnreadCounts,
 };
 pub use room_tags::{
     ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, TagKnowledge,

@@ -16,7 +16,7 @@ use std::{
 use morpheus_config::{AccountOverrides, Config, ConfigStore};
 use morpheus_matrix::{
     AccountSelection, MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_KEYWORDS, MatrixCoreError,
-    NotificationDefaults, NotificationMode, RoomNotificationRule,
+    NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT, RoomNotificationRule,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
 use tokio::runtime::Handle;
@@ -28,6 +28,15 @@ use crate::{
 
 /// Rows listed at once; a search narrows the rest.
 const MAX_LISTED: usize = 100;
+
+// A change the homeserver did not confirm may have reached it in part (a
+// default level is two rules, for encrypted and unencrypted rooms), so none
+// of these says it is unchanged. The list is read again once sync brings the
+// homeserver's rules, and the controls stay available.
+const ROOM_UNCONFIRMED: &str = "The homeserver did not confirm the whole change; part of it may have reached it. The level shown updates when sync brings its rules.";
+const DEFAULT_UNCONFIRMED: &str = "The homeserver did not confirm the whole default level; part of it may have reached it. The levels shown update when sync brings its rules.";
+const KEYWORD_ADD_UNCONFIRMED: &str = "The homeserver did not confirm the keyword; it may still have been added and shows here once sync brings it.";
+const KEYWORD_REMOVE_UNCONFIRMED: &str = "The homeserver did not confirm removing the keyword; it may still have been removed and goes from here once sync brings it.";
 const MAX_QUERY_CHARS: usize = 128;
 const MAX_NAME_CHARS: usize = 80;
 
@@ -376,7 +385,7 @@ impl Rules {
     }
 
     fn finish_room_mode(
-        &self,
+        self: &Arc<Self>,
         ui: &AppWindow,
         operation: u64,
         selection: &AccountSelection,
@@ -408,10 +417,11 @@ impl Rules {
                 global.set_error("That room is no longer joined.".into());
             }
             Err(_) => {
-                global.set_error(
-                    "The homeserver did not confirm the change; the room keeps its shown level."
-                        .into(),
-                );
+                global.set_error(ROOM_UNCONFIRMED.into());
+                update_row(&global, row);
+                drop(state);
+                self.resync(operation, selection.clone());
+                return;
             }
         }
         update_row(&global, row);
@@ -496,10 +506,10 @@ impl Rules {
                         apply_defaults(&global, defaults);
                         global.set_notice("Default level saved.".into());
                     }
-                    Err(_) => global.set_error(
-                        "The homeserver did not confirm the default level; it is unchanged here."
-                            .into(),
-                    ),
+                    Err(_) => {
+                        global.set_error(DEFAULT_UNCONFIRMED.into());
+                        rules.resync(operation, selection.clone());
+                    }
                 }
             });
         });
@@ -536,6 +546,47 @@ impl Rules {
                     update_row(&global, &state.rows[index]);
                 }
             });
+        });
+    }
+}
+
+impl Rules {
+    /// After a change the homeserver did not confirm, wait (bounded) for sync
+    /// to bring its rules, then read the levels, defaults and keywords again
+    /// for the same view, so what is shown is what the homeserver holds
+    /// rather than this device's copy. Nothing is sent.
+    fn resync(self: &Arc<Self>, operation: u64, selection: AccountSelection) {
+        let rules = self.clone();
+        self.runtime.spawn(async move {
+            let manager = rules.live.manager.clone();
+            if manager
+                .wait_for_push_rules_sync_selected(&selection, PUSH_RULE_SYNC_WAIT)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let (defaults, keywords) = tokio::join!(
+                manager.notification_defaults_selected(&selection),
+                manager.notification_keywords_selected(&selection),
+            );
+            let weak = rules.ui.clone();
+            let shown = rules.clone();
+            let shown_selection = selection.clone();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if !shown.owns(&ui, operation, &shown_selection) {
+                    return;
+                }
+                let global = ui.global::<NotificationRulesState>();
+                if let Ok(defaults) = defaults {
+                    apply_defaults(&global, defaults);
+                }
+                if let Ok(keywords) = keywords {
+                    shown.state().keywords = keywords;
+                    publish_keywords(&global, &shown.state().keywords);
+                }
+            });
+            rules.reload_levels(operation, selection);
         });
     }
 }
@@ -685,14 +736,17 @@ impl Rules {
                         };
                         global.set_notice(notice.into());
                     }
-                    Err(_) => global.set_keyword_error(
-                        if add {
-                            "The homeserver did not confirm the keyword; it was not added."
-                        } else {
-                            "The homeserver did not confirm removing the keyword."
-                        }
-                        .into(),
-                    ),
+                    Err(_) => {
+                        global.set_keyword_error(
+                            if add {
+                                KEYWORD_ADD_UNCONFIRMED
+                            } else {
+                                KEYWORD_REMOVE_UNCONFIRMED
+                            }
+                            .into(),
+                        );
+                        rules.resync(operation, selection.clone());
+                    }
                 }
             });
         });
@@ -798,6 +852,26 @@ fn update_row(global: &NotificationRulesState<'_>, row: &Row) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unconfirmed_changes_never_claim_what_the_homeserver_holds() {
+        for text in [
+            ROOM_UNCONFIRMED,
+            DEFAULT_UNCONFIRMED,
+            KEYWORD_ADD_UNCONFIRMED,
+            KEYWORD_REMOVE_UNCONFIRMED,
+        ] {
+            let lower = text.to_lowercase();
+            // A partly applied change is possible: no claim that nothing
+            // changed, and no claim of a rollback.
+            for claim in ["unchanged", "not changed", "keeps", "was not added", "rolled back"] {
+                assert!(!lower.contains(claim), "{text}");
+            }
+            assert!(lower.contains("may") && lower.contains("sync"), "{text}");
+        }
+        // The default level is two rules; its wording names a partial result.
+        assert!(DEFAULT_UNCONFIRMED.contains("part of it may have reached it"));
+    }
 
     #[test]
     fn keywords_are_plain_bounded_text() {

@@ -1000,9 +1000,10 @@ export component RoomNotificationPanel inherits Rectangle {
     in property <length> available-height: 10000px;
     // The person closed the panel: ×; the window returns focus to the bell.
     callback dismissed();
+    // A known level stays choosable after an unconfirmed change; a level that
+    // could not be read (effective 0) offers nothing.
     property <bool> choosable: root.live && !RoomNotificationState.loading
-        && RoomNotificationState.error == "" && !RoomNotificationState.pending
-        && RoomNotificationState.effective != 0;
+        && !RoomNotificationState.pending && RoomNotificationState.effective != 0;
     public function focus-first() {
         close-action.focus();
     }
