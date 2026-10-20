@@ -56,6 +56,7 @@ struct VisibleRoom {
     room_id: String,
 }
 
+#[derive(Clone, Debug)]
 struct UiSnapshot {
     account_id: String,
     live: bool,
@@ -438,40 +439,34 @@ impl DesktopNotifications {
         {
             return None;
         }
-        let active = self.manager.active_account().await?;
+        // Nothing is looked up for an account no longer live on screen.
         let ui = self.ui_snapshot().await?;
         if !ui.live || ui.account_id != candidate.account_id {
             return None;
         }
-        let mut config = self
-            .config
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        privacy_ceiling(&mut config, ui.private);
         let noted = self.room_mode(&candidate.account_id, &candidate.room_id);
-        let held = match noted {
-            Some(_) => self
-                .manager
+        let lookup = async {
+            self.manager
                 .room_notification_rule_selected(&queued.selection, &candidate.room_id)
                 .await
                 .ok()
-                .map(|rule| rule.effective),
-            None => None,
+                .map(|rule| rule.effective)
         };
-        // Account changes can happen during any await above. Returning to
-        // the same account must not revive this earlier notification.
-        if self.stopped.load(Ordering::Acquire) || !queued.selection.is_current() {
-            return None;
-        }
-        plan_notification(
-            candidate,
-            &active,
-            &config,
-            ui.visible_room.as_ref(),
-            noted_override(noted, held),
-            now_ms(),
-        )
+        let snapshot = move || async move {
+            let active = self.manager.active_account().await?;
+            let ui = self.ui_snapshot().await?;
+            Some((active, ui))
+        };
+        let config = || {
+            self.config
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        };
+        // Account changes can happen during any await. Returning to the same
+        // account must not revive this earlier notification.
+        let current = || !self.stopped.load(Ordering::Acquire) && queued.selection.is_current();
+        plan_after_lookup(candidate, noted, lookup, snapshot, config, current, now_ms()).await
     }
 
     /// Resolve one clicked banner to its target. Only a remembered, unexpired
@@ -750,6 +745,46 @@ impl Candidate {
 /// another level for the room (or its rule cannot be read). Once sync has
 /// brought it to the SDK, the SDK's push actions decide: a keyword match
 /// notifies without a highlight, which this window cannot tell apart.
+/// Plan one banner whose room rule may first need a lookup of up to 30 s.
+/// What can change meanwhile, the active account, the window's privacy screens
+/// (sign-in, the app password, Manage accounts, a recovery key) and the
+/// accepted policy, is read only after that lookup and after the last await,
+/// so a ceiling raised during the lookup applies to this banner.
+async fn plan_after_lookup<S>(
+    candidate: &Candidate,
+    noted: Option<NotificationMode>,
+    lookup: impl Future<Output = Option<NotificationMode>>,
+    snapshot: impl FnOnce() -> S,
+    config: impl FnOnce() -> Config,
+    current: impl Fn() -> bool,
+    now_ms: u64,
+) -> Option<PlannedNotification>
+where
+    S: Future<Output = Option<(AccountInfo, UiSnapshot)>>,
+{
+    let held = match noted {
+        Some(_) => lookup.await,
+        None => None,
+    };
+    if !current() {
+        return None;
+    }
+    let (active, ui) = snapshot().await?;
+    if !current() || !ui.live || ui.account_id != candidate.account_id {
+        return None;
+    }
+    let mut config = config();
+    privacy_ceiling(&mut config, ui.private);
+    plan_notification(
+        candidate,
+        &active,
+        &config,
+        ui.visible_room.as_ref(),
+        noted_override(noted, held),
+        now_ms,
+    )
+}
+
 fn noted_override(
     noted: Option<NotificationMode>,
     held: Option<NotificationMode>,
@@ -1021,6 +1056,76 @@ mod tests {
         config.notifications.show_message_preview = false;
         let plan = plan_notification(&event, &active, &config, None, None, 1_000_000).unwrap();
         assert!(!plan.sound && !plan.body.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn a_ceiling_raised_during_the_rule_lookup_applies_to_that_banner() {
+        let active = account("alice", "@alice:example.org");
+        let mut shown = Config::default();
+        shown.notifications.show_message_preview = true;
+        let config = std::sync::Mutex::new(shown);
+        let ui = std::sync::Mutex::new(UiSnapshot {
+            account_id: "alice".into(),
+            live: true,
+            visible_room: None,
+            private: false,
+        });
+        let event = candidate();
+        let (reached, suspended) = oneshot::channel::<()>();
+        let (release, released) = oneshot::channel::<()>();
+        // The room rule lookup waits until the test releases it.
+        let lookup = async move {
+            let _ = reached.send(());
+            let _ = released.await;
+            Some(NotificationMode::AllMessages)
+        };
+        let plan = plan_after_lookup(
+            &event,
+            Some(NotificationMode::AllMessages),
+            lookup,
+            || std::future::ready(Some((active.clone(), ui.lock().unwrap().clone()))),
+            || config.lock().unwrap().clone(),
+            || true,
+            1_000_000,
+        );
+        let change = async {
+            suspended.await.unwrap();
+            // While it waits: previews are turned off, then Manage accounts
+            // and the app password screen open.
+            config.lock().unwrap().notifications.show_message_preview = false;
+            ui.lock().unwrap().private = true;
+            release.send(()).unwrap();
+        };
+        let (plan, ()) = tokio::join!(plan, change);
+        let plan = plan.expect("the banner is still shown, under the new ceiling");
+        assert_eq!(plan.summary, "@alice:example.org");
+        assert_eq!(plan.body, "New message");
+        assert!(!plan.body.contains("secret") && !plan.summary.contains("Work"));
+        // A selection lost during the lookup shows nothing at all.
+        let (reached, suspended) = oneshot::channel::<()>();
+        let (release, released) = oneshot::channel::<()>();
+        let lost = std::sync::atomic::AtomicBool::new(false);
+        let lookup = async move {
+            let _ = reached.send(());
+            let _ = released.await;
+            None
+        };
+        let plan = plan_after_lookup(
+            &event,
+            Some(NotificationMode::AllMessages),
+            lookup,
+            || std::future::ready(Some((active.clone(), ui.lock().unwrap().clone()))),
+            || config.lock().unwrap().clone(),
+            || !lost.load(Ordering::Acquire),
+            1_000_000,
+        );
+        let change = async {
+            suspended.await.unwrap();
+            lost.store(true, Ordering::Release);
+            release.send(()).unwrap();
+        };
+        let (plan, ()) = tokio::join!(plan, change);
+        assert!(plan.is_none());
     }
 
     #[test]
