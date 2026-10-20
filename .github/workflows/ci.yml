@@ -1,20 +1,13 @@
-# TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
+# TEMPORARY Linux-only UI/activity/tag diagnostic. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - 128e997 - ${{ inputs.platform }}
+name: Reviewed Linux UI activity and tag diagnostic
+run-name: Reviewed Linux focused diagnostic - 52a28c1deea01aa5b0cf507b761533cf7b9b05c8
 on:
   workflow_dispatch:
-    inputs:
-      platform:
-        description: Select only affected native platforms
-        type: choice
-        required: true
-        default: all
-        options: [all, macos-arm64, macos-intel, windows, linux]
 permissions:
   contents: read
 concurrency:
-  group: beta-native-128e997-${{ github.ref }}
+  group: beta-linux-focused-52a28c1deea01aa5b0cf507b761533cf7b9b05c8-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -31,7 +24,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 128e997f865861d3fc7cdfbe3172094635241fb1
+          ref: 52a28c1deea01aa5b0cf507b761533cf7b9b05c8
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -44,7 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = 128e997f865861d3fc7cdfbe3172094635241fb1
+          test "$(git -C candidate rev-parse HEAD)" = 52a28c1deea01aa5b0cf507b761533cf7b9b05c8
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -59,16 +52,13 @@ jobs:
             --evidence "$RUNNER_TEMP/reviewed-candidate-history"
   native:
     needs: security
-    name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["all","macos-arm64","macos-intel","windows","linux"]'), inputs.platform)
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    name: Focused Linux UI activity and tags
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     env:
-      MORPHEUS_EXPECTED_OS: ${{ matrix.os }}
-      MORPHEUS_EXPECTED_ARCH: ${{ matrix.arch }}
+      MORPHEUS_EXPECTED_OS: Linux
+      MORPHEUS_EXPECTED_ARCH: X64
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         env:
@@ -78,7 +68,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 128e997f865861d3fc7cdfbe3172094635241fb1
+          ref: 52a28c1deea01aa5b0cf507b761533cf7b9b05c8
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -317,7 +307,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='128e997f865861d3fc7cdfbe3172094635241fb1'
+          source='52a28c1deea01aa5b0cf507b761533cf7b9b05c8'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,70 +369,8 @@ jobs:
           key: verified-sdk-archives-v1
           workspaces: candidate -> target
           save-if: false
-      - name: Select the installed Microsoft x64 compiler environment
-        if: runner.os == 'Windows'
-        timeout-minutes: 2
-        shell: python -I {0}
-        run: |
-          import json, os, pathlib, shutil, subprocess
-          assert os.environ['RUNNER_OS']=='Windows' and os.environ['RUNNER_ARCH']=='X64'
-          # Use the runner's installed vendor tools, without a new setup action.
-          # Keep tokens out of the compiler environment and print no raw output.
-          allowed=('PATH','SystemRoot','SYSTEMROOT','SystemDrive','PROCESSOR_ARCHITECTURE','OS','WINDIR','COMSPEC','PATHEXT',
-              'ProgramFiles','ProgramFiles(x86)','ProgramW6432','TEMP','TMP',
-              'USERPROFILE','HOMEDRIVE','HOMEPATH','LOCALAPPDATA','APPDATA',
-              'CARGO_HOME','RUSTUP_HOME')
-          environment={key:os.environ[key] for key in allowed if key in os.environ}
-          installer=pathlib.Path(os.environ['ProgramFiles(x86)'])/'Microsoft Visual Studio'/'Installer'/'vswhere.exe'
-          def command(args):
-              result=subprocess.run(args,env=environment,stdin=subprocess.DEVNULL,
-                  stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,check=False)
-              if result.returncode!=0 or len(result.stdout)>256*1024 or len(result.stderr)>64*1024:
-                  # Fixed diagnostics only; no setup output or environment data.
-                  text=(result.stdout+result.stderr).decode('utf-8',errors='ignore').lower()
-                  markers={'command_not_recognized':'is not recognized as an internal or external command',
-                      'invalid_syntax':'the syntax of the command is incorrect',
-                      'vsdevcmd_error':'[error:', 'vcvars_error':'error in script usage'}
-                  print(json.dumps({'check':'msvc_environment','status':'failed',
-                      'exit_code':result.returncode,'stdout_bytes':len(result.stdout),
-                      'stderr_bytes':len(result.stderr),
-                      'markers':sorted(key for key,value in markers.items() if value in text)}),flush=True)
-                  raise SystemExit(1)
-              return result.stdout
-          selected=command([str(installer),'-latest','-products','*','-requires',
-              'Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-property','installationPath']).decode('utf-8').strip()
-          assert selected and not any(char in selected for char in '\r\n"%')
-          installation=pathlib.Path(selected).resolve(strict=True)
-          assert installation.is_relative_to(pathlib.Path(os.environ['ProgramFiles']).resolve())
-          setup=installation/'Common7'/'Tools'/'VsDevCmd.bat'
-          assert setup.is_file()
-          cmd=pathlib.Path(os.environ['SystemRoot'])/'System32'/'cmd.exe'
-          # cmd.exe uses its own quoting rules. Pass a raw CreateProcess
-          # command line, avoiding list2cmdline's C-runtime quote escapes.
-          raw=command(f'"{cmd}" /d /s /c ""{setup}" -no_logo -arch=x64 -host_arch=x64 >nul && set"')
-          wanted={'PATH','INCLUDE','LIB','LIBPATH','VCTOOLSINSTALLDIR','VCINSTALLDIR',
-              'VSINSTALLDIR','WINDOWSSDKDIR','WINDOWSSDKVERSION'}
-          values={}
-          # cmd writes OEM text to pipes; preserve all characters in tool paths.
-          import ctypes
-          encoding='cp'+str(ctypes.windll.kernel32.GetOEMCP())
-          for line in raw.decode(encoding,errors='strict').splitlines():
-              name,separator,value=line.partition('=')
-              if separator and name.upper() in wanted:
-                  assert name.upper() not in values and value and not any(c in value for c in '\r\n\x00')
-                  values[name.upper()]=value
-          assert wanted<=values.keys()
-          compiler_root=pathlib.Path(values['VCTOOLSINSTALLDIR']).resolve(strict=True)
-          assert compiler_root.is_relative_to(installation/'VC'/'Tools'/'MSVC')
-          linker=shutil.which('link.exe',path=values['PATH'])
-          assert linker and pathlib.Path(linker).resolve().is_relative_to(compiler_root/'bin'/'Hostx64'/'x64')
-          # Fixed names, single-line values; no credentials or compiler stdout.
-          with pathlib.Path(os.environ['GITHUB_ENV']).open('a',encoding='utf-8',newline='\n') as output:
-              for name,value in values.items():
-                  output.write(name+'='+value+'\n')
-          print(json.dumps({'check':'msvc_environment','status':'passed','target':'x64','linker':'msvc'}))
-      - name: Build native desktop and run existing unit and controller suites
-        timeout-minutes: 160
+      - name: Run only generated UI activity and tag checks
+        timeout-minutes: 105
         env:
           CARGO_BUILD_JOBS: "2"
           CARGO_INCREMENTAL: "0"
@@ -658,7 +586,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='128e997f865861d3fc7cdfbe3172094635241fb1'
+          source='52a28c1deea01aa5b0cf507b761533cf7b9b05c8'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -804,96 +732,85 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          # Exact libtest IDs reconstructed from the reviewed public config
-          # test functions. Raw assertion values and arbitrary test prefixes
-          # cannot enter the diagnostic summary.
-          known_test_ids=set()
-          for unit in ('lib','registry','diagnostics','input','style_profiles'):
-              text=(workspace/f'crates/morpheus-config/src/{unit}.rs').read_text(encoding='utf-8')
-              prefix='tests::' if unit=='lib' else unit+'::tests::'
-              for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
-                  known_test_ids.add(prefix+function)
+          # Exact immutable-source libtest sets:1 generated UI,13 tags,5 activity.
+          # No ignored, missing, duplicate or additional test IDs count as a pass.
           needed_app={
-              'people_directory::tests::a_busy_creation_refuses_every_new_step_so_its_completion_still_applies',
-              'people_directory::tests::an_exact_id_is_offered_first_and_never_twice',
-              'people_directory::tests::a_created_room_is_never_reported_failed_for_its_listing',
-              'people_directory::tests::several_and_none_known_are_distinct_states',
-              'room_organization::tests::authoritative_noop_order_replaces_the_plan_and_sync_ends_its_overlay',
-
-              'kept_replies::tests::a_queued_restore_cannot_outlive_a_clear_or_a_room_change',
-              'live::account_presentation_tests::a_focused_view_loaded_out_of_order_never_replaces_the_shown_one',
-              'live::account_presentation_tests::a_withdrawn_search_navigation_held_at_its_commit_changes_nothing',
-              'live::account_presentation_tests::no_refresh_samples_a_reveal_until_it_is_decided_or_given_back',
-              'message_search::tests::context_keeps_the_hit_near_the_top_and_stays_bounded',
-              'message_search::tests::search_result_display_sanitizes_untrusted_text_without_changing_ids',
               'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-              'discovery_tests::timeline_link_handler_accepts_only_browser_urls',
-              'discovery_tests::call_stage_uses_joined_room_even_after_chat_navigation',
-              'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
-              'video_render::tests::screen_share_is_featured_while_cameras_stay_in_a_bounded_filmstrip',
-              'video_render::tests::hidden_stage_pauses_every_remote_stream_and_drops_pictures',
-              'video_render::tests::released_slot_discards_a_late_conversion',
-              'local_video::tests::signaling_gate_withholds_frames_without_an_owner_or_stop',
-              'local_video::tests::transmission_pause_serializes_with_pushes_and_stale_resumes',
-              'call_recovery::tests::only_running_sticky_sync_may_transmit',
-              'calls::tests::recovering_calls_keep_blocking_account_switches',
-              'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
           }
-          needed_matrix={
-              'people_directory::tests::cancelled_or_revoked_people_lookup_releases_a_held_manager_wait',
-              'people_directory::tests::ended_application_admission_refuses_before_request_work_is_polled',
-              'people_directory::tests::queries_and_exact_ids_are_bounded',
-              'people_directory::tests::directory_pages_are_bounded_deduplicated_and_never_list_this_account',
-              'people_directory::tests::several_and_none_known_are_distinguished',
-              'people_directory::tests::requests_are_single_bounded_authenticated_attempts',
-              'people_directory::tests::rejected_authorization_returns_a_fixed_read_error',
+          needed_tags={
+              'room_tags::tests::orders_are_bounded_and_compare_numerically',
+              'room_tags::tests::deserialized_orders_cannot_bypass_numeric_bounds',
+              'room_tags::tests::fresh_tags_govern_writes_despite_every_cached_hint',
+              'room_tags::tests::retrying_uncertain_tags_never_discards_other_clients_metadata',
+              'room_tags::tests::stored_orders_and_foreign_fields_are_read_faithfully',
+              'room_tags::tests::a_superseded_selection_changes_no_tags',
+              'room_tags::tests::tag_requests_are_bounded_single_attempts',
+              'room_tags::tests::unreadable_content_is_refused_and_results_stay_truthful',
+              'room_tags::tests::a_change_writes_each_tag_once_against_a_fresh_unchanged_baseline',
               'room_tags::tests::fresh_server_tags_and_orders_survive_stale_confirmation_hints',
               'room_tags::tests::malformed_rereads_after_accepted_writes_report_partial_changes',
-              'room_tags::tests::fresh_tags_govern_writes_despite_every_cached_hint',
-              'direct_account_data::tests::unknown_fields_and_numbers_survive_byte_for_byte',
-              'direct_account_data::tests::an_existing_listing_writes_nothing_and_invalid_targets_are_refused',
-              'direct_account_data::tests::a_baseline_differing_only_in_a_big_number_is_a_change',
-              'direct_account_data::tests::requests_are_bounded_single_attempts',
-
-              'history::tests::a_focused_view_is_owned_only_by_the_selection_that_loaded_it',
-              'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one',
-              'tests::homeserver_must_not_send_password_over_plain_http',
-              'tests::registry_rejects_path_like_account_ids',
-              'tests::sso_redirect_must_be_private_loopback_listener',
+              'room_tags::tests::reorders_check_every_room_first_and_each_baseline_before_its_write',
+              'room_tags::tests::a_stopped_change_reports_truthfully_what_it_saved',
           }
-          needed_rtc={
-              'tests::build_capability_matches_feature','tests::device_capability_matches_features',
-              'audio_device::tests::signaling_gate_withholds_audio_without_an_owner_or_revocation',
-              'audio_device::tests::paused_transmission_withholds_audio_and_keeps_the_requested_mute_state',
-              'reconnect::tests::no_attempt_starts_at_or_after_the_budget',
-              'reconnect::tests::deliberate_removals_are_not_treated_as_connection_loss',
-              'video_device::tests::cancelled_camera_open_returns_before_native_enumeration',
-              'video_device::tests::camera_permission::stop_while_permission_is_pending_drops_late_grant',
-          }
-          allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
-          needed_config={
-              'tests::every_editor_metric_is_a_bounded_field_with_one_accessor',
-              'tests::pane_composition_and_fades_default_off_round_trip_and_survive_presets',
-              'tests::interaction_states_are_optional_validated_and_absent_from_shipped_presets',
-              'tests::config_sender_palette_is_bounded_round_trips_and_survives_presets',
-              'tests::metric_edits_reject_invalid_files_without_repeating_values_and_recover',
-              'tests::validation_errors_never_repeat_the_rejected_value',
+          needed_activity={
+              'room_activity::tests::a_receipt_waiting_for_its_timeline_is_withdrawn_before_it_is_sent',
+              'room_activity::tests::a_typing_start_waiting_for_the_account_lock_expires_at_its_idle_deadline',
+              'room_activity::tests::nothing_is_handed_to_the_sdk_once_a_write_is_cancelled',
+              'room_activity::tests::a_room_event_never_counts_a_thread_receipt',
+              'room_activity::tests::outgoing_receipts_are_private_unless_public_was_chosen',
           }
           checks=[
-              ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
-              ('native_sdk_archive_unit',['cargo','test','--locked','-p','webrtc-sys-build','--lib','--','--test-threads=1'],20*60,
-                  {'archive_tests::cache_receipts_are_bounded_and_match_the_reviewed_identity'},set()),
-              ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
-              ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
-              ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib','--','--test-threads=1'],20*60,needed_config,set()),
-              ('rtc_unit',['cargo','test','--locked','-p','morpheus-rtc','--features','native-devices','--lib','--','--test-threads=1'],30*60,needed_rtc,set()),
+              ('generated_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                  '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
+                  '--','--exact','--test-threads=1'],70*60,needed_app,set()),
+              ('room_tags',['cargo','test','--locked','-p','morpheus-matrix','--lib','room_tags::tests::',
+                  '--','--test-threads=1'],15*60,needed_tags,set()),
+              ('room_activity',['cargo','test','--locked','-p','morpheus-matrix','--lib','room_activity::tests::',
+                  '--','--test-threads=1'],15*60,needed_activity,set()),
           ]
-          for _name, _args, _seconds, required, _ignored in checks:
-              if required is not None: known_test_ids.update(required)
-          if os.environ.get('RUNNER_OS')=='Linux':
-              checks.insert(0, ('format', ['cargo','fmt','--all','--','--check'], 300, None, set()))
-          # All four platform scopes use this exact stable reviewed candidate.
+          known_test_ids=needed_app|needed_tags|needed_activity
+          def motion_projection(output):
+              # Called only after independent default scanning of the sealed log.
+              # Admit at most4 complete marker lines and8192 UTF-8 bytes total.
+              import math
+              projected=[]; consumed=0
+              def vector(value,size):
+                  return (isinstance(value,list) and len(value)==size and all(
+                      type(item) in (int,float) and math.isfinite(item) and abs(item)<=1e7
+                      for item in value))
+              def unique_object(pairs):
+                  result={}
+                  for key,value in pairs:
+                      if key in result: raise ValueError()
+                      result[key]=value
+                  return result
+              def invalid_constant(_): raise ValueError()
+              marker='MORPHEUS_MOTION_FAILURE '
+              examined=0
+              for line in output.splitlines():
+                  if not line.startswith(marker): continue
+                  if examined>=4: break
+                  examined+=1
+                  size=len(line.encode('utf-8'))
+                  if size>8192 or consumed+size>8192: break
+                  consumed+=size
+                  try:
+                      value=json.loads(line[len(marker):],object_pairs_hook=unique_object,
+                          parse_constant=invalid_constant)
+                      if not isinstance(value,dict) or 'bounds_before' not in value: continue
+                      scale=value.get('scale'); before=value.get('bounds_before'); window=value.get('window')
+                      if type(scale) is not int or scale not in (100,200): continue
+                      if before is not None and not vector(before,4): continue
+                      if not vector(window,2): continue
+                      entry={'scale':scale,'bounds_before':before,'window':window}
+                      for key in ('focus_before','focus_after','config_error_present','presentation','requested','saved'):
+                          if key in value:
+                              if type(value[key]) is not bool: raise ValueError()
+                              entry[key]=value[key]
+                      projected.append(entry)
+                  except (ValueError,TypeError,RecursionError,OverflowError): continue
+              return projected
+          # Single Linux scope, three affected cases only; no package/artifact jobs.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               if not tracked_intact():
@@ -933,9 +850,11 @@ jobs:
                       complete=(len(seen)==a+b+c and len(failures)==b and len(ignored)==c
                           and failures<=seen and ignored<=seen and not failures&ignored)
                   okay=seen-failures-ignored if complete else set()
-                  passed=(passed and complete and summaries[0][0]=='ok' and a>0 and b==0
-                      and ignored==allowed_ignored and required<=okay)
-                  record.update({'complete_test_accounting':complete,'tests_passed':a,'tests_failed':b,
+                  exact=complete and seen==required and a+b+c==len(required)
+                  passed=(passed and exact and summaries[0][0]=='ok' and a==len(required) and b==0
+                      and c==0 and ignored==allowed_ignored and required==okay)
+                  record.update({'complete_test_accounting':complete,'exact_test_selection':exact,
+                      'expected_test_count':len(required),'tests_passed':a,'tests_failed':b,
                       'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
               record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
               if not passed:
@@ -1060,6 +979,7 @@ jobs:
                   missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
                   record['failure_diagnostics']={
                       'ui_timeout_phases':[int(phase) for phase in re.findall(r'morpheus-ui-timeout-phase=([0-9]{1,3})', output)[:8]],
+                      'motion_failures':motion_projection(output) if name=='generated_ui' else [],
                       'transfer_focus_state':[{'page':int(page),'panel':panel=='true','tab':int(tab),'pending':pending=='true','headings':int(headings)}
                           for page,panel,tab,pending,headings in re.findall(r'MORPHEUS_TRANSFER_FOCUS_STATE page=([0-9]{1,2}) panel=(true|false) tab=([0-9]{1,2}) pending=(true|false) headings=([0-9]{1,3})',output)[:8]],
                       'ui_settings_target_failures':[{'stage':int(stage),'index':int(index),'live':live=='true'}
@@ -1080,7 +1000,6 @@ jobs:
               record.update({'status':'passed' if passed else 'failed','ui_binding_loop_warnings':loops})
               print(json.dumps(record,sort_keys=True),flush=True)
               all_passed=all_passed and passed
-              # Failed compilation cannot yield meaningful unit checks. Independent test
-              # suites still run after a test failure, using the same compiled graph.
-              if name=='native_app_build' and not passed: break
+              # Independent affected suites still run after a UI/test failure.
+              # Each command is supervised, scanned and accounted separately.
           if not all_passed: raise SystemExit(1)
