@@ -157,7 +157,7 @@ pub struct LiveUi {
     /// snapshot is decided (see RevealOwner).
     snapshot_barrier: tokio::sync::RwLock<()>,
     #[cfg(test)]
-    pauses: TestPauses,
+    pub(crate) pauses: TestPauses,
 }
 
 /// The one focused conversation view the app shows, with the feed
@@ -271,7 +271,7 @@ impl TestPauses {
         point
     }
 
-    async fn reach(&self, name: &'static str) {
+    pub(crate) async fn reach(&self, name: &'static str) {
         let point = self
             .points
             .lock()
@@ -3783,6 +3783,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     crate::polls::clear_presentation(ui);
     // The public-profile editor's drafts, previews and errors end with it too.
     crate::account_identity::clear_presentation(ui);
+    // Directory rows, chosen person and notices end with the account.
+    crate::people_directory::clear_presentation(ui);
     // Decrypted pinned rows are account-private and never wait for a task.
     ui.invoke_reset_pinned_messages();
     // So is who is in this account's voice rooms.

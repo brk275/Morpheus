@@ -1700,7 +1700,9 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
         outcome.expect("account UI scenario must finish without network or vault access");
         // Opt-in live room/thread controller coverage shares this one event
         // loop; it returns at once unless a disposable local fixture is set.
-        crate::live::timeline_controller_tests::run_if_configured(runtime_handle).await;
+        crate::live::timeline_controller_tests::run_if_configured(runtime_handle.clone()).await;
+        // Opt-in too: the People busy path on the real window and fixture.
+        crate::people_directory::live_tests::run_if_configured(runtime_handle).await;
         slint::quit_event_loop().unwrap();
     })
     .unwrap();
@@ -3881,6 +3883,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_room_appearance_scope(&ui, directory.path()).await;
     phase.set(56);
     assert_font_browser(&ui, directory.path()).await;
+    phase.set(57);
+    assert_people_window_privacy(&ui).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
@@ -6108,6 +6112,194 @@ async fn assert_public_profile_projection(ui: &AppWindow) {
     ui.set_active_account_index(index);
     ui.set_active_account_name(name);
     ui.set_active_account_initials(initials);
+    settle(ui).await;
+}
+
+/// Start a conversation on the real generated window with synthetic people
+/// only: Up/Down stay within the shown rows, the selected row is revealed,
+/// and a detach clears every row, name and notice synchronously.
+async fn assert_people_window_privacy(ui: &AppWindow) {
+    let live = ui.get_live_session();
+    let sign_in = ui.get_show_sign_in();
+    ui.set_live_session(true);
+    ui.set_show_sign_in(false);
+    let weak = ui.as_weak();
+    ui.on_close_people(move || {
+        if let Some(ui) = weak.upgrade() {
+            crate::people_directory::clear_presentation(&ui);
+        }
+    });
+    let rows: Vec<crate::PersonItem> = (0..30)
+        .map(|index| crate::PersonItem {
+            user_id: format!("@synthetic{index}:example.org").as_str().into(),
+            name: format!("Synthetic {index}").as_str().into(),
+            exact: index == 0,
+        })
+        .collect();
+    ui.set_people_items(ModelRc::new(VecModel::from(rows)));
+    ui.set_people_index(0);
+    ui.set_people_open(true);
+    settle(ui).await;
+    key(ui, Key::UpArrow);
+    assert_eq!(ui.get_people_index(), 0, "Up stops at the first row");
+    for _ in 0..40 {
+        key(ui, Key::DownArrow);
+    }
+    assert_eq!(ui.get_people_index(), 29, "Down stops at the last row");
+    settle(ui).await;
+    let last = control_bounds(ui, "Choose Synthetic 29, @synthetic29:example.org");
+    assert_eq!(last.len(), 1, "the selected row is instantiated");
+    assert!(inside_window(ui, last[0]), "the selected row is revealed");
+    // The window's own debounce Timer and Enter, counted at the callbacks
+    // (no LiveUi here; the opt-in live People scenario drives the Rust side).
+    // Not busy: a typing pause searches once.
+    let searches = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+    let chosen = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+    let counted = searches.clone();
+    ui.on_people_search(move || counted.set(counted.get() + 1));
+    let counted = chosen.clone();
+    ui.on_people_choose(move |_| counted.set(counted.get() + 1));
+    let query = ui.get_people_query();
+    key(ui, "s");
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(400));
+    settle(ui).await;
+    assert_eq!(searches.get(), 1, "a typing pause searches when not busy");
+    // Armed, then a creation is admitted before the pause ends: the Timer
+    // never searches, and Enter neither searches nor chooses.
+    key(ui, "t");
+    ui.set_people_busy(true);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1_000));
+    settle(ui).await;
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!((searches.get(), chosen.get()), (1, 0), "nothing searches or chooses while busy");
+    ui.set_people_busy(false);
+    ui.set_people_query(query);
+    settle(ui).await;
+    // While a creation runs the search field is disabled, and Tab and
+    // Shift+Tab cycle inside the dialog.
+    ui.set_people_busy(true);
+    settle(ui).await;
+    for _ in 0..12 {
+        key(ui, Key::Tab);
+        assert!(
+            focused_control_has_label(ui, "Close")
+                || focused_control_has_label(ui, "Search people; arrows select, Enter chooses, Escape closes")
+                || {
+                    let index = usize::try_from(ui.get_people_index()).unwrap_or(0);
+                    focused_control_has_label(
+                        ui,
+                        &format!("Choose Synthetic {index}, @synthetic{index}:example.org"),
+                    )
+                },
+            "Tab left the dialog while busy"
+        );
+    }
+    ui.set_people_busy(false);
+    settle(ui).await;
+    // From Close, Tab returns to the search field; Shift+Tab from the
+    // search field returns to Close.
+    for _ in 0..40 {
+        if focused_control_has_label(ui, "Close") {
+            break;
+        }
+        key(ui, Key::Tab);
+    }
+    assert!(focused_control_has_label(ui, "Close"));
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(
+        ui,
+        "Search people; arrows select, Enter chooses, Escape closes"
+    ));
+    key(ui, Key::Backtab);
+    assert!(focused_control_has_label(ui, "Close"), "Shift+Tab cycles to Close");
+
+    // At the smallest window and 200% text a chosen person's decision stays
+    // reachable: the actions are fixed below the scrolling body.
+    let size = ui.window().size();
+    ui.window().set_size(slint::PhysicalSize::new(900, 620));
+    ui.set_font_scale_percent(200);
+    ui.set_people_chosen_id("@synthetic3:example.org".into());
+    ui.set_people_chosen_name("Synthetic 3".into());
+    ui.set_people_known(2);
+    ui.set_people_status("synthetic status".into());
+    settle(ui).await;
+    for label in [
+        "Start an encrypted direct conversation with @synthetic3:example.org",
+        "Close",
+    ] {
+        let bounds = control_bounds(ui, label);
+        assert_eq!(bounds.len(), 1, "{label}");
+        assert!(inside_window(ui, bounds[0]), "{label} is reachable at 620 px and 200%");
+    }
+    ui.set_people_confirm(true);
+    settle(ui).await;
+    let confirm = control_bounds(
+        ui,
+        "Confirm starting an encrypted direct conversation with @synthetic3:example.org",
+    );
+    assert_eq!(confirm.len(), 1);
+    assert!(inside_window(ui, confirm[0]), "the confirmation action is reachable");
+    // With the widest valid control padding (24 px) in a 560 px dialog at
+    // 200% text, the confirmation, Cancel and Close all fit inside the
+    // dialog, one per row, without overlapping, in decision-Cancel-Close
+    // order.
+    let tokens = ui.global::<crate::StyleTokens>();
+    let padding = tokens.get_control_padding();
+    tokens.set_control_padding(24.0);
+    settle(ui).await;
+    let dialog = control_bounds(ui, "Start a conversation");
+    assert_eq!(dialog.len(), 1);
+    let footer: Vec<_> = [
+        "Confirm starting an encrypted direct conversation with @synthetic3:example.org",
+        "Cancel",
+        "Close",
+    ]
+    .into_iter()
+    .map(|label| {
+        let bounds = control_bounds(ui, label);
+        assert_eq!(bounds.len(), 1, "{label}");
+        let bounds = bounds[0];
+        assert!(
+            bounds.left >= dialog[0].left - 0.5 && bounds.right <= dialog[0].right + 0.5,
+            "{label} fits inside the 560 px dialog"
+        );
+        assert!(inside_window(ui, bounds), "{label} stays reachable");
+        bounds
+    })
+    .collect();
+    for pair in footer.windows(2) {
+        assert!(pair[0].bottom <= pair[1].top + 0.5, "the footer actions do not overlap");
+    }
+    tokens.set_control_padding(padding);
+    ui.set_people_confirm(false);
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(size);
+    settle(ui).await;
+
+    // Detach: nothing about the people searched stays on screen.
+    ui.set_people_chosen_id("@synthetic3:example.org".into());
+    ui.set_people_chosen_name("Synthetic 3".into());
+    ui.set_people_status("synthetic status".into());
+    ui.set_people_error("synthetic error".into());
+    ui.set_people_query("synthetic".into());
+    ui.set_people_confirm(true);
+    // The actual window context fence closes the dialog on account access;
+    // the registered callback uses the production private-state clearing path.
+    ui.set_access_open(true);
+    settle(ui).await;
+    assert!(!ui.get_people_open());
+    assert_eq!(ui.get_people_items().row_count(), 0);
+    assert_eq!(ui.get_people_index(), -1);
+    assert_eq!(ui.get_people_query(), "");
+    assert_eq!(ui.get_people_chosen_id(), "");
+    assert_eq!(ui.get_people_chosen_name(), "");
+    assert_eq!(ui.get_people_status(), "");
+    assert_eq!(ui.get_people_error(), "");
+    assert!(!ui.get_people_confirm());
+    ui.set_access_open(false);
+    ui.set_live_session(live);
+    ui.set_show_sign_in(sign_in);
     settle(ui).await;
 }
 

@@ -285,6 +285,14 @@ export struct SpaceItem {
     accent: color,
 }
 
+// One person in Start a conversation. Text is bounded and single-line.
+export struct PersonItem {
+    user-id: string,
+    name: string,
+    // The complete Matrix ID typed, offered without a directory result.
+    exact: bool,
+}
+
 export struct RoomItem {
     id: string,
     name: string,
@@ -3900,6 +3908,21 @@ export component AppWindow inherits Window {
     in-out property <string> quick-switcher-account-id;
     in-out property <int> quick-switcher-account-index: -1;
     in-out property <string> quick-switcher-space-id;
+    // Start a conversation (people_directory.rs). Everything here clears
+    // with the account.
+    in-out property <bool> people-open: false;
+    in-out property <string> people-query;
+    in-out property <[PersonItem]> people-items;
+    in-out property <int> people-index: -1;
+    in-out property <string> people-status;
+    in-out property <string> people-error;
+    in-out property <bool> people-busy: false;
+    in-out property <string> people-chosen-id;
+    in-out property <string> people-chosen-name;
+    // 0 nothing chosen, 1 checking, 2 none known here, 3 one, 4 several.
+    in-out property <int> people-known: 0;
+    in-out property <int> people-known-count: 0;
+    in-out property <bool> people-confirm: false;
     property <int> search-focus-request: 0;
     in-out property <bool> show-sign-in: true;
     in-out property <bool> login-loading: false;
@@ -4205,6 +4228,32 @@ export component AppWindow inherits Window {
     }
     callback filter-quick-switcher();
     callback choose-quick-room(int);
+    callback open-people(string);
+    callback close-people();
+    callback dismiss-people();
+    dismiss-people => {
+        root.close-people();
+        people-trigger.focus();
+    }
+    callback people-search();
+    callback people-choose(int);
+    callback people-open-dm();
+    callback people-ask-start();
+    callback people-confirm-start();
+    // A lock, account replacement or another modal cancels the exact People
+    // window immediately; no pending result restores its private content.
+    property <bool> people-context-current: !root.people-open || (root.live-session
+        && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
+        && !root.account-switch-pending && !root.account-menu-open
+        && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy
+        && !root.account-profile-open && !SpaceExplorer.open
+        && !RoomNotificationState.open && !RoomActivity.seen-open
+        && !root.quick-switcher-open && !root.room-actions-open && !root.room-admin-open
+        && !root.member-confirm-open && !root.native-capture-picker-open
+        && !root.leave-call-dialog && !root.image-preview-open && !root.poll-dialog-open);
+    changed people-context-current => {
+        if !root.people-context-current { root.close-people(); }
+    }
     // Presentation only: show the thread tab of the side panel.
     public function show-thread-panel() {
         root.page = 0;
@@ -4415,7 +4464,8 @@ export component AppWindow inherits Window {
         && RoomNotificationState.account-id == root.active-account-local-id
         && RoomNotificationState.room-id == root.active-room-id && root.active-room-id != ""
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
-        && root.security-recovery-key == "" && !root.account-profile-open && !SpaceExplorer.open;
+        && root.security-recovery-key == "" && !root.account-profile-open && !SpaceExplorer.open
+        && !root.people-open;
     // Another account or room, a lock or a detach clears the panel's rows.
     changed room-notifications-current => {
         if !root.room-notifications-current && RoomNotificationState.open {
@@ -4522,7 +4572,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !root.image-preview-open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -4605,6 +4655,7 @@ export component AppWindow inherits Window {
         if root.room-admin-mode != 0 { root.cancel-room-settings(); }
     }
     changed active-account-local-id => {
+        root.close-people();
         root.details-reveal-open = false;
         root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
@@ -5017,6 +5068,16 @@ export component AppWindow inherits Window {
                                 text: "Offline preview"; color: root.muted;
                                 font-size: 10px * root.text-scale; font-weight: 500;
                                 accessible-label: "Offline preview with fictional accounts";
+                            }
+                        }
+                        VerticalLayout { width: 34px; alignment: center;
+                            people-trigger := IconAction {
+                                width: 34px; height: 34px;
+                                icon: "direct-messages";
+                                label: "Start a direct conversation";
+                                enabled: root.live-session;
+                                ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                activated => { root.open-people(""); }
                             }
                         }
                         VerticalLayout { width: 34px; alignment: center;
@@ -10926,6 +10987,238 @@ export component AppWindow inherits Window {
         scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
         text-scale: root.text-scale;
     }
+    if root.people-open : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { people-input.focus(); }
+        // Admission of a creation stops a queued search; edits are disabled
+        // while it runs, and Rust refuses a search while busy too.
+        property <bool> busy: root.people-busy;
+        changed busy => { if self.busy { people-debounce.running = false; } }
+        // Reveal the selected row (rows share one height) whenever the
+        // selection or the geometry changes: text scale, the body's height,
+        // the row count, or the status lines above the rows.
+        property <int> selected: root.people-index;
+        property <length> row-height: max(44px, 32px * root.text-scale + 12px);
+        property <length> row-step: self.row-height + 3px;
+        property <length> body-view: people-body.visible-height;
+        property <int> row-count: root.people-items.length;
+        property <length> rows-top: people-rows.absolute-position.y - people-content.absolute-position.y;
+        changed selected => { self.reveal-selected(); }
+        changed row-step => { self.reveal-selected(); }
+        changed body-view => { self.reveal-selected(); }
+        changed row-count => { self.reveal-selected(); }
+        changed rows-top => { self.reveal-selected(); }
+        // A chosen person or a confirmation appears below the rows: show it.
+        property <string> chosen: root.people-chosen-id;
+        property <bool> confirming: root.people-confirm;
+        changed chosen => { self.reveal-decision(); }
+        changed confirming => { self.reveal-decision(); }
+        function reveal-selected() {
+            if self.selected >= 0 && self.selected < root.people-items.length {
+                if self.rows-top + self.selected * self.row-step < -people-body.viewport-y {
+                    people-body.viewport-y = -(self.rows-top + self.selected * self.row-step);
+                } else if self.rows-top + (self.selected + 1) * self.row-step > -people-body.viewport-y + people-body.visible-height {
+                    people-body.viewport-y = -(self.rows-top + (self.selected + 1) * self.row-step - people-body.visible-height);
+                }
+            }
+        }
+        function reveal-decision() {
+            if root.people-chosen-id != "" {
+                people-body.viewport-y = min(0px, people-body.visible-height - people-content.preferred-height);
+            }
+        }
+        // The first and last enabled controls, for the modal Tab cycle.
+        function focus-first() {
+            if people-input.enabled { people-input.focus(); } else { people-close.focus(); }
+        }
+        pure function at-first() -> bool {
+            return people-input.enabled ? people-input.has-focus : people-close.has-focus;
+        }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                if root.people-confirm { root.people-confirm = false; } else { root.dismiss-people(); }
+                accept
+            } else if event.text == Key.Tab && !event.modifiers.shift && people-close.has-focus {
+                self.focus-first();
+                accept
+            } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && self.at-first() {
+                people-close.focus();
+                accept
+            } else if people-input.has-focus && !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt && !event.modifiers.shift && root.people-items.length > 0 && event.text == Key.DownArrow {
+                root.people-index = min(root.people-index + 1, root.people-items.length - 1);
+                accept
+            } else if people-input.has-focus && !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt && !event.modifiers.shift && root.people-items.length > 0 && event.text == Key.UpArrow {
+                root.people-index = max(root.people-index - 1, 0);
+                accept
+            } else { reject }
+        }
+        Rectangle {
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
+            // The scrim takes clicks and wheel scrolling: nothing behind the
+            // dialog moves or acts while it is open.
+            TouchArea {
+                width: parent.width; height: parent.height;
+                scroll-event(event) => { accept }
+            }
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: min(560px, parent.width - 32px); height: min(600px, parent.height - 40px);
+                background: root.dialog-surface;
+                border-radius: StyleTokens.radius * 1.4; border-color: root.accent; border-width: StyleTokens.line-width;
+                accessible-role: region; accessible-label: "Start a conversation";
+                // A short pause after typing searches; Enter searches at once
+                // or chooses the selected person.
+                people-debounce := Timer {
+                    interval: 350ms; running: false;
+                    triggered => { self.running = false; if !root.people-busy { root.people-search(); } }
+                }
+                VerticalLayout {
+                    padding: 20px; spacing: 8px;
+                    Text { text: "Start a conversation"; color: root.ink; font-size: 18px * root.text-scale; font-weight: 750; }
+                    Rectangle {
+                        height: max(38px, 16px * root.text-scale + 18px);
+                        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated;
+                        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                        if root.people-query == "" : Text {
+                            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                            text: "Name or @name:example.org"; color: root.muted; font-size: 12px * root.text-scale;
+                            vertical-alignment: center; overflow: elide;
+                        }
+                        people-input := ThemedTextInput {
+                            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                            text <=> root.people-query; color: root.ink; font-size: 12px * root.text-scale;
+                            single-line: true; vertical-alignment: center;
+                            enabled: !root.people-busy;
+                            accessible-label: "Search people; arrows select, Enter chooses, Escape closes";
+                            edited => {
+                                people-debounce.running = false;
+                                if !root.people-busy { people-debounce.running = true; }
+                            }
+                            accepted => {
+                                people-debounce.running = false;
+                                if root.people-busy {
+                                } else if root.people-index >= 0 && root.people-index < root.people-items.length {
+                                    root.people-choose(root.people-index);
+                                } else {
+                                    root.people-search();
+                                }
+                            }
+                        }
+                    }
+                    // Only this body scrolls: the heading, the search field and
+                    // the actions below stay in view at the smallest window and
+                    // the largest text.
+                    people-body := ScrollView {
+                        vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
+                        people-content := VerticalLayout {
+                            width: people-body.visible-width; spacing: 8px; alignment: start;
+                            Text {
+                                text: "Search people on your homeserver, or enter a complete Matrix ID. A new conversation is encrypted and invites only the person you choose.";
+                                color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                            }
+                            if root.people-status != "" : Text {
+                                text: root.people-status; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                                accessible-live-region: polite;
+                            }
+                            if root.people-error != "" : Text {
+                                text: root.people-error;
+                                color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483;
+                                font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
+                            }
+                            // At most 21 rows (the bound in Rust), each one height.
+                            people-rows := VerticalLayout {
+                                spacing: 3px; alignment: start;
+                                for person[index] in root.people-items : ActionRect {
+                                    height: max(44px, 32px * root.text-scale + 12px);
+                                    border-radius: StyleTokens.radius * 0.7;
+                                    background: index == root.people-index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : root.elevated;
+                                    focus-color: root.accent;
+                                    enabled: !root.people-busy;
+                                    label: "Choose " + person.name + ", " + person.user-id;
+                                    focus-state-changed(focused) => { if focused { root.people-index = index; } }
+                                    activated => { root.people-choose(index); }
+                                    VerticalLayout {
+                                        padding-left: 10px; padding-right: 10px; padding-top: 4px; padding-bottom: 4px; spacing: 1px; alignment: center;
+                                        Text { text: person.name; color: index == root.people-index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink; font-size: 12px * root.text-scale; font-weight: 650; overflow: elide; }
+                                        Text { text: person.exact ? person.user-id + " (as typed)" : person.user-id; color: index == root.people-index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-size: 10px * root.text-scale; overflow: elide; }
+                                    }
+                                }
+                            }
+                            if root.people-chosen-id != "" : Rectangle {
+                                background: root.elevated; border-radius: StyleTokens.radius * 0.8;
+                                border-color: root.divider; border-width: StyleTokens.line-width;
+                                VerticalLayout {
+                                    padding: 10px; spacing: 6px;
+                                    Text { text: root.people-chosen-name; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; overflow: elide; }
+                                    Text { text: root.people-chosen-id; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; }
+                                    Text {
+                                        text: root.people-known == 1 ? "Checking this device's conversations…"
+                                            : root.people-known == 2 ? "No direct conversation with this person is known on this device."
+                                            : root.people-known == 3 ? "You already have a direct conversation with this person."
+                                            : root.people-known == 4 ? root.people-known-count + " direct conversations with this person exist; Open shows the first of them."
+                                            : "";
+                                        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                                    }
+                                    if root.people-confirm : Text {
+                                        text: "Start an encrypted direct conversation with " + root.people-chosen-id + "? An invitation is sent to that account only.";
+                                        color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: assertive;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // The explicit actions are fixed below the body, always reachable.
+                    // Each action on its own right-aligned row: at 200% text,
+                    // the widest control padding and a narrow dialog the
+                    // confirmation, Cancel and Close never need more width
+                    // than the dialog has. Tab order: decision, Cancel, Close.
+                    VerticalLayout {
+                        spacing: 6px; alignment: end;
+                        if root.people-known == 3 || root.people-known == 4 : HorizontalLayout {
+                            alignment: end;
+                            TokenButton { colors: root.button-colors; text-scale: root.text-scale; primary: true;
+                                text: "Open conversation"; label: "Open the direct conversation with " + root.people-chosen-id;
+                                enabled: !root.people-busy;
+                                activated => { root.people-open-dm(); }
+                            }
+                        }
+                        if root.people-known == 2 && !root.people-confirm : HorizontalLayout {
+                            alignment: end;
+                            TokenButton { colors: root.button-colors; text-scale: root.text-scale; primary: true;
+                                text: "Start conversation…"; label: "Start an encrypted direct conversation with " + root.people-chosen-id;
+                                enabled: !root.people-busy;
+                                activated => { root.people-ask-start(); }
+                            }
+                        }
+                        if root.people-confirm : HorizontalLayout {
+                            alignment: end;
+                            TokenButton { colors: root.button-colors; text-scale: root.text-scale; primary: true;
+                                text: "Start encrypted conversation"; label: "Confirm starting an encrypted direct conversation with " + root.people-chosen-id;
+                                enabled: !root.people-busy;
+                                activated => { root.people-confirm-start(); }
+                            }
+                        }
+                        if root.people-confirm : HorizontalLayout {
+                            alignment: end;
+                            TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                text: "Cancel";
+                                activated => { root.people-confirm = false; people-input.focus(); }
+                            }
+                        }
+                        HorizontalLayout {
+                            alignment: end;
+                        people-close := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                            text: "Close";
+                            activated => { root.dismiss-people(); }
+                        }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if root.room-actions-open : FocusScope {
         focus-on-tab-navigation: false;
         init => { room-action-input.focus(); }

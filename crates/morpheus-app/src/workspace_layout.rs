@@ -316,6 +316,7 @@ fn gesture_blocked(ui: &AppWindow) -> bool {
         || ui.get_quick_switcher_open()
         || ui.get_image_preview_open()
         || ui.get_poll_dialog_open()
+        || ui.get_people_open()
 }
 
 /// Start a gesture: capture the applied arrangement and the account. Returns

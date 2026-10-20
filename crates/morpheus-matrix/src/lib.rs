@@ -95,6 +95,17 @@ pub use room_tags::{
     ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, TagKnowledge,
     TagOrder,
 };
+mod direct_account_data;
+pub use direct_account_data::{
+    DirectListing, DirectWriteError, DirectWriteGuard, MAX_DIRECT_CONTENT_BYTES, list_direct_room,
+    merged_direct,
+};
+mod people_directory;
+pub use people_directory::{
+    CreatedDirect, DirectoryPerson, KnownDirect, MAX_KNOWN_DMS, MAX_PERSON_NAME_CHARS,
+    MAX_USER_QUERY_CHARS, MAX_USER_RESULTS, PeopleCancellation, PeopleError, PeoplePage,
+    PeopleResult, exact_user_id, validate_people_query,
+};
 mod device_sessions;
 pub use device_sessions::{
     CrossSigningState, DeviceSession, DeviceSessionCancellation, DeviceSessionError,

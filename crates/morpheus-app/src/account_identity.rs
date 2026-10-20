@@ -525,6 +525,7 @@ fn unobstructed(ui: &AppWindow, live: &LiveUi) -> bool {
         && !ui.get_room_actions_open()
         && !ui.get_image_preview_open()
         && !ui.get_poll_dialog_open()
+        && !ui.get_people_open()
 }
 
 /// What an operation captured when it started.

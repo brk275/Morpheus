@@ -37,6 +37,7 @@ mod notification_center;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
+mod people_directory;
 mod pinned_messages;
 mod polls;
 #[cfg(debug_assertions)]
@@ -2918,6 +2919,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     space_explorer::register(&ui, live.clone(), runtime.handle().clone());
     thread_history::register(&ui, live.clone(), runtime.handle().clone());
     account_identity::register(&ui, live.clone(), runtime.handle().clone());
+    people_directory::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let directory_live = live.clone();
@@ -3023,6 +3025,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if window.get_directory_join_busy() {
                 return;
             }
+            // A complete Matrix user ID opens Start a conversation for that
+            // person; nothing is joined or created from here.
+            if let Some(user) = morpheus_matrix::exact_user_id(&input) {
+                window.invoke_open_people(user.into());
+                return;
+            }
             let account_id = window.get_active_account_local_id().to_string();
             if account_id.is_empty() {
                 window.set_directory_join_error("Choose a Matrix account first".into());
@@ -3102,6 +3110,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             2 => Some(RoomAction::CreateSpace),
             _ => return,
         };
+        // Joining by a user's Matrix ID means talking to them: open Start a
+        // conversation for that exact person instead of failing.
+        if action.is_none()
+            && let Some(user) = morpheus_matrix::exact_user_id(&input)
+        {
+            window.set_room_actions_open(false);
+            window.invoke_open_people(user.into());
+            return;
+        }
         let account_id = window.get_active_account_local_id().to_string();
         if account_id.is_empty() {
             window.set_room_action_error("Choose a Matrix account first".into());
