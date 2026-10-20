@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use morpheus_config::{Config, ConfigStore};
 use slint::fontique_011::fontique;
-use slint::{ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 
 use super::scope::{self, Scope};
 use crate::{AppWindow, FontFamilyItem};

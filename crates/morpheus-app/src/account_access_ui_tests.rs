@@ -5797,13 +5797,12 @@ fn drawn_icon(ui: &AppWindow, label: &str) -> (Bounds, DrawnIcon) {
 async fn assert_vector_icons(ui: &AppWindow) {
     let page = ui.get_page();
     let live = ui.get_live_session();
-    let was_muted = ui.get_mic_muted();
     let space = ui.get_active_space_id();
     let side = ui.get_show_side_panel();
     let tab = ui.get_side_panel_tab();
+    let reveal = ui.get_details_reveal_open();
     ui.set_page(0);
-    ui.set_show_side_panel(true);
-    ui.set_side_panel_tab(0);
+    ui.invoke_show_members_panel();
     settle(ui).await;
     let tokens = ui.global::<crate::StyleTokens>();
     let stroke_for = |size: f32, high_contrast: bool| {
@@ -5892,9 +5891,13 @@ async fn assert_vector_icons(ui: &AppWindow) {
     // Use an explicit synthetic preview state; earlier phases may have
     // left a live-session presentation or a muted preview on the window.
     ui.set_live_session(false);
-    ui.set_mic_muted(false);
     ui.set_page(2);
     settle(ui).await;
+    let was_muted = !control_bounds(ui, "Unmute microphone preview").is_empty();
+    if was_muted {
+        click_control_once(ui, "Unmute microphone preview");
+        settle(ui).await;
+    }
     let (_, unmuted) = drawn_icon(ui, "Mute microphone preview");
     click_control_once(ui, "Mute microphone preview");
     settle(ui).await;
@@ -5911,12 +5914,25 @@ async fn assert_vector_icons(ui: &AppWindow) {
     // Both preview controls draw in the window's ink.
     assert_eq!(muted.strokes[0], back.strokes[0]);
     click_control_once(ui, "Unmute microphone preview");
+    if was_muted {
+        settle(ui).await;
+        click_control_once(ui, "Mute microphone preview");
+    }
     ui.set_live_session(live);
-    ui.set_mic_muted(was_muted);
     ui.set_active_space_id(space);
+    // Restore through the window's real navigation seam; internal tab and
+    // preview-microphone properties need no new Rust write access for tests.
+    match tab {
+        0 => ui.invoke_show_members_panel(),
+        1 => ui.invoke_show_thread_panel(),
+        2 => ui.invoke_focus_room_search(),
+        3 => ui.invoke_show_pinned_panel(),
+        4 => ui.invoke_show_transfer_panel(),
+        _ => panic!("unexpected details tab"),
+    }
     ui.set_page(page);
     ui.set_show_side_panel(side);
-    ui.set_side_panel_tab(tab);
+    ui.set_details_reveal_open(reveal);
     settle(ui).await;
 }
 
@@ -6213,6 +6229,7 @@ async fn assert_layout_navigation_recovery(ui: &AppWindow, directory: &std::path
 /// Exercise real generated TouchAreas: Slint sends Cancel with button Other.
 /// Neither a cancelled grab nor its late release may persist a layout edit.
 async fn assert_pane_pointer_cancellation(ui: &AppWindow, store: &morpheus_config::ConfigStore) {
+    use i_slint_backend_testing::ElementHandle;
     use slint::platform::PointerEventButton;
     let was_live = ui.get_live_session();
     let was_preview = ui.get_preview_session();

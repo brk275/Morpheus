@@ -50,6 +50,7 @@ use morpheus_config::style_profiles::{
     installed_theme_pack, pack_name_from, read_theme_pack,
 };
 use morpheus_config::{Config, ConfigStore, ThemePack};
+use slint::ComponentHandle;
 
 use super::scope::{self, Scope};
 use crate::AppWindow;

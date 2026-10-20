@@ -40,7 +40,7 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use morpheus_config::{CommitError, Config, ConfigRevision, ConfigStore, ThemePack};
-use slint::{ModelRc, VecModel};
+use slint::{ComponentHandle, ModelRc, VecModel};
 
 use crate::{AppWindow, StudioVariation};
 use session::{Draft, Edits, Group, LookKey, Resolution, look, overlay};
