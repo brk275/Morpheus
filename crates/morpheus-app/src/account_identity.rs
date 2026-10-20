@@ -85,9 +85,10 @@ struct Editor {
     selection: Option<AccountSelection>,
     cancellation: Option<RoomSettingsCancellation>,
     server: Option<OwnProfile>,
-    /// A send ended Unknown and the profile could not be read back: the
-    /// server copy above may be out of date.
-    uncertain: bool,
+    /// A display-name send ended Unknown and the profile could not be read
+    /// back: the server's name may differ from the copy above. Avatar
+    /// outcomes never set this; they keep their own draft for a retry.
+    name_uncertain: bool,
     avatar: AvatarDraft,
     busy: bool,
 }
@@ -102,7 +103,7 @@ impl Default for Editor {
             selection: None,
             cancellation: None,
             server: None,
-            uncertain: false,
+            name_uncertain: false,
             avatar: AvatarDraft::Keep,
             busy: false,
         }
@@ -497,6 +498,7 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_account_profile_homeserver("".into());
     ui.set_account_profile_server_name("".into());
     ui.set_account_profile_server_has_avatar(false);
+    ui.set_account_profile_server_has_name(false);
     ui.set_account_profile_name_input("".into());
     ui.set_account_profile_name_dirty(false);
     ui.set_account_profile_avatar_state(0);
@@ -643,7 +645,7 @@ fn read(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, reset_name: bool) 
                     hold_profile_avatar(&ui, &profile, preview.as_ref());
                     with(|editor| {
                         editor.server = Some(profile);
-                        editor.uncertain = false;
+                        editor.name_uncertain = false;
                     });
                     if with(|editor| matches!(editor.avatar, AvatarDraft::Keep)) {
                         show_image(&ui, preview.as_ref());
@@ -688,6 +690,9 @@ pub(crate) fn apply_server(ui: &AppWindow, profile: &OwnProfile, reset_name: boo
     ui.set_account_profile_homeserver(profile.homeserver.as_str().into());
     ui.set_account_profile_server_name(name.as_str().into());
     ui.set_account_profile_server_has_avatar(profile.has_avatar());
+    // Offered on the raw value: a name that displays as nothing can still
+    // be removed.
+    ui.set_account_profile_server_has_name(!profile.name_is_absent());
     if reset_name {
         ui.set_account_profile_name_input(name.as_str().into());
     }
@@ -760,10 +765,12 @@ fn name_change(
     uncertain: bool,
 ) -> Result<Option<String>, ProfileError> {
     if input.trim().is_empty() {
-        if !uncertain && server.is_none_or(OwnProfile::name_is_absent) {
+        // An empty field never sends anything: removing a name is its own
+        // confirmed action. It is "unchanged" when the server holds no name,
+        // or when the name's state is uncertain (Remove stays available).
+        if uncertain || server.is_none_or(OwnProfile::name_is_absent) {
             return Ok(None);
         }
-        // Emptying the field is not a removal; that is its own action.
         return Err(ProfileError::InvalidName);
     }
     let draft = validate_display_name(input)?;
@@ -773,11 +780,24 @@ fn name_change(
     Ok(Some(draft))
 }
 
+/// Whether Remove display name is offered: the server holds any raw name
+/// at all (a whitespace-only or otherwise unshowable one included), or a
+/// name send's outcome is uncertain.
+fn can_remove_name(server: Option<&OwnProfile>, name_uncertain: bool) -> bool {
+    name_uncertain || server.is_some_and(|server| !server.name_is_absent())
+}
+
+/// The name's uncertainty after a save with no read-back: set only when the
+/// name field itself ended Unknown; any other outcome keeps the previous.
+fn name_uncertain_after(name: Option<FieldOutcome>, previous: bool) -> bool {
+    previous || name == Some(FieldOutcome::Unknown)
+}
+
 fn show_dirty(ui: &AppWindow) {
     let input = ui.get_account_profile_name_input();
     let dirty = with(|editor| {
         !matches!(
-            name_change(input.as_str(), editor.server.as_ref(), editor.uncertain),
+            name_change(input.as_str(), editor.server.as_ref(), editor.name_uncertain),
             Ok(None)
         )
     });
@@ -982,7 +1002,7 @@ fn save(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
         editor
             .server
             .as_ref()
-            .map(|server| name_change(input.as_str(), Some(server), editor.uncertain))
+            .map(|server| name_change(input.as_str(), Some(server), editor.name_uncertain))
     });
     let Some(decided) = decided else {
         return;
@@ -1009,13 +1029,7 @@ fn clear_name(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     ui.set_account_profile_confirm_clear(false);
     // A whitespace-only or otherwise unshowable raw name can be removed too:
     // only a server holding no name at all has nothing to remove.
-    let has_name = with(|editor| {
-        editor.uncertain
-            || editor
-                .server
-                .as_ref()
-                .is_some_and(|server| !server.name_is_absent())
-    });
+    let has_name = with(|editor| can_remove_name(editor.server.as_ref(), editor.name_uncertain));
     if !has_name {
         return;
     }
@@ -1151,16 +1165,12 @@ fn finish_save(
         hold_profile_avatar(ui, profile, picture);
         with(|editor| {
             editor.server = Some(profile.clone());
-            editor.uncertain = false;
+            editor.name_uncertain = false;
         });
-    } else if [name, avatar]
-        .into_iter()
-        .flatten()
-        .any(|field| field == FieldOutcome::Unknown)
-    {
-        // Sent, but nothing could be read back: the held server copy may be
-        // stale, so no draft counts as unchanged until a read succeeds.
-        with(|editor| editor.uncertain = true);
+    } else {
+        // Sent, but nothing could be read back: only a name outcome makes
+        // the held name uncertain; an avatar outcome never touches it.
+        with(|editor| editor.name_uncertain = name_uncertain_after(name, editor.name_uncertain));
     }
     // A failed, unknown or unsent avatar change stays drafted for a retry.
     if avatar == Some(FieldOutcome::Saved) {
@@ -1490,6 +1500,26 @@ mod tests {
     }
 
     #[test]
+    fn remove_is_offered_on_the_raw_name_and_avatar_unknowns_never_block_the_name() {
+        // A whitespace-only raw name displays as nothing but can be removed.
+        let blank = raw(Some("   "));
+        assert_eq!(blank.display_name, None);
+        assert!(can_remove_name(Some(&blank), false));
+        assert!(!can_remove_name(Some(&raw(None)), false));
+        assert!(!can_remove_name(Some(&raw(Some(""))), false));
+        assert!(can_remove_name(Some(&raw(None)), true));
+        // An avatar Unknown with no read-back leaves the name certain...
+        assert!(!name_uncertain_after(None, false));
+        assert!(!name_uncertain_after(Some(FieldOutcome::Saved), false));
+        assert!(name_uncertain_after(Some(FieldOutcome::Unknown), false));
+        // ...so an absent name with an empty field stays unchanged and Save
+        // never fails with InvalidName for it.
+        assert_eq!(name_change("", Some(&raw(None)), false), Ok(None));
+        // And an uncertain name with an empty field sends nothing either.
+        assert_eq!(name_change("", Some(&raw(Some("Synthetic"))), true), Ok(None));
+    }
+
+    #[test]
     fn an_unknown_outcome_never_reads_as_unchanged() {
         let same = raw(Some("Synthetic"));
         // After a send ended Unknown with no read-back, an equal draft can
@@ -1498,7 +1528,7 @@ mod tests {
             name_change("Synthetic", Some(&same), true),
             Ok(Some("Synthetic".to_owned()))
         );
-        assert_eq!(name_change("", Some(&raw(None)), true), Err(ProfileError::InvalidName));
+        assert_eq!(name_change("", Some(&raw(None)), true), Ok(None));
     }
 
     #[test]

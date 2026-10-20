@@ -3405,6 +3405,8 @@ export component AppWindow inherits Window {
     in-out property <string> account-profile-homeserver;
     in-out property <string> account-profile-server-name;
     in-out property <bool> account-profile-server-has-avatar: false;
+    // The server holds any raw display name (even one that shows as nothing).
+    in-out property <bool> account-profile-server-has-name: false;
     in-out property <string> account-profile-name-input;
     in-out property <bool> account-profile-name-dirty: false;
     // 0 keep the server avatar, 1 a chosen image to publish, 2 remove it.
@@ -11444,10 +11446,10 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            if root.account-profile-server-name != "" : HorizontalLayout {
+                            if root.account-profile-server-has-name : HorizontalLayout {
                                 spacing: 8px; vertical-stretch: 0;
                                 Text {
-                                    text: "Saved name: " + root.account-profile-server-name; color: root.muted; font-size: 11px * root.text-scale;
+                                    text: root.account-profile-server-name != "" ? "Saved name: " + root.account-profile-server-name : "Saved name: (blank)"; color: root.muted; font-size: 11px * root.text-scale;
                                     overflow: elide; vertical-alignment: center; horizontal-stretch: 1;
                                 }
                                 if !root.account-profile-confirm-clear : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
