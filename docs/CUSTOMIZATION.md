@@ -956,13 +956,62 @@ writes the complete ID to TOML; IDs and availability differ across operating
 systems. Malformed IDs
 reject the configuration edit and retain the last valid preferences.
 
-Choices apply to the **next join**. Changing Settings or TOML does not reroute
-an active call; leave and rejoin to apply them. At startup of each call,
-Morpheus resolves the exact selected ID again. A missing or ambiguous ID
-produces an explicit audio error without falling back to a different device.
-An unavailable saved choice remains visible until you explicitly change it.
-The call can remain joined with local audio unavailable; choose another device
-and rejoin to retry.
+Saved choices apply to **new calls**. Choosing in a list, including arrow-key
+and wheel steps, and external TOML edits never reroute an active call. During
+a call, **Use for this call** switches that call to the saved choices without
+leaving. While local audio is running, Morpheus opens each new device and
+swaps it in only once it is open, keeping the published microphone track, its
+encryption, and your mute and deafen settings; call audio pauses in both
+directions while a device opens (up to 30 seconds). If the chosen microphone
+or speaker cannot be opened, the one in use stays and the call page says so.
+If local audio had stopped (for example, a chosen device was missing when the
+call started), **Use for this call** starts it again inside the same call with
+a new microphone track, keeping your mute and deafen settings. Morpheus
+resolves the exact selected ID again at the start of each call and on every
+switch. At call start a missing or ambiguous ID produces an audio error; on a
+switch it leaves the device in use and the call page says so. Neither picks a
+different device. An unavailable saved choice remains visible until you
+explicitly change it. The call can remain joined with local audio unavailable;
+choose another device and **Use for this call** to retry without rejoining.
+
+The call page names the microphone and speaker in use and the last change to
+them. If the microphone is disconnected, nothing is sent from it and no
+different microphone is opened for you: Morpheus reopens only the chosen
+microphone by its exact device ID (or, when System default is chosen, the
+exact microphone that was lost). If the speaker is disconnected, call audio
+plays through the system default output, the call page says so, and Morpheus
+moves back to the chosen speaker when it returns. Returning devices are
+detected by checking every 3 seconds for up to 10 minutes after the last
+change; a check that could not finish within that time is not started, so
+Morpheus stops looking by then and says so. Each check pauses call audio
+while it opens a device. A device saved only by a name or an ambiguous alias
+is never reopened on its own. A microphone reopened for System default stays
+on that device even if the system default changes later. A request that
+changes only the speaker never opens a microphone in place of a disconnected
+one; choosing Use for this call with nothing changed from the devices the call
+is using counts as asking for the microphone again.
+
+When the call itself reconnects, Morpheus picks up where it left off. It
+reopens the microphone it was using only by that device's exact ID; if the
+platform gave none (for example an ALSA alias), the microphone is not reopened
+by its route, because System default or an alias may now be a different
+microphone, and the call page says so until you choose a microphone and Use
+for this call. The speaker reopens on its route (System default follows the
+operating system). Morpheus keeps waiting for a disconnected microphone
+without opening another, keeps a stand-in speaker until the chosen one
+returns, and keeps either side working if the other cannot be opened. It then
+switches to your choices again where they differ, saying so if they still
+cannot be opened. This holds even when the connection drops during the very
+first join, before its microphone was published: once that join opened a
+microphone, the reconnect reopens it by the exact ID recorded then, even if
+you had chosen System default rather than that device; if no exact ID was
+ever recorded (the join was lost before any microphone opened, or the
+platform gave none), a reconnect reopens a microphone only if you chose it by
+its exact device, and a System default or alias choice stays closed until you
+choose again. A reconnect never opens System default or an alias afresh. If a
+reconnect interrupts Use for this call, the notice asks you to
+check the devices and choose again rather than promising the switch. Mute,
+deafen and the camera are never changed by a switch or a reconnect.
 
 Device discovery runs off the UI thread and times out after 20 seconds. A
 driver query still blocked in the operating system prevents another query
@@ -970,12 +1019,13 @@ until it returns; late results cannot replace a newer list. Discovery uses the
 platform default backend (CoreAudio, WASAPI, or the configured Linux ALSA
 backend), not every optional CPAL backend. Audio still requires the existing
 48 kHz mono/stereo PCM support. Operating-system default and virtual endpoints
-can themselves reroute audio. Automatic device hotplug recovery, live
-reconfiguration, camera selection, and extra noise-processing controls are
-outside this change. Native compilation and automated guards passed on all four
-targets at `a38fe43`. Selector interaction, permissions, duplicate-name hardware,
-unplug/rejoin and actual routing acceptance on all supported desktops remain
-pending.
+can themselves reroute audio. Camera selection and extra noise-processing
+controls are outside this change. Native compilation and automated guards
+passed on all four targets at `a38fe43`, before in-call switching and
+disconnect recovery were added; those are not yet compiled or run. Selector
+interaction, permissions, duplicate-name hardware, physical unplug and replug,
+in-call switching and actual routing acceptance on all supported desktops
+remain pending.
 
 ## Call membership mode
 

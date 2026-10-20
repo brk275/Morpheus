@@ -126,6 +126,8 @@ fresh evidence. See [the verification log](VERIFICATION.md).
       recovered in a native test. Persisted next-call microphone/speaker
       selectors passed native compilation and regressions on all four targets
       at `3f1a3df`; real routing, permissions and unplug behavior remain open.
+      In-call switching (Use for this call) and disconnect recovery were added
+      later in source only and have not been compiled or run.
       A full network outage, SFU restart, GUI capture stop/start and
       cross-platform call acceptance also remain open.
 - [ ] Settings, themes, accessibility, and platform packaging work on macOS,

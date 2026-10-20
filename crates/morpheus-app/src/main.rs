@@ -102,6 +102,7 @@ use url::Url;
 #[cfg(feature = "native-calls")]
 use crate::calls::{
     AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStartIntent, CallStatus,
+    route_degraded, route_notice, route_reply_notice, route_reply_scope, route_summary,
 };
 use crate::live::{LiveUi, RoomAction, show_error};
 #[cfg(feature = "native-calls")]
@@ -1817,6 +1818,106 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(feature = "native-calls")]
     call_stage::bind(&ui, runtime.handle(), calls.clone());
+    // The call page names the devices in use and the last route change, only
+    // for the call generation on screen. The watch holds only the latest
+    // report, so one for another generation means none for this one yet.
+    #[cfg(feature = "native-calls")]
+    {
+        let calls = calls.clone();
+        let weak = ui.as_weak();
+        runtime.spawn(async move {
+            let mut routes = calls.subscribe_audio_route();
+            loop {
+                let update = routes.borrow_and_update().clone();
+                let calls_for_ui = calls.clone();
+                let closed = weak
+                    .upgrade_in_event_loop(move |ui| {
+                        if update.token == 0 || update.token != calls_for_ui.video_token() {
+                            ui.set_native_audio_route("".into());
+                            ui.set_native_audio_route_notice("".into());
+                            ui.set_native_audio_degraded(false);
+                            return;
+                        }
+                        ui.set_native_audio_degraded(route_degraded(&update.route));
+                        ui.set_native_audio_route(route_summary(&update.route).into());
+                        ui.set_native_audio_route_notice(
+                            update.route.notice.map(route_notice).unwrap_or("").into(),
+                        );
+                    })
+                    .is_err();
+                if closed || routes.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    // Use for this call: the saved catalog IDs (never a label or a display
+    // name) switch the call generation on screen, on this explicit click only.
+    // The reply writes the notice only while that call and this click are
+    // still current and nothing else has replaced the pending text.
+    #[cfg(feature = "native-calls")]
+    {
+        const SWITCHING: &str = "Switching this call's audio…";
+        let calls = calls.clone();
+        let weak = ui.as_weak();
+        let handle = runtime.handle().clone();
+        let clicks = Arc::new(AtomicU64::new(0));
+        ui.on_apply_audio_route_to_call(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if !ui.get_audio_devices_enabled() || ui.get_audio_devices_busy() {
+                return;
+            }
+            let click = clicks.fetch_add(1, Ordering::SeqCst) + 1;
+            // The call itself, not only its generation: a later reply may only
+            // claim a rejoin of this same call.
+            let call = calls.call_token();
+            let token = calls.video_token();
+            if token == 0 || call == 0 || !ui.get_native_call_joined() {
+                ui.set_audio_device_notice(
+                    "No call is in progress, so nothing was switched.".into(),
+                );
+                return;
+            }
+            let selection = audio_devices::selection(&ui);
+            ui.set_audio_device_notice(SWITCHING.into());
+            let calls = calls.clone();
+            let weak = weak.clone();
+            let clicks = clicks.clone();
+            handle.spawn(async move {
+                let result = calls.set_audio_route(token, selection).await;
+                let accepted = result.is_ok();
+                let text = match result {
+                    Ok(()) => "Switch requested. The call page shows which devices are in use.",
+                    Err(CallControllerError::AccountChanged) => {
+                        "The account changed, so this call's audio was not switched."
+                    }
+                    // Nothing was queued and nothing is retried.
+                    Err(CallControllerError::TimedOut(_)) => {
+                        "Switching took too long, so this call's audio was not changed. Choose Use for this call again to retry."
+                    }
+                    Err(_) => "This call cannot switch audio right now, so nothing was changed.",
+                };
+                let calls_for_ui = calls.clone();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    if clicks.load(Ordering::SeqCst) != click
+                        || ui.get_audio_device_notice().as_str() != SWITCHING
+                    {
+                        return;
+                    }
+                    // The pending text always resolves, and once the call on
+                    // screen changed, only to what is still true of this call.
+                    let scope = route_reply_scope(
+                        token,
+                        call,
+                        calls_for_ui.video_token(),
+                        calls_for_ui.call_token(),
+                    );
+                    let text = route_reply_notice(scope, accepted, text);
+                    ui.set_audio_device_notice(text.into());
+                });
+            });
+        });
+    }
     #[cfg(feature = "native-calls")]
     {
         let calls = calls.clone();

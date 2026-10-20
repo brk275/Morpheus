@@ -3566,6 +3566,14 @@ async fn assert_themed_select(ui: &AppWindow) {
     let chosen = Rc::new(RefCell::new(Vec::<String>::new()));
     let record = chosen.clone();
     ui.on_select_audio_microphone(move |value| record.borrow_mut().push(value.into()));
+    // Choosing saves for new calls only; a call in progress switches on its
+    // explicit Use for this call button, never on an arrow or wheel step.
+    let switched = Rc::new(std::cell::Cell::new(0));
+    let switches = switched.clone();
+    ui.on_apply_audio_route_to_call(move || switches.set(switches.get() + 1));
+    let live = ui.get_live_session();
+    ui.set_live_session(true);
+    ui.set_native_call_joined(true);
     let choices: Vec<slint::SharedString> = vec![
         "System default".into(),
         "Desk microphone".into(),
@@ -3580,8 +3588,13 @@ async fn assert_themed_select(ui: &AppWindow) {
     settle(ui).await;
     assert!(crate::settings_search::reveal(ui, "media.audio_devices"));
     settle(ui).await;
-    let label = "Microphone for the next call";
+    let label = "Microphone for calls";
     assert!(focused_control_has_label(ui, label));
+    assert_eq!(
+        button_bounds(ui, "Use for this call").len(),
+        1,
+        "offered in a call"
+    );
 
     key(ui, Key::DownArrow);
     assert_eq!(ui.get_audio_microphone_index(), 1);
@@ -3636,9 +3649,18 @@ async fn assert_themed_select(ui: &AppWindow) {
     settle(ui).await;
     key(ui, Key::UpArrow);
     assert_eq!(ui.get_audio_microphone_index(), 1, "disabled");
+    assert_eq!(switched.get(), 0, "choosing never switches the call");
 
     ui.set_audio_devices_busy(false);
+    ui.set_native_call_joined(false);
+    settle(ui).await;
+    assert!(
+        button_bounds(ui, "Use for this call").is_empty(),
+        "no call, no button"
+    );
     ui.set_audio_devices_enabled(false);
+    ui.set_live_session(live);
+    ui.on_apply_audio_route_to_call(|| {});
     ui.on_select_audio_microphone(|_| {});
     ui.set_page(0);
     settle(ui).await;

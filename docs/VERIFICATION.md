@@ -2152,6 +2152,27 @@ formatting checks cleared; ten new focused regressions await hosted execution.
 Physical routing, permissions, unplug behavior and picker accessibility remain
 required.
 
+A later source-only batch adds in-call device switching and disconnect
+recovery. **Use for this call** reopens the saved exact IDs inside the running
+audio loop and swaps the microphone stream behind the same publication, so the
+track, its encryption, mute and deafen are unchanged; a failed open keeps the
+device in use and says so, and call audio pauses while a device opens. If
+local audio had stopped, the same action restarts it in the call with a new
+track and the same mute and deafen. A lost microphone sends nothing and is
+reopened only by the chosen exact ID (for the system default, the lost one's);
+a lost speaker plays through the visible system default until the chosen one
+returns. A call that reconnects resumes that state (the microphone only by
+its retained exact ID, never by its route; the speaker on its route; a lost
+microphone still waited for; a stand-in speaker kept) instead of opening the
+route afresh. Looking for returning devices stops by a monotonic 10-minute
+deadline after the last change. A later repair bounds and cancels the switch
+admission, keeps a route chosen right after joining, and claims a reconnect
+in the switch notice only for the same call. The call page names the devices
+in use. It has
+not been compiled, formatted or run; focused regressions await hosted
+execution, and physical unplug/replug, in-call switching on real hardware,
+permissions and screen-reader acceptance remain required.
+
 The Linux follow-up completes the PipeWire consumer's required buffer-parameter
 update after receiving a format. Its serialized offer permits only one packed
 RGB plane in mapped memory and preserves producer-supplied row padding. Fixed

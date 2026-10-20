@@ -4027,6 +4027,10 @@ export component AppWindow inherits Window {
     in-out property <bool> native-call-joined: false;
     in-out property <bool> native-audio-failed: false;
     in-out property <string> native-audio-error;
+    // The current call's audio route and its last change, from src/main.rs.
+    in-out property <string> native-audio-route;
+    in-out property <string> native-audio-route-notice;
+    in-out property <bool> native-audio-degraded: false;
     in-out property <bool> native-leave-unconfirmed: false;
     // Native call stage; see call-stage.slint and src/call_stage.rs.
     in-out property <[CallTileItem]> native-call-tiles;
@@ -4288,6 +4292,7 @@ export component AppWindow inherits Window {
     callback discard-update();
     callback dispatch-shortcut(string, bool, bool, bool, bool) -> bool;
     callback refresh-audio-devices();
+    callback apply-audio-route-to-call();
     callback select-audio-microphone(string);
     callback select-audio-speaker(string);
     callback reset-shortcuts();
@@ -9462,7 +9467,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Call audio devices"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
-                        Text { text: "Saved for your next call. Your current call keeps its selection until you leave. An unavailable selected device shows an error. System default follows your operating system's audio routing."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        Text { text: "Saved for new calls. During a call, Use for this call switches it to these devices without leaving; your mute and deafen settings stay as they are. An unavailable selected device shows an error. System default follows your operating system's audio routing."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Microphone"; color: root.ink; font-size: 13px * root.text-scale; }
                         TokenSelect {
                             model: root.audio-microphone-choices;
@@ -9491,7 +9496,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            accessible-label: "Microphone for the next call";
+                            accessible-label: "Microphone for calls";
                             selected(value) => { root.select-audio-microphone(value); }
                         }
                         Text { text: "Speaker"; color: root.ink; font-size: 13px * root.text-scale; }
@@ -9501,10 +9506,18 @@ export component AppWindow inherits Window {
                             colors: root.button-colors;
                             text-scale: root.text-scale;
                             enabled: root.audio-devices-enabled && !root.audio-devices-busy;
-                            accessible-label: "Speaker for the next call";
+                            accessible-label: "Speaker for calls";
                             selected(value) => { root.select-audio-speaker(value); }
                         }
                         TokenButton { colors: root.button-colors; text-scale: root.text-scale; text: root.audio-devices-busy ? "Finding devices…" : "Refresh audio devices"; enabled: root.audio-devices-enabled && !root.audio-devices-busy; activated => { root.refresh-audio-devices(); } }
+                        // The only way a call in progress changes devices: choosing in the
+                        // lists above (arrow or wheel steps included) saves for new calls.
+                        if root.live-session && root.audio-devices-enabled && root.native-call-joined : TokenButton {
+                            colors: root.button-colors; text-scale: root.text-scale;
+                            text: "Use for this call";
+                            enabled: !root.audio-devices-busy;
+                            activated => { root.apply-audio-route-to-call(); }
+                        }
                         // Read-only and focusable, so search can reveal it while devices are unavailable.
                         audio-status-field := ThemedTextInput {
                             text: root.audio-device-notice != "" ? root.audio-device-notice : "Choose Refresh audio devices to list devices.";
@@ -9652,7 +9665,9 @@ export component AppWindow inherits Window {
                                     ? (root.native-audio-failed
                                         ? "Room call joined · local audio unavailable"
                                         : (root.native-audio-ready
-                                        ? "Room call joined · microphone and speaker ready"
+                                        ? (root.native-audio-degraded
+                                            ? "Room call joined · audio device changed, see below"
+                                            : "Room call joined · microphone and speaker ready")
                                         : "Room call joined · preparing local audio…"))
                                     : root.native-call-status)
                                 : "Native calls are unavailable in this build")
@@ -9663,6 +9678,18 @@ export component AppWindow inherits Window {
                     if root.live-session && root.native-audio-failed : Text {
                         text: root.native-audio-error;
                         color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b; font-size: 12px * root.text-scale;
+                        wrap: word-wrap; accessible-live-region: polite;
+                    }
+                    // Which devices the call uses now, and the last change to them.
+                    if root.live-session && root.native-call-joined && !root.native-audio-failed && root.native-audio-route != "" : Text {
+                        text: root.native-audio-route;
+                        color: root.muted; font-size: 11px * root.text-scale;
+                        wrap: word-wrap;
+                    }
+                    if root.live-session && root.native-call-joined && !root.native-audio-failed && root.native-audio-route-notice != "" : Text {
+                        text: root.native-audio-route-notice;
+                        color: root.native-audio-degraded ? (StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b) : root.muted;
+                        font-size: 12px * root.text-scale;
                         wrap: word-wrap; accessible-live-region: polite;
                     }
                     if root.live-session && root.native-camera-active : Text {

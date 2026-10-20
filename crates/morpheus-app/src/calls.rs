@@ -32,6 +32,7 @@
 use std::{
     fmt,
     future::{Future, pending},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -44,10 +45,12 @@ use morpheus_matrix::{
 };
 pub use morpheus_rtc::CallInfo;
 use morpheus_rtc::{
-    AudioControls, AudioDeviceSelection, AudioState, CallOptions, LocalRtcSupport, MediaError,
-    ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd, RtcConnectionSignal, RtcError,
-    RtcService, TransportSupport, local_device_support, local_support,
+    AudioControls, AudioDeviceSelection, AudioResume, AudioState, CallOptions, LocalRtcSupport,
+    MediaError, ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd,
+    RtcConnectionSignal, RtcError, RtcService, TransportSupport, local_device_support,
+    local_support,
 };
+pub use morpheus_rtc::{AudioRoute, DeviceRoute, RouteNotice};
 use tokio::{
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
     time::timeout,
@@ -73,6 +76,9 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(45);
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(75);
+/// How long "Use for this call" may wait for the account manager and the call
+/// slot. Past it, nothing is queued and nothing is retried.
+const ROUTE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 const INVITATION_INTERRUPTED: &str = "Invitation interrupted by a lost connection.";
 
 /// A read-only compatibility result. `TransportReady` means the binary,
@@ -354,13 +360,13 @@ impl AudioFailure {
     pub fn message(self) -> &'static str {
         match self {
             Self::MicrophoneUnavailable => {
-                "Microphone unavailable or ambiguous. Choose a microphone in Settings, then leave and rejoin."
+                "Microphone unavailable or ambiguous. Choose another in Settings under Call audio devices, then Use for this call."
             }
             Self::SpeakerUnavailable => {
-                "Speaker unavailable or ambiguous. Choose a speaker in Settings, then leave and rejoin."
+                "Speaker unavailable or ambiguous. Choose another in Settings under Call audio devices, then Use for this call."
             }
             Self::Other => {
-                "Local audio could not start or stopped. Check device permissions and Settings, then leave and rejoin."
+                "Local audio could not start or stopped. Check device permissions, then choose devices in Settings and Use for this call."
             }
         }
     }
@@ -374,6 +380,169 @@ impl AudioUpdate {
             | Self::Applied { token, .. } => token,
         }
     }
+}
+
+/// The local audio route of call generation `token`, as its audio loop last
+/// applied it. Device names in it are for showing only.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AudioRouteUpdate {
+    pub token: u64,
+    pub route: AudioRoute,
+}
+
+/// A route the user chose for call generation `token` (`set_audio_route`).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RouteRequest {
+    token: u64,
+    selection: AudioDeviceSelection,
+    /// The same selection as the route this generation runs with
+    /// (`Shared::route_baseline`): the user asked again with nothing changed.
+    /// Decided at admission, one request at a time, so coalesced changes
+    /// never look like a repeat.
+    retry: bool,
+}
+
+/// One line for the call page: the device each direction of call audio uses.
+/// Platform names are bounded and stripped of control and direction
+/// characters before they are shown.
+pub fn route_summary(route: &AudioRoute) -> String {
+    fn side(label: &str, route: &DeviceRoute) -> String {
+        let name = |name: &Option<String>| {
+            name.as_deref()
+                .map(crate::audio_devices::friendly_name)
+                .filter(|name| !name.is_empty())
+        };
+        match route {
+            DeviceRoute::Opening => format!("{label}: opening…"),
+            DeviceRoute::Chosen {
+                name: device,
+                system_default: true,
+            } => match name(device) {
+                Some(device) => format!("{label}: System default ({device})"),
+                None => format!("{label}: System default"),
+            },
+            DeviceRoute::Chosen { name: device, .. } => format!(
+                "{label}: {}",
+                name(device).unwrap_or_else(|| "the chosen device".to_owned())
+            ),
+            DeviceRoute::Previous { name: device } => format!(
+                "{label}: {} (the chosen one could not be opened)",
+                name(device).unwrap_or_else(|| "the device in use before".to_owned())
+            ),
+            DeviceRoute::DefaultInstead { name: device } => match name(device) {
+                Some(device) => format!("{label}: System default ({device}) instead"),
+                None => format!("{label}: System default instead"),
+            },
+            DeviceRoute::Lost => format!("{label}: none in use"),
+        }
+    }
+    format!(
+        "{} · {}",
+        side("Microphone", &route.microphone),
+        side("Speaker", &route.speaker)
+    )
+}
+
+/// What changed, in words. The route summary says what holds now.
+pub fn route_notice(notice: RouteNotice) -> &'static str {
+    match notice {
+        RouteNotice::Switched => "Call audio switched to the chosen devices.",
+        RouteNotice::MicrophoneSwitchFailed => {
+            "The chosen microphone could not be opened. The microphone in use did not change."
+        }
+        RouteNotice::SpeakerSwitchFailed => {
+            "The chosen speaker could not be opened. The speaker in use did not change."
+        }
+        RouteNotice::MicrophoneLost => {
+            "Your microphone was disconnected. Nothing is sent from it; if it has an exact device ID, Morpheus looks for it for up to 10 minutes. Or choose another."
+        }
+        RouteNotice::MicrophoneDenied => {
+            "The system withdrew microphone access. Nothing is sent from the microphone."
+        }
+        RouteNotice::MicrophoneRestored => {
+            "The chosen microphone is open and in use. Your mute setting did not change."
+        }
+        RouteNotice::SpeakerFellBack => {
+            "Your speaker was disconnected. Call audio plays through the system default output until it returns."
+        }
+        RouteNotice::SpeakerLost => {
+            "Your speaker was disconnected and no output is in use, so call audio is not playing."
+        }
+        RouteNotice::SpeakerRestored => "Your speaker is back and in use again.",
+        RouteNotice::DefaultSpeakerReopened => {
+            "Your speaker was disconnected. Call audio now plays through the system default output."
+        }
+        RouteNotice::ReconnectStopped => {
+            "Stopped looking for the disconnected device. Choose devices in Settings and Use for this call."
+        }
+        RouteNotice::MicrophoneNotResumed => {
+            "Call audio started again, but your microphone has no exact device identity to reopen it by, so it was not reopened and nothing is sent from it. Choose a microphone and Use for this call."
+        }
+    }
+}
+
+/// What a "Use for this call" reply may still claim when it arrives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteReplyScope {
+    /// The generation it was made for is still on screen: its outcome stands.
+    Current,
+    /// The same call rejoined under a new generation (an accepted request
+    /// carries over to it; a refused one does not).
+    Rejoined,
+    /// That call ended, whether or not another call has started since.
+    Ended,
+}
+
+/// Compare the call and generation a click was made for (`clicked_call`,
+/// `clicked_generation`) with those on screen now. Only the same call
+/// (`CallController::call_token`) under a new generation is a rejoin; a new
+/// nonzero generation of another call is not.
+pub fn route_reply_scope(
+    clicked_generation: u64,
+    clicked_call: u64,
+    generation_now: u64,
+    call_now: u64,
+) -> RouteReplyScope {
+    if clicked_call == 0 || call_now != clicked_call || generation_now == 0 {
+        RouteReplyScope::Ended
+    } else if generation_now == clicked_generation {
+        RouteReplyScope::Current
+    } else {
+        RouteReplyScope::Rejoined
+    }
+}
+
+/// The settled "Use for this call" notice: `outcome` (the admission's own
+/// text) while its generation is on screen, else only what is still true.
+/// After a rejoin nothing is promised: a carried choice is applied, but a
+/// retry is not carried (`Shared::retag_route_for_rejoin`), so the user is
+/// asked to check and choose again rather than told the switch will happen.
+pub fn route_reply_notice(
+    scope: RouteReplyScope,
+    accepted: bool,
+    outcome: &'static str,
+) -> &'static str {
+    match scope {
+        RouteReplyScope::Current => outcome,
+        RouteReplyScope::Ended => "The call ended before the switch was confirmed.",
+        RouteReplyScope::Rejoined if accepted => {
+            "The call reconnected while switching. The call page shows which devices are in use; if they are not the ones you chose, choose Use for this call again."
+        }
+        RouteReplyScope::Rejoined => {
+            "The call reconnected before the switch was made. Choose Use for this call again."
+        }
+    }
+}
+
+/// Whether either direction is not on the device the user chose, so the call
+/// page must not call local audio ready.
+pub fn route_degraded(route: &AudioRoute) -> bool {
+    [&route.microphone, &route.speaker].into_iter().any(|side| {
+        matches!(
+            side,
+            DeviceRoute::Previous { .. } | DeviceRoute::DefaultInstead { .. } | DeviceRoute::Lost
+        )
+    })
 }
 
 enum CallSlot {
@@ -439,10 +608,21 @@ struct Shared {
     // Call-stage pin/page/visibility requests; see `choose_stage`.
     stage: watch::Sender<StageRequest>,
     audio: watch::Sender<AudioUpdate>,
+    /// The audio route the current generation's loop last applied.
+    audio_route: watch::Sender<AudioRouteUpdate>,
+    /// The route the user last chose for a call generation; the worker reads it.
+    route_requests: watch::Sender<RouteRequest>,
+    /// The route a call generation runs with: what its join opened, then each
+    /// request admitted for it. A request equal to it is the user's
+    /// unchanged repeat (`RouteRequest::retry`). Written under `slot`.
+    route_baseline: std::sync::Mutex<(u64, AudioDeviceSelection)>,
     local_video: watch::Sender<LocalVideoStatus>,
     active_capture_workers: Arc<AtomicUsize>,
     active_video_token: AtomicU64,
     active_audio_token: AtomicU64,
+    /// The running call itself (its first generation's token), unchanged by
+    /// rejoins and retired only by that same call; 0 without a call.
+    active_call_token: AtomicU64,
     next_token: AtomicU64,
 }
 
@@ -548,8 +728,56 @@ impl Shared {
         }
     }
 
-    fn clear_media(&self, token: u64) {
-        self.clear_video(token);
+    /// Audio restarted inside the same generation after it had stopped: show
+    /// it as preparing again, under that generation's token. Call with the
+    /// call slot held and its generation checked.
+    fn rearm_audio(&self, token: u64) {
+        let rearmed = self
+            .active_audio_token
+            .compare_exchange(0, token, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if rearmed || self.active_audio_token.load(Ordering::SeqCst) == token {
+            self.audio.send_replace(AudioUpdate::Unavailable { token });
+        }
+    }
+
+    /// A route report renders only for the current call generation.
+    fn send_audio_route(&self, token: u64, route: AudioRoute) {
+        if token != 0 && self.active_video_token.load(Ordering::SeqCst) == token {
+            self.audio_route
+                .send_replace(AudioRouteUpdate { token, route });
+        }
+    }
+
+    /// Carry generation `previous`'s route choice and baseline to the rejoin
+    /// that replaces it (`generation`). Call with the slot held. A retry is
+    /// never carried: whether the lost join consumed it is not known, and an
+    /// already-consumed System default or alias retry must not reopen another
+    /// microphone on the rejoin. The reply for it says so
+    /// (`route_reply_notice`).
+    fn retag_route_for_rejoin(&self, previous: u64, generation: u64) {
+        self.route_requests.send_if_modified(|request| {
+            let ours = request.token == previous;
+            if ours {
+                request.token = generation;
+                request.retry = false;
+            }
+            ours
+        });
+        let mut baseline = self
+            .route_baseline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if baseline.0 == previous {
+            baseline.0 = generation;
+        }
+    }
+
+    fn clear_media(&self, call: u64, token: u64) {
+        if self.active_video_token.load(Ordering::SeqCst) == token {
+            self.audio_route.send_replace(AudioRouteUpdate::default());
+        }
+        self.clear_video(call, token);
         self.clear_audio(token);
         if self.active_video_token.load(Ordering::SeqCst) == 0 {
             self.invitation.send_replace(InvitationUpdate::default());
@@ -566,11 +794,23 @@ impl Shared {
         }
     }
 
-    fn clear_video(&self, token: u64) {
+    /// Retire only the lifecycle identity whose cleanup is completing. The
+    /// video clear and this step are separate atomic operations: an older
+    /// cleanup may resume here after a replacement call has started.
+    fn clear_call_identity(&self, call: u64) {
+        let _ =
+            self.active_call_token
+                .compare_exchange(call, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    fn clear_video(&self, call: u64, token: u64) {
         let cleared = self
             .active_video_token
             .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
+        if cleared {
+            self.clear_call_identity(call);
+        }
         // A late producer can race the first clear while its async task is
         // being cancelled. Re-send on final worker cleanup, but never clear a
         // newer call's generation.
@@ -615,10 +855,14 @@ impl CallController {
                 roster,
                 stage: watch::channel(StageRequest::default()).0,
                 audio,
+                audio_route: watch::channel(AudioRouteUpdate::default()).0,
+                route_requests: watch::channel(RouteRequest::default()).0,
+                route_baseline: std::sync::Mutex::default(),
                 local_video,
                 active_capture_workers: Arc::new(AtomicUsize::new(0)),
                 active_video_token: AtomicU64::new(0),
                 active_audio_token: AtomicU64::new(0),
+                active_call_token: AtomicU64::new(0),
                 next_token: AtomicU64::new(1),
             }),
         }
@@ -665,6 +909,52 @@ impl CallController {
         self.shared.audio.subscribe()
     }
 
+    /// Which device each direction of the current call's audio uses, and the
+    /// last route change worth telling the user about.
+    pub fn subscribe_audio_route(&self) -> watch::Receiver<AudioRouteUpdate> {
+        self.shared.audio_route.subscribe()
+    }
+
+    /// Switch the observed call generation's microphone and speaker to
+    /// `selection` without leaving. A running audio loop opens the new devices
+    /// beside the ones in use and swaps each only once it is open, keeping
+    /// the published microphone track, its encryption and the mute and deafen
+    /// state; if local audio had stopped (a chosen device was missing at the
+    /// start, or another open was still in progress), it starts again on
+    /// `selection` inside the same join, publishing a new microphone track
+    /// with the stopped controls' mute and deafen state. The outcome arrives on
+    /// `subscribe_audio_route()` and `subscribe_audio()`; this only queues it.
+    /// Pass only validated IDs from the device catalog. Nothing is persisted
+    /// here, and no microphone or camera is enabled that was not.
+    pub async fn set_audio_route(
+        &self,
+        token: u64,
+        selection: AudioDeviceSelection,
+    ) -> Result<(), CallControllerError> {
+        // Fenced on the call generation, not the audio token: a local audio
+        // failure clears that, and choosing other devices is how it recovers.
+        if token == 0 || self.video_token() != token {
+            return Err(CallControllerError::StaleCall);
+        }
+        let status = self.subscribe_status();
+        let admission = async {
+            let account = self
+                .manager
+                .active_account()
+                .await
+                .ok_or(CallControllerError::AccountChanged)?;
+            admit_route_request(&self.shared, token, &account.id, selection).await
+        };
+        bounded_route_admission(
+            &self.shared,
+            status,
+            token,
+            ROUTE_ADMISSION_TIMEOUT,
+            admission,
+        )
+        .await
+    }
+
     pub fn subscribe_local_video(&self) -> watch::Receiver<LocalVideoStatus> {
         self.shared.local_video.subscribe()
     }
@@ -672,6 +962,13 @@ impl CallController {
     /// A queued UI update may only render for the current call generation.
     pub fn video_token(&self) -> u64 {
         self.shared.active_video_token.load(Ordering::SeqCst)
+    }
+
+    /// The running call itself, unchanged when it rejoins under a new
+    /// generation (`video_token`); 0 without a call. Each call, whatever its
+    /// account or room, gets its own.
+    pub fn call_token(&self) -> u64 {
+        self.shared.active_call_token.load(Ordering::SeqCst)
     }
 
     pub fn audio_token(&self) -> u64 {
@@ -1032,6 +1329,9 @@ impl CallController {
                 video_commands: video_tx,
                 capture_stop: Arc::clone(&capture_stop),
             });
+            // The call's own identity first: a reply that sees this
+            // generation must also see whose call it is.
+            self.shared.active_call_token.store(token, Ordering::SeqCst);
             self.shared
                 .active_video_token
                 .store(token, Ordering::SeqCst);
@@ -1183,7 +1483,7 @@ impl CallController {
         if let Some(cancel) = cancel {
             let _ = cancel.send(());
         }
-        self.shared.clear_media(presentation);
+        self.shared.clear_media(token, presentation);
         let finished = timeout(SHUTDOWN_TIMEOUT, async {
             loop {
                 if let Some(result) = done.borrow_and_update().clone() {
@@ -1518,7 +1818,7 @@ impl CallWorker {
                 .is_err()
             || !self.selection.is_current()
         {
-            self.shared.clear_media(self.presentation);
+            self.shared.clear_media(self.token, self.presentation);
             let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
             self.send_ready(Err(CallControllerError::Cancelled));
             self.finish(leave.map_err(|error| error.to_string()), None)
@@ -1604,7 +1904,7 @@ impl CallWorker {
             || !self.selection.is_current()
             || signaling_health(&sync_state) == SignalingHealth::Unavailable
         {
-            self.shared.clear_media(self.presentation);
+            self.shared.clear_media(self.token, self.presentation);
             let reason = if account_still_active && self.selection.is_current() {
                 CallControllerError::Unavailable(AudioCallCapability::StickySyncRequired(
                     sync_state,
@@ -1638,6 +1938,16 @@ impl CallWorker {
         };
         let mut info = info;
         let mut controls = controls;
+        // Route choices made for this call (`set_audio_route`). One may be
+        // queued already (Joined was published above), and one made while the
+        // worker rejoins waits too: each join's start takes it
+        // (`begin_session_route`).
+        let mut route_requests = self.shared.route_requests.subscribe();
+        // A rejoin resumes local audio where the lost join left it (devices
+        // in use, a lost microphone still waited for, a speaker still
+        // standing in) and then switches to the chosen route, rather than
+        // opening that afresh.
+        let mut resume_audio: Option<AudioResume> = None;
         let mut invitation_pending = self.intent == CallStartIntent::Notify;
         let mut invitation_deadline = None;
         let mut invitation_receipt = None;
@@ -1655,8 +1965,21 @@ impl CallWorker {
             // A platform publish operation can suspend the call worker. These
             // watchers stop OS capture immediately even if the worker has not
             // yet returned to its main account/sync select loop.
-            let guards =
+            let mut guards =
                 self.spawn_capture_guards(&active, &sync, incoming_guard.as_ref(), Some(&controls));
+            // A route chosen before this join started (right after Joined, or
+            // while the worker was rejoining) applies from its first device
+            // open, and becomes the baseline later requests are compared with.
+            let start_retry = begin_session_route(
+                &self.shared,
+                &mut route_requests,
+                self.presentation,
+                &mut self.audio_devices,
+            )
+            .await;
+            // Kept until this join's audio reports its own resume point: a join
+            // lost before it opened anything resumes from the same point again.
+            let mut resumed_from = resume_audio.take();
             let session = {
                 let mut call_events = match rtc.take_call_events(&self.room_id) {
                     Ok(events) => events,
@@ -1678,12 +2001,19 @@ impl CallWorker {
                 )
                 .send(&rtc);
                 tokio::pin!(invitation);
-                let audio = rtc.run_audio_controlled_with_devices(
+                // Owns its controls, so audio can start again inside this join
+                // on new controls (see the route request branch below).
+                let mut audio = run_local_audio(
+                    &rtc,
                     &self.room_id,
-                    &controls,
+                    controls.clone(),
+                    resumed_from.clone(),
                     self.audio_devices.clone(),
+                    start_retry,
                 );
                 let mut applied_audio = controls.subscribe_applied_state();
+                let mut audio_route = controls.subscribe_route();
+                let mut audio_failed = false;
                 let video = run_remote_video(
                     &rtc,
                     &self.room_id,
@@ -1693,7 +2023,6 @@ impl CallWorker {
                     self.shared.stage.subscribe(),
                     &self.shared.active_video_token,
                 );
-                tokio::pin!(audio);
                 tokio::pin!(video);
                 let mut audio_running = true;
                 let mut video_running = true;
@@ -1788,12 +2117,74 @@ impl CallWorker {
                                 // A missing or stuck local audio device must not
                                 // tear down the receive-only call stage.
                                 audio_running = false;
+                                audio_failed = true;
                                 self.shared.fail_audio(self.presentation, AudioFailure::from_error(&error));
                             }
                         },
                         changed = applied_audio.changed() => {
                             if changed.is_ok() && controls.is_running() {
                                 self.shared.send_applied_audio(self.presentation, *applied_audio.borrow_and_update());
+                            }
+                        }
+                        changed = audio_route.changed() => {
+                            if changed.is_ok() {
+                                let route = audio_route.borrow_and_update().clone();
+                                self.shared.send_audio_route(self.presentation, route);
+                            }
+                        }
+                        changed = route_requests.changed() => {
+                            let request = route_requests.borrow_and_update().clone();
+                            // Another generation's choice never reroutes this one.
+                            if changed.is_ok() && request.token == self.presentation {
+                                // The current choice: a rejoin opens it too.
+                                self.audio_devices = request.selection.clone();
+                                if audio_running {
+                                    // The audio loop opens the new devices beside
+                                    // the ones in use and reports the outcome.
+                                    let _ = controls.request_route(request.selection, request.retry);
+                                } else if audio_failed {
+                                    // Restart where the stopped loop left off, so a
+                                    // lost or unresumed microphone is not reopened by
+                                    // its route on a request that did not choose one.
+                                    let resume = controls.resume_point().or_else(|| resumed_from.clone());
+                                    let fresh = self.restarted_audio_controls(
+                                        &rtc,
+                                        &info,
+                                        incoming_guard.as_ref(),
+                                        &sync,
+                                        &controls,
+                                        signaling_deadline.is_some(),
+                                    );
+                                    // Awaits with only the worker's Sync parts:
+                                    // CallWorker is not Sync, and this future
+                                    // must stay Send.
+                                    if let Some(fresh) = fresh
+                                        && let Some(restarted) = install_restarted_audio(
+                                            &self.shared,
+                                            self.token,
+                                            self.presentation,
+                                            &self.selection,
+                                            &self.capture_stop,
+                                            fresh,
+                                        )
+                                        .await
+                                    {
+                                        // New controls, carrying the requested mute and
+                                        // deafen state, replace the stopped ones; the
+                                        // capture guards revoke them from now on.
+                                        controls = restarted;
+                                        guards = self.spawn_capture_guards(&active, &sync, incoming_guard.as_ref(), Some(&controls));
+                                        applied_audio = controls.subscribe_applied_state();
+                                        audio_route = controls.subscribe_route();
+                                        // Opening, not the route from before audio stopped.
+                                        self.shared.send_audio_route(self.presentation, controls.route());
+                                        audio = run_local_audio(&rtc, &self.room_id, controls.clone(), resume.clone(), self.audio_devices.clone(), request.retry);
+                                        // Kept until the restarted loop reports its own.
+                                        resumed_from = resume;
+                                        audio_running = true;
+                                        audio_failed = false;
+                                    }
+                                }
                             }
                         }
                         // A closed roster/video stream must not end microphone
@@ -1867,6 +2258,11 @@ impl CallWorker {
                 );
             }
             let requested = controls.requested_state();
+            resume_audio = Some(rejoin_resume_point(
+                controls.resume_point(),
+                resumed_from,
+                &self.audio_devices,
+            ));
             let guards = self.spawn_capture_guards(&active, &sync, None, None);
             let mut inputs = RecoveryInputs {
                 outgoing: &mut outgoing,
@@ -1892,7 +2288,7 @@ impl CallWorker {
         self.capture_stop.request();
         controls.cancel();
         let outgoing_result = outgoing.shutdown().await;
-        self.shared.clear_media(self.presentation);
+        self.shared.clear_media(self.token, self.presentation);
         // Local media and invitation UI stop before the bounded network
         // cleanup. Unknown HTTP completion has no receipt and is not retried;
         // the invitation's original short expiry remains the fallback.
@@ -2103,6 +2499,35 @@ impl CallWorker {
         )
     }
 
+    /// Controls for starting local audio again inside the same join after its
+    /// loop stopped (a chosen device missing at the start, or another open
+    /// still in progress), for the route the user just chose. They carry the
+    /// stopped ones' requested mute and deafen state, so nothing is unmuted
+    /// that was not, and a signalling pause still holds. Install them with
+    /// `install_restarted_audio`.
+    fn restarted_audio_controls(
+        &self,
+        rtc: &RtcService,
+        info: &CallInfo,
+        incoming_guard: Option<&EstablishedGuard>,
+        sync: &watch::Receiver<SyncStatus>,
+        stopped: &AudioControls,
+        suspended: bool,
+    ) -> Option<AudioControls> {
+        let controls = self
+            .new_audio_controls(rtc, info, incoming_guard, sync)
+            .ok()?;
+        if controls
+            .preset_requested_state(stopped.requested_state())
+            .is_err()
+            || (suspended && controls.set_transmission_suspended(true).is_err())
+        {
+            controls.cancel();
+            return None;
+        }
+        Some(controls)
+    }
+
     fn spawn_capture_guards(
         &self,
         active: &watch::Receiver<Option<AccountInfo>>,
@@ -2248,6 +2673,17 @@ impl CallWorker {
                 request.token = generation;
             }
         });
+        // So is a device choice: one accepted just before the join was lost
+        // is carried to the rejoin as its chosen route (never as a retry)
+        // instead of being dropped as another call's. What the rejoin opens
+        // still follows its own rules (`rejoin_resume_point`), so this opens
+        // nothing by itself; the reply asks the user to check the devices and
+        // choose again (`route_reply_notice`).
+        self.shared.retag_route_for_rejoin(previous, generation);
+        // No device is open until the rejoined loop reports its own route.
+        self.shared
+            .audio_route
+            .send_replace(AudioRouteUpdate::default());
         self.shared
             .video
             .send_replace(VideoUpdate::Clear { token: generation });
@@ -2537,7 +2973,7 @@ impl CallWorker {
     }
 
     async fn finish_with(&mut self, cleanup: Result<(), String>, outcome: CallOutcome) {
-        self.shared.clear_media(self.presentation);
+        self.shared.clear_media(self.token, self.presentation);
         {
             let mut slot = self.shared.slot.lock().await;
             let done = match &*slot {
@@ -2579,6 +3015,188 @@ impl CallWorker {
             // Publish completion while holding the slot lock, so a later
             // acknowledgement sees a completed first cleanup attempt.
             self.done.send_replace(Some(cleanup));
+        }
+    }
+}
+
+type LocalAudioRun<'a> = Pin<Box<dyn Future<Output = Result<(), MediaError>> + Send + 'a>>;
+
+/// A join's local audio loop on `chosen`, resuming where a lost join (or a
+/// stopped loop) left it (`resume`); `retry` when the request that started
+/// it was the user's unchanged repeat. It owns its controls, so audio can
+/// start again on new controls inside the same join.
+fn run_local_audio<'a>(
+    rtc: &'a RtcService,
+    room_id: &'a str,
+    controls: AudioControls,
+    resume: Option<AudioResume>,
+    chosen: AudioDeviceSelection,
+    retry: bool,
+) -> LocalAudioRun<'a> {
+    Box::pin(async move {
+        rtc.run_audio_resuming(room_id, &controls, resume, chosen, retry)
+            .await
+    })
+}
+
+/// Run a "Use for this call" admission for call generation `token` within
+/// `limit` (`ROUTE_ADMISSION_TIMEOUT`), and abandon it as soon as that
+/// generation is no longer the one on screen (Leave, an end, a rejoin, an
+/// account switch). The request is queued only by `admission` completing; on
+/// a timeout or a retirement nothing was queued, and nothing is retried.
+async fn bounded_route_admission(
+    shared: &Shared,
+    mut status: watch::Receiver<CallStatus>,
+    token: u64,
+    limit: Duration,
+    admission: impl Future<Output = Result<(), CallControllerError>>,
+) -> Result<(), CallControllerError> {
+    let retired = async {
+        loop {
+            if shared.active_video_token.load(Ordering::SeqCst) != token
+                || !status.borrow_and_update().controls_available()
+            {
+                return;
+            }
+            if status.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        () = retired => Err(CallControllerError::StaleCall),
+        admitted = timeout(limit, admission) => admitted
+            .unwrap_or(Err(CallControllerError::TimedOut("switching call audio"))),
+    }
+}
+
+/// Queue `selection` for generation `token` of the running call, after a
+/// final check under the slot lock that the call, its generation and its
+/// account (`account_id`) still own it. The send is the last step, after the
+/// only await, so a cancelled admission never queues anything.
+async fn admit_route_request(
+    shared: &Shared,
+    token: u64,
+    account_id: &str,
+    selection: AudioDeviceSelection,
+) -> Result<(), CallControllerError> {
+    let slot = shared.slot.lock().await;
+    let CallSlot::Running(running) = &*slot else {
+        return Err(CallControllerError::StaleCall);
+    };
+    if running.presentation != token
+        || shared.active_video_token.load(Ordering::SeqCst) != token
+        || running.cancel.is_none()
+        || running.capture_stop.requested()
+        || !shared.status.borrow().controls_available()
+    {
+        return Err(CallControllerError::StaleCall);
+    }
+    if running.account_id != account_id {
+        return Err(CallControllerError::AccountChanged);
+    }
+    // An unchanged repeat of the route this generation runs with (what its
+    // join opened, or the last request admitted for it) is a retry. Each
+    // admission moves the baseline, so a change and its undo never are.
+    let retry = {
+        let mut baseline = shared
+            .route_baseline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let retry = baseline.0 == token && baseline.1 == selection;
+        *baseline = (token, selection.clone());
+        retry
+    };
+    shared.route_requests.send_replace(RouteRequest {
+        token,
+        selection,
+        retry,
+    });
+    Ok(())
+}
+
+/// Where the rejoin that replaces a lost join resumes local audio: the lost
+/// join's own point (recorded before its track was even published), else
+/// the point it was itself resumed from, else, when its audio never opened
+/// a device, a conservative point for `chosen` that reopens a microphone
+/// only by an exact chosen ID. An automatic rejoin therefore never opens a
+/// System default or alias microphone whose identity it does not hold.
+fn rejoin_resume_point(
+    lost_join: Option<AudioResume>,
+    carried: Option<AudioResume>,
+    chosen: &AudioDeviceSelection,
+) -> AudioResume {
+    lost_join
+        .or(carried)
+        .unwrap_or_else(|| AudioResume::unestablished(chosen))
+}
+
+/// The route request queued for generation `presentation`, read and marked
+/// seen. Reading the current value, not only a change, matters right after
+/// subscribing: Joined is published first, so a choice accepted in between
+/// is already the receiver's seen value.
+fn take_route_request(
+    requests: &mut watch::Receiver<RouteRequest>,
+    presentation: u64,
+) -> Option<RouteRequest> {
+    let request = requests.borrow_and_update().clone();
+    (request.token == presentation).then_some(request)
+}
+
+/// At the start of each join of generation `presentation`: take a request
+/// already queued for it (Joined is published before the worker subscribes,
+/// and requests admitted while it rejoined wait too) into `chosen`, and
+/// record `chosen` as the route baseline admissions compare with. Under the
+/// slot lock, so no admission interleaves. Returns whether the taken request
+/// was the user's unchanged repeat.
+async fn begin_session_route(
+    shared: &Shared,
+    requests: &mut watch::Receiver<RouteRequest>,
+    presentation: u64,
+    chosen: &mut AudioDeviceSelection,
+) -> bool {
+    let _slot = shared.slot.lock().await;
+    let mut retry = false;
+    if let Some(request) = take_route_request(requests, presentation) {
+        *chosen = request.selection;
+        retry = request.retry;
+    }
+    *shared
+        .route_baseline
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = (presentation, chosen.clone());
+    retry
+}
+
+/// Install restarted audio `controls` only while generation `presentation`
+/// of call `token` is still the running one for its account; Leave or an
+/// account change meanwhile cancels them instead. A free function over the
+/// worker's Sync parts, so the worker future stays Send.
+async fn install_restarted_audio(
+    shared: &Shared,
+    token: u64,
+    presentation: u64,
+    selection: &AccountSelection,
+    capture_stop: &CaptureStop,
+    controls: AudioControls,
+) -> Option<AudioControls> {
+    let mut slot = shared.slot.lock().await;
+    match &mut *slot {
+        CallSlot::Running(running)
+            if running.token == token
+                && running.presentation == presentation
+                && running.cancel.is_some()
+                && selection.is_current()
+                && !capture_stop.requested() =>
+        {
+            running.audio_controls = Some(controls.clone());
+            shared.rearm_audio(presentation);
+            Some(controls)
+        }
+        _ => {
+            controls.cancel();
+            None
         }
     }
 }
@@ -3069,17 +3687,21 @@ mod tests {
             roster,
             stage: watch::channel(StageRequest::default()).0,
             audio,
+            audio_route: watch::channel(AudioRouteUpdate::default()).0,
+            route_requests: watch::channel(RouteRequest::default()).0,
+            route_baseline: std::sync::Mutex::default(),
             local_video,
             active_capture_workers: Arc::new(AtomicUsize::new(0)),
             active_video_token: AtomicU64::new(5),
             active_audio_token: AtomicU64::new(5),
+            active_call_token: AtomicU64::new(5),
             next_token: AtomicU64::new(6),
         };
         shared.invitation.send_replace(InvitationUpdate {
             token: 5,
             text: "Invitation sent",
         });
-        shared.clear_media(5);
+        shared.clear_media(5, 5);
         assert_eq!(shared.active_video_token.load(Ordering::SeqCst), 0);
         assert_eq!(*shared.invitation.borrow(), InvitationUpdate::default());
         shared.invitation.send_replace(InvitationUpdate {
@@ -3099,7 +3721,7 @@ mod tests {
             token: 5,
             members: Vec::new(),
         });
-        shared.clear_media(5);
+        shared.clear_media(5, 5);
         assert_eq!(*shared.invitation.borrow(), InvitationUpdate::default());
         assert_eq!(shared.video.borrow().token(), 0);
         assert_eq!(shared.roster.borrow().token, 0);
@@ -3120,11 +3742,29 @@ mod tests {
             },
             ..LocalVideoStatus::default()
         });
-        shared.clear_media(5);
+        shared.clear_media(5, 5);
         assert_eq!(*shared.invitation.borrow(), current_invitation);
         assert_eq!(shared.video.borrow().token(), 6);
         assert_eq!(shared.local_video.borrow().token, 6);
         assert_eq!(shared.local_video.borrow().screen.source, "New display");
+
+        // End A can win its video CAS, then be descheduled before retiring
+        // its lifecycle identity. Its worker can finish A and install B in
+        // between. Resume A at that exact remaining production step: it must
+        // not erase B's identity, even when B has a different join generation.
+        shared.active_call_token.store(6, Ordering::SeqCst);
+        shared.active_video_token.store(9, Ordering::SeqCst);
+        shared.clear_call_identity(5);
+        assert_eq!(shared.active_call_token.load(Ordering::SeqCst), 6);
+        assert_eq!(shared.active_video_token.load(Ordering::SeqCst), 9);
+        shared.clear_media(5, 5);
+        assert_eq!(shared.active_call_token.load(Ordering::SeqCst), 6);
+
+        // A rejoined call is retired by its stable call ID, not by the
+        // presentation number. Clearing that last join retires only B.
+        shared.clear_media(6, 9);
+        assert_eq!(shared.active_call_token.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.active_video_token.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -3151,10 +3791,14 @@ mod tests {
             roster,
             stage: watch::channel(StageRequest::default()).0,
             audio,
+            audio_route: watch::channel(AudioRouteUpdate::default()).0,
+            route_requests: watch::channel(RouteRequest::default()).0,
+            route_baseline: std::sync::Mutex::default(),
             local_video,
             active_capture_workers: Arc::new(AtomicUsize::new(0)),
             active_video_token: AtomicU64::new(5),
             active_audio_token: AtomicU64::new(5),
+            active_call_token: AtomicU64::new(5),
             next_token: AtomicU64::new(6),
         };
         let state = AudioState {
@@ -3212,7 +3856,139 @@ mod tests {
             *shared.audio.borrow(),
             AudioUpdate::Applied { token: 6, state }
         );
+
+        // Choosing other devices after a failure restarts audio in the same
+        // generation: re-arming shows it preparing again under its own
+        // token, and never takes a later generation's audio.
+        shared.active_audio_token.store(0, Ordering::SeqCst);
+        shared.rearm_audio(5);
+        assert_eq!(shared.active_audio_token.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            *shared.audio.borrow(),
+            AudioUpdate::Unavailable { token: 5 }
+        );
+        shared.active_audio_token.store(6, Ordering::SeqCst);
+        shared.rearm_audio(5);
+        assert_eq!(shared.active_audio_token.load(Ordering::SeqCst), 6);
+
+        // Route reports render only for the current call generation, and
+        // leaving clears them.
+        let route = AudioRoute {
+            generation: 1,
+            microphone: DeviceRoute::Lost,
+            speaker: DeviceRoute::Opening,
+            notice: Some(RouteNotice::MicrophoneLost),
+        };
+        shared.send_audio_route(4, route.clone());
+        shared.send_audio_route(0, route.clone());
+        assert_eq!(*shared.audio_route.borrow(), AudioRouteUpdate::default());
+        shared.send_audio_route(5, route.clone());
+        assert_eq!(
+            *shared.audio_route.borrow(),
+            AudioRouteUpdate { token: 5, route }
+        );
+        shared.clear_media(5, 5);
+        assert_eq!(*shared.audio_route.borrow(), AudioRouteUpdate::default());
     }
+
+    #[test]
+    fn the_call_page_names_each_route_side_and_claims_nothing_more() {
+        let route = AudioRoute {
+            generation: 3,
+            microphone: DeviceRoute::Chosen {
+                name: Some("Desk\u{202e} mic".into()),
+                system_default: false,
+            },
+            speaker: DeviceRoute::DefaultInstead {
+                name: Some("Built-in speakers".into()),
+            },
+            notice: Some(RouteNotice::SpeakerFellBack),
+        };
+        assert_eq!(
+            route_summary(&route),
+            "Microphone: Desk mic · Speaker: System default (Built-in speakers) instead"
+        );
+        let route = AudioRoute {
+            microphone: DeviceRoute::Lost,
+            speaker: DeviceRoute::Chosen {
+                name: None,
+                system_default: true,
+            },
+            ..route
+        };
+        assert_eq!(
+            route_summary(&route),
+            "Microphone: none in use · Speaker: System default"
+        );
+        let route = AudioRoute {
+            microphone: DeviceRoute::Previous {
+                name: Some("Desk mic".into()),
+            },
+            ..route
+        };
+        assert!(route_summary(&route).contains("Desk mic (the chosen one could not be opened)"));
+        // The notices never claim a reroute that did not happen, and losing
+        // the microphone never claims it was replaced.
+        assert!(route_notice(RouteNotice::MicrophoneLost).contains("Nothing is sent"));
+        assert!(
+            route_notice(RouteNotice::MicrophoneRestored).contains("mute setting did not change")
+        );
+        assert!(route_notice(RouteNotice::SpeakerFellBack).contains("system default output"));
+        for notice in [
+            RouteNotice::Switched,
+            RouteNotice::MicrophoneSwitchFailed,
+            RouteNotice::SpeakerSwitchFailed,
+            RouteNotice::MicrophoneLost,
+            RouteNotice::MicrophoneDenied,
+            RouteNotice::MicrophoneRestored,
+            RouteNotice::SpeakerFellBack,
+            RouteNotice::SpeakerLost,
+            RouteNotice::SpeakerRestored,
+            RouteNotice::DefaultSpeakerReopened,
+            RouteNotice::ReconnectStopped,
+            RouteNotice::MicrophoneNotResumed,
+        ] {
+            assert!(!route_notice(notice).contains("rejoin"), "{notice:?}");
+        }
+        // The status line calls audio ready only while both sides are on the
+        // chosen devices (or still opening them).
+        assert!(route_degraded(&route));
+        let chosen = DeviceRoute::Chosen {
+            name: None,
+            system_default: true,
+        };
+        let healthy = AudioRoute {
+            microphone: chosen.clone(),
+            speaker: DeviceRoute::Opening,
+            ..route.clone()
+        };
+        assert!(!route_degraded(&healthy));
+        for side in [
+            DeviceRoute::Lost,
+            DeviceRoute::Previous { name: None },
+            DeviceRoute::DefaultInstead { name: None },
+        ] {
+            assert!(route_degraded(&AudioRoute {
+                speaker: side,
+                ..healthy.clone()
+            }));
+        }
+        for failure in [
+            AudioFailure::MicrophoneUnavailable,
+            AudioFailure::SpeakerUnavailable,
+            AudioFailure::Other,
+        ] {
+            assert!(
+                !failure.message().contains("leave and rejoin"),
+                "{failure:?}"
+            );
+            assert!(
+                failure.message().contains("Use for this call"),
+                "{failure:?}"
+            );
+        }
+    }
+
     #[test]
     fn queued_outgoing_request_suppresses_ring_before_call_token_or_lock_changes() {
         let gate = Arc::new(RingRequestGate::default());
@@ -3226,5 +4002,279 @@ mod tests {
         drop(pending);
         assert!(!gate.allowed(initial));
         assert!(gate.allowed(pending_epoch));
+    }
+
+    #[test]
+    fn a_late_route_reply_claims_a_rejoin_only_for_the_same_call() {
+        // Clicked on generation 9 of call 7.
+        assert_eq!(route_reply_scope(9, 7, 9, 7), RouteReplyScope::Current);
+        // Call 7 rejoined as generation 11.
+        assert_eq!(route_reply_scope(9, 7, 11, 7), RouteReplyScope::Rejoined);
+        // Call 7 ended, and another call (12) started: not a rejoin, whatever
+        // its account or room.
+        assert_eq!(route_reply_scope(9, 7, 12, 12), RouteReplyScope::Ended);
+        assert_eq!(route_reply_scope(9, 7, 0, 0), RouteReplyScope::Ended);
+        // Nothing to compare against: never claimed as this call.
+        assert_eq!(route_reply_scope(9, 0, 9, 0), RouteReplyScope::Ended);
+    }
+
+    #[tokio::test]
+    async fn a_route_chosen_before_the_worker_subscribes_is_still_applied() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let controller = CallController::new(manager, UpdateActivity::default());
+        let shared = &controller.shared;
+        let usb = AudioDeviceSelection {
+            microphone: Some("coreaudio:usb".into()),
+            speaker: None,
+        };
+        // Joined is published, a route is accepted (an unchanged repeat), then
+        // the worker subscribes and starts the join (its own steps).
+        shared.route_requests.send_replace(RouteRequest {
+            token: 9,
+            selection: usb.clone(),
+            retry: true,
+        });
+        let mut requests = shared.route_requests.subscribe();
+        assert!(
+            !requests.has_changed().unwrap(),
+            "already seen when subscribed"
+        );
+        let mut chosen = AudioDeviceSelection::default();
+        let retry = begin_session_route(shared, &mut requests, 9, &mut chosen).await;
+        assert!(retry, "a repeat admitted before the join started is kept");
+        assert_eq!(chosen, usb);
+        // The route the join opens is the baseline later requests compare with.
+        assert_eq!(*shared.route_baseline.lock().unwrap(), (9, usb.clone()));
+        // Another generation's queued choice is never taken.
+        shared.route_requests.send_replace(RouteRequest {
+            token: 8,
+            ..RouteRequest::default()
+        });
+        let retry = begin_session_route(shared, &mut requests, 10, &mut chosen).await;
+        assert!(!retry);
+        assert_eq!(chosen, usb);
+        assert_eq!(shared.route_baseline.lock().unwrap().0, 10);
+    }
+
+    #[tokio::test]
+    async fn a_held_call_slot_bounds_a_route_switch_and_never_queues_it_late() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let controller = CallController::new(manager, UpdateActivity::default());
+        let shared = Arc::clone(&controller.shared);
+        shared.active_video_token.store(9, Ordering::SeqCst);
+        shared.status.send_replace(CallStatus::Joined {
+            account_id: "account-a".into(),
+            call: CallInfo {
+                room_id: "!room:example.org".into(),
+                slot_id: "m.call#room".into(),
+                membership_id: "member".into(),
+                local_identity: "identity".into(),
+            },
+        });
+        let (cancel, _cancelled) = oneshot::channel();
+        let (_done, done) = watch::channel(None);
+        let (video_commands, _video_rx) = mpsc::channel(1);
+        let mut requests = shared.route_requests.subscribe();
+        let usb = AudioDeviceSelection {
+            microphone: Some("coreaudio:usb".into()),
+            speaker: None,
+        };
+        let limit = Duration::from_millis(50);
+        // A worker wedged while holding the slot of a running call that would
+        // otherwise admit this request: the switch gives up, and queues
+        // nothing later once the slot is free.
+        let mut held = shared.slot.lock().await;
+        *held = CallSlot::Running(RunningCall {
+            token: 7,
+            presentation: 9,
+            account_id: "account-a".into(),
+            room_id: "!room:example.org".into(),
+            cancel: Some(cancel),
+            done,
+            audio_controls: None,
+            video_commands,
+            capture_stop: Arc::new(CaptureStop::default()),
+        });
+        let admission = admit_route_request(&shared, 9, "account-a", usb.clone());
+        let result =
+            bounded_route_admission(&shared, controller.subscribe_status(), 9, limit, admission)
+                .await;
+        assert!(matches!(result, Err(CallControllerError::TimedOut(_))));
+        drop(held);
+        tokio::task::yield_now().await;
+        assert!(
+            !requests.has_changed().unwrap(),
+            "a timed-out admission never queues"
+        );
+
+        // Positive control with the slot free: each admission queues once, and
+        // only an unchanged repeat of the route the generation runs with is a
+        // retry (the first one included, with no click before it), so a
+        // change and its undo never look like one.
+        let speaker = AudioDeviceSelection {
+            speaker: Some("coreaudio:desk".into()),
+            ..usb.clone()
+        };
+        let other = AudioDeviceSelection::default();
+        assert_eq!(*shared.route_baseline.lock().unwrap(), (0, other.clone()));
+        let mut chosen = usb.clone();
+        let mut started = shared.route_requests.subscribe();
+        assert!(!begin_session_route(&shared, &mut started, 9, &mut chosen).await);
+        for (selection, retry) in [
+            (usb.clone(), true),
+            (usb.clone(), true),
+            (speaker, false),
+            (usb.clone(), false),
+            (other, false),
+        ] {
+            let admission = admit_route_request(&shared, 9, "account-a", selection.clone());
+            bounded_route_admission(&shared, controller.subscribe_status(), 9, limit, admission)
+                .await
+                .unwrap();
+            let queued = requests.borrow_and_update().clone();
+            assert_eq!(
+                (queued.token, queued.selection, queued.retry),
+                (9, selection, retry)
+            );
+        }
+
+        // The call ending while it waits abandons it at once, not by the bound.
+        let held = shared.slot.lock().await;
+        let admission = admit_route_request(&shared, 9, "account-a", usb);
+        let pending = bounded_route_admission(
+            &shared,
+            controller.subscribe_status(),
+            9,
+            Duration::from_secs(2),
+            admission,
+        );
+        let end = async {
+            shared.active_video_token.store(0, Ordering::SeqCst);
+            shared.status.send_replace(CallStatus::Idle);
+        };
+        let started = tokio::time::Instant::now();
+        let (result, ()) = tokio::join!(pending, end);
+        assert!(matches!(result, Err(CallControllerError::StaleCall)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "abandoned at once"
+        );
+        drop(held);
+        tokio::task::yield_now().await;
+        assert!(!requests.has_changed().unwrap(), "nothing was queued");
+    }
+
+    #[test]
+    fn a_rejoin_after_a_join_lost_before_its_first_report_keeps_an_unknown_microphone_closed() {
+        // The worker's session-to-rejoin hand-off. A first join lost before
+        // its audio recorded anything (the open or the first publication
+        // still pending) has no point of its own and carried none.
+        let default = AudioDeviceSelection::default();
+        let alias = AudioDeviceSelection {
+            microphone: Some("alsa:default".into()),
+            speaker: None,
+        };
+        let usb = AudioDeviceSelection {
+            microphone: Some("coreaudio:usb".into()),
+            speaker: None,
+        };
+        // System default or an alias may name another microphone now: closed.
+        for chosen in [&default, &alias] {
+            let point = rejoin_resume_point(None, None, chosen);
+            assert_eq!(point.retained_microphone(), None, "{chosen:?}");
+        }
+        // An exact chosen device is the only one reopened.
+        assert_eq!(
+            rejoin_resume_point(None, None, &usb).retained_microphone(),
+            Some("coreaudio:usb".into())
+        );
+        // The lost join's own point (recorded before its first publication)
+        // wins over the one it carried and over the route.
+        let recorded = AudioResume::unestablished(&usb);
+        let carried = AudioResume::unestablished(&default);
+        let point = rejoin_resume_point(Some(recorded), Some(carried.clone()), &default);
+        assert_eq!(point.retained_microphone(), Some("coreaudio:usb".into()));
+        assert_eq!(
+            rejoin_resume_point(None, Some(carried.clone()), &usb),
+            carried
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_cut_off_by_a_rejoin_is_not_carried_and_the_reply_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let controller = CallController::new(manager, UpdateActivity::default());
+        let shared = Arc::clone(&controller.shared);
+        shared.active_video_token.store(9, Ordering::SeqCst);
+        shared.status.send_replace(CallStatus::Joined {
+            account_id: "account-a".into(),
+            call: CallInfo {
+                room_id: "!room:example.org".into(),
+                slot_id: "m.call#room".into(),
+                membership_id: "member".into(),
+                local_identity: "identity".into(),
+            },
+        });
+        let (cancel, _cancelled) = oneshot::channel();
+        let (_done, done) = watch::channel(None);
+        let (video_commands, _video_rx) = mpsc::channel(1);
+        *shared.slot.lock().await = CallSlot::Running(RunningCall {
+            token: 7,
+            presentation: 9,
+            account_id: "account-a".into(),
+            room_id: "!room:example.org".into(),
+            cancel: Some(cancel),
+            done,
+            audio_controls: None,
+            video_commands,
+            capture_stop: Arc::new(CaptureStop::default()),
+        });
+        // System default, with the microphone left unresumed (no exact ID).
+        let default = AudioDeviceSelection::default();
+        let mut worker = shared.route_requests.subscribe();
+        let limit = Duration::from_secs(2);
+        for consumed in [false, true] {
+            // Generation 9's join starts on System default (the baseline).
+            let mut chosen = default.clone();
+            assert!(!begin_session_route(&shared, &mut worker, 9, &mut chosen).await);
+            // An unchanged Use for this call: admitted as a retry.
+            let admission = admit_route_request(&shared, 9, "account-a", default.clone());
+            bounded_route_admission(&shared, controller.subscribe_status(), 9, limit, admission)
+                .await
+                .unwrap();
+            assert!(shared.route_requests.borrow().retry);
+            if consumed {
+                // The lost join's worker had already taken it.
+                let _ = worker.borrow_and_update();
+            }
+            // The join is lost (a higher-priority branch) and rejoins as 11.
+            {
+                let _slot = shared.slot.lock().await;
+                shared.retag_route_for_rejoin(9, 11);
+            }
+            let mut chosen = default.clone();
+            let retry = begin_session_route(&shared, &mut worker, 11, &mut chosen).await;
+            assert!(!retry, "consumed={consumed}: a retry is never carried");
+            assert_eq!(chosen, default);
+            // That rejoin keeps the unknown microphone closed.
+            let point = rejoin_resume_point(None, None, &chosen);
+            assert_eq!(point.retained_microphone(), None);
+            // The delayed reply for call 7 sees generation 11: no promise.
+            let scope = route_reply_scope(9, 7, 11, 7);
+            assert_eq!(scope, RouteReplyScope::Rejoined);
+            let notice = route_reply_notice(scope, true, "Switch requested.");
+            assert!(!notice.contains("switches to these devices"), "{notice}");
+            assert!(
+                notice.contains("choose Use for this call again"),
+                "{notice}"
+            );
+        }
+        assert_eq!(
+            route_reply_notice(RouteReplyScope::Current, true, "Switch requested."),
+            "Switch requested."
+        );
     }
 }

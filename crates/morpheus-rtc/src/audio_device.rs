@@ -38,12 +38,304 @@ impl Drop for DeviceOpenGuard {
     }
 }
 
-/// An immutable routing choice for one join. IDs are CPAL host-qualified IDs,
-/// never display names or enumeration offsets. None alone requests the default.
+/// A routing choice: the devices the user chose for a join. IDs are CPAL
+/// host-qualified IDs, never display names or enumeration offsets. None alone
+/// requests the system default. A running join changes it only through
+/// `AudioControls::request_route`, never from configuration on its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AudioDeviceSelection {
     pub microphone: Option<String>,
     pub speaker: Option<String>,
+}
+
+/// Which device one direction of call audio uses now. Names are platform
+/// display names, for showing only: they are never stored or used to find a
+/// device.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum DeviceRoute {
+    /// Not open yet.
+    #[default]
+    Opening,
+    /// The chosen route is open. With `system_default`, the system default
+    /// was chosen and `name` is the device it resolved to when it opened, when
+    /// known (an output that follows the system default may have moved on
+    /// since; then it is None).
+    Chosen {
+        name: Option<String>,
+        system_default: bool,
+    },
+    /// A requested switch could not be opened: the device in use before it
+    /// stays in use.
+    Previous { name: Option<String> },
+    /// The chosen speaker is unavailable, so the system default output plays
+    /// instead until the chosen one returns. Never used for the microphone.
+    DefaultInstead { name: Option<String> },
+    /// Nothing is in use on this side: the device was lost or could not be
+    /// opened. For the microphone nothing is captured or sent, and the user's
+    /// mute choice is unchanged.
+    Lost,
+}
+
+/// A route change the user should be told about. The route itself says what
+/// holds now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteNotice {
+    /// A requested route change was applied.
+    Switched,
+    /// The requested microphone could not be opened.
+    MicrophoneSwitchFailed,
+    /// The requested speaker could not be opened.
+    SpeakerSwitchFailed,
+    /// The microphone stopped (unplugged or lost).
+    MicrophoneLost,
+    /// The operating system withdrew microphone access.
+    MicrophoneDenied,
+    /// The lost microphone came back and is in use again.
+    MicrophoneRestored,
+    /// The chosen speaker stopped; the system default output plays instead.
+    SpeakerFellBack,
+    /// The speaker stopped and no output could be opened.
+    SpeakerLost,
+    /// The chosen speaker is in use again.
+    SpeakerRestored,
+    /// The system default speaker the user chose stopped; the default output
+    /// opened again, possibly on another device.
+    DefaultSpeakerReopened,
+    /// Call audio resumed (after a rejoin, or a restart after a failure), but
+    /// the microphone it had in use has no exact identity to reopen it by, so
+    /// it was not reopened: nothing is captured until the chosen exact device
+    /// returns or the user chooses again.
+    MicrophoneNotResumed,
+    /// Reconnecting stopped after its time budget; choosing a device again
+    /// tries again.
+    ReconnectStopped,
+}
+
+/// A route request as the audio loop receives it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RouteChoice {
+    selection: AudioDeviceSelection,
+    /// The user's own repeat of their previous request (`request_route`).
+    retry: bool,
+}
+
+/// Where one join's audio loop left off (`AudioControls::resume_point`), so
+/// the rejoin that replaces a lost join resumes it under the rules for a
+/// device lost inside a join instead of opening the route afresh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioResume {
+    /// The route the devices answered, side by side.
+    route: AudioDeviceSelection,
+    /// The last route request the loop handled, so a choice made while the
+    /// call reconnected still counts as a new one.
+    last_request: AudioDeviceSelection,
+    /// The microphone's ID: the open one (only when exact), or the lost one
+    /// waited for. `resume_microphone` uses it only when `exact_identity`
+    /// validates it; otherwise no microphone is reopened on the rejoin.
+    microphone: Option<String>,
+    microphone_lost: bool,
+    microphone_loss: RouteNotice,
+    /// The system default output stood in for the lost chosen speaker.
+    speaker_fallback: bool,
+    /// No speaker was playing (a lost stand-in is not replaced by another).
+    speaker_lost: bool,
+    /// The channel count the microphone track was published with.
+    channels: u32,
+}
+
+impl AudioResume {
+    /// For a rejoin that replaces a join whose audio never recorded where it
+    /// was (lost before its devices opened): resume `chosen` conservatively.
+    /// The microphone is reopened only when `chosen` names an exact device;
+    /// System default or an alias stays closed, unresumed, until the user
+    /// chooses again, because it may name a different microphone now. The
+    /// speaker follows its route.
+    pub fn unestablished(chosen: &AudioDeviceSelection) -> Self {
+        Self {
+            route: chosen.clone(),
+            last_request: chosen.clone(),
+            microphone: chosen.microphone.clone().filter(|id| exact_identity(id)),
+            microphone_lost: false,
+            microphone_loss: RouteNotice::MicrophoneLost,
+            speaker_fallback: false,
+            speaker_lost: false,
+            channels: 1,
+        }
+    }
+
+    /// The only microphone a rejoin from this point may capture from without
+    /// a new choice: the retained exact ID (opened at once, or waited for if
+    /// it was lost). None when the identity is unknown: that microphone
+    /// stays closed until the user chooses.
+    pub fn retained_microphone(&self) -> Option<String> {
+        match resume_microphone(self) {
+            ResumeMicrophone::Open(id) => Some(id),
+            ResumeMicrophone::Wait { lost, .. } => lost,
+        }
+    }
+}
+
+/// The local audio route of one join, as its audio loop last applied it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioRoute {
+    /// Increases with every report, so two equal notices can be told apart.
+    pub generation: u64,
+    pub microphone: DeviceRoute,
+    pub speaker: DeviceRoute,
+    pub notice: Option<RouteNotice>,
+}
+
+/// What a running stream's error callback reported. Glitches and reroutes
+/// keep a stream running; only these end it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamFault {
+    /// The device is gone, or its stream must be rebuilt.
+    Lost,
+    /// The operating system withdrew access.
+    Denied,
+}
+
+impl StreamFault {
+    /// None for errors that leave the stream running: an underrun or
+    /// overrun, a refused real-time priority, or an output that followed the
+    /// system default to another device.
+    fn classify(kind: cpal::ErrorKind) -> Option<Self> {
+        match kind {
+            cpal::ErrorKind::Xrun
+            | cpal::ErrorKind::RealtimeDenied
+            | cpal::ErrorKind::DeviceChanged => None,
+            cpal::ErrorKind::PermissionDenied => Some(Self::Denied),
+            _ => Some(Self::Lost),
+        }
+    }
+
+    fn error(self, input: bool) -> MediaError {
+        MediaError::Device(
+            match (self, input) {
+                (Self::Lost, true) => "the microphone was disconnected or stopped",
+                (Self::Lost, false) => "the speaker was disconnected or stopped",
+                (Self::Denied, true) => "microphone access was denied",
+                (Self::Denied, false) => "speaker access was denied",
+            }
+            .into(),
+        )
+    }
+}
+
+/// A stream's health, written by the platform's error callback (on a backend
+/// thread, so it only stores and wakes) and read by the audio loop, which it
+/// wakes at once instead of at its next frame or roster tick.
+#[derive(Default)]
+struct StreamHealth {
+    fault: Mutex<Option<StreamFault>>,
+    rerouted: AtomicBool,
+    wake: Notify,
+}
+
+impl StreamHealth {
+    fn report(&self, kind: cpal::ErrorKind) {
+        match StreamFault::classify(kind) {
+            Some(fault) => {
+                if let Ok(mut slot) = self.fault.lock() {
+                    slot.get_or_insert(fault);
+                }
+            }
+            None if kind == cpal::ErrorKind::DeviceChanged => {
+                self.rerouted.store(true, Ordering::Release);
+            }
+            None => return,
+        }
+        self.wake.notify_one();
+    }
+
+    fn take_fault(&self) -> Option<StreamFault> {
+        self.fault.lock().ok()?.take()
+    }
+
+    fn take_rerouted(&self) -> bool {
+        self.rerouted.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// Whether an ID names one physical endpoint well enough to reconnect to it
+/// without the user choosing again. CoreAudio UIDs and WASAPI endpoint IDs
+/// do. ALSA routing aliases (`default`, `pulse`, `sysdefault`) and numeric
+/// cards (`CARD=0`), which can name another card after a replug, do not.
+fn exact_identity(id: &str) -> bool {
+    let Some((host, device)) = id.split_once(':') else {
+        return false;
+    };
+    if host != "alsa" {
+        return !device.trim().is_empty();
+    }
+    let Some(card) = device.split("CARD=").nth(1) else {
+        return false;
+    };
+    let card = card.split(',').next().unwrap_or("");
+    !card.is_empty() && !card.chars().all(|character| character.is_ascii_digit())
+}
+
+/// The microphone to reopen after it was lost, without the user choosing
+/// again: the chosen exact device, or, when the system default was chosen,
+/// the same physical device that was in use. Never a different microphone,
+/// so a lost one is never silently replaced by another that can hear the
+/// room. None when no ID is exact enough to wait for.
+fn microphone_reopen_target(chosen: Option<&str>, lost: Option<&str>) -> Option<String> {
+    let target = chosen.or(lost)?;
+    exact_identity(target).then(|| target.to_owned())
+}
+
+/// What a route request does on the microphone side.
+#[derive(Debug, PartialEq, Eq)]
+enum MicrophoneStep {
+    /// Leave that side as it is.
+    Keep,
+    /// Open the choice, and report it if it cannot be opened: it changed
+    /// since the previous request, it is a choice that could not be opened
+    /// before (while a microphone is in use), or the user repeated the whole
+    /// request unchanged while the microphone is lost (`retry`).
+    Open(Option<String>),
+    /// The choice did not change and the microphone is lost: reopen only its
+    /// exact device, as reconnecting would, and keep waiting quietly if that
+    /// fails.
+    Reopen(String),
+}
+
+/// Requests carry the whole selection, so most leave the microphone choice
+/// as it was (they change the speaker). Such a request never opens the
+/// current system default or an alias in place of a lost microphone: those
+/// may now name a different microphone that can hear the room. Only an
+/// explicit microphone choice opens as given: one that differs from the
+/// previous request, or `retry`, the user's own request repeated with
+/// nothing changed (so not a speaker-only change).
+fn microphone_step(
+    wanted: Option<&str>,
+    previous_request: Option<&str>,
+    current: Option<&str>,
+    in_use: bool,
+    lost: Option<&str>,
+    retry: bool,
+) -> MicrophoneStep {
+    if wanted != previous_request || (in_use && wanted != current) || (retry && !in_use) {
+        return MicrophoneStep::Open(wanted.map(str::to_owned));
+    }
+    if in_use {
+        return MicrophoneStep::Keep;
+    }
+    match microphone_reopen_target(wanted, lost) {
+        Some(target) => MicrophoneStep::Reopen(target),
+        None => MicrophoneStep::Keep,
+    }
+}
+
+/// The speaker to reopen while the chosen one is lost or replaced by the
+/// default: the chosen exact device, or the system default when that is the
+/// choice. Output only, so following the choice never opens a microphone.
+fn speaker_reopen_target(chosen: Option<&str>) -> Option<Option<String>> {
+    match chosen {
+        None => Some(None),
+        Some(id) => exact_identity(id).then(|| Some(id.to_owned())),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +439,18 @@ fn resolve_device(selected: Option<&str>, input: bool) -> Result<cpal::Device, M
         .1)
 }
 
+/// The opened device's host-qualified ID and display name, when the platform
+/// reports them. Reading them opens nothing.
+fn identify(device: &cpal::Device) -> (Option<String>, Option<String>) {
+    let id = device.id().ok().map(|id| id.to_string());
+    let name = device
+        .description()
+        .ok()
+        .map(|description| description.name().to_owned())
+        .filter(|name| !name.trim().is_empty());
+    (id, name)
+}
+
 fn while_open_active<T>(
     active: &impl Fn() -> bool,
     action: impl FnOnce() -> Result<T, MediaError>,
@@ -185,7 +489,12 @@ pub struct MicrophoneCapture {
     _stream: Stream,
     rx: mpsc::Receiver<AudioFrame>,
     channels: u32,
-    stream_error: Arc<Mutex<Option<String>>>,
+    health: Arc<StreamHealth>,
+    /// The opened device's host-qualified ID and display name, when the
+    /// platform reports them. The ID is the one to wait for after a loss; the
+    /// name is for showing only.
+    id: Option<String>,
+    name: Option<String>,
 }
 
 impl MicrophoneCapture {
@@ -213,14 +522,18 @@ impl MicrophoneCapture {
         selected: Option<&str>,
         active: &impl Fn() -> bool,
     ) -> Result<Self, MediaError> {
-        let device = while_open_active(active, || resolve_device(selected, true))?;
+        let (device, id, name) = while_open_active(active, || {
+            let device = resolve_device(selected, true)?;
+            let (id, name) = identify(&device);
+            Ok((device, id, name))
+        })?;
         let config = while_open_active(active, || select_48k_config(&device, true))?;
         let channels = u32::from(config.channels());
         let sample_format = config.sample_format();
         let chunk_len = CHUNK_SAMPLES_PER_CHANNEL * channels as usize;
         let (tx, rx) = mpsc::channel(32);
-        let stream_error = Arc::new(Mutex::new(None));
-        let error_for_callback = Arc::clone(&stream_error);
+        let health = Arc::new(StreamHealth::default());
+        let health_for_callback = Arc::clone(&health);
         let mut pending = VecDeque::<i16>::with_capacity(chunk_len * 2);
         let stream = while_open_active(active, || {
             device
@@ -263,11 +576,7 @@ impl MicrophoneCapture {
                             let _ = tx.try_send(frame);
                         }
                     },
-                    move |error| {
-                        if let Ok(mut last) = error_for_callback.lock() {
-                            *last = Some(error.to_string());
-                        }
-                    },
+                    move |error| health_for_callback.report(error.kind()),
                     None,
                 )
                 .map_err(|error| MediaError::Device(error.to_string()))
@@ -276,7 +585,9 @@ impl MicrophoneCapture {
             _stream: stream,
             rx,
             channels,
-            stream_error,
+            health,
+            id,
+            name,
         })
     }
 
@@ -302,19 +613,21 @@ impl MicrophoneCapture {
         while self.rx.try_recv().is_ok() {}
     }
 
+    /// The next captured frame. A device loss or withdrawn access ends it with
+    /// an error, also while no frame arrives; glitches do not.
     pub async fn next_frame(&mut self) -> Result<AudioFrame, MediaError> {
-        if let Some(error) = self
-            .stream_error
-            .lock()
-            .ok()
-            .and_then(|mut last| last.take())
-        {
-            return Err(MediaError::Device(error));
+        loop {
+            if let Some(fault) = self.health.take_fault() {
+                return Err(fault.error(true));
+            }
+            tokio::select! {
+                frame = self.rx.recv() => {
+                    return frame
+                        .ok_or_else(|| MediaError::Device("microphone stream stopped".into()));
+                }
+                () = self.health.wake.notified() => {}
+            }
         }
-        self.rx
-            .recv()
-            .await
-            .ok_or_else(|| MediaError::Device("microphone stream stopped".into()))
     }
 
     /// Forward microphone frames until the publication closes or this future
@@ -332,7 +645,9 @@ impl MicrophoneCapture {
 pub struct AudioOutput {
     _stream: Stream,
     mixer: Arc<Mutex<AudioMixer>>,
-    stream_error: Arc<Mutex<Option<String>>>,
+    health: Arc<StreamHealth>,
+    /// The opened device's display name, for showing only.
+    name: Option<String>,
 }
 
 struct AudioMixer {
@@ -419,14 +734,18 @@ impl AudioOutput {
         selected: Option<&str>,
         active: &impl Fn() -> bool,
     ) -> Result<Self, MediaError> {
-        let device = while_open_active(active, || resolve_device(selected, false))?;
+        let (device, name) = while_open_active(active, || {
+            let device = resolve_device(selected, false)?;
+            let (_, name) = identify(&device);
+            Ok((device, name))
+        })?;
         let config = while_open_active(active, || select_48k_config(&device, false))?;
         let channels = u32::from(config.channels());
         let sample_format = config.sample_format();
         let mixer = Arc::new(Mutex::new(AudioMixer::new(channels)));
         let mixer_for_callback = Arc::clone(&mixer);
-        let stream_error = Arc::new(Mutex::new(None));
-        let error_for_callback = Arc::clone(&stream_error);
+        let health = Arc::new(StreamHealth::default());
+        let health_for_callback = Arc::clone(&health);
         let stream = while_open_active(active, || {
             device
                 .build_output_stream_raw(
@@ -467,11 +786,7 @@ impl AudioOutput {
                             _ => {}
                         }
                     },
-                    move |error| {
-                        if let Ok(mut last) = error_for_callback.lock() {
-                            *last = Some(error.to_string());
-                        }
-                    },
+                    move |error| health_for_callback.report(error.kind()),
                     None,
                 )
                 .map_err(|error| MediaError::Device(error.to_string()))
@@ -479,7 +794,8 @@ impl AudioOutput {
         Ok(Self {
             _stream: stream,
             mixer,
-            stream_error,
+            health,
+            name,
         })
     }
 
@@ -497,14 +813,15 @@ impl AudioOutput {
     }
 
     pub fn push_frame_for(&self, member_id: &str, frame: &AudioFrame) -> Result<(), MediaError> {
-        if let Some(error) = self
-            .stream_error
-            .lock()
-            .ok()
-            .and_then(|mut last| last.take())
-        {
-            return Err(MediaError::Device(error));
+        if let Some(fault) = self.health.take_fault() {
+            return Err(fault.error(false));
         }
+        self.mix(member_id, frame)
+    }
+
+    /// Queue a remote frame without reading the stream's health: the call
+    /// audio loop watches that itself and replaces a lost speaker.
+    fn mix(&self, member_id: &str, frame: &AudioFrame) -> Result<(), MediaError> {
         self.mixer
             .lock()
             .map_err(|_| MediaError::Device("speaker mixer poisoned".into()))?
@@ -574,6 +891,12 @@ pub struct AudioControls {
     requested: watch::Sender<AudioState>,
     applied: watch::Sender<AudioState>,
     running: Arc<AtomicBool>,
+    /// The route the user chose for this join (`request_route`).
+    route_request: watch::Sender<RouteChoice>,
+    /// The route the audio loop last applied.
+    route: watch::Sender<AudioRoute>,
+    /// Where the audio loop left off; None until it opened any device.
+    resume: watch::Sender<Option<AudioResume>>,
 }
 
 impl AudioControls {
@@ -621,6 +944,94 @@ impl AudioControls {
             requested,
             applied: applied_updates,
             running: Arc::new(AtomicBool::new(false)),
+            route_request: watch::channel(RouteChoice::default()).0,
+            route: watch::channel(AudioRoute::default()).0,
+            resume: watch::channel(None).0,
+        }
+    }
+
+    /// Choose the devices for this join. Starting the audio loop sets the
+    /// route it was given. While it runs, the loop opens the new device beside
+    /// the one in use and swaps only once it is open, keeping the published
+    /// microphone track, its encryption and the mute and deafen state; a
+    /// device that cannot be opened leaves the one in use and is reported in
+    /// `route`. Pass only IDs from `audio_devices`, or None for the system
+    /// default. Nothing here is persisted.
+    ///
+    /// `retry`: the user's request is unchanged from the route the call runs
+    /// with (decided where requests are admitted one by one, so two coalesced
+    /// changes never look like one). Only then may a microphone that is lost
+    /// or was not resumed be opened again by its route; a request that
+    /// changes only the speaker never opens one.
+    pub fn request_route(
+        &self,
+        selection: AudioDeviceSelection,
+        retry: bool,
+    ) -> Result<(), MediaError> {
+        self.ensure_authorized()?;
+        self.route_request
+            .send_replace(RouteChoice { selection, retry });
+        Ok(())
+    }
+
+    /// The route the user chose for this join. Cancellation does not change
+    /// it, so a rejoin can carry it to new controls.
+    pub fn requested_route(&self) -> AudioDeviceSelection {
+        self.route_request.borrow().selection.clone()
+    }
+
+    /// The route the audio loop last applied: which device each direction
+    /// uses, and the last change worth telling the user about.
+    pub fn route(&self) -> AudioRoute {
+        self.route.borrow().clone()
+    }
+
+    pub fn subscribe_route(&self) -> watch::Receiver<AudioRoute> {
+        self.route.subscribe()
+    }
+
+    /// Where this join's audio loop left off, for `RtcService::run_audio_resuming`
+    /// on the rejoin that replaces it: the route, the microphone's exact ID, a
+    /// lost microphone still waited for, a speaker still standing in or lost,
+    /// and the last microphone request. Recorded synchronously once the
+    /// devices are open, before the first publication await
+    /// (`prepare_publication`), then on each report. None only while the
+    /// loop has not got that far; keep the previous point then.
+    pub fn resume_point(&self) -> Option<AudioResume> {
+        self.resume.borrow().clone()
+    }
+
+    fn publish_route(
+        &self,
+        microphone: DeviceRoute,
+        speaker: DeviceRoute,
+        notice: Option<RouteNotice>,
+    ) {
+        self.route.send_modify(|route| {
+            route.generation = route.generation.wrapping_add(1);
+            route.microphone = microphone;
+            route.speaker = speaker;
+            route.notice = notice;
+        });
+    }
+
+    /// Point deafen and playback at a newly opened speaker. A new mixer starts
+    /// undeafened, so the user's deafen choice is applied before it plays.
+    fn install_speaker(&self, speaker: &AudioOutput) -> Result<(), MediaError> {
+        let mut state = self.lock_state()?;
+        self.ensure_authorized()?;
+        speaker.set_deafened(state.desired.deafened)?;
+        state.speaker_mixer = Some(Arc::clone(&speaker.mixer));
+        state.applied.deafened = state.desired.deafened;
+        self.applied.send_replace(state.applied);
+        Ok(())
+    }
+
+    /// The speaker is gone: deafen changes are kept as requested and applied
+    /// to the next one.
+    fn release_speaker(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.speaker_mixer = None;
         }
     }
 
@@ -798,14 +1209,18 @@ impl AudioControls {
     fn attach(
         &self,
         publication: Arc<Publication>,
-        speaker: &AudioOutput,
-        microphone: &mut MicrophoneCapture,
+        speaker: Option<&AudioOutput>,
+        microphone: Option<&mut MicrophoneCapture>,
     ) -> Result<(), MediaError> {
         // The transport publishes muted, including while the OS devices open.
-        microphone.discard_buffered_frames();
+        if let Some(microphone) = microphone {
+            microphone.discard_buffered_frames();
+        }
         let mut state = self.lock_state()?;
         self.ensure_authorized()?;
-        speaker.set_deafened(state.desired.deafened)?;
+        if let Some(speaker) = speaker {
+            speaker.set_deafened(state.desired.deafened)?;
+        }
         if !state.desired.microphone_muted && !state.suspended {
             publication.set_muted(false)?;
         }
@@ -814,19 +1229,27 @@ impl AudioControls {
             state.applied.microphone_muted = true;
         }
         state.microphone = Some(publication);
-        state.speaker_mixer = Some(Arc::clone(&speaker.mixer));
+        // Without a speaker, deafen applies to the next one (install_speaker).
+        state.speaker_mixer = speaker.map(|speaker| Arc::clone(&speaker.mixer));
         self.applied.send_replace(state.applied);
         Ok(())
     }
 
-    fn apply_pending_unmute(&self, microphone: &mut MicrophoneCapture) -> Result<(), MediaError> {
+    fn apply_pending_unmute(
+        &self,
+        microphone: Option<&mut MicrophoneCapture>,
+    ) -> Result<(), MediaError> {
         self.ensure_authorized()?;
         let needs_unmute = {
             let state = self.lock_state()?;
             !state.suspended && !state.desired.microphone_muted && state.applied.microphone_muted
         };
         if needs_unmute {
-            microphone.discard_buffered_frames();
+            // A lost microphone captures nothing; the requested unmute still
+            // reaches the track, which sends silence until one is back.
+            if let Some(microphone) = microphone {
+                microphone.discard_buffered_frames();
+            }
             let mut state = self.lock_state()?;
             self.ensure_authorized()?;
             if !state.suspended && !state.desired.microphone_muted && state.applied.microphone_muted
@@ -917,8 +1340,9 @@ impl RtcService {
     /// Call this only after an explicit user action that authorizes microphone
     /// capture. It returns when the call ends or the media path fails; dropping
     /// the future mutes the publication and aborts remote frame pumps. Each
-    /// remote microphone gets a bounded playback queue; device switching and
-    /// network jitter control are still outside this adapter.
+    /// remote microphone gets a bounded playback queue; network jitter control
+    /// is still outside this adapter. Live device routing needs the controls:
+    /// see `run_audio_controlled_with_devices`.
     pub async fn run_audio(&self, room_id: &str) -> Result<(), MediaError> {
         let controls = self.audio_controls(room_id)?;
         self.run_audio_controlled(room_id, &controls).await
@@ -937,13 +1361,55 @@ impl RtcService {
             .await
     }
 
-    /// Use the immutable selection captured when this join was requested.
-    /// Later configuration changes never reroute an active call.
+    /// Run call audio on `selection`, the route chosen when the join was
+    /// requested (it replaces any route requested on `controls` before). While
+    /// it runs, only `AudioControls::request_route` changes the route:
+    /// configuration changes never reroute an active call on their own.
+    ///
+    /// Live routing keeps the published microphone track: a new microphone is
+    /// opened beside the one in use, its frames are remixed to the published
+    /// channel count, and only then does it replace the old one, so the
+    /// track's encryption, its mute state and peers' view of it never change.
+    /// A new speaker gets the user's deafen choice before it plays. The loop
+    /// awaits each open (bounded by `DEVICE_OPEN_TIMEOUT`), so call audio
+    /// pauses in both directions while a device opens.
+    ///
+    /// A device lost mid-call (unplugged, withdrawn, or its stream invalidated)
+    /// no longer ends call audio. The microphone side stops capturing and waits
+    /// for the chosen exact device (for the system default, the exact one that
+    /// was lost), never another one; the speaker side plays through the system
+    /// default instead, visibly, until the chosen one returns. Reconnecting
+    /// polls every `RECONNECT_INTERVAL` until `RECONNECT_WINDOW` after the last
+    /// change, and never starts an open that could run past that. Every
+    /// change is reported on `AudioControls::route`.
     pub async fn run_audio_controlled_with_devices(
         &self,
         room_id: &str,
         controls: &AudioControls,
         selection: AudioDeviceSelection,
+    ) -> Result<(), MediaError> {
+        self.run_audio_resuming(room_id, controls, None, selection, false)
+            .await
+    }
+
+    /// `run_audio_controlled_with_devices` on `chosen`, resuming where a lost
+    /// join's audio left off (`AudioControls::resume_point` of its controls)
+    /// when `resume` is given. A rejoin then follows the rules for a device
+    /// lost inside a join rather than opening `chosen` afresh: the microphone
+    /// in use reopens by exact ID where the platform gives one and the speaker
+    /// on its route, a lost microphone is waited for and never replaced, a
+    /// speaker standing in for a lost one keeps standing in (a lost stand-in
+    /// is not replaced by another), and one side that cannot be opened stays
+    /// closed (and looked for) without costing the call the other. Once open, the loop switches to `chosen`
+    /// where it differs, as `request_route` would. Without `resume`, a choice
+    /// made while the first devices open is tried if they cannot be opened.
+    pub async fn run_audio_resuming(
+        &self,
+        room_id: &str,
+        controls: &AudioControls,
+        resume: Option<AudioResume>,
+        chosen: AudioDeviceSelection,
+        retry: bool,
     ) -> Result<(), MediaError> {
         let call = self.call(room_id).ok_or(MediaError::NotJoined)?;
         let lease = self.call_lease(room_id).ok_or(MediaError::NotJoined)?;
@@ -955,70 +1421,26 @@ impl RtcService {
         }
         let _run_guard = AudioRunGuard::start(controls)?;
         let mut requests = controls.requested.subscribe();
-        // CoreAudio can block inside AudioUnitSetProperty while opening the
-        // microphone (for example while macOS resolves device permissions).
-        // Keeping that synchronous call on the Tokio worker also starves the
-        // call's roster and remote video futures. Open both devices on a
-        // blocking thread and bound the wait so the call can leave cleanly.
-        if DEVICE_OPEN_IN_PROGRESS
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(MediaError::Device(
-                "audio device setup is still in progress".into(),
-            ));
-        }
-        let opening_guard = DeviceOpenGuard;
-        controls.ensure_authorized()?;
-        let opening_controls = controls.clone();
-        let (device_tx, device_rx) = tokio::sync::oneshot::channel();
-        let opened = std::thread::Builder::new()
-            .name("morpheus-audio-open".into())
-            .spawn(move || {
-                let _opening = opening_guard;
-                // Receiver drop is only one stop signal. Leave and account
-                // revocation must also win while the async owner retains this
-                // receiver and is suspended in another media branch.
-                let active = || opening_controls.is_authorized() && !device_tx.is_closed();
-                let result = prepare_audio_pair(
-                    &active,
-                    || {
-                        MicrophoneCapture::prepare_selected(
-                            selection.microphone.as_deref(),
-                            &active,
-                        )
-                    },
-                    || AudioOutput::prepare_selected(selection.speaker.as_deref(), &active),
-                    |speaker| speaker.start(&active),
-                    |microphone| microphone.start(&active),
-                );
-                let _ = device_tx.send(result);
-            });
-        if opened.is_err() {
-            // The captured opening guard also drops on thread-spawn failure.
-            return Err(MediaError::Device(
-                "could not start audio device setup".into(),
-            ));
-        }
-        // The OS thread is deliberately detached. If CoreAudio never returns,
-        // Tokio shutdown and the rest of the call UI still make progress.
-        let received = tokio::select! {
-            biased;
-            _ = controls.cancelled() => return Err(MediaError::CallEnded),
-            received = tokio::time::timeout(Duration::from_secs(30), device_rx) => received,
+        // The chosen route of this join; later requests arrive on `routes`.
+        controls.route_request.send_replace(RouteChoice {
+            selection: chosen.clone(),
+            retry,
+        });
+        let mut routes = controls.route_request.subscribe();
+        let (mut local, opened_notice) = match resume {
+            None => {
+                let (microphone, speaker, opened) =
+                    open_first_route(controls, &mut routes, chosen).await?;
+                (LocalAudio::new(opened, microphone, speaker), None)
+            }
+            Some(resume) => resume_local_audio(controls, resume).await?,
         };
-        let (mut microphone, speaker) = received
-            .map_err(|_| MediaError::Device("audio device initialization timed out".into()))?
-            .map_err(|_| MediaError::Device("audio device setup task failed".into()))??;
         controls.ensure_authorized()?;
+        // Records the resume point before the publication await below.
+        let (sample_rate, published_channels) = local.prepare_publication(controls);
         let publication = Arc::new(
-            self.publish_microphone(
-                room_id,
-                microphone.sample_rate(),
-                microphone.channels(),
-                true,
-            )
-            .await?,
+            self.publish_microphone(room_id, sample_rate, published_channels, true)
+                .await?,
         );
         let _mute_on_drop = MuteOnDrop(&publication);
         controls.ensure_authorized()?;
@@ -1028,12 +1450,36 @@ impl RtcService {
         let mut roster_refresh = tokio::time::interval(Duration::from_secs(2));
         roster_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+        // The track keeps the format it was published with; any later
+        // microphone is remixed to it (`conform_channels`).
         let result = async {
-            controls.attach(Arc::clone(&publication), &speaker, &mut microphone)?;
+            controls.attach(
+                Arc::clone(&publication),
+                local.speaker.as_ref(),
+                local.microphone.as_mut(),
+            )?;
             let _ = *requests.borrow_and_update();
-            controls.apply_pending_unmute(&mut microphone)?;
-            remotes.reconcile(call, &speaker)?;
+            controls.apply_pending_unmute(local.microphone.as_mut())?;
+            remotes.reconcile(call, local.speaker.as_ref())?;
+            local.report(controls, opened_notice);
+            // The route that opened may not be the one chosen: the devices in
+            // use before a rejoin, or a choice made while they opened.
+            let wanted = routes.borrow_and_update().clone();
+            // Also a microphone choice made while a rejoin reconnected that
+            // differs from the lost join's last request, even when it names
+            // the route in use, and the user's explicit retry that restarted
+            // audio; `switch` applies the microphone_step rules.
+            if wanted.retry
+                || wanted.selection != local.current
+                || wanted.selection.microphone != local.last_request.microphone
+            {
+                local.switch(controls, wanted.selection, wanted.retry).await?;
+            }
+            let mut reconnect = tokio::time::interval(RECONNECT_INTERVAL);
+            reconnect.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
+                let microphone_health = local.microphone_health();
+                let speaker_health = local.speaker_health();
                 tokio::select! {
                     biased;
                     _ = controls.cancelled() => break Err(MediaError::CallEnded),
@@ -1042,17 +1488,51 @@ impl RtcService {
                             break Ok(());
                         }
                         let _ = *requests.borrow_and_update();
-                        controls.apply_pending_unmute(&mut microphone)?;
+                        controls.apply_pending_unmute(local.microphone.as_mut())?;
+                    }
+                    changed = routes.changed() => {
+                        if changed.is_ok() {
+                            let wanted = routes.borrow_and_update().clone();
+                            match local.switch(controls, wanted.selection, wanted.retry).await {
+                                Err(MediaError::CallEnded) => break Err(MediaError::CallEnded),
+                                result => result?,
+                            }
+                        }
+                    }
+                    () = stream_fault(microphone_health, speaker_health) => {
+                        match local.handle_faults(controls).await {
+                            Err(MediaError::CallEnded) => break Err(MediaError::CallEnded),
+                            result => result?,
+                        }
+                        // The device just lost is looked for a full interval later.
+                        reconnect.reset();
+                    }
+                    _ = reconnect.tick(), if local.reconnecting(&controls.requested_route()) => {
+                        match local.reconnect(controls).await {
+                            Err(MediaError::CallEnded) => break Err(MediaError::CallEnded),
+                            result => result?,
+                        }
                     }
                     _ = roster_refresh.tick() => {
                         // A frame stream can close without a matching call
                         // event. Retry subscribed tracks at a bounded rate.
-                        remotes.reconcile(call, &speaker)?;
+                        remotes.reconcile(call, local.speaker.as_ref())?;
                     }
-                    frame = microphone.next_frame() => {
-                        let frame = frame?;
-                        if controls.should_send_microphone()? {
-                            publication.push_audio(frame).await?;
+                    frame = next_microphone_frame(&mut local.microphone) => {
+                        match frame {
+                            Some(frame) => {
+                                if controls.should_send_microphone()? {
+                                    publication
+                                        .push_audio(conform_channels(frame, published_channels))
+                                        .await?;
+                                }
+                            }
+                            // The capture stream ended without reporting why.
+                            None => {
+                                let notice = local.lose_microphone(StreamFault::Lost);
+                                local.report(controls, Some(notice));
+                                reconnect.reset();
+                            }
                         }
                     }
                     event = events.recv() => {
@@ -1060,20 +1540,20 @@ impl RtcService {
                             Ok(CallEvent::StreamStarted { member_id, kind })
                                 if kind == matrix_rtc_transport::MediaStreamKind::Microphone
                                     && member_id != call.membership_id() => {
-                                remotes.start(call, &speaker, &member_id)?;
+                                remotes.start(call, local.speaker.as_ref(), &member_id)?;
                             }
                             Ok(CallEvent::StreamStopped { member_id, kind })
                                 if kind == matrix_rtc_transport::MediaStreamKind::Microphone => {
-                                remotes.stop(&speaker, &member_id)?;
+                                remotes.stop(local.speaker.as_ref(), &member_id)?;
                             }
                             Ok(CallEvent::ParticipantLeft { member_id }) => {
-                                remotes.stop(&speaker, &member_id)?;
+                                remotes.stop(local.speaker.as_ref(), &member_id)?;
                             }
                             Ok(CallEvent::Ended { .. }) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 break Ok(());
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                remotes.reconcile(call, &speaker)?;
+                                remotes.reconcile(call, local.speaker.as_ref())?;
                             }
                             Ok(_) => {}
                         }
@@ -1082,11 +1562,14 @@ impl RtcService {
                         match remote {
                             Some(RemoteAudioEvent::Frame { member_id, generation, frame })
                                 if remotes.is_current(&member_id, generation) => {
-                                speaker.push_frame_for(&member_id, &frame)?;
+                                // Without a speaker, remote audio is dropped.
+                                if let Some(output) = &local.speaker {
+                                    output.mix(&member_id, &frame)?;
+                                }
                             }
                             Some(RemoteAudioEvent::Ended { member_id, generation })
                                 if remotes.is_current(&member_id, generation) => {
-                                remotes.stop(&speaker, &member_id)?;
+                                remotes.stop(local.speaker.as_ref(), &member_id)?;
                             }
                             Some(_) => {}, // An old stream was replaced or stopped.
                             None => break Ok(()),
@@ -1096,6 +1579,8 @@ impl RtcService {
             }
         }
         .await;
+        // Close the devices before unpublishing, as before the loop owned them.
+        drop(local);
         drop(remotes);
         let _ = publication.set_muted(true);
         let _ = publication.unpublish().await;
@@ -1106,6 +1591,742 @@ impl RtcService {
     /// path now receives and mixes every subscribed remote microphone.
     pub async fn run_two_person_audio(&self, room_id: &str) -> Result<(), MediaError> {
         self.run_audio(room_id).await
+    }
+}
+
+/// How often a lost or replaced device is looked for again, and until when:
+/// a monotonic deadline `RECONNECT_WINDOW` after the last change. No device
+/// open starts that could run past it (`reconnect_open_fits`), so looking
+/// stops by then however long each open takes.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
+const RECONNECT_WINDOW: Duration = Duration::from_secs(10 * 60);
+const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether a device open started `now` ends, at its timeout, by `deadline`.
+fn reconnect_open_fits(now: tokio::time::Instant, deadline: tokio::time::Instant) -> bool {
+    now + DEVICE_OPEN_TIMEOUT <= deadline
+}
+
+/// What a device-open thread checks before and after every OS step: the
+/// controls still authorize audio, and the async owner still waits for the
+/// result (a timed-out or cancelled open drops its receiver).
+struct OpenGate<'a, T> {
+    controls: &'a AudioControls,
+    reply: &'a tokio::sync::oneshot::Sender<Result<T, MediaError>>,
+}
+
+impl<T> OpenGate<'_, T> {
+    fn active(&self) -> bool {
+        self.controls.is_authorized() && !self.reply.is_closed()
+    }
+}
+
+/// Open audio devices on their own thread, one open at a time in the
+/// process. CoreAudio can block inside AudioUnitSetProperty (for example while
+/// macOS resolves device permissions); on a Tokio worker that would starve the
+/// call's roster and remote video, so the OS work runs on a detached thread
+/// and the wait is bounded, letting the call leave cleanly. An open that is
+/// already in progress is reported, never waited for or retried here.
+async fn open_on_device_thread<T: Send + 'static>(
+    controls: &AudioControls,
+    open: impl FnOnce(&OpenGate<'_, T>) -> Result<T, MediaError> + Send + 'static,
+) -> Result<T, MediaError> {
+    if DEVICE_OPEN_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(MediaError::Device(
+            "audio device setup is still in progress".into(),
+        ));
+    }
+    let opening_guard = DeviceOpenGuard;
+    controls.ensure_authorized()?;
+    let opening_controls = controls.clone();
+    let (device_tx, device_rx) = tokio::sync::oneshot::channel();
+    let opened = std::thread::Builder::new()
+        .name("morpheus-audio-open".into())
+        .spawn(move || {
+            let opening = opening_guard;
+            // Receiver drop is only one stop signal. Leave and account
+            // revocation must also win while the async owner retains this
+            // receiver and is suspended in another media branch.
+            let result = {
+                let gate = OpenGate {
+                    controls: &opening_controls,
+                    reply: &device_tx,
+                };
+                open(&gate)
+            };
+            // An open nobody waits for is closed while the flag is still
+            // held. Otherwise the flag is released before the reply, so the
+            // owner's next open (the other device of the same switch) does
+            // not find it still held.
+            if device_tx.is_closed() {
+                drop(result);
+                drop(opening);
+            } else {
+                drop(opening);
+                let _ = device_tx.send(result);
+            }
+        });
+    if opened.is_err() {
+        // The captured opening guard also drops on thread-spawn failure.
+        return Err(MediaError::Device(
+            "could not start audio device setup".into(),
+        ));
+    }
+    // The OS thread is deliberately detached. If CoreAudio never returns,
+    // Tokio shutdown and the rest of the call UI still make progress.
+    let received = tokio::select! {
+        biased;
+        _ = controls.cancelled() => return Err(MediaError::CallEnded),
+        received = tokio::time::timeout(DEVICE_OPEN_TIMEOUT, device_rx) => received,
+    };
+    received
+        .map_err(|_| MediaError::Device("audio device initialization timed out".into()))?
+        .map_err(|_| MediaError::Device("audio device setup task failed".into()))?
+}
+
+/// A fresh join's first microphone and speaker: `start` (the chosen route),
+/// or if that cannot be opened, a newer choice made while it opened, once
+/// per distinct route. Returns the route that opened.
+async fn open_first_route(
+    controls: &AudioControls,
+    routes: &mut watch::Receiver<RouteChoice>,
+    start: AudioDeviceSelection,
+) -> Result<(MicrophoneCapture, AudioOutput, AudioDeviceSelection), MediaError> {
+    let mut attempt = start;
+    loop {
+        let opening = attempt.clone();
+        let opened = open_on_device_thread(controls, move |gate| {
+            let active = || gate.active();
+            prepare_audio_pair(
+                &active,
+                || MicrophoneCapture::prepare_selected(opening.microphone.as_deref(), &active),
+                || AudioOutput::prepare_selected(opening.speaker.as_deref(), &active),
+                |speaker| speaker.start(&active),
+                |microphone| microphone.start(&active),
+            )
+        })
+        .await;
+        match opened {
+            Ok((microphone, speaker)) => return Ok((microphone, speaker, attempt)),
+            Err(MediaError::CallEnded) => return Err(MediaError::CallEnded),
+            Err(error) => {
+                let wanted = routes.borrow_and_update().selection.clone();
+                if wanted == attempt {
+                    return Err(error);
+                }
+                attempt = wanted;
+            }
+        }
+    }
+}
+
+/// What a rejoin does with the microphone the lost join had.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeMicrophone {
+    /// Reopen exactly this device: the one in use, by its validated ID.
+    Open(String),
+    /// Keep it closed. A lost one waits for its exact device (`lost`); one
+    /// without an exact identity waits for none. Either way capture resumes
+    /// only on the chosen exact device or on the user's explicit choice
+    /// (`microphone_step`), never on the current default or an alias.
+    Wait {
+        lost: Option<String>,
+        notice: RouteNotice,
+    },
+}
+
+/// The rejoin never reopens a microphone by its route: System default or an
+/// alias may name a different microphone now. Only a retained exact ID is
+/// reopened; a missing or inexact identity stays explicitly unresumed.
+fn resume_microphone(resume: &AudioResume) -> ResumeMicrophone {
+    let exact = resume.microphone.clone().filter(|id| exact_identity(id));
+    if resume.microphone_lost {
+        return ResumeMicrophone::Wait {
+            lost: exact,
+            notice: resume.microphone_loss,
+        };
+    }
+    match exact {
+        Some(id) => ResumeMicrophone::Open(id),
+        None => ResumeMicrophone::Wait {
+            lost: None,
+            notice: RouteNotice::MicrophoneNotResumed,
+        },
+    }
+}
+
+/// Reopen what a lost join's audio had, by the rules for a device lost
+/// inside a join: the microphone only by its retained exact ID (a lost one
+/// is waited for, never replaced; one without an exact identity is not
+/// reopened, see `resume_microphone`), the speaker on its route or, visibly,
+/// the system default. A side that cannot be opened stays closed while the
+/// loop looks for it, so one missing device never costs the call the other.
+/// Mute and deafen are the controls' requested state either way. Returns the
+/// notice for what could not be resumed.
+async fn resume_local_audio(
+    controls: &AudioControls,
+    resume: AudioResume,
+) -> Result<(LocalAudio, Option<RouteNotice>), MediaError> {
+    let chosen = controls.requested_route();
+    let mut local = LocalAudio::closed(
+        resume.route.clone(),
+        resume.last_request.clone(),
+        resume.channels,
+    );
+    let mut notice = None;
+    match resume_microphone(&resume) {
+        ResumeMicrophone::Open(id) => match open_microphone(controls, Some(id.clone())).await {
+            Ok(microphone) => local.microphone = Some(microphone),
+            Err(MediaError::CallEnded) => return Err(MediaError::CallEnded),
+            Err(_) => {
+                local.microphone_lost = true;
+                local.lost_microphone_id = Some(id);
+                notice = Some(RouteNotice::MicrophoneLost);
+            }
+        },
+        ResumeMicrophone::Wait { lost, notice: why } => {
+            local.microphone_lost = true;
+            local.microphone_loss = why;
+            local.lost_microphone_id = lost;
+            notice = Some(why);
+        }
+    }
+    if resume.speaker_lost {
+        // Nothing was playing, and a lost stand-in is not replaced by another:
+        // only the chosen speaker itself, as reconnecting would.
+        let mut reopened = false;
+        if let Some(target) = speaker_reopen_target(chosen.speaker.as_deref()) {
+            match open_speaker(controls, target.clone()).await {
+                Ok(speaker) => {
+                    local.speaker = Some(speaker);
+                    local.current.speaker = target;
+                    reopened = true;
+                }
+                Err(MediaError::CallEnded) => return Err(MediaError::CallEnded),
+                Err(_) => {}
+            }
+        }
+        if !reopened {
+            local.speaker_lost = true;
+            notice = notice.or(Some(RouteNotice::SpeakerLost));
+        }
+        return Ok((local, notice));
+    }
+    let speaker_target = if resume.speaker_fallback {
+        None
+    } else {
+        resume.route.speaker.clone()
+    };
+    match open_speaker(controls, speaker_target).await {
+        Ok(speaker) => {
+            local.speaker = Some(speaker);
+            local.speaker_fallback = resume.speaker_fallback;
+            if resume.speaker_fallback {
+                notice = notice.or(Some(RouteNotice::SpeakerFellBack));
+            }
+        }
+        Err(MediaError::CallEnded) => return Err(MediaError::CallEnded),
+        // The stand-in itself is gone: wait for the chosen speaker.
+        Err(_) if resume.speaker_fallback => {
+            local.speaker_lost = true;
+            notice = notice.or(Some(RouteNotice::SpeakerLost));
+        }
+        Err(_) => {
+            let lost = local.lose_speaker(controls).await?;
+            notice = notice.or(Some(lost));
+        }
+    }
+    Ok((local, notice))
+}
+
+async fn open_microphone(
+    controls: &AudioControls,
+    selected: Option<String>,
+) -> Result<MicrophoneCapture, MediaError> {
+    open_on_device_thread(controls, move |gate| {
+        let active = || gate.active();
+        let microphone = MicrophoneCapture::prepare_selected(selected.as_deref(), &active)?;
+        microphone.start(&active)?;
+        Ok(microphone)
+    })
+    .await
+}
+
+async fn open_speaker(
+    controls: &AudioControls,
+    selected: Option<String>,
+) -> Result<AudioOutput, MediaError> {
+    open_on_device_thread(controls, move |gate| {
+        let active = || gate.active();
+        let speaker = AudioOutput::prepare_selected(selected.as_deref(), &active)?;
+        speaker.start(&active)?;
+        Ok(speaker)
+    })
+    .await
+}
+
+/// The next captured frame of the microphone in use; pending forever while
+/// none is. None when its stream ended.
+async fn next_microphone_frame(microphone: &mut Option<MicrophoneCapture>) -> Option<AudioFrame> {
+    match microphone {
+        Some(microphone) => microphone.rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Wake when either open device's error callback reported something.
+async fn stream_fault(microphone: Option<Arc<StreamHealth>>, speaker: Option<Arc<StreamHealth>>) {
+    async fn wait(health: Option<Arc<StreamHealth>>) {
+        match health {
+            Some(health) => health.wake.notified().await,
+            None => std::future::pending().await,
+        }
+    }
+    tokio::select! {
+        () = wait(microphone) => {}
+        () = wait(speaker) => {}
+    }
+}
+
+/// A frame in the track's published channel count. A microphone opened after
+/// publication may have the other one of mono and stereo.
+fn conform_channels(frame: AudioFrame, channels: u32) -> AudioFrame {
+    if frame.num_channels == channels {
+        return frame;
+    }
+    let mut out = VecDeque::with_capacity(frame.samples_per_channel as usize * channels as usize);
+    remix_channels(&frame.data, frame.num_channels, channels, &mut out);
+    AudioFrame {
+        data: Vec::from(out),
+        sample_rate: frame.sample_rate,
+        num_channels: channels,
+        samples_per_channel: frame.samples_per_channel,
+    }
+}
+
+/// What one side of the route reports: the device open (its display name,
+/// when known), against the route that opened it and the route now chosen.
+fn route_for(
+    open: Option<&Option<String>>,
+    current: &Option<String>,
+    wanted: &Option<String>,
+    instead_of_chosen: bool,
+    rerouted: bool,
+) -> DeviceRoute {
+    let Some(name) = open else {
+        return DeviceRoute::Lost;
+    };
+    // An output that followed the system default no longer plays on the
+    // device it opened on, and the platform does not say which one.
+    let name = if rerouted { None } else { name.clone() };
+    if instead_of_chosen {
+        return DeviceRoute::DefaultInstead { name };
+    }
+    if current != wanted {
+        return DeviceRoute::Previous { name };
+    }
+    DeviceRoute::Chosen {
+        name,
+        system_default: wanted.is_none(),
+    }
+}
+
+/// The devices one join's audio loop uses, against the route the user chose.
+struct LocalAudio {
+    /// The route the open devices answer, side by side.
+    current: AudioDeviceSelection,
+    /// The previous route request, so a request can tell a new microphone
+    /// choice from one that changes only the speaker, and a repeat of the
+    /// same request (an explicit retry) from both.
+    last_request: AudioDeviceSelection,
+    microphone: Option<MicrophoneCapture>,
+    speaker: Option<AudioOutput>,
+    microphone_lost: bool,
+    /// Why the microphone was lost (`MicrophoneLost` or `MicrophoneDenied`).
+    microphone_loss: RouteNotice,
+    /// The exact ID of the lost microphone, the only one to wait for.
+    lost_microphone_id: Option<String>,
+    speaker_lost: bool,
+    /// The system default output plays instead of the chosen speaker.
+    speaker_fallback: bool,
+    /// The default output followed the system to another device.
+    speaker_rerouted: bool,
+    /// Looking for lost or replaced devices stops here (monotonic).
+    reconnect_deadline: tokio::time::Instant,
+    reconnect_stopped: bool,
+    /// The microphone track's published channel count.
+    channels: u32,
+}
+
+impl LocalAudio {
+    fn new(
+        current: AudioDeviceSelection,
+        microphone: MicrophoneCapture,
+        speaker: AudioOutput,
+    ) -> Self {
+        let last_request = current.clone();
+        let mut local = Self::closed(current, last_request, microphone.channels());
+        local.microphone = Some(microphone);
+        local.speaker = Some(speaker);
+        local
+    }
+
+    /// No device open yet: `current` is the route the devices to open answer.
+    fn closed(
+        current: AudioDeviceSelection,
+        last_request: AudioDeviceSelection,
+        channels: u32,
+    ) -> Self {
+        Self {
+            current,
+            last_request,
+            microphone: None,
+            speaker: None,
+            microphone_lost: false,
+            microphone_loss: RouteNotice::MicrophoneLost,
+            lost_microphone_id: None,
+            speaker_lost: false,
+            speaker_fallback: false,
+            speaker_rerouted: false,
+            reconnect_deadline: tokio::time::Instant::now() + RECONNECT_WINDOW,
+            reconnect_stopped: false,
+            channels,
+        }
+    }
+
+    /// Look for lost or replaced devices again, for a fresh window from now.
+    fn rearm_reconnect(&mut self) {
+        self.reconnect_deadline = tokio::time::Instant::now() + RECONNECT_WINDOW;
+        self.reconnect_stopped = false;
+    }
+
+    fn reconnect_open_fits(&self) -> bool {
+        reconnect_open_fits(tokio::time::Instant::now(), self.reconnect_deadline)
+    }
+
+    fn microphone_health(&self) -> Option<Arc<StreamHealth>> {
+        self.microphone
+            .as_ref()
+            .map(|microphone| Arc::clone(&microphone.health))
+    }
+
+    fn speaker_health(&self) -> Option<Arc<StreamHealth>> {
+        self.speaker
+            .as_ref()
+            .map(|speaker| Arc::clone(&speaker.health))
+    }
+
+    /// Whether there is anything to look for: a lost microphone only when it
+    /// has a device to reopen (`microphone_reopen_target` for `wanted`); one
+    /// without waits for the user, and no search is claimed for it.
+    fn reconnecting(&self, wanted: &AudioDeviceSelection) -> bool {
+        let microphone = self.microphone_lost
+            && microphone_reopen_target(
+                wanted.microphone.as_deref(),
+                self.lost_microphone_id.as_deref(),
+            )
+            .is_some();
+        !self.reconnect_stopped && (microphone || self.speaker_lost || self.speaker_fallback)
+    }
+
+    fn report(&self, controls: &AudioControls, notice: Option<RouteNotice>) {
+        let wanted = controls.requested_route();
+        let microphone = route_for(
+            self.microphone.as_ref().map(|microphone| &microphone.name),
+            &self.current.microphone,
+            &wanted.microphone,
+            false,
+            false,
+        );
+        let speaker = route_for(
+            self.speaker.as_ref().map(|speaker| &speaker.name),
+            &self.current.speaker,
+            &wanted.speaker,
+            self.speaker_fallback,
+            self.speaker_rerouted,
+        );
+        controls.publish_route(microphone, speaker, notice);
+        self.record_resume(controls);
+    }
+
+    /// Store where this loop is, so the rejoin that replaces a lost join
+    /// resumes it (`AudioControls::resume_point`) instead of opening the
+    /// route afresh.
+    fn record_resume(&self, controls: &AudioControls) {
+        let microphone = if self.microphone_lost {
+            self.lost_microphone_id.clone()
+        } else {
+            self.microphone
+                .as_ref()
+                .and_then(|microphone| microphone.id.clone())
+                .filter(|id| exact_identity(id))
+        };
+        controls.resume.send_replace(Some(AudioResume {
+            route: self.current.clone(),
+            last_request: self.last_request.clone(),
+            microphone,
+            microphone_lost: self.microphone_lost,
+            microphone_loss: self.microphone_loss,
+            speaker_fallback: self.speaker_fallback,
+            speaker_lost: self.speaker.is_none(),
+            channels: self.channels,
+        }));
+    }
+
+    /// The microphone track's format for this join, decided once the devices
+    /// are open. The resume point is recorded here, synchronously, before the
+    /// caller's first fallible publication await: a join lost while its track
+    /// is still being published leaves the exact identity it opened (or an
+    /// explicitly unknown one), never nothing for the rejoin to fill in from
+    /// the route.
+    fn prepare_publication(&mut self, controls: &AudioControls) -> (u32, u32) {
+        // A resumed join may start without a microphone; its track takes the
+        // lost join's channel count, and a later microphone is remixed to it.
+        let format = match &self.microphone {
+            Some(microphone) => (microphone.sample_rate(), microphone.channels()),
+            None => (SAMPLE_RATE, self.channels),
+        };
+        self.channels = format.1;
+        self.record_resume(controls);
+        format
+    }
+
+    /// Open the chosen route's new devices beside the ones in use, and swap
+    /// each only once it is open. The track and the mute and deafen state are
+    /// kept; a side that cannot be opened keeps its device and is reported.
+    /// `retry`: the user repeated their previous request unchanged, as
+    /// decided at admission (`AudioControls::request_route`); never inferred
+    /// here, where coalesced requests could look like a repeat.
+    async fn switch(
+        &mut self,
+        controls: &AudioControls,
+        wanted: AudioDeviceSelection,
+        retry: bool,
+    ) -> Result<(), MediaError> {
+        let mut failed = None;
+        let mut switched = false;
+        let mut restored = false;
+        let step = microphone_step(
+            wanted.microphone.as_deref(),
+            self.last_request.microphone.as_deref(),
+            self.current.microphone.as_deref(),
+            self.microphone.is_some(),
+            self.lost_microphone_id.as_deref(),
+            retry,
+        );
+        self.last_request = wanted.clone();
+        let (target, chosen_now) = match step {
+            MicrophoneStep::Keep => (None, false),
+            MicrophoneStep::Open(target) => (Some(target), true),
+            MicrophoneStep::Reopen(target) => (Some(Some(target)), false),
+        };
+        if let Some(target) = target {
+            // A lost device reopened by its own ID (for the system default,
+            // or standing in for a choice that failed) answers the route it
+            // answered before, not the choice.
+            let answers_choice = target == wanted.microphone;
+            match open_microphone(controls, target).await {
+                Ok(mut microphone) => {
+                    // Nothing recorded before the swap is sent.
+                    microphone.discard_buffered_frames();
+                    controls.ensure_authorized()?;
+                    self.microphone = Some(microphone);
+                    self.microphone_lost = false;
+                    self.lost_microphone_id = None;
+                    if answers_choice {
+                        self.current.microphone = wanted.microphone.clone();
+                    }
+                    if chosen_now {
+                        switched = true;
+                    } else {
+                        restored = true;
+                    }
+                }
+                Err(MediaError::CallEnded) => return Err(MediaError::CallEnded),
+                Err(_) if chosen_now => failed = Some(RouteNotice::MicrophoneSwitchFailed),
+                // A quiet reopen that fails keeps waiting, as reconnecting does.
+                Err(_) => {}
+            }
+        }
+        if wanted.speaker != self.current.speaker || self.speaker.is_none() || self.speaker_fallback
+        {
+            match open_speaker(controls, wanted.speaker.clone()).await {
+                Ok(speaker) => {
+                    controls.install_speaker(&speaker)?;
+                    self.speaker = Some(speaker);
+                    self.speaker_lost = false;
+                    self.speaker_fallback = false;
+                    self.speaker_rerouted = false;
+                    self.current.speaker = wanted.speaker.clone();
+                    switched = true;
+                }
+                Err(MediaError::CallEnded) => return Err(MediaError::CallEnded),
+                Err(_) => failed = failed.or(Some(RouteNotice::SpeakerSwitchFailed)),
+            }
+        }
+        self.rearm_reconnect();
+        // A microphone still lost is said again rather than "switched".
+        let still_lost = self.microphone_lost.then_some(self.microphone_loss);
+        self.report(
+            controls,
+            failed
+                .or(still_lost)
+                .or(switched.then_some(RouteNotice::Switched))
+                .or(restored.then_some(RouteNotice::MicrophoneRestored)),
+        );
+        Ok(())
+    }
+
+    /// Stop using a microphone whose stream was lost. Its exact device is
+    /// the only one waited for; capture resumes only on it, or on a new
+    /// choice. The track and the mute state are untouched.
+    fn lose_microphone(&mut self, fault: StreamFault) -> RouteNotice {
+        self.lost_microphone_id = self
+            .microphone
+            .take()
+            .and_then(|microphone| microphone.id.clone());
+        self.microphone_lost = true;
+        self.rearm_reconnect();
+        self.microphone_loss = match fault {
+            StreamFault::Denied => RouteNotice::MicrophoneDenied,
+            StreamFault::Lost => RouteNotice::MicrophoneLost,
+        };
+        self.microphone_loss
+    }
+
+    /// Replace a lost speaker. Output only: playing through the system default
+    /// never opens a microphone. The default is what the user chose, or the
+    /// visible stand-in for a lost chosen speaker; a stand-in that is itself
+    /// lost is not replaced by yet another device.
+    async fn lose_speaker(&mut self, controls: &AudioControls) -> Result<RouteNotice, MediaError> {
+        let was_fallback = self.speaker_fallback;
+        self.speaker = None;
+        controls.release_speaker();
+        self.speaker_lost = true;
+        self.speaker_fallback = false;
+        self.speaker_rerouted = false;
+        self.rearm_reconnect();
+        let chosen = controls.requested_route().speaker;
+        if chosen.is_some() && was_fallback {
+            return Ok(RouteNotice::SpeakerLost);
+        }
+        match open_speaker(controls, None).await {
+            Ok(speaker) => {
+                controls.install_speaker(&speaker)?;
+                self.speaker = Some(speaker);
+                self.speaker_lost = false;
+                if chosen.is_some() {
+                    self.speaker_fallback = true;
+                    Ok(RouteNotice::SpeakerFellBack)
+                } else {
+                    self.current.speaker = None;
+                    Ok(RouteNotice::DefaultSpeakerReopened)
+                }
+            }
+            Err(MediaError::CallEnded) => Err(MediaError::CallEnded),
+            Err(_) => Ok(RouteNotice::SpeakerLost),
+        }
+    }
+
+    async fn handle_faults(&mut self, controls: &AudioControls) -> Result<(), MediaError> {
+        let mut changed = false;
+        let mut notice = None;
+        if let Some(fault) = self
+            .microphone
+            .as_ref()
+            .and_then(|microphone| microphone.health.take_fault())
+        {
+            notice = Some(self.lose_microphone(fault));
+            changed = true;
+        }
+        if self
+            .speaker
+            .as_ref()
+            .is_some_and(|speaker| speaker.health.take_rerouted())
+        {
+            self.speaker_rerouted = true;
+            changed = true;
+        }
+        if self
+            .speaker
+            .as_ref()
+            .and_then(|speaker| speaker.health.take_fault())
+            .is_some()
+        {
+            let lost = self.lose_speaker(controls).await?;
+            notice = notice.or(Some(lost));
+            changed = true;
+        }
+        if changed {
+            self.report(controls, notice);
+        }
+        Ok(())
+    }
+
+    /// Look for the chosen devices again: a lost microphone only on its exact
+    /// device (see `microphone_reopen_target`), a lost or replaced speaker on
+    /// the chosen route. Bounded by `reconnect_deadline`: no open starts that
+    /// could run past it, and looking stops once none can.
+    async fn reconnect(&mut self, controls: &AudioControls) -> Result<(), MediaError> {
+        if !self.reconnect_open_fits() {
+            self.reconnect_stopped = true;
+            self.report(controls, Some(RouteNotice::ReconnectStopped));
+            return Ok(());
+        }
+        let wanted = controls.requested_route();
+        let mut notice = None;
+        if self.microphone_lost
+            && let Some(target) = microphone_reopen_target(
+                wanted.microphone.as_deref(),
+                self.lost_microphone_id.as_deref(),
+            )
+        {
+            // As in `switch`: the lost device itself keeps its route.
+            let answers_choice = wanted.microphone.as_deref() == Some(target.as_str());
+            match open_microphone(controls, Some(target)).await {
+                Ok(mut microphone) => {
+                    microphone.discard_buffered_frames();
+                    self.microphone = Some(microphone);
+                    self.microphone_lost = false;
+                    self.lost_microphone_id = None;
+                    if answers_choice {
+                        self.current.microphone = wanted.microphone.clone();
+                    }
+                    notice = Some(RouteNotice::MicrophoneRestored);
+                }
+                Err(MediaError::CallEnded) => return Err(MediaError::CallEnded),
+                Err(_) => {}
+            }
+        }
+        // A stand-in default stays until the chosen speaker itself opens. The
+        // microphone's open may have used up the time left for this one.
+        if (self.speaker_lost || self.speaker_fallback)
+            && self.reconnect_open_fits()
+            && let Some(target) = speaker_reopen_target(wanted.speaker.as_deref())
+            && !(self.speaker_fallback && target.is_none())
+        {
+            match open_speaker(controls, target.clone()).await {
+                Ok(speaker) => {
+                    controls.install_speaker(&speaker)?;
+                    self.speaker = Some(speaker);
+                    self.speaker_lost = false;
+                    self.speaker_fallback = false;
+                    self.speaker_rerouted = false;
+                    self.current.speaker = target;
+                    notice = notice.or(Some(RouteNotice::SpeakerRestored));
+                }
+                Err(MediaError::CallEnded) => return Err(MediaError::CallEnded),
+                Err(_) => {}
+            }
+        }
+        if notice.is_some() {
+            self.rearm_reconnect();
+            self.report(controls, notice);
+        }
+        Ok(())
     }
 }
 
@@ -1150,7 +2371,7 @@ impl RemoteAudioStreams {
     fn start(
         &mut self,
         call: &matrix_rtc_call_sdk::LiveKitCall,
-        speaker: &AudioOutput,
+        speaker: Option<&AudioOutput>,
         member_id: &str,
     ) -> Result<(), MediaError> {
         if self.tasks.len() >= MAX_REMOTE_STREAMS && !self.tasks.contains_key(member_id) {
@@ -1191,17 +2412,22 @@ impl RemoteAudioStreams {
         Ok(())
     }
 
-    fn stop(&mut self, speaker: &AudioOutput, member_id: &str) -> Result<(), MediaError> {
+    /// Remote streams keep running without a speaker (while one is lost or
+    /// being replaced); their frames are then dropped.
+    fn stop(&mut self, speaker: Option<&AudioOutput>, member_id: &str) -> Result<(), MediaError> {
         if let Some(task) = self.tasks.remove(member_id) {
             task.task.abort();
         }
-        speaker.remove_stream(member_id)
+        match speaker {
+            Some(speaker) => speaker.remove_stream(member_id),
+            None => Ok(()),
+        }
     }
 
     fn reconcile(
         &mut self,
         call: &matrix_rtc_call_sdk::LiveKitCall,
-        speaker: &AudioOutput,
+        speaker: Option<&AudioOutput>,
     ) -> Result<(), MediaError> {
         let desired: HashSet<String> = call
             .participants()
@@ -1800,5 +3026,401 @@ mod tests {
             "DEVICE".into(),
         );
         assert!(!fresh.is_for(&same_ids_but_new_lease));
+    }
+
+    #[test]
+    fn glitches_and_reroutes_keep_a_stream_running() {
+        use cpal::ErrorKind;
+        for kind in [
+            ErrorKind::Xrun,
+            ErrorKind::RealtimeDenied,
+            ErrorKind::DeviceChanged,
+        ] {
+            assert_eq!(StreamFault::classify(kind), None, "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::DeviceNotAvailable,
+            ErrorKind::StreamInvalidated,
+            ErrorKind::HostUnavailable,
+            ErrorKind::BackendError,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                StreamFault::classify(kind),
+                Some(StreamFault::Lost),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            StreamFault::classify(ErrorKind::PermissionDenied),
+            Some(StreamFault::Denied)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_device_wakes_the_loop_at_once_and_glitches_do_not() {
+        let health = StreamHealth::default();
+        health.report(cpal::ErrorKind::Xrun);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), health.wake.notified())
+                .await
+                .is_err(),
+            "a glitch neither wakes nor ends the stream"
+        );
+        assert_eq!(health.take_fault(), None);
+        // Reported from a backend thread before the loop waits: the wake is
+        // kept until it does.
+        health.report(cpal::ErrorKind::DeviceNotAvailable);
+        health.report(cpal::ErrorKind::PermissionDenied);
+        tokio::time::timeout(Duration::from_secs(1), health.wake.notified())
+            .await
+            .expect("a lost device wakes the loop");
+        assert_eq!(
+            health.take_fault(),
+            Some(StreamFault::Lost),
+            "the first fault"
+        );
+        assert_eq!(health.take_fault(), None);
+        health.report(cpal::ErrorKind::DeviceChanged);
+        assert!(health.take_rerouted());
+        assert!(!health.take_rerouted());
+        assert_eq!(health.take_fault(), None);
+    }
+
+    #[test]
+    fn only_exact_device_ids_are_reconnected_without_a_new_choice() {
+        for exact in [
+            "coreaudio:AppleUSBAudioEngine:Vendor:Headset:1234:1",
+            "wasapi:{0.0.1.00000000}.{4b0b3d5e-0000-0000-0000-000000000000}",
+            "alsa:hw:CARD=Headset,DEV=0",
+            "alsa:sysdefault:CARD=PCH",
+        ] {
+            assert!(exact_identity(exact), "{exact}");
+        }
+        for ambiguous in [
+            "alsa:default",
+            "alsa:pulse",
+            "alsa:hw:CARD=0,DEV=0",
+            "alsa:plughw:CARD=1,DEV=0",
+            "coreaudio:",
+            "no host",
+        ] {
+            assert!(!exact_identity(ambiguous), "{ambiguous}");
+        }
+    }
+
+    #[test]
+    fn a_lost_microphone_reopens_only_on_its_own_exact_device() {
+        // The chosen device itself, not the one in use before.
+        assert_eq!(
+            microphone_reopen_target(Some("coreaudio:usb"), Some("coreaudio:built-in")),
+            Some("coreaudio:usb".to_owned())
+        );
+        // The system default was chosen: the same physical device that was
+        // in use, never whatever the default is now.
+        assert_eq!(
+            microphone_reopen_target(None, Some("coreaudio:headset")),
+            Some("coreaudio:headset".to_owned())
+        );
+        assert_eq!(microphone_reopen_target(None, None), None);
+        // Aliases and card numbers can name another device after a replug.
+        assert_eq!(microphone_reopen_target(Some("alsa:default"), None), None);
+        assert_eq!(
+            microphone_reopen_target(None, Some("alsa:hw:CARD=1,DEV=0")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_lost_speaker_follows_the_chosen_route() {
+        assert_eq!(speaker_reopen_target(None), Some(None));
+        assert_eq!(
+            speaker_reopen_target(Some("coreaudio:desk")),
+            Some(Some("coreaudio:desk".to_owned()))
+        );
+        assert_eq!(speaker_reopen_target(Some("alsa:default")), None);
+    }
+
+    #[test]
+    fn a_later_microphone_is_remixed_to_the_published_channels() {
+        let stereo = frame(&[100, 300, -200, 200], 2);
+        let mono = conform_channels(stereo, 1);
+        assert_eq!(mono.num_channels, 1);
+        assert_eq!(mono.data, vec![200, 0]);
+        assert_eq!(mono.samples_per_channel, 2);
+        let back = conform_channels(mono, 2);
+        assert_eq!(back.data, vec![200, 200, 0, 0]);
+        let same = conform_channels(frame(&[1, 2], 1), 1);
+        assert_eq!(same.data, vec![1, 2]);
+    }
+
+    #[test]
+    fn route_reports_say_what_is_in_use_against_the_choice() {
+        let name = Some("Desk mic".to_owned());
+        let usb = Some("coreaudio:usb".to_owned());
+        assert_eq!(
+            route_for(Some(&name), &usb, &usb, false, false),
+            DeviceRoute::Chosen {
+                name: name.clone(),
+                system_default: false
+            }
+        );
+        assert_eq!(
+            route_for(Some(&name), &None, &None, false, false),
+            DeviceRoute::Chosen {
+                name: name.clone(),
+                system_default: true
+            }
+        );
+        // A switch that failed keeps the device in use, and says so.
+        assert_eq!(
+            route_for(Some(&name), &None, &usb, false, false),
+            DeviceRoute::Previous { name: name.clone() }
+        );
+        assert_eq!(
+            route_for(Some(&name), &None, &usb, true, false),
+            DeviceRoute::DefaultInstead { name: name.clone() }
+        );
+        assert_eq!(route_for(None, &usb, &usb, false, false), DeviceRoute::Lost);
+        // A default output that followed the system: no stale device name,
+        // whether it was chosen or stands in for a lost chosen speaker.
+        assert_eq!(
+            route_for(Some(&name), &None, &None, false, true),
+            DeviceRoute::Chosen {
+                name: None,
+                system_default: true
+            }
+        );
+        assert_eq!(
+            route_for(Some(&name), &usb, &usb, true, true),
+            DeviceRoute::DefaultInstead { name: None }
+        );
+    }
+
+    #[test]
+    fn a_route_request_needs_live_controls_and_outlives_cancellation() {
+        let controls = guarded_controls(|| true);
+        let chosen = AudioDeviceSelection {
+            microphone: Some("coreaudio:usb".into()),
+            speaker: None,
+        };
+        controls.request_route(chosen.clone(), false).unwrap();
+        assert_eq!(controls.requested_route(), chosen);
+        let mut reports = controls.subscribe_route();
+        controls.publish_route(
+            DeviceRoute::Lost,
+            DeviceRoute::Opening,
+            Some(RouteNotice::MicrophoneLost),
+        );
+        assert!(reports.has_changed().unwrap());
+        let first = reports.borrow_and_update().clone();
+        controls.publish_route(
+            DeviceRoute::Lost,
+            DeviceRoute::Opening,
+            Some(RouteNotice::MicrophoneLost),
+        );
+        assert!(
+            controls.route().generation > first.generation,
+            "equal notices differ"
+        );
+        controls.cancel();
+        assert!(matches!(
+            controls.request_route(AudioDeviceSelection::default(), true),
+            Err(MediaError::CallEnded)
+        ));
+        // A rejoin carries the choice to new controls.
+        assert_eq!(controls.requested_route(), chosen);
+    }
+
+    #[test]
+    fn deafen_chosen_while_no_speaker_is_open_waits_for_the_next_one() {
+        let controls = guarded_controls(|| true);
+        let _running = AudioRunGuard::start(&controls).unwrap();
+        controls.release_speaker();
+        controls.set_deafened(true).unwrap();
+        assert!(controls.requested_state().deafened);
+        assert!(
+            !controls.applied_state().deafened,
+            "nothing plays, so nothing was deafened yet"
+        );
+        // The choice is kept for the next speaker; install_speaker applies
+        // `desired` to it (that needs a real output stream, so it is covered
+        // by device acceptance, not here).
+        assert!(controls.lock_state().unwrap().desired.deafened);
+    }
+
+    #[test]
+    fn a_route_request_never_swaps_a_lost_microphone_for_another() {
+        use MicrophoneStep::{Keep, Open, Reopen};
+        let usb = Some("coreaudio:usb");
+        let built_in = Some("coreaudio:built-in");
+        let headset = Some("coreaudio:headset");
+        // A new choice opens as chosen, the system default included.
+        assert_eq!(
+            microphone_step(usb, built_in, built_in, true, None, false),
+            Open(Some("coreaudio:usb".into()))
+        );
+        assert_eq!(
+            microphone_step(None, usb, usb, false, usb, false),
+            Open(None)
+        );
+        // The same choice while its microphone is in use: nothing to open,
+        // even when the user repeats the request.
+        assert_eq!(microphone_step(usb, usb, usb, true, None, false), Keep);
+        assert_eq!(microphone_step(usb, usb, usb, true, None, true), Keep);
+        // The same choice again after it could not be opened: retried while
+        // another microphone is in use.
+        assert_eq!(
+            microphone_step(usb, usb, built_in, true, None, false),
+            Open(Some("coreaudio:usb".into()))
+        );
+        // A request that changes only the speaker, while the microphone is
+        // lost: the default (or an alias) may now be a different microphone,
+        // so only the exact lost or chosen device is reopened, quietly.
+        assert_eq!(
+            microphone_step(None, None, None, false, headset, false),
+            Reopen("coreaudio:headset".into())
+        );
+        assert_eq!(microphone_step(None, None, None, false, None, false), Keep);
+        let alias = Some("alsa:default");
+        assert_eq!(
+            microphone_step(alias, alias, alias, false, None, false),
+            Keep
+        );
+        // The default was chosen but could not be opened, so the call stayed
+        // on USB, which was then unplugged. A later speaker-only request
+        // waits for USB; it never opens whatever the default is now.
+        assert_eq!(
+            microphone_step(None, None, usb, false, usb, false),
+            Reopen("coreaudio:usb".into())
+        );
+        // Only the user's own request repeated unchanged is an explicit
+        // microphone choice while none is open (a microphone with no exact
+        // identity waits for exactly that).
+        assert_eq!(
+            microphone_step(None, None, None, false, None, true),
+            Open(None)
+        );
+        assert_eq!(
+            microphone_step(alias, alias, alias, false, None, true),
+            Open(Some("alsa:default".into()))
+        );
+    }
+
+    fn resume_point(microphone: Option<&str>, lost: bool) -> AudioResume {
+        AudioResume {
+            route: AudioDeviceSelection::default(),
+            last_request: AudioDeviceSelection::default(),
+            microphone: microphone.map(str::to_owned),
+            microphone_lost: lost,
+            microphone_loss: RouteNotice::MicrophoneDenied,
+            speaker_fallback: false,
+            speaker_lost: false,
+            channels: 1,
+        }
+    }
+
+    #[test]
+    fn a_rejoin_reopens_a_microphone_only_by_its_retained_exact_id() {
+        // The device in use, by its exact ID.
+        assert_eq!(
+            resume_microphone(&resume_point(Some("coreaudio:usb"), false)),
+            ResumeMicrophone::Open("coreaudio:usb".into())
+        );
+        // No exact identity: never the route's System default or an alias,
+        // which may name a different microphone now. It stays unresumed.
+        for identity in [None, Some("alsa:default"), Some("alsa:hw:CARD=1,DEV=0")] {
+            assert_eq!(
+                resume_microphone(&resume_point(identity, false)),
+                ResumeMicrophone::Wait {
+                    lost: None,
+                    notice: RouteNotice::MicrophoneNotResumed
+                },
+                "{identity:?}"
+            );
+        }
+        // A lost one keeps waiting for its own exact device, with its reason.
+        assert_eq!(
+            resume_microphone(&resume_point(Some("coreaudio:usb"), true)),
+            ResumeMicrophone::Wait {
+                lost: Some("coreaudio:usb".into()),
+                notice: RouteNotice::MicrophoneDenied
+            }
+        );
+        assert_eq!(
+            resume_microphone(&resume_point(Some("alsa:default"), true)),
+            ResumeMicrophone::Wait {
+                lost: None,
+                notice: RouteNotice::MicrophoneDenied
+            }
+        );
+    }
+
+    #[test]
+    fn reconnecting_never_starts_an_open_that_could_outlast_its_window() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + RECONNECT_WINDOW;
+        assert!(reconnect_open_fits(start, deadline));
+        assert!(reconnect_open_fits(
+            deadline - DEVICE_OPEN_TIMEOUT,
+            deadline
+        ));
+        assert!(!reconnect_open_fits(
+            deadline - DEVICE_OPEN_TIMEOUT + Duration::from_millis(1),
+            deadline
+        ));
+        assert!(!reconnect_open_fits(deadline, deadline));
+    }
+
+    #[test]
+    fn a_join_lost_while_its_track_publishes_already_left_its_resume_point() {
+        // The production step between the device opens and the publication
+        // await (`prepare_publication`): a join lost while publishing has
+        // already recorded where it was, so the rejoin hand-off finds it.
+        let controls = guarded_controls(|| true);
+        let usb = AudioDeviceSelection {
+            microphone: Some("coreaudio:usb".into()),
+            speaker: None,
+        };
+        let mut local = LocalAudio::closed(usb.clone(), usb.clone(), 2);
+        local.microphone_lost = true;
+        local.lost_microphone_id = Some("coreaudio:usb".into());
+        assert_eq!(controls.resume_point(), None, "nothing recorded yet");
+        assert_eq!(local.prepare_publication(&controls), (SAMPLE_RATE, 2));
+        let point = controls.resume_point().expect("recorded before publishing");
+        assert_eq!(point.retained_microphone(), Some("coreaudio:usb".into()));
+        // An open microphone with no exact identity is recorded as unknown:
+        // the rejoin keeps it closed rather than reopening the route.
+        let default = AudioDeviceSelection::default();
+        let mut local = LocalAudio::closed(default.clone(), default, 1);
+        local.prepare_publication(&controls);
+        assert_eq!(controls.resume_point().unwrap().retained_microphone(), None);
+    }
+
+    #[test]
+    fn a_rejoin_with_no_recorded_point_reopens_only_an_exact_chosen_microphone() {
+        let exact = AudioDeviceSelection {
+            microphone: Some("coreaudio:usb".into()),
+            speaker: None,
+        };
+        assert_eq!(
+            AudioResume::unestablished(&exact).retained_microphone(),
+            Some("coreaudio:usb".into())
+        );
+        for chosen in [None, Some("alsa:default"), Some("alsa:hw:CARD=1,DEV=0")] {
+            let route = AudioDeviceSelection {
+                microphone: chosen.map(str::to_owned),
+                speaker: None,
+            };
+            let point = AudioResume::unestablished(&route);
+            assert_eq!(point.retained_microphone(), None, "{chosen:?}");
+            assert_eq!(
+                resume_microphone(&point),
+                ResumeMicrophone::Wait {
+                    lost: None,
+                    notice: RouteNotice::MicrophoneNotResumed
+                }
+            );
+        }
     }
 }
