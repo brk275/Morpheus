@@ -6900,6 +6900,17 @@ export component AppWindow inherits Window {
                     function reveal(offset: length) {
                         self.content-y = -max(0px, min(offset - 16px, self.content-height - self.visible-height));
                     }
+                    // Keep a retained focus target visible after layout changes,
+                    // moving only when an edge crosses the live viewport. A
+                    // target taller than the viewport keeps its leading edge.
+                    function reveal-region(offset: length, extent: length) {
+                        let shown = -self.content-y;
+                        let target = offset < shown ? offset
+                            : offset + extent > shown + self.visible-height
+                                ? min(offset, offset + extent - self.visible-height) : shown;
+                        let bounded = max(0px, min(target, max(0px, self.content-height - self.visible-height)));
+                        if self.content-y != -bounded { self.content-y = -bounded; }
+                    }
                     settings-content := VerticalLayout {
                         width: settings-scroll.visible-width;
                         min-width: 0px;
@@ -7355,22 +7366,36 @@ export component AppWindow inherits Window {
                         ActionRect {
                             height: 42px * root.text-scale;
                             property <int> reveal-request: root.reveal-request("appearance.reduce_motion");
-                            // Keyboard focus and search share the same bounded reveal.
+                            // This is a direct child of settings-content: its
+                            // layout-local y changes on reflow, never on scroll.
+                            // FocusScope keeps focus across text-scale changes
+                            // without another focus-gained event, so also reveal
+                            // that retained target when its geometry changes.
+                            property <length> reveal-top: self.y;
+                            property <length> reveal-view: settings-scroll.visible-height;
+                            property <length> reveal-content: settings-scroll.content-height;
+                            function reveal-focused() {
+                                if self.has-focus { settings-scroll.reveal-region(self.reveal-top, self.height); }
+                            }
+                            changed reveal-top => { self.reveal-focused(); }
+                            changed height => { self.reveal-focused(); }
+                            changed reveal-view => { self.reveal-focused(); }
+                            changed reveal-content => { self.reveal-focused(); }
+                            // Keyboard focus, retained focus and search share
+                            // the same bounded whole-control reveal.
                             changed has-focus => {
-                                if self.has-focus {
-                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                }
+                                self.reveal-focused();
                             }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
-                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    settings-scroll.reveal-region(self.reveal-top, self.height);
                                     self.focus();
                                     if self.has-focus { root.settings-revealed-id = "appearance.reduce_motion"; }
                                 }
                             }
                             focus-state-changed(focused) => {
                                 if focused {
-                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    settings-scroll.reveal-region(self.reveal-top, self.height);
                                 }
                             }
                             label: "Reduce motion" + (StyleTokens.reduced-motion ? ", on" : ", off");
