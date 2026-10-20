@@ -29,6 +29,12 @@ pub use discovery::{
     MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery, ResolvedRoomAlias,
     parse_matrix_link_target,
 };
+mod space_explorer;
+pub use space_explorer::{
+    MAX_SPACE_ALIAS_CHARS, MAX_SPACE_LEVEL_LINKS, MAX_SPACE_LINK_VIA, MAX_SPACE_NAME_CHARS,
+    MAX_SPACE_TOKEN_BYTES, MAX_SPACE_TOPIC_CHARS, SPACE_LEVEL_PAGE_LIMIT, SpaceLevelEntry,
+    SpaceLevelError, SpaceLevelPage,
+};
 mod history;
 pub use history::{FocusedView, HistoryReveal};
 mod search;
@@ -120,7 +126,7 @@ use matrix_sdk::{
             },
             space::child::SpaceChildEventContent,
         },
-        room::RoomType,
+        room::{JoinRuleSummary, RoomType},
         serde::Raw,
     },
     search_index::SearchIndexStoreKind,
@@ -393,6 +399,30 @@ pub struct SpaceNodeInfo {
     pub avatar_mxc: Option<String>,
     pub is_space: bool,
     pub children: Vec<SpaceChildInfo>,
+    #[serde(default)]
+    pub canonical_alias: Option<String>,
+    #[serde(default)]
+    pub joined_members: u64,
+    #[serde(default)]
+    pub join_rule: SpaceJoinRule,
+    /// A room type other than a Space, which this client cannot show.
+    #[serde(default)]
+    pub unsupported_type: bool,
+}
+
+/// The join rule a hierarchy summary reports. The server's summary is a
+/// hint: a join is still decided by the room's homeserver.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceJoinRule {
+    Public,
+    Invite,
+    Knock,
+    Restricted,
+    KnockRestricted,
+    Private,
+    #[default]
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2527,28 +2557,8 @@ impl AccountManager {
         from: Option<&str>,
         limit: u32,
     ) -> Result<SpaceHierarchyPage> {
-        let owns = || {
-            selection.is_current()
-                && self
-                    .account_selection(selection.account_id())
-                    .is_some_and(|current| selection.same_epoch(&current))
-        };
-        if !owns() {
-            return Err(MatrixCoreError::SelectedAccountChanged);
-        }
-        let client = {
-            let state = selection
-                .guard(self.state.lock())
-                .await
-                .ok_or(MatrixCoreError::SelectedAccountChanged)?;
-            if !owns() {
-                return Err(MatrixCoreError::SelectedAccountChanged);
-            }
-            account_access::ensure_eligible(&state, selection.account_id())?;
-            selected_loaded_for(&state, selection.account_id())?
-                .client
-                .clone()
-        };
+        let owns = || self.owns_selection(selection);
+        let client = self.hierarchy_client_for(selection).await?;
         let id = RoomId::parse(space_id)
             .map_err(|error| MatrixCoreError::InvalidRoomId(error.to_string()))?;
         let mut request = get_hierarchy::v1::Request::new(id);
@@ -2573,6 +2583,37 @@ impl AccountManager {
             nodes: response.rooms.into_iter().map(space_node_info).collect(),
             next_batch: response.next_batch,
         })
+    }
+
+    /// The selection is current and still this manager's selection of its
+    /// account: matching account IDs alone never bind work after A-B-A.
+    pub(crate) fn owns_selection(&self, selection: &AccountSelection) -> bool {
+        selection.is_current()
+            && self
+                .account_selection(selection.account_id())
+                .is_some_and(|current| selection.same_epoch(&current))
+    }
+
+    /// The pinned client of the exact selection, for a hierarchy read. An
+    /// ineligible, unloaded or departed account has none.
+    pub(crate) async fn hierarchy_client_for(
+        &self,
+        selection: &AccountSelection,
+    ) -> Result<Client> {
+        if !self.owns_selection(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let state = selection
+            .guard(self.state.lock())
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        if !self.owns_selection(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        account_access::ensure_eligible(&state, selection.account_id())?;
+        Ok(selected_loaded_for(&state, selection.account_id())?
+            .client
+            .clone())
     }
 
     pub async fn link_space_child(
@@ -4177,6 +4218,15 @@ fn space_node_info(
             suggested: event.content.suggested,
         })
         .collect();
+    let join_rule = match &chunk.summary.join_rule {
+        JoinRuleSummary::Public => SpaceJoinRule::Public,
+        JoinRuleSummary::Invite => SpaceJoinRule::Invite,
+        JoinRuleSummary::Knock => SpaceJoinRule::Knock,
+        JoinRuleSummary::Restricted(_) => SpaceJoinRule::Restricted,
+        JoinRuleSummary::KnockRestricted(_) => SpaceJoinRule::KnockRestricted,
+        JoinRuleSummary::Private => SpaceJoinRule::Private,
+        _ => SpaceJoinRule::Other,
+    };
     SpaceNodeInfo {
         room_id: chunk.summary.room_id.to_string(),
         name: chunk.summary.name,
@@ -4184,6 +4234,10 @@ fn space_node_info(
         avatar_mxc: chunk.summary.avatar_url.map(|url| url.to_string()),
         is_space: matches!(chunk.summary.room_type, Some(RoomType::Space)),
         children,
+        canonical_alias: chunk.summary.canonical_alias.map(|alias| alias.to_string()),
+        joined_members: chunk.summary.num_joined_members.into(),
+        join_rule,
+        unsupported_type: !matches!(chunk.summary.room_type, None | Some(RoomType::Space)),
     }
 }
 

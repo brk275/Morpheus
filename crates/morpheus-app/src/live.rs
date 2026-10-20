@@ -1664,6 +1664,34 @@ impl LiveUi {
             .await
     }
 
+    /// Join from the Space explorer under the exact selection it was opened
+    /// with. A selection is never current again once its account was left,
+    /// so a join asked for before an A-B-A switch is not sent after it.
+    pub(crate) async fn join_explorer_target(
+        self: &Arc<Self>,
+        selection: &AccountSelection,
+        target: &MatrixLinkTarget,
+        space_hint: Option<bool>,
+        display_name: &str,
+        ui: Weak<AppWindow>,
+    ) -> Result<(), MatrixCoreError> {
+        let _transition = self.account_transition.lock().await;
+        let account_id = selection.account_id();
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        self.require_active_account(account_id).await?;
+        let room_id = selection
+            .guard(self.manager.join_matrix_room_for(account_id, target))
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)??;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        self.complete_room_action(account_id, room_id, space_hint, display_name, ui)
+            .await
+    }
+
     async fn complete_room_action(
         self: &Arc<Self>,
         account_id: &str,
@@ -3768,6 +3796,7 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     ui.set_directory_search("".into());
     ui.set_directory_server("".into());
     ui.set_directory_join_input("".into());
+    crate::space_explorer::clear(ui);
     ui.set_invitations(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_results(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_open(false);

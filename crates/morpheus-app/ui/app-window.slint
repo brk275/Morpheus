@@ -19,6 +19,8 @@ import { RoomOrganizationButton, RoomOrganizationState, RoomSectionHeader } from
 export { RoomOrganizationState } from "room-organization.slint";
 import { VoicePresencePill, VoiceRosters } from "voice-rosters.slint";
 export { VoiceParticipant, VoicePresence, VoiceRosters } from "voice-rosters.slint";
+import { SpaceExplorer, SpaceExplorerPanel } from "space-explorer.slint";
+export { SpaceExplorer, SpaceExplorerCrumb, SpaceExplorerRow } from "space-explorer.slint";
 import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "device-sessions.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
@@ -4728,11 +4730,22 @@ export component AppWindow inherits Window {
                             background: transparent;
                             Text {
                                 x: 8px;
+                                width: parent.width - 8px - (space-explore.enabled ? space-explore.width + 4px : 0px);
                                 text: "v   " + (root.active-space-id == "" ? "Home" : root.active-space-name);
                                 color: root.ink;
                                 font-size: StyleTokens.sidebar-font-size * root.text-scale;
                                 font-weight: 650;
                                 vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            // Browse the shown Space's rooms and nested Spaces (space-explorer.slint).
+                            space-explore := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                x: parent.width - self.width; y: (parent.height - self.height) / 2;
+                                enabled: root.live-session && root.active-space-id != "";
+                                visible: self.enabled;
+                                text: "Explore";
+                                label: "Explore the rooms and Spaces in " + root.active-space-name;
+                                activated => { SpaceExplorer.show(root.active-space-id, root.active-space-name, "", ""); }
                             }
                         }
                         if root.invitations.length > 0 : Text {
@@ -6074,6 +6087,12 @@ export component AppWindow inherits Window {
                                         text: room.topic != "" ? room.topic : "No room topic";
                                         color: root.muted; font-size: 11px * root.text-scale; overflow: elide;
                                     }
+                                }
+                                if room.is-space : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                    width: 84px; text: "Explore";
+                                    label: "Explore public Space " + room.title + " before joining";
+                                    enabled: root.live-session;
+                                    activated => { SpaceExplorer.show(room.id, room.title, room.route-server, room.canonical-alias); }
                                 }
                                 TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                                     width: 76px; text: root.directory-join-busy && root.directory-joining-room-id == room.id ? "Joining…" : "Join";
@@ -9842,6 +9861,27 @@ export component AppWindow inherits Window {
         cancel-loading => { root.cancel-image-preview-loading(); }
         retry => { root.retry-image-preview(); }
         save => { root.save-attachment(root.image-preview-event-id, root.image-preview-title); }
+    }
+
+    // The Space explorer (space-explorer.slint); Rust owns its state.
+    if SpaceExplorer.open : SpaceExplorerPanel {
+        text-scale: root.text-scale;
+        button-colors: root.button-colors;
+        palette: {
+            ink: root.ink,
+            muted: root.muted,
+            accent: root.accent,
+            surface: root.dialog-surface,
+            elevated: root.elevated,
+            hover: root.hover,
+            divider: root.divider,
+            error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+            selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover,
+            selection-ink: StyleTokens.roles.selection-ink.color,
+            has-selection-ink: StyleTokens.roles.selection-ink.present,
+            focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+            scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa,
+        };
     }
 
     if root.quick-switcher-open : FocusScope {

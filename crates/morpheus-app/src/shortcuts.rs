@@ -363,6 +363,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || ui.get_leave_call_dialog()
         || !ui.get_security_recovery_key().is_empty()
         || ui.get_quick_switcher_open()
+        || crate::space_explorer::is_open(ui)
         || ui.get_image_preview_open()
         || !ui.get_shortcut_recording().is_empty()
         || ui.get_poll_dialog_open()

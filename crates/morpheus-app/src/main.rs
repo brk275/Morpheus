@@ -44,6 +44,7 @@ mod security;
 mod sender_palette_editor;
 mod settings_search;
 mod shortcuts;
+mod space_explorer;
 mod sso;
 #[cfg(not(morpheus_timeline_acceptance))]
 mod startup_error;
@@ -2241,6 +2242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = weak.upgrade() {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
+            space_explorer::clear(&ui);
         }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
@@ -2871,6 +2873,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     message_search::register(&ui, live.clone(), runtime.handle().clone());
+    space_explorer::register(&ui, live.clone(), runtime.handle().clone());
     thread_history::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
