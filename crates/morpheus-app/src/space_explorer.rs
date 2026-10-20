@@ -133,7 +133,12 @@ fn status(
 
 impl Row {
     pub(crate) fn status(&self) -> Status {
-        status(self.membership, self.missing, self.unsupported, self.join_rule)
+        status(
+            self.membership,
+            self.missing,
+            self.unsupported,
+            self.join_rule,
+        )
     }
     fn matches(&self, query: &str) -> bool {
         [&self.name, &self.alias, &self.topic, &self.room_id]
@@ -179,12 +184,16 @@ impl Level {
     fn wants_page(&self, loaded: usize) -> bool {
         self.error.is_none()
             && !self.complete
+            && !self.capped
             && self.pages < MAX_LEVEL_PAGES
             && self.rows.len() < MAX_LEVEL_ROWS
             && loaded < MAX_LOADED_ROWS
     }
     fn link(&self, room_id: &str) -> Option<&SpaceChildInfo> {
-        self.links.as_ref()?.iter().find(|link| link.room_id == room_id)
+        self.links
+            .as_ref()?
+            .iter()
+            .find(|link| link.room_id == room_id)
     }
 }
 
@@ -221,7 +230,9 @@ impl Explorer {
         }
     }
     pub(crate) fn top(&self) -> &Level {
-        self.trail.last().expect("the trail always holds its first Space")
+        self.trail
+            .last()
+            .expect("the trail always holds its first Space")
     }
     fn top_mut(&mut self) -> &mut Level {
         self.trail
@@ -298,6 +309,7 @@ impl Explorer {
             }
         };
         level.pages += 1;
+        level.capped |= page.truncated;
         if let Some(space) = page.space {
             level.membership = space.membership;
             if let Some(name) = space.node.name.as_deref() {
@@ -327,8 +339,12 @@ impl Explorer {
             level.rows.push(row(entry, link.as_ref()));
             room += 1;
         }
-        level.next_batch = page.next_batch;
-        level.complete = level.next_batch.is_none();
+        // An unusable/repeated cursor or a bounded partial page must not turn
+        // unseen children into a claim that the server cannot preview them.
+        let repeated = page.next_batch.is_some() && page.next_batch == request.from;
+        level.capped |= repeated || (page.next_batch.is_some() && level.pages >= MAX_LEVEL_PAGES);
+        level.next_batch = if repeated { None } else { page.next_batch };
+        level.complete = level.next_batch.is_none() && !level.capped;
         if level.complete {
             level.add_missing(room);
         }
@@ -339,7 +355,11 @@ impl Explorer {
     /// already on the trail: a Space that links an ancestor is a cycle and
     /// is never read again.
     pub(crate) fn browse(&mut self, room_id: &str, operation: u64) -> bool {
-        if let Some(index) = self.trail.iter().position(|level| level.space_id == room_id) {
+        if let Some(index) = self
+            .trail
+            .iter()
+            .position(|level| level.space_id == room_id)
+        {
             return self.crumb(index, operation);
         }
         if self.trail.len() >= MAX_TRAIL {
@@ -403,9 +423,9 @@ impl Explorer {
         if level.space_id == room_id {
             // A Space the homeserver could not describe may still admit a
             // deliberate join; the server decides.
-            let status = level.rule.map(|(rule, unsupported)| {
-                status(level.membership, false, unsupported, rule)
-            });
+            let status = level
+                .rule
+                .map(|(rule, unsupported)| status(level.membership, false, unsupported, rule));
             let joinable = match status {
                 Some(status) => status.joinable(),
                 None => !matches!(
@@ -522,9 +542,13 @@ impl Level {
 fn row(entry: SpaceLevelEntry, link: Option<&SpaceChildInfo>) -> Row {
     let node = entry.node;
     let alias = node.canonical_alias.unwrap_or_default();
-    let name = node
-        .name
-        .unwrap_or_else(|| if alias.is_empty() { node.room_id.clone() } else { alias.clone() });
+    let name = node.name.unwrap_or_else(|| {
+        if alias.is_empty() {
+            node.room_id.clone()
+        } else {
+            alias.clone()
+        }
+    });
     Row {
         name: label(&name, &node.room_id),
         alias,
@@ -535,7 +559,9 @@ fn row(entry: SpaceLevelEntry, link: Option<&SpaceChildInfo>) -> Row {
         join_rule: node.join_rule,
         membership: entry.membership,
         suggested: link.is_some_and(|link| link.suggested),
-        via: link.map(|link| link.via_servers.clone()).unwrap_or_default(),
+        via: link
+            .map(|link| link.via_servers.clone())
+            .unwrap_or_default(),
         links: node.is_space.then_some(node.children.len()),
         missing: false,
         room_id: node.room_id,
@@ -929,7 +955,10 @@ fn join(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, room_id: &str) {
             if live_session(&ui).is_none() {
                 return;
             }
-            let failure = result.as_ref().err().map_or("", |error| target.failure(error));
+            let failure = result
+                .as_ref()
+                .err()
+                .map_or("", |error| target.failure(error));
             let shown_space = SESSION.with(|session| {
                 let mut session = session.borrow_mut();
                 let explorer = &mut session.as_mut()?.explorer;

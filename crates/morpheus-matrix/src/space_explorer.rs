@@ -92,6 +92,8 @@ pub struct SpaceLevelPage {
     /// joined room the server does not describe can still be opened.
     pub linked_memberships: Vec<(String, RoomMembership)>,
     pub next_batch: Option<String>,
+    /// The server supplied more than this page can represent or an unusable cursor.
+    pub truncated: bool,
 }
 
 impl AccountManager {
@@ -177,6 +179,10 @@ pub(crate) fn level_page(
     rooms: Vec<SpaceHierarchyRoomsChunk>,
     next_batch: Option<String>,
 ) -> SpaceLevelPage {
+    let mut truncated = rooms.len() > SPACE_LEVEL_PAGE_LIMIT as usize + 1
+        || next_batch
+            .as_deref()
+            .is_some_and(|token| !valid_token(token));
     let mut space = None;
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
@@ -187,8 +193,10 @@ pub(crate) fn level_page(
         }
         if entry.node.room_id == space_id {
             space = Some(entry);
-        } else {
+        } else if entries.len() < SPACE_LEVEL_PAGE_LIMIT as usize {
             entries.push(entry);
+        } else {
+            truncated = true;
         }
     }
     SpaceLevelPage {
@@ -197,6 +205,7 @@ pub(crate) fn level_page(
         entries,
         linked_memberships: Vec::new(),
         next_batch: next_batch.filter(|token| valid_token(token)),
+        truncated,
     }
 }
 
@@ -240,7 +249,10 @@ fn level_failure(error: &HttpError) -> SpaceLevelError {
         Some(ErrorKind::InvalidParam) => return SpaceLevelError::InvalidToken,
         _ => {}
     }
-    match error.as_client_api_error().map(|error| error.status_code.as_u16()) {
+    match error
+        .as_client_api_error()
+        .map(|error| error.status_code.as_u16())
+    {
         Some(403) => SpaceLevelError::Forbidden,
         Some(404) => SpaceLevelError::NotFound,
         _ => SpaceLevelError::Unavailable,
@@ -294,7 +306,10 @@ mod tests {
         assert_eq!(ids, ["!a:example.org", "!b:example.org"]);
         // A link back to the Space is kept as a link: the explorer, not the
         // core, decides that it is a cycle.
-        assert_eq!(page.entries[1].node.children[0].room_id, "!space:example.org");
+        assert_eq!(
+            page.entries[1].node.children[0].room_id,
+            "!space:example.org"
+        );
         assert_eq!(page.next_batch.as_deref(), Some("next"));
     }
 
@@ -335,6 +350,16 @@ mod tests {
     }
 
     #[test]
+    fn a_page_without_its_parent_still_respects_the_room_limit() {
+        let rooms = (0..SPACE_LEVEL_PAGE_LIMIT + 1)
+            .map(|index| room(&format!("!r{index}:example.org"), &[]))
+            .collect();
+        let page = level_page("!space:example.org", rooms, None);
+        assert_eq!(page.entries.len(), SPACE_LEVEL_PAGE_LIMIT as usize);
+        assert!(page.truncated);
+    }
+
+    #[test]
     fn pages_links_and_tokens_are_bounded() {
         let ids = (0..MAX_SPACE_LEVEL_LINKS + 20)
             .map(|index| format!("!r{index}:example.org"))
@@ -348,6 +373,7 @@ mod tests {
         assert_eq!(space.node.children.len(), MAX_SPACE_LEVEL_LINKS);
         assert_eq!(page.entries.len(), SPACE_LEVEL_PAGE_LIMIT as usize);
         assert_eq!(page.next_batch, None);
+        assert!(page.truncated);
         assert!(!valid_token(""));
         assert!(!valid_token("a\nb"));
         assert!(valid_token("s_123"));

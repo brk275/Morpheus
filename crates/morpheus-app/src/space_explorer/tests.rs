@@ -59,6 +59,7 @@ fn page(
         entries: entries.into_iter().map(entry).collect(),
         linked_memberships: Vec::new(),
         next_batch: next_batch.map(str::to_owned),
+        truncated: false,
     }
 }
 
@@ -68,7 +69,9 @@ fn ids(explorer: &Explorer) -> Vec<String> {
 
 fn opened() -> (Explorer, Request) {
     let mut explorer = Explorer::new(1, ROOT, "Root", Vec::new());
-    let request = explorer.next_request().expect("the first page is asked for");
+    let request = explorer
+        .next_request()
+        .expect("the first page is asked for");
     assert_eq!(request.from, None);
     assert!(explorer.next_request().is_none(), "one page at a time");
     (explorer, request)
@@ -110,7 +113,10 @@ fn links_the_server_does_not_describe_are_listed_and_extras_are_not() {
         ROOT,
         Some(node(ROOT, true, &links)),
         // A room the Space does not link is not one of its children.
-        vec![node(links[0], false, &[]), node("!extra:example.org", false, &[])],
+        vec![
+            node(links[0], false, &[]),
+            node("!extra:example.org", false, &[]),
+        ],
         None,
     );
     result.linked_memberships = vec![(links[2].into(), RoomMembership::Joined)];
@@ -220,7 +226,9 @@ fn a_room_in_several_spaces_is_joined_everywhere_it_is_listed() {
         None,
     );
     assert!(explorer.apply(&in_child, Ok(result)));
-    let target = explorer.join_target(shared).expect("a public room is joinable");
+    let target = explorer
+        .join_target(shared)
+        .expect("a public room is joinable");
     assert_eq!(target.via, ["example.org"]);
     assert!(explorer.begin_join(shared, 7));
     assert!(!explorer.begin_join(child, 8), "one join at a time");
@@ -246,7 +254,12 @@ fn results_for_a_departed_level_or_explorer_are_dropped() {
     let more = explorer.next_request().unwrap();
     // Browsing retires the root's Load more.
     assert!(explorer.browse(child, 2));
-    let late = page(ROOT, None, vec![node("!late:example.org", false, &[])], None);
+    let late = page(
+        ROOT,
+        None,
+        vec![node("!late:example.org", false, &[])],
+        None,
+    );
     assert!(!explorer.apply(&more, Ok(late)));
     // Going back while the child is read retires the child's first page,
     // and the root keeps the rows and token it had.
@@ -272,13 +285,18 @@ fn the_shown_space_is_joinable_only_as_its_own_rule_allows() {
     let mut space = node(ROOT, true, &[]);
     space.join_rule = SpaceJoinRule::Invite;
     assert!(explorer.apply(&first, Ok(page(ROOT, Some(space), Vec::new(), None))));
-    assert!(explorer.join_target(ROOT).is_none(), "invite only, not invited");
+    assert!(
+        explorer.join_target(ROOT).is_none(),
+        "invite only, not invited"
+    );
 
     let (mut explorer, first) = opened();
     let mut space = node(ROOT, true, &[]);
     space.join_rule = SpaceJoinRule::Restricted;
     assert!(explorer.apply(&first, Ok(page(ROOT, Some(space), Vec::new(), None))));
-    let target = explorer.join_target(ROOT).expect("a restricted Space may be tried");
+    let target = explorer
+        .join_target(ROOT)
+        .expect("a restricted Space may be tried");
     assert!(target.restricted && target.is_space);
 }
 
@@ -302,7 +320,10 @@ fn statuses_decide_what_may_be_joined_or_opened() {
     use SpaceJoinRule::*;
     assert_eq!(row(Public, None, false).status(), Status::Public);
     assert_eq!(row(Restricted, None, false).status(), Status::Restricted);
-    assert_eq!(row(KnockRestricted, None, false).status(), Status::Restricted);
+    assert_eq!(
+        row(KnockRestricted, None, false).status(),
+        Status::Restricted
+    );
     assert_eq!(row(Knock, None, false).status(), Status::Knock);
     assert_eq!(row(Invite, None, false).status(), Status::InviteOnly);
     assert_eq!(row(Private, None, false).status(), Status::InviteOnly);
@@ -425,7 +446,9 @@ async fn a_departed_selection_neither_reads_nor_joins_after_a_b_a() {
     assert!(manager.account_selection(&a.id).unwrap().is_current());
     // The same account is active again, but the explorer opened under the
     // departed selection reads nothing...
-    let read = manager.space_level_for(&departed, "!space:example.org", None).await;
+    let read = manager
+        .space_level_for(&departed, "!space:example.org", None)
+        .await;
     assert_eq!(read, Err(SpaceLevelError::AccountChanged));
     // ...and joins nothing.
     let target = MatrixLinkTarget::Room {
@@ -436,9 +459,40 @@ async fn a_departed_selection_neither_reads_nor_joins_after_a_b_a() {
     let joined = live
         .join_explorer_target(&departed, &target, Some(true), "Space", Weak::default())
         .await;
-    assert!(matches!(joined, Err(MatrixCoreError::SelectedAccountChanged)));
+    assert!(matches!(
+        joined,
+        Err(MatrixCoreError::SelectedAccountChanged)
+    ));
     manager.stop().await;
     drop(live);
     drop(manager);
     directory.close().unwrap();
+}
+
+#[test]
+fn a_partial_page_or_repeated_cursor_never_invents_missing_children() {
+    for repeated in [false, true] {
+        let (mut explorer, first) = opened();
+        let root = node(ROOT, true, &["!a:example.org", "!unknown:example.org"]);
+        let mut result = page(
+            ROOT,
+            Some(root),
+            vec![node("!a:example.org", false, &[])],
+            Some("t1"),
+        );
+        if !repeated {
+            result.next_batch = None;
+            result.truncated = true;
+        }
+        assert!(explorer.apply(&first, Ok(result)));
+        if repeated {
+            let next = explorer.next_request().unwrap();
+            assert!(explorer.apply(&next, Ok(page(ROOT, None, Vec::new(), Some("t1")))));
+        }
+        assert!(explorer.top().capped);
+        assert!(!explorer.top().complete);
+        assert!(!explorer.can_load_more());
+        assert_eq!(ids(&explorer), ["!a:example.org"]);
+        assert!(summary(&explorer).contains("more than can be shown"));
+    }
 }
