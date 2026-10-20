@@ -49,6 +49,8 @@ pub struct RequestConfig {
     pub(crate) max_concurrent_requests: Option<NonZeroUsize>,
     pub(crate) force_auth: bool,
     pub(crate) skip_auth: bool,
+    // Morpheus patch: a mutation can refuse authentication refresh and replay.
+    pub(crate) disable_auth_refresh: bool,
     // Morpheus patch: optional per-request response body limit; see
     // `RequestConfig::max_response_bytes`.
     pub(crate) max_response_bytes: Option<u64>,
@@ -65,6 +67,7 @@ impl Debug for RequestConfig {
             force_auth,
             max_concurrent_requests,
             skip_auth: skip_optional_auth,
+            disable_auth_refresh,
             max_response_bytes,
         } = self;
 
@@ -84,6 +87,10 @@ impl Debug for RequestConfig {
             res.field("skip_optional_auth", &true);
         }
 
+        if *disable_auth_refresh {
+            res.field("disable_auth_refresh", &true);
+        }
+
         res.finish()
     }
 }
@@ -98,6 +105,7 @@ impl Default for RequestConfig {
             max_concurrent_requests: Default::default(),
             force_auth: false,
             skip_auth: false,
+            disable_auth_refresh: false,
             max_response_bytes: None,
         }
     }
@@ -122,6 +130,25 @@ impl RequestConfig {
     #[must_use]
     pub fn disable_retry(mut self) -> Self {
         self.retry_limit = Some(0);
+        self
+    }
+
+    /// Return an unknown-token response without automatically refreshing
+    /// authentication, replaying this request, or broadcasting an unknown-token
+    /// session change for it.
+    ///
+    /// This is separate from [`Self::disable_retry`]: ordinary HTTP retries and
+    /// authentication refresh are independent. Combine the two when a mutation
+    /// must be sent at most once. The original error is returned so the caller
+    /// can report an unconfirmed outcome and require an explicit new attempt.
+    ///
+    /// The default is `false`, preserving the client's authentication refresh
+    /// policy. This does not disable authentication on the original request or
+    /// prevent another request from refreshing the session. The SDK still marks
+    /// the rejected access token as expired.
+    #[must_use]
+    pub fn disable_auth_refresh(mut self) -> Self {
+        self.disable_auth_refresh = true;
         self
     }
 
@@ -256,6 +283,16 @@ mod tests {
 
         let cfg = RequestConfig::short_retry();
         assert_eq!(cfg.retry_limit, Some(3));
+    }
+
+    #[test]
+    fn authentication_refresh_is_disabled_only_when_chosen() {
+        assert!(!RequestConfig::new().disable_auth_refresh);
+        let config = RequestConfig::new().disable_retry().disable_auth_refresh();
+        assert!(config.disable_auth_refresh);
+        assert_eq!(config.retry_limit, Some(0));
+        assert!(format!("{config:?}").contains("disable_auth_refresh: true"));
+        assert!(!format!("{:?}", RequestConfig::new()).contains("disable_auth_refresh"));
     }
 
     #[test]

@@ -177,10 +177,17 @@ where
         let Self { client, request, config, send_progress } = self;
 
         Box::pin(async move {
+            // Authentication refresh is a separate replay path from HTTP
+            // backoff. An opted-out mutation must return its original response
+            // without entering the refresh handler (including its session-change
+            // broadcasts), even when the client normally refreshes tokens.
+            let disable_auth_refresh =
+                config.unwrap_or_else(|| client.request_config()).disable_auth_refresh;
             let res =
                 Box::pin(client.send_inner(request.clone(), config, send_progress.clone())).await;
 
-            if let Err(e) = &res
+            if !disable_auth_refresh
+                && let Err(e) = &res
                 && let RetryRequest::Yes = handle_unknown_token_error(e, &client).await?
             {
                 return Box::pin(client.send_inner(request, config, send_progress)).await;

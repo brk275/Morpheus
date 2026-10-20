@@ -492,6 +492,7 @@ impl NotificationSettings {
         let request_config = Some(
             RequestConfig::new()
                 .retry_limit(0)
+                .disable_auth_refresh()
                 .timeout(std::time::Duration::from_secs(30))
                 .max_response_bytes(64 * 1024),
         );
@@ -1066,6 +1067,61 @@ mod tests {
                 .await,
             Err(NotificationSettingsError::UnableToAddPushRule)
         );
+        server.verify().await;
+    }
+
+    #[async_test]
+    async fn test_push_rule_unknown_token_is_not_refreshed_or_replayed() {
+        let server = MockServer::start().await;
+        let client = crate::test_utils::test_client_builder(Some(server.uri()))
+            .server_versions([ruma::api::MatrixVersion::V1_3])
+            .handle_refresh_tokens()
+            .build()
+            .await
+            .unwrap();
+        client
+            .matrix_auth()
+            .restore_session(
+                crate::authentication::matrix::MatrixSession {
+                    meta: crate::test_utils::client::mock_session_meta(),
+                    tokens: crate::test_utils::client::mock_session_tokens_with_refresh(),
+                },
+                crate::store::RoomLoadSettings::default(),
+            )
+            .await
+            .unwrap();
+        let mut session_changes = client.subscribe_to_session_changes();
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "errcode": "M_UNKNOWN_TOKEN", "error": "Synthetic token rejection",
+                "soft_logout": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_matrix/client/v3/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "synthetic-refreshed-token"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let room_id = get_test_room_id();
+        let settings = from_insert_rules(&client, vec![(RuleKind::Room, &room_id, true)]);
+        assert_eq!(
+            settings.set_room_notification_mode(&room_id, RoomNotificationMode::Mute).await,
+            Err(NotificationSettingsError::UnableToAddPushRule)
+        );
+        assert_eq!(
+            settings.get_user_defined_room_notification_mode(&room_id).await,
+            Some(RoomNotificationMode::AllMessages)
+        );
+        assert_eq!(
+            session_changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
         server.verify().await;
     }
 

@@ -1,4 +1,5 @@
 use std::{
+    future::IntoFuture,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -325,6 +326,154 @@ async fn test_refresh_token_handled_success() {
 
     assert_eq!(session_changes.try_recv(), Ok(SessionChange::TokensRefreshed));
     assert_eq!(session_changes.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[async_test]
+async fn test_mutation_can_disable_auth_refresh_and_replay() {
+    use std::io::{self, Write};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Disposable loopback-only fixture values, never credentials from a user.
+    const ACCESS: &str = "synthetic-no-replay-access-sentinel";
+    const REFRESH: &str = "synthetic-no-replay-refresh-sentinel";
+    const PRIVATE_REPLY: &str = "synthetic unknown-token reply sentinel";
+    let (builder, server) = test_client_builder_with_server().await;
+    let client = builder
+        .request_config(RequestConfig::new().disable_retry())
+        .server_versions([MatrixVersion::V1_3])
+        .handle_refresh_tokens()
+        .build()
+        .await
+        .unwrap();
+    client
+        .matrix_auth()
+        .restore_session(
+            MatrixSession {
+                meta: mock_session_meta(),
+                tokens: SessionTokens {
+                    access_token: ACCESS.to_owned(),
+                    refresh_token: Some(REFRESH.to_owned()),
+                },
+            },
+            RoomLoadSettings::default(),
+        )
+        .await
+        .unwrap();
+    let mut session_changes = client.subscribe_to_session_changes();
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/createRoom"))
+        .and(header(http::header::AUTHORIZATION, format!("Bearer {ACCESS}")))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "errcode": "M_UNKNOWN_TOKEN", "error": PRIVATE_REPLY, "soft_logout": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::REFRESH_TOKEN))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sink = Capture(captured.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || sink.clone())
+        .finish();
+    let result = client
+        .send(ruma::api::client::room::create_room::v3::Request::new())
+        .with_request_config(
+            RequestConfig::new()
+                .disable_retry()
+                .disable_auth_refresh()
+                .max_response_bytes(64 * 1024),
+        )
+        .into_future()
+        .with_subscriber(subscriber)
+        .await;
+    let error = result.expect_err("the original unknown-token response is returned");
+    assert_matches!(error.client_api_error_kind(), Some(ErrorKind::UnknownToken(_)));
+    assert_eq!(error.as_client_api_error().unwrap().status_code.as_u16(), 401);
+    // No refresh, replay or sign-out signal, and no credentials were replaced.
+    assert_eq!(session_changes.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(client.access_token().as_deref(), Some(ACCESS));
+    assert_eq!(client.session_tokens().unwrap().refresh_token.as_deref(), Some(REFRESH));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(output.contains("Matrix request failed"), "capture the actual HTTP error route");
+    for private in [ACCESS, REFRESH, PRIVATE_REPLY] {
+        assert!(!output.contains(private), "no token or response text may enter tracing");
+    }
+    server.verify().await;
+}
+
+#[async_test]
+async fn test_mutation_keeps_default_auth_refresh_and_replay() {
+    let (builder, server) = test_client_builder_with_server().await;
+    let client = builder
+        .request_config(RequestConfig::new().disable_retry())
+        .server_versions([MatrixVersion::V1_3])
+        .handle_refresh_tokens()
+        .build()
+        .await
+        .unwrap();
+    client.matrix_auth().restore_session(session(), RoomLoadSettings::default()).await.unwrap();
+    let mut session_changes = client.subscribe_to_session_changes();
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/createRoom"))
+        .and(header(http::header::AUTHORIZATION, "Bearer 1234"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_json(&*test_json::UNKNOWN_TOKEN_SOFT_LOGOUT),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/refresh"))
+        .and(body_partial_json(json!({ "refresh_token": "abcd" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::REFRESH_TOKEN))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_matrix/client/v3/createRoom"))
+        .and(header(http::header::AUTHORIZATION, "Bearer 5678"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "room_id": "!created:example.org"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // HTTP retry_limit(0) alone retains the existing authentication behavior.
+    let response = client
+        .send(ruma::api::client::room::create_room::v3::Request::new())
+        .with_request_config(RequestConfig::new().disable_retry().max_response_bytes(64 * 1024))
+        .await
+        .unwrap();
+    assert_eq!(response.room_id.as_str(), "!created:example.org");
+    assert_eq!(session_changes.try_recv(), Ok(SessionChange::TokensRefreshed));
+    assert_eq!(session_changes.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    server.verify().await;
 }
 
 #[async_test]
