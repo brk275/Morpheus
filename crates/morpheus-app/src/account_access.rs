@@ -301,26 +301,24 @@ impl AccountAccessUi {
         let accounts = self.live.manager.accounts().await;
         let status = self.live.manager.app_password_status().await;
         let active = self.live.manager.active_account().await;
-        let rows = accounts
-            .into_iter()
-            .map(|account| SavedAccountItem {
-                id: account.id.as_str().into(),
-                handle: account.user_id.into(),
-                active: active.as_ref().is_some_and(|a| a.id == account.id),
-                removal_pending: status.pending_removals.contains(&account.id),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
         let current_generation = self.accounts_refresh_generation.clone();
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
             // An earlier Manage refresh must not reinsert a row after removal.
             if current_generation.load(Ordering::Acquire) != generation {
                 return;
             }
-            // Avatars are attached on the UI thread from the in-memory cache
-            // of each exact local account; nothing is fetched for them here.
-            let rows = rows
+            // Generated rows contain a Slint Image even before an avatar is
+            // attached. Construct the whole row on its UI thread; only the
+            // core account metadata crosses from the worker.
+            let rows = accounts
                 .into_iter()
+                .map(|account| SavedAccountItem {
+                    id: account.id.as_str().into(),
+                    handle: account.user_id.into(),
+                    active: active.as_ref().is_some_and(|a| a.id == account.id),
+                    removal_pending: status.pending_removals.contains(&account.id),
+                    ..Default::default()
+                })
                 .map(crate::account_identity::with_saved_avatar)
                 .collect::<Vec<_>>();
             ui.set_saved_accounts(ModelRc::new(VecModel::from(rows)));
