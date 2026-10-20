@@ -281,7 +281,7 @@ export component SpaceExplorerPanel inherits FocusScope {
                 Rectangle {
                     height: 26px * max(1, root.text-scale);
                     clip: true;
-                    accessible-role: list;
+                    accessible-role: AccessibleRole.list;
                     accessible-label: "Space path";
                     HorizontalLayout {
                         alignment: start; spacing: 2px;
@@ -375,7 +375,7 @@ export component SpaceExplorerPanel inherits FocusScope {
                 list := ListView {
                     vertical-stretch: 1;
                     horizontal-scrollbar-policy: always-off;
-                    accessible-role: list;
+                    accessible-role: AccessibleRole.list;
                     accessible-label: "Rooms and Spaces in " + SpaceExplorer.title;
                     for row[index] in SpaceExplorer.rows : Rectangle {
                         width: list.visible-width;
