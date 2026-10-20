@@ -26,8 +26,8 @@ pub use polls::{
 };
 mod discovery;
 pub use discovery::{
-    MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery, ResolvedRoomAlias,
-    parse_matrix_link_target,
+    JoinError, MAX_JOIN_VIA, MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery,
+    ResolvedRoomAlias, parse_matrix_link_target,
 };
 mod space_explorer;
 pub use space_explorer::{
@@ -111,7 +111,7 @@ use matrix_sdk::{
     room::Room,
     room::edit::EditedContent,
     ruma::{
-        EventId, RoomId, RoomOrAliasId, ServerName, UserId,
+        EventId, RoomId, ServerName, UserId,
         api::{
             FeatureFlag,
             client::{room::create_room, space::get_hierarchy},
@@ -253,6 +253,9 @@ pub enum MatrixCoreError {
     Keyring(String),
     #[error("Matrix SDK error: {0}")]
     Sdk(String),
+    /// A join that did not complete (fixed sentences, no homeserver text).
+    #[error(transparent)]
+    Join(#[from] JoinError),
     #[error("{0} login is not implemented yet")]
     UnsupportedLogin(&'static str),
 }
@@ -2677,17 +2680,24 @@ impl AccountManager {
         Ok(room.room_id().to_string())
     }
 
+    /// The active account joins a room by ID or alias, through the one
+    /// bounded request of join_room_for (no routes, no local state change;
+    /// the room appears once sync shows it). No app path calls this; local
+    /// fixtures do.
     pub async fn join_room(&self, room_or_alias_id: &str) -> Result<String> {
-        let state = self.state.lock().await;
-        let loaded = selected_loaded(&state)?;
-        let id = RoomOrAliasId::parse(room_or_alias_id)
-            .map_err(|e| MatrixCoreError::InvalidRoomId(e.to_string()))?;
-        let room = loaded
-            .client
-            .join_room_by_id_or_alias(&id, &[])
+        let account = self
+            .active_account()
             .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        Ok(room.room_id().to_string())
+            .ok_or(MatrixCoreError::NoActiveAccount)?;
+        let selection = self
+            .account_selection(&account.id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        let target = MatrixLinkTarget::Room {
+            room_or_alias_id: room_or_alias_id.to_owned(),
+            event_id: None,
+            via_servers: Vec::new(),
+        };
+        Ok(self.join_room_for(&selection, &target, || true).await?)
     }
 
     pub async fn leave_room(&self, room_id: &str) -> Result<()> {

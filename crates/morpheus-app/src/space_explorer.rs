@@ -11,9 +11,10 @@
 //! level or explorer (A-B-A included) is dropped. Detaching, switching or
 //! closing clears every private name and row synchronously.
 //!
-//! Joins go through `LiveUi::join_explorer_target` (the guarded directory
-//! join path) and Open through the existing `select-space` / `open-room`
-//! routing. Nothing here edits a Space or its links.
+//! Joins go through `LiveUi::join_target_for` (the one bounded join for the
+//! exact selection, shared with the directory) and Open through the
+//! existing `select-space` / `open-room` routing. Nothing here edits a Space
+//! or its links.
 
 use std::{
     cell::{Cell, RefCell},
@@ -435,9 +436,7 @@ impl Explorer {
             };
             return joinable.then(|| JoinTarget {
                 room_id: level.space_id.clone(),
-                name: level.name.clone(),
                 via: level.via.clone(),
-                is_space: true,
                 restricted: status == Some(Status::Restricted),
             });
         }
@@ -445,9 +444,7 @@ impl Explorer {
         let status = row.status();
         status.joinable().then(|| JoinTarget {
             room_id: row.room_id.clone(),
-            name: row.name.clone(),
             via: row.via.clone(),
-            is_space: row.is_space,
             restricted: status == Status::Restricted,
         })
     }
@@ -578,12 +575,12 @@ fn label(text: &str, fallback: &str) -> String {
     }
 }
 
+/// What a join needs: whether it is a Space, and its name, come from sync
+/// once it is joined (LiveUi::join_target_for), never from the preview.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JoinTarget {
     pub(crate) room_id: String,
-    pub(crate) name: String,
     pub(crate) via: Vec<String>,
-    pub(crate) is_space: bool,
     pub(crate) restricted: bool,
 }
 
@@ -604,7 +601,14 @@ impl JoinTarget {
     /// A fixed sentence; the homeserver's reason is never shown.
     fn failure(&self, error: &MatrixCoreError) -> &'static str {
         match error {
-            MatrixCoreError::SelectedAccountChanged => "The account changed before joining.",
+            MatrixCoreError::SelectedAccountChanged
+            | MatrixCoreError::Join(morpheus_matrix::JoinError::AccountChanged) => {
+                "The account changed before joining. Nothing was sent."
+            }
+            // Sent, and no definite reply: never "could not join".
+            MatrixCoreError::Join(error) if error.may_have_joined() => {
+                "No reply arrived, so you may or may not have joined. Check your room list before joining again."
+            }
             _ if self.restricted => {
                 "Could not join. Only members of certain Spaces or rooms can join this one."
             }
@@ -941,16 +945,11 @@ fn join(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, room_id: &str) {
     let weak = ui.as_weak();
     handle.spawn(async move {
         let link = target.link();
-        let joining = live.join_explorer_target(
-            &selection,
-            &link,
-            Some(target.is_space),
-            &target.name,
-            weak.clone(),
-        );
+        let joining = live.join_target_for(&selection, &link, weak.clone());
+        // Past the bound the request may have been sent: unknown.
         let result = tokio::time::timeout(JOIN_TIMEOUT, joining)
             .await
-            .unwrap_or(Err(MatrixCoreError::Sdk("timed out".into())));
+            .unwrap_or(Err(morpheus_matrix::JoinError::OutcomeUnknown.into()));
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if live_session(&ui).is_none() {
                 return;

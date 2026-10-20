@@ -2969,7 +2969,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory_live = live.clone();
     let directory_handle = runtime.handle().clone();
     ui.on_join_discovery_target(
-        move |input, canonical_alias, route_server, display_name, is_space| {
+        move |input, canonical_alias, route_server, _display_name, _is_space| {
             let Some(window) = weak.upgrade() else {
                 return;
             };
@@ -2981,10 +2981,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let account_id = window.get_active_account_local_id().to_string();
-            if account_id.is_empty() {
+            // The exact account shown at the click: an account switch before
+            // the request is sent cancels it, and a switch back never revives it.
+            let Some(selection) = directory_live
+                .manager
+                .account_selection(&account_id)
+                .filter(morpheus_matrix::AccountSelection::is_current)
+            else {
                 window.set_directory_join_error("Choose a Matrix account first".into());
                 return;
-            }
+            };
             let target = match room_join_target(&input, &canonical_alias, &route_server) {
                 Ok(target) => target,
                 Err(error) => {
@@ -2997,26 +3003,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window.set_directory_join_error("".into());
             window.set_directory_join_busy(true);
             window.set_directory_joining_room_id(input.clone());
-            let space_hint = (!display_name.is_empty()).then_some(is_space);
+            // Whether it is a Space is read from sync once it is joined, not
+            // from the directory's display fields.
             let live = directory_live.clone();
             let weak = weak.clone();
             directory_handle.spawn(async move {
                 let result = tokio::time::timeout(
                     Duration::from_secs(60),
-                    live.join_matrix_target(
-                        &account_id,
-                        &target,
-                        space_hint,
-                        &display_name,
-                        weak.clone(),
-                    ),
+                    live.join_target_for(&selection, &target, weak.clone()),
                 )
                 .await
-                .map_err(|_| {
-                    "Join timed out. It may have completed; refresh your rooms before retrying."
-                        .to_owned()
-                })
-                .and_then(|result| result.map_err(|error| error.to_string()));
+                .map_err(|_| morpheus_matrix::JoinError::OutcomeUnknown.to_string())
+                .and_then(|result| result.map(|_| ()).map_err(|error| error.to_string()));
                 let _ = weak.upgrade_in_event_loop(move |window| {
                     if window.get_active_account_local_id().as_str() != account_id
                         || window.get_directory_join_operation() != operation
@@ -3071,18 +3069,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let live = action_live.clone();
         let weak = weak.clone();
         let submitted = input.to_string();
+        // A join is bound to the exact account shown at the click.
+        let selection = action_live
+            .manager
+            .account_selection(&account_id)
+            .filter(morpheus_matrix::AccountSelection::is_current);
         action_handle.spawn(async move {
             let result = match action {
                 Some(action) => live
                     .run_room_action(&account_id, action, &submitted, weak.clone())
                     .await
                     .map_err(|error| error.to_string()),
-                None => match room_join_target(&submitted, "", "") {
-                    Ok(target) => live
-                        .join_matrix_target(&account_id, &target, None, "", weak.clone())
+                None => match (room_join_target(&submitted, "", ""), selection) {
+                    (Ok(target), Some(selection)) => live
+                        .join_target_for(&selection, &target, weak.clone())
                         .await
+                        .map(|_| ())
                         .map_err(|error| error.to_string()),
-                    Err(error) => Err(error),
+                    (Ok(_), None) => Err(morpheus_matrix::JoinError::AccountChanged.to_string()),
+                    (Err(error), _) => Err(error),
                 },
             };
             let _ = weak.upgrade_in_event_loop(move |window| {

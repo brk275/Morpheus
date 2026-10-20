@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use morpheus_matrix::{
     AccountInfo, AccountManager, AccountSelection, ComposeSendTarget, ComposeText,
-    DownloadedAttachment, EditBaseline, Generation, MatrixCoreError, MatrixLinkTarget, MessageInfo,
+    DownloadedAttachment, EditBaseline, Generation, JoinError, MatrixCoreError, MatrixLinkTarget,
+    MessageInfo,
     MessageSendState, PublicMediaConsent, QueuedAttachment, QueuedMessage, QueuedSendUpdate,
     RecoveredDraft, RoomInfo, RoomMemberInfo, RoomMembership, StickerCatalog, SyncBackend,
     SyncStatus, TextFormat,
@@ -58,6 +59,26 @@ pub enum MessageTarget {
 pub enum RoomAction {
     CreatePrivate,
     CreateSpace,
+}
+
+/// How a joined room opens, once sync shows it joined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinedNavigation {
+    Room,
+    Space,
+}
+
+/// What a confirmed join opens: nothing until sync shows the room joined
+/// (`synced`: `Some(is_space)`), so no local state or navigation is ever
+/// changed for a room that has not arrived.
+pub(crate) fn joined_navigation(synced: Option<bool>) -> Option<JoinedNavigation> {
+    synced.map(|is_space| {
+        if is_space {
+            JoinedNavigation::Space
+        } else {
+            JoinedNavigation::Room
+        }
+    })
 }
 
 struct KnownSpace {
@@ -1644,52 +1665,76 @@ impl LiveUi {
         .await
     }
 
-    /// Join a parsed room ID, alias, or Matrix link and navigate to it. The
-    /// directory may already know this is a Space before local sync does.
-    pub async fn join_matrix_target(
-        self: &Arc<Self>,
-        account_id: &str,
-        target: &MatrixLinkTarget,
-        space_hint: Option<bool>,
-        display_name: &str,
-        ui: Weak<AppWindow>,
-    ) -> Result<(), MatrixCoreError> {
-        let _transition = self.account_transition.lock().await;
-        self.require_active_account(account_id).await?;
-        let room_id = self
-            .manager
-            .join_matrix_room_for(account_id, target)
-            .await?;
-        self.complete_room_action(account_id, room_id, space_hint, display_name, ui)
-            .await
-    }
-
-    /// Join from the Space explorer under the exact selection it was opened
-    /// with. A selection is never current again once its account was left,
-    /// so a join asked for before an A-B-A switch is not sent after it.
-    pub(crate) async fn join_explorer_target(
+    /// Join a parsed room ID, alias, or Matrix link (the directory, Join a
+    /// room, the Space explorer) for the exact `selection` captured when it
+    /// was asked for (AccountManager::join_room_for): one bounded request,
+    /// refused while a security step runs, never sent again. A selection is
+    /// never current again once its account was left, so a join asked for
+    /// before an A-B-A switch is not sent after it.
+    ///
+    /// The account transition lock is not held across the request: a slow
+    /// homeserver never holds up an account switch, and the selection
+    /// fences every step. Nothing local changes until sync shows the room
+    /// joined (see joined_navigation); then it opens through the guarded
+    /// navigation as its own task, so no caller's bound can drop it between
+    /// a commit and its give-back. Ok(true) when it is opening, Ok(false)
+    /// when it was joined but has not arrived through sync yet.
+    pub(crate) async fn join_target_for(
         self: &Arc<Self>,
         selection: &AccountSelection,
         target: &MatrixLinkTarget,
-        space_hint: Option<bool>,
-        display_name: &str,
         ui: Weak<AppWindow>,
-    ) -> Result<(), MatrixCoreError> {
-        let _transition = self.account_transition.lock().await;
-        let account_id = selection.account_id();
-        if !selection.is_current() {
-            return Err(MatrixCoreError::SelectedAccountChanged);
+    ) -> Result<bool, MatrixCoreError> {
+        if !self.is_live.load(Ordering::Acquire) || !selection.is_current() {
+            return Err(JoinError::AccountChanged.into());
         }
-        self.require_active_account(account_id).await?;
-        let room_id = selection
-            .guard(self.manager.join_matrix_room_for(account_id, target))
-            .await
-            .ok_or(MatrixCoreError::SelectedAccountChanged)??;
-        if !selection.is_current() {
-            return Err(MatrixCoreError::SelectedAccountChanged);
+        // Navigating anywhere after the join was asked for wins over opening
+        // the joined room.
+        let navigation = self.current_navigation_epoch();
+        let (gate, is_live) = (self.security_gate.clone(), self.is_live.clone());
+        let admit = move || is_live.load(Ordering::Acquire) && !gate.blocked();
+        let room_id = self.manager.join_room_for(selection, target, admit).await?;
+        let synced = self.manager.await_joined_for(selection, &room_id).await;
+        let Some(open) = joined_navigation(synced) else {
+            return Ok(false);
+        };
+        let live = self.clone();
+        let selection = selection.clone();
+        tokio::spawn(async move {
+            live.open_joined(selection, room_id, open, navigation, ui)
+                .await;
+        });
+        Ok(true)
+    }
+
+    /// Open a room or Space that sync shows joined, only while its selection
+    /// is current and nothing navigated since the join was asked for: a
+    /// room as an owned reveal (reveal_room_for: committed exactly, shown
+    /// only through its own admitted snapshot, given back otherwise), a
+    /// Space the way choosing it in the sidebar does (select_space_for).
+    async fn open_joined(
+        self: Arc<Self>,
+        selection: AccountSelection,
+        room_id: String,
+        open: JoinedNavigation,
+        navigation: u64,
+        ui: Weak<AppWindow>,
+    ) {
+        if !selection.is_current() || !self.navigation_is_current(navigation) {
+            return;
         }
-        self.complete_room_action(account_id, room_id, space_hint, display_name, ui)
-            .await
+        let epoch = self.invalidate_navigation();
+        let _ = match open {
+            JoinedNavigation::Room => {
+                let authority = NavigationAuthority::default();
+                self.reveal_room_for(selection, room_id, epoch, authority, ui)
+                    .await
+            }
+            JoinedNavigation::Space => {
+                self.select_space_for(selection.account_id(), room_id, epoch, ui)
+                    .await
+            }
+        };
     }
 
     async fn complete_room_action(
@@ -6402,5 +6447,20 @@ mod stale_observer_tests {
         drop(manager);
         close_profile(directory, live).await;
         recovery_check!(thread_retention);
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+
+    /// A confirmed join changes nothing local and navigates nowhere until
+    /// sync shows the room joined; then a room opens as a room and a Space
+    /// as a Space, from what sync says, not from a directory hint.
+    #[test]
+    fn a_join_opens_nothing_until_sync_shows_the_room_joined() {
+        assert_eq!(joined_navigation(None), None);
+        assert_eq!(joined_navigation(Some(false)), Some(JoinedNavigation::Room));
+        assert_eq!(joined_navigation(Some(true)), Some(JoinedNavigation::Space));
     }
 }
