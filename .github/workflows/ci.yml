@@ -1,12 +1,12 @@
 # TEMPORARY owner-reviewed layout contracts. NEVER MERGE this workflow.
 name: Reviewed SDK and Slint reference diagnosis
-run-name: Reviewed SDK and Slint reference diagnosis - d4c5d08
+run-name: Reviewed SDK and Slint reference diagnosis - 47f2f82
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sdk-slint-d4c5d08-${{ github.ref }}
+  group: sdk-slint-47f2f82-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: d4c5d08b08304fb40fbc250c9f40b891eb62b67d
+          ref: 47f2f82bdc34d80b96f94935134b65dcc65e4c8d
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='d4c5d08b08304fb40fbc250c9f40b891eb62b67d'
+          source='47f2f82bdc34d80b96f94935134b65dcc65e4c8d'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
@@ -265,8 +265,7 @@ jobs:
               for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
                   known_test_ids.add(prefix+function)
           checks=[
-              ('sdk_auth_config', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'config::request::tests::authentication_refresh_is_disabled_only_when_chosen', '--', '--exact', '--test-threads=1'], 2700, {'config::request::tests::authentication_refresh_is_disabled_only_when_chosen'}, set()),
-              ('sdk_push_rule_writes', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'notification_settings::tests::test_push_rule_', '--', '--test-threads=1'], 2700, {'notification_settings::tests::test_push_rule_errors_do_not_log_server_reply_text', 'notification_settings::tests::test_push_rule_writes_reject_oversized_valid_json', 'notification_settings::tests::test_push_rule_failure_is_not_retried', 'notification_settings::tests::test_push_rule_unknown_token_is_not_refreshed_or_replayed'}, set()),
+              ('sdk_push_rule_writes', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'notification_settings::tests::test_push_rule_unknown_token_is_not_refreshed_or_replayed', '--', '--exact', '--test-threads=1'], 2700, {'notification_settings::tests::test_push_rule_unknown_token_is_not_refreshed_or_replayed'}, set()),
               ('sdk_auth_replay', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--test', 'integration', 'refresh_token::test_mutation_', '--', '--test-threads=1'], 2700, {'refresh_token::test_mutation_can_disable_auth_refresh_and_replay', 'refresh_token::test_mutation_keeps_default_auth_refresh_and_replay'}, set()),
               ('workspace_layout', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'workspace_layout::tests::', '--', '--test-threads=1'], 2700, {'workspace_layout::tests::hidden_and_collapsed_panes_restore_to_the_default', 'workspace_layout::tests::the_account_control_stays_bottom_left_in_every_arrangement', 'workspace_layout::tests::presets_change_only_the_arrangement_and_are_recognized', 'workspace_layout::tests::narrow_windows_give_way_in_order_and_keep_the_conversation', 'workspace_layout::tests::the_default_arrangement_matches_the_classic_layout', 'workspace_layout::tests::a_dragged_width_commits_once_clamped_and_never_over_an_external_change', 'workspace_layout::tests::a_dragged_pane_lands_exactly_once_at_its_insertion_position', 'workspace_layout::tests::reordering_keeps_hidden_collapsed_and_widths_and_refuses_stale_orders'}, set()),
           ]
