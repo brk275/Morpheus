@@ -1,16 +1,16 @@
 # TEMPORARY owner-reviewed layout contracts. NEVER MERGE this workflow.
-name: Reviewed native failure diagnosis
-run-name: Reviewed native failure diagnosis - c7d0e12
+name: Reviewed SDK and Slint reference diagnosis
+run-name: Reviewed SDK and Slint reference diagnosis - d4c5d08
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: native-failure-c7d0e12-${{ github.ref }}
+  group: sdk-slint-d4c5d08-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
-    name: Native failure diagnosis Linux x64
+    name: SDK and Slint reference diagnosis Linux x64
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: c7d0e125e8a99c574e97d9e9715ca5ba0ec855d9
+          ref: d4c5d08b08304fb40fbc250c9f40b891eb62b67d
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='c7d0e125e8a99c574e97d9e9715ca5ba0ec855d9'
+          source='d4c5d08b08304fb40fbc250c9f40b891eb62b67d'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
@@ -265,13 +265,53 @@ jobs:
               for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
                   known_test_ids.add(prefix+function)
           checks=[
+              ('sdk_auth_config', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'config::request::tests::authentication_refresh_is_disabled_only_when_chosen', '--', '--exact', '--test-threads=1'], 2700, {'config::request::tests::authentication_refresh_is_disabled_only_when_chosen'}, set()),
+              ('sdk_push_rule_writes', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'notification_settings::tests::test_push_rule_', '--', '--test-threads=1'], 2700, {'notification_settings::tests::test_push_rule_errors_do_not_log_server_reply_text', 'notification_settings::tests::test_push_rule_writes_reject_oversized_valid_json', 'notification_settings::tests::test_push_rule_failure_is_not_retried', 'notification_settings::tests::test_push_rule_unknown_token_is_not_refreshed_or_replayed'}, set()),
+              ('sdk_auth_replay', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--test', 'integration', 'refresh_token::test_mutation_', '--', '--test-threads=1'], 2700, {'refresh_token::test_mutation_can_disable_auth_refresh_and_replay', 'refresh_token::test_mutation_keeps_default_auth_refresh_and_replay'}, set()),
               ('workspace_layout', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'workspace_layout::tests::', '--', '--test-threads=1'], 2700, {'workspace_layout::tests::hidden_and_collapsed_panes_restore_to_the_default', 'workspace_layout::tests::the_account_control_stays_bottom_left_in_every_arrangement', 'workspace_layout::tests::presets_change_only_the_arrangement_and_are_recognized', 'workspace_layout::tests::narrow_windows_give_way_in_order_and_keep_the_conversation', 'workspace_layout::tests::the_default_arrangement_matches_the_classic_layout', 'workspace_layout::tests::a_dragged_width_commits_once_clamped_and_never_over_an_external_change', 'workspace_layout::tests::a_dragged_pane_lands_exactly_once_at_its_insertion_position', 'workspace_layout::tests::reordering_keeps_hidden_collapsed_and_widths_and_refuses_stale_orders'}, set()),
           ]
           for _name, _args, _seconds, required, _ignored in checks:
               if required is not None: known_test_ids.update(required)
+          def slint_reference_diagnostic():
+              # Diagnostic-only compiler: retain the exact failing assertion and add
+              # only the static source reference. This never verifies shipping builds.
+              fetched=bounded(['cargo','fetch','--locked','--target','x86_64-unknown-linux-gnu'], 'compiler-fetch', 900)
+              report=private/'compiler-fetch-scan.json'
+              assert scanner_intact()
+              scanned=bounded([str(scanner),'dir',str(fetched['log'].parent),
+                  '--redact=100','--ignore-gitleaks-allow','--no-banner','--max-target-megabytes','0',
+                  '--config',str(config),'--gitleaks-ignore-path',str(ignore),
+                  '--report-format','json','--report-path',str(report)],'compiler-fetch-scan',60,8*1024*1024)
+              assert fetched['code']==0 and fetched['reason'] is None
+              assert scanned['code']==0 and scanned['reason'] is None and json.loads(report.read_text())==[]
+              cargo=pathlib.Path(environment['CARGO_HOME'])
+              archives=list((cargo/'registry/cache').glob('*/i-slint-compiler-1.18.1.crate'))
+              files=list((cargo/'registry/src').glob('*/i-slint-compiler-1.18.1/passes/const_propagation.rs'))
+              assert len(archives)==len(files)==1
+              archive=archives[0].read_bytes()
+              assert len(archive)<=16*1024*1024 and hashlib.sha256(archive).hexdigest()=='f55d48ebef05e2bf09ba5a1fc67bcb11033b9e12a2a50ed3105c7d25e2b539d0'
+              with tarfile.open(fileobj=io.BytesIO(archive),mode='r:gz') as package:
+                  entry=package.getmember('i-slint-compiler-1.18.1/passes/const_propagation.rs')
+                  assert entry.isfile() and entry.size<1024*1024
+                  original=package.extractfile(entry).read(1024*1024)
+              assert hashlib.sha256(original).hexdigest()=='47b8beda9c0b78bc6be399084274341a6a4a8e4a058ad90d5c398de214e8a1e0'
+              assert not files[0].is_symlink() and files[0].read_bytes()==original
+              old=b'debug_assert!(!matches!(ty, Type::Invalid));'
+              new=b'debug_assert!(!matches!(ty, Type::Invalid), "MORPHEUS_SLINT_CONST_REFERENCE name={} element={}", nr.name(), nr.element().borrow().id);'
+              assert original.count(old)==1
+              files[0].write_bytes(original.replace(old,new))
+              # Registry package sources are normally immutable to Cargo; evict only
+              # this compiler's build artifacts so the message change is compiled.
+              cleaned=bounded(['cargo','clean','--locked','-p','i-slint-compiler'],'compiler-clean',120)
+              assert cleaned['code']==0 and cleaned['reason'] is None
+              assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
+              print(json.dumps({'check':'compiler_reference_diagnostic','status':'prepared','source':source,
+                  'assertion_preserved':True,'shipping_compiler_evidence':False,'raw_logs_public':False}),flush=True)
+
           # Stop at the first concrete failure; diagnose it before further native work.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
+              if name=='workspace_layout': slint_reference_diagnostic()
               result=bounded(args,name,seconds)
               report=private/(name+'-scan.json')
               if not scanner_intact():
@@ -295,7 +335,7 @@ jobs:
               record={'check':name,'status':'passed' if passed else 'failed','reason':result['reason'],
                   'source':source,'exit_code':result['code'],'log_bytes':result['bytes'],
                   'raw_logs_public':False,'real_accounts':False,'physical_devices':False,
-                  'installed_app':False,'packages_uploaded':False}
+                  'installed_app':False,'packages_uploaded':False, 'shipping_compiler_evidence':name!='workspace_layout'}
               # Interleaved CLI stdout does not guarantee each name and ok share a line.
               # Account for every unique prefix and exact failure/ignore sets instead.
               failures=set()
@@ -330,7 +370,7 @@ jobs:
                       if not (stripped.startswith(('error:', 'error[', 'Error:', 'error occurred', 'Caused by:',
                           "process didn't exit successfully:", 'thread ', 'called `',
                           'fatal error:', 'fatal runtime error:', 'note: run with',
-                          '--- stdout', '--- stderr', 'signal:'))
+                          '--- stdout', '--- stderr', 'signal:', 'MORPHEUS_SLINT_CONST_REFERENCE'))
                           or ('-->' in stripped and '.slint:' in stripped)
                           or ('Unknown property' in stripped) or ('Unknown element' in stripped)
                           or ('Cannot access' in stripped) or ('No such property' in stripped)):
