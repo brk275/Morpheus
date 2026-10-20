@@ -1121,7 +1121,18 @@ mod tests {
             session_changes.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         );
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        // Session restoration can make discovery requests before this
+        // mutation. Count the wire boundary under test, not setup traffic.
+        let requests = server.received_requests().await.unwrap();
+        let mutations = requests.iter().filter(|request| {
+            request.method.as_str() == "PUT"
+                && request.url.path().starts_with("/_matrix/client/v3/pushrules/")
+        }).count();
+        let refreshes = requests.iter().filter(|request| {
+            request.url.path() == "/_matrix/client/v3/refresh"
+        }).count();
+        assert_eq!(mutations, 1);
+        assert_eq!(refreshes, 0);
         server.verify().await;
     }
 
