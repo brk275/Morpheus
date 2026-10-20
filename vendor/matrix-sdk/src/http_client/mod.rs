@@ -196,8 +196,10 @@ impl HttpClient {
         fn log_got_response() {
             debug!("Got response");
         }
-        fn log_error(e: &HttpError) {
-            error!("Error while sending request: {e:?}");
+        fn log_error(_error: &HttpError) {
+            // The typed error returned to the caller may contain an untrusted
+            // server body. Never duplicate that body into application logs.
+            error!("Matrix request failed");
         }
 
         let config = match config {

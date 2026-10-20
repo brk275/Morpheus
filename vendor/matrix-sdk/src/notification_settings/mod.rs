@@ -487,34 +487,41 @@ impl NotificationSettings {
         &self,
         rule_commands: &RuleCommands,
     ) -> Result<(), NotificationSettingsError> {
-        let request_config = Some(RequestConfig::short_retry());
+        // Push-rule writes have small JSON responses. Do not accumulate an
+        // unbounded response or silently resend a mutation after an unclear result.
+        let request_config = Some(
+            RequestConfig::new()
+                .retry_limit(0)
+                .timeout(std::time::Duration::from_secs(30))
+                .max_response_bytes(64 * 1024),
+        );
         for command in &rule_commands.commands {
             match command {
                 Command::DeletePushRule { kind, rule_id } => {
                     let request = delete_pushrule::v3::Request::new(kind.clone(), rule_id.clone());
                     self.client.send(request).with_request_config(request_config).await.map_err(
-                        |error| {
-                            error!("Unable to delete {kind} push rule `{rule_id}`: {error}");
+                        |_| {
+                            error!("Unable to confirm push-rule deletion");
                             NotificationSettingsError::UnableToRemovePushRule
                         },
                     )?;
                 }
-                Command::SetRoomPushRule { room_id, notify: _ } => {
+                Command::SetRoomPushRule { .. } => {
                     let push_rule = command.to_push_rule()?;
                     let request = set_pushrule::v3::Request::new(push_rule);
                     self.client.send(request).with_request_config(request_config).await.map_err(
-                        |error| {
-                            error!("Unable to set room push rule `{room_id}`: {error}");
+                        |_| {
+                            error!("Unable to confirm room push-rule update");
                             NotificationSettingsError::UnableToAddPushRule
                         },
                     )?;
                 }
-                Command::SetOverridePushRule { rule_id, room_id: _, notify: _ } => {
+                Command::SetOverridePushRule { .. } => {
                     let push_rule = command.to_push_rule()?;
                     let request = set_pushrule::v3::Request::new(push_rule);
                     self.client.send(request).with_request_config(request_config).await.map_err(
-                        |error| {
-                            error!("Unable to set override push rule `{rule_id}`: {error}");
+                        |_| {
+                            error!("Unable to confirm override push-rule update");
                             NotificationSettingsError::UnableToAddPushRule
                         },
                     )?;
@@ -535,8 +542,8 @@ impl NotificationSettings {
                         *enabled,
                     );
                     self.client.send(request).with_request_config(request_config).await.map_err(
-                        |error| {
-                            error!("Unable to set {kind} push rule `{rule_id}` enabled: {error}");
+                        |_| {
+                            error!("Unable to confirm push-rule enabled state");
                             NotificationSettingsError::UnableToUpdatePushRule
                         },
                     )?;
@@ -548,8 +555,8 @@ impl NotificationSettings {
                         actions.clone(),
                     );
                     self.client.send(request).with_request_config(request_config).await.map_err(
-                        |error| {
-                            error!("Unable to set {kind} push rule `{rule_id}` actions: {error}");
+                        |_| {
+                            error!("Unable to confirm push-rule action update");
                             NotificationSettingsError::UnableToUpdatePushRule
                         },
                     )?;
@@ -558,8 +565,8 @@ impl NotificationSettings {
                     let request = set_pushrule::v3::Request::new(rule.clone());
 
                     self.client.send(request).with_request_config(request_config).await.map_err(
-                        |error| {
-                            error!("Unable to set custom push rule `{rule:#?}`: {error}");
+                        |_| {
+                            error!("Unable to confirm custom push-rule update");
                             NotificationSettingsError::UnableToAddPushRule
                         },
                     )?;
@@ -1010,6 +1017,101 @@ mod tests {
 
         server.verify().await;
         Ok(())
+    }
+
+    #[async_test]
+    async fn test_push_rule_writes_reject_oversized_valid_json() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+        // Valid JSON that the uncapped implementation would accept.
+        let body = format!("{}{{}}", " ".repeat(64 * 1024));
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let room_id = get_test_room_id();
+        let settings = from_insert_rules(&client, vec![(RuleKind::Room, &room_id, true)]);
+        assert_eq!(
+            settings
+                .set_room_notification_mode(&room_id, RoomNotificationMode::Mute)
+                .await,
+            Err(NotificationSettingsError::UnableToAddPushRule)
+        );
+        assert_eq!(
+            settings
+                .get_user_defined_room_notification_mode(&room_id)
+                .await,
+            Some(RoomNotificationMode::AllMessages)
+        );
+        server.verify().await;
+    }
+
+    #[async_test]
+    async fn test_push_rule_failure_is_not_retried() {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "errcode": "M_UNKNOWN", "error": "Synthetic request failure"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let room_id = get_test_room_id();
+        let settings = from_insert_rules(&client, vec![(RuleKind::Room, &room_id, true)]);
+        assert_eq!(
+            settings
+                .set_room_notification_mode(&room_id, RoomNotificationMode::Mute)
+                .await,
+            Err(NotificationSettingsError::UnableToAddPushRule)
+        );
+        server.verify().await;
+    }
+
+    #[async_test]
+    async fn test_push_rule_errors_do_not_log_server_reply_text() {
+        use std::io::{self, Write};
+        use std::sync::Mutex;
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        const PRIVATE_REPLY: &str = "private server reply sentinel";
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "errcode": "M_UNKNOWN", "error": PRIVATE_REPLY
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = Capture(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || sink.clone())
+            .finish();
+        let room_id = get_test_room_id();
+        let settings = from_insert_rules(&client, vec![(RuleKind::Room, &room_id, true)]);
+        let result = settings.set_room_notification_mode(&room_id, RoomNotificationMode::Mute)
+            .with_subscriber(subscriber)
+            .await;
+        assert_eq!(result, Err(NotificationSettingsError::UnableToAddPushRule));
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("Matrix request failed"), "capture the real HTTP error path");
+        assert!(!output.contains(PRIVATE_REPLY), "server text must stay out of tracing");
+        server.verify().await;
     }
 
     #[async_test]
