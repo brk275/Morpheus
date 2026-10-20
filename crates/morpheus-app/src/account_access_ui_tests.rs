@@ -6923,8 +6923,8 @@ async fn assert_theme_pack_keeps_installed_file(ui: &AppWindow, directory: &std:
 /// both a missing and malformed theme, and a callback that tries to mix a
 /// behavior change with an appearance change.
 async fn assert_behavior_saves_with_broken_theme(ui: &AppWindow, directory: &std::path::Path) {
-    use morpheus_config::ConfigStore;
     use morpheus_config::style_profiles::install_theme_pack;
+    use morpheus_config::{ConfigStore, RoomNotificationLocal, ThemeMode};
 
     for (case, malformed) in [("missing", false), ("malformed", true)] {
         let store = ConfigStore::at(directory.join(format!("behavior-{case}/config.toml")));
@@ -6932,6 +6932,22 @@ async fn assert_behavior_saves_with_broken_theme(ui: &AppWindow, directory: &std
         initial.appearance.theme_pack = Some("behavior-palette".into());
         initial.notifications.enabled = true;
         initial.notifications.show_message_preview = true;
+        initial.activity.send_typing = true;
+        initial.activity.public_read_receipts = true;
+        initial.activity.read_tracking = true;
+        initial.set_room_notification_local(
+            "last-notification",
+            "!last:example.org",
+            RoomNotificationLocal {
+                quiet: true,
+                ..Default::default()
+            },
+        );
+        initial
+            .account_overrides
+            .entry("appearance-account".into())
+            .or_default()
+            .theme = Some(ThemeMode::Light);
         let pack = BuiltInStylePreset::Paper.theme().unwrap();
         install_theme_pack(&store, "behavior-palette", &pack, None).unwrap();
         store.save(&initial).unwrap();
@@ -6941,7 +6957,11 @@ async fn assert_behavior_saves_with_broken_theme(ui: &AppWindow, directory: &std
         ui.set_page(1);
         settle(ui).await;
 
-        let radius = if initial.geometry.corner_radius == 4 { 5 } else { 4 };
+        let radius = if initial.geometry.corner_radius == 4 {
+            5
+        } else {
+            4
+        };
         crate::save_config_change(ui, &store, |config| config.geometry.corner_radius = radius)
             .unwrap();
         assert_eq!(ui.get_studio_pending(), 1);
@@ -6956,6 +6976,31 @@ async fn assert_behavior_saves_with_broken_theme(ui: &AppWindow, directory: &std
         let saved = crate::save_config_change(ui, &store, |config| {
             config.notifications.enabled = false;
             config.notifications.show_message_preview = false;
+            config.activity = Default::default();
+            config
+                .account_overrides
+                .entry("new-notifications".into())
+                .or_default()
+                .notifications_enabled = Some(false);
+            config.set_room_notification_local(
+                "new-notifications",
+                "!quiet:example.org",
+                RoomNotificationLocal {
+                    quiet: true,
+                    hide_preview: true,
+                    no_highlights: true,
+                },
+            );
+            config
+                .account_overrides
+                .get_mut("appearance-account")
+                .unwrap()
+                .notifications_enabled = Some(false);
+            config.set_room_notification_local(
+                "last-notification",
+                "!last:example.org",
+                Default::default(),
+            );
         });
         assert!(saved.is_some(), "{case}: behavior edit must save");
         let written = store.load().unwrap();
@@ -6963,27 +7008,98 @@ async fn assert_behavior_saves_with_broken_theme(ui: &AppWindow, directory: &std
         assert!(!written.notifications.show_message_preview);
         assert!(!ui.get_notifications_enabled());
         assert!(!ui.get_notification_show_preview());
-        assert_eq!(written.geometry.corner_radius, initial.geometry.corner_radius);
-        assert_eq!(ui.get_studio_pending(), 1, "the appearance draft stays pending");
+        assert_eq!(written.activity, Default::default());
+        let activity = ui.global::<crate::RoomActivity>();
+        assert!(!activity.get_send_typing());
+        assert!(!activity.get_public_receipts());
+        assert!(!activity.get_read_tracking());
+        assert!(!written.account_overrides.contains_key("last-notification"));
+        assert_eq!(
+            written.account_overrides["new-notifications"].notifications_enabled,
+            Some(false)
+        );
+        assert!(
+            written
+                .room_notification_local("new-notifications", "!quiet:example.org")
+                .hide_preview
+        );
+        assert_eq!(
+            written.account_overrides["appearance-account"].theme,
+            Some(ThemeMode::Light)
+        );
+        assert_eq!(
+            written.account_overrides["appearance-account"].notifications_enabled,
+            Some(false)
+        );
+        assert_eq!(
+            written.geometry.corner_radius,
+            initial.geometry.corner_radius
+        );
+        assert_eq!(
+            ui.get_studio_pending(),
+            1,
+            "the appearance draft stays pending"
+        );
         assert_eq!(ui.invoke_token_color("accent".into()), shown_accent);
-        assert!(!ui.get_config_error().is_empty(), "the theme error remains visible");
+        assert!(
+            !ui.get_config_error().is_empty(),
+            "the theme error remains visible"
+        );
 
         let before = std::fs::read(store.path()).unwrap();
+        let mixed_account = crate::save_config_change(ui, &store, |config| {
+            let account = config
+                .account_overrides
+                .get_mut("appearance-account")
+                .unwrap();
+            account.notifications_enabled = Some(true);
+            account.theme = Some(ThemeMode::Dark);
+        });
+        assert!(
+            mixed_account.is_none(),
+            "account theme and privacy cannot share the fallback"
+        );
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        assert_eq!(ui.get_studio_pending(), 1);
         let refused = crate::save_config_change(ui, &store, |config| {
             config.notifications.enabled = true;
             config.geometry.corner_radius = radius + 1;
         });
-        assert!(refused.is_none(), "mixed edits must not enter the behavior fallback");
+        assert!(
+            refused.is_none(),
+            "mixed edits must not enter the behavior fallback"
+        );
         assert_eq!(std::fs::read(store.path()).unwrap(), before);
         assert_eq!(ui.get_studio_pending(), 1);
         ui.invoke_studio_apply();
         assert_eq!(std::fs::read(store.path()).unwrap(), before);
-        assert_eq!(ui.get_studio_pending(), 1, "Apply cannot accept the broken theme");
+        assert_eq!(
+            ui.get_studio_pending(),
+            1,
+            "Apply cannot accept the broken theme"
+        );
         ui.invoke_studio_discard();
         assert_eq!(ui.get_studio_pending(), 0);
         assert_eq!(ui.invoke_token_color("accent".into()), shown_accent);
         assert!(!ui.get_notifications_enabled());
         assert!(!ui.get_notification_show_preview());
+        // Discard redisplays the accepted last-valid look. Its behavior
+        // metadata must include every successful fallback save, including
+        // account entry creation/deletion, while the pending radius was
+        // never accepted or written.
+        let accepted = crate::appearance::remembered_theme_source().unwrap().0;
+        assert_eq!(accepted.activity, written.activity);
+        assert!(!accepted.account_overrides.contains_key("last-notification"));
+        for account in ["new-notifications", "appearance-account"] {
+            assert_eq!(
+                accepted.account_overrides.get(account),
+                written.account_overrides.get(account)
+            );
+        }
+        assert_eq!(
+            accepted.geometry.corner_radius,
+            initial.geometry.corner_radius
+        );
 
         // The same path works without a pending appearance draft too.
         crate::save_config_change(ui, &store, |config| config.notifications.sounds = false)

@@ -308,10 +308,11 @@ pub(crate) fn save(
 }
 
 /// The fallback is intentionally limited to settings applied by the
-/// behavior path. Accessibility, geometry, account overrides and every
-/// other appearance field still require a valid look. Comparing complete
-/// configurations after removing these four deltas also rejects a callback
-/// that changes behavior and appearance together.
+/// behavior path, including activity privacy and the two account notification
+/// fields. Accessibility, geometry, account appearance, voice designations
+/// and call modes still require a valid look. Comparing complete configurations
+/// after removing only those behavior deltas rejects a callback that changes
+/// behavior and appearance together.
 fn behavior_change_only(before: &Config, after: &Config) -> bool {
     let mut without_behavior = after.clone();
     copy_behavior(&mut without_behavior, before);
@@ -321,8 +322,41 @@ fn behavior_change_only(before: &Config, after: &Config) -> bool {
 fn copy_behavior(target: &mut Config, source: &Config) {
     target.notifications = source.notifications.clone();
     target.media = source.media.clone();
+    target.activity = source.activity.clone();
     target.shortcuts = source.shortcuts.clone();
     target.experimental = source.experimental.clone();
+
+    // Copy only notification behavior within account overrides. The other
+    // fields belong to appearance or room/call configuration and must never
+    // be admitted by the behavior-only fallback or replaced in the last
+    // valid accepted look.
+    let accounts: std::collections::BTreeSet<String> = target
+        .account_overrides
+        .keys()
+        .chain(source.account_overrides.keys())
+        .cloned()
+        .collect();
+    for account in accounts {
+        let source = source.account_overrides.get(&account);
+        let enabled = source.and_then(|overrides| overrides.notifications_enabled);
+        let rooms = source.map(|overrides| &overrides.room_notifications);
+        if let Some(overrides) = target.account_overrides.get_mut(&account) {
+            let had_behavior = overrides.notifications_enabled.is_some()
+                || !overrides.room_notifications.is_empty();
+            overrides.notifications_enabled = enabled;
+            overrides.room_notifications = rooms.cloned().unwrap_or_default();
+            // Removing the last notification override may remove its now
+            // empty account entry. Do not normalize an already-empty entry:
+            // an unrelated structural change must not become a behavior edit.
+            if had_behavior && *overrides == morpheus_config::AccountOverrides::default() {
+                target.account_overrides.remove(&account);
+            }
+        } else if enabled.is_some() || rooms.is_some_and(|rooms| !rooms.is_empty()) {
+            let overrides = target.account_overrides.entry(account).or_default();
+            overrides.notifications_enabled = enabled;
+            overrides.room_notifications = rooms.cloned().unwrap_or_default();
+        }
+    }
 }
 
 /// Record an accepted configuration (startup, a reload or a save). While
