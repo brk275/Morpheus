@@ -5,8 +5,9 @@
 //! - `activation`: opening a clicked banner through the window's
 //!   `open-conversation` navigation seam (exact account, room, event and
 //!   thread behind the protected account switch).
-//! - `read_markers`: private read receipts for the room on screen and
-//!   withdrawal of banners for rooms that were read.
+//! - `read_markers`: withdrawal of banners for rooms read here or elsewhere;
+//!   it sends no receipts (the opt-in room activity path is the only
+//!   automatic receipt sender).
 //! - `room_panel`: the room header's bell and panel for the open room: its
 //!   Matrix push-rule level and this device's sound, preview and highlight
 //!   switches for it.
@@ -59,7 +60,7 @@ pub(crate) fn register(
         runtime.clone(),
     );
     let activator = Activator::register(ui, runtime.clone(), notifications.take_activations());
-    runtime.spawn(read_markers::run(live, notifications, ui.as_weak()));
+    runtime.spawn(read_markers::run(live, notifications));
     NotificationCenter {
         _activator: activator,
         _rules: rules,

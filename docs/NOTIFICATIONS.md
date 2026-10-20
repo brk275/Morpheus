@@ -140,15 +140,15 @@ Tab stays inside the panel, and shortcuts pause while it is open.
 
 ## Read state and withdrawal
 
-While a room is on screen (the window is shown and not minimized, the
-conversation page is open and the room is selected), Morpheus marks its live
-timeline, and an open thread's, read with a private read receipt when it comes
-into view and when the window is activated again. New messages arriving by sync
-are marked read only while the window is active, or within two minutes of the
-room coming into view where the window system does not report activation, so a
-window merely left open does not mark messages nobody saw as read. Unread and
-mention counts therefore clear in Morpheus and on the account's other devices,
-while other members see no read marker. The scroll position is not considered.
+Notifications never mark a room or thread read and send no read receipt of
+their own. Showing a room, activating the window or a sync batch sends nothing.
+Read receipts come only from an explicit mark-as-read action or from the
+opt-in automatic read tracking of room activity (off by default), which is the
+single automatic receipt path. After each sync batch of the active account,
+the unread counts the SDK computed from that account's receipts decide which
+banners go: a room with no unread notification left, because it was read here
+or on another device or client, loses its banners. Inactive accounts are never
+read, and the request is bound to the account selection that made it.
 
 A shown banner is remembered only as an opaque token with its account, room,
 event and thread IDs, at most 32 of them and for at most 24 hours; no message
@@ -192,8 +192,8 @@ on Linux and Windows a minimized window is restored, but raising it is up to the
 desktop.
 
 These behaviors were written against the pinned SDK and `notify-rust` sources
-and have not been run. Click activation, withdrawal, private receipts against a
-real homeserver, push-rule changes on each platform, and the room panel, its
+and have not been run. Click activation, withdrawal of banners for rooms read
+on a real homeserver, push-rule changes on each platform, and the room panel, its
 device switches and the call-ring separation remain to be accepted.
 
 [Incoming-call sounds](INCOMING_CALLS.md) use a separate native speaker path
