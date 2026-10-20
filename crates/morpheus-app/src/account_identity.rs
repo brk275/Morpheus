@@ -121,6 +121,251 @@ pub(crate) fn retain_confirmed(account_ids: &[&str]) {
     {
         names.retain(|id, _| account_ids.contains(&id.as_str()));
     }
+    // A removed or logged-out account's picture goes with it.
+    if let Some(avatars) = AVATARS.lock().expect("account avatars poisoned").as_mut() {
+        avatars.retain(|id, _| account_ids.contains(&id.as_str()));
+    }
+}
+
+/// Longest side of an account picture held for the switcher, in pixels.
+pub(crate) const MAX_ACCOUNT_AVATAR_SIDE: u32 = 64;
+
+/// One account's own public avatar, decoded and reduced to at most 64 px,
+/// with the key of the profile avatar it came from. Memory only.
+struct Thumb {
+    key: String,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+/// Account pictures by exact local account ID. Filled only from the active
+/// account's own profile, never for an inactive account; kept for the other
+/// signed-in accounts until they are removed, logged out or the app locks.
+static AVATARS: Mutex<Option<HashMap<String, Thumb>>> = Mutex::new(None);
+
+/// The picture held for this exact local account, as a Slint image.
+pub(crate) fn avatar_image(account_id: &str) -> Option<slint::Image> {
+    let avatars = AVATARS.lock().expect("account avatars poisoned");
+    let thumb = avatars.as_ref()?.get(account_id)?;
+    let pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        &thumb.rgba,
+        thumb.width,
+        thumb.height,
+    );
+    Some(slint::Image::from_rgba8(pixels))
+}
+
+fn held_avatar_key(account_id: &str) -> Option<String> {
+    AVATARS
+        .lock()
+        .expect("account avatars poisoned")
+        .as_ref()?
+        .get(account_id)
+        .map(|thumb| thumb.key.clone())
+}
+
+/// A Manage accounts row with its fallback initials and color, and the
+/// picture held for exactly its local account, if any.
+pub(crate) fn with_saved_avatar(mut row: crate::SavedAccountItem) -> crate::SavedAccountItem {
+    let name = confirmed_name(row.id.as_str())
+        .unwrap_or_else(|| crate::live::display_user(row.handle.as_str()));
+    row.initials = crate::live::initials(&name).into();
+    row.accent = crate::live::accent(row.id.as_str());
+    match avatar_image(row.id.as_str()) {
+        Some(image) => {
+            row.avatar = image;
+            row.has_avatar = true;
+        }
+        None => {
+            row.avatar = slint::Image::default();
+            row.has_avatar = false;
+        }
+    }
+    row
+}
+
+/// Reduce RGBA pixels to at most `max` pixels per side by averaging boxes of
+/// source pixels, alpha-weighted so transparent pixels lend no color.
+/// Returns the input unchanged when it already fits.
+pub(crate) fn thumbnail(rgba: &[u8], width: u32, height: u32, max: u32) -> (Vec<u8>, u32, u32) {
+    if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
+        return (Vec::new(), 0, 0);
+    }
+    if width <= max && height <= max {
+        return (rgba.to_vec(), width, height);
+    }
+    let scale = f64::from(width.max(height)) / f64::from(max);
+    let out_w = ((f64::from(width) / scale).round() as u32).clamp(1, max);
+    let out_h = ((f64::from(height) / scale).round() as u32).clamp(1, max);
+    let mut out = vec![0u8; out_w as usize * out_h as usize * 4];
+    for y in 0..out_h {
+        let y0 = (u64::from(y) * u64::from(height) / u64::from(out_h)) as u32;
+        let y1 = ((u64::from(y + 1) * u64::from(height)).div_ceil(u64::from(out_h)) as u32)
+            .clamp(y0 + 1, height);
+        for x in 0..out_w {
+            let x0 = (u64::from(x) * u64::from(width) / u64::from(out_w)) as u32;
+            let x1 = ((u64::from(x + 1) * u64::from(width)).div_ceil(u64::from(out_w)) as u32)
+                .clamp(x0 + 1, width);
+            let (mut r, mut g, mut b, mut a, mut count) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let i = (sy as usize * width as usize + sx as usize) * 4;
+                    let alpha = u64::from(rgba[i + 3]);
+                    r += u64::from(rgba[i]) * alpha;
+                    g += u64::from(rgba[i + 1]) * alpha;
+                    b += u64::from(rgba[i + 2]) * alpha;
+                    a += alpha;
+                    count += 1;
+                }
+            }
+            let o = (y as usize * out_w as usize + x as usize) * 4;
+            if a > 0 {
+                out[o] = (r / a) as u8;
+                out[o + 1] = (g / a) as u8;
+                out[o + 2] = (b / a) as u8;
+            }
+            out[o + 3] = (a / count.max(1)) as u8;
+        }
+    }
+    (out, out_w, out_h)
+}
+
+/// Hold `prepared` (the account's own avatar for `key`) for `account_id`.
+fn store_avatar(account_id: &str, key: String, prepared: &PreparedAvatar) {
+    let (width, height) = prepared.dimensions();
+    let (rgba, width, height) = thumbnail(prepared.rgba(), width, height, MAX_ACCOUNT_AVATAR_SIDE);
+    if rgba.is_empty() {
+        return;
+    }
+    AVATARS
+        .lock()
+        .expect("account avatars poisoned")
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            account_id.to_owned(),
+            Thumb {
+                key,
+                width,
+                height,
+                rgba,
+            },
+        );
+}
+
+fn forget_avatar(account_id: &str) {
+    if let Some(avatars) = AVATARS.lock().expect("account avatars poisoned").as_mut() {
+        avatars.remove(account_id);
+    }
+}
+
+/// Drop every account picture from memory and from view, synchronously.
+/// Called when the app locks or the account detaches (logout, removal).
+pub(crate) fn forget_all_avatars(ui: &AppWindow) {
+    AVATARS.lock().expect("account avatars poisoned").take();
+    LABEL.with(|label| {
+        let mut label = label.borrow_mut();
+        if let Some(cancellation) = label.cancellation.take() {
+            cancellation.cancel();
+        }
+        label.selection = None;
+        label.in_flight = false;
+        label.generation = label.generation.wrapping_add(1);
+    });
+    ui.set_active_account_avatar(slint::Image::default());
+    ui.set_active_account_has_avatar(false);
+    let accounts = ui.get_accounts();
+    for index in 0..accounts.row_count() {
+        if let Some(mut item) = accounts.row_data(index)
+            && item.has_avatar
+        {
+            item.avatar = slint::Image::default();
+            item.has_avatar = false;
+            accounts.set_row_data(index, item);
+        }
+    }
+    let options = ui.get_account_options();
+    for index in 0..options.row_count() {
+        if let Some(mut option) = options.row_data(index)
+            && option.has_avatar
+        {
+            option.avatar = slint::Image::default();
+            option.has_avatar = false;
+            options.set_row_data(index, option);
+        }
+    }
+    let saved = ui.get_saved_accounts();
+    for index in 0..saved.row_count() {
+        if let Some(mut row) = saved.row_data(index)
+            && row.has_avatar
+        {
+            row.avatar = slint::Image::default();
+            row.has_avatar = false;
+            saved.set_row_data(index, row);
+        }
+    }
+}
+
+/// Hold a synthetic picture for a local account and show it, for UI tests.
+#[cfg(test)]
+pub(crate) fn hold_test_avatar(ui: &AppWindow, account_id: &str, side: u32) {
+    let rgba = vec![200u8; side as usize * side as usize * 4];
+    let (rgba, width, height) = thumbnail(&rgba, side, side, MAX_ACCOUNT_AVATAR_SIDE);
+    AVATARS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            account_id.to_owned(),
+            Thumb {
+                key: "mxc://example.org/synthetic".to_owned(),
+                width,
+                height,
+                rgba,
+            },
+        );
+    project_avatar(ui, account_id);
+}
+
+/// Show the picture held for `account_id` (or its initials) in every row
+/// that names exactly that local account, and in the active profile when it
+/// is the visible account.
+fn project_avatar(ui: &AppWindow, account_id: &str) {
+    let image = avatar_image(account_id);
+    let has = image.is_some();
+    let image = image.unwrap_or_default();
+    if ui.get_active_account_local_id().as_str() == account_id {
+        ui.set_active_account_avatar(image.clone());
+        ui.set_active_account_has_avatar(has);
+        let accounts = ui.get_accounts();
+        if let Ok(index) = usize::try_from(ui.get_active_account_index())
+            && let Some(mut item) = accounts.row_data(index)
+        {
+            item.avatar = image.clone();
+            item.has_avatar = has;
+            accounts.set_row_data(index, item);
+        }
+    }
+    let options = ui.get_account_options();
+    for index in 0..options.row_count() {
+        if let Some(mut option) = options.row_data(index)
+            && option.local_id.as_str() == account_id
+        {
+            option.avatar = image.clone();
+            option.has_avatar = has;
+            options.set_row_data(index, option);
+        }
+    }
+    let saved = ui.get_saved_accounts();
+    for index in 0..saved.row_count() {
+        if let Some(mut row) = saved.row_data(index)
+            && row.id.as_str() == account_id
+        {
+            row.avatar = image.clone();
+            row.has_avatar = has;
+            saved.set_row_data(index, row);
+        }
+    }
 }
 
 fn record_confirmed(profile: &OwnProfile) {
@@ -375,6 +620,8 @@ fn read(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, reset_name: bool) 
                 Ok(profile) => {
                     let edited = ui.get_account_profile_name_dirty();
                     apply_server(&ui, &profile, reset_name || !edited);
+                    // The switcher and active profile show the same picture.
+                    hold_profile_avatar(&ui, &profile, preview.as_ref());
                     with(|editor| editor.server = Some(profile));
                     if with(|editor| matches!(editor.avatar, AvatarDraft::Keep)) {
                         show_image(&ui, preview.as_ref());
@@ -844,6 +1091,11 @@ fn finish_save(
         // What the server shows now replaces the confirmed copy. The name
         // field keeps what the user typed unless the name was cleared.
         apply_server(ui, profile, clearing && name == Some(FieldOutcome::Saved));
+        // A saved picture replaces the held one; a removed one drops it.
+        let picture = (avatar == Some(FieldOutcome::Saved))
+            .then_some(preview.as_ref())
+            .flatten();
+        hold_profile_avatar(ui, profile, picture);
         with(|editor| editor.server = Some(profile.clone()));
     }
     // A failed, unknown or unsent avatar change stays drafted for a retry.
@@ -983,9 +1235,33 @@ pub(crate) fn refresh_active_label(ui: &AppWindow, force: bool) {
     let Some((generation, cancellation)) = started else {
         return;
     };
+    let held_key = held_avatar_key(&account);
     let weak = ui.as_weak();
     runtime.spawn(async move {
         let profile = live.manager.own_profile_for(&selection, &cancellation).await;
+        // The picture is read only for this active account, only when its
+        // profile names one that is not already held, and only while the
+        // same selection and read stay current.
+        let picture = match &profile {
+            Ok(profile) if profile.avatar_key().is_some() && profile.avatar_key() != held_key => {
+                match live
+                    .manager
+                    .own_avatar_bytes_for(&selection, &cancellation, profile)
+                    .await
+                {
+                    Ok(Some(bytes)) => prepare_avatar_for(
+                        AvatarConsumer::AccountProfile,
+                        Zeroizing::new(bytes),
+                        selection.clone(),
+                        cancellation.clone(),
+                    )
+                    .await
+                    .ok(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         let _ = weak.upgrade_in_event_loop(move |ui| {
             let current = LABEL.with(|label| {
                 let mut label = label.borrow_mut();
@@ -1007,9 +1283,30 @@ pub(crate) fn refresh_active_label(ui: &AppWindow, force: bool) {
             {
                 record_confirmed(&profile);
                 project_switcher(&ui, &profile);
+                hold_profile_avatar(&ui, &profile, picture.as_ref());
             }
         });
     });
+}
+
+/// Keep the held picture in step with a server-confirmed profile of the
+/// visible account: a new picture replaces it, a profile without an avatar
+/// drops it, and an unchanged key keeps it. A picture that failed to load
+/// leaves the initials (never another account's picture).
+fn hold_profile_avatar(ui: &AppWindow, profile: &OwnProfile, picture: Option<&PreparedAvatar>) {
+    if ui.get_active_account_local_id().as_str() != profile.account_id {
+        return;
+    }
+    match (profile.avatar_key(), picture) {
+        (None, _) => forget_avatar(&profile.account_id),
+        (Some(key), Some(picture)) => store_avatar(&profile.account_id, key, picture),
+        (Some(key), None) => {
+            if held_avatar_key(&profile.account_id).as_deref() != Some(key.as_str()) {
+                forget_avatar(&profile.account_id);
+            }
+        }
+    }
+    project_avatar(ui, &profile.account_id);
 }
 
 #[cfg(test)]
@@ -1105,6 +1402,78 @@ mod tests {
         outcome.record(&unknown);
         assert_eq!(outcome.send_error, Some(ProfileError::TimedOut));
         assert!(outcome.profile.is_some());
+    }
+
+    #[test]
+    fn account_pictures_are_reduced_to_64_pixels_without_bleeding_transparency() {
+        // 256 x 128 opaque red with a fully transparent green right half.
+        let (width, height) = (256u32, 128u32);
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for _y in 0..height {
+            for x in 0..width {
+                if x < width / 2 {
+                    rgba.extend_from_slice(&[255, 0, 0, 255]);
+                } else {
+                    rgba.extend_from_slice(&[0, 255, 0, 0]);
+                }
+            }
+        }
+        let (out, out_w, out_h) = thumbnail(&rgba, width, height, MAX_ACCOUNT_AVATAR_SIDE);
+        assert_eq!((out_w, out_h), (64, 32));
+        assert_eq!(out.len(), 64 * 32 * 4);
+        // Left: opaque red. Right: transparent, its hidden green never shows.
+        assert_eq!(&out[0..4], &[255, 0, 0, 255]);
+        let right = ((64 - 1) * 4) as usize;
+        assert_eq!(out[right + 3], 0);
+        assert_eq!(&out[right..right + 3], &[0, 0, 0]);
+        // Small pictures pass through; malformed input yields nothing.
+        assert_eq!(thumbnail(&[1, 2, 3, 4], 1, 1, 64).1, 1);
+        assert_eq!(thumbnail(&[1, 2, 3], 1, 1, 64).1, 0);
+        assert_eq!(thumbnail(&[], 0, 0, 64).1, 0);
+    }
+
+    #[test]
+    fn pictures_map_only_to_their_exact_local_account_and_leave_with_it() {
+        let thumb = |key: &str| Thumb {
+            key: key.to_owned(),
+            width: 1,
+            height: 1,
+            rgba: vec![9, 9, 9, 255],
+        };
+        {
+            let mut avatars = AVATARS.lock().unwrap();
+            let avatars = avatars.get_or_insert_with(HashMap::new);
+            avatars.insert("synthetic-pic-a".to_owned(), thumb("mxc://example.org/a"));
+            avatars.insert("synthetic-pic-b".to_owned(), thumb("mxc://example.org/b"));
+        }
+        assert!(avatar_image("synthetic-pic-a").is_some());
+        assert!(avatar_image("synthetic-pic-a2").is_none());
+        assert!(avatar_image("synthetic-pic").is_none());
+        assert_eq!(
+            held_avatar_key("synthetic-pic-b").as_deref(),
+            Some("mxc://example.org/b")
+        );
+        // A Manage accounts row gets exactly its own account's picture.
+        let row = with_saved_avatar(crate::SavedAccountItem {
+            id: "synthetic-pic-b".into(),
+            handle: "@synthetic-pic-b:example.org".into(),
+            ..Default::default()
+        });
+        assert!(row.has_avatar);
+        assert!(!row.initials.is_empty());
+        let other = with_saved_avatar(crate::SavedAccountItem {
+            id: "synthetic-unknown".into(),
+            handle: "@synthetic-unknown:example.org".into(),
+            ..Default::default()
+        });
+        assert!(!other.has_avatar);
+        // Forgetting one account's picture leaves the other's. (Pruning to
+        // the saved accounts uses the same removal; it is not exercised
+        // here because the cache is shared with concurrently running tests.)
+        forget_avatar("synthetic-pic-a");
+        assert!(avatar_image("synthetic-pic-a").is_none());
+        assert!(avatar_image("synthetic-pic-b").is_some());
+        forget_avatar("synthetic-pic-b");
     }
 
     #[test]

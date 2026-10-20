@@ -152,6 +152,13 @@ impl OwnProfile {
         self.avatar.is_some()
     }
 
+    /// An opaque key for the avatar this profile names, to tell whether a
+    /// picture already held in memory is still the current one. Compared
+    /// for equality only; never logged or shown.
+    pub fn avatar_key(&self) -> Option<String> {
+        self.avatar.as_ref().map(ToString::to_string)
+    }
+
     /// Whether the server holds exactly `sent` as the display name. Compared
     /// on the raw value, never on the shortened, normalized display copy.
     pub fn name_is_exactly(&self, sent: &str) -> bool {

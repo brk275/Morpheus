@@ -1515,6 +1515,8 @@ impl LiveUi {
             crate::kept_replies::forget_all();
             crate::reset_attachment_view(&ui);
             clear_account_context(&ui, &gate);
+            // Locked or detached: no account picture stays in memory or view.
+            crate::account_identity::forget_all_avatars(&ui);
             ui.set_live_session(false);
             ui.set_preview_session(false);
             ui.set_active_account_local_id("".into());
@@ -3871,6 +3873,8 @@ pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], activ
                 handle: item.handle.clone(),
                 initials: item.initials.clone(),
                 accent: item.accent,
+                avatar: item.avatar.clone(),
+                has_avatar: item.has_avatar,
             }
         })
         .collect::<Vec<_>>();
@@ -3888,6 +3892,8 @@ pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], activ
     ui.set_active_account_initials(account.initials.clone());
     ui.set_active_account_status(account.status.clone());
     ui.set_active_account_accent(account.accent);
+    ui.set_active_account_avatar(account.avatar.clone());
+    ui.set_active_account_has_avatar(account.has_avatar);
     // Once per account selection: read the visible account's own public
     // profile for this label (never an inactive account's).
     crate::account_identity::refresh_active_label(ui, false);
@@ -3899,12 +3905,17 @@ fn account_item(account: &AccountInfo, selected: bool) -> AccountItem {
     let name = crate::account_identity::confirmed_name(&account.id)
         .unwrap_or_else(|| display_user(&account.user_id));
     let account_initials = initials(&name);
+    // An avatar this session already read for this exact local account, from
+    // memory; nothing is fetched here and inactive accounts are never read.
+    let avatar = crate::account_identity::avatar_image(&account.id);
     AccountItem {
         name: name.into(),
         handle: account.user_id.as_str().into(),
         initials: account_initials.into(),
         status: if selected { "Connected" } else { "Paused" }.into(),
         accent: accent(&account.id),
+        has_avatar: avatar.is_some(),
+        avatar: avatar.unwrap_or_default(),
     }
 }
 

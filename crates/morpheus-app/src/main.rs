@@ -134,6 +134,7 @@ fn account(name: &str, handle: &str, initials: &str, status: &str, accent: Color
         initials: initials.into(),
         status: status.into(),
         accent,
+        ..Default::default()
     }
 }
 
@@ -674,6 +675,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
                 handle: item.handle.clone(),
                 initials: item.initials.clone(),
                 accent: item.accent,
+                ..Default::default()
             }
         })
         .collect::<Vec<_>>();

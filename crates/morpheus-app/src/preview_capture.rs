@@ -226,18 +226,21 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                             handle: "@casey:example.org".into(),
                             active: true,
                             removal_pending: false,
+                            ..Default::default()
                         },
                         super::SavedAccountItem {
                             id: "preview-personal".into(),
                             handle: "@river:example.net".into(),
                             active: false,
                             removal_pending: false,
+                            ..Default::default()
                         },
                         super::SavedAccountItem {
                             id: "preview-community".into(),
                             handle: "@workshop:example.org".into(),
                             active: false,
                             removal_pending: true,
+                            ..Default::default()
                         },
                     ])));
                     window.set_app_password_enabled(true);

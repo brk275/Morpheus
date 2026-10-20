@@ -4008,6 +4008,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
         handle: "@jordan:example.org".into(),
         active: false,
         removal_pending: true,
+        ..Default::default()
     }])));
     ui.invoke_remove_saved_account("presentation-only".into());
     settle(&ui).await;
@@ -4077,6 +4078,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
         handle: "@jordan:example.org".into(),
         active: false,
         removal_pending: false,
+        ..Default::default()
     }])));
     ui.set_manage_accounts_open(true);
     settle(&ui).await;
@@ -5960,6 +5962,24 @@ async fn assert_public_profile_projection(ui: &AppWindow) {
     ui.set_font_scale_percent(100);
     ui.window().set_size(size);
     settle(ui).await;
+
+    // An account picture shows only in the rows of its exact local account
+    // and the active profile, and a lock or detach drops every one at once.
+    crate::account_identity::hold_test_avatar(ui, "synthetic-a", 128);
+    settle(ui).await;
+    assert!(ui.get_active_account_has_avatar());
+    assert!(ui.get_account_options().row_data(0).unwrap().has_avatar);
+    assert!(!ui.get_account_options().row_data(1).unwrap().has_avatar);
+    assert!(ui.get_accounts().row_data(0).unwrap().has_avatar);
+    assert!(!ui.get_accounts().row_data(1).unwrap().has_avatar);
+    let picture = ui.get_active_account_avatar().size();
+    assert!(picture.width <= 64 && picture.height <= 64, "{picture:?}");
+    crate::account_identity::forget_all_avatars(ui);
+    settle(ui).await;
+    assert!(!ui.get_active_account_has_avatar());
+    assert!(!ui.get_account_options().row_data(0).unwrap().has_avatar);
+    assert!(!ui.get_accounts().row_data(0).unwrap().has_avatar);
+    assert!(crate::account_identity::avatar_image("synthetic-a").is_none());
 
     // Detach clears the editor's private presentation at once.
     ui.set_account_profile_open(true);

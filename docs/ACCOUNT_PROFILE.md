@@ -54,6 +54,20 @@ The switcher also refreshes its label without opening the editor. It makes one b
 
 Only one read runs at a time. Each read is fenced by the exact selection, so A -> B -> A never lets an old read relabel anything. Inactive accounts are never read, and nothing syncs in the background. These names are kept in memory only; nothing goes to configuration or any other store. A removed account's name is forgotten the next time the account list is shown.
 
+## Account pictures
+
+The bottom-left active profile, the account switcher and Manage accounts show each account's own public avatar in place of its initials.
+
+- **Active account only.** The picture is read only for the active account, and only in the same bounded, once-per-selection profile read that keeps the switcher label current, or when the editor reads or saves.
+  - The profile response is capped at 64 KiB, with one attempt and an authenticated request.
+  - The media fetch uses the existing bounded, authenticated media read, then the shared decoder.
+  - The image is reduced to at most 64 px with alpha-weighted averaging and kept in memory only. Nothing is written to disk.
+  - If the profile still names the same avatar, nothing is fetched again.
+- **Other signed-in accounts** keep a picture only if one was read while they were active, and only in rows that name exactly their local account. Inactive accounts are never fetched.
+- **Clearing.** A removed or logged-out account's picture is dropped with it. When the app locks or the account detaches, every picture is dropped from memory and from view at once, and any read in progress is cancelled.
+- **Fallback.** While a picture loads, or if it fails, the initials show. A late result from an earlier selection (A -> B -> A) is dropped.
+- **No extra actions.** Pictures add no hit target and no action; every account action stays where it was, behind the same app-password and confirmation flows.
+
 ## Fences
 
 - Every read, choice and save captures four things:
@@ -82,7 +96,8 @@ Only one read runs at a time. Each read is fenced by the exact selection, so A -
 ## Known limits
 
 - **No device or remote preview of other aliases.** The editor edits the current account only.
-- **No avatar in the switcher.** Root owns that geometry. The handoff proposes an interface for it.
+- **Avatar placement.** Pictures only fill the existing badges (and one 24 px badge in each Manage accounts row); badge positions and sizes are unchanged. Root owns that geometry.
+- **Version lookup.** Removing a field still asks the SDK which endpoint the server supports, using its own (cached) versions request.
 - **Shared cancellation token type.** The cancellation token is the existing `RoomSettingsCancellation`, reused as a generic token.
 - **Shared chooser and decoder.** Only one image chooser and one decoder run at a time, process-wide; they are shared with the room settings form. When Room settings holds either one, the editor says so ("The image picker is in use by Room settings...") instead of waiting, and Close stays available.
 - **Error wording.** Some decoder error texts are worded generically ("Choose an image...").

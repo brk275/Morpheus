@@ -308,6 +308,7 @@ impl AccountAccessUi {
                 handle: account.user_id.into(),
                 active: active.as_ref().is_some_and(|a| a.id == account.id),
                 removal_pending: status.pending_removals.contains(&account.id),
+                ..Default::default()
             })
             .collect::<Vec<_>>();
         let current_generation = self.accounts_refresh_generation.clone();
@@ -316,6 +317,12 @@ impl AccountAccessUi {
             if current_generation.load(Ordering::Acquire) != generation {
                 return;
             }
+            // Avatars are attached on the UI thread from the in-memory cache
+            // of each exact local account; nothing is fetched for them here.
+            let rows = rows
+                .into_iter()
+                .map(crate::account_identity::with_saved_avatar)
+                .collect::<Vec<_>>();
             ui.set_saved_accounts(ModelRc::new(VecModel::from(rows)));
             ui.set_app_password_enabled(status.enabled);
         });

@@ -226,6 +226,10 @@ export struct AccountItem {
     initials: string,
     status: string,
     accent: color,
+    // The account's own public avatar, already read while it was active
+    // (memory only, at most 64 px); initials show when there is none.
+    avatar: image,
+    has-avatar: bool,
 }
 
 export struct AccountOption {
@@ -235,6 +239,8 @@ export struct AccountOption {
     handle: string,
     initials: string,
     accent: color,
+    avatar: image,
+    has-avatar: bool,
 }
 
 export struct SavedAccountItem {
@@ -242,6 +248,11 @@ export struct SavedAccountItem {
     handle: string,
     active: bool,
     removal-pending: bool,
+    avatar: image,
+    has-avatar: bool,
+    // Initials and color for the avatar fallback.
+    initials: string,
+    accent: color,
 }
 
 export struct SpaceItem {
@@ -337,6 +348,10 @@ export struct PublicRoomItem {
 component AvatarBadge inherits Rectangle {
     in property <string> initials;
     in property <color> accent;
+    // A decoded, bounded picture (an account's own avatar); initials show
+    // whenever there is none. Purely presentation: no input or action.
+    in property <image> avatar;
+    in property <bool> has-avatar: false;
     in property <color> ink: StyleTokens.roles.avatar-ink.present ? StyleTokens.roles.avatar-ink.color : #ffffff;
     // Each call site's own corners. Avatar roundness, when set, replaces
     // them with a share of this avatar's size, so every size stays alike.
@@ -346,13 +361,19 @@ component AvatarBadge inherits Rectangle {
     height: 38px;
     border-radius: StyleTokens.avatar-roundness >= 0 ? min(self.width, self.height) * StyleTokens.avatar-roundness / 100 : root.built-in-radius;
     background: accent;
-    Text {
+    clip: root.has-avatar;
+    if !root.has-avatar : Text {
         text: root.initials;
         color: root.ink;
         font-size: root.initials-size;
         font-weight: 700;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+    if root.has-avatar : Image {
+        width: parent.width; height: parent.height;
+        source: root.avatar; image-fit: cover;
+        accessible-role: none;
     }
 }
 
@@ -3078,6 +3099,9 @@ export component AppWindow inherits Window {
     in-out property <string> active-account-initials;
     in-out property <string> active-account-status;
     in-out property <color> active-account-accent: #8e7dff;
+    // The active account's own avatar from memory (account_identity.rs).
+    in-out property <image> active-account-avatar;
+    in-out property <bool> active-account-has-avatar: false;
     in-out property <string> active-room-id;
     in-out property <string> active-room-name;
     in-out property <string> active-room-topic;
@@ -9670,7 +9694,7 @@ export component AppWindow inherits Window {
                         padding-top: 15px;
                         padding-bottom: 15px;
                         spacing: root.account-column ? 0px : 10px;
-                        VerticalLayout { width: 38px; alignment: center; AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; } }
+                        VerticalLayout { width: 38px; alignment: center; AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; avatar: root.active-account-avatar; has-avatar: root.active-account-has-avatar; } }
                         if !root.account-column : VerticalLayout {
                             alignment: center;
                             spacing: 2px;
@@ -9775,7 +9799,7 @@ export component AppWindow inherits Window {
                         padding-top: 6px;
                         padding-bottom: 6px;
                         spacing: 9px;
-                        VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; built-in-radius: StyleTokens.radius * 1.0; initials: account.initials; accent: account.accent; } }
+                        VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; built-in-radius: StyleTokens.radius * 1.0; initials: account.initials; accent: account.accent; avatar: account.avatar; has-avatar: account.has-avatar; } }
                         VerticalLayout {
                             alignment: center;
                             spacing: 1px;
@@ -11082,7 +11106,11 @@ export component AppWindow inherits Window {
                                     min-height: 88px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.9;
                                     VerticalLayout {
                                         padding: 10px; spacing: 7px; alignment: start;
-                                        Text { text: account.handle; color: root.ink; font-size: 13px * root.text-scale; overflow: elide; accessible-label: account.handle; vertical-stretch: 0; }
+                                        HorizontalLayout {
+                                            spacing: 8px; vertical-stretch: 0;
+                                            VerticalLayout { width: 24px * root.text-scale; alignment: center; AvatarBadge { width: 24px * root.text-scale; height: 24px * root.text-scale; built-in-radius: StyleTokens.radius * 0.8; initials-size: 10px * root.text-scale; initials: account.initials; accent: account.accent; avatar: account.avatar; has-avatar: account.has-avatar; } }
+                                            Text { text: account.handle; color: root.ink; font-size: 13px * root.text-scale; overflow: elide; vertical-alignment: center; accessible-label: account.handle; horizontal-stretch: 1; }
+                                        }
                                         HorizontalLayout {
                                             height: 36px * root.text-scale; vertical-stretch: 0; spacing: 8px;
                                             Text { text: account.removal-pending ? "Removal pending" : account.active ? "Current account" : "Paused"; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
