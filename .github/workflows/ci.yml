@@ -1,13 +1,13 @@
-# TEMPORARY Linux-only retained-focus regression check. NEVER MERGE this workflow.
+# TEMPORARY Linux-only combined-product UI regression check. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed Linux retained focus check
-run-name: Reviewed Linux retained focus check - df8b62486e24779ce2896cc77e20b8e7f63945e0
+name: Reviewed Linux product UI vector check
+run-name: Reviewed Linux product UI vector check - d9a094e70d1f2dbbcca349050084a4fb3579439a
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: beta-linux-retained-focus-df8b62486e24779ce2896cc77e20b8e7f63945e0-${{ github.ref }}
+  group: beta-linux-product-ui-vector-d9a094e70d1f2dbbcca349050084a4fb3579439a-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -24,7 +24,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: df8b62486e24779ce2896cc77e20b8e7f63945e0
+          ref: d9a094e70d1f2dbbcca349050084a4fb3579439a
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -37,7 +37,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = df8b62486e24779ce2896cc77e20b8e7f63945e0
+          test "$(git -C candidate rev-parse HEAD)" = d9a094e70d1f2dbbcca349050084a4fb3579439a
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -52,7 +52,7 @@ jobs:
             --evidence "$RUNNER_TEMP/reviewed-candidate-history"
   native:
     needs: security
-    name: Focused Linux retained focus
+    name: Focused Linux product UI
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -68,7 +68,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: df8b62486e24779ce2896cc77e20b8e7f63945e0
+          ref: d9a094e70d1f2dbbcca349050084a4fb3579439a
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -307,7 +307,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='df8b62486e24779ce2896cc77e20b8e7f63945e0'
+          source='d9a094e70d1f2dbbcca349050084a4fb3579439a'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -586,7 +586,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='df8b62486e24779ce2896cc77e20b8e7f63945e0'
+          source='d9a094e70d1f2dbbcca349050084a4fb3579439a'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
