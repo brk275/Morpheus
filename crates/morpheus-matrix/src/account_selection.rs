@@ -61,6 +61,9 @@ impl AccountSelection {
     /// for a departed selection.
     pub async fn guard<F: std::future::Future>(&self, wait: F) -> Option<F::Output> {
         let output = tokio::select! {
+            // Do not poll work that may dispatch a request when revocation
+            // is already ready, including when a held read becomes ready too.
+            biased;
             _ = self.revoked() => return None,
             output = wait => output,
         };
@@ -156,6 +159,49 @@ mod tests {
             .enable_time()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn revoked_work_is_never_polled_even_when_it_is_ready() {
+        use std::sync::atomic::AtomicUsize;
+
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("a"));
+            let selection = selections.for_account("a").unwrap();
+            selections.replace(Some("b"));
+            let dispatched = AtomicUsize::new(0);
+            let result = selection
+                .guard(async {
+                    dispatched.fetch_add(1, Ordering::SeqCst);
+                })
+                .await;
+            assert_eq!(result, None);
+            assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn revocation_wins_when_a_held_read_and_its_next_action_are_ready_together() {
+        use std::sync::atomic::AtomicUsize;
+
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("a"));
+            let selection = selections.for_account("a").unwrap();
+            let dispatched = AtomicUsize::new(0);
+            let (release, held) = tokio::sync::oneshot::channel::<()>();
+            let mut work = Box::pin(selection.guard(async {
+                held.await.unwrap();
+                dispatched.fetch_add(1, Ordering::SeqCst);
+            }));
+            assert!(futures_util::poll!(work.as_mut()).is_pending());
+            // Both branches become ready before the guard's next poll.
+            release.send(()).unwrap();
+            selections.replace(Some("b"));
+            assert_eq!(work.await, None);
+            assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]
