@@ -11159,7 +11159,34 @@ export component AppWindow inherits Window {
                 root.close-account-profile();
                 account-trigger.focus();
                 accept
+            } else if event.text == Key.Tab && !event.modifiers.shift && self.at-last() {
+                // Keep keyboard focus inside the dialog.
+                self.focus-first();
+                accept
+            } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && self.at-first() {
+                self.focus-last();
+                accept
             } else { reject }
+        }
+        // The first and last enabled controls, for the Tab trap. Close is
+        // always enabled, so focus always has somewhere to stay.
+        function focus-first() {
+            if profile-choose.enabled { profile-choose.focus(); }
+            else if root.account-profile-loaded { profile-name-input.focus(); }
+            else if profile-refresh.enabled { profile-refresh.focus(); }
+            else { profile-close.focus(); }
+        }
+        function focus-last() {
+            if profile-save.enabled { profile-save.focus(); } else { profile-close.focus(); }
+        }
+        pure function at-first() -> bool {
+            return profile-choose.enabled ? profile-choose.has-focus
+                : root.account-profile-loaded ? profile-name-input.has-focus
+                : profile-refresh.enabled ? profile-refresh.has-focus
+                : profile-close.has-focus;
+        }
+        pure function at-last() -> bool {
+            return profile-save.enabled ? profile-save.has-focus : profile-close.has-focus;
         }
         Rectangle {
             background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
@@ -11172,139 +11199,147 @@ export component AppWindow inherits Window {
                 accessible-role: region; accessible-label: "Public Matrix profile of " + root.account-profile-user-id;
                 VerticalLayout {
                     padding: 20px; spacing: 10px;
-                    Text { text: "Public profile"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
-                    // Exactly which identity this changes.
-                    Text { text: root.account-profile-user-id; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; overflow: elide; vertical-stretch: 0; accessible-label: "Matrix account " + root.account-profile-user-id; }
-                    if root.account-profile-homeserver != "" : Text { text: "on " + root.account-profile-homeserver; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; vertical-stretch: 0; }
-                    Text {
-                        text: "Anyone who can see this Matrix account sees its display name and avatar. Your local account entry, device name, sign-in and app password are not changed here.";
-                        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
-                    }
-                    HorizontalLayout {
-                        spacing: 12px; vertical-stretch: 0; height: 72px * root.text-scale;
-                        Rectangle {
-                            width: 64px * root.text-scale; height: 64px * root.text-scale;
-                            border-radius: StyleTokens.radius; clip: true; background: root.elevated;
-                            if root.account-profile-image-visible : Image {
-                                width: parent.width; height: parent.height; source: root.account-profile-image; image-fit: cover;
-                                accessible-role: image;
-                                accessible-label: root.account-profile-avatar-state == 1 ? "New avatar preview, not saved" : "Current avatar";
-                            }
-                            if !root.account-profile-image-visible : Text {
-                                text: root.account-profile-avatar-state == 2 ? "None" : root.active-account-initials;
-                                color: root.muted; font-size: 18px * root.text-scale; font-weight: 700;
-                                horizontal-alignment: center; vertical-alignment: center;
-                            }
-                        }
+                    // Only the body scrolls, so every control stays reachable at
+                    // the smallest window and the largest text; the actions stay
+                    // fixed below it.
+                    profile-body := ScrollView {
+                        vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
                         VerticalLayout {
-                            spacing: 6px; alignment: center; horizontal-stretch: 1;
-                            HorizontalLayout {
-                                spacing: 6px; alignment: start;
-                                TokenButton { colors: root.button-colors; text-scale: root.text-scale;
-                                    text: "Choose image…"; label: "Choose a new public avatar image";
-                                    enabled: root.account-profile-loaded && !root.account-profile-busy;
-                                    activated => { root.account-profile-choose-avatar(); }
-                                }
-                                if root.account-profile-server-has-avatar && root.account-profile-avatar-state != 2 : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
-                                    text: "Remove avatar"; label: "Remove the public avatar when saving";
-                                    enabled: root.account-profile-loaded && !root.account-profile-busy;
-                                    activated => { root.account-profile-stage-remove-avatar(); }
-                                }
-                                if root.account-profile-avatar-state != 0 : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
-                                    text: "Keep current"; label: "Discard the avatar change";
-                                    enabled: !root.account-profile-busy;
-                                    activated => { root.account-profile-keep-avatar(); }
-                                }
-                            }
+                            width: profile-body.visible-width; spacing: 10px; alignment: start;
+                            Text { text: "Public profile"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
+                            // Exactly which identity this changes.
+                            Text { text: root.account-profile-user-id; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; overflow: elide; vertical-stretch: 0; accessible-label: "Matrix account " + root.account-profile-user-id; }
+                            if root.account-profile-homeserver != "" : Text { text: "on " + root.account-profile-homeserver; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; vertical-stretch: 0; }
                             Text {
-                                text: root.account-profile-avatar-state == 1 ? "New image, not public until you Save" : root.account-profile-avatar-state == 2 ? "Avatar will be removed when you Save" : root.account-profile-server-has-avatar ? "Current avatar" : "No avatar";
-                                color: root.muted; font-size: 11px * root.text-scale; overflow: elide;
-                            }
-                        }
-                    }
-                    Text { text: "Display name"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; vertical-stretch: 0; }
-                    Rectangle {
-                        height: 38px * root.text-scale; vertical-stretch: 0;
-                        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated;
-                        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
-                        border-width: profile-name-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
-                        border-color: profile-name-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : root.divider;
-                        profile-name-input := ThemedTextInput {
-                            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
-                            text <=> root.account-profile-name-input; color: root.ink; font-size: 13px * root.text-scale;
-                            single-line: true; vertical-alignment: center;
-                            enabled: root.account-profile-loaded;
-                            accessible-label: "Public display name of " + root.account-profile-user-id;
-                            edited => { root.account-profile-name-edited(); }
-                            accepted => {
-                                if !root.account-profile-busy && (root.account-profile-name-dirty || root.account-profile-avatar-state != 0) {
-                                    root.account-profile-save();
-                                }
-                            }
-                        }
-                    }
-                    if root.account-profile-server-name != "" : HorizontalLayout {
-                        spacing: 8px; vertical-stretch: 0;
-                        Text {
-                            text: "Saved name: " + root.account-profile-server-name; color: root.muted; font-size: 11px * root.text-scale;
-                            overflow: elide; vertical-alignment: center; horizontal-stretch: 1;
-                        }
-                        if !root.account-profile-confirm-clear : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
-                            text: "Remove display name…"; label: "Remove the display name from the public profile of " + root.account-profile-user-id;
-                            enabled: root.account-profile-loaded && !root.account-profile-busy;
-                            activated => { root.account-profile-confirm-clear = true; }
-                        }
-                    }
-                    if root.account-profile-confirm-clear : Rectangle {
-                        vertical-stretch: 0;
-                        background: root.elevated; border-radius: StyleTokens.radius * 0.8;
-                        border-color: root.accent; border-width: StyleTokens.line-width;
-                        init => { profile-clear-keep.focus(); }
-                        VerticalLayout {
-                            padding: 10px; spacing: 8px;
-                            Text {
-                                text: "Remove the display name from the public profile of " + root.account-profile-user-id + "? It will have no display name until you set one.";
-                                color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap;
-                                accessible-live-region: assertive;
+                                text: "Anyone who can see this Matrix account sees its display name and avatar. Your local account entry, device name, sign-in and app password are not changed here.";
+                                color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
                             }
                             HorizontalLayout {
-                                spacing: 8px; alignment: end;
-                                profile-clear-keep := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
-                                    text: "Keep the name";
-                                    activated => { root.account-profile-confirm-clear = false; profile-name-input.focus(); }
+                                spacing: 12px; vertical-stretch: 0; height: 72px * root.text-scale;
+                                Rectangle {
+                                    width: 64px * root.text-scale; height: 64px * root.text-scale;
+                                    border-radius: StyleTokens.radius; clip: true; background: root.elevated;
+                                    if root.account-profile-image-visible : Image {
+                                        width: parent.width; height: parent.height; source: root.account-profile-image; image-fit: cover;
+                                        accessible-role: image;
+                                        accessible-label: root.account-profile-avatar-state == 1 ? "New avatar preview, not saved" : "Current avatar";
+                                    }
+                                    if !root.account-profile-image-visible : Text {
+                                        text: root.account-profile-avatar-state == 2 ? "None" : root.active-account-initials;
+                                        color: root.muted; font-size: 18px * root.text-scale; font-weight: 700;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
                                 }
-                                TokenButton { colors: root.button-colors; text-scale: root.text-scale;
-                                    text: "Remove display name"; label: "Confirm removing the display name of " + root.account-profile-user-id;
-                                    enabled: !root.account-profile-busy;
-                                    activated => { root.account-profile-clear-name(); profile-name-input.focus(); }
+                                VerticalLayout {
+                                    spacing: 6px; alignment: center; horizontal-stretch: 1;
+                                    HorizontalLayout {
+                                        spacing: 6px; alignment: start;
+                                        profile-choose := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                            text: "Choose image…"; label: "Choose a new public avatar image";
+                                            enabled: root.account-profile-loaded && !root.account-profile-busy;
+                                            activated => { root.account-profile-choose-avatar(); }
+                                        }
+                                        if root.account-profile-server-has-avatar && root.account-profile-avatar-state != 2 : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                            text: "Remove avatar"; label: "Remove the public avatar when saving";
+                                            enabled: root.account-profile-loaded && !root.account-profile-busy;
+                                            activated => { root.account-profile-stage-remove-avatar(); }
+                                        }
+                                        if root.account-profile-avatar-state != 0 : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                            text: "Keep current"; label: "Discard the avatar change";
+                                            enabled: !root.account-profile-busy;
+                                            activated => { root.account-profile-keep-avatar(); }
+                                        }
+                                    }
+                                    Text {
+                                        text: root.account-profile-avatar-state == 1 ? "New image, not public until you Save" : root.account-profile-avatar-state == 2 ? "Avatar will be removed when you Save" : root.account-profile-server-has-avatar ? "Current avatar" : "No avatar";
+                                        color: root.muted; font-size: 11px * root.text-scale; overflow: elide;
+                                    }
                                 }
+                            }
+                            Text { text: "Display name"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; vertical-stretch: 0; }
+                            Rectangle {
+                                height: 38px * root.text-scale; vertical-stretch: 0;
+                                background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.elevated;
+                                border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                                border-width: profile-name-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+                                border-color: profile-name-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : root.divider;
+                                profile-name-input := ThemedTextInput {
+                                    x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                                    text <=> root.account-profile-name-input; color: root.ink; font-size: 13px * root.text-scale;
+                                    single-line: true; vertical-alignment: center;
+                                    enabled: root.account-profile-loaded;
+                                    accessible-label: "Public display name of " + root.account-profile-user-id;
+                                    edited => { root.account-profile-name-edited(); }
+                                    accepted => {
+                                        if !root.account-profile-busy && (root.account-profile-name-dirty || root.account-profile-avatar-state != 0) {
+                                            root.account-profile-save();
+                                        }
+                                    }
+                                }
+                            }
+                            if root.account-profile-server-name != "" : HorizontalLayout {
+                                spacing: 8px; vertical-stretch: 0;
+                                Text {
+                                    text: "Saved name: " + root.account-profile-server-name; color: root.muted; font-size: 11px * root.text-scale;
+                                    overflow: elide; vertical-alignment: center; horizontal-stretch: 1;
+                                }
+                                if !root.account-profile-confirm-clear : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                    text: "Remove display name…"; label: "Remove the display name from the public profile of " + root.account-profile-user-id;
+                                    enabled: root.account-profile-loaded && !root.account-profile-busy;
+                                    activated => { root.account-profile-confirm-clear = true; }
+                                }
+                            }
+                            if root.account-profile-confirm-clear : Rectangle {
+                                vertical-stretch: 0;
+                                background: root.elevated; border-radius: StyleTokens.radius * 0.8;
+                                border-color: root.accent; border-width: StyleTokens.line-width;
+                                init => { profile-clear-keep.focus(); }
+                                VerticalLayout {
+                                    padding: 10px; spacing: 8px;
+                                    Text {
+                                        text: "Remove the display name from the public profile of " + root.account-profile-user-id + "? It will have no display name until you set one.";
+                                        color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap;
+                                        accessible-live-region: assertive;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px; alignment: end;
+                                        profile-clear-keep := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                            text: "Keep the name";
+                                            activated => { root.account-profile-confirm-clear = false; profile-name-input.focus(); }
+                                        }
+                                        TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                            text: "Remove display name"; label: "Confirm removing the display name of " + root.account-profile-user-id;
+                                            enabled: !root.account-profile-busy;
+                                            activated => { root.account-profile-clear-name(); profile-name-input.focus(); }
+                                        }
+                                    }
+                                }
+                            }
+                            if root.account-profile-status != "" : Text {
+                                text: root.account-profile-status; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
+                                accessible-live-region: polite;
+                            }
+                            if root.account-profile-error != "" : Text {
+                                text: root.account-profile-error;
+                                color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483;
+                                font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
+                                accessible-live-region: polite;
                             }
                         }
                     }
-                    if root.account-profile-status != "" : Text {
-                        text: root.account-profile-status; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
-                        accessible-live-region: polite;
-                    }
-                    if root.account-profile-error != "" : Text {
-                        text: root.account-profile-error;
-                        color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483;
-                        font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
-                        accessible-live-region: polite;
-                    }
-                    Rectangle { vertical-stretch: 1; background: transparent; }
                     HorizontalLayout {
                         spacing: 8px; vertical-stretch: 0;
-                        TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        profile-refresh := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                             text: "Refresh"; label: "Read the public profile again from the homeserver";
                             enabled: !root.account-profile-busy;
                             activated => { root.account-profile-refresh(); }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        profile-close := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                             text: "Close";
                             activated => { root.close-account-profile(); account-trigger.focus(); }
                         }
-                        TokenButton { colors: root.button-colors; text-scale: root.text-scale; primary: true;
+                        profile-save := TokenButton { colors: root.button-colors; text-scale: root.text-scale; primary: true;
                             text: "Save to public profile"; label: "Save to the public profile of " + root.account-profile-user-id;
                             enabled: root.account-profile-loaded && !root.account-profile-busy && (root.account-profile-name-dirty || root.account-profile-avatar-state != 0);
                             activated => { root.account-profile-save(); }

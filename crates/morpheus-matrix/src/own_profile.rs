@@ -26,8 +26,8 @@ use matrix_sdk::{
         api::{
             Metadata,
             client::profile::{
-                AvatarUrl, DisplayName, ProfileFieldName, delete_profile_field, set_avatar_url,
-                set_display_name,
+                AvatarUrl, DisplayName, ProfileFieldName, delete_profile_field, get_profile,
+                set_avatar_url, set_display_name,
             },
             error::ErrorKind,
         },
@@ -43,6 +43,9 @@ pub const MAX_DISPLAY_NAME_CHARS: usize = 256;
 pub const MAX_DISPLAY_NAME_BYTES: usize = 1024;
 /// Largest current avatar read back for the editor preview.
 pub const MAX_OWN_AVATAR_PREVIEW_BYTES: usize = crate::MAX_IMAGE_PREVIEW_BYTES;
+/// Largest profile response body read, for reads and writes alike. A
+/// display name, avatar URL and the few other standard fields fit easily.
+pub const MAX_PROFILE_RESPONSE_BYTES: u64 = 64 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -116,14 +119,53 @@ pub struct OwnProfile {
     pub account_id: String,
     pub user_id: String,
     pub homeserver: String,
-    /// Bounded and single-line; `None` when the server holds none.
+    /// For display only: bounded and single-line; `None` when the server
+    /// holds none. Never used to confirm a change.
     pub display_name: Option<String>,
+    /// The name exactly as the server returned it, if it fits the bound;
+    /// the only value a write is confirmed against.
+    raw_display_name: RawName,
     avatar: Option<OwnedMxcUri>,
+}
+
+/// The server's display name as returned, kept only within a bound.
+#[derive(Clone, PartialEq, Eq)]
+enum RawName {
+    Absent,
+    Exact(String),
+    /// Longer than any name this editor sends: never equal to one.
+    Oversize,
+}
+
+impl RawName {
+    fn from_server(raw: Option<String>) -> Self {
+        match raw {
+            None => Self::Absent,
+            Some(raw) if raw.len() > MAX_DISPLAY_NAME_BYTES => Self::Oversize,
+            Some(raw) => Self::Exact(raw),
+        }
+    }
 }
 
 impl OwnProfile {
     pub fn has_avatar(&self) -> bool {
         self.avatar.is_some()
+    }
+
+    /// Whether the server holds exactly `sent` as the display name. Compared
+    /// on the raw value, never on the shortened, normalized display copy.
+    pub fn name_is_exactly(&self, sent: &str) -> bool {
+        matches!(&self.raw_display_name, RawName::Exact(raw) if raw == sent)
+    }
+
+    /// Whether the server holds no display name (absent, or the empty value
+    /// a legacy clear may leave).
+    pub fn name_is_absent(&self) -> bool {
+        match &self.raw_display_name {
+            RawName::Absent => true,
+            RawName::Exact(raw) => raw.is_empty(),
+            RawName::Oversize => false,
+        }
     }
 
     /// A profile without an avatar for synthetic UI tests. It names no real
@@ -140,6 +182,7 @@ impl OwnProfile {
             user_id: user_id.to_owned(),
             homeserver: homeserver.to_owned(),
             display_name: display_name.map(str::to_owned),
+            raw_display_name: RawName::from_server(display_name.map(str::to_owned)),
             avatar: None,
         }
     }
@@ -189,6 +232,10 @@ fn shown_name(raw: Option<String>) -> Option<String> {
 }
 
 fn request_failure(error: &HttpError) -> ProfileError {
+    if matches!(error, HttpError::ResponseTooLarge { .. }) {
+        // Over the profile bound: nothing of it is used or shown.
+        return ProfileError::InvalidResponse;
+    }
     match error.as_client_api_error() {
         Some(api)
             if api.status_code.as_u16() == 429
@@ -197,13 +244,6 @@ fn request_failure(error: &HttpError) -> ProfileError {
             ProfileError::RateLimited
         }
         Some(api) if api.status_code.as_u16() == 403 => ProfileError::NotAllowed,
-        _ => ProfileError::Unavailable,
-    }
-}
-
-fn sdk_failure(error: &matrix_sdk::Error) -> ProfileError {
-    match error {
-        matrix_sdk::Error::Http(http) => request_failure(http),
         _ => ProfileError::Unavailable,
     }
 }
@@ -241,9 +281,24 @@ async fn guarded<T>(
 }
 
 /// The request settings of every public profile change: sent once, never
-/// retried by the SDK, bounded in time.
+/// retried by the SDK, authenticated, bounded in time and in response size.
 fn single_send() -> RequestConfig {
-    RequestConfig::new().retry_limit(0).timeout(WRITE_TIMEOUT)
+    RequestConfig::new()
+        .retry_limit(0)
+        .timeout(WRITE_TIMEOUT)
+        .force_auth()
+        .max_response_bytes(MAX_PROFILE_RESPONSE_BYTES)
+}
+
+/// The request settings of every profile read: one attempt, authenticated,
+/// bounded in time and in response size. A larger body is refused before it
+/// is buffered past the bound.
+fn profile_read() -> RequestConfig {
+    RequestConfig::new()
+        .retry_limit(0)
+        .timeout(READ_TIMEOUT)
+        .force_auth()
+        .max_response_bytes(MAX_PROFILE_RESPONSE_BYTES)
 }
 
 /// Run one profile request (built with `single_send`) exactly once. Only a
@@ -376,13 +431,16 @@ impl AccountManager {
         selection: &AccountSelection,
         cancellation: &RoomSettingsCancellation,
     ) -> ProfileResult<OwnProfile> {
+        // A typed request under this module's own bounds, never the SDK's
+        // unbounded profile helper.
+        let request = get_profile::v3::Request::new(owned.user.clone());
         let response = guarded(selection, cancellation, READ_TIMEOUT, async {
             owned
                 .client
-                .account()
-                .fetch_user_profile_of(&owned.user)
+                .send(request)
+                .with_request_config(profile_read())
                 .await
-                .map_err(|error| sdk_failure(&error))
+                .map_err(|error| request_failure(&error))
         })
         .await?;
         let display_name = response
@@ -399,6 +457,7 @@ impl AccountManager {
             account_id: owned.account_id.clone(),
             user_id: owned.user.to_string(),
             homeserver: owned.homeserver.clone(),
+            raw_display_name: RawName::from_server(display_name.clone()),
             display_name: shown_name(display_name),
             avatar,
         })
@@ -431,7 +490,7 @@ impl AccountManager {
         })
         .await;
         Self::confirm(&owned, selection, cancellation, sent, |profile| {
-            profile.display_name.as_deref() == Some(name.as_str())
+            profile.name_is_exactly(&name)
         })
         .await
     }
@@ -446,7 +505,7 @@ impl AccountManager {
         let owned = self.own_client(selection, cancellation).await?;
         let sent = clear_field(&owned, selection, cancellation, ProfileFieldName::DisplayName).await;
         Self::confirm(&owned, selection, cancellation, sent, |profile| {
-            profile.display_name.is_none()
+            profile.name_is_absent()
         })
         .await
     }
@@ -609,6 +668,76 @@ mod tests {
             send_error: None,
         };
         assert!(unread.unknown());
+    }
+
+    #[test]
+    fn profile_reads_and_writes_are_bounded_single_attempts() {
+        for config in [profile_read(), single_send()] {
+            let shown = format!("{config:?}");
+            assert!(
+                shown.contains(&format!("max_response_bytes: {MAX_PROFILE_RESPONSE_BYTES}"))
+                    || shown.contains(&format!("max_response_bytes: Some({MAX_PROFILE_RESPONSE_BYTES})")),
+                "{shown}"
+            );
+            assert!(shown.contains("retry_limit: 0") || shown.contains("retry_limit: Some(0)"));
+            assert!(shown.contains("force_auth: true"));
+        }
+    }
+
+    #[test]
+    fn an_oversize_profile_response_is_refused_without_its_contents() {
+        let error = HttpError::ResponseTooLarge {
+            limit: MAX_PROFILE_RESPONSE_BYTES,
+        };
+        assert_eq!(request_failure(&error), ProfileError::InvalidResponse);
+        // The fixed message carries no limit, URL or body.
+        assert!(!ProfileError::InvalidResponse.to_string().contains("65536"));
+    }
+
+    fn read_back(raw: Option<&str>) -> OwnProfile {
+        let raw = raw.map(str::to_owned);
+        OwnProfile {
+            account_id: "synthetic-a".into(),
+            user_id: "@synthetic-a:example.org".into(),
+            homeserver: "https://example.org".into(),
+            raw_display_name: RawName::from_server(raw.clone()),
+            display_name: shown_name(raw),
+            avatar: None,
+        }
+    }
+
+    #[test]
+    fn a_long_name_read_back_is_not_confirmed_by_its_shortened_display_copy() {
+        let sent = "n".repeat(MAX_DISPLAY_NAME_CHARS);
+        // The server returned a longer name; its display copy is cut to the
+        // very value that was sent, but the raw value differs.
+        let longer = format!("{sent}tail");
+        let shown = read_back(Some(&longer));
+        assert_eq!(shown.display_name.as_deref(), Some(sent.as_str()));
+        assert!(!shown.name_is_exactly(&sent));
+        // Oversize raw values never equal anything and are never "absent".
+        let oversize = read_back(Some(&"o".repeat(MAX_DISPLAY_NAME_BYTES + 1)));
+        assert!(!oversize.name_is_exactly(&"o".repeat(MAX_DISPLAY_NAME_BYTES + 1)));
+        assert!(!oversize.name_is_absent());
+        // The exact value confirms.
+        assert!(read_back(Some(&sent)).name_is_exactly(&sent));
+    }
+
+    #[test]
+    fn a_whitespace_altered_read_back_is_not_confirmed() {
+        let sent = "Synthetic Name";
+        for altered in ["Synthetic  Name", " Synthetic Name", "Synthetic Name ", "Synthetic\tName", "Synthetic\nName"] {
+            let shown = read_back(Some(altered));
+            // The display copy normalizes to the sent value...
+            assert_eq!(shown.display_name.as_deref(), Some(sent), "{altered:?}");
+            // ...but only the exact raw value confirms a write.
+            assert!(!shown.name_is_exactly(sent), "{altered:?}");
+        }
+        assert!(read_back(Some(sent)).name_is_exactly(sent));
+        // Cleared: absent or empty; a whitespace-only name is not cleared.
+        assert!(read_back(None).name_is_absent());
+        assert!(read_back(Some("")).name_is_absent());
+        assert!(!read_back(Some(" ")).name_is_absent());
     }
 
     #[test]

@@ -5923,6 +5923,44 @@ async fn assert_public_profile_projection(ui: &AppWindow) {
     assert_eq!(ui.get_active_account_name(), "synthetic-a");
     assert_eq!(crate::account_identity::confirmed_name("synthetic-a"), None);
 
+    // The editor stays inside the smallest window at 200% text, its body
+    // scrolls, and Tab and Shift+Tab stay inside it.
+    let size = ui.window().size();
+    ui.window().set_size(slint::PhysicalSize::new(900, 620));
+    ui.set_font_scale_percent(200);
+    ui.set_account_profile_open(true);
+    ui.set_account_profile_loaded(true);
+    ui.set_account_profile_busy(false);
+    ui.set_account_profile_name_dirty(false);
+    ui.set_account_profile_avatar_state(0);
+    settle(ui).await;
+    for label in ["Close", "Read the public profile again from the homeserver"] {
+        let bounds = control_bounds(ui, label);
+        assert_eq!(bounds.len(), 1, "{label}");
+        assert!(inside_window(ui, bounds[0]), "{label} stays in the window");
+    }
+    // Save is disabled with nothing to save, so Close is the last control.
+    for _ in 0..12 {
+        if focused_control_has_label(ui, "Close") {
+            break;
+        }
+        key(ui, Key::Tab);
+    }
+    assert!(focused_control_has_label(ui, "Close"));
+    key(ui, Key::Tab);
+    assert!(
+        focused_control_has_label(ui, "Choose a new public avatar image"),
+        "Tab from the last control returns to the first"
+    );
+    key(ui, Key::Backtab);
+    assert!(
+        focused_control_has_label(ui, "Close"),
+        "Shift+Tab from the first control goes to the last"
+    );
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(size);
+    settle(ui).await;
+
     // Detach clears the editor's private presentation at once.
     ui.set_account_profile_open(true);
     ui.set_account_profile_name_input("Unsaved Synthetic".into());
