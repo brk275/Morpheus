@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - f9c3a3c - ${{ inputs.platform }}
+run-name: Reviewed native candidate - 5e1ca9b - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-f9c3a3c-${{ github.ref }}
+  group: beta-native-5e1ca9b-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -31,7 +31,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: f9c3a3cfc42eb20ec57d754fd585e385453517ac
+          ref: 5e1ca9bb86cf452eccdc79cb988964dac80d2d24
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = f9c3a3cfc42eb20ec57d754fd585e385453517ac
+          test "$(git -C candidate rev-parse HEAD)" = 5e1ca9bb86cf452eccdc79cb988964dac80d2d24
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -78,7 +78,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: f9c3a3cfc42eb20ec57d754fd585e385453517ac
+          ref: 5e1ca9bb86cf452eccdc79cb988964dac80d2d24
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -291,8 +291,33 @@ jobs:
               # Parsing and scanning consume these same captured bytes, never a reopened path.
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
+          # Verify the owner runner wrapper on generated processes before candidate code.
+          # The orphan redirects its output, reproducing the normal-exit cleanup bug.
+          probe_root=private/'lifecycle-probe'; probe_root.mkdir(mode=0o700)
+          ready=probe_root/'ready'; late=probe_root/'late'
+          orphan_code="import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(2); pathlib.Path(sys.argv[2]).write_text('escaped'); time.sleep(30)"
+          parent_code="""import pathlib,subprocess,sys,time
+          child=subprocess.Popen([sys.executable,'-I','-c',sys.argv[1],sys.argv[2],sys.argv[3]],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True)
+          until=time.monotonic()+5
+          while not pathlib.Path(sys.argv[2]).exists():
+              if time.monotonic()>=until: raise SystemExit(8)
+              time.sleep(0.01)
+          sys.stdout.buffer.write(b'ready\\n'); sys.stdout.buffer.flush()
+          """
+          normal=bounded([sys.executable,'-I','-c',parent_code,orphan_code,str(ready),str(late)],'owner-orphan-probe',15,1024)
+          time.sleep(2.2)
+          nonzero=bounded([sys.executable,'-I','-c','raise SystemExit(7)'],'owner-exit-probe',10,1024)
+          deadline=bounded([sys.executable,'-I','-c','import time; time.sleep(30)'],'owner-deadline-probe',0.2,1024)
+          overflow=bounded([sys.executable,'-I','-c',"print('x'*4096,flush=True)"],'owner-output-probe',10,1024)
+          probe_ok=(normal['reason'] is None and normal['code']==0 and normal['captured']==b'ready\n'
+              and ready.is_file() and not late.exists() and nonzero['reason'] is None and nonzero['code']==7
+              and deadline['reason']=='deadline' and overflow['reason']=='output_limit')
+          print(json.dumps({'check':'owner_process_lifecycle','status':'passed' if probe_ok else 'failed',
+              'candidate_executed':False,'raw_logs_public':False},sort_keys=True),flush=True)
+          if not probe_ok: raise SystemExit(1)
+
           import io, tarfile, urllib.request, zipfile
-          source='f9c3a3cfc42eb20ec57d754fd585e385453517ac'
+          source='5e1ca9bb86cf452eccdc79cb988964dac80d2d24'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -348,6 +373,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # reviewed action pin
         with:
           toolchain: 1.99.0
+          components: rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: verified-sdk-archives-v1
@@ -632,7 +658,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='f9c3a3cfc42eb20ec57d754fd585e385453517ac'
+          source='5e1ca9bb86cf452eccdc79cb988964dac80d2d24'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -778,7 +804,21 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
+          # Exact libtest IDs reconstructed from the reviewed public config
+          # test functions. Raw assertion values and arbitrary test prefixes
+          # cannot enter the diagnostic summary.
+          known_test_ids=set()
+          for unit in ('lib','registry','diagnostics','input','style_profiles'):
+              text=(workspace/f'crates/morpheus-config/src/{unit}.rs').read_text(encoding='utf-8')
+              prefix='tests::' if unit=='lib' else unit+'::tests::'
+              for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
+                  known_test_ids.add(prefix+function)
           needed_app={
+              'people_directory::tests::a_busy_creation_refuses_every_new_step_so_its_completion_still_applies',
+              'people_directory::tests::an_exact_id_is_offered_first_and_never_twice',
+              'people_directory::tests::a_created_room_is_never_reported_failed_for_its_listing',
+              'people_directory::tests::several_and_none_known_are_distinct_states',
+
               'kept_replies::tests::a_queued_restore_cannot_outlive_a_clear_or_a_room_change',
               'live::account_presentation_tests::a_focused_view_loaded_out_of_order_never_replaces_the_shown_one',
               'live::account_presentation_tests::a_withdrawn_search_navigation_held_at_its_commit_changes_nothing',
@@ -799,6 +839,17 @@ jobs:
               'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
           }
           needed_matrix={
+              'people_directory::tests::cancelled_or_revoked_people_lookup_releases_a_held_manager_wait',
+              'people_directory::tests::ended_application_admission_refuses_before_request_work_is_polled',
+              'people_directory::tests::queries_and_exact_ids_are_bounded',
+              'people_directory::tests::directory_pages_are_bounded_deduplicated_and_never_list_this_account',
+              'people_directory::tests::several_and_none_known_are_distinguished',
+              'people_directory::tests::requests_are_single_bounded_authenticated_attempts',
+              'direct_account_data::tests::unknown_fields_and_numbers_survive_byte_for_byte',
+              'direct_account_data::tests::an_existing_listing_writes_nothing_and_invalid_targets_are_refused',
+              'direct_account_data::tests::a_baseline_differing_only_in_a_big_number_is_a_change',
+              'direct_account_data::tests::requests_are_bounded_single_attempts',
+
               'history::tests::a_focused_view_is_owned_only_by_the_selection_that_loaded_it',
               'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one',
               'tests::homeserver_must_not_send_password_over_plain_http',
@@ -816,6 +867,7 @@ jobs:
           }
           allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
           needed_config={
+              'tests::every_editor_metric_is_a_bounded_field_with_one_accessor',
               'tests::pane_composition_and_fades_default_off_round_trip_and_survive_presets',
               'tests::interaction_states_are_optional_validated_and_absent_from_shipped_presets',
               'tests::config_sender_palette_is_bounded_round_trips_and_survives_presets',
@@ -824,12 +876,18 @@ jobs:
           }
           checks=[
               ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
+              ('native_sdk_archive_unit',['cargo','test','--locked','-p','webrtc-sys-build','--lib','--','--test-threads=1'],20*60,
+                  {'archive_tests::cache_receipts_are_bounded_and_match_the_reviewed_identity'},set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
               ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
               ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib','--','--test-threads=1'],20*60,needed_config,set()),
               ('rtc_unit',['cargo','test','--locked','-p','morpheus-rtc','--features','native-devices','--lib','--','--test-threads=1'],30*60,needed_rtc,set()),
           ]
+          for _name, _args, _seconds, required, _ignored in checks:
+              if required is not None: known_test_ids.update(required)
+          if os.environ.get('RUNNER_OS')=='Linux':
+              checks.insert(0, ('format', ['cargo','fmt','--all','--','--check'], 300, None, set()))
           # All four platform scopes use this exact stable reviewed candidate.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
@@ -856,6 +914,7 @@ jobs:
                   'installed_app':False,'packages_uploaded':False}
               # Interleaved CLI stdout does not guarantee each name and ok share a line.
               # Account for every unique prefix and exact failure/ignore sets instead.
+              failures=set()
               if required is not None:
                   names=re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\.',output,re.MULTILINE)
                   seen=set(names)
@@ -875,6 +934,32 @@ jobs:
                       'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
               record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
               if not passed:
+                  # Compiler diagnostics leave this process only after the independent scan.
+                  # Exclude panic/assertion/authentication bodies. Keep compiler type-chain notes
+                  # needed to diagnose Send/Sync constraints, bounded to 4 KiB in total.
+                  diagnostics=[]; diagnostic_bytes=0
+                  for line in output.splitlines():
+                      line=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',line)
+                      stripped=line.strip()
+                      type_note=re.match(r'^(?:=\s*)?(?:note|help): (?:required (?:because|by)|within `|the trait |consider (?:removing|using|further)|future (?:created|is)|this (?:value|type))',stripped)
+                      source_span=re.match(r'^(?:-->|:::)\s+[^\r\n]{1,1000}\.(?:rs|slint):[0-9]{1,7}:[0-9]{1,5}',stripped)
+                      compiler_error=re.match(r'^error(?:\[E[0-9]{4}\])?: (?:could not compile|aborting|failed to run custom build command|cannot|expected|unexpected|unresolved|unknown|Unknown|No such|Cannot|invalid|unterminated|mismatched|attribute|proc macro|item|recursion|reached|linking)',stripped)
+                      coded_error=re.match(r'^error\[E[0-9]{4}\]: ',stripped)
+                      if not (compiler_error or coded_error or stripped.startswith(('fatal error:',
+                          'MORPHEUS_SLINT_CONST_REFERENCE')) or type_note or source_span
+                          or 'Unknown property' in stripped or 'Unknown element' in stripped
+                          or 'Cannot access' in stripped or 'No such property' in stripped): continue
+                      for value in sorted({str(workspace),str(private),os.environ.get('RUNNER_TEMP',''),
+                          environment.get('HOME',''),environment.get('USERPROFILE',''),
+                          environment.get('CARGO_HOME',''),environment.get('RUSTUP_HOME','')},key=len,reverse=True):
+                          if value: line=line.replace(value,'<runner>')
+                      line=re.sub(r"(?i)[a-z]:[\\/][^\s'\"`<>]+",'<runner-path>',line)
+                      line=re.sub(r"(?<![A-Za-z0-9_.>])/(?:[^\s'\"`<>]+)",'<runner-path>',line)
+                      line=''.join(ch for ch in line if ord(ch)>=32 and ord(ch)!=127)[:1000]
+                      encoded=line.encode('utf-8')
+                      if diagnostic_bytes+len(encoded)>4096 or len(diagnostics)>=32: break
+                      diagnostics.append(line); diagnostic_bytes+=len(encoded)
+                  record['compiler_diagnostics']=diagnostics
                   crates=set(re.findall(r"failed to run custom build command for `([A-Za-z0-9_-]+) v([0-9][A-Za-z0-9.+_-]*)`",output))
                   # Only fixed tool families and package names from the reviewed lock
                   # may leave the private log. Normalize NULs for native UTF-16 output.
@@ -893,7 +978,90 @@ jobs:
                   resolved_link=shutil.which('link.exe',path=environment.get('PATH','')) if os.name=='nt' else None
                   locked_names={package for package,version in locked}
                   failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
+                  # Only reviewed public filenames and numeric compiler spans.
+                  # Missing identifiers are admitted only if already in those public sources.
+                  source_files=('crates/morpheus-app/src/voice_rosters/mod.rs',
+                      'crates/morpheus-app/src/voice_rosters/model.rs',
+                      'crates/morpheus-app/src/voice_rosters/tests.rs',
+                      'crates/morpheus-app/ui/voice-rosters.slint',
+                      'crates/morpheus-app/ui/icons.slint',
+                      'crates/morpheus-rtc/src/observer.rs',
+                      'crates/morpheus-config/src/lib.rs',
+                      'crates/morpheus-config/src/registry.rs',
+                      'crates/morpheus-config/src/diagnostics.rs',
+                      'crates/morpheus-config/src/input.rs',
+                      'crates/morpheus-config/src/style_profiles.rs',
+                      'crates/morpheus-app/src/workspace_layout.rs',
+                      'crates/morpheus-app/src/attachment_workbench.rs',
+                      'crates/morpheus-app/src/attachments.rs',
+                      'crates/morpheus-app/ui/transfer-center.slint',
+                      'crates/morpheus-matrix/src/media.rs',
+                      'crates/morpheus-config/src/registry.rs',
+                      'crates/morpheus-matrix/src/device_sessions.rs',
+                      'crates/morpheus-app/src/device_sessions.rs',
+                      'crates/morpheus-app/ui/device-sessions.slint',
+                      'vendor/matrix-sdk/src/config/request.rs',
+                      'vendor/matrix-sdk/src/error.rs',
+                      'vendor/matrix-sdk/src/http_client/mod.rs',
+                      'vendor/matrix-sdk/src/http_client/native.rs',
+                      'vendor/matrix-sdk/src/search_index/mod.rs',
+                      'vendor/matrix-sdk/src/message_search.rs',
+                      'vendor/matrix-sdk-search/src/index/mod.rs',
+                      'vendor/matrix-sdk-search/src/schema.rs',
+                      'crates/morpheus-matrix/src/search.rs',
+                      'crates/morpheus-app/src/main.rs',
+                      'crates/morpheus-app/src/settings_search.rs',
+                      'crates/morpheus-app/src/room_organization/mod.rs',
+                      'crates/morpheus-app/src/navigation.rs',
+                      'crates/morpheus-app/ui/room-organization.slint',
+                      'crates/morpheus-matrix/src/room_tags.rs',
+                      'crates/morpheus-app/src/appearance.rs',
+                      'crates/morpheus-app/src/style_profiles.rs',
+                      'crates/morpheus-app/ui/controls.slint',
+                      'crates/morpheus-app/ui/style-tokens.slint',
+                      'crates/morpheus-app/ui/call-stage.slint',
+                      'crates/morpheus-app/ui/message-search.slint',
+                      'crates/morpheus-app/ui/poll-card.slint',
+                      'crates/morpheus-app/ui/poll-dialog.slint',
+                      'crates/morpheus-app/ui/attachment-workbench.slint',
+                      'crates/morpheus-app/ui/media-viewer.slint',
+                      'crates/morpheus-app/src/account_access_ui_tests.rs',
+                      'crates/morpheus-app/src/live.rs',
+                      'crates/morpheus-app/src/timeline_model.rs',
+                      'crates/morpheus-app/src/pinned_messages/mod.rs',
+                      'crates/morpheus-app/src/pinned_messages/view.rs',
+                      'crates/morpheus-app/src/message_search.rs',
+                      'crates/morpheus-app/src/polls/mod.rs',
+                      'crates/morpheus-app/ui/app-window.slint',
+                      'crates/morpheus-app/ui/pinned-messages.slint',
+                      'crates/morpheus-matrix/src/lib.rs',
+                      'crates/morpheus-matrix/src/pinned_messages.rs')
+                  # All current Rust/Slint files in the reviewed tracked source tree,
+                  # including theme_studio/{mod,fonts,packs}.rs and new compiled modules.
+                  source_files=tuple(sorted(set(source_files)|{str(path) for path,_mode,_blob,_size in tracked
+                      if str(path).startswith(('crates/morpheus-app/src/','crates/morpheus-app/ui/',
+                          'crates/morpheus-config/src/','crates/morpheus-matrix/src/','crates/morpheus-rtc/src/'))
+                      and path.suffix in ('.rs','.slint')}))
+                  locations=[]; public_identifiers=set()
+                  for path in source_files:
+                      file=workspace/path
+                      if not file.is_file(): continue
+                      text=file.read_text(encoding='utf-8')
+                      public_identifiers.update(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{0,127}\b',text))
+                      line_limit=len(text.splitlines())+1
+                      spans={(int(line),int(column)) for line,column in re.findall(re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})',normalized)
+                          if 0<int(line)<=line_limit and 0<int(column)<=4096}
+                      locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
+                  missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
                   record['failure_diagnostics']={
+                      'ui_timeout_phases':[int(phase) for phase in re.findall(r'morpheus-ui-timeout-phase=([0-9]{1,3})', output)[:8]],
+                      'transfer_focus_state':[{'page':int(page),'panel':panel=='true','tab':int(tab),'pending':pending=='true','headings':int(headings)}
+                          for page,panel,tab,pending,headings in re.findall(r'MORPHEUS_TRANSFER_FOCUS_STATE page=([0-9]{1,2}) panel=(true|false) tab=([0-9]{1,2}) pending=(true|false) headings=([0-9]{1,3})',output)[:8]],
+                      'ui_settings_target_failures':[{'stage':int(stage),'index':int(index),'live':live=='true'}
+                          for stage,index,live in re.findall(r'MORPHEUS_SETTINGS_TARGET_FAILURE stage=([01]) index=([0-9]{1,3}) live=(true|false)',output)[:8]],
+                      'failed_test_ids':[name for name in sorted(failures) if name in known_test_ids][:16],
+                      'source_locations':locations,
+                      'missing_public_identifiers':sorted(missing & public_identifiers)[:32],
                       'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
                       'path_link_family':tool_family(resolved_link) if resolved_link else 'not_resolved',
                       'locked_failed_packages':sorted(failed_packages & locked_names),
