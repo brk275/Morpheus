@@ -115,7 +115,10 @@ fn main() {
     let webrtc_include = webrtc_dir.join("include");
     let webrtc_lib = webrtc_dir.join("lib");
 
-    if !webrtc_dir.exists() {
+    // Admit restored prebuilt directories through the helper's receipt/root
+    // checks too. An existing explicit custom build keeps its upstream opt-in
+    // behavior; custom paths are not authenticated by the archive pins.
+    if webrtc_sys_build::custom_dir().is_none() || !webrtc_dir.exists() {
         webrtc_sys_build::download_webrtc().unwrap();
     }
 

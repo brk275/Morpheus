@@ -28,10 +28,13 @@ isolation patch still verifies the extracted static library independently.
   extraction. Remove temporary files and staging directories on success/error.
 - Require a bounded matching download receipt on cache reuse. Older caches
   without a receipt are rejected; remove the old SDK cache explicitly before
-  rebuilding. A receipt records download provenance; it does **not** authenticate
-  a mutable cache tree against another process running as the same OS user.
-  Explicit `LK_CUSTOM_WEBRTC` builds remain a developer-controlled opt-in and
-  are not covered by the archive pins or Morpheus release acceptance.
+  rebuilding. Whenever the `webrtc-sys` build script runs, it invokes this
+  admission path for prebuilt cache hits before using headers or libraries.
+  A receipt records download provenance; it does **not** authenticate a mutable cache
+  tree against another process running as the same OS user, and a cache hit
+  is not fresh-download evidence. Existing explicit `LK_CUSTOM_WEBRTC` builds
+  retain their developer-controlled opt-in behavior and are not covered by
+  the archive pins or Morpheus release acceptance.
 
 The only added dependency is the already-locked `sha2` 0.10.9. The upstream
 generated lockfile, changelog and registry metadata are omitted from this local

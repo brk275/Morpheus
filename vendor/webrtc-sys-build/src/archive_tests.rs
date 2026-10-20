@@ -76,6 +76,11 @@ fn cache_receipts_are_bounded_and_match_the_reviewed_identity() {
     archive::write_receipt(&directory.0, &ABC).unwrap();
     archive::check_receipt(&directory.0, &ABC).unwrap();
     assert!(archive::write_receipt(&directory.0, &ABC).is_err());
+    // A cache hit must match the pinned identity, not merely the 64-byte shape.
+    fs::write(directory.0.join(archive::RECEIPT), "0".repeat(64)).unwrap();
+    assert!(archive::check_receipt(&directory.0, &ABC).is_err());
+    fs::write(directory.0.join(archive::RECEIPT), ABC.sha256).unwrap();
+    archive::check_receipt(&directory.0, &ABC).unwrap();
     fs::write(directory.0.join(archive::RECEIPT), "x".repeat(1024)).unwrap();
     assert!(archive::check_receipt(&directory.0, &ABC).is_err());
 }
