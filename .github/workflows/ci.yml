@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed beta catch-up - e8c9bc3 - ${{ inputs.platform }}
+run-name: Reviewed beta catch-up - 8fdb71f - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -16,11 +16,11 @@ on:
         type: choice
         required: true
         default: full
-        options: [full, failed-linux, account-ui, product-linux, app-linux]
+        options: [full, failed-linux, account-ui, product-linux, app-linux, product-sdk-linux]
 permissions:
   contents: read
 concurrency:
-  group: beta-native-e8c9bc3-${{ github.ref }}
+  group: beta-native-8fdb71f-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -37,7 +37,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: e8c9bc3030d9e298d14098677545cfebcc39b309
+          ref: 8fdb71f817b9134a1be1746bd600ed6abe6b484d
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -50,7 +50,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = e8c9bc3030d9e298d14098677545cfebcc39b309
+          test "$(git -C candidate rev-parse HEAD)" = 8fdb71f817b9134a1be1746bd600ed6abe6b484d
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -85,7 +85,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: e8c9bc3030d9e298d14098677545cfebcc39b309
+          ref: 8fdb71f817b9134a1be1746bd600ed6abe6b484d
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -324,7 +324,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='e8c9bc3030d9e298d14098677545cfebcc39b309'
+          source='8fdb71f817b9134a1be1746bd600ed6abe6b484d'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -665,7 +665,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='e8c9bc3030d9e298d14098677545cfebcc39b309'
+          source='8fdb71f817b9134a1be1746bd600ed6abe6b484d'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -966,6 +966,25 @@ jobs:
                       '--test','integration','encryption::recovery::test_recovery_setup_hands_over_the_key_when_its_last_request_fails',
                       '--','--exact','--test-threads=1'],20*60,
                   {'encryption::recovery::test_recovery_setup_hands_over_the_key_when_its_last_request_fails'},set()))
+          if os.environ.get('RUNNER_OS')=='Linux':
+              # Changed SDK no-sync identity stream: synthetic loopback fixtures,
+              # including default syncing behavior and queued departures.
+              checks.append(('identity_sdk',
+                  ['cargo','test','--locked','-p','matrix-sdk','--features','testing',
+                      '--lib','room::identity_status_changes::tests::',
+                      '--','--test-threads=1'],20*60,
+                  {
+                      'room::identity_status_changes::tests::test_no_sync_stream_never_requests_the_member_list',
+                      'room::identity_status_changes::tests::test_syncing_stream_requests_an_incomplete_member_list',
+                      'room::identity_status_changes::tests::test_no_sync_stream_does_not_report_a_member_who_left_again',
+                      'room::identity_status_changes::tests::test_no_sync_stream_reconciles_queued_pin_before_leave_or_ban',
+                      'room::identity_status_changes::tests::test_no_sync_stream_reconciles_queued_verification_before_leave_or_ban',
+                      'room::identity_status_changes::tests::test_no_sync_stream_ends_if_departure_rebuild_cannot_read_members',
+                      'room::identity_status_changes::tests::test_syncing_stream_keeps_queued_departure_and_historical_member_behavior',
+                      'room::identity_status_changes::tests::test_stored_reconciliation_keeps_own_identity_excluded_from_publication',
+                      'room::identity_status_changes::tests::test_no_sync_stream_does_not_start_from_an_unreadable_member_list',
+                      'room::identity_status_changes::tests::test_no_sync_stream_ends_when_a_stored_member_cannot_be_read',
+                  },set()))
           for _name, _args, _seconds, required, _ignored in checks:
               if required is not None: known_test_ids.update(required)
           if os.environ.get('RUNNER_OS')=='Linux':
@@ -974,7 +993,7 @@ jobs:
           # successful production/RTC/config/SDK evidence on Linux, and reruns only
           # the two failed suites plus formatting. Other native platforms stay full.
           scope=os.environ.get('MORPHEUS_CHECK_SCOPE','full')
-          if scope not in ('full','failed-linux','account-ui','product-linux','app-linux'):
+          if scope not in ('full','failed-linux','account-ui','product-linux','app-linux','product-sdk-linux'):
               raise SystemExit('unknown_check_scope')
           if scope=='failed-linux':
               if os.environ.get('RUNNER_OS')!='Linux':
@@ -999,6 +1018,11 @@ jobs:
                   raise SystemExit('product_linux_requires_linux')
               checks=[check for check in checks if check[0] in
                   {'format','native_app_build','app_unit_controller','matrix_unit'}]
+          if scope=='product-sdk-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('product_sdk_linux_requires_linux')
+              checks=[check for check in checks if check[0] in
+                  {'format','native_app_build','app_unit_controller','matrix_unit','identity_sdk'}]
           # All four platform scopes use this exact stable reviewed candidate.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
