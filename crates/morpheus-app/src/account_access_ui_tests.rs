@@ -3866,21 +3866,20 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_public_profile_projection(&ui).await;
     phase.set(21);
     assert_room_notification_panel(&ui).await;
-    phase.set(21);
+    phase.set(50);
     assert_theme_studio_draft(&ui, directory.path()).await;
     assert_behavior_saves_with_broken_theme(&ui, directory.path()).await;
-    phase.set(22);
+    phase.set(51);
     assert_theme_studio_publish_race(&ui, directory.path()).await;
-    phase.set(23);
+    phase.set(52);
     assert_theme_pack_keeps_installed_file(&ui, directory.path()).await;
-    phase.set(24);
+    phase.set(53);
     assert_pack_scope_fences(&ui, directory.path()).await;
-    phase.set(25);
+    phase.set(54);
     assert_style_profile_scope_fences(&ui, directory.path()).await;
-    phase.set(26);
+    phase.set(55);
     assert_room_appearance_scope(&ui, directory.path()).await;
-    // 40: clear of other workers' phase numbers (root also uses 26).
-    phase.set(40);
+    phase.set(56);
     assert_font_browser(&ui, directory.path()).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
