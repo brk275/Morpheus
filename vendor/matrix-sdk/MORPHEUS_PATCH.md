@@ -216,3 +216,14 @@ rename/sign-out responses (including UIAA). Existing selection, operation,
 password and cancellation fences remain intact. Oversized responses map to
 the fixed unavailable result; ambiguous destructive requests are not resent.
 Source only; no hosted or installed-device acceptance is claimed yet.
+
+
+## Push-rule write responses
+
+The pinned notification-settings command sender uses the existing per-request
+response cap at 64 KiB, a 30-second timeout and no automatic mutation retry.
+Its error messages use fixed operation categories; the shared HTTP error log
+also omits the typed error body. Existing HTTP request spans are unchanged. Existing authenticated-client and redirect policies are
+unchanged. Focused mock-server regressions cover oversized valid JSON and a
+single failed request. A failed multi-command update may have partly reached
+the server; callers must reconcile through sync and must not claim rollback.
