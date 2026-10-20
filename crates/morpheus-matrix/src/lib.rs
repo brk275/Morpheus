@@ -85,6 +85,10 @@ pub use room_settings::{
     RoomSettingsSnapshot,
 };
 pub use room_settings::{
+    DirectoryListing, GuestAccessChoice, HistoryVisibilityChoice, RoomAccessPermissions,
+    RoomAccessSetting, RoomAccessSnapshot,
+};
+pub use room_settings::{
     MAX_ALIAS_LOCALPART_CHARS, MAX_ALTERNATIVE_ADDRESSES, MAX_ROOM_ADDRESSES, PublishEdit,
     RoomAddress, RoomAddressError, RoomAddressesSession, RoomAddressesSnapshot, new_local_address,
 };

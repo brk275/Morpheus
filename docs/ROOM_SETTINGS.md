@@ -47,6 +47,59 @@ Matrix room and can be used in that list. Unknown rules, unsupported allow-list
 entries and unsupported room versions remain read-only. Changing the join rule
 does not publish the room in a public directory.
 
+## History, guests and directory listing
+
+Access and visibility, opened from Room settings, reads three settings fresh
+from your homeserver and shows each with the choices you can make:
+
+- **Who can read the history**: members from when they joined, members from
+  when they were invited, members including messages from before they joined,
+  or anyone, even without joining. A change applies to messages sent from then
+  on. People keep what they could already read, and in encrypted rooms it shares
+  no message keys, so new members may still be unable to read earlier messages.
+- **Guest access**: whether guest accounts may join. Guests still need what the
+  join rule requires (an invitation in an invite-only room) and a homeserver
+  that offers guest accounts. Allowing guests creates no accounts and gives no
+  one keys to encrypted messages.
+- **Room directory**: whether your homeserver lists the room in its room
+  directory, where anyone who browses it can find the room's name, topic,
+  avatar, address and member count. Listing does not change who may join. Only
+  your own homeserver's directory is covered. If it offers no directory, or
+  gives no usable answer, the panel says so and the listing cannot be changed.
+
+A setting the room has never set shows the Matrix default, and so does guest
+access redacted to no value. A history-visibility event without a value, a
+value Morpheus does not recognize, or content it would not rewrite is
+read-only; so is a setting your permissions in the room do not allow. Who may change the directory listing
+is up to the homeserver: Morpheus first asks for the room's address permission,
+as Synapse does, and the homeserver's answer is final. These reads, the
+permission checks behind them included, never renew an expired sign-in to read
+again.
+
+Choosing sends nothing. Review changes lists each change and what it means.
+Making the history readable by anyone, or listing the room, also needs an
+explicit confirmation. Save then sends the changes one at a time: those that
+close the room up first, and a listing last. Each is sent only after a fresh
+read finds that setting exactly as reviewed, and the first that does not
+succeed stops the save; the rest are not sent. Results are reported as
+described in [How a save is sent](#how-a-save-is-sent), and after any failure
+the panel needs a refresh before another change.
+
+A change counts as saved only when the settings read back show it, together
+with every change saved before it. A change your homeserver accepted that the
+read-back does not show is reported as accepted but not confirmed, and the rest
+are not sent. Closing the panel stops a read; closing the form stops a change
+that has not been sent yet. A change already sent is still waited for, and its
+result is kept for as long as Morpheus runs, whether the form is closed,
+reopened or refreshed, or another account is shown: a setting whose earlier
+change is still waiting stays read-only with a note until that change is
+answered. One that got no answer stays read-only until Morpheus restarts, even
+if a later read shows the value you chose, because the unanswered request may
+still apply after that read. Removing the account from Morpheus completely, or
+logging out of it, forgets these results; a removal that does not complete
+keeps them. Nothing is sent again automatically, and a read cannot make a change
+and its read-back atomic.
+
 ## Permissions and concurrent edits
 
 The form reads current room state from the homeserver. Your permissions may

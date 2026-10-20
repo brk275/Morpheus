@@ -419,6 +419,7 @@ impl AccountAccessUi {
                         if result.complete {
                             crate::room_addresses::forget_account(&id);
                             crate::room_permissions::forget_account(&id);
+                            crate::room_settings::forget_access_account(&id);
                             access.live.forget_removed_account_joins(&id);
                             if let Err(error) = access.live.voice_spaces.clear_logged_out_account(&id) {
                                 return Ok(format!("Account removed. Some appearance preferences could not be removed: {error}"));

@@ -1,0 +1,498 @@
+// Who can read a room's history, whether guests may join, and whether the
+// account's homeserver lists the room in its directory, opened from Room
+// settings. Rust owns the fresh reads, the choices and the save; choosing
+// sends nothing, and only Save after the review does. The window passes
+// resolved colors; geometry and interaction states come from StyleTokens.
+
+import { ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton, TokenCheck } from "controls.slint";
+
+// One reviewed change, or what saving it did.
+export struct RoomAccessLine {
+    title: string,
+    before: string,
+    after: string,
+    note: string,
+    // 0 plain, 1 saved, 2 a warning or an uncertain outcome, 3 not changed.
+    tone: int,
+}
+
+export global RoomAccessState {
+    in-out property <bool> open: false;
+    in-out property <bool> busy: false;
+    in-out property <bool> loaded: false;
+    in-out property <bool> refresh-required: false;
+    // 0 choose, 1 review the changes, 2 what the save did.
+    in-out property <int> mode: 0;
+    // Per setting: its choices, the one chosen, the room's own (-1 when
+    // unknown), whether it may be changed now, and what was read.
+    in-out property <[string]> history-options;
+    in-out property <int> history-index: -1;
+    in-out property <int> history-current: -1;
+    in-out property <bool> history-editable: false;
+    in-out property <string> history-status;
+    in-out property <[string]> guest-options;
+    in-out property <int> guest-index: -1;
+    in-out property <int> guest-current: -1;
+    in-out property <bool> guest-editable: false;
+    in-out property <string> guest-status;
+    in-out property <[string]> directory-options;
+    in-out property <int> directory-index: -1;
+    in-out property <int> directory-current: -1;
+    in-out property <bool> directory-editable: false;
+    in-out property <string> directory-status;
+    in-out property <bool> changed: false;
+    in-out property <[RoomAccessLine]> lines;
+    // What a change that opens the room up asks you to confirm; empty when
+    // no change does.
+    in-out property <string> acknowledgement;
+    in-out property <bool> acknowledged: false;
+    in-out property <string> error;
+    in-out property <string> notice;
+    callback open-panel();
+    callback close-panel();
+    // 0 refresh, 1 review, 2 back to the choices, 3 save, 4 done.
+    callback action(int);
+    // The setting (0 history, 1 guests, 2 directory) and the choice.
+    callback choose(int, int);
+    callback acknowledge(bool);
+}
+
+component AccessChoice inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    in property <bool> current;
+    in property <bool> enabled: true;
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    callback activated();
+    callback focused();
+    forward-focus: scope;
+    min-height: max(30px * root.text-scale, row.preferred-height);
+    border-radius: StyleTokens.control-corner;
+    border-width: root.checked ? max(2px, StyleTokens.line-width) : StyleTokens.line-width;
+    border-color: root.checked ? root.colors.accent : root.colors.outline;
+    background: touch.pressed && root.enabled && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+        : touch.has-hover && root.enabled ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.colors.hover)
+        : root.colors.surface;
+    accessible-role: radio-button;
+    accessible-label: root.current ? root.text + ", the room's current setting" : root.text;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if root.enabled {
+            root.activated();
+        }
+    }
+    row := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 14px * root.text-scale;
+                height: self.width;
+                border-radius: self.width / 2;
+                border-width: 2px;
+                border-color: root.checked ? root.colors.accent : root.colors.muted;
+                if root.checked : Rectangle {
+                    x: parent.width / 4;
+                    y: parent.height / 4;
+                    width: parent.width / 2;
+                    height: parent.height / 2;
+                    border-radius: self.width / 2;
+                    background: root.colors.accent;
+                }
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.enabled ? root.colors.ink
+                : StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.colors.muted;
+            font-size: 12px * root.text-scale;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            accessible-role: none;
+        }
+        if root.current : Text {
+            text: "Current";
+            color: root.colors.muted;
+            font-size: 11px * root.text-scale;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+    scope := FocusScope {
+        enabled: root.enabled;
+        focus-gained(reason) => { root.focused(); }
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled {
+                    root.activated();
+                }
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            scope.focus();
+            root.activated();
+        }
+    }
+    if scope.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: StyleTokens.focus-width;
+        border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.colors.accent;
+        background: transparent;
+    }
+}
+
+component AccessSection inherits Rectangle {
+    in property <string> title;
+    in property <string> status;
+    in property <string> note;
+    in property <[string]> options;
+    in property <int> index: -1;
+    in property <int> current: -1;
+    in property <bool> editable;
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    callback chosen(int);
+    // A choice took focus at this offset and height within the section.
+    callback focused-at(length, length);
+    accessible-role: radio-group;
+    accessible-label: root.title;
+    accessible-description: root.status;
+    VerticalLayout {
+        spacing: 6px;
+        Text {
+            text: root.title;
+            color: root.colors.ink;
+            font-size: 13px * root.text-scale;
+            font-weight: 700;
+            wrap: word-wrap;
+            accessible-role: none;
+        }
+        Text {
+            text: root.status;
+            color: root.colors.muted;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        for label[index] in root.options : AccessChoice {
+            text: label;
+            checked: index == root.index;
+            current: index == root.current;
+            enabled: root.editable;
+            colors: root.colors;
+            text-scale: root.text-scale;
+            activated => { root.chosen(index); }
+            focused => { root.focused-at(self.y, self.height); }
+        }
+        Text {
+            text: root.note;
+            color: root.colors.muted;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component RoomAccessPanel inherits FocusScope {
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    in property <length> corner: 10px;
+    in property <color> surface;
+    in property <color> scrim;
+    in property <color> error-color;
+    in property <color> success-color;
+    // While a save is pending: stop waiting and close Room settings, which
+    // cancels pending work.
+    callback stop();
+
+    property <bool> working: RoomAccessState.busy;
+    property <int> mode: RoomAccessState.mode;
+    property <bool> saving: root.working && root.mode == 1;
+    property <bool> can-review: RoomAccessState.loaded && RoomAccessState.changed && !RoomAccessState.refresh-required;
+    property <bool> can-save: RoomAccessState.acknowledgement == "" || RoomAccessState.acknowledged;
+
+    // Keep a focused control inside the visible part of the scrolled body.
+    function show(top: length, extent: length) {
+        if top < -scroller.content-y {
+            scroller.content-y = -top;
+        } else if top + extent > scroller.visible-height - scroller.content-y {
+            scroller.content-y = min(0px, scroller.visible-height - top - extent);
+        }
+    }
+    // Close, Back, and Escape: never a save.
+    function leave() {
+        if root.saving {
+            root.stop();
+        } else if root.mode == 1 {
+            RoomAccessState.action(2);
+        } else {
+            RoomAccessState.close-panel();
+        }
+    }
+
+    focus-on-tab-navigation: false;
+    init => { leave-button.focus(); }
+    // Work starts (a read or a save): the keyboard goes to the one control
+    // that can act, Close (or Stop and close), never a disabled one.
+    changed working => {
+        if root.working {
+            leave-button.focus();
+        }
+    }
+    // The review starts on Back, so a repeated Return never saves unseen;
+    // while work runs only the leave control can take the keyboard.
+    changed mode => {
+        scroller.content-y = 0px;
+        if root.mode == 1 || root.working {
+            leave-button.focus();
+        } else if root.mode == 2 || go.enabled {
+            go.focus();
+        } else {
+            refresh.focus();
+        }
+    }
+    // Tab stays inside the panel: Refresh is first, the primary button (or
+    // Close while it is unavailable) is last. While anything is pending only
+    // Close (or Stop and close) can act, and Tab keeps the keyboard there.
+    capture-key-pressed(event) => {
+        if root.working && (event.text == Key.Tab || event.text == Key.Backtab) {
+            leave-button.focus();
+            accept
+        } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && refresh.has-focus {
+            if go.enabled {
+                go.focus();
+            } else {
+                leave-button.focus();
+            }
+            accept
+        } else if event.text == Key.Tab && !event.modifiers.shift && (go.has-focus || (leave-button.has-focus && !go.enabled)) {
+            if refresh.enabled {
+                refresh.focus();
+            } else {
+                leave-button.focus();
+            }
+            accept
+        } else {
+            reject
+        }
+    }
+    key-pressed(event) => {
+        if event.text == Key.Escape {
+            root.leave();
+            accept
+        } else {
+            reject
+        }
+    }
+
+    Rectangle {
+        background: root.scrim;
+        TouchArea { }
+        Rectangle {
+            width: min(560px * root.text-scale, parent.width - 32px);
+            height: min(640px * root.text-scale, parent.height - 32px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.surface;
+            border-radius: root.corner * 1.4;
+            border-width: StyleTokens.line-width;
+            border-color: root.colors.outline;
+            accessible-role: region;
+            accessible-label: "Room access and visibility";
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: root.mode == 1 ? "Review changes" : root.mode == 2 ? "Save results" : "Access and visibility";
+                        color: root.colors.ink;
+                        font-size: 18px * root.text-scale;
+                        font-weight: 750;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        wrap: word-wrap;
+                    }
+                    refresh := TokenButton {
+                        text: "Refresh";
+                        colors: root.colors;
+                        text-scale: root.text-scale;
+                        enabled: !root.working;
+                        label: "Refresh: read these settings again from the homeserver; unsaved choices and the review are discarded";
+                        activated => { RoomAccessState.action(0); }
+                    }
+                }
+                Text {
+                    text: root.mode == 1 ? "Check each change. Save sends them one at a time and stops at the first that does not succeed."
+                        : root.mode == 2 ? "Each change as your homeserver answered it."
+                        : "These apply to everyone in the room. Nothing is sent until you review the changes and save.";
+                    color: root.colors.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                }
+                scroller := ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        width: scroller.visible-width;
+                        alignment: start;
+                        if root.mode == 0 : VerticalLayout {
+                            spacing: 16px;
+                            AccessSection {
+                                title: "Who can read the history";
+                                status: RoomAccessState.history-status;
+                                note: "A change applies to messages sent from then on. People keep what they could already read; it is not taken back. In encrypted rooms it shares no message keys, so new members may still be unable to read earlier messages.";
+                                options: RoomAccessState.history-options;
+                                index: RoomAccessState.history-index;
+                                current: RoomAccessState.history-current;
+                                editable: RoomAccessState.history-editable && !root.working;
+                                colors: root.colors;
+                                text-scale: root.text-scale;
+                                chosen(index) => { RoomAccessState.choose(0, index); }
+                                focused-at(top, extent) => { root.show(self.y + top, extent); }
+                            }
+                            AccessSection {
+                                title: "Guest access";
+                                status: RoomAccessState.guest-status;
+                                note: "Guests are temporary accounts that some homeservers offer. They still need what the join rule requires, such as an invitation, and a homeserver that allows guests. Allowing them creates no accounts and gives no one keys to encrypted messages.";
+                                options: RoomAccessState.guest-options;
+                                index: RoomAccessState.guest-index;
+                                current: RoomAccessState.guest-current;
+                                editable: RoomAccessState.guest-editable && !root.working;
+                                colors: root.colors;
+                                text-scale: root.text-scale;
+                                chosen(index) => { RoomAccessState.choose(1, index); }
+                                focused-at(top, extent) => { root.show(self.y + top, extent); }
+                            }
+                            AccessSection {
+                                title: "Room directory";
+                                status: RoomAccessState.directory-status;
+                                note: "Listing lets anyone who browses your homeserver's room directory find this room's name, topic, avatar, address and member count. It does not change who may join; the join rule still decides.";
+                                options: RoomAccessState.directory-options;
+                                index: RoomAccessState.directory-index;
+                                current: RoomAccessState.directory-current;
+                                editable: RoomAccessState.directory-editable && !root.working;
+                                colors: root.colors;
+                                text-scale: root.text-scale;
+                                chosen(index) => { RoomAccessState.choose(2, index); }
+                                focused-at(top, extent) => { root.show(self.y + top, extent); }
+                            }
+                        }
+                        if root.mode != 0 : VerticalLayout {
+                            spacing: 10px;
+                            for line in RoomAccessState.lines : Rectangle {
+                                border-radius: StyleTokens.control-corner;
+                                border-width: StyleTokens.line-width;
+                                border-color: line.tone == 2 || line.tone == 3 ? root.error-color : line.tone == 1 ? root.success-color : root.colors.outline;
+                                background: root.colors.surface;
+                                accessible-role: text;
+                                accessible-label: line.title + ": " + line.before + " to " + line.after + ". " + line.note;
+                                VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 4px;
+                                    Text {
+                                        text: line.title;
+                                        color: root.colors.ink;
+                                        font-size: 12px * root.text-scale;
+                                        font-weight: 650;
+                                        wrap: word-wrap;
+                                        accessible-role: none;
+                                    }
+                                    Text {
+                                        text: line.before + "  →  " + line.after;
+                                        color: root.colors.ink;
+                                        font-size: 12px * root.text-scale;
+                                        wrap: word-wrap;
+                                        accessible-role: none;
+                                    }
+                                    if line.note != "" : Text {
+                                        text: line.note;
+                                        color: line.tone == 3 || line.tone == 2 ? root.error-color : root.colors.muted;
+                                        font-size: 11px * root.text-scale;
+                                        wrap: word-wrap;
+                                        accessible-role: none;
+                                    }
+                                }
+                            }
+                            if root.mode == 1 && RoomAccessState.acknowledgement != "" : TokenCheck {
+                                text: RoomAccessState.acknowledgement;
+                                checked <=> RoomAccessState.acknowledged;
+                                enabled: !root.working;
+                                colors: root.colors;
+                                text-scale: root.text-scale;
+                                toggled => { RoomAccessState.acknowledge(self.checked); }
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        root.show(self.y, self.height);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if root.working : Text {
+                    text: root.saving ? "Saving… Stop and close stops waiting; a change already sent may still apply." : "Reading the current settings…";
+                    color: root.colors.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if RoomAccessState.error != "" : Text {
+                    text: RoomAccessState.error;
+                    color: root.error-color;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if RoomAccessState.notice != "" : Text {
+                    text: RoomAccessState.notice;
+                    color: root.colors.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 10px;
+                    leave-button := TokenButton {
+                        text: root.saving ? "Stop and close" : root.mode == 1 ? "Back" : "Close";
+                        colors: root.colors;
+                        text-scale: root.text-scale;
+                        label: root.saving ? "Stop and close: stop waiting and close Room settings; a change already sent may still apply"
+                            : root.mode == 1 ? "Back to the choices; nothing is sent"
+                            : "Close access and visibility; unsaved choices are discarded";
+                        activated => { root.leave(); }
+                    }
+                    go := TokenButton {
+                        text: root.mode == 1 ? (root.working ? "Saving…" : "Save changes") : root.mode == 2 ? "Done" : "Review changes…";
+                        primary: true;
+                        colors: root.colors;
+                        text-scale: root.text-scale;
+                        enabled: !root.working && (root.mode == 0 ? root.can-review : root.mode == 1 ? root.can-save : true);
+                        label: root.mode == 1 ? "Save changes: save the reviewed changes to this room"
+                            : root.mode == 2 ? "Done: back to the choices"
+                            : "Review changes: review the chosen changes before saving";
+                        activated => { RoomAccessState.action(root.mode == 0 ? 1 : root.mode == 1 ? 3 : 4); }
+                    }
+                }
+            }
+        }
+    }
+}

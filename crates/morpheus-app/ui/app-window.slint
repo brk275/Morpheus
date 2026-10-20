@@ -3,6 +3,8 @@ import { CallParticipantItem, CallStage, CallTileItem } from "call-stage.slint";
 import { MessageSearchItem, MessageSearchPanel } from "message-search.slint";
 import { PollCard, PollCardData, PollPalette } from "poll-card.slint";
 import { PollCreateDialog } from "poll-dialog.slint";
+import { RoomAccessPanel, RoomAccessState } from "room-access-settings.slint";
+export { RoomAccessLine, RoomAccessState } from "room-access-settings.slint";
 // Rust drives poll drafts, pending actions and the create dialog through this global.
 export { PollOptionItem, PollUiState } from "poll-card.slint";
 import { PinnedMessageItem, PinnedMessagesPanel } from "pinned-messages.slint";
@@ -11847,6 +11849,9 @@ export component AppWindow inherits Window {
         // The address panel closed: its opener takes the keyboard back.
         property <int> addresses-closed: RoomAddresses.closed;
         changed addresses-closed => { settings-addresses.focus(); }
+        // Access and visibility return focus to the control that opened it.
+        property <bool> access-open: RoomAccessState.open;
+        changed access-open => { if !self.access-open { settings-access.focus(); } }
         capture-key-pressed(event) => {
             if event.text == Key.Escape {
                 if root.room-settings-confirmation != 0 {
@@ -11907,9 +11912,9 @@ export component AppWindow inherits Window {
                                 height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
                                 background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                                 label: root.room-settings-dirty ? "Roles and permissions; save or refresh your settings edits first" : "Open this room's roles and permissions";
-                                enabled: !RoomAddresses.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty;
+                                enabled: !RoomAddresses.open && !RoomAccessState.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty;
                                 activated => {
-                                    if !RoomAddresses.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty {
+                                    if !RoomAddresses.open && !RoomAccessState.open && !root.room-admin-busy && root.room-settings-confirmation == 0 && !root.room-settings-dirty {
                                         root.room-admin-mode = 3;
                                     }
                                 }
@@ -12057,6 +12062,20 @@ export component AppWindow inherits Window {
                                 Text { x: 12px; width: parent.width - 24px; text: "Save join rule"; color: parent.enabled ? root.accent-ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                             }
                             Text { text: "Public access requires confirmation. Directory listing is a separate setting and is not changed here. Unknown rules remain read-only."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                            Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                            Text { text: "History, guests and directory"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; }
+                            Text { text: "Who can read the history, whether guests may join, and whether your homeserver lists this room. Each is read fresh and saved only after a review."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                            // Access and visibility and Room addresses each open over this
+                            // form, never together: each opener refuses while the other is open.
+                            settings-access := ActionRect {
+                                height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
+                                background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
+                                label: "Open history visibility, guest access and directory listing";
+                                enabled: !RoomAddresses.open && root.room-settings-loaded && !root.room-admin-busy && root.room-settings-confirmation == 0;
+                                activated => { if !RoomAddresses.open { RoomAccessState.open-panel(); } }
+
+                                Text { x: 12px; width: parent.width - 24px; text: "Access and visibility…"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            }
                             // Room addresses (room-addresses.slint) open over this form.
                             Rectangle { height: StyleTokens.line-width; background: root.divider; }
                             Text { text: "Room addresses"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; }
@@ -12065,10 +12084,10 @@ export component AppWindow inherits Window {
                                 height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
                                 background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                                 label: "Manage the addresses of this room";
-                                enabled: !root.room-admin-busy && root.room-settings-confirmation == 0
+                                enabled: !RoomAccessState.open && !root.room-admin-busy && root.room-settings-confirmation == 0
                                     && root.room-admin-account-id == root.active-account-local-id
                                     && root.room-admin-room-id == root.active-room-id;
-                                activated => { RoomAddresses.show(root.room-admin-room-id, root.active-room-name); }
+                                activated => { if !RoomAccessState.open { RoomAddresses.show(root.room-admin-room-id, root.active-room-name); } }
 
                                 Text { x: 12px; width: parent.width - 24px; text: "Manage addresses…"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                             }
@@ -12130,6 +12149,21 @@ export component AppWindow inherits Window {
         }
     }
 
+
+    if root.room-admin-open && root.room-admin-mode == 0 && RoomAccessState.open : RoomAccessPanel {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        colors: root.button-colors;
+        text-scale: root.text-scale;
+        corner: StyleTokens.radius;
+        surface: root.dialog-surface;
+        scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
+        error-color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.ink;
+        success-color: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.divider;
+        stop => { root.dismiss-room-settings(); }
+    }
 
     if root.room-admin-open && root.room-admin-mode == 3 : RoomPermissionsDialog {
         text-scale: root.text-scale;

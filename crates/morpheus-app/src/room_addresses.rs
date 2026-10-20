@@ -558,7 +558,9 @@ fn surface_allowed(ui: &AppWindow) -> bool {
                 && !ui.get_room_admin_busy()
                 && ui.get_room_settings_confirmation() == 0
                 && ui.get_room_admin_account_id() == ui.get_active_account_local_id()
-                && ui.get_room_admin_room_id() == ui.get_active_room_id()))
+                && ui.get_room_admin_room_id() == ui.get_active_room_id()
+                // Access and visibility, over the same form, keeps it.
+                && !ui.global::<crate::RoomAccessState>().get_open()))
         && !crate::member_privacy::is_open(ui)
         && !ui.get_people_open()
         && !ui.get_account_profile_open()

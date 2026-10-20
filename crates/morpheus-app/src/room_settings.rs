@@ -22,6 +22,14 @@ use std::{
 use tokio::{runtime::Handle, sync::Notify};
 use zeroize::Zeroizing;
 
+mod room_access_settings;
+
+/// An account was removed from this app: its room-access change receipts
+/// (changes with no known result) go with it.
+pub(crate) fn forget_access_account(account: &str) {
+    room_access_settings::forget_account(account);
+}
+
 static FILE_WORKER: AtomicBool = AtomicBool::new(false);
 /// Which form holds the chooser (an `AvatarConsumer` as u8, 0 none), only so
 /// a waiting form can say who has it. Never used for admission.
@@ -134,6 +142,7 @@ struct Form {
     cancellation: RoomSettingsCancellation,
     wake: Notify,
     content: Mutex<Content>,
+    access: Mutex<room_access_settings::Access>,
 }
 impl Form {
     fn cancel(&self) {
@@ -201,6 +210,7 @@ impl RoomSettingsUi {
                 this.edited(&ui, field);
             }
         });
+        room_access_settings::register(ui, &owner);
         owner
     }
     fn edited(&self, ui: &AppWindow, field: i32) {
@@ -236,6 +246,7 @@ impl RoomSettingsUi {
             ui.set_room_admin_busy(false);
         }
         clear_image(ui);
+        room_access_settings::clear(ui);
         ui.set_room_settings_confirmation(0);
         ui.set_room_settings_dirty(false);
         ui.set_room_settings_access_description("".into());
@@ -330,6 +341,7 @@ impl RoomSettingsUi {
             cancellation: RoomSettingsCancellation::new(),
             wake: Notify::new(),
             content: Mutex::new(Content::default()),
+            access: Mutex::default(),
         });
         *self.current.lock().expect("Room settings owner poisoned") = Some(form.clone());
         ui.set_room_admin_mode(0);

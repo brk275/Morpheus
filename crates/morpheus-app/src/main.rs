@@ -4116,6 +4116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     live.voice_spaces.forget_account(&account_id).await;
                     live.forget_account_drafts(&account_id);
                     room_permissions::forget_account(&account_id);
+                    room_settings::forget_access_account(&account_id);
                     space_management::forget_account(&account_id);
                     live.forget_removed_account_joins(&account_id);
                     live.clear_feed().await;

@@ -69,6 +69,12 @@ use tokio::{
 
 use crate::{AccountManager, AccountSelection, account_room};
 
+mod room_access_settings;
+pub use room_access_settings::{
+    DirectoryListing, GuestAccessChoice, HistoryVisibilityChoice, RoomAccessPermissions,
+    RoomAccessSetting, RoomAccessSnapshot,
+};
+
 pub const MAX_ROOM_AVATAR_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ROOM_AVATAR_SIDE: u32 = 2048;
 pub const MAX_ROOM_AVATAR_PIXELS: u64 = 4 * 1024 * 1024;
@@ -2185,6 +2191,12 @@ mod tests {
         /// Each write's event type and body as sent.
         writes: Arc<StdMutex<Vec<(String, String)>>>,
         write_reply: Arc<StdMutex<Option<(u16, Value)>>>,
+        /// The listing the room directory serves; `None` serves no directory
+        /// (an unrecognized endpoint). A listing change is recorded among the
+        /// writes as `directory`, then held, answered or applied like one.
+        directory: Arc<StdMutex<Option<String>>>,
+        /// Extra text served with a listing, to make its answer large.
+        directory_padding: Arc<StdMutex<Option<String>>>,
         upload_reply: Arc<StdMutex<Option<(u16, Value)>>>,
         uploads: Arc<AtomicUsize>,
         /// An upload taken while uploads are held is never answered.
@@ -2201,15 +2213,23 @@ mod tests {
         refused_state_reads: Arc<AtomicUsize>,
         refresh_reads: Arc<AtomicUsize>,
         alias_reads: Arc<AtomicUsize>,
+        /// The event type of each state read, in order.
+        state_reads: Arc<StdMutex<Vec<String>>>,
+        /// Answers the next read of this event type, once, with this status
+        /// and body instead of the stored state.
+        read_reply: Arc<StdMutex<Option<(String, u16, Value)>>>,
         stopped: Arc<AtomicBool>,
     }
 
     /// It answers the version check, queued syncs, state reads from its
     /// current state, state writes (recorded, then applied unless a reply is
-    /// set) and media uploads, each connection on its own thread. Power-level
-    /// reads can be held until released; a state write or an upload taken
-    /// while held is never answered or applied, like a lost connection. It
-    /// has no media limits (`/media/config`): it only counts their reads.
+    /// set), the room directory listing, access-token renewals (counted in
+    /// `refresh_reads`) and media uploads, each connection on its own thread.
+    /// Power-level reads can be held until released, and one state read
+    /// answered with a set reply; a state write, a listing change or an
+    /// upload taken while held is never answered or applied, like a lost
+    /// connection. It has no media limits (`/media/config`): it only counts
+    /// their reads.
     struct SettingsServer {
         url: String,
         served: Served,
@@ -2380,6 +2400,38 @@ mod tests {
             let reply = served.upload_reply.lock().unwrap().clone();
             let (status, reply) = reply.unwrap_or((200, uploaded));
             (status, reply.to_string())
+        } else if path.contains("/directory/list/room/") {
+            if method == "PUT" {
+                let write = ("directory".to_owned(), body.clone());
+                served.writes.lock().unwrap().push(write);
+                if served.hold_writes.load(Ordering::SeqCst) {
+                    while !served.stopped.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    return;
+                }
+                let reply = served.write_reply.lock().unwrap().clone();
+                match reply {
+                    Some((status, reply)) => (status, reply.to_string()),
+                    None => {
+                        let change: Value = serde_json::from_str(&body).unwrap();
+                        let listed = change["visibility"].as_str().map(str::to_owned);
+                        *served.directory.lock().unwrap() = listed;
+                        (200, "{}".to_owned())
+                    }
+                }
+            } else {
+                let unrecognized = json!({"errcode": "M_UNRECOGNIZED", "error": "x"});
+                let pad = served.directory_padding.lock().unwrap().clone();
+                let listed = served.directory.lock().unwrap().clone();
+                match listed {
+                    Some(listed) => {
+                        let reply = json!({"visibility": listed, "org.example.pad": pad});
+                        (200, reply.to_string())
+                    }
+                    None => (404, unrecognized.to_string()),
+                }
+            }
         } else if let Some((kind, key)) = state_target(&path) {
             if method == "PUT" {
                 let write = (kind.clone(), body.clone());
@@ -2398,6 +2450,8 @@ mod tests {
                         (200, json!({"event_id": "$written"}).to_string())
                     }
                 }
+            } else if let Some((status, reply)) = read_answer(served, &kind) {
+                (status, reply.to_string())
             } else if let Some(reply) = served.state_read_reply.lock().unwrap().clone() {
                 served.refused_state_reads.fetch_add(1, Ordering::SeqCst);
                 reply
@@ -2432,6 +2486,18 @@ mod tests {
             reply.len()
         );
         let _ = stream.write_all(response.as_bytes());
+    }
+
+    /// A state read: recorded, then answered once by `read_reply` when it
+    /// names this event type.
+    fn read_answer(served: &Served, kind: &str) -> Option<(u16, Value)> {
+        served.state_reads.lock().unwrap().push(kind.to_owned());
+        let mut reply = served.read_reply.lock().unwrap();
+        let (wanted, _, _) = reply.as_ref()?;
+        if wanted != kind {
+            return None;
+        }
+        reply.take().map(|(_, status, body)| (status, body))
     }
 
     /// The request line and body of one HTTP/1.1 request.
@@ -3089,4 +3155,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(directory);
         });
     }
+
+    // History visibility, guest access and the directory listing against
+    // this same loopback homeserver.
+    mod room_access;
 }
