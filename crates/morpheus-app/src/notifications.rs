@@ -444,7 +444,8 @@ impl DesktopNotifications {
         if !ui.live || ui.account_id != candidate.account_id {
             return None;
         }
-        let noted = self.room_mode(&candidate.account_id, &candidate.room_id);
+        // A room mode accepted in this window, read again after every await.
+        let noted = || self.room_mode(&candidate.account_id, &candidate.room_id);
         let lookup = async {
             self.manager
                 .room_notification_rule_selected(&queued.selection, &candidate.room_id)
@@ -466,7 +467,7 @@ impl DesktopNotifications {
         // Account changes can happen during any await. Returning to the same
         // account must not revive this earlier notification.
         let current = || !self.stopped.load(Ordering::Acquire) && queued.selection.is_current();
-        plan_after_lookup(candidate, noted, lookup, snapshot, config, current, now_ms()).await
+        plan_after_lookup(candidate, noted, lookup, snapshot, config, current, now_ms).await
     }
 
     /// Resolve one clicked banner to its target. Only a remembered, unexpired
@@ -747,22 +748,25 @@ impl Candidate {
 /// notifies without a highlight, which this window cannot tell apart.
 /// Plan one banner whose room rule may first need a lookup of up to 30 s.
 /// What can change meanwhile, the active account, the window's privacy screens
-/// (sign-in, the app password, Manage accounts, a recovery key) and the
-/// accepted policy, is read only after that lookup and after the last await,
-/// so a ceiling raised during the lookup applies to this banner.
+/// (sign-in, the app password, Manage accounts, a recovery key), the accepted
+/// policy, the room mode accepted in this window and the clock that ages the
+/// message, is read only after that lookup and after the last await, so a
+/// ceiling raised, a Mute accepted or the age passed during the lookup
+/// applies to this banner. Both preflights, before queuing and right before
+/// the operating system takes the banner, plan this way.
 async fn plan_after_lookup<S>(
     candidate: &Candidate,
-    noted: Option<NotificationMode>,
+    noted: impl Fn() -> Option<NotificationMode>,
     lookup: impl Future<Output = Option<NotificationMode>>,
     snapshot: impl FnOnce() -> S,
     config: impl FnOnce() -> Config,
     current: impl Fn() -> bool,
-    now_ms: u64,
+    now_ms: impl FnOnce() -> u64,
 ) -> Option<PlannedNotification>
 where
     S: Future<Output = Option<(AccountInfo, UiSnapshot)>>,
 {
-    let held = match noted {
+    let held = match noted() {
         Some(_) => lookup.await,
         None => None,
     };
@@ -775,13 +779,14 @@ where
     }
     let mut config = config();
     privacy_ceiling(&mut config, ui.private);
+    // The latest accepted room mode and the clock, after every await.
     plan_notification(
         candidate,
         &active,
         &config,
         ui.visible_room.as_ref(),
-        noted_override(noted, held),
-        now_ms,
+        noted_override(noted(), held),
+        now_ms(),
     )
 }
 
@@ -1081,12 +1086,12 @@ mod tests {
         };
         let plan = plan_after_lookup(
             &event,
-            Some(NotificationMode::AllMessages),
+            || Some(NotificationMode::AllMessages),
             lookup,
             || std::future::ready(Some((active.clone(), ui.lock().unwrap().clone()))),
             || config.lock().unwrap().clone(),
             || true,
-            1_000_000,
+            || 1_000_000,
         );
         let change = async {
             suspended.await.unwrap();
@@ -1112,12 +1117,12 @@ mod tests {
         };
         let plan = plan_after_lookup(
             &event,
-            Some(NotificationMode::AllMessages),
+            || Some(NotificationMode::AllMessages),
             lookup,
             || std::future::ready(Some((active.clone(), ui.lock().unwrap().clone()))),
             || config.lock().unwrap().clone(),
             || !lost.load(Ordering::Acquire),
-            1_000_000,
+            || 1_000_000,
         );
         let change = async {
             suspended.await.unwrap();
@@ -1126,6 +1131,88 @@ mod tests {
         };
         let (plan, ()) = tokio::join!(plan, change);
         assert!(plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_mute_accepted_or_the_age_passed_during_the_lookup_governs_the_plan() {
+        let active = account("alice", "@alice:example.org");
+        let config = Config::default();
+        let ui = UiSnapshot {
+            account_id: "alice".into(),
+            live: true,
+            visible_room: None,
+            private: false,
+        };
+        let event = candidate();
+        let sent_at = event.timestamp_ms.unwrap();
+        // Delay the room rule lookup until the change below is made.
+        async fn delayed(
+            reached: oneshot::Sender<()>,
+            released: oneshot::Receiver<()>,
+        ) -> Option<NotificationMode> {
+            let _ = reached.send(());
+            let _ = released.await;
+            Some(NotificationMode::AllMessages)
+        }
+        // A Mute accepted in this window while the lookup waits.
+        let noted = std::sync::Mutex::new(Some(NotificationMode::AllMessages));
+        let (reached, suspended) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let plan = plan_after_lookup(
+            &event,
+            || *noted.lock().unwrap(),
+            delayed(reached, released),
+            || std::future::ready(Some((active.clone(), ui.clone()))),
+            || config.clone(),
+            || true,
+            || sent_at,
+        );
+        let mute = async {
+            suspended.await.unwrap();
+            *noted.lock().unwrap() = Some(NotificationMode::Mute);
+            release.send(()).unwrap();
+        };
+        let (plan, ()) = tokio::join!(plan, mute);
+        assert!(plan.is_none(), "the Mute accepted during the lookup applies");
+        // The message's age passes while the lookup waits.
+        let clock = AtomicU64::new(sent_at);
+        let (reached, suspended) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let plan = plan_after_lookup(
+            &event,
+            || Some(NotificationMode::AllMessages),
+            delayed(reached, released),
+            || std::future::ready(Some((active.clone(), ui.clone()))),
+            || config.clone(),
+            || true,
+            || clock.load(Ordering::Acquire),
+        );
+        let expire = async {
+            suspended.await.unwrap();
+            let late = sent_at + MAX_NOTIFICATION_AGE.as_millis() as u64 + 1;
+            clock.store(late, Ordering::Release);
+            release.send(()).unwrap();
+        };
+        let (plan, ()) = tokio::join!(plan, expire);
+        assert!(plan.is_none(), "the age is judged at the final plan");
+        // Without either change the same banner is planned.
+        let (reached, suspended) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let plan = plan_after_lookup(
+            &event,
+            || Some(NotificationMode::AllMessages),
+            delayed(reached, released),
+            || std::future::ready(Some((active.clone(), ui.clone()))),
+            || config.clone(),
+            || true,
+            || sent_at,
+        );
+        let wait = async {
+            suspended.await.unwrap();
+            release.send(()).unwrap();
+        };
+        let (plan, ()) = tokio::join!(plan, wait);
+        assert!(plan.is_some());
     }
 
     #[test]
