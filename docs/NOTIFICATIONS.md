@@ -79,12 +79,17 @@ from then on the SDK's push actions decide, so keyword matches in a room set to
 mentions and keywords notify. A change the homeserver did not confirm may have
 reached it in part: one change can be several rules (a default level is one
 for encrypted and one for unencrypted rooms), and the first can land before a
-later one fails or times out. Morpheus then says the change was not confirmed
-and that part of it may have reached the homeserver, never that nothing
-changed or that it was rolled back, keeps the controls available, and reads
-the levels, defaults and keywords again once sync brings the homeserver's rules
-(waiting at most a minute), because this device's copy of the rules is
-authoritative only after sync. Saving a default updates the rooms that follow it
+later one fails or times out, or all of them can land although no answer
+arrived. Morpheus then says the change was not confirmed and that part or all
+of it may have reached the homeserver, never that nothing changed or that it
+was rolled back, and keeps the controls available. What it shows is this
+device's copy of the rules until a sync observed after the change brings the
+homeserver's rules: Morpheus starts watching for that sync before it sends a
+change, waits at most a minute, and only then reads the levels, defaults and
+keywords again and says that they are what the homeserver's rules say (which
+may include part of the change). Without such a sync it says that what is
+shown may differ from what the homeserver holds, also when the list or the
+room panel is opened again, until one arrives. Saving a default updates the rooms that follow it
 without clearing the search or a room change still waiting for the homeserver.
 The list shows at most 100 matching rooms at a time and reads at most 2,000
 rooms, the first ones by name. Reopening the section, or showing another
@@ -118,8 +123,10 @@ account default removes only that room's own rules; every other rule, the
 account defaults and the keywords stay. One change runs at a time, for exactly
 the account and room shown when it was chosen. It is shown as saved only after
 the homeserver accepts it; a change it did not confirm is reported as possibly
-partly applied, never as undone or unchanged, the levels stay available, and
-the level is read again once sync brings the rules. A change sent before the panel closed
+partly or wholly applied, never as undone or unchanged, the levels stay
+available, and the level is called the homeserver's only after a sync observed
+after the change, as above. A focused control is scrolled fully into view by
+its real height, wrapped text included. A change sent before the panel closed
 still completes, and the Settings list, the bell and local delivery follow the
 accepted rule.
 

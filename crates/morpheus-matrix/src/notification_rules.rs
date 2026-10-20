@@ -16,6 +16,10 @@ use matrix_sdk::{
     notification_settings::{IsEncrypted, IsOneToOne, NotificationSettings, RoomNotificationMode},
     ruma::{RoomId, api::client::receipt::create_receipt::v3::ReceiptType},
 };
+use tokio::sync::broadcast::{
+    self,
+    error::{RecvError, TryRecvError},
+};
 
 use super::*;
 
@@ -24,6 +28,39 @@ const RULE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest wait for sync to bring the push rules again after a change the
 /// homeserver did not confirm.
 pub const PUSH_RULE_SYNC_WAIT: Duration = Duration::from_secs(60);
+
+/// A watch on one account's push rules as sync delivers them. It is opened
+/// before a change, so an update arriving while the change runs, or right
+/// after it, cannot be missed; `change_finished` then drops what arrived
+/// before the change finished, so only a sync observed after it counts as
+/// fresh. Nothing is sent.
+pub struct PushRuleSyncWatch {
+    // Its event handler feeds `changes` for as long as it lives.
+    _settings: NotificationSettings,
+    changes: broadcast::Receiver<()>,
+}
+
+impl PushRuleSyncWatch {
+    /// The change finished (whatever its result): earlier updates may
+    /// predate it and never count as fresh.
+    pub fn change_finished(&mut self) {
+        drain(&mut self.changes);
+    }
+}
+
+/// Drop every update already received.
+fn drain(changes: &mut broadcast::Receiver<()>) {
+    while matches!(changes.try_recv(), Ok(()) | Err(TryRecvError::Lagged(_))) {}
+}
+
+/// Whether sync delivers an update within `bound`. A timeout or a closed feed
+/// is not a fresh sync.
+async fn next_update(changes: &mut broadcast::Receiver<()>, bound: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(bound, changes.recv()).await,
+        Ok(Ok(()) | Err(RecvError::Lagged(_)))
+    )
+}
 /// Upper bound on rooms described by one listing.
 pub const MAX_NOTIFICATION_ROOMS: usize = 2_000;
 /// Matrix keyword rules Morpheus adds at most, and their length in characters.
@@ -258,31 +295,45 @@ impl AccountManager {
         .await
     }
 
-    /// Wait, at most `bound`, for sync to bring the selected account's push
-    /// rules again. After a change the homeserver did not confirm, part of
-    /// it may have reached it; the SDK's copy of the rules says so only once
-    /// sync delivers them, so a read after this shows what the homeserver
-    /// holds. Returns whether an update arrived; nothing is sent.
-    pub async fn wait_for_push_rules_sync_selected(
+    /// Open a watch on the selected account's push rules from sync. Open it
+    /// before a change and call `change_finished` right after the change.
+    pub async fn watch_push_rules_selected(
         &self,
         selection: &AccountSelection,
+    ) -> Result<PushRuleSyncWatch> {
+        let client = self.rule_client(selection).await?;
+        self.under_rule_selection(selection, async move {
+            let settings = client.notification_settings().await;
+            let changes = settings.subscribe_to_changes();
+            Ok(PushRuleSyncWatch {
+                _settings: settings,
+                changes,
+            })
+        })
+        .await
+    }
+
+    /// Wait, at most `bound`, for sync to bring the selected account's push
+    /// rules after the change `watch` was opened for. After a change the
+    /// homeserver did not confirm, part of it may have reached it, and this
+    /// device's copy of the rules says what the homeserver holds only once
+    /// such a sync arrived: `Ok(true)` means one did, `Ok(false)` that none
+    /// did within the bound, so nothing read afterwards may be called
+    /// current. Nothing is sent.
+    pub async fn fresh_push_rules_selected(
+        &self,
+        selection: &AccountSelection,
+        watch: &mut PushRuleSyncWatch,
         bound: Duration,
     ) -> Result<bool> {
-        let client = self.rule_client(selection).await?;
-        // Its event handler lives as long as `settings`.
-        let settings = client.notification_settings().await;
-        let mut changes = settings.subscribe_to_changes();
-        let waited = selection
-            .guard(tokio::time::timeout(bound, changes.recv()))
+        let fresh = selection
+            .guard(next_update(&mut watch.changes, bound))
             .await
             .ok_or(MatrixCoreError::SelectedAccountChanged)?;
         if !self.owns_rule_selection(selection) {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
-        Ok(matches!(
-            waited,
-            Ok(Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)))
-        ))
+        Ok(fresh)
     }
 
     /// The account's default levels for group rooms and two-person rooms.
@@ -572,6 +623,22 @@ mod tests {
         ] {
             assert!(!production.contains(claim), "{claim}");
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_sync_after_the_change_counts_as_fresh() {
+        let (send, mut changes) = broadcast::channel(4);
+        // An update that arrived while the change ran may predate it.
+        send.send(()).unwrap();
+        drain(&mut changes);
+        // No sync within the bound: not fresh, whatever is cached.
+        assert!(!next_update(&mut changes, Duration::from_millis(10)).await);
+        // A sync after the change is.
+        send.send(()).unwrap();
+        assert!(next_update(&mut changes, Duration::from_millis(10)).await);
+        // A closed feed is not a sync.
+        drop(send);
+        assert!(!next_update(&mut changes, Duration::from_millis(10)).await);
     }
 
     #[test]

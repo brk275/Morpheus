@@ -6429,6 +6429,32 @@ async fn assert_room_notification_panel(ui: &AppWindow) {
         focused.top >= panel.top && focused.bottom <= panel.bottom,
         "the last control is scrolled into the panel: {focused:?} in {panel:?}"
     );
+    // Every body control, the device switches with wrapped details included,
+    // is shown whole below the header when focus reaches it: the reveal uses
+    // each control's real laid-out height, not a guess.
+    global.set_previews_on(true);
+    global.set_highlights_set(true);
+    global.set_no_highlights(true);
+    settle(ui).await;
+    key(ui, Key::Tab);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Close room notifications"));
+    let header = item_bounds(&control_with_label(ui, "Close room notifications"));
+    let mut reached_last = false;
+    for step in 0..16 {
+        key(ui, Key::Tab);
+        settle(ui).await;
+        let focused = focused_control_bounds(ui).expect("a focused panel control");
+        assert!(
+            focused.top >= header.bottom - 0.5 && focused.bottom <= panel.bottom + 0.5,
+            "body control {step} is shown whole: {focused:?} below {header:?} in {panel:?}"
+        );
+        if focused_control_has_label(ui, "Open notification settings for every room") {
+            reached_last = true;
+            break;
+        }
+    }
+    assert!(reached_last, "Tab reached every body control");
     key(ui, Key::Escape);
     settle(ui).await;
     ui.set_font_scale_percent(100);

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, atomic::Ordering};
 use morpheus_config::{Config, ConfigStore, MAX_ROOM_NOTIFICATION_OVERRIDES, RoomNotificationLocal};
 use morpheus_matrix::{
     AccountSelection, MatrixCoreError, NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT,
-    RoomNotificationRule,
+    PushRuleSyncWatch, RoomNotificationRule,
 };
 use slint::{ComponentHandle, Weak};
 use tokio::runtime::Handle;
@@ -32,11 +32,24 @@ const MAX_NAME_CHARS: usize = 80;
 
 const READ_FAILED: &str = "This room's level could not be read. Read it again, or try later.";
 const NOT_JOINED: &str = "This room is no longer joined on this account.";
-// A change the homeserver did not confirm may have reached it in part; the
-// panel says so, keeps its levels available and reads them again once sync
-// brings the homeserver's rules.
-const NOT_CONFIRMED: &str = "The homeserver did not confirm the whole change; part of it may have reached it. The level shown updates when sync brings its rules.";
-const SYNCED: &str = "Read again: the level shown is the one sync brought most recently.";
+// A change the homeserver did not confirm may have reached it in part or in
+// full; the panel says so and keeps its levels available. The level shown is
+// this device's copy until a sync observed after the change brings the
+// homeserver's rules; only then is it called what they say.
+const NOT_CONFIRMED: &str = "The homeserver did not confirm the whole change; part or all of it may have reached it. The level shown is this device's copy until a sync brings its rules.";
+const SYNCED: &str = "Sync brought the homeserver's rules after the unconfirmed change; the level shown is what they say, which may include part of that change.";
+const NOT_SYNCED: &str = "No sync has brought the homeserver's rules since the unconfirmed change; the level shown may differ from what it holds.";
+
+/// What the panel may say once the wait after an unconfirmed change ended,
+/// and whether the change stays unconfirmed: only an observed fresh sync
+/// ends it.
+fn after_wait(fresh: bool) -> (&'static str, bool) {
+    if fresh {
+        (SYNCED, false)
+    } else {
+        (NOT_SYNCED, true)
+    }
+}
 const LOCAL_FULL: &str =
     "Up to 256 rooms per account can have their own device settings; clear another room first.";
 const LOCAL_FAILED: &str =
@@ -119,9 +132,23 @@ struct State {
     /// finished. It outlives a close, so a reopened panel never sends a
     /// second change over it.
     in_flight: Option<(String, String)>,
+    /// The account and room of a change the homeserver did not confirm, with
+    /// no sync observed since. It outlives a close, so a reopened panel never
+    /// calls this device's copy the homeserver's rules.
+    unconfirmed: Option<(String, String)>,
     /// Bumped for every room the header shows; a bell read is used only
     /// while its number is current.
     header: u64,
+}
+
+impl State {
+    /// Whether `room_id` of `account_id` has an unconfirmed change with no
+    /// sync observed since.
+    fn unconfirmed_here(&self, account_id: &str, room_id: &str) -> bool {
+        self.unconfirmed
+            .as_ref()
+            .is_some_and(|(account, room)| account == account_id && room == room_id)
+    }
 }
 
 pub(super) struct RoomPanel {
@@ -289,7 +316,7 @@ impl RoomPanel {
     }
 
     fn apply_read(
-        &self,
+        self: &Arc<Self>,
         ui: &AppWindow,
         operation: u64,
         selection: &AccountSelection,
@@ -313,7 +340,14 @@ impl RoomPanel {
                     global.set_default_level(level(default));
                 }
                 header_rule(ui, selection.account_id(), &rule);
+                let unconfirmed =
+                    self.state().unconfirmed_here(selection.account_id(), &rule.room_id);
                 self.show_rule(&global, rule);
+                if unconfirmed {
+                    // What was just read is this device's copy, not confirmed.
+                    global.set_notice(NOT_SYNCED.into());
+                    self.await_fresh(operation, selection.clone(), None);
+                }
             }
             Err(MatrixCoreError::RoomNotFound(_)) => global.set_error(NOT_JOINED.into()),
             Err(_) => global.set_error(READ_FAILED.into()),
@@ -360,11 +394,16 @@ impl RoomPanel {
         global.set_notice("".into());
         let panel = self.clone();
         self.runtime.spawn(async move {
-            let result = panel
-                .live
-                .manager
+            let manager = panel.live.manager.clone();
+            // Opened before the change, so a sync during or right after it is
+            // not missed.
+            let mut watch = manager.watch_push_rules_selected(&selection).await.ok();
+            let result = manager
                 .set_room_notification_mode_selected(&selection, &room_id, mode)
                 .await;
+            if let Some(watch) = &mut watch {
+                watch.change_finished();
+            }
             // Delivery follows an accepted rule even if the panel has closed.
             if let Ok(rule) = &result
                 && selection.is_current()
@@ -377,7 +416,7 @@ impl RoomPanel {
             }
             let weak = panel.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                panel.finish_choice(&ui, operation, &selection, result);
+                panel.finish_choice(&ui, operation, &selection, &room_id, result, watch);
             });
         });
     }
@@ -387,9 +426,26 @@ impl RoomPanel {
         ui: &AppWindow,
         operation: u64,
         selection: &AccountSelection,
+        room_id: &str,
         result: Result<RoomNotificationRule, MatrixCoreError>,
+        watch: Option<PushRuleSyncWatch>,
     ) {
-        self.state().in_flight = None;
+        {
+            let mut state = self.state();
+            state.in_flight = None;
+            match &result {
+                // A confirmed change settles this room's rules.
+                Ok(_) if state.unconfirmed_here(selection.account_id(), room_id) => {
+                    state.unconfirmed = None;
+                }
+                Ok(_) | Err(MatrixCoreError::RoomNotFound(_)) => {}
+                // The room the change was sent for, wherever the panel is now.
+                Err(_) => {
+                    state.unconfirmed =
+                        Some((selection.account_id().to_owned(), room_id.to_owned()));
+                }
+            }
+        }
         if let Ok(rule) = &result
             && selection.is_current()
         {
@@ -429,34 +485,72 @@ impl RoomPanel {
             Err(MatrixCoreError::RoomNotFound(_)) => global.set_error(NOT_JOINED.into()),
             Err(_) => {
                 global.set_error(NOT_CONFIRMED.into());
-                self.resync(operation, selection.clone());
+                self.await_fresh(operation, selection.clone(), watch);
             }
         }
     }
 
-    /// After a change the homeserver did not confirm, wait (bounded) for
-    /// sync to bring its rules, then read the room's level again for the same
-    /// opening, so the panel shows what the homeserver holds. Nothing is sent.
-    fn resync(self: &Arc<Self>, operation: u64, selection: AccountSelection) {
+    /// After a change the homeserver did not confirm, wait (bounded) for a
+    /// sync observed after it, with `watch` opened before the change (or,
+    /// without one, from now on). Only then is the level read again and
+    /// called what the homeserver's rules say; a timeout keeps the change
+    /// unconfirmed and says so. Nothing is sent.
+    fn await_fresh(
+        self: &Arc<Self>,
+        operation: u64,
+        selection: AccountSelection,
+        watch: Option<PushRuleSyncWatch>,
+    ) {
         let panel = self.clone();
         self.runtime.spawn(async move {
-            let synced = panel
-                .live
-                .manager
-                .wait_for_push_rules_sync_selected(&selection, PUSH_RULE_SYNC_WAIT)
-                .await;
-            if synced.is_err() {
+            let manager = panel.live.manager.clone();
+            let watch = match watch {
+                Some(watch) => Ok(watch),
+                None => manager.watch_push_rules_selected(&selection).await,
+            };
+            let Ok(mut watch) = watch else {
                 return;
-            }
+            };
+            let Ok(fresh) = manager
+                .fresh_push_rules_selected(&selection, &mut watch, PUSH_RULE_SYNC_WAIT)
+                .await
+            else {
+                return;
+            };
             let weak = panel.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                if panel.owns(&ui, operation, &selection) {
-                    let room_id = panel.state().room_id.clone();
-                    panel.read(&ui, operation, selection, room_id);
-                    ui.global::<RoomNotificationState>().set_notice(SYNCED.into());
-                }
+                panel.finish_wait(&ui, operation, selection, fresh);
             });
         });
+    }
+
+    fn finish_wait(
+        self: &Arc<Self>,
+        ui: &AppWindow,
+        operation: u64,
+        selection: AccountSelection,
+        fresh: bool,
+    ) {
+        if !self.owns(ui, operation, &selection) {
+            return;
+        }
+        let global = ui.global::<RoomNotificationState>();
+        let (text, unconfirmed) = after_wait(fresh);
+        if unconfirmed {
+            global.set_error(text.into());
+            return;
+        }
+        let room_id = {
+            let mut state = self.state();
+            let room_id = state.room_id.clone();
+            if state.unconfirmed_here(selection.account_id(), &room_id) {
+                state.unconfirmed = None;
+            }
+            room_id
+        };
+        // The level sync brought is what the homeserver's rules say now.
+        self.read(ui, operation, selection, room_id);
+        global.set_notice(text.into());
     }
 
     /// Save one device switch for the room shown, through the same
@@ -676,8 +770,30 @@ mod tests {
     }
 
     #[test]
+    fn a_timeout_never_calls_this_devices_copy_the_homeservers_rules() {
+        let (text, unconfirmed) = after_wait(false);
+        assert!(unconfirmed, "a timeout keeps the change unconfirmed");
+        assert_eq!(text, NOT_SYNCED);
+        assert!(text.contains("may differ") && !text.contains("what they say"));
+        // Only an observed fresh sync makes the level the homeserver's, and
+        // the change itself may still have landed in part.
+        let (text, unconfirmed) = after_wait(true);
+        assert!(!unconfirmed);
+        assert!(text.contains("what they say") && text.contains("may include part"));
+        assert!(NOT_CONFIRMED.contains("part or all of it may have reached it"));
+    }
+
+    #[test]
     fn failure_wording_is_fixed_and_never_claims_an_undo() {
-        for message in [READ_FAILED, NOT_JOINED, NOT_CONFIRMED, SYNCED, LOCAL_FULL, LOCAL_FAILED] {
+        for message in [
+            READ_FAILED,
+            NOT_JOINED,
+            NOT_CONFIRMED,
+            SYNCED,
+            NOT_SYNCED,
+            LOCAL_FULL,
+            LOCAL_FAILED,
+        ] {
             let lower = message.to_lowercase();
             let claims = ["undone", "reverted", "rolled back", "cancelled", "unchanged", "keeps"];
             for claim in claims {

@@ -93,6 +93,9 @@ component RuleAction inherits Rectangle {
     callback activated();
     // Focus arrived, at this absolute y; the page scrolls it into view.
     callback focused-at(length);
+    // The same, with the control's laid-out height (wrapped text included),
+    // for a scroller that must show the whole control.
+    callback focused-span(length, length);
     forward-focus: keyboard-focus;
     accessible-role: button;
     accessible-label: root.label;
@@ -114,6 +117,7 @@ component RuleAction inherits Rectangle {
         enabled: root.enabled;
         focus-gained(reason) => {
             root.focused-at(root.absolute-position.y);
+            root.focused-span(root.absolute-position.y, root.height);
         }
         key-pressed(event) => {
             if event.text == Key.Space || event.text == Key.Return {
@@ -1010,13 +1014,18 @@ export component RoomNotificationPanel inherits Rectangle {
     public function focus-last() {
         settings-action.focus();
     }
-    // Scroll the body so a control that took focus at absolute `top` is in
-    // view; one already in view stays where it is.
-    function reveal(top: length) {
-        let shown-top = scroller.absolute-position.y;
-        let control = max(48px, 40px * root.text-scale);
-        if top < shown-top || top + control > shown-top + scroller.height {
-            scroller.viewport-y = -max(0px, min(top - body.absolute-position.y - 8px, scroller.viewport-height - scroller.height));
+    // Scroll the body so a control that took focus, at absolute `top` with
+    // its real laid-out `extent` (wrapped text included), is wholly in view.
+    // One already wholly in view stays where it is; one taller than the body
+    // shows from its top.
+    function reveal(top: length, extent: length) {
+        let offset = top - body.absolute-position.y;
+        let shown = -scroller.viewport-y;
+        let last = scroller.viewport-height - scroller.height;
+        if offset < shown || extent > scroller.height {
+            scroller.viewport-y = -max(0px, min(offset, last));
+        } else if offset + extent > shown + scroller.height {
+            scroller.viewport-y = -max(0px, min(offset + extent - scroller.height, last));
         }
     }
     pure function level-name(level: int) -> string {
@@ -1113,8 +1122,8 @@ export component RoomNotificationPanel inherits Rectangle {
                     text-scale: root.text-scale;
                     text: "Read again";
                     label: "Read this room's notification level again";
-                    focused-at(offset) => {
-                        root.reveal(offset);
+                    focused-span(at, extent) => {
+                        root.reveal(at, extent);
                     }
                     selected: false;
                     checkable: false;
@@ -1127,8 +1136,8 @@ export component RoomNotificationPanel inherits Rectangle {
                     text-scale: root.text-scale;
                     text: "Account default" + (RoomNotificationState.default-level == 0 ? "" : " (" + root.level-name(RoomNotificationState.default-level) + ")");
                     label: "Follow the account's default level for " + (RoomNotificationState.direct ? "direct messages" : "rooms");
-                    focused-at(offset) => {
-                        root.reveal(offset);
+                    focused-span(at, extent) => {
+                        root.reveal(at, extent);
                     }
                     selected: RoomNotificationState.effective != 0 && RoomNotificationState.mode == 0;
                     enabled: root.choosable;
@@ -1142,8 +1151,8 @@ export component RoomNotificationPanel inherits Rectangle {
                     text-scale: root.text-scale;
                     text: root.level-name(level);
                     label: root.level-name(level) + " in this room";
-                    focused-at(offset) => {
-                        root.reveal(offset);
+                    focused-span(at, extent) => {
+                        root.reveal(at, extent);
                     }
                     selected: RoomNotificationState.effective != 0 && RoomNotificationState.mode == level;
                     enabled: root.choosable;
@@ -1180,8 +1189,8 @@ export component RoomNotificationPanel inherits Rectangle {
                     title: "Sound";
                     detail: !RoomNotificationState.sounds-on ? "Sounds are off for every room" : RoomNotificationState.quiet ? "Silent for this room" : "Plays as for other rooms";
                     label: "Play a sound for this room's notifications";
-                    focused-at(offset) => {
-                        root.reveal(offset);
+                    focused-span(at, extent) => {
+                        root.reveal(at, extent);
                     }
                     checked: RoomNotificationState.sounds-on && !RoomNotificationState.quiet;
                     enabled: root.live && RoomNotificationState.sounds-on;
@@ -1195,8 +1204,8 @@ export component RoomNotificationPanel inherits Rectangle {
                     title: "Message preview";
                     detail: !RoomNotificationState.previews-on ? "Previews are off for every room" : RoomNotificationState.hide-preview ? "Never shown for this room" : "Shown as for other rooms";
                     label: "Show message text in this room's notifications";
-                    focused-at(offset) => {
-                        root.reveal(offset);
+                    focused-span(at, extent) => {
+                        root.reveal(at, extent);
                     }
                     checked: RoomNotificationState.previews-on && !RoomNotificationState.hide-preview;
                     enabled: root.live && RoomNotificationState.previews-on;
@@ -1210,8 +1219,8 @@ export component RoomNotificationPanel inherits Rectangle {
                     title: "Highlight words";
                     detail: !RoomNotificationState.highlights-set ? "No highlight words are set" : RoomNotificationState.no-highlights ? "Not marked in this room; mentions and keywords still are" : "Marked as in other rooms";
                     label: "Mark this room's notifications that contain your highlight words";
-                    focused-at(offset) => {
-                        root.reveal(offset);
+                    focused-span(at, extent) => {
+                        root.reveal(at, extent);
                     }
                     checked: RoomNotificationState.highlights-set && !RoomNotificationState.no-highlights;
                     enabled: root.live && RoomNotificationState.highlights-set;
@@ -1228,8 +1237,8 @@ export component RoomNotificationPanel inherits Rectangle {
                 }
                 settings-action := RuleAction {
                     label: "Open notification settings for every room";
-                    focused-at(offset) => {
-                        root.reveal(offset);
+                    focused-span(at, extent) => {
+                        root.reveal(at, extent);
                     }
                     focus-color: root.palette.focus;
                     height: max(28px, 22px * root.text-scale);

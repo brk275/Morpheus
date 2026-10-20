@@ -16,7 +16,8 @@ use std::{
 use morpheus_config::{AccountOverrides, Config, ConfigStore};
 use morpheus_matrix::{
     AccountSelection, MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_KEYWORDS, MatrixCoreError,
-    NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT, RoomNotificationRule,
+    NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT, PushRuleSyncWatch,
+    RoomNotificationRule,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
 use tokio::runtime::Handle;
@@ -29,14 +30,29 @@ use crate::{
 /// Rows listed at once; a search narrows the rest.
 const MAX_LISTED: usize = 100;
 
-// A change the homeserver did not confirm may have reached it in part (a
-// default level is two rules, for encrypted and unencrypted rooms), so none
-// of these says it is unchanged. The list is read again once sync brings the
-// homeserver's rules, and the controls stay available.
-const ROOM_UNCONFIRMED: &str = "The homeserver did not confirm the whole change; part of it may have reached it. The level shown updates when sync brings its rules.";
-const DEFAULT_UNCONFIRMED: &str = "The homeserver did not confirm the whole default level; part of it may have reached it. The levels shown update when sync brings its rules.";
-const KEYWORD_ADD_UNCONFIRMED: &str = "The homeserver did not confirm the keyword; it may still have been added and shows here once sync brings it.";
-const KEYWORD_REMOVE_UNCONFIRMED: &str = "The homeserver did not confirm removing the keyword; it may still have been removed and goes from here once sync brings it.";
+// A change the homeserver did not confirm may have reached it in part or in
+// full (a default level is two rules, for encrypted and unencrypted rooms, and
+// both can land), so none of these says it is unchanged. What is shown is
+// this device's copy until a sync observed after the change brings the
+// homeserver's rules; the controls stay available.
+const ROOM_UNCONFIRMED: &str = "The homeserver did not confirm the whole change; part or all of it may have reached it. Levels shown are this device's copy until a sync brings its rules.";
+const DEFAULT_UNCONFIRMED: &str = "The homeserver did not confirm the whole default level; part or all of it may have reached it. Levels shown are this device's copy until a sync brings its rules.";
+const KEYWORD_ADD_UNCONFIRMED: &str = "The homeserver did not confirm the keyword; it may still have been added. Keywords shown are this device's copy until a sync brings its rules.";
+const KEYWORD_REMOVE_UNCONFIRMED: &str = "The homeserver did not confirm removing the keyword; it may still have been removed. Keywords shown are this device's copy until a sync brings its rules.";
+// After waiting for that sync: only one actually observed makes what is shown
+// the homeserver's rules, and even then the change may have landed in part.
+const SYNCED: &str = "Sync brought the homeserver's rules after the unconfirmed change; what is shown is what they say, which may include part of that change.";
+const NOT_SYNCED: &str = "No sync has brought the homeserver's rules since an unconfirmed change; levels and keywords shown may differ from what it holds.";
+
+/// What may be said once the wait after an unconfirmed change ended, and
+/// whether the change stays unconfirmed: only an observed fresh sync ends it.
+fn after_wait(fresh: bool) -> (&'static str, bool) {
+    if fresh {
+        (SYNCED, false)
+    } else {
+        (NOT_SYNCED, true)
+    }
+}
 const MAX_QUERY_CHARS: usize = 128;
 const MAX_NAME_CHARS: usize = 80;
 
@@ -99,6 +115,10 @@ struct State {
     loaded: bool,
     /// The account's Matrix keywords exactly as stored in its push rules.
     keywords: Vec<String>,
+    /// An account with a change the homeserver did not confirm and no sync
+    /// observed since. It outlives a refresh, so a reopened list never
+    /// presents this device's copy as the homeserver's rules.
+    unconfirmed: Option<String>,
 }
 
 pub(super) struct Rules {
@@ -267,7 +287,7 @@ impl Rules {
     }
 
     fn apply_loaded(
-        &self,
+        self: &Arc<Self>,
         ui: &AppWindow,
         operation: u64,
         selection: &AccountSelection,
@@ -308,6 +328,13 @@ impl Rules {
             }
         }
         publish(&global, &state);
+        let unconfirmed = state.unconfirmed.as_deref() == Some(selection.account_id());
+        drop(state);
+        if unconfirmed {
+            // What was just read is this device's copy, not yet confirmed.
+            global.set_notice(NOT_SYNCED.into());
+            self.await_fresh(operation, selection.clone(), None);
+        }
     }
 
     fn search(&self, query: &str) {
@@ -362,11 +389,16 @@ impl Rules {
         let rules = self.clone();
         let room_id = room_id.to_owned();
         self.runtime.spawn(async move {
-            let result = rules
-                .live
-                .manager
+            let manager = rules.live.manager.clone();
+            // Opened before the change, so a sync during or right after it is
+            // not missed.
+            let mut watch = manager.watch_push_rules_selected(&selection).await.ok();
+            let result = manager
                 .set_room_notification_mode_selected(&selection, &room_id, mode)
                 .await;
+            if let Some(watch) = &mut watch {
+                watch.change_finished();
+            }
             // Delivery follows an accepted rule even if this view has moved on.
             if let Ok(rule) = &result
                 && selection.is_current()
@@ -379,7 +411,7 @@ impl Rules {
             }
             let weak = rules.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                rules.finish_room_mode(&ui, operation, &selection, &room_id, result);
+                rules.finish_room_mode(&ui, operation, &selection, &room_id, result, watch);
             });
         });
     }
@@ -391,6 +423,7 @@ impl Rules {
         selection: &AccountSelection,
         room_id: &str,
         result: Result<RoomNotificationRule, MatrixCoreError>,
+        watch: Option<PushRuleSyncWatch>,
     ) {
         if let Ok(rule) = &result
             && selection.is_current()
@@ -419,8 +452,9 @@ impl Rules {
             Err(_) => {
                 global.set_error(ROOM_UNCONFIRMED.into());
                 update_row(&global, row);
+                state.unconfirmed = Some(selection.account_id().to_owned());
                 drop(state);
-                self.resync(operation, selection.clone());
+                self.await_fresh(operation, selection.clone(), watch);
                 return;
             }
         }
@@ -487,11 +521,14 @@ impl Rules {
         global.set_notice("".into());
         let rules = self.clone();
         self.runtime.spawn(async move {
-            let result = rules
-                .live
-                .manager
+            let manager = rules.live.manager.clone();
+            let mut watch = manager.watch_push_rules_selected(&selection).await.ok();
+            let result = manager
                 .set_notification_default_selected(&selection, direct, mode)
                 .await;
+            if let Some(watch) = &mut watch {
+                watch.change_finished();
+            }
             let weak = rules.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 if !rules.owns(&ui, operation, &selection) {
@@ -508,7 +545,8 @@ impl Rules {
                     }
                     Err(_) => {
                         global.set_error(DEFAULT_UNCONFIRMED.into());
-                        rules.resync(operation, selection.clone());
+                        rules.state().unconfirmed = Some(selection.account_id().to_owned());
+                        rules.await_fresh(operation, selection.clone(), watch);
                     }
                 }
             });
@@ -551,21 +589,64 @@ impl Rules {
 }
 
 impl Rules {
-    /// After a change the homeserver did not confirm, wait (bounded) for sync
-    /// to bring its rules, then read the levels, defaults and keywords again
-    /// for the same view, so what is shown is what the homeserver holds
-    /// rather than this device's copy. Nothing is sent.
-    fn resync(self: &Arc<Self>, operation: u64, selection: AccountSelection) {
+    /// After a change the homeserver did not confirm, wait (bounded) for a
+    /// sync observed after it, with `watch` opened before the change (or,
+    /// without one, from now on). Only then are the levels, defaults and
+    /// keywords read again and called the homeserver's rules; a timeout keeps
+    /// the change unconfirmed and says so. Nothing is sent.
+    fn await_fresh(
+        self: &Arc<Self>,
+        operation: u64,
+        selection: AccountSelection,
+        watch: Option<PushRuleSyncWatch>,
+    ) {
         let rules = self.clone();
         self.runtime.spawn(async move {
             let manager = rules.live.manager.clone();
-            if manager
-                .wait_for_push_rules_sync_selected(&selection, PUSH_RULE_SYNC_WAIT)
-                .await
-                .is_err()
-            {
+            let watch = match watch {
+                Some(watch) => Ok(watch),
+                None => manager.watch_push_rules_selected(&selection).await,
+            };
+            let Ok(mut watch) = watch else {
                 return;
-            }
+            };
+            let Ok(fresh) = manager
+                .fresh_push_rules_selected(&selection, &mut watch, PUSH_RULE_SYNC_WAIT)
+                .await
+            else {
+                return;
+            };
+            let weak = rules.ui.clone();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if !rules.owns(&ui, operation, &selection) {
+                    return;
+                }
+                let global = ui.global::<NotificationRulesState>();
+                let (text, unconfirmed) = after_wait(fresh);
+                if unconfirmed {
+                    global.set_error(text.into());
+                    return;
+                }
+                {
+                    let mut state = rules.state();
+                    if state.unconfirmed.as_deref() == Some(selection.account_id()) {
+                        state.unconfirmed = None;
+                    }
+                }
+                global.set_error("".into());
+                global.set_keyword_error("".into());
+                global.set_notice(text.into());
+                rules.reload_all(operation, selection);
+            });
+        });
+    }
+
+    /// Read the levels, defaults and keywords again for the same view,
+    /// keeping its search and any room change still waiting.
+    fn reload_all(self: &Arc<Self>, operation: u64, selection: AccountSelection) {
+        let rules = self.clone();
+        self.runtime.spawn(async move {
+            let manager = rules.live.manager.clone();
             let (defaults, keywords) = tokio::join!(
                 manager.notification_defaults_selected(&selection),
                 manager.notification_keywords_selected(&selection),
@@ -706,6 +787,7 @@ impl Rules {
         let rules = self.clone();
         self.runtime.spawn(async move {
             let manager = rules.live.manager.clone();
+            let mut watch = manager.watch_push_rules_selected(&selection).await.ok();
             let result = if add {
                 manager
                     .add_notification_keyword_selected(&selection, &keyword)
@@ -715,6 +797,9 @@ impl Rules {
                     .remove_notification_keyword_selected(&selection, &keyword)
                     .await
             };
+            if let Some(watch) = &mut watch {
+                watch.change_finished();
+            }
             let weak = rules.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 if !rules.owns(&ui, operation, &selection) {
@@ -745,7 +830,8 @@ impl Rules {
                             }
                             .into(),
                         );
-                        rules.resync(operation, selection.clone());
+                        rules.state().unconfirmed = Some(selection.account_id().to_owned());
+                        rules.await_fresh(operation, selection.clone(), watch);
                     }
                 }
             });
@@ -869,8 +955,22 @@ mod tests {
             }
             assert!(lower.contains("may") && lower.contains("sync"), "{text}");
         }
-        // The default level is two rules; its wording names a partial result.
-        assert!(DEFAULT_UNCONFIRMED.contains("part of it may have reached it"));
+        // The default level is two rules, and both can land.
+        assert!(DEFAULT_UNCONFIRMED.contains("part or all of it may have reached it"));
+    }
+
+    #[test]
+    fn only_an_observed_fresh_sync_ends_an_unconfirmed_change() {
+        // A timeout keeps it unconfirmed and never calls the copy current.
+        let (text, unconfirmed) = after_wait(false);
+        assert!(unconfirmed);
+        assert_eq!(text, NOT_SYNCED);
+        assert!(text.contains("may differ") && !text.contains("what they say"));
+        // A sync observed after the change does, and still keeps the doubt
+        // about the change itself.
+        let (text, unconfirmed) = after_wait(true);
+        assert!(!unconfirmed);
+        assert!(text.contains("may include part of that change"));
     }
 
     #[test]
