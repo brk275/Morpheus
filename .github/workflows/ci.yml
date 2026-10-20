@@ -1,12 +1,12 @@
 # TEMPORARY owner-reviewed layout contracts. NEVER MERGE this workflow.
 name: Reviewed native compile diagnosis
-run-name: Reviewed native compile diagnosis - 027a2b4
+run-name: Reviewed native compile diagnosis - 1fd8704
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: compile-diagnosis-027a2b4-${{ github.ref }}
+  group: compile-diagnosis-1fd8704-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 027a2b4e05b4e3c1836baba502517270355a12fd
+          ref: 1fd8704b59a42fe1dd12ba07c4666776e49ab431
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='027a2b4e05b4e3c1836baba502517270355a12fd'
+          source='1fd8704b59a42fe1dd12ba07c4666776e49ab431'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
@@ -298,6 +298,7 @@ jobs:
                   'installed_app':False,'packages_uploaded':False}
               # Interleaved CLI stdout does not guarantee each name and ok share a line.
               # Account for every unique prefix and exact failure/ignore sets instead.
+              failures=set()
               if required is not None:
                   names=re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\.',output,re.MULTILINE)
                   seen=set(names)
