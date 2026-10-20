@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed beta catch-up - 30795fa - ${{ inputs.platform }}
+run-name: Reviewed beta catch-up - 5161a86 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-30795fa-${{ github.ref }}
+  group: beta-native-5161a86-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -31,7 +31,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 30795fa40274ade20525fda2ee7d16079b3fa71c
+          ref: 5161a8655fcdd34610db0d9c76fb0f766088bc72
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -44,7 +44,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = 30795fa40274ade20525fda2ee7d16079b3fa71c
+          test "$(git -C candidate rev-parse HEAD)" = 5161a8655fcdd34610db0d9c76fb0f766088bc72
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -78,7 +78,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 30795fa40274ade20525fda2ee7d16079b3fa71c
+          ref: 5161a8655fcdd34610db0d9c76fb0f766088bc72
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -317,7 +317,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='30795fa40274ade20525fda2ee7d16079b3fa71c'
+          source='5161a8655fcdd34610db0d9c76fb0f766088bc72'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -658,7 +658,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='30795fa40274ade20525fda2ee7d16079b3fa71c'
+          source='5161a8655fcdd34610db0d9c76fb0f766088bc72'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -905,6 +905,23 @@ jobs:
               'room_addresses::tests::retained_receipts_never_settle_unknown_from_reads_or_resurrect_after_removal',
               'room_addresses::tests::accepted_receipt_needs_later_fresh_read_and_saturation_never_evicts',
               'room_addresses::tests::dropping_the_actual_completion_owner_keeps_the_existing_receipt_unknown',
+          })
+          # Require changed security-boundary regressions from this reviewed batch.
+          # The existing whole suites still run; no accepted assertion is removed.
+          needed_app.update({
+              'calls::tests::final_cleanup_reasserts_clear_after_late_old_call_update',
+              'calls::tests::a_held_call_slot_bounds_a_route_switch_and_never_queues_it_late',
+              'room_permissions::tests::completed_account_cleanup_cannot_let_an_old_save_complete_a_new_one',
+              'room_settings::room_access_settings::tests::a_read_never_settles_an_unanswered_change_and_no_second_change_is_sent',
+              'room_settings::room_access_settings::tests::the_production_book_is_forgotten_only_at_account_removal',
+              'matrix_links::tests::a_joined_message_opens_only_under_the_join_s_own_receipt',
+          })
+          needed_matrix.update({
+              'room_settings::room_permissions::tests::a_changed_baseline_or_fresh_authority_or_closed_gate_sends_nothing',
+              'room_settings::room_permissions::tests::a_write_handed_over_then_stopped_or_refused_is_reported_as_it_is_and_never_resent',
+              'room_settings::room_access_settings::tests::closing_withdraws_a_change_only_until_its_request_is_handed_over',
+              'room_settings::room_access_settings::tests::the_access_reads_opt_out_of_authentication_refresh',
+              'matrix_links::tests::an_alias_resolves_once_to_a_typed_room_and_ignores_its_servers',
           })
           needed_rtc={
               'tests::build_capability_matches_feature','tests::device_capability_matches_features',
