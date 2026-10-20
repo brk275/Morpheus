@@ -30,7 +30,8 @@ It never switches, logs out or removes an account. Ordinary edits use the sessio
 - **Choose image...** previews the image locally. It isn't public until you Save.
 - **Remove avatar** stages a removal, and **Keep current** drops the avatar change.
 - **Save to public profile** sends each changed field as its own request. Each request is sent exactly once (SDK retries off), and then the profile is read back:
-  - A field counts as saved only when the read-back shows exactly the change.
+  - A field counts as saved only when the read-back shows exactly the change. The name is compared on the exact value the server returned (within the name bound), never on the shortened, normalized copy shown on screen, so a cut-off prefix or changed spacing is not reported as saved. A removed name counts as removed when the server returns none or an empty one.
+  - Profile reads and writes are single attempts, authenticated, and capped at a 64 KiB response; a larger response is refused with a fixed message.
   - If a send fails, or the editor closes while it is in flight, the outcome is *unknown*. The editor reads the profile back once, says what the server shows, and never resends on its own.
   - Each outcome is reported separately, followed by what the server shows. For example: "Display name saved. Avatar not confirmed; the server may or may not have it. The server now shows the name "..." and no avatar. Save again to retry only what still differs."
   - The chosen image is kept after a failed upload, so a retry doesn't need the file chosen again.
@@ -42,6 +43,10 @@ It never switches, logs out or removes an account. Ordinary edits use the sessio
   - the pinned PNG or baseline-JPEG decoder, at most 4096 px per side and 4 megapixels;
   - a stripped PNG of at most 512 px, uploaded with no retries.
 - There is no URL fetching, SVG, clipboard or folder scanning.
+
+## Keyboard and layout
+
+The editor's content scrolls inside a dialog bounded by the window, with Refresh, Close and Save fixed below it, so every control stays reachable in the smallest window at large text sizes. Tab and Shift+Tab move between the editor's own controls only, wrapping from the last enabled control to the first and back. Escape closes an open confirmation first, then the editor.
 
 ## Account switcher
 
