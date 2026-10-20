@@ -46,13 +46,21 @@ pub(crate) fn apply_theme_mode(ui: &AppWindow) {
     // Every account switch or detach publishes here, so a style profile
     // preview started for another account is cancelled first.
     crate::style_profiles::check_account(ui);
+    // Drafted account colors never carry over to another account.
+    crate::theme_studio::check_account(ui);
     let account = ui.get_active_account_local_id();
+    // The open room's own appearance draws over its account's (global ->
+    // account -> room). Every room change re-projects here.
+    let room = ui.get_active_room_id();
     let source = THEME_SOURCE
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    let projection =
-        theme_projection_for(source.as_ref().map(|(config, _)| config), account.as_str());
+    let projection = theme_projection_in(
+        source.as_ref().map(|(config, _)| config),
+        account.as_str(),
+        room.as_str(),
+    );
     ui.set_theme_mode(theme_mode_index(projection.effective));
     ui.set_global_theme_mode(theme_mode_index(projection.global));
     ui.set_account_theme_notice(projection.notice.into());
@@ -66,20 +74,41 @@ pub(crate) fn apply_theme_mode(ui: &AppWindow) {
     let (config, theme) = source.as_ref().unwrap_or(&default);
     apply_theme(ui, config, theme.as_ref());
     crate::appearance_editor::refresh(ui);
+    crate::theme_studio::font_browser_refresh(ui);
     crate::sender_palette_editor::refresh(ui);
 }
 
-/// The configuration as the active account sees its colors.
-fn account_view<'a>(config: &'a Config, account_id: &str) -> std::borrow::Cow<'a, Config> {
+/// Re-project the look whenever the open room changes, so a room's own
+/// appearance shows only while that room is open and never in another room
+/// or account. Scopes observe the room here too (see `theme_studio::scope`).
+pub(crate) fn register_room_hook(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    ui.on_appearance_room_changed(move || {
+        if let Some(ui) = weak.upgrade() {
+            apply_theme_mode(&ui);
+        }
+    });
+}
+
+/// The configuration as the active account sees its colors in the open
+/// room: global, then the account's, then the room's.
+fn account_view<'a>(
+    config: &'a Config,
+    account_id: &str,
+    room_id: &str,
+) -> std::borrow::Cow<'a, Config> {
     let has_colors = config
         .account_overrides
         .get(account_id)
         .is_some_and(|overrides| !overrides.colors.is_empty());
-    if account_id.is_empty() || !has_colors {
+    let room_colors = config
+        .room_appearance(Some(account_id), Some(room_id))
+        .is_some_and(|room| !room.colors.is_empty());
+    if account_id.is_empty() || !(has_colors || room_colors) {
         return std::borrow::Cow::Borrowed(config);
     }
     let mut view = config.clone();
-    view.colors = config.colors_for(Some(account_id));
+    view.colors = config.colors_for_room(Some(account_id), Some(room_id));
     std::borrow::Cow::Owned(view)
 }
 
@@ -109,6 +138,10 @@ struct MetricProjection {
     avatar_roundness: i32,
     popup_fade_ms: i32,
     panel_fade_ms: i32,
+    /// Multiplies each font's natural line height; 1 keeps it.
+    line_height_factor: f32,
+    /// A font weight, or 0 to keep each surface's own weight.
+    body_font_weight: i32,
 }
 
 fn metric_projection(config: &Config) -> MetricProjection {
@@ -136,6 +169,10 @@ fn metric_projection(config: &Config) -> MetricProjection {
         avatar_roundness: geometry.avatar_roundness.map_or(-1, i32::from),
         popup_fade_ms: config.appearance.popup_fade_ms.into(),
         panel_fade_ms: config.appearance.panel_fade_ms.into(),
+        line_height_factor: typography
+            .line_height_percent
+            .map_or(1.0, |percent| f32::from(percent) / 100.0),
+        body_font_weight: typography.body_weight.map_or(0, i32::from),
     }
 }
 
@@ -162,6 +199,8 @@ fn apply_metrics(ui: &AppWindow, config: &Config) {
     tokens.set_avatar_roundness(metrics.avatar_roundness);
     tokens.set_popup_fade_ms(metrics.popup_fade_ms);
     tokens.set_panel_fade_ms(metrics.panel_fade_ms);
+    tokens.set_line_height_factor(metrics.line_height_factor);
+    tokens.set_body_font_weight(metrics.body_font_weight);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -175,26 +214,45 @@ struct ThemeModeProjection {
 }
 
 fn theme_projection_for(source: Option<&Config>, account_id: &str) -> ThemeModeProjection {
+    theme_projection_in(source, account_id, "")
+}
+
+/// The theme mode with global -> account -> room precedence, and a notice
+/// naming the level that overrides the global choice, if any.
+fn theme_projection_in(
+    source: Option<&Config>,
+    account_id: &str,
+    room_id: &str,
+) -> ThemeModeProjection {
     let default = Config::default();
     let config = source.unwrap_or(&default);
     let global = config.theme_for(None);
-    let effective = config.theme_for(Some(account_id));
+    let effective = config.theme_for_room(Some(account_id), Some(room_id));
+    let room_overrides = config
+        .room_appearance(Some(account_id), Some(room_id))
+        .is_some_and(|room| room.theme.is_some());
     let overridden = !account_id.is_empty()
         && config
             .account_overrides
             .get(account_id)
             .is_some_and(|overrides| overrides.theme.is_some());
+    let notice = if room_overrides {
+        format!(
+            "This room overrides it with {} in config.toml.",
+            theme_mode_name(effective)
+        )
+    } else if overridden {
+        format!(
+            "This account overrides it with {} in config.toml.",
+            theme_mode_name(effective)
+        )
+    } else {
+        String::new()
+    };
     ThemeModeProjection {
         effective,
         global,
-        notice: if overridden {
-            format!(
-                "This account overrides it with {} in config.toml.",
-                theme_mode_name(effective)
-            )
-        } else {
-            String::new()
-        },
+        notice,
     }
 }
 
@@ -227,7 +285,8 @@ pub(crate) fn theme_mode_index(mode: ThemeMode) -> i32 {
 /// over each control's built-in color.
 pub(super) fn apply_theme(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     let account = ui.get_active_account_local_id();
-    let config = account_view(config, account.as_str());
+    let room = ui.get_active_room_id();
+    let config = account_view(config, account.as_str(), room.as_str());
     let (roles, senders) = theme_projection(&config, theme);
     let tokens = ui.global::<StyleTokens>();
     tokens.set_roles(roles);
@@ -337,6 +396,10 @@ fn state_projection(config: &Config, theme: Option<&ThemePack>) -> ThemeStateSet
         composer_focus: state("composer_focus"),
         icon: state("icon"),
         icon_active: state("icon_active"),
+        icon_navigation: state("icon_navigation"),
+        icon_header: state("icon_header"),
+        icon_composer: state("icon_composer"),
+        icon_message: state("icon_message"),
         nav_hover: state("nav_hover"),
         nav_selected: state("nav_selected"),
         nav_selected_ink: state("nav_selected_ink"),
@@ -351,11 +414,11 @@ fn transparency_status(percent: u8) -> &'static str {
     if percent >= 100 {
         "Opaque. Lower the value to let the desktop show through the window's panes."
     } else if cfg!(target_os = "macos") {
-        "Applied to the window as you change it. Not yet verified on this build."
+        "Applied to the window as you change it. No blur is added. Not yet verified on this build."
     } else if cfg!(target_os = "windows") {
-        "Requested from Windows. Whether the desktop shows through depends on desktop composition and the graphics driver. Not yet verified on this build."
+        "Requested from Windows. Whether the desktop shows through depends on desktop composition and the graphics driver. No blur or acrylic is added. Not yet verified on this build."
     } else {
-        "Requested from the window system. Wayland compositors, and X11 with a running compositing manager, can show the desktop; without one the panes may look black or stay opaque. Not yet verified on this build."
+        "Requested from the window system. Wayland compositors, and X11 with a running compositing manager, can show the desktop; without one the panes may look black or stay opaque. No blur is added. Not yet verified on this build."
     }
 }
 
@@ -452,6 +515,9 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.set_message_font_family(display_font_family(
         config.typography.message_family(&config.appearance),
     ));
+    ui.set_composer_font_family(display_font_family(
+        config.typography.composer_family(&config.appearance),
+    ));
     ui.set_monospace_font_family(display_font_family(
         &config.typography.monospace_font_family,
     ));
@@ -490,6 +556,14 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
         config
             .typography
             .message_font_family
+            .as_deref()
+            .unwrap_or("")
+            .into(),
+    );
+    ui.set_appearance_composer_font_input(
+        config
+            .typography
+            .composer_font_family
             .as_deref()
             .unwrap_or("")
             .into(),
@@ -654,12 +728,15 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
 
     let weak = ui.as_weak();
     let store_for_fonts = store.clone();
-    ui.on_set_style_fonts(move |interface, messages, monospace| {
+    ui.on_set_style_fonts(move |interface, messages, composer, monospace| {
         if let Some(ui) = weak.upgrade() {
             let _ = save_config_change(&ui, &store_for_fonts, |config| {
                 config.appearance.font_family = interface.trim().to_owned();
                 config.typography.message_font_family =
                     (!messages.trim().is_empty()).then(|| messages.trim().to_owned());
+                // Blank follows the message font.
+                config.typography.composer_font_family =
+                    (!composer.trim().is_empty()).then(|| composer.trim().to_owned());
                 config.typography.monospace_font_family = monospace.trim().to_owned();
             });
         }
@@ -669,11 +746,12 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     let store_for_font_reset = store.clone();
     ui.on_reset_style_fonts(move || {
         if let Some(ui) = weak.upgrade() {
-            // Only the three families; every other preference is kept.
+            // Only the font families; every other preference is kept.
             let defaults = Config::default();
             let _ = save_config_change(&ui, &store_for_font_reset, |config| {
                 config.appearance.font_family = defaults.appearance.font_family;
                 config.typography.message_font_family = defaults.typography.message_font_family;
+                config.typography.composer_font_family = defaults.typography.composer_font_family;
                 config.typography.monospace_font_family = defaults.typography.monospace_font_family;
             });
         }
@@ -789,6 +867,45 @@ mod theme_tests {
         assert_eq!(theme_mode_index(ThemeMode::Light), 1);
         assert_eq!(theme_mode_index(ThemeMode::HighContrast), 2);
         assert_eq!(theme_mode_index(ThemeMode::System), 3);
+    }
+
+    #[test]
+    fn rooms_draw_over_their_account_which_draws_over_global() {
+        use morpheus_config::RoomAppearance;
+        let room = "!harbor:example.org";
+        let mut config = Config::default();
+        config.appearance.theme = ThemeMode::System;
+        config.colors.insert("link".into(), "#111111".into());
+        config.colors.insert("accent".into(), "#121212".into());
+        let account = config.account_overrides.entry("alice".into()).or_default();
+        account.theme = Some(ThemeMode::Light);
+        account.colors.insert("link".into(), "#222222".into());
+        account.room_appearance.insert(
+            room.into(),
+            RoomAppearance {
+                theme: Some(ThemeMode::HighContrast),
+                colors: [("link".to_owned(), "#333333".to_owned())].into(),
+            },
+        );
+        // The room wins where it sets a value; absent values inherit.
+        let shown = theme_projection_in(Some(&config), "alice", room);
+        assert_eq!(shown.effective, ThemeMode::HighContrast);
+        assert_eq!(shown.global, ThemeMode::System);
+        assert!(shown.notice.starts_with("This room overrides it"));
+        let view = account_view(&config, "alice", room);
+        assert_eq!(view.colors["link"], "#333333");
+        assert_eq!(view.colors["accent"], "#121212");
+        // Another room, and the same room in another account, inherit.
+        let other = theme_projection_in(Some(&config), "alice", "!other:example.org");
+        assert_eq!(other.effective, ThemeMode::Light);
+        assert_eq!(account_view(&config, "alice", "").colors["link"], "#222222");
+        assert_eq!(theme_projection_in(Some(&config), "bob", room).effective, ThemeMode::System);
+        assert_eq!(account_view(&config, "bob", room).colors["link"], "#111111");
+        // Reset of the room removes only that override.
+        assert!(config.clear_room_appearance("alice", room));
+        assert_eq!(theme_projection_in(Some(&config), "alice", room).effective, ThemeMode::Light);
+        assert_eq!(account_view(&config, "alice", room).colors["link"], "#222222");
+        assert!(!config.clear_room_appearance("alice", room));
     }
 
     #[test]
@@ -947,6 +1064,8 @@ mod theme_tests {
                 avatar_roundness: -1,
                 popup_fade_ms: 0,
                 panel_fade_ms: 0,
+                line_height_factor: 1.0,
+                body_font_weight: 0,
             }
         );
         let mut config = Config::default();

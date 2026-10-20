@@ -25,17 +25,20 @@ is per-window presentation state; the file stays the record.
 
 Inheritance, lowest to highest, for one color token:
 
-1. The built-in palette of the effective theme mode. The mode is
-   `account_overrides."<account>".theme` while that account is active, else
-   `appearance.theme`.
+1. The built-in palette of the effective theme mode. The mode is the open
+   room's `account_overrides."<account>".room_appearance."<room>".theme`,
+   else `account_overrides."<account>".theme` while that account is active,
+   else `appearance.theme`.
 2. The theme pack named by `appearance.theme_pack`: its eleven `[colors]`, its
    optional `[roles]` and `[senders]`.
 3. Sparse overrides in `[colors]` of `config.toml`, keyed by token ID.
+4. The active account's `account_overrides."<account>".colors`.
+5. The open room's `account_overrides."<account>".room_appearance."<room>".colors`.
 
 Overrides apply in every theme mode and survive choosing a starting point
 (presets change typography, layout, geometry and `theme_pack`, never
-`[colors]` or `[window]`). Color overrides are global; per-account color
-overrides are not part of this checkpoint.
+`[colors]` or `[window]`). A level that omits a token inherits it; see
+[per-room appearance](CUSTOMIZATION.md#per-room-appearance).
 
 ```toml
 schema_version = 1
@@ -79,10 +82,17 @@ claimed. Size is enforced on the bytes actually read. Text must be UTF-8.
 
 A rejected edit leaves the last valid appearance applied. Settings re-reads the
 file before every save, so an invalid hand edit is never overwritten by a UI
-action. Settings writes `config.toml` with a same-directory temporary file and
-an atomic rename, which replaces a symbolic link rather than writing through
-it. Nothing writes theme files. Theme names are ASCII letters, digits, `-` and
-`_`, at most 64 characters, so they cannot name a path.
+action. Settings and theme studio saves write only over the exact text they
+read. A change found in the file at that moment is kept and reported, and
+nothing is written; the [theme studio](THEME_STUDIO.md) states the exact
+guarantee and the remaining window for other programs. Settings writes
+`config.toml` with a same-directory temporary file and an atomic rename,
+which replaces a symbolic link rather than writing through it. The only
+writer of theme files is a theme pack's Apply in the theme studio. It installs
+the pack into the themes folder only under an unused name. Existing packs
+are kept; give an imported pack a different name to keep both. Theme names
+are ASCII letters, digits, `-` and `_`, at most 64 characters, so they cannot
+name a path.
 
 Every error the app shows (initial load, theme load, live reload and Settings
 saves) and every offline diagnostic uses the same sanitized form: a fixed code
@@ -173,6 +183,10 @@ unset state keeps the previous look.
 | Inputs and controls | `composer_focus` | State | `composer_border` |
 | Inputs and controls | `icon` | State | `muted` |
 | Inputs and controls | `icon_active` | State | `accent` |
+| Inputs and controls | `icon_navigation` | State | `icon` |
+| Inputs and controls | `icon_header` | State | `icon` |
+| Inputs and controls | `icon_composer` | State | `icon` |
+| Inputs and controls | `icon_message` | State | `icon` |
 | Navigation and badges | `nav_hover` | State | the built-in row hover, about `#272D3B` |
 | Navigation and badges | `nav_selected` | State | `selection` |
 | Navigation and badges | `nav_selected_ink` | State | `selection_ink` |
@@ -246,9 +260,10 @@ whatever alpha a token or the window setting has. There is no blur and no
 whole-content fade. With opaque colors at 100 the window is painted exactly as
 before, so macOS keeps its opaque window path.
 
-The slider previews while it moves. A pointer or key release saves at once;
-keyboard, accessibility and number edits also save once the value has settled
-for 400 ms. A rejected save, for example because `config.toml` became invalid,
+The slider previews while it moves. A pointer or key release commits the value
+(to the theme studio draft in Settings, otherwise to the file); keyboard,
+accessibility and number edits also commit once the value has settled for
+400 ms. A rejected save, for example because `config.toml` became invalid,
 restores the last valid value in the window and in both controls.
 
 ### Platform status
@@ -321,8 +336,9 @@ groups and tokens beside (or, at narrow widths and large text, above) one
 selected-token editor: swatch, label, description, where the color comes from,
 the hex field, Reset and Undo, and the advanced `[colors]` key. Choosing a
 token moves focus to its hex field; Slint scrolls a focused control into view
-in the list and in the page. A complete valid value applies and saves at once;
-partial input only shows an inline hint. Reset all asks for a second
+in the list and in the page. A complete valid value applies at once, and in
+the running app it joins the [theme studio](THEME_STUDIO.md) draft until
+Apply; partial input only shows an inline hint. Reset all asks for a second
 activation and can then restore what it removed. The Window group holds the
 transparency slider with its numeric entry.
 
@@ -366,7 +382,7 @@ actual change and `released` on pointer release and on release of Left,
 Right, Home or End, so the transparency preview and save timing are
 unchanged. The window transparency number field is still the stock SpinBox.
 
-Targets (33): appearance presets, colors, window transparency, base palette,
+Targets (41): appearance presets, starting-point variations, theme packs, unsaved appearance changes (the theme studio bar and Reset section), colors, window transparency, base palette,
 reduce motion, fonts, message size, sender weight, room header, conversation
 style, message details, timestamps, corner radius, spacing, rail width, font
 scale, density; navigation, pane sizes, unread first; desktop notifications,
@@ -376,14 +392,17 @@ settings file; updates.
 
 ## Remaining
 
-- Number settings show their unit: `px` for lengths, none for the sender font
-  weight, `ms` for durations and `%` for percentages as those fields arrive.
-- Typography line height and body weight, icon sizing and colors, avatar
-  shape and the avatar/account palettes, pane order and visibility beyond the
-  existing panel toggle, animation durations, the sender palette in the
-  workspace, separate input, button, composer and icon tokens, per-account
-  color overrides and shortcut actions beyond the four existing ones are part
-  of the objective and not editable yet.
+- Number settings show their unit: `px` for lengths, `%` for percentages
+  (including line height), `ms` for durations, and none for font weights.
+- Now editable (source only, not yet run): composer line height, default body
+  weight including rich messages, per-control icon colors, and theme pack
+  import and export; see [theme studio](THEME_STUDIO.md). Rich message bodies
+  keep their natural line spacing. Explicit heading, sender and Markdown
+  span weights remain unchanged by the default-body-weight setting.
+- Pane order, visibility and collapse are editable in Settings › Layout ›
+  Pane arrangement and in TOML; see [customization](CUSTOMIZATION.md#pane-arrangement).
+- Still not editable: the avatar and account background palettes and shortcut
+  actions beyond the existing ones.
 - Native transparency has not been verified on any platform; see the plan
   above.
 - Formatting has not been run; expect `rustfmt` changes, especially in the

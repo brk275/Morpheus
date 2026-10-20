@@ -79,6 +79,8 @@ export struct ColorEditorState {
     can-undo: bool,
     // Inline guidance for the typed value; the last valid color stays applied.
     hint: string,
+    // Advisory contrast of this text color and its surface, or empty.
+    contrast: string,
 }
 
 // One keyboard shortcut action. `action` is a registry name, never a command.
@@ -150,6 +152,17 @@ export struct StyleProfileItem {
     current: bool,
 }
 
+// One row of the installed font browser: a generic name or an installed
+// family, with its weights and whether the system lists it as monospaced.
+export struct FontFamilyItem {
+    name: string,
+    detail: string,
+    generic: bool,
+    monospace: bool,
+    // The role draws with this family now.
+    current: bool,
+}
+
 // The selected style profile and any pending confirmation.
 export struct StyleProfileState {
     key: string,
@@ -211,6 +224,9 @@ component ThemedTextInput inherits TextInput {
 // internal test/IME properties; placement uses the public UTF-8 offset setter.
 // This wrapper must receive native caret/selection/IME acceptance on upgrades.
 component MentionInput inherits TextInput {
+    // typography.line_height_percent and typography.body_weight.
+    line-height-factor: StyleTokens.line-height-factor;
+    font-weight: StyleTokens.body-font-weight;
     selection-background-color: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : Palette.selection-background;
     selection-foreground-color: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground;
     out property <int> caret-bytes: self.cursor-position-byte-offset;
@@ -282,6 +298,12 @@ export struct RoomItem {
     // Standard Matrix m.favourite / m.lowpriority tags (room organization).
     favourite: bool,
     low-priority: bool,
+}
+
+// A variation of a built-in starting point (theme_studio/presets.rs).
+export struct StudioVariation {
+    name: string,
+    description: string,
 }
 
 export struct MessageItem {
@@ -1916,6 +1938,147 @@ component StyleFontSetting inherits Rectangle {
     }
 }
 
+// The installed font browser for one font role, inside the Fonts card: a
+// search, a monospaced filter, the generic names and the installed families
+// (Rust bounds the list), and a sample of the previewed family at the
+// role's own size and weight. Choosing writes the role through the normal
+// Settings path. Nothing here animates.
+component FontBrowser inherits VerticalLayout {
+    in property <string> title;
+    in property <string> current;
+    in property <bool> current-missing;
+    in property <[FontFamilyItem]> items;
+    in property <string> status;
+    in property <string> notice;
+    in property <string> previewed;
+    in property <string> sample-family;
+    in property <int> sample-size: 13;
+    in property <int> sample-weight: 400;
+    in property <string> sample-text;
+    in property <string> sample-label;
+    in property <bool> monospace-only;
+    // Message and composer fonts follow another role; the others return to
+    // their built-in family.
+    in property <bool> can-follow;
+    in-out property <string> query;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> accent;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    callback query-edited(string);
+    callback monospace-toggled();
+    callback preview(string);
+    callback choose(string);
+    callback follow();
+    callback reread();
+    callback dismiss();
+    forward-focus: search;
+    spacing: 8px;
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.title; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700;
+            vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap;
+        }
+        TextAction {
+            text: "Close"; label: "Close the font list";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.dismiss(); }
+        }
+    }
+    Text { text: root.current; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+    if root.current-missing : Text {
+        text: "That family is not in this app's font list. It is kept as typed, and the renderer uses a fallback. Restart Morpheus after installing or removing system fonts.";
+        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.ink;
+        font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+    Rectangle {
+        height: 34px * root.text-scale;
+        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+        border-width: search.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+        border-color: search.has-focus && StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : search.has-focus ? root.accent : root.outline;
+        search := ThemedTextInput {
+            x: StyleTokens.input-padding; width: max(0px, parent.width - 2 * StyleTokens.input-padding); height: parent.height;
+            text <=> root.query; single-line: true;
+            color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+            accessible-label: "Search installed font families";
+            edited(text) => { root.query-edited(text); }
+        }
+    }
+    HorizontalLayout {
+        spacing: 8px; alignment: start;
+        TextAction {
+            text: root.monospace-only ? "Monospaced only: on" : "Monospaced only: off";
+            label: "Show only monospaced families" + (root.monospace-only ? ", on" : ", off");
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.monospace-only ? root.accent : root.outline; text-scale: root.text-scale;
+            activated => { root.monospace-toggled(); }
+        }
+        TextAction {
+            text: "Refresh cached list"; label: "Read the font families already known to this app again";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.reread(); }
+        }
+    }
+    Text { text: root.status; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+    Text {
+        text: "Restart Morpheus after installing or removing system fonts. Refresh reads the app's existing font list.";
+        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+    ListView {
+        height: min(240px * root.text-scale, max(48px * root.text-scale, root.items.length * 40px * root.text-scale));
+        for item in root.items : TextAction {
+            height: 38px * root.text-scale;
+            text: item.name + (item.detail != "" ? " · " + item.detail : "");
+            label: "Font " + item.name + (item.current ? ", in use" : "") + (item.name == root.previewed ? ", previewed" : "");
+            ink: root.ink; muted: root.muted;
+            surface: item.name == root.previewed ? root.hover-surface : root.surface;
+            hover-surface: root.hover-surface; outline: item.current ? root.accent : root.outline;
+            text-scale: root.text-scale;
+            activated => { root.preview(item.name); }
+        }
+    }
+    Rectangle {
+        height: sample.preferred-height + 20px;
+        background: root.surface;
+        border-radius: StyleTokens.radius; border-width: StyleTokens.line-width; border-color: root.outline;
+        sample := Text {
+            x: 10px; y: 10px; width: parent.width - 20px;
+            text: root.sample-text; font-family: root.sample-family;
+            font-size: root.sample-size * 1px * root.text-scale; font-weight: root.sample-weight;
+            color: root.ink; wrap: word-wrap;
+            accessible-label: "Sample of " + root.sample-label;
+        }
+    }
+    Text { text: root.sample-label; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+    HorizontalLayout {
+        spacing: 8px; alignment: start;
+        TextAction {
+            text: "Use " + root.previewed; label: "Use " + root.previewed + " for this font";
+            enabled: root.previewed != "";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.accent; text-scale: root.text-scale;
+            activated => { root.choose(root.previewed); }
+        }
+        TextAction {
+            text: root.can-follow ? "Follow the inherited font" : "Use the built-in font";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.follow(); }
+        }
+    }
+    if root.notice != "" : Text {
+        text: root.notice; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+}
+
 // Pinned Settings search. Up and Down move the highlighted result, Enter
 // reveals it and Escape clears the query. Choosing a result only reveals and
 // focuses its control; it never changes a setting.
@@ -2214,6 +2377,9 @@ component ColorTokenEditor inherits VerticalLayout {
         }
     }
     Text { text: root.state.description; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+    if root.state.contrast != "" : Text {
+        text: root.state.contrast; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; min-width: 0px;
+    }
     Rectangle {
         height: max(38px, 32px * root.text-scale);
         background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface; border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
@@ -2689,7 +2855,7 @@ component WindowOpacitySetting inherits VerticalLayout {
     }
     Text { text: "Window transparency"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
     Text {
-        text: "Lower values let the desktop show through the window's panes. Text, icons, inputs, cards and dialogs stay opaque; sign-in and recovery always stay opaque.";
+        text: "Lower values let the desktop show through the window's panes. Text, icons, inputs, cards and dialogs stay opaque; sign-in and recovery always stay opaque. Readability then depends on what is behind the window: light text over a bright desktop, or dark text over a dark one, is harder to read, and the contrast advice in the color editor assumes an opaque pane. No blur is added.";
         color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
     }
     HorizontalLayout {
@@ -3118,6 +3284,10 @@ export component AppWindow inherits Window {
     in-out property <image> active-account-avatar;
     in-out property <bool> active-account-has-avatar: false;
     in-out property <string> active-room-id;
+    // A room's own appearance draws over its account's: every change of the
+    // open room re-projects the look (handled in Rust, appearance.rs). Called
+    // from the one `changed active-room-id` handler below.
+    callback appearance-room-changed();
     in-out property <string> active-room-name;
     in-out property <string> active-room-topic;
     in-out property <string> active-room-topic-raw;
@@ -3358,6 +3528,9 @@ export component AppWindow inherits Window {
     in-out property <bool> show-side-panel: true;
     in-out property <string> ui-font-family: "Inter";
     in-out property <string> message-font-family: "Inter";
+    // The message and thread composers; follows the message family unless
+    // typography.composer_font_family is set.
+    in-out property <string> composer-font-family: "Inter";
     in-out property <string> monospace-font-family: "monospace";
     in-out property <int> message-font-size: 14;
     in-out property <int> sender-font-weight: 0; // zero preserves each surface's legacy weight
@@ -3381,10 +3554,38 @@ export component AppWindow inherits Window {
     in-out property <string> appearance-ui-font-input;
     in-out property <string> appearance-message-font-input;
     in-out property <string> appearance-mono-font-input;
+    in-out property <string> appearance-composer-font-input;
     callback choose-style-preset(int);
-    callback set-style-fonts(string, string, string);
-    // Return the three font families to their built-in defaults.
+    // Interface, message, composer and monospaced families.
+    callback set-style-fonts(string, string, string, string);
+    // Return the font families to their built-in defaults.
     callback reset-style-fonts();
+    // The installed font browser (theme_studio/fonts.rs). Role 0 interface,
+    // 1 message, 2 composer, 3 monospaced.
+    in-out property <bool> font-browser-open: false;
+    in-out property <int> font-browser-role: 0;
+    in-out property <string> font-browser-role-label;
+    in-out property <string> font-browser-query;
+    in-out property <bool> font-browser-monospace-only: false;
+    in-out property <[FontFamilyItem]> font-browser-results;
+    in-out property <string> font-browser-status;
+    in-out property <string> font-browser-current;
+    in-out property <bool> font-browser-current-missing: false;
+    in-out property <string> font-browser-notice;
+    in-out property <string> font-browser-previewed;
+    in-out property <string> font-browser-sample-family;
+    in-out property <int> font-browser-sample-size: 13;
+    in-out property <int> font-browser-sample-weight: 400;
+    in-out property <string> font-browser-sample-text;
+    in-out property <string> font-browser-sample-label;
+    callback font-browser-show(int);
+    callback font-browser-close();
+    callback font-browser-query-changed(string);
+    callback font-browser-monospace-toggled();
+    callback font-browser-highlight(string);
+    callback font-browser-use(string);
+    callback font-browser-inherit();
+    callback font-browser-refresh();
     callback change-style-number(int, int);
     callback choose-message-layout(int);
     callback choose-conversation-header-mode(int);
@@ -3468,9 +3669,18 @@ export component AppWindow inherits Window {
     callback color-reset();
     callback color-undo();
     callback color-reset-all();
-    // 0 edits the colors for all accounts, 1 the active account's own.
+    // 0 edits the colors for all accounts, 1 the active account's own, 2 the
+    // open room's own in the active account (global -> account -> room).
     in-out property <int> color-scope: 0;
     callback color-scope-chosen(int);
+    // Whether an account is active and a room is open, so "This room" can
+    // be chosen. Set from Rust.
+    in-out property <bool> color-room-available: false;
+    // Advanced colors (interaction states, per-control icons) are listed
+    // only on request; the count is how many the list hides now.
+    in-out property <bool> color-show-advanced: false;
+    in-out property <int> color-advanced-hidden: 0;
+    callback color-advanced-toggled();
     in-out property <int> window-opacity-percent: 100;
     in-out property <int> window-opacity-revision: 0;
     in-out property <string> window-transparency-status;
@@ -3528,6 +3738,49 @@ export component AppWindow inherits Window {
     in-out property <string> style-profile-notice;
     in-out property <bool> style-profile-notice-error: false;
     callback style-profile-notice-dismiss();
+    // Theme studio (theme_studio/): look changes made in Settings are a draft,
+    // shown at once and saved only by Apply.
+    in-out property <int> studio-pending: 0;
+    in-out property <bool> studio-can-undo: false;
+    in-out property <bool> studio-can-redo: false;
+    // Drafted settings the file also changed; Apply waits for a choice.
+    in-out property <int> studio-conflicts: 0;
+    in-out property <string> studio-conflict-summary;
+    in-out property <string> studio-notice;
+    in-out property <bool> studio-notice-error: false;
+    in-out property <int> studio-reset-index: 0;
+    callback studio-apply();
+    callback studio-discard();
+    callback studio-undo();
+    callback studio-redo();
+    // 1 keeps this window's values, 2 keeps the file's, 0 goes back.
+    callback studio-resolve(int);
+    // An index of theme_studio::session::Group::ALL.
+    callback studio-reset-group(int);
+    callback studio-notice-dismiss();
+    // theme_studio/presets.rs replaces this with the same list at startup; a
+    // test keeps both in step. The default lets search reveal the list.
+    // Theme packs (theme_studio/packs.rs): import, preview and apply a
+    // palette file, or export the one in use. Non-empty while previewing.
+    in-out property <string> studio-pack-preview-name;
+    // An installed pack already uses this name: preview only, no replacement.
+    in-out property <bool> studio-pack-replaces: false;
+    in-out property <bool> studio-pack-busy: false;
+    in-out property <string> studio-pack-message;
+    in-out property <bool> studio-pack-message-error: false;
+    callback studio-pack-import();
+    callback studio-pack-export();
+    callback studio-pack-apply();
+    callback studio-pack-cancel();
+    in-out property <[StudioVariation]> studio-variations: [
+        { name: "Nocturne Compact", description: "Charcoal · tighter rows and margins · narrower panes" },
+        { name: "Nocturne Large Print", description: "Charcoal · large type and icons · roomy controls" },
+        { name: "Terminal Soft", description: "Monospaced columns · rounded edges · small avatars" },
+        { name: "Paper Wide", description: "Warm paper · serif · wide margins for long reading" },
+        { name: "Contrast Reading", description: "Built-in high-contrast colors · heavier outlines · larger type" },
+    ];
+    // An index of studio-variations.
+    callback studio-choose-variation(int);
     callback style-profile-filter-changed(string);
     callback style-profile-chosen(string);
     callback style-profile-save-current();
@@ -4359,7 +4612,8 @@ export component AppWindow inherits Window {
         root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {
-        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); root.attachment-context-changed(); RoomOrganizationState.active-room-changed(); }
+        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); root.attachment-context-changed(); RoomOrganizationState.active-room-changed();
+        root.appearance-room-changed(); }
     changed thread-root-id => {
         root.close-image-preview(); root.mention-context-changed();
         // A page request for the previous thread can no longer publish here.
@@ -4436,6 +4690,12 @@ export component AppWindow inherits Window {
     property <color> composer-focus-border: StyleTokens.states.composer-focus.present ? StyleTokens.states.composer-focus.color : root.composer-border;
     property <color> icon-ink: StyleTokens.states.icon.present ? StyleTokens.states.icon.color : root.muted;
     property <color> icon-active-ink: StyleTokens.states.icon-active.present ? StyleTokens.states.icon-active.color : root.accent;
+    // Per-control icon colors. Each follows `icon` until set; switched-on
+    // and primary icons keep `icon_active`.
+    property <color> icon-navigation-ink: StyleTokens.states.icon-navigation.present ? StyleTokens.states.icon-navigation.color : root.icon-ink;
+    property <color> icon-header-ink: StyleTokens.states.icon-header.present ? StyleTokens.states.icon-header.color : root.icon-ink;
+    property <color> icon-composer-ink: StyleTokens.states.icon-composer.present ? StyleTokens.states.icon-composer.color : root.icon-ink;
+    property <color> icon-message-ink: StyleTokens.states.icon-message.present ? StyleTokens.states.icon-message.color : root.icon-ink;
     property <color> input-border-color: StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.divider;
     property <color> mention-badge: StyleTokens.states.mention.present ? StyleTokens.states.mention.color
         : StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483;
@@ -4511,6 +4771,10 @@ export component AppWindow inherits Window {
         if id == "composer_focus" { return root.composer-focus-border; }
         if id == "icon" { return root.icon-ink; }
         if id == "icon_active" { return root.icon-active-ink; }
+        if id == "icon_navigation" { return root.icon-navigation-ink; }
+        if id == "icon_header" { return root.icon-header-ink; }
+        if id == "icon_composer" { return root.icon-composer-ink; }
+        if id == "icon_message" { return root.icon-message-ink; }
         if id == "nav_hover" { return StyleTokens.states.nav-hover.present ? StyleTokens.states.nav-hover.color : root.elevated; }
         if id == "nav_selected" {
             return StyleTokens.states.nav-selected.present ? StyleTokens.states.nav-selected.color
@@ -4538,7 +4802,8 @@ export component AppWindow inherits Window {
             || id == "message_hover" || id == "control_hover" || id == "control_pressed"
             || id == "control_disabled" || id == "input_surface" || id == "input_border"
             || id == "composer_surface" || id == "composer_border" || id == "composer_focus"
-            || id == "icon" || id == "icon_active" || id == "nav_hover" || id == "nav_selected"
+            || id == "icon" || id == "icon_active" || id == "icon_navigation" || id == "icon_header"
+            || id == "icon_composer" || id == "icon_message" || id == "nav_hover" || id == "nav_selected"
             || id == "nav_selected_ink" || id == "mention" || id == "mention_ink";
     }
     // Any pane color with its own alpha also clears the window background, so
@@ -4568,6 +4833,10 @@ export component AppWindow inherits Window {
         error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483,
         success: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : #78c8b1
     };
+    // StyledText resolves an omitted font weight from its enclosing window.
+    // Explicit sender, heading and Markdown span weights remain their own.
+    // Zero preserves the platform default when the preference is unset.
+    default-font-weight: StyleTokens.body-font-weight;
     default-font-family: root.ui-font-family;
     background: root.window-translucent ? transparent : canvas;
 
@@ -4634,7 +4903,7 @@ export component AppWindow inherits Window {
                     icon: "home";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:home", focused); }
                     label: "Home and all rooms";
-                    ink: root.page == 0 && root.active-space-id == "" ? root.icon-active-ink : root.icon-ink;
+                    ink: root.page == 0 && root.active-space-id == "" ? root.icon-active-ink : root.icon-navigation-ink;
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 0 && root.active-space-id == "";
@@ -4687,7 +4956,7 @@ export component AppWindow inherits Window {
                     icon: "explore";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:discover", focused); }
                     label: "Explore public Matrix rooms";
-                    ink: root.page == 3 ? root.icon-active-ink : root.icon-ink;
+                    ink: root.page == 3 ? root.icon-active-ink : root.icon-navigation-ink;
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 3;
@@ -4699,7 +4968,7 @@ export component AppWindow inherits Window {
                     icon: "calls";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:calls", focused); }
                     label: "Open call stage";
-                    ink: root.page == 2 ? root.icon-active-ink : root.icon-ink;
+                    ink: root.page == 2 ? root.icon-active-ink : root.icon-navigation-ink;
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 2;
@@ -4711,7 +4980,7 @@ export component AppWindow inherits Window {
                     icon: "settings";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:settings", focused); }
                     label: "Open settings";
-                    ink: root.page == 1 ? root.icon-active-ink : root.icon-ink;
+                    ink: root.page == 1 ? root.icon-active-ink : root.icon-navigation-ink;
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 1;
@@ -4755,7 +5024,7 @@ export component AppWindow inherits Window {
                             height: 34px;
                             icon: "+";
                             label: "Create or join a Matrix room";
-                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            ink: root.icon-navigation-ink; surface: transparent; hover-surface: root.hover;
                             activated => {
                                 root.room-action-mode = 0;
                                 root.room-action-input = "";
@@ -5126,7 +5395,7 @@ export component AppWindow inherits Window {
                                 room-id: root.active-room-id; room-name: root.active-room-name;
                                 account-context: root.active-account-local-id;
                                 enabled: root.live-session && root.active-room-id != "";
-                                ink: root.icon-ink; hover: root.hover; radius: StyleTokens.radius * 0.9;
+                                ink: root.icon-header-ink; hover: root.hover; radius: StyleTokens.radius * 0.9;
                                 focus-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.ink;
                             }
                         }
@@ -5139,7 +5408,7 @@ export component AppWindow inherits Window {
                             // Stable IDs of the native icon set, which draws them once merged.
                             icon: RoomNotificationState.header-muted ? "notifications-off" : "notifications";
                             label: RoomNotificationState.header-muted ? "Room notifications, muted" : "Room notifications";
-                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.room-notifications-current;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
@@ -5150,7 +5419,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "settings"; label: "Edit room settings"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "settings"; label: "Edit room settings"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
                                 root.open-room-settings();
@@ -5160,7 +5429,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "search"; label: "Search messages"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "search"; label: "Search messages"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 2;
                             enabled: root.live-session;
                             activated => { root.focus-room-search(); }
@@ -5169,7 +5438,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "pin"; label: "Show pinned messages"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "pin"; label: "Show pinned messages"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 3;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
@@ -5182,7 +5451,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "transfers"; label: root.transfer-active-count > 0 ? "Show transfers, " + root.transfer-active-count + " in progress" : "Show transfers"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "transfers"; label: root.transfer-active-count > 0 ? "Show transfers, " + root.transfer-active-count + " in progress" : "Show transfers"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 4;
                             enabled: root.live-session;
                             activated => { root.show-transfer-panel(); }
@@ -5191,7 +5460,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "calls"; label: "Open current room call stage"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "calls"; label: "Open current room call stage"; ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             activated => { root.page = 2; }
                         }
                         }
@@ -5199,7 +5468,7 @@ export component AppWindow inherits Window {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
                             icon: "details-panel"; label: root.show-side-panel ? "Hide details panel" : "Show details panel";
-                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            ink: root.icon-header-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel;
                             activated => { root.set-side-panel(!root.show-side-panel); }
                         }
@@ -5363,6 +5632,134 @@ export component AppWindow inherits Window {
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                             outline: root.divider; text-scale: root.text-scale;
                             activated => { shortcut-scope.focus(); root.style-profile-cancel-preview(); }
+                        }
+                    }
+                }
+                // A theme pack preview stays visible on every page until it is
+                // applied or cancelled; it installs and saves nothing on its own.
+                if root.studio-pack-preview-name != "" : Rectangle {
+                    height: max(44px, 32px * root.text-scale + 12px);
+                    background: root.elevated;
+                    border-width: StyleTokens.line-width; border-color: root.accent;
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 12px; padding-top: 6px; padding-bottom: 6px; spacing: 10px;
+                        Text {
+                            text: "Previewing the " + root.studio-pack-preview-name + " theme pack. "
+                                + (root.studio-pack-replaces ? "That name is already installed. Change the imported TOML file's name field and import it again to keep both packs." : "Nothing is installed until you apply it.");
+                            color: root.ink; font-size: 12px * root.text-scale;
+                            vertical-alignment: center; horizontal-stretch: 1; min-width: 0px; overflow: elide;
+                            accessible-live-region: polite;
+                        }
+                        TextAction {
+                            text: "Install and apply";
+                            enabled: !root.studio-pack-replaces;
+                            label: root.studio-pack-replaces ? "Give the imported pack a different name and import it again; the installed pack is kept" : "Install and apply the " + root.studio-pack-preview-name + " theme pack";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.accent; text-scale: root.text-scale;
+                            activated => { shortcut-scope.focus(); root.studio-pack-apply(); }
+                        }
+                        TextAction {
+                            text: "Cancel";
+                            label: "Cancel the theme pack preview and restore your look";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            activated => { shortcut-scope.focus(); root.studio-pack-cancel(); }
+                        }
+                    }
+                }
+                // Unsaved theme studio changes stay visible on every page until
+                // they are applied or discarded; nothing in the draft is saved.
+                if root.studio-pending > 0 : Rectangle {
+                    height: max(44px, 32px * root.text-scale + 12px);
+                    background: root.elevated;
+                    border-width: StyleTokens.line-width; border-color: root.accent;
+                    accessible-role: region;
+                    accessible-label: "Unsaved appearance changes";
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 12px; padding-top: 6px; padding-bottom: 6px; spacing: 8px;
+                        Text {
+                            text: root.studio-conflicts > 0
+                                ? (root.studio-conflicts == 1 ? "1 of these settings" : root.studio-conflicts + " of these settings")
+                                    + " also changed in the settings file (" + root.studio-conflict-summary + "). Keep which values?"
+                                : (root.studio-pending == 1 ? "1 appearance change is" : root.studio-pending + " appearance changes are")
+                                    + " shown but not saved.";
+                            color: root.ink; font-size: 12px * root.text-scale;
+                            vertical-alignment: center; horizontal-stretch: 1; min-width: 0px; overflow: elide;
+                            accessible-live-region: polite;
+                        }
+                        if root.studio-conflicts == 0 : TextAction {
+                            text: "Undo";
+                            label: "Undo the last unsaved appearance change";
+                            enabled: root.studio-can-undo;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.studio-undo(); }
+                        }
+                        if root.studio-conflicts == 0 : TextAction {
+                            text: "Redo";
+                            label: "Redo the appearance change you undid";
+                            enabled: root.studio-can-redo;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.studio-redo(); }
+                        }
+                        if root.studio-conflicts == 0 : TextAction {
+                            text: "Discard";
+                            label: "Discard the unsaved appearance changes and restore your saved look";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            // The bar closes: keep keyboard focus in the window.
+                            activated => { shortcut-scope.focus(); root.studio-discard(); }
+                        }
+                        if root.studio-conflicts == 0 : TextAction {
+                            text: "Apply";
+                            label: "Save the appearance changes to the settings file";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.accent; text-scale: root.text-scale;
+                            activated => { shortcut-scope.focus(); root.studio-apply(); }
+                        }
+                        if root.studio-conflicts > 0 : TextAction {
+                            text: "Keep mine";
+                            label: "Save this window's values for the settings changed in both places";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.accent; text-scale: root.text-scale;
+                            activated => { shortcut-scope.focus(); root.studio-resolve(1); }
+                        }
+                        if root.studio-conflicts > 0 : TextAction {
+                            text: "Keep the file's";
+                            label: "Keep the settings file's values for the settings changed in both places and save the rest";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            activated => { shortcut-scope.focus(); root.studio-resolve(2); }
+                        }
+                        if root.studio-conflicts > 0 : TextAction {
+                            text: "Back";
+                            label: "Go back to editing without saving";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            activated => { shortcut-scope.focus(); root.studio-resolve(0); }
+                        }
+                    }
+                }
+                // The outcome of Apply, Discard or an account switch, until dismissed.
+                if root.studio-notice != "" : Rectangle {
+                    height: max(36px, 32px * root.text-scale + 8px);
+                    background: root.panel;
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 12px; padding-top: 4px; padding-bottom: 4px; spacing: 10px;
+                        Text {
+                            text: root.studio-notice;
+                            color: root.studio-notice-error && StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.ink;
+                            font-size: 11px * root.text-scale;
+                            vertical-alignment: center; horizontal-stretch: 1; min-width: 0px; overflow: elide;
+                            accessible-live-region: polite;
+                        }
+                        TextAction {
+                            text: "Dismiss";
+                            label: "Dismiss the appearance notice";
+                            ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            activated => { shortcut-scope.focus(); root.studio-notice-dismiss(); }
                         }
                     }
                 }
@@ -5749,7 +6146,7 @@ export component AppWindow inherits Window {
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "↩"; label: "Reply to " + message.sender;
-                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-message-ink; surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         if !root.composer-busy { root.begin-compose(1, message.event-id, message.sender, "", false); }
                                         message-input.focus();
@@ -5758,7 +6155,7 @@ export component AppWindow inherits Window {
                                 if message.event-id != "" && message.is-own && message.attachment == "" && !message.poll.present : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
-                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-message-ink; surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         if !root.composer-busy { root.begin-compose(2, message.event-id, message.sender, message.edit-source, message.edit-markdown); }
                                         message-input.focus();
@@ -5767,13 +6164,13 @@ export component AppWindow inherits Window {
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "♥"; label: "Toggle heart reaction";
-                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-message-ink; surface: transparent; hover-surface: root.hover;
                                     activated => { root.toggle-message-reaction(message.event-id, "❤️"); }
                                 }
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "thread"; label: "Open thread for " + message.sender;
-                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-message-ink; surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         root.thread-root-id = message.event-id;
                                         root.thread-root-sender = message.sender;
@@ -5825,7 +6222,7 @@ export component AppWindow inherits Window {
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "⌫"; label: "Redact message from " + message.sender;
-                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-message-ink; surface: transparent; hover-surface: root.hover;
                                     enabled: root.live-session && !root.room-admin-busy;
                                     activated => {
                                         root.room-admin-mode = 2;
@@ -5916,7 +6313,7 @@ export component AppWindow inherits Window {
                             }
                             IconAction {
                                 width: 26px; height: 25px; icon: "×"; label: "Cancel reply or edit";
-                                ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                ink: root.icon-composer-ink; surface: transparent; hover-surface: root.hover;
                                 activated => {
                                     if !root.composer-busy { root.cancel-compose(); }
                                 }
@@ -5938,13 +6335,13 @@ export component AppWindow inherits Window {
                                 padding-bottom: 11px;
                                 spacing: 6px;
                                 IconAction {
-                                    icon: "attach"; label: "Attach files"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    icon: "attach"; label: "Attach files"; ink: root.icon-composer-ink; surface: transparent; hover-surface: root.hover;
                                     enabled: root.live-session && root.active-room-id != "" && root.composer-mode == 0 && root.attachment-can-add;
                                     activated => { root.attach-file(); }
                                 }
                                 IconAction {
                                     width: 32px; icon: "emoji"; label: "Open emoji picker for message";
-                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    ink: root.icon-composer-ink; surface: transparent; hover-surface: root.hover;
                                     enabled: root.mention-ui-allowed && !root.composer-busy;
                                     activated => {
                                         if root.sticker-open { root.sticker-dismiss(); }
@@ -5954,7 +6351,7 @@ export component AppWindow inherits Window {
                                 }
                                 IconAction {
                                     width: 32px; icon: "sticker"; label: "Open sticker picker for this room";
-                                    ink: root.sticker-open && !root.sticker-threaded ? root.icon-active-ink : root.icon-ink;
+                                    ink: root.sticker-open && !root.sticker-threaded ? root.icon-active-ink : root.icon-composer-ink;
                                     selected: root.sticker-open && !root.sticker-threaded;
                                     surface: transparent; hover-surface: root.hover;
                                     enabled: root.mention-ui-allowed && !root.composer-busy && root.composer-mode == 0 && root.active-room-id != "";
@@ -5980,7 +6377,7 @@ export component AppWindow inherits Window {
                                     icon: "Md";
                                     label: root.composer-markdown ? "Clear Markdown formatting" : "Use Markdown formatting";
                                     selected: root.composer-markdown;
-                                    ink: root.composer-markdown ? root.icon-active-ink : root.icon-ink;
+                                    ink: root.composer-markdown ? root.icon-active-ink : root.icon-composer-ink;
                                     surface: transparent; hover-surface: root.hover;
                                     enabled: root.active-room-id != "" && !root.composer-busy;
                                     activated => {
@@ -6001,7 +6398,7 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                     message-input := MentionInput {
-                                        font-family: root.message-font-family;
+                                        font-family: root.composer-font-family;
                                         x: 3px;
                                         width: parent.width - 6px;
                                         height: parent.height;
@@ -6680,11 +7077,14 @@ export component AppWindow inherits Window {
                                                             spacing: 8px;
                                                             VerticalLayout {
                                                                 alignment: center;
-                                                                MorpheusIcon { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "attach"; ink: root.icon-ink; }
+                                                                MorpheusIcon { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "attach"; ink: root.icon-composer-ink; }
                                                             }
                                                             Text {
                                                                 text: "Message Design review";
-                                                                color: root.muted; font-family: root.message-font-family; font-size: root.composer-font-px;
+                                                                color: root.muted; font-family: root.composer-font-family; font-size: root.composer-font-px;
+                                                                // The composer's line height and weight, as the real composer draws them.
+                                                                line-height-factor: StyleTokens.line-height-factor;
+                                                                font-weight: StyleTokens.body-font-weight;
                                                                 vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
                                                             }
                                                             VerticalLayout {
@@ -6792,6 +7192,44 @@ export component AppWindow inherits Window {
                                 activated => { root.settings-search-choose(destination.id); }
                             }
                         }
+                        // The studio's draft: what this page changes is shown at once and
+                        // saved only by Apply in the bar above.
+                        Text {
+                            text: "Changes on this page are shown at once and saved only when you choose Apply in the bar at the top. Text size, Reduce motion and the focus ring save at once.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; min-width: 0px;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            TokenSelect {
+                                horizontal-stretch: 1;
+                                model: ["Theme and motion", "Fonts and type sizes", "Shapes and spacing", "Messages and header",
+                                    "Panes and navigation", "Window transparency", "Colors for all accounts", "Sender name colors"];
+                                current-index <=> root.studio-reset-index;
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
+                                accessible-label: "Section to reset";
+                                property <int> reveal-request: root.reveal-request("appearance.studio");
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.studio"; }
+                                    }
+                                }
+                            }
+                            TextAction {
+                                text: "Reset section";
+                                label: "Reset the chosen section to its built-in values in the preview; Apply saves it";
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale;
+                                activated => { root.studio-reset-group(root.studio-reset-index); }
+                            }
+                        }
                         Text { text: "Starting points"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         Text { text: "Presets fill in editable settings. Fonts use installed families; a missing family falls back to your system font."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         for name[index] in ["Nocturne", "Terminal", "Paper"] : ActionRect {
@@ -6819,6 +7257,37 @@ export component AppWindow inherits Window {
                                 Text { text: name; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
                                 Text { text: index == 0 ? "Charcoal · soft edges · avatars and room context" : index == 1 ? "Monospaced · square edges · aligned nickname columns" : "Warm paper · serif messages · quiet, open space";
                                     color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
+                            }
+                        }
+                        // Variations fill in the same editable settings as the presets;
+                        // in Settings they are drafted until Apply.
+                        if root.studio-variations.length > 0 : Text {
+                            text: "Variations"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650;
+                        }
+                        for variation[index] in root.studio-variations : ActionRect {
+                            property <int> reveal-request: index == 0 ? root.reveal-request("appearance.variations") : 0;
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.variations"; }
+                                }
+                            }
+                            height: max(52px, 40px * root.text-scale + 12px);
+                            label: "Show the " + variation.name + " variation; Apply saves it";
+                            background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
+                            border-radius: StyleTokens.radius; focus-color: root.accent;
+                            activated => { root.studio-choose-variation(index); }
+                            VerticalLayout {
+                                padding-left: 12px; padding-right: 12px; padding-top: 8px; padding-bottom: 8px; spacing: 3px;
+                                Text { text: variation.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; }
+                                Text { text: variation.description; color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; min-width: 0px; }
                             }
                         }
                         ActionRect {
@@ -6933,18 +7402,68 @@ export component AppWindow inherits Window {
                             }
                         }
 
+                        Text { text: "Theme packs"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        Text {
+                            text: "A theme pack is a palette file: base colors, roles, interaction states and sender colors, nothing else. Importing shows it first; nothing is installed until you apply it. Export saves the pack in use as a file.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; min-width: 0px;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px; alignment: start;
+                            TextAction {
+                                text: "Import theme pack…";
+                                label: "Import a theme pack file and preview it";
+                                enabled: !root.studio-pack-busy;
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale;
+                                property <int> reveal-request: root.reveal-request("appearance.theme_packs");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.theme_packs"; }
+                                    }
+                                }
+                                activated => { root.studio-pack-import(); }
+                            }
+                            TextAction {
+                                text: "Export current pack…";
+                                label: "Export the theme pack in use as a file";
+                                enabled: !root.studio-pack-busy;
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale;
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                activated => { root.studio-pack-export(); }
+                            }
+                        }
+                        if root.studio-pack-message != "" : Text {
+                            text: root.studio-pack-message;
+                            color: root.studio-pack-message-error && StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.muted;
+                            font-size: 11px * root.text-scale; wrap: word-wrap; min-width: 0px;
+                            accessible-live-region: polite;
+                        }
+
                         Text { text: "Colors and window"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         Text {
-                            text: "Choose a color, then type #RRGGBB or #RRGGBBAA, with alpha last. A valid value applies and saves at once; Reset returns one color to its theme or built-in value. Your colors stay when you choose a starting point.";
+                            text: "Choose a color, then type #RRGGBB or #RRGGBBAA, with alpha last. A valid value is shown at once and saved with Apply in the bar at the top; Reset returns one color to its theme or built-in value. Your colors stay when you choose a starting point.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
                         HorizontalLayout {
                             spacing: 8px; alignment: start;
-                            for scope[index] in ["All accounts", "This account"] : TextAction {
+                            for scope[index] in ["All accounts", "This account", "This room"] : TextAction {
                                 height: 36px * root.text-scale; vertical-stretch: 0;
-                                enabled: index == 0 || root.active-account-local-id != "";
+                                enabled: index == 0 || (index == 1 && root.active-account-local-id != "") || (index == 2 && root.color-room-available);
                                 text: scope;
-                                label: "Edit colors for " + (index == 0 ? "all accounts" : "this account only") + (root.color-scope == index ? ", selected" : "");
+                                label: "Edit colors for " + (index == 0 ? "all accounts" : index == 1 ? "this account only" : "the open room only") + (root.color-scope == index ? ", selected" : "");
                                 ink: root.ink; muted: root.muted; surface: root.color-scope == index ? root.hover : root.elevated;
                                 hover-surface: root.hover; outline: root.color-scope == index ? root.accent : root.divider; text-scale: root.text-scale;
                                 activated => { root.color-scope-chosen(index); }
@@ -6954,6 +7473,20 @@ export component AppWindow inherits Window {
                             text: "Colors you set now apply only while this account is active, over the colors for all accounts. Removing the account removes them.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                             accessible-live-region: polite;
+                        }
+                        if root.color-scope == 2 : Text {
+                            text: root.color-room-available
+                                ? "Colors you set now apply only while " + (root.active-room-name != "" ? root.active-room-name : "this room") + " is open in this account, over the account's colors and the colors for all accounts. Reset removes only this room's color; a color the room does not set follows the account."
+                                : "Open a room of this account to edit its colors.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                        if root.color-show-advanced || root.color-advanced-hidden > 0 : TextAction {
+                            height: 32px * root.text-scale; vertical-stretch: 0;
+                            text: root.color-show-advanced ? "Hide advanced colors" : "Show advanced colors (" + root.color-advanced-hidden + ")";
+                            ink: root.ink; muted: root.muted; surface: root.elevated;
+                            hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.color-advanced-toggled(); }
                         }
                         color-workspace := Rectangle {
                             // Side by side when there is room; stacked at narrow widths or large text.
@@ -7118,6 +7651,8 @@ export component AppWindow inherits Window {
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Message font family · blank follows interface"; family <=> root.appearance-message-font-input;
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
+                        StyleFontSetting { label: "Composer font family · blank follows messages"; family <=> root.appearance-composer-font-input;
+                            ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Monospaced font family · timestamps and security codes"; family <=> root.appearance-mono-font-input;
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         HorizontalLayout {
@@ -7126,7 +7661,7 @@ export component AppWindow inherits Window {
                             TextAction {
                                 text: "Apply fonts"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                                 outline: root.divider; text-scale: root.text-scale;
-                                activated => { root.set-style-fonts(root.appearance-ui-font-input, root.appearance-message-font-input, root.appearance-mono-font-input); }
+                                activated => { root.set-style-fonts(root.appearance-ui-font-input, root.appearance-message-font-input, root.appearance-composer-font-input, root.appearance-mono-font-input); }
                             }
                             TextAction {
                                 text: "Use default fonts"; label: "Use the default interface, message and monospaced fonts";
@@ -7140,8 +7675,56 @@ export component AppWindow inherits Window {
                                 activated => { root.reset-style-fonts(); }
                             }
                         }
+                        HorizontalLayout {
+                            spacing: 8px; alignment: start;
+                            Text {
+                                text: "Browse installed fonts for"; color: root.muted;
+                                font-size: 11px * root.text-scale; vertical-alignment: center;
+                            }
+                            for role[index] in ["Interface", "Messages", "Composer", "Monospaced"] : TextAction {
+                                text: role;
+                                label: "Browse installed fonts for the " + (index == 0 ? "interface" : index == 1 ? "message" : index == 2 ? "composer" : "monospaced") + " font";
+                                ink: root.ink; muted: root.muted;
+                                surface: root.font-browser-open && root.font-browser-role == index ? root.hover : root.elevated;
+                                hover-surface: root.hover;
+                                outline: root.font-browser-open && root.font-browser-role == index ? root.accent : root.divider;
+                                text-scale: root.text-scale;
+                                activated => { root.font-browser-show(index); }
+                            }
+                        }
+                        if root.font-browser-open : FontBrowser {
+                            title: root.font-browser-role-label;
+                            current: root.font-browser-current;
+                            current-missing: root.font-browser-current-missing;
+                            items: root.font-browser-results;
+                            status: root.font-browser-status;
+                            notice: root.font-browser-notice;
+                            previewed: root.font-browser-previewed;
+                            sample-family: root.font-browser-sample-family;
+                            sample-size: root.font-browser-sample-size;
+                            sample-weight: root.font-browser-sample-weight;
+                            sample-text: root.font-browser-sample-text;
+                            sample-label: root.font-browser-sample-label;
+                            monospace-only: root.font-browser-monospace-only;
+                            can-follow: root.font-browser-role == 1 || root.font-browser-role == 2;
+                            query <=> root.font-browser-query;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                            query-edited(text) => { root.font-browser-query-changed(text); }
+                            monospace-toggled => { root.font-browser-monospace-toggled(); }
+                            preview(name) => { root.font-browser-highlight(name); }
+                            choose(name) => { root.font-browser-use(name); }
+                            follow => { root.font-browser-inherit(); }
+                            reread => { root.font-browser-refresh(); }
+                            dismiss => { root.font-browser-close(); }
+                        }
+                        if !root.font-browser-open && root.font-browser-notice != "" : Text {
+                            text: root.font-browser-notice; color: root.muted;
+                            font-size: 11px * root.text-scale; wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
                         Text {
-                            text: "Keys: appearance.font_family, typography.message_font_family and typography.monospace_font_family in config.toml.";
+                            text: "Keys: appearance.font_family, typography.message_font_family, typography.composer_font_family and typography.monospace_font_family in config.toml. Fonts are the same for every account and room.";
                             color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
                         }
                         StyleNumberSetting {
@@ -7188,7 +7771,7 @@ export component AppWindow inherits Window {
                             outline: root.divider; text-scale: root.text-scale;
                             activated => { root.set-sender-weight(0); }
                         }
-                        Text { text: "Available weights depend on your font. Message-body weight and line spacing are not configurable yet.";
+                        Text { text: "Available weights depend on your font. Body weight is in Typography and geometry details. Rich-message line spacing keeps the toolkit default.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Room header"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         for name[index] in ["Full · room header and introduction", "Compact · room header and topic", "Minimal · room name and actions"] : ActionRect {
@@ -9511,7 +10094,7 @@ export component AppWindow inherits Window {
                                 border-width: thread-input.has-focus && StyleTokens.states.composer-focus.present ? StyleTokens.focus-width : 0px;
                                 border-color: root.composer-focus-border;
                                 thread-input := MentionInput {
-                                    font-family: root.message-font-family;
+                                    font-family: root.composer-font-family;
                                     x: 8px; width: parent.width - 16px; height: parent.height;
                                     text <=> root.thread-composer-text; color: root.ink; font-size: root.composer-font-px;
                                     accessible-label: "Reply in thread started by " + root.thread-root-sender;
@@ -9541,7 +10124,7 @@ export component AppWindow inherits Window {
                             }
                             IconAction {
                                 width: 28px; icon: "emoji"; label: "Open emoji picker for thread reply";
-                                ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                ink: root.icon-composer-ink; surface: transparent; hover-surface: root.hover;
                                 enabled: root.mention-ui-allowed && !root.thread-send-pending;
                                 activated => {
                                     if root.sticker-open { root.sticker-dismiss(); }
@@ -9551,7 +10134,7 @@ export component AppWindow inherits Window {
                             }
                             IconAction {
                                 width: 28px; icon: "sticker"; label: "Open sticker picker for this thread";
-                                ink: root.sticker-open && root.sticker-threaded ? root.icon-active-ink : root.icon-ink;
+                                ink: root.sticker-open && root.sticker-threaded ? root.icon-active-ink : root.icon-composer-ink;
                                 selected: root.sticker-open && root.sticker-threaded;
                                 surface: root.panel; hover-surface: root.hover;
                                 enabled: root.mention-ui-allowed && !root.thread-send-pending;
@@ -9563,7 +10146,7 @@ export component AppWindow inherits Window {
                             IconAction {
                                 width: 32px; icon: "Md"; label: root.thread-markdown ? "Thread plain text" : "Thread Markdown";
                                 selected: root.thread-markdown; enabled: !root.thread-send-pending;
-                                ink: root.thread-markdown ? root.icon-active-ink : root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                ink: root.thread-markdown ? root.icon-active-ink : root.icon-composer-ink; surface: transparent; hover-surface: root.hover;
                                 activated => { root.thread-markdown = !root.thread-markdown; root.thread-formatting-changed(root.thread-markdown); thread-input.focus(); }
                             }
                             IconAction {

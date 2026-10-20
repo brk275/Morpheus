@@ -23,6 +23,8 @@
 //! alphabet, and writes through a staging file in the same folder that
 //! replaces the destination atomically. Morpheus rewrites a profile file only
 //! when it is saved, renamed or imported; comments in it are not kept then.
+//! An export ([`export_profile`]) only ever creates a new file; it never
+//! replaces one.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,6 +38,13 @@ use crate::{
     ChatStyle, Config, ConfigError, ConfigStore, Conversation, Density, DetailsSide, Geometry,
     NavigationMode, Problem, SenderColors, ThemeMode, Typography, WindowStyle, diagnostics,
     parse_toml,
+};
+
+mod theme_packs;
+pub use theme_packs::{
+    InstalledPack, MAX_THEME_PACKS, PackError, export_theme_pack, import_theme_pack,
+    install_theme_pack, installed_theme_pack, pack_name_from, parse_theme_pack, read_theme_pack,
+    theme_pack_installed, theme_pack_toml,
 };
 
 /// The profile format this version reads and writes.
@@ -88,6 +97,9 @@ pub enum ProfileError {
     Folder,
     #[error("the chosen file is a link, folder or device; choose another file")]
     Target,
+    /// Exports never replace a file, whatever the system dialog asked.
+    #[error("a file with that name already exists; exports never replace a file, so choose a new name")]
+    TargetExists,
     #[error("the profile could not be saved; the previous file was kept")]
     Write,
     #[error("the profile changed on disk; the list was refreshed")]
@@ -122,6 +134,7 @@ impl ProfileError {
             Self::TooMany => "too-many-profiles",
             Self::Folder => "profiles-folder",
             Self::Target => "export-target",
+            Self::TargetExists => "export-target-exists",
             Self::Write => "write-failed",
             Self::Changed => "changed-on-disk",
         }
@@ -450,15 +463,26 @@ impl StyleProfile {
 }
 
 /// Whether two configurations look the same: the same profile look and the
-/// same per-account theme and colors. Notifications, shortcuts, call modes
-/// and other behavior do not matter here.
+/// same per-account and per-room theme and colors. Notifications, shortcuts,
+/// call modes and other behavior do not matter here.
 pub fn same_look(left: &Config, right: &Config) -> bool {
     let accounts = |config: &Config| {
         config
             .account_overrides
             .iter()
-            .filter(|(_, overrides)| overrides.theme.is_some() || !overrides.colors.is_empty())
-            .map(|(id, overrides)| (id.clone(), overrides.theme, overrides.colors.clone()))
+            .filter(|(_, overrides)| {
+                overrides.theme.is_some()
+                    || !overrides.colors.is_empty()
+                    || !overrides.room_appearance.is_empty()
+            })
+            .map(|(id, overrides)| {
+                (
+                    id.clone(),
+                    overrides.theme,
+                    overrides.colors.clone(),
+                    overrides.room_appearance.clone(),
+                )
+            })
             .collect::<Vec<_>>()
     };
     StyleProfile::from_config("", left) == StyleProfile::from_config("", right)
@@ -829,11 +853,20 @@ pub fn import_profile(path: &Path) -> Result<StyleProfile, ProfileError> {
     StyleProfile::parse(&read_path(path)?)
 }
 
-/// Write `profile` to the file the person chose to export to. An existing
-/// target must be a regular file (the system dialog confirmed replacing it);
-/// a link, folder or device is refused. The write goes to a temporary file
-/// in the same folder that then replaces the target's entry, so a link put
-/// there meanwhile is replaced, never followed.
+/// Write `profile` to a new file at the path the person chose to export to.
+///
+/// An export never replaces anything. Neither the system dialog's answer
+/// nor a check made here is consent bound to what is at that path when the
+/// file is written. So:
+/// - an existing regular file is refused with [`ProfileError::TargetExists`],
+///   and the person chooses a new name;
+/// - a link, folder or device is refused with [`ProfileError::Target`];
+/// - the write goes to a temporary file in the same folder, moved into place
+///   with a no-clobber rename, so anything that appears at the path
+///   meanwhile is kept, never replaced or followed.
+///
+/// On a filesystem with neither a no-clobber rename nor hard links, the
+/// export fails rather than risk replacing a file.
 pub fn export_profile(profile: &StyleProfile, target: &Path) -> Result<(), ProfileError> {
     let raw = profile.to_toml()?;
     if device_path(target) {
@@ -846,15 +879,16 @@ pub fn export_profile(profile: &StyleProfile, target: &Path) -> Result<(), Profi
     if !fs::metadata(parent).is_ok_and(|metadata| metadata.is_dir()) {
         return Err(ProfileError::Target);
     }
-    let replace = match fs::symlink_metadata(target) {
-        Err(error) if error.kind() == ErrorKind::NotFound => false,
-        Ok(metadata) if metadata.is_file() => true,
+    // Only for a precise refusal; the write below never replaces either way.
+    match fs::symlink_metadata(target) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Ok(metadata) if metadata.is_file() => return Err(ProfileError::TargetExists),
         _ => return Err(ProfileError::Target),
-    };
-    match write_atomic(parent, target, &raw, replace) {
+    }
+    match write_atomic(parent, target, &raw, false) {
         Ok(()) => Ok(()),
-        // Created by something else since the check: do not replace it.
-        Err(WriteError::Exists) => Err(ProfileError::Target),
+        // Created by something else since the check: kept, not replaced.
+        Err(WriteError::Exists) => Err(ProfileError::TargetExists),
         Err(WriteError::Failed) => Err(ProfileError::Write),
     }
 }
@@ -1530,6 +1564,11 @@ mod tests {
         config.typography.sender_size = Some(15);
         config.typography.timestamp_size = Some(11);
         config.typography.composer_size = Some(16);
+        // Every optional typography key, so the documented schema and the
+        // profile's leaves can be compared.
+        config.typography.composer_font_family = Some("monospace".into());
+        config.typography.line_height_percent = Some(140);
+        config.typography.body_weight = Some(500);
         config.geometry.control_radius = Some(4);
         config.geometry.input_radius = Some(5);
         config.geometry.composer_radius = Some(6);
@@ -1960,16 +1999,23 @@ mod tests {
     }
 
     #[test]
-    fn export_and_import_round_trip_and_replace_only_regular_files() {
+    fn export_and_import_round_trip_and_never_replace_a_file() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("look.toml");
         let profile = StyleProfile::from_config("Look", &styled());
         export_profile(&profile, &target).unwrap();
         assert_eq!(import_profile(&target).unwrap(), profile);
-        // The system dialog confirmed replacing an existing regular file.
+        // Even when the system dialog asked about replacing it, an existing
+        // file is kept, and the person is asked to choose a new name.
         let other = StyleProfile::named("Other");
-        export_profile(&other, &target).unwrap();
-        assert_eq!(import_profile(&target).unwrap(), other);
+        let error = export_profile(&other, &target).unwrap_err();
+        assert!(matches!(error, ProfileError::TargetExists));
+        assert_eq!(error.code(), "export-target-exists");
+        assert!(error.to_string().contains("choose a new name"));
+        assert_eq!(import_profile(&target).unwrap(), profile);
+        let renamed = directory.path().join("other.toml");
+        export_profile(&other, &renamed).unwrap();
+        assert_eq!(import_profile(&renamed).unwrap(), other);
         assert!(matches!(
             import_profile(&directory.path().join("absent.toml")),
             Err(ProfileError::Missing)

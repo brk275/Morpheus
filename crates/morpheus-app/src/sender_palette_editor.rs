@@ -324,7 +324,7 @@ fn composite([red, green, blue, alpha]: [u8; 4], background: [u8; 4]) -> [u8; 4]
 /// The WCAG contrast ratio of `foreground`, composited over the opaque
 /// `background`, against that background. A transparent color is as
 /// readable as the background itself; the stored alpha is never changed.
-fn contrast(foreground: [u8; 4], background: [u8; 4]) -> f64 {
+pub(crate) fn contrast(foreground: [u8; 4], background: [u8; 4]) -> f64 {
     let shown = composite(foreground, background);
     let (first, second) = (relative_luminance(shown), relative_luminance(background));
     (first.max(second) + 0.05) / (first.min(second) + 0.05)

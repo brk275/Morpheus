@@ -54,6 +54,7 @@ mod sso;
 mod startup_error;
 mod stickers;
 mod style_profiles;
+mod theme_studio;
 mod thread_history;
 // Instrumented release builds only (see build.rs); unit tests cover its pure checks.
 #[cfg(any(test, morpheus_timeline_acceptance))]
@@ -897,7 +898,11 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 }
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
-    apply_appearance(ui, config, theme, true);
+    // While the theme studio drafts look changes, they stay shown over the
+    // accepted configuration (see theme_studio).
+    if !theme_studio::show_over_accepted(ui, config, theme) {
+        apply_appearance(ui, config, theme, true);
+    }
     apply_behavior(ui, config);
     style_profiles::config_applied(ui);
 }
@@ -1009,15 +1014,30 @@ fn save_config_change(
 /// `save_config_change` for a change decided on the file as re-read: when
 /// `change` returns false, nothing is written or applied and `None` is
 /// returned without an error, so the caller tells a declined change from a
-/// failed save by what its closure recorded.
+/// failed save by what its closure recorded. Look changes made in Settings,
+/// or while the theme studio holds a draft, join that draft instead of the
+/// file; other settings are written as before.
 fn save_config_edit(
+    ui: &AppWindow,
+    store: &ConfigStore,
+    change: impl FnOnce(&mut Config) -> bool,
+) -> Option<Config> {
+    if theme_studio::routes(ui) {
+        return theme_studio::save(ui, store, change);
+    }
+    write_config_edit(ui, store, change)
+}
+
+/// `save_config_edit` straight to the file, for a change that is itself an
+/// explicit apply of a whole look (a style profile). It is never drafted.
+fn write_config_edit(
     ui: &AppWindow,
     store: &ConfigStore,
     change: impl FnOnce(&mut Config) -> bool,
 ) -> Option<Config> {
     // Read from disk first so an invalid external edit is never overwritten by a UI action.
     let result = (|| {
-        let mut config = store.load()?;
+        let (mut config, revision) = store.load_revision()?;
         let before = style_profiles::previewing().then(|| config.clone());
         if !change(&mut config) {
             return Ok(None);
@@ -1030,8 +1050,11 @@ fn save_config_edit(
         {
             return Ok(None);
         }
-        store.save(&config)?;
-        Ok::<_, morpheus_config::ConfigError>(Some(config))
+        // Written only over the revision the change was decided on. An edit
+        // found in between is kept and reported instead of replaced; the
+        // morpheus-config commit module states the remaining window.
+        store.commit(&config, &revision)?;
+        Ok::<_, morpheus_config::CommitError>(Some(config))
     })();
     match result {
         Ok(None) => None,
@@ -4202,6 +4225,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     metric_editor::register(&ui, &store);
     sender_palette_editor::register(&ui, &store);
     style_profiles::register(&ui, &store);
+    theme_studio::register(&ui, &store);
+    appearance::register_room_hook(&ui);
     settings_search::register(&ui);
     ui.on_choose_theme(move |index| {
         if let Some(ui) = weak.upgrade() {

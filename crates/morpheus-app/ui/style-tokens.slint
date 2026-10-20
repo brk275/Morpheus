@@ -51,6 +51,10 @@ export struct ThemeStateSet {
     composer-focus: ColorRole,
     icon: ColorRole,
     icon-active: ColorRole,
+    icon-navigation: ColorRole,
+    icon-header: ColorRole,
+    icon-composer: ColorRole,
+    icon-message: ColorRole,
     nav-hover: ColorRole,
     nav-selected: ColorRole,
     nav-selected-ink: ColorRole,
@@ -98,6 +102,14 @@ export global StyleTokens {
     in-out property <length> sidebar-font-size: 13px;
     // Zero keeps each surface's own size.
     in-out property <length> sender-font-size: 0px;
+    // Multiplies each font's natural line height on the composer and
+    // plain-text previews; 1 keeps it. Styled (rich) text has no such
+    // setting in this toolkit version and keeps its natural spacing.
+    in-out property <float> line-height-factor: 1;
+    // Default body weight, inherited by rich messages and unweighted text;
+    // explicit heading/sender/Markdown weights stay explicit. Zero keeps
+    // the platform default.
+    in-out property <int> body-font-weight: 0;
     in-out property <length> timestamp-font-size: 10px;
     // Zero follows the message font size.
     in-out property <length> composer-font-size: 0px;

@@ -530,6 +530,42 @@ pub const COLOR_TOKENS: &[ColorToken] = &[
         &["icon", "active", "selected", "send", "toggle"],
     ),
     token(
+        "icon_navigation",
+        Controls,
+        State,
+        Token("icon"),
+        "Navigation icons",
+        "Route icons of the navigation rail and sidebar, such as Home, Explore and Settings. Unset follows Icons.",
+        &["icon", "navigation", "rail", "sidebar", "route"],
+    ),
+    token(
+        "icon_header",
+        Controls,
+        State,
+        Token("icon"),
+        "Header icons",
+        "Conversation header actions such as search, pinned messages, calls and the details panel. Unset follows Icons.",
+        &["icon", "header", "toolbar", "room header"],
+    ),
+    token(
+        "icon_composer",
+        Controls,
+        State,
+        Token("icon"),
+        "Composer icons",
+        "Composer tools such as attach, emoji, stickers and formatting, in the message and thread composers. Unset follows Icons.",
+        &["icon", "composer", "attach", "emoji", "formatting"],
+    ),
+    token(
+        "icon_message",
+        Controls,
+        State,
+        Token("icon"),
+        "Message action icons",
+        "Quick actions on a message, such as reply, edit, react, thread and redact. Unset follows Icons.",
+        &["icon", "message", "reply", "react", "quick actions"],
+    ),
+    token(
         "nav_hover",
         Navigation,
         State,
@@ -732,6 +768,8 @@ pub enum Unit {
     Pixels,
     Percent,
     Milliseconds,
+    /// A CSS-style font weight number; shown without a suffix.
+    Weight,
 }
 
 impl Unit {
@@ -741,6 +779,7 @@ impl Unit {
             Self::Pixels => " px",
             Self::Percent => "%",
             Self::Milliseconds => " ms",
+            Self::Weight => "",
         }
     }
 
@@ -750,6 +789,7 @@ impl Unit {
             Self::Pixels => "logical pixels",
             Self::Percent => "percent",
             Self::Milliseconds => "milliseconds",
+            Self::Weight => "font weight",
         }
     }
 }
@@ -865,7 +905,7 @@ pub fn metric_field(key: &str) -> Option<(&'static FieldSpec, &'static MetricEdi
 
 use FieldKind::{Bool, Integer};
 use MetricGroup::{IconsAndAvatars, Motion, Shapes, Spacing, Text as TextSizes};
-use Unit::{Milliseconds, Percent, Pixels};
+use Unit::{Milliseconds, Percent, Pixels, Weight};
 
 const THEME_MODES: &[&str] = &["dark", "light", "high_contrast", "system"];
 const DENSITIES: &[&str] = &["compact", "comfortable", "spacious"];
@@ -991,7 +1031,13 @@ pub const FIELDS: &[FieldSpec] = &[
         "typography.message_font_family",
         FieldKind::FontFamily,
         "(none)",
-        "Message and composer font family; omitted follows appearance.font_family.",
+        "Message font family, and the composers' unless typography.composer_font_family is set; omitted follows appearance.font_family.",
+    ),
+    field(
+        "typography.composer_font_family",
+        FieldKind::FontFamily,
+        "(none)",
+        "Message and thread composer font family; omitted follows the message font family.",
     ),
     field(
         "typography.monospace_font_family",
@@ -1134,6 +1180,44 @@ pub const FIELDS: &[FieldSpec] = &[
             1,
             &["composer", "input", "typing", "message box", "font size"],
             inherit("Follows the message font size", 14),
+        ),
+    ),
+    metric(
+        field(
+            "typography.line_height_percent",
+            Integer {
+                minimum: 100,
+                maximum: 200,
+            },
+            "(none)",
+            "Line spacing of the composer and plain-text previews, in percent of each font's natural line height; omitted keeps natural spacing. Rich message bodies keep their natural spacing.",
+        ),
+        editor(
+            TextSizes,
+            "Line height",
+            Percent,
+            5,
+            &["line height", "line spacing", "leading", "between lines"],
+            inherit("Natural line spacing", 100),
+        ),
+    ),
+    metric(
+        field(
+            "typography.body_weight",
+            Integer {
+                minimum: 300,
+                maximum: 800,
+            },
+            "(none)",
+            "Default weight for message bodies, composers and other unweighted text, from 300 (light) to 800 (extra bold). Explicit heading, sender and Markdown weights remain; omitted keeps platform defaults.",
+        ),
+        editor(
+            TextSizes,
+            "Body text weight",
+            Weight,
+            100,
+            &["weight", "bold", "light", "heavier", "thin", "body text"],
+            inherit("Each surface's own weight", 400),
         ),
     ),
     metric(
@@ -1659,6 +1743,18 @@ pub const FIELDS: &[FieldSpec] = &[
         "Local highlight words do not mark this room's notifications; Matrix mentions and keywords still do.",
     ),
     field(
+        "account_overrides.<account>.room_appearance.<room>.theme",
+        FieldKind::Enum(THEME_MODES),
+        "(none)",
+        "Base palette while this room of this account is open; omitted inherits the account's, then the global one. At most 64 rooms per account.",
+    ),
+    field(
+        "account_overrides.<account>.room_appearance.<room>.colors.<token>",
+        FieldKind::Color,
+        "(none)",
+        "Color override while this room of this account is open, drawn over the account's and the global colors; removing the account removes it.",
+    ),
+    field(
         "colors.<token>",
         FieldKind::Color,
         "(none)",
@@ -1780,12 +1876,59 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         ],
     ),
     target(
+        "appearance.variations",
+        APPEARANCE,
+        "Settings › Appearance › Starting points › Variations",
+        "Starting point variations",
+        "Try a compact, large-print, soft, wide or high-contrast variation of a starting point before applying it.",
+        &[
+            "variation",
+            "variations",
+            "large print",
+            "contrast reading",
+            "nocturne compact",
+            "terminal soft",
+            "paper wide",
+        ],
+    ),
+    target(
+        "appearance.studio",
+        APPEARANCE,
+        "Settings › Appearance",
+        "Unsaved appearance changes",
+        "Look changes made in Settings are a draft: apply, discard, undo or reset a section.",
+        &[
+            "draft",
+            "unsaved",
+            "apply changes",
+            "discard",
+            "undo",
+            "redo",
+            "reset section",
+            "revert",
+        ],
+    ),
+    target(
         "appearance.style_profiles",
         APPEARANCE,
         "Settings › Appearance › Style profiles",
         "Style profiles",
         "Save, preview, import and export named looks.",
         &["profile", "saved look", "import", "export", "share look"],
+    ),
+    target(
+        "appearance.theme_packs",
+        APPEARANCE,
+        "Settings › Appearance › Theme packs",
+        "Theme packs",
+        "Import a palette file, preview it and install it, or export the palette in use.",
+        &[
+            "theme pack",
+            "palette file",
+            "import theme",
+            "export theme",
+            "install theme",
+        ],
     ),
     target(
         "appearance.colors",
@@ -1876,7 +2019,7 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         APPEARANCE,
         "Settings › Appearance › Fonts",
         "Font families",
-        "Interface, message and monospaced font families.",
+        "Interface, message, composer and monospaced font families, with a browser of the installed fonts.",
         &[
             "font",
             "typeface",
@@ -1884,6 +2027,9 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             "monospace",
             "serif",
             "typography",
+            "installed fonts",
+            "font browser",
+            "composer font",
         ],
     ),
     target(

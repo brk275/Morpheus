@@ -19,6 +19,24 @@
 //! path. Import and export run the system dialog and the bounded file work on
 //! a worker thread, one at a time; nothing chosen is opened or applied
 //! automatically.
+//!
+//! Scope fences are shared with theme packs (`theme_studio::scope`). Work
+//! captures its scope (appearance epoch, account, operation) before its
+//! first asynchronous step:
+//! - Import, before its dialog: the answer adds a profile only while that
+//!   scope is current.
+//! - A preview, when it starts: Apply from the preview bar checks it again
+//!   itself before writing, and the account hook cancels a preview whose
+//!   scope ended (an account switch, A -> B -> A included, a detach or a new
+//!   settings context).
+//! - Export, before its dialog: the write is admitted only in that scope,
+//!   and only while the profile file still holds exactly what was captured.
+//!   The admitted write runs on a worker, never the UI thread, with the
+//!   dialog permit held, and is reported once. If the scope changed while it
+//!   ran, it is reported without naming the profile, and never as "nothing
+//!   written" after a real write.
+//! A system file dialog cannot be cancelled from here; a stale answer is
+//! ignored.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -34,6 +52,7 @@ use morpheus_config::{
 };
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
+use crate::theme_studio::scope::{self, Scope};
 use crate::{AppWindow, StyleProfileItem, StyleProfileState};
 
 const MAX_FILTER_CHARS: usize = 64;
@@ -64,7 +83,9 @@ struct Preview {
     profile: StyleProfile,
     theme: Option<ThemePack>,
     base: (Config, Option<ThemePack>),
-    account: String,
+    /// Captured when the preview started; Apply from the preview bar acts
+    /// only while it is current.
+    scope: Scope,
 }
 
 struct State {
@@ -77,6 +98,9 @@ struct State {
     selected: Option<ProfileFile>,
     confirm: Confirm,
     preview: Option<Preview>,
+    /// The export admitted in this scope whose write is running on a
+    /// worker; reported once when it ends.
+    writing: Option<Scope>,
     truncated: bool,
     message: String,
     error: bool,
@@ -93,6 +117,7 @@ impl Default for State {
             selected: None,
             confirm: Confirm::None,
             preview: None,
+            writing: None,
             truncated: false,
             message: String::new(),
             error: false,
@@ -111,10 +136,12 @@ thread_local! {
 /// One system file dialog, with its file work, at a time.
 static DIALOG: AtomicBool = AtomicBool::new(false);
 
-struct DialogPermit;
+/// Held while a system file dialog and its file work run; style profiles
+/// and theme packs share it, so only one dialog is open at a time.
+pub(crate) struct DialogPermit;
 
 impl DialogPermit {
-    fn acquire() -> Option<Self> {
+    pub(crate) fn acquire() -> Option<Self> {
         DIALOG
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -692,7 +719,16 @@ fn theme_problem(error: &ConfigError) -> &'static str {
     }
 }
 
+const DRAFT_FIRST: &str = "Apply or discard your unsaved appearance changes first.";
+
 fn start_preview(ui: &AppWindow) {
+    // A preview, the theme studio's draft and a theme pack preview all own
+    // the shown look.
+    if crate::theme_studio::drafting() || crate::theme_studio::pack_previewing() {
+        set_message(DRAFT_FIRST, true);
+        project(ui);
+        return;
+    }
     let Some(file) = selected_file(ui) else {
         return;
     };
@@ -733,19 +769,25 @@ fn start_preview(ui: &AppWindow) {
             return;
         }
     };
-    let account = ui.get_active_account_local_id().to_string();
+    let opened = scope::capture(ui);
     let name = profile.name.clone();
     let shown_theme = theme.clone();
+    let previous = with_state(|state| state.preview.take());
+    // A second preview keeps the original base when it belongs to the same
+    // scope.
+    let base = match previous {
+        Some(previous) if scope::current(ui, &previous.scope) => previous.base,
+        _ => base,
+    };
     with_state(|state| {
         state.confirm = Confirm::None;
-        let base = state.preview.take().map_or(base, |previous| previous.base);
         state.preview = Some(Preview {
             file,
             name: name.clone(),
             profile,
             theme: shown_theme,
             base,
-            account,
+            scope: opened,
         });
     });
     ui.set_style_profile_notice("".into());
@@ -777,6 +819,11 @@ fn cancel_preview(ui: &AppWindow, note: &str) {
 /// Apply the previewed profile (`previewed`) or the selected one. Either way
 /// a preview ends first, without restoring it: the save shows the new look.
 fn apply(ui: &AppWindow, previewed: bool) {
+    if crate::theme_studio::drafting() {
+        set_message(DRAFT_FIRST, true);
+        project(ui);
+        return;
+    }
     let (Some(store), Some(config_store)) =
         with_state(|state| (state.profiles.clone(), state.config.clone()))
     else {
@@ -785,14 +832,25 @@ fn apply(ui: &AppWindow, previewed: bool) {
     // The preview bar applies exactly the look it shows, not the file as it
     // is now; the Settings card applies the selected profile's file.
     let profile = if previewed {
-        let Some(profile) = with_state(|state| {
+        let Some((profile, opened)) = with_state(|state| {
             state
                 .preview
                 .as_ref()
-                .map(|preview| preview.profile.clone())
+                .map(|preview| (preview.profile.clone(), preview.scope.clone()))
         }) else {
             return;
         };
+        // The preview's own scope, checked here rather than trusting that
+        // every change was notified. Nothing has been written yet.
+        if !scope::current(ui, &opened) {
+            cancel_preview(ui, "");
+            notify(
+                ui,
+                "The preview ended because the account or settings changed. Nothing was applied.",
+                false,
+            );
+            return;
+        }
         profile
     } else {
         let Some(file) = selected_file(ui) else {
@@ -824,7 +882,8 @@ fn apply(ui: &AppWindow, previewed: bool) {
     // End the preview without restoring it: the save below applies the same
     // look, and the save guard must not treat it as an edit made during it.
     let preview = with_state(|state| state.preview.take());
-    let saved = crate::save_config_edit(ui, &config_store, |config| {
+    // Applying a profile is itself the explicit save of a whole look.
+    let saved = crate::write_config_edit(ui, &config_store, |config| {
         profile.apply_to(config);
         true
     });
@@ -924,14 +983,13 @@ pub(crate) fn keeps_preview(ui: &AppWindow, loaded: &LoadedConfig) -> bool {
     }
 }
 
-/// Called whenever the active account is published. A preview started for
-/// another account, or before a detach, is cancelled.
+/// Called whenever the active account is published. A preview whose scope
+/// ended (another account, A -> B -> A, a detach or a new settings context)
+/// is cancelled.
 pub(crate) fn check_account(ui: &AppWindow) {
-    let changed = with_state(|state| {
-        state.preview.as_ref().is_some_and(|preview| {
-            preview.account.as_str() != ui.get_active_account_local_id().as_str()
-        })
-    });
+    scope::observe(ui);
+    let changed = with_state(|state| state.preview.as_ref().map(|preview| preview.scope.clone()))
+        .is_some_and(|opened| !scope::current(ui, &opened));
     if changed {
         cancel_preview(ui, "");
         notify(ui, "Switching accounts cancelled the preview.", false);
@@ -947,8 +1005,11 @@ fn import(ui: &AppWindow) {
         project(ui);
         return;
     };
+    // Captured before the dialog opens: its answer belongs to this scope.
+    let opened = scope::begin_dialog(ui);
     ui.set_style_profile_busy(true);
     let weak = ui.as_weak();
+    let dialog_scope = opened.clone();
     let spawned = std::thread::Builder::new()
         .name("morpheus-style-profile-import".into())
         .spawn(move || {
@@ -957,21 +1018,38 @@ fn import(ui: &AppWindow) {
                 .set_title("Import a style profile")
                 .add_filter("Morpheus style profile", &["toml"])
                 .pick_file();
+            // Reading the chosen file writes nothing; whether it is added is
+            // decided on the UI thread.
             let result = chosen.map(|path| {
                 style_profiles::import_profile(&path).map_err(|error| error.to_string())
             });
             drop(permit);
-            let _ = weak.upgrade_in_event_loop(move |ui| finish_import(&ui, result));
+            let _ =
+                weak.upgrade_in_event_loop(move |ui| finish_import(&ui, dialog_scope, result));
         });
     if spawned.is_err() {
+        scope::finish_dialog(ui, &opened);
         ui.set_style_profile_busy(false);
         set_message("The file dialog could not open.", true);
         project(ui);
     }
 }
 
-fn finish_import(ui: &AppWindow, result: Option<Result<StyleProfile, String>>) {
+/// The import dialog opened in `opened` returned. Its answer is added to
+/// the profiles only while that scope is current; a stale answer is ignored
+/// and says so.
+fn finish_import(ui: &AppWindow, opened: Scope, result: Option<Result<StyleProfile, String>>) {
     ui.set_style_profile_busy(false);
+    if !scope::finish_dialog(ui, &opened) {
+        if result.is_some() {
+            set_message(
+                "The profile you chose was not imported because the account or settings changed while the file dialog was open. Nothing was added.",
+                false,
+            );
+            project(ui);
+        }
+        return;
+    }
     match result {
         None => {}
         Some(Err(problem)) => {
@@ -1004,12 +1082,15 @@ fn export(ui: &AppWindow) {
         project(ui);
         return;
     };
+    // Captured before the dialog opens; the write is admitted only in this
+    // scope (see finish_export).
+    let opened = scope::begin_dialog(ui);
     ui.set_style_profile_busy(true);
     let suggested = style_profiles::export_file_name(&profile.name);
     let documents = directories::UserDirs::new()
         .and_then(|dirs| dirs.document_dir().map(std::path::Path::to_path_buf));
-    let name = profile.name.clone();
     let weak = ui.as_weak();
+    let dialog_scope = opened.clone();
     let spawned = std::thread::Builder::new()
         .name("morpheus-style-profile-export".into())
         .spawn(move || {
@@ -1020,30 +1101,131 @@ fn export(ui: &AppWindow) {
             if let Some(documents) = documents {
                 dialog = dialog.set_directory(documents);
             }
-            // The system dialog asks before replacing an existing file.
-            let result = dialog.save_file().map(|path| {
-                style_profiles::export_profile(&profile, &path).map_err(|error| error.to_string())
+            // Only the chosen path leaves this thread; the write is admitted
+            // on the UI thread, and the permit goes with it.
+            let chosen = dialog.save_file();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                finish_export(&ui, dialog_scope, file, profile, chosen, permit);
             });
-            drop(permit);
-            let _ = weak.upgrade_in_event_loop(move |ui| finish_export(&ui, &name, result));
         });
     if spawned.is_err() {
+        scope::finish_dialog(ui, &opened);
         ui.set_style_profile_busy(false);
         set_message("The file dialog could not open.", true);
         project(ui);
     }
 }
 
-fn finish_export(ui: &AppWindow, name: &str, result: Option<Result<(), String>>) {
-    ui.set_style_profile_busy(false);
-    match result {
-        None => return,
-        Some(Ok(())) => set_message(format!("Exported {}.", shown_name(name)), false),
-        Some(Err(problem)) => {
-            set_message(format!("Could not export the profile: {problem}."), true)
-        }
+/// The export dialog opened in `opened` returned with `chosen`: the
+/// admission boundary.
+///
+/// The write is admitted only while that scope is current and `file` still
+/// holds exactly `profile`. Otherwise nothing is written, and the message
+/// says so. An admitted write runs on a worker with `permit` held and is
+/// reported by [`finish_write`]. Whatever the system dialog asked about an
+/// existing file, the export never replaces one: it asks for a new name
+/// instead.
+fn finish_export(
+    ui: &AppWindow,
+    opened: Scope,
+    file: ProfileFile,
+    profile: StyleProfile,
+    chosen: Option<std::path::PathBuf>,
+    permit: DialogPermit,
+) {
+    let admitted = scope::finish_dialog(ui, &opened);
+    let Some(path) = chosen else {
+        ui.set_style_profile_busy(false);
+        return;
+    };
+    if !admitted {
+        ui.set_style_profile_busy(false);
+        set_message(
+            "The profile was not exported because the account or settings changed while the file dialog was open. Nothing was written.",
+            false,
+        );
+        project(ui);
+        return;
     }
+    let unchanged = store().is_some_and(|store| store.read(&file).is_ok_and(|now| now == profile));
+    if !unchanged {
+        ui.set_style_profile_busy(false);
+        set_message(
+            "The profile changed while the file dialog was open. Nothing was written; export again.",
+            true,
+        );
+        project(ui);
+        return;
+    }
+    // Admitted. From here the write is under way and will be reported.
+    with_state(|state| state.writing = Some(opened.clone()));
+    let name = profile.name.clone();
+    let weak = ui.as_weak();
+    let spawned = std::thread::Builder::new()
+        .name("morpheus-style-profile-write".into())
+        .spawn(move || {
+            let result =
+                style_profiles::export_profile(&profile, &path).map_err(|error| error.to_string());
+            drop(permit);
+            let _ = weak.upgrade_in_event_loop(move |ui| finish_write(&ui, opened, name, result));
+        });
+    if spawned.is_err() {
+        with_state(|state| state.writing = None);
+        ui.set_style_profile_busy(false);
+        set_message("The profile export could not start. Nothing was written.", true);
+        project(ui);
+    }
+}
+
+/// The admitted export of `admitted` ended. It is reported once, in place
+/// while its scope is current. Otherwise it is reported without naming the
+/// profile, stating only what happened to the file.
+fn finish_write(ui: &AppWindow, admitted: Scope, name: String, result: Result<(), String>) {
+    let ours = with_state(|state| state.writing.take_if(|writing| *writing == admitted).is_some());
+    if !ours {
+        return;
+    }
+    ui.set_style_profile_busy(false);
+    let failed = result.is_err();
+    let text = match (result, scope::current(ui, &admitted)) {
+        (Ok(()), true) => format!("Exported {}.", shown_name(&name)),
+        // Every export error is a refusal or a failed no-clobber write that
+        // removed its staged file: nothing is at the chosen path.
+        (Err(problem), true) => {
+            format!("Could not export the profile: {problem}. Nothing was written.")
+        }
+        (Ok(()), false) => "A profile export started before the account or settings changed has finished; the file was written.".to_owned(),
+        (Err(_), false) => "A profile export started before the account or settings changed could not be written. Nothing was written.".to_owned(),
+    };
+    set_message(text, failed);
     project(ui);
+}
+
+/// Deliver an import dialog's answer for `opened`, as the dialog thread does.
+#[cfg(test)]
+pub(crate) fn finish_import_for_test(ui: &AppWindow, opened: Scope, profile: StyleProfile) {
+    finish_import(ui, opened, Some(Ok(profile)));
+}
+
+/// Deliver an export dialog's answer for `opened` and the selected profile,
+/// as the dialog thread does, holding the permit and busy state as export()
+/// does. Returns false when no profile is selected.
+#[cfg(test)]
+pub(crate) fn finish_export_for_test(
+    ui: &AppWindow,
+    opened: Scope,
+    chosen: std::path::PathBuf,
+) -> bool {
+    let Some(file) = with_state(|state| state.selected.clone()) else {
+        return false;
+    };
+    let Some(profile) = store().and_then(|store| store.read(&file).ok()) else {
+        return false;
+    };
+    let permit = DialogPermit::acquire().expect("no other file dialog in the test");
+    ui.set_style_profile_busy(true);
+    finish_export(ui, opened, file, profile, Some(chosen), permit);
+    true
 }
 
 #[cfg(test)]

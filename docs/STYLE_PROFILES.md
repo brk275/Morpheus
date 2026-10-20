@@ -47,7 +47,8 @@ account is active.
   Delete asks first and never changes your current look.
 - **Import…** reads a profile file you choose and adds it to the list. It is
   not applied; preview it first. **Export…** writes the selected profile to a
-  file you choose; the system dialog asks before replacing a file.
+  new file you choose. It never replaces an existing file, even when the
+  system dialog asked about replacing it: choose a new name instead.
 
 ## Where profiles are stored
 
@@ -75,9 +76,13 @@ Imports refuse links, junctions, folders and devices, also when one replaces
 the chosen file while it is opened. On Windows that means any reparse point,
 including files kept as cloud placeholders in a synced folder such as a
 OneDrive Documents folder: copy such a file to a local folder to import it.
-Exports may replace a cloud file; a link at the target is replaced, never
-followed. Every write goes to a temporary file in the same folder that then
-replaces the target, so a failed write keeps the previous file.
+Exports never replace anything. An existing file, link, folder or device at
+the chosen path is refused, and the new file is moved into place with a
+no-clobber rename, so a file that appears there meanwhile is kept. On a
+filesystem without a no-clobber rename or hard links, the export fails
+instead. Every write in the profiles folder goes to a temporary file in the
+same folder that then replaces the target, so a failed write keeps the
+previous file.
 
 ## File format
 
@@ -114,8 +119,8 @@ colors = ["#2E684A", "#80552C", "#625684"]
 ```
 
 Ready-to-import examples are in
-[`examples/style-profiles`](../examples/style-profiles): Harbor, Ledger and
-Lantern, checked by the configuration tests.
+[`examples/style-profiles`](../examples/style-profiles): Harbor, Ledger,
+Lantern and Meadow, checked by the configuration tests.
 
 `profile_version = 1` and `name` (1 to 48 characters, without line breaks or
 control, zero-width or bidirectional formatting characters) are required. The accepted

@@ -68,6 +68,16 @@ your `config.toml` rather than replacing it, then adjust from Settings.
 Custom colors are applied as written; check contrast with your own surfaces
 and text scale. Beacon keeps the built-in high-contrast colors.
 
+### Theme studio
+
+Look changes made in Settings are a draft: they show at once and are saved
+only by **Apply** in the bar at the top, with Undo, Redo and Discard, a
+per-section reset and an explicit choice when the settings file changed the
+same setting meanwhile. Text size, Reduce motion, the focus ring and behavior
+settings still save at once. Five variations of the starting points (Nocturne
+Compact, Nocturne Large Print, Terminal Soft, Paper Wide, Contrast Reading)
+can be tried the same way. See [theme studio](THEME_STUDIO.md).
+
 ### Style profiles
 
 **Settings → Appearance → Style profiles** saves the look you see under a
@@ -301,7 +311,8 @@ edit, so spelling mistakes do not silently become inactive settings.
 | Field | Default | Accepted values / effect |
 | --- | --- | --- |
 | `appearance.font_family` | `"Inter"` | Interface font family |
-| `typography.message_font_family` | Omitted | Message and composer family; omission follows the interface font |
+| `typography.message_font_family` | Omitted | Message family, and the composers' unless set below; omission follows the interface font |
+| `typography.composer_font_family` | Omitted | Message and thread composer family; omission follows the message family |
 | `typography.monospace_font_family` | `"monospace"` | Timestamp and security-code family |
 | `typography.message_size` | `14` | 10–32 logical pixels before text scaling |
 | `typography.sender_weight` | Omitted | 100–900; sender-name weight in the timeline and thread headings/replies; omission preserves each surface's existing weight |
@@ -329,9 +340,42 @@ usable generic family is available, the renderer uses its normal fallback,
 which may have different metrics or a proportional design. Missing named families
 also use that fallback. Resolution runs again on each configuration reload.
 In Settings,
-leave the message family blank to inherit the interface font and choose
-**Apply fonts**. In TOML, omit `message_font_family` to inherit; an explicitly
-empty string is invalid.
+leave the message family blank to inherit the interface font, or the composer
+family blank to follow the message font, and choose **Apply fonts**. In TOML,
+omit `message_font_family` or `composer_font_family` to inherit; an
+explicitly empty string is invalid. Fonts are the same for every account and
+room: account and room levels hold theme and colors only.
+
+**Browse installed fonts** (Interface, Messages, Composer, Monospaced) opens a
+list for that role inside the Fonts card:
+- It lists the families of the font collection the window draws with, read
+  on a background thread. No folder is walked and nothing is downloaded.
+- `sans-serif`, `serif` and `monospace` are listed first, with the family
+  each resolves to now.
+- Search matches every typed word. **Monospaced only** keeps the families
+  the system lists as monospace and those named "… Mono". That is not a
+  measurement of glyph widths.
+- The list holds at most 4096 families and shows at most 200 matches, and it
+  says how many it left out.
+- Selecting a family shows a sample at the role's own size and weight, and
+  says when the family has no font of that weight (the renderer then uses
+  the nearest one). Nothing is written until **Use**.
+- **Use** writes the role's key through the normal Settings path. On the
+  Settings page the theme studio drafts it (shown at once, saved by
+  **Apply** in the bar). **Follow the inherited font** removes the message
+  or composer value; **Use the built-in font** returns the interface or
+  monospaced font to its default.
+- **Refresh cached list** reads the font families already known to the app,
+  including application fonts. The toolkit keeps a snapshot of system fonts:
+  restart Morpheus after installing or removing them. A family typed by hand
+  that is absent from the snapshot is kept as typed and shown as not found;
+  the renderer uses a fallback.
+- The list closes when the account changes (including switching away and
+  back) or is detached, and a choice made after such a change is refused.
+
+Rich message bodies are drawn as styled text, which has no line spacing
+setting in the toolkit; `typography.line_height_percent` applies to the
+composer and plain-text previews only.
 
 Sender weight is independent of message-body formatting. Choose a number in
 Settings or **Restore sender weight defaults** to remove the override. Omission
@@ -409,10 +453,11 @@ nickname_alignment = "right"
 The appearance controls cover the main conversation, navigation, composer and
 reusable controls. Some call and modal surfaces still have fixed geometry.
 Theme packs add optional semantic colors and a sender-name palette to the
-original eleven color tokens; see [Theme files](#theme-files). Message-body font
-weights, line-height controls, background images and arbitrary pane arrangements
-remain future work. The pinned rich-text component does not expose body-weight
-or line-height controls. Theme packs cannot execute code.
+original eleven color tokens; see [Theme files](#theme-files). Default body
+weight reaches rich messages through the window's font inheritance. Rich-message
+line spacing and background images remain future work. Pane order, visibility
+and collapse are covered by [Pane arrangement](#pane-arrangement). Theme packs
+cannot execute code.
 
 ### Typography and geometry details
 
@@ -435,6 +480,8 @@ value, so removing it from the file restores the previous look.
 | `typography.sender_size` | Omitted | 10–32 | Timeline sender names in every layout; omitted follows each layout's message-based size |
 | `typography.timestamp_size` | Omitted | 8–20 | Timeline clocks and thread-reply clocks; omitted keeps 10 |
 | `typography.composer_size` | Omitted | 10–32 | Message and thread composer text and the composer placeholder; omitted follows `message_size` |
+| `typography.line_height_percent` | Omitted | 100–200 | Line spacing of the message and thread composers, in percent of the font's natural line height; omitted keeps it natural. Message bodies keep their natural spacing: they are styled text, which has no line spacing setting in this toolkit version |
+| `typography.body_weight` | Omitted | 300–800 | Default weight for rich message bodies, composers and other text without an explicit weight; omitted keeps platform defaults. Heading, sender and Markdown span weights remain explicit |
 | `geometry.control_radius` | Omitted | 0–24 | Text buttons and icon buttons; omitted keeps their share of `corner_radius` |
 | `geometry.input_radius` | Omitted | 0–24 | The text fields listed for `input_padding`; omitted keeps each field's corners |
 | `geometry.composer_radius` | Omitted | 0–32 | Message and thread composers |
@@ -465,9 +512,9 @@ grow with large text instead of clipping.
 High contrast draws borders at least one pixel wide even when `border_width` is
 `0`; other palettes respect `0`. Starting points reset these metrics to their
 defaults like other typography and geometry, except `focus_width`, which they
-keep as an accessibility choice. Message bodies use the pinned rich-text
-component, which has no line-height or body-weight property, and the composer
-is a single-line field, so line spacing is not offered.
+keep as an accessibility choice. Rich message bodies inherit the default body
+weight from the window. Their line spacing remains the toolkit default;
+`line_height_percent` controls composer and plain-preview spacing.
 
 ```toml
 [typography]
@@ -592,6 +639,46 @@ fonts, geometry, sender palettes and layout remain global.
 Invalid edits keep the last valid configuration, including each account's
 last valid theme, until the file is valid again. The override is a local
 presentation preference; it is not written to Matrix.
+
+## Per-room appearance
+
+A room can have its own theme mode and colors in one account. Precedence is
+global -> account -> room: while the room is open, its values draw over the
+account's, which draw over the global ones. A value a level omits inherits
+from the level below; there is no other merging.
+
+```toml
+[account_overrides."<local account ID>".room_appearance."!room:example.org"]
+theme = "light"
+
+[account_overrides."<local account ID>".room_appearance."!room:example.org".colors]
+accent = "#C46A3F"
+```
+
+- Keys are the local account ID, then the Matrix room ID (quoted, because
+  room IDs contain `!` and `:`). Invalid room IDs, unknown color tokens and
+  any other key are refused. Error messages never repeat an account or room
+  ID.
+- Each account holds at most 64 rooms with their own appearance. A room that
+  sets nothing is not stored.
+- In **Settings → Appearance → Colors and window**, choose **This room**
+  (available while an account is active and a room is open) to edit the open
+  room's colors. Reset removes only that room's color, so it follows the
+  account again; Reset all removes all of that room's colors.
+- The editor stays on the room it shows. If the open room changes before the
+  editor has shown the new one, the edit is refused and nothing is written;
+  check the color and try again. With **This room** chosen and no room open,
+  nothing is edited.
+- A room's theme mode is set in `config.toml`. The theme picker notice names
+  a room override while that room is open.
+- Room settings are drafted by the theme studio like any look setting, and
+  belong to their account: switching accounts drops another account's
+  drafted room colors.
+- Removing or logging out of an account removes its rooms' appearance with
+  the rest of its appearance. The global and account levels keep working
+  with no account active (offline settings).
+- Files without `room_appearance` load unchanged. Older versions of the app
+  refuse a file that uses it, as with any newer key.
 
 ## Notifications
 
@@ -784,6 +871,10 @@ presets look exactly as before.
 | `composer_focus` | Composer border while typing; setting it also outlines the focused thread composer | Follows `composer_border` |
 | `icon` | Quiet icon buttons: message actions, composer tools, room header actions | Follows `muted` |
 | `icon_active` | Primary or switched-on icons such as Send and open pickers | Follows `accent` |
+| `icon_navigation` | Route icons of the navigation rail and sidebar (Home, Explore, Calls, Settings, create or join) | Follows `icon` |
+| `icon_header` | Conversation header actions (room settings, search, pinned messages, call, details panel) | Follows `icon` |
+| `icon_composer` | Composer tools in the message and thread composers (attach, emoji, stickers, formatting, cancel reply) | Follows `icon` |
+| `icon_message` | Quick actions on a message (reply, edit, react, thread, redact) | Follows `icon` |
 | `nav_hover` | Room, direct message, route and Space rows under the pointer | Each row's hover color |
 | `nav_selected` | The open room, route or Space | Follows `selection` |
 | `nav_selected_ink` | Its text and icons | Follows `selection_ink` |
@@ -810,7 +901,8 @@ colors = ["#C2AEFA", "#9DD8CD", "#F0C28F", "#ACCEFF"]
 ```
 
 Each row shows a sample name on the conversation background with its hex value.
-A complete `#RRGGBB` or `#RRGGBBAA` value saves at once; partial input only shows
+A complete `#RRGGBB` or `#RRGGBBAA` value applies at once and joins the
+[theme studio](THEME_STUDIO.md) draft until Apply; partial input only shows
 a hint. Colors can be moved earlier or later, removed (one always remains) or
 added up to 16. Undo restores the previous palette only while the file still
 holds the palette you saved, and **Use theme colors** removes your palette.

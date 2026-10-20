@@ -3866,6 +3866,22 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_public_profile_projection(&ui).await;
     phase.set(21);
     assert_room_notification_panel(&ui).await;
+    phase.set(21);
+    assert_theme_studio_draft(&ui, directory.path()).await;
+    assert_behavior_saves_with_broken_theme(&ui, directory.path()).await;
+    phase.set(22);
+    assert_theme_studio_publish_race(&ui, directory.path()).await;
+    phase.set(23);
+    assert_theme_pack_keeps_installed_file(&ui, directory.path()).await;
+    phase.set(24);
+    assert_pack_scope_fences(&ui, directory.path()).await;
+    phase.set(25);
+    assert_style_profile_scope_fences(&ui, directory.path()).await;
+    phase.set(26);
+    assert_room_appearance_scope(&ui, directory.path()).await;
+    // 40: clear of other workers' phase numbers (root also uses 26).
+    phase.set(40);
+    assert_font_browser(&ui, directory.path()).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
@@ -6444,5 +6460,833 @@ async fn assert_room_notification_panel(ui: &AppWindow) {
     ui.set_live_session(live);
     ui.set_active_account_local_id(account);
     ui.set_active_room_id(room);
+    settle(ui).await;
+}
+
+/// The installed font browser fills the existing font roles through the
+/// production controller (a test catalog stands in for the system fonts):
+/// - coalesced search and a monospaced filter;
+/// - a sample-only preview;
+/// - choose and inherit writing only the role's key;
+/// - a hand-typed missing family kept and shown as not found;
+/// - the browser's scope fenced against A -> B -> A and against an account
+///   change no hook reported.
+async fn assert_font_browser(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+
+    let store = ConfigStore::at(directory.join("fonts.toml"));
+    let initial = store.load_or_create().unwrap();
+    let switch = |ui: &AppWindow, account: &str| {
+        ui.set_active_account_local_id(account.into());
+        crate::appearance::apply_theme_mode(ui);
+    };
+    apply_config(ui, &initial, None);
+    switch(ui, "font-a");
+    crate::theme_studio::register(ui, &store);
+    crate::theme_studio::font_catalog_for_test(vec![
+        ("Inter", false, vec![400, 700]),
+        ("JetBrains Mono", true, vec![400]),
+        ("Literata", false, vec![400]),
+    ]);
+    // Direct saves, so the file shows each choice.
+    ui.set_page(0);
+    settle(ui).await;
+    let names = |ui: &AppWindow| -> Vec<String> {
+        ui.get_font_browser_results()
+            .iter()
+            .filter(|item| !item.generic)
+            .map(|item| item.name.to_string())
+            .collect()
+    };
+
+    ui.invoke_font_browser_show(1);
+    assert!(ui.get_font_browser_open());
+    assert!(names(ui).contains(&"JetBrains Mono".to_owned()));
+    assert!(ui.get_font_browser_current().contains("Follows the interface font"));
+    // Typing is searched once it settles.
+    ui.set_font_browser_query("lit".into());
+    ui.invoke_font_browser_query_changed("lit".into());
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(names(ui), ["Literata"]);
+    ui.set_font_browser_query("".into());
+    ui.invoke_font_browser_query_changed("".into());
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    ui.invoke_font_browser_monospace_toggled();
+    assert_eq!(names(ui), ["JetBrains Mono"]);
+    ui.invoke_font_browser_monospace_toggled();
+
+    // Previewing changes only the sample; nothing is written.
+    let before = std::fs::read(store.path()).unwrap();
+    ui.invoke_font_browser_highlight("Literata".into());
+    assert_eq!(ui.get_font_browser_sample_family(), "Literata");
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    // Choosing writes the role's key; the composer follows messages.
+    ui.invoke_font_browser_use("Literata".into());
+    let saved = store.load().unwrap();
+    assert_eq!(saved.typography.message_font_family.as_deref(), Some("Literata"));
+    assert_eq!(saved.appearance.font_family, initial.appearance.font_family);
+    assert_eq!(ui.get_message_font_family(), "Literata");
+    assert_eq!(ui.get_composer_font_family(), "Literata");
+    // Following the inherited font removes only that role's own value.
+    ui.invoke_font_browser_inherit();
+    assert_eq!(store.load().unwrap().typography.message_font_family, None);
+
+    // A family typed by hand that is not installed is kept as typed and
+    // shown as not found.
+    let mut typed = store.load().unwrap();
+    typed.typography.composer_font_family = Some("Not An Installed Face".into());
+    store.save(&typed).unwrap();
+    apply_config(ui, &typed, None);
+    ui.invoke_font_browser_show(2);
+    assert!(ui.get_font_browser_current_missing());
+    assert_eq!(ui.get_composer_font_family(), "Not An Installed Face");
+
+    // The controller samples the body weight that unweighted interface and
+    // rich-message text inherit from the window, and the composers set
+    // explicitly. The regular monospaced sample remains independent.
+    typed.typography.body_weight = Some(600);
+    store.save(&typed).unwrap();
+    apply_config(ui, &typed, None);
+    for (role, weight) in [(0, 600), (1, 600), (2, 600), (3, 400)] {
+        ui.invoke_font_browser_show(role);
+        assert_eq!(ui.get_font_browser_sample_weight(), weight);
+    }
+
+    // A -> B -> A while the browser is open closes it; nothing is chosen.
+    switch(ui, "font-b");
+    switch(ui, "font-a");
+    assert!(!ui.get_font_browser_open());
+    assert!(ui.get_font_browser_notice().contains("account changed"));
+    // An account change no hook reported refuses the choice itself.
+    ui.invoke_font_browser_show(1);
+    ui.set_active_account_local_id("font-b".into());
+    let before = std::fs::read(store.path()).unwrap();
+    ui.invoke_font_browser_use("JetBrains Mono".into());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    assert!(!ui.get_font_browser_open());
+
+    crate::theme_studio::reset_for_test();
+    switch(ui, "");
+    apply_config(ui, &initial, None);
+    settle(ui).await;
+}
+
+/// The color editor's "This room" level: global -> account -> room
+/// precedence on screen, writes only to the open room of the active
+/// account, Reset of that room only, and an edit made after the open room
+/// changed (before the editor showed it) refused rather than moved.
+async fn assert_room_appearance_scope(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+
+    let room = "!harbor:example.org";
+    let other = "!quay:example.org";
+    let store = ConfigStore::at(directory.join("room-scope.toml"));
+    let mut config = store.load_or_create().unwrap();
+    config.colors.insert("link".into(), "#101010".into());
+    config
+        .account_overrides
+        .entry("room-a".into())
+        .or_default()
+        .colors
+        .insert("link".into(), "#202020".into());
+    store.save(&config).unwrap();
+    crate::appearance_editor::register(ui, &store);
+    crate::appearance::register_room_hook(ui);
+    // Direct saves (not drafted), so the file shows each write.
+    ui.set_page(0);
+    let open = |ui: &AppWindow, account: &str, room: &str| {
+        ui.set_active_account_local_id(account.into());
+        ui.set_active_room_id(room.into());
+        crate::appearance::apply_theme_mode(ui);
+    };
+    let link = |ui: &AppWindow| ui.invoke_token_color("link".into());
+    let grey = |value: u8| Color::from_rgb_u8(value, value, value);
+    let room_link = |config: &morpheus_config::Config, account: &str, room: &str| {
+        config
+            .room_appearance(Some(account), Some(room))
+            .and_then(|appearance| appearance.colors.get("link").cloned())
+    };
+    apply_config(ui, &config, None);
+    open(ui, "room-a", room);
+    settle(ui).await;
+    assert_eq!(link(ui), grey(0x20), "the room inherits its account's color");
+
+    // A color set for this room is written to it alone and shows only while
+    // it is open in this account.
+    ui.invoke_color_scope_chosen(2);
+    assert_eq!(ui.get_color_scope(), 2);
+    ui.invoke_color_token_chosen("link".into());
+    ui.invoke_color_hex_edited("#303030".into());
+    settle(ui).await;
+    let saved = store.load().unwrap();
+    assert_eq!(room_link(&saved, "room-a", room).as_deref(), Some("#303030"));
+    assert_eq!(saved.account_overrides["room-a"].colors["link"], "#202020");
+    assert_eq!(saved.colors["link"], "#101010");
+    assert_eq!(link(ui), grey(0x30));
+    open(ui, "room-a", other);
+    settle(ui).await;
+    assert_eq!(link(ui), grey(0x20), "another room inherits the account");
+    open(ui, "room-b", room);
+    settle(ui).await;
+    assert_eq!(link(ui), grey(0x10), "the same room ID in another account");
+
+    // The open room changes and the editor has not shown it yet: the edit
+    // is refused, and neither room changes.
+    open(ui, "room-a", room);
+    ui.invoke_color_scope_chosen(2);
+    settle(ui).await;
+    ui.set_active_room_id(other.into());
+    let before = std::fs::read(store.path()).unwrap();
+    ui.invoke_color_hex_edited("#404040".into());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    assert!(ui.get_color_editor().hint.contains("open room changed"));
+    // Once the editor shows that room, the edit goes to it.
+    crate::appearance::apply_theme_mode(ui);
+    ui.invoke_color_hex_edited("#404040".into());
+    let saved = store.load().unwrap();
+    assert_eq!(room_link(&saved, "room-a", other).as_deref(), Some("#404040"));
+    assert_eq!(room_link(&saved, "room-a", room).as_deref(), Some("#303030"));
+
+    // Reset removes only this room's color; it inherits again.
+    ui.invoke_color_reset();
+    let saved = store.load().unwrap();
+    assert!(saved.room_appearance(Some("room-a"), Some(other)).is_none());
+    assert_eq!(room_link(&saved, "room-a", room).as_deref(), Some("#303030"));
+
+    // Without an open room, "This room" edits nothing.
+    open(ui, "room-a", "");
+    let before = std::fs::read(store.path()).unwrap();
+    ui.invoke_color_hex_edited("#505050".into());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+
+    ui.invoke_color_scope_chosen(0);
+    open(ui, "", "");
+    settle(ui).await;
+}
+
+/// Style profile import, preview, Apply and export carry the same scope
+/// fences as theme packs, through the production controller.
+async fn assert_style_profile_scope_fences(ui: &AppWindow, directory: &std::path::Path) {
+    use crate::style_profiles::{finish_export_for_test, finish_import_for_test};
+    use crate::theme_studio::scope;
+    use morpheus_config::ConfigStore;
+    use morpheus_config::style_profiles::StyleProfile;
+
+    let folder = directory.join("profile-scopes");
+    let store = ConfigStore::at(folder.join("config.toml"));
+    let initial = store.load_or_create().unwrap();
+    let switch = |ui: &AppWindow, account: &str| {
+        ui.set_active_account_local_id(account.into());
+        crate::appearance::apply_theme_mode(ui);
+    };
+    apply_config(ui, &initial, None);
+    switch(ui, "profile-a");
+    crate::style_profiles::register(ui, &store);
+    settle(ui).await;
+    let listed = |ui: &AppWindow| {
+        ui.get_style_profile_items()
+            .iter()
+            .any(|item| item.name.as_str() == "Harbor look")
+    };
+
+    // An import answered after A -> B -> A adds nothing.
+    let opened = scope::begin_dialog(ui);
+    switch(ui, "profile-b");
+    switch(ui, "profile-a");
+    finish_import_for_test(ui, opened, StyleProfile::named("Harbor look"));
+    assert!(!listed(ui));
+    assert!(ui.get_style_profile_message().contains("not imported"));
+    // In its own scope it is added (and selected, never applied).
+    let opened = scope::begin_dialog(ui);
+    finish_import_for_test(ui, opened, StyleProfile::named("Harbor look"));
+    assert!(listed(ui));
+
+    // The preview bar's Apply checks the preview's scope itself: an account
+    // change that no hook reported stops it before anything is written.
+    let before = std::fs::read(store.path()).unwrap();
+    ui.invoke_style_profile_preview();
+    assert!(crate::style_profiles::previewing());
+    ui.set_active_account_local_id("profile-b".into());
+    ui.invoke_style_preview_apply();
+    assert!(!crate::style_profiles::previewing());
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+    switch(ui, "profile-a");
+
+    // An export answered after A -> B -> A is not admitted: nothing written.
+    let target = folder.join("harbor-look.toml");
+    let opened = scope::begin_dialog(ui);
+    switch(ui, "profile-b");
+    switch(ui, "profile-a");
+    assert!(finish_export_for_test(ui, opened, target.clone()));
+    assert!(!target.exists());
+    assert!(ui.get_style_profile_message().contains("Nothing was written"));
+    // In scope, the admitted write runs on a worker and is reported.
+    let opened = scope::begin_dialog(ui);
+    assert!(finish_export_for_test(ui, opened, target.clone()));
+    wait_for(ui, |ui| !ui.get_style_profile_busy()).await;
+    assert!(target.exists());
+    assert!(ui.get_style_profile_message().contains("Exported"));
+
+    switch(ui, "");
+    apply_config(ui, &initial, None);
+    settle(ui).await;
+}
+
+/// Settle the window until `done` holds, for results posted from a worker
+/// thread (an admitted file write).
+async fn wait_for(ui: &AppWindow, done: impl Fn(&AppWindow) -> bool) {
+    for _ in 0..400 {
+        settle(ui).await;
+        if done(ui) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("a worker result did not arrive");
+}
+
+/// Theme pack work is fenced by the scope captured before its file dialog
+/// opened: the appearance epoch, the account and the operation. Each case
+/// drives the production controller through the entry points the dialog
+/// threads use, with the scope from the production helper.
+async fn assert_pack_scope_fences(ui: &AppWindow, directory: &std::path::Path) {
+    use crate::theme_studio::{finish_pack_export_for_test, finish_pack_import_for_test, scope};
+    use morpheus_config::ConfigStore;
+    use morpheus_config::style_profiles::install_theme_pack;
+
+    let folder = directory.join("studio-scopes");
+    let store = ConfigStore::at(folder.join("config.toml"));
+    let initial = store.load_or_create().unwrap();
+    // An account switch as live.rs publishes one: the ID, then the hook.
+    let switch = |ui: &AppWindow, account: &str| {
+        ui.set_active_account_local_id(account.into());
+        crate::appearance::apply_theme_mode(ui);
+    };
+    apply_config(ui, &initial, None);
+    switch(ui, "scope-a");
+    crate::theme_studio::register(ui, &store);
+    settle(ui).await;
+    let mut pack = BuiltInStylePreset::Terminal.theme().unwrap();
+    pack.name = "Harbor".into();
+    let previewed = |ui: &AppWindow| ui.get_studio_pack_preview_name().to_string();
+
+    // A picker opened in A that answers after A -> B -> A starts nothing in
+    // the new context, although the account ID matches again.
+    let opened = scope::begin_dialog(ui);
+    switch(ui, "scope-b");
+    switch(ui, "scope-a");
+    finish_pack_import_for_test(ui, opened, pack.clone());
+    assert_eq!(previewed(ui), "");
+    assert!(ui.get_studio_pack_message().contains("not opened"));
+    // The same answer in an unchanged scope previews.
+    let opened = scope::begin_dialog(ui);
+    finish_pack_import_for_test(ui, opened, pack.clone());
+    assert_eq!(previewed(ui), "Harbor");
+
+    // Apply checks the preview's exact scope itself: an account change that
+    // no hook reported still stops it before anything is written.
+    ui.set_active_account_local_id("scope-b".into());
+    ui.invoke_studio_pack_apply();
+    assert_eq!(previewed(ui), "");
+    assert!(!folder.join("themes").join("harbor.toml").exists());
+    assert_ne!(store.load().unwrap().appearance.theme_pack.as_deref(), Some("harbor"));
+    switch(ui, "scope-a");
+
+    // An export answer after A -> B -> A is not admitted: nothing written.
+    install_theme_pack(&store, "harbor", &pack, None).unwrap();
+    let mut using = store.load().unwrap();
+    using.appearance.theme_pack = Some("harbor".into());
+    store.save(&using).unwrap();
+    apply_config(ui, &using, Some(&pack));
+    let target = folder.join("harbor-export.toml");
+    let opened = scope::begin_dialog(ui);
+    switch(ui, "scope-b");
+    switch(ui, "scope-a");
+    finish_pack_export_for_test(ui, opened, "harbor".into(), pack.clone(), target.clone());
+    assert!(!target.exists());
+    assert!(ui.get_studio_pack_message().contains("Nothing was written"));
+    // Admitted in its own scope, the write runs on a worker (never the UI
+    // thread) and is reported when it ends.
+    let opened = scope::begin_dialog(ui);
+    finish_pack_export_for_test(ui, opened, "harbor".into(), pack.clone(), target.clone());
+    assert!(ui.get_studio_pack_busy(), "admitted and writing");
+    wait_for(ui, |ui| !ui.get_studio_pack_busy()).await;
+    assert!(target.exists());
+    assert!(ui.get_studio_pack_message().contains("Exported"));
+    // An admitted write still finishes when the account changes before it
+    // reports. The result is told without naming the pack, and never as
+    // "nothing written".
+    let admitted_target = folder.join("harbor-admitted.toml");
+    let opened = scope::begin_dialog(ui);
+    finish_pack_export_for_test(ui, opened, "harbor".into(), pack.clone(), admitted_target.clone());
+    switch(ui, "scope-b");
+    wait_for(ui, |ui| !ui.get_studio_pack_busy()).await;
+    assert!(admitted_target.exists());
+    let told = ui.get_studio_pack_message();
+    assert!(told.contains("the file was written"), "{told}");
+    assert!(!told.contains("Harbor"));
+    switch(ui, "scope-a");
+    // A pack in use that changed while the dialog was open is not exported.
+    let stale_target = folder.join("harbor-stale.toml");
+    let mut older = pack.clone();
+    older.name = "Older".into();
+    let opened = scope::begin_dialog(ui);
+    finish_pack_export_for_test(ui, opened, "harbor".into(), older, stale_target.clone());
+    assert!(!stale_target.exists());
+
+    // Detaching to offline settings ends a scope; offline settings work in
+    // their own.
+    let opened = scope::begin_dialog(ui);
+    switch(ui, "");
+    finish_pack_import_for_test(ui, opened, pack.clone());
+    assert_eq!(previewed(ui), "");
+    let opened = scope::begin_dialog(ui);
+    finish_pack_import_for_test(ui, opened, pack.clone());
+    assert_eq!(previewed(ui), "Harbor");
+    ui.invoke_studio_pack_cancel();
+    assert_eq!(previewed(ui), "");
+    // A new settings context ends what the previous one started.
+    let opened = scope::begin_dialog(ui);
+    crate::theme_studio::register(ui, &store);
+    finish_pack_import_for_test(ui, opened, pack);
+    assert_eq!(previewed(ui), "");
+
+    crate::theme_studio::reset_for_test();
+    apply_config(ui, &initial, None);
+    settle(ui).await;
+}
+
+/// An installed name collision is preview-only. Both a stale and a fresh
+/// snapshot are refused; importing under a new name still installs and
+/// applies without changing the original file.
+async fn assert_theme_pack_keeps_installed_file(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+    use morpheus_config::style_profiles::{install_theme_pack, read_theme_pack};
+
+    let folder = directory.join("studio-packs");
+    let store = ConfigStore::at(folder.join("config.toml"));
+    let initial = store.load_or_create().unwrap();
+    apply_config(ui, &initial, None);
+    ui.set_active_account_local_id("".into());
+    crate::theme_studio::register(ui, &store);
+    settle(ui).await;
+    let mut installed = BuiltInStylePreset::Paper.theme().unwrap();
+    installed.name = "Dusk".into();
+    install_theme_pack(&store, "dusk", &installed, None).unwrap();
+    let mut incoming = BuiltInStylePreset::Terminal.theme().unwrap();
+    incoming.name = "Dusk".into();
+
+    crate::theme_studio::preview_pack_for_test(ui, incoming.clone());
+    assert_eq!(ui.get_studio_pack_preview_name(), "Dusk");
+    assert!(ui.get_studio_pack_replaces());
+
+    // Another program edits the installed pack after the offer.
+    let file = folder.join("themes").join("dusk.toml");
+    let edited = format!("{}\n# edited elsewhere\n", std::fs::read_to_string(&file).unwrap());
+    std::fs::write(&file, &edited).unwrap();
+    ui.invoke_studio_pack_apply();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), edited, "nothing is replaced");
+    assert_ne!(store.load().unwrap().appearance.theme_pack.as_deref(), Some("dusk"));
+    assert!(ui.get_studio_pack_message_error());
+    // The preview stays, bound to the file as it is now, and asks again.
+    assert_eq!(ui.get_studio_pack_preview_name(), "Dusk");
+    assert!(ui.get_studio_pack_replaces());
+
+    // Trying again cannot turn the new snapshot into overwrite permission.
+    ui.invoke_studio_pack_apply();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
+    assert_ne!(store.load().unwrap().appearance.theme_pack.as_deref(), Some("dusk"));
+    assert!(ui.get_studio_pack_message().contains("different")
+        || ui.get_studio_pack_message().contains("Change the name"));
+    ui.invoke_studio_pack_cancel();
+
+    // A different name keeps both packs. It can already be selected in the
+    // file while that theme file is missing; installing must still reload it.
+    incoming.name = "NewDusk".into();
+    let mut selecting_missing = store.load().unwrap();
+    selecting_missing.appearance.theme_pack = Some("newdusk".into());
+    store.save(&selecting_missing).unwrap();
+    crate::theme_studio::preview_pack_for_test(ui, incoming.clone());
+    assert!(!ui.get_studio_pack_replaces());
+    ui.invoke_studio_pack_apply();
+    assert_eq!(read_theme_pack(&store, "newdusk").unwrap(), incoming);
+    assert_eq!(store.load().unwrap().appearance.theme_pack.as_deref(), Some("newdusk"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
+    assert_eq!(ui.get_studio_pack_preview_name(), "");
+
+    crate::theme_studio::reset_for_test();
+    apply_config(ui, &initial, None);
+    settle(ui).await;
+}
+
+/// A broken palette file cannot hold notification privacy changes hostage.
+/// Exercise the actual routed save/controller with a real pending draft,
+/// both a missing and malformed theme, and a callback that tries to mix a
+/// behavior change with an appearance change.
+async fn assert_behavior_saves_with_broken_theme(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+    use morpheus_config::style_profiles::install_theme_pack;
+
+    for (case, malformed) in [("missing", false), ("malformed", true)] {
+        let store = ConfigStore::at(directory.join(format!("behavior-{case}/config.toml")));
+        let mut initial = store.load_or_create().unwrap();
+        initial.appearance.theme_pack = Some("behavior-palette".into());
+        initial.notifications.enabled = true;
+        initial.notifications.show_message_preview = true;
+        let pack = BuiltInStylePreset::Paper.theme().unwrap();
+        install_theme_pack(&store, "behavior-palette", &pack, None).unwrap();
+        store.save(&initial).unwrap();
+        ui.set_active_account_local_id("".into());
+        apply_config(ui, &initial, Some(&pack));
+        crate::theme_studio::register(ui, &store);
+        ui.set_page(1);
+        settle(ui).await;
+
+        let radius = if initial.geometry.corner_radius == 4 { 5 } else { 4 };
+        crate::save_config_change(ui, &store, |config| config.geometry.corner_radius = radius)
+            .unwrap();
+        assert_eq!(ui.get_studio_pending(), 1);
+        let shown_accent = ui.invoke_token_color("accent".into());
+        let theme_file = store.theme_path("behavior-palette").unwrap();
+        if malformed {
+            std::fs::write(&theme_file, "not = [valid").unwrap();
+        } else {
+            std::fs::remove_file(&theme_file).unwrap();
+        }
+
+        let saved = crate::save_config_change(ui, &store, |config| {
+            config.notifications.enabled = false;
+            config.notifications.show_message_preview = false;
+        });
+        assert!(saved.is_some(), "{case}: behavior edit must save");
+        let written = store.load().unwrap();
+        assert!(!written.notifications.enabled);
+        assert!(!written.notifications.show_message_preview);
+        assert!(!ui.get_notifications_enabled());
+        assert!(!ui.get_notification_show_preview());
+        assert_eq!(written.geometry.corner_radius, initial.geometry.corner_radius);
+        assert_eq!(ui.get_studio_pending(), 1, "the appearance draft stays pending");
+        assert_eq!(ui.invoke_token_color("accent".into()), shown_accent);
+        assert!(!ui.get_config_error().is_empty(), "the theme error remains visible");
+
+        let before = std::fs::read(store.path()).unwrap();
+        let refused = crate::save_config_change(ui, &store, |config| {
+            config.notifications.enabled = true;
+            config.geometry.corner_radius = radius + 1;
+        });
+        assert!(refused.is_none(), "mixed edits must not enter the behavior fallback");
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        assert_eq!(ui.get_studio_pending(), 1);
+        ui.invoke_studio_apply();
+        assert_eq!(std::fs::read(store.path()).unwrap(), before);
+        assert_eq!(ui.get_studio_pending(), 1, "Apply cannot accept the broken theme");
+        ui.invoke_studio_discard();
+        assert_eq!(ui.get_studio_pending(), 0);
+        assert_eq!(ui.invoke_token_color("accent".into()), shown_accent);
+        assert!(!ui.get_notifications_enabled());
+        assert!(!ui.get_notification_show_preview());
+
+        // The same path works without a pending appearance draft too.
+        crate::save_config_change(ui, &store, |config| config.notifications.sounds = false)
+            .unwrap();
+        assert!(!store.load().unwrap().notifications.sounds);
+        assert!(!ui.get_notification_sounds());
+        assert_eq!(ui.get_studio_pending(), 0);
+        crate::theme_studio::reset_for_test();
+        ui.set_config_error("".into());
+        ui.invoke_studio_notice_dismiss();
+        apply_config(ui, &Config::default(), None);
+        ui.set_page(0);
+        settle(ui).await;
+    }
+}
+
+/// Apply and routed behavior saves commit only over the revision of the
+/// file they were decided on. Each case places another program's edit at
+/// the real pre-publish boundary (staged and locked, immediately before the
+/// comparison and the rename). That version stays in the file byte for
+/// byte, the draft stays pending, and the person then chooses.
+async fn assert_theme_studio_publish_race(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+
+    let store = ConfigStore::at(directory.join("studio-race.toml"));
+    let initial = store.load_or_create().unwrap();
+    apply_config(ui, &initial, None);
+    ui.set_active_account_local_id("".into());
+    crate::theme_studio::register(ui, &store);
+    ui.set_page(1);
+    settle(ui).await;
+    let on_disk = || std::fs::read_to_string(store.path()).unwrap();
+    // The other program's version is rendered beforehand by a scratch store
+    // and written with std::fs at the boundary, where no ConfigStore may
+    // write.
+    let scratch = ConfigStore::at(directory.join("studio-race-external.toml"));
+    let other_version = |config: &Config| {
+        scratch.save(config).unwrap();
+        let text = std::fs::read_to_string(scratch.path()).unwrap();
+        let edit = text.clone();
+        crate::theme_studio::before_next_publish_for_test(move |path| {
+            std::fs::write(path, edit).unwrap();
+        });
+        text
+    };
+
+    // The other version also changed the drafted setting: nothing is
+    // written, the draft is kept, and the choice is offered at once.
+    crate::save_config_change(ui, &store, |config| config.geometry.corner_radius = 4).unwrap();
+    assert_eq!(ui.get_studio_pending(), 1);
+    let mut other = store.load().unwrap();
+    other.geometry.corner_radius = 11;
+    other.typography.message_size += 1;
+    let other_text = other_version(&other);
+    ui.invoke_studio_apply();
+    assert_eq!(on_disk(), other_text, "the intervening version is kept");
+    assert_eq!(ui.get_studio_pending(), 1, "the draft is kept");
+    assert_eq!(ui.get_studio_conflicts(), 1);
+    assert!(ui.get_studio_notice_error());
+    // Keeping mine writes the drafted value over the version now on disk
+    // and keeps that version's other change.
+    ui.invoke_studio_resolve(1);
+    let saved = store.load().unwrap();
+    assert_eq!(saved.geometry.corner_radius, 4);
+    assert_eq!(saved.typography.message_size, other.typography.message_size);
+    assert_eq!(ui.get_studio_pending(), 0);
+
+    // The other version changed only an unrelated setting: nothing is
+    // written and no choice is needed; Apply again saves both.
+    crate::save_config_change(ui, &store, |config| config.geometry.corner_radius = 6).unwrap();
+    let mut other = store.load().unwrap();
+    other.chat.show_avatars = !other.chat.show_avatars;
+    let other_text = other_version(&other);
+    ui.invoke_studio_apply();
+    assert_eq!(on_disk(), other_text);
+    assert_eq!(ui.get_studio_pending(), 1);
+    assert_eq!(ui.get_studio_conflicts(), 0);
+    ui.invoke_studio_apply();
+    let saved = store.load().unwrap();
+    assert_eq!(saved.geometry.corner_radius, 6);
+    assert_eq!(saved.chat.show_avatars, other.chat.show_avatars);
+    assert_eq!(ui.get_studio_pending(), 0);
+
+    // A routed behavior save while drafting: the other version stays, the
+    // behavior change is reported unsaved, and the draft is untouched.
+    crate::save_config_change(ui, &store, |config| config.geometry.corner_radius = 8).unwrap();
+    let mut other = store.load().unwrap();
+    other.typography.message_size += 1;
+    let other_text = other_version(&other);
+    let sounds = !other.notifications.sounds;
+    let refused =
+        crate::save_config_change(ui, &store, |config| config.notifications.sounds = sounds);
+    assert!(refused.is_none());
+    assert_eq!(on_disk(), other_text);
+    assert!(!ui.get_config_error().is_empty());
+    assert_eq!(ui.get_studio_pending(), 1);
+    // Made again over the version now on disk, it saves; the draft stays.
+    crate::save_config_change(ui, &store, |config| config.notifications.sounds = sounds).unwrap();
+    let saved = store.load().unwrap();
+    assert_eq!(saved.notifications.sounds, sounds);
+    assert_eq!(saved.typography.message_size, other.typography.message_size);
+    assert_eq!(saved.geometry.corner_radius, other.geometry.corner_radius);
+    assert_eq!(ui.get_studio_pending(), 1);
+
+    // Another Morpheus writer is mid-save (it holds the writer lock) when
+    // Apply runs. The window is not blocked: nothing is written, the draft
+    // stays, and Apply is tried again on a timer once the writer is done.
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join("studio-race.toml.lock"))
+        .unwrap();
+    holder.lock().unwrap();
+    let before = on_disk();
+    ui.invoke_studio_apply();
+    assert_eq!(on_disk(), before);
+    assert_eq!(ui.get_studio_pending(), 1);
+    assert!(!ui.get_studio_notice_error());
+    holder.unlock().unwrap();
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(ui.get_studio_pending(), 0);
+    assert_eq!(store.load().unwrap().geometry.corner_radius, 8);
+    // A waiting Apply is dropped when the draft changes before it runs: it
+    // never saves values the person did not apply.
+    crate::save_config_change(ui, &store, |config| config.geometry.corner_radius = 9).unwrap();
+    holder.lock().unwrap();
+    ui.invoke_studio_apply();
+    crate::save_config_change(ui, &store, |config| config.geometry.corner_radius = 10).unwrap();
+    holder.unlock().unwrap();
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(store.load().unwrap().geometry.corner_radius, 8);
+    assert_eq!(ui.get_studio_pending(), 1);
+    drop(holder);
+
+    ui.invoke_studio_discard();
+    ui.invoke_studio_notice_dismiss();
+    ui.set_config_error("".into());
+    crate::theme_studio::reset_for_test();
+    ui.set_page(0);
+    settle(ui).await;
+}
+
+/// The theme studio drafts look changes made in Settings and saves them only
+/// on Apply. Discard writes nothing, a concurrent change of a drafted setting
+/// is never overwritten without a choice, behavior settings still save at
+/// once, and drafted account colors never reach another account.
+async fn assert_theme_studio_draft(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+
+    let store = ConfigStore::at(directory.join("studio.toml"));
+    let initial = store.load_or_create().unwrap();
+    apply_config(ui, &initial, None);
+    ui.set_active_account_local_id("".into());
+    // The window's default variation list (which search reveals before the
+    // studio registers) matches the Rust definitions it is replaced with.
+    let shown_names = |ui: &AppWindow| -> Vec<String> {
+        ui.get_studio_variations()
+            .iter()
+            .map(|variation| variation.name.to_string())
+            .collect()
+    };
+    let before = shown_names(ui);
+    crate::theme_studio::register(ui, &store);
+    assert_eq!(before, shown_names(ui));
+    assert_eq!(before.len(), 5);
+    ui.set_page(1);
+    settle(ui).await;
+    let radius = |store: &ConfigStore| store.load().unwrap().geometry.corner_radius;
+    let draft = |radius: u16| {
+        crate::save_config_change(ui, &store, |config| config.geometry.corner_radius = radius)
+    };
+
+    // A look edit is shown and drafted, not saved.
+    let shown = draft(3).unwrap();
+    assert_eq!(shown.geometry.corner_radius, 3);
+    assert_eq!(radius(&store), initial.geometry.corner_radius);
+    assert_eq!(ui.get_studio_pending(), 1);
+    // A behavior setting still saves at once and leaves the draft alone.
+    let sounds = !initial.notifications.sounds;
+    crate::save_config_change(ui, &store, |config| config.notifications.sounds = sounds).unwrap();
+    assert_eq!(store.load().unwrap().notifications.sounds, sounds);
+    assert_eq!(ui.get_studio_pending(), 1);
+    // Undo and redo move through the draft only.
+    ui.invoke_studio_undo();
+    assert_eq!(ui.get_studio_pending(), 0);
+    assert!(ui.get_studio_can_redo());
+    ui.invoke_studio_redo();
+    assert_eq!(ui.get_studio_pending(), 1);
+    // Apply writes the draft and ends it.
+    ui.invoke_studio_apply();
+    assert_eq!(radius(&store), 3);
+    assert_eq!(ui.get_studio_pending(), 0);
+
+    // Discard restores the saved look and writes nothing.
+    draft(5).unwrap();
+    ui.invoke_studio_discard();
+    assert_eq!(ui.get_studio_pending(), 0);
+    assert_eq!(radius(&store), 3);
+
+    // The file changed the drafted setting meanwhile: Apply asks first.
+    draft(6).unwrap();
+    let mut external = store.load().unwrap();
+    external.geometry.corner_radius = 9;
+    external.typography.message_size += 1;
+    store.save(&external).unwrap();
+    ui.invoke_studio_apply();
+    assert_eq!(ui.get_studio_conflicts(), 1);
+    assert_eq!(
+        radius(&store),
+        9,
+        "a concurrent change is never overwritten silently"
+    );
+    // Keeping the file's value saves nothing of the conflicting setting and
+    // keeps the unrelated external change.
+    ui.invoke_studio_resolve(2);
+    assert_eq!(ui.get_studio_pending(), 0);
+    let kept = store.load().unwrap();
+    assert_eq!(kept.geometry.corner_radius, 9);
+    assert_eq!(
+        kept.typography.message_size,
+        external.typography.message_size
+    );
+    // Keeping mine writes this window's value and still keeps the rest.
+    draft(7).unwrap();
+    let mut external = store.load().unwrap();
+    external.geometry.corner_radius = 8;
+    external.chat.show_avatars = !external.chat.show_avatars;
+    store.save(&external).unwrap();
+    ui.invoke_studio_apply();
+    assert_eq!(ui.get_studio_conflicts(), 1);
+    ui.invoke_studio_resolve(1);
+    let mine = store.load().unwrap();
+    assert_eq!(mine.geometry.corner_radius, 7);
+    assert_eq!(mine.chat.show_avatars, external.chat.show_avatars);
+
+    // The new typography and per-control icon settings are drafted like any
+    // look key: shown at once, saved only by Apply, gone after Discard.
+    let line_height =
+        |ui: &AppWindow| ui.global::<crate::StyleTokens>().get_line_height_factor();
+    let draft_new = |ui: &AppWindow| {
+        crate::save_config_change(ui, &store, |config| {
+            config.typography.line_height_percent = Some(150);
+            config.typography.body_weight = Some(600);
+            config.colors.insert("icon_header".into(), "#123456".into());
+        })
+        .unwrap()
+    };
+    draft_new(ui);
+    assert_eq!(ui.get_studio_pending(), 3);
+    assert!((line_height(ui) - 1.5).abs() < 0.001);
+    assert_eq!(ui.global::<crate::StyleTokens>().get_body_font_weight(), 600);
+    let header = Color::from_rgb_u8(0x12, 0x34, 0x56);
+    assert_eq!(ui.invoke_token_color("icon_header".into()), header);
+    let saved = store.load().unwrap();
+    assert_eq!(saved.typography.line_height_percent, None);
+    assert!(!saved.colors.contains_key("icon_header"));
+    ui.invoke_studio_discard();
+    assert!((line_height(ui) - 1.0).abs() < 0.001);
+    assert_eq!(ui.global::<crate::StyleTokens>().get_body_font_weight(), 0);
+    draft_new(ui);
+    ui.invoke_studio_apply();
+    let applied = store.load().unwrap();
+    assert_eq!(applied.typography.line_height_percent, Some(150));
+    assert_eq!(applied.typography.body_weight, Some(600));
+    assert_eq!(applied.colors.get("icon_header").map(String::as_str), Some("#123456"));
+
+    // Drafted account colors belong to the account that was active.
+    ui.set_active_account_local_id("studio-first".into());
+    crate::appearance::apply_theme_mode(ui);
+    let saved_accent = ui.invoke_token_color("accent".into());
+    assert_ne!(saved_accent, color_from_hex("#123456"));
+    crate::save_config_change(ui, &store, |config| {
+        config
+            .account_overrides
+            .entry("studio-first".into())
+            .or_default()
+            .colors
+            .insert("accent".into(), "#123456".into());
+    })
+    .unwrap();
+    assert_eq!(ui.get_studio_pending(), 1);
+    assert_eq!(
+        ui.invoke_token_color("accent".into()),
+        color_from_hex("#123456")
+    );
+    ui.set_active_account_local_id("studio-second".into());
+    crate::appearance::apply_theme_mode(ui);
+    assert_eq!(ui.get_studio_pending(), 0);
+    assert_eq!(ui.invoke_token_color("accent".into()), saved_accent);
+    // Returning must not revive the old cached palette after its edits and
+    // history were removed. Check the actual color, not just pending count.
+    ui.set_active_account_local_id("studio-first".into());
+    crate::appearance::apply_theme_mode(ui);
+    assert_eq!(ui.invoke_token_color("accent".into()), saved_accent);
+    ui.invoke_studio_undo();
+    assert_eq!(ui.invoke_token_color("accent".into()), saved_accent);
+    ui.invoke_studio_apply();
+    assert!(store.load().unwrap().account_overrides.is_empty());
+
+    ui.set_active_account_local_id("".into());
+    ui.invoke_studio_notice_dismiss();
+    crate::theme_studio::reset_for_test();
+    ui.set_page(0);
     settle(ui).await;
 }

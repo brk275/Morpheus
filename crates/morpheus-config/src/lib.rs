@@ -6,19 +6,19 @@ use directories::ProjectDirs;
 use ruma_identifiers_validation::room_id::validate as validate_room_id;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 
+mod commit;
 pub mod diagnostics;
 mod input;
 pub mod registry;
 pub mod style_profiles;
 
+pub use commit::{CommitError, ConfigRevision};
 pub use input::{InputError, MAX_CONFIG_BYTES, MAX_THEME_BYTES, read_bounded};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -157,6 +157,41 @@ fn field_error(field: impl Into<String>, problem: Problem) -> ConfigError {
         field: field.into(),
         problem,
     }
+}
+
+/// One account's room appearance table. Neither the account ID nor a room ID
+/// is ever part of a field path.
+fn validate_room_appearance(rooms: &BTreeMap<String, RoomAppearance>) -> Result<(), ConfigError> {
+    const FIELD: &str = "account_overrides.<account>.room_appearance";
+    if rooms.len() > MAX_ROOM_APPEARANCES {
+        return Err(field_error(
+            FIELD,
+            Problem::Range {
+                minimum: 0,
+                maximum: MAX_ROOM_APPEARANCES as u32,
+            },
+        ));
+    }
+    for (room_id, room) in rooms {
+        if validate_room_id(room_id).is_err() {
+            return Err(field_error(FIELD, Problem::RoomId));
+        }
+        for (id, value) in &room.colors {
+            if registry::color_token(id).is_none() {
+                return Err(field_error(
+                    format!("{FIELD}.<room>.colors"),
+                    Problem::UnknownColorToken,
+                ));
+            }
+            if registry::parse_hex_color(value).is_none() {
+                return Err(field_error(
+                    format!("{FIELD}.<room>.colors.{id}"),
+                    Problem::Color,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn theme_error(field: impl Into<String>, problem: Problem) -> ConfigError {
@@ -337,6 +372,7 @@ impl Config {
                     ));
                 }
             }
+            validate_room_appearance(&overrides.room_appearance)?;
         }
         Ok(())
     }
@@ -666,15 +702,74 @@ impl Config {
         colors
     }
 
-    /// Remove one account's appearance preferences, its theme mode and its
-    /// colors, and nothing of any other account. The entry itself goes once
-    /// nothing else remains in it. Returns whether anything changed.
+    /// One room's own appearance while `account_id` is active and `room_id`
+    /// is open; `None` when either is missing or the room sets nothing.
+    pub fn room_appearance(
+        &self,
+        account_id: Option<&str>,
+        room_id: Option<&str>,
+    ) -> Option<&RoomAppearance> {
+        let account = account_id.filter(|id| !id.is_empty())?;
+        let room = room_id.filter(|id| !id.is_empty())?;
+        self.account_overrides
+            .get(account)?
+            .room_appearance
+            .get(room)
+    }
+
+    /// The color overrides in force with global -> account -> room
+    /// precedence: the global table, then the active account's colors, then
+    /// the open room's. A level that omits a token inherits it.
+    pub fn colors_for_room(
+        &self,
+        account_id: Option<&str>,
+        room_id: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        let mut colors = self.colors_for(account_id);
+        if let Some(room) = self.room_appearance(account_id, room_id) {
+            colors.extend(
+                room.colors
+                    .iter()
+                    .map(|(id, value)| (id.clone(), value.clone())),
+            );
+        }
+        colors
+    }
+
+    /// The theme mode with global -> account -> room precedence.
+    pub fn theme_for_room(&self, account_id: Option<&str>, room_id: Option<&str>) -> ThemeMode {
+        self.room_appearance(account_id, room_id)
+            .and_then(|room| room.theme)
+            .unwrap_or_else(|| self.theme_for(account_id))
+    }
+
+    /// Remove one room's own appearance, and nothing else: it then inherits
+    /// its account's and the global settings. An account entry left empty
+    /// goes too. Returns whether anything changed.
+    pub fn clear_room_appearance(&mut self, account_id: &str, room_id: &str) -> bool {
+        let Some(overrides) = self.account_overrides.get_mut(account_id) else {
+            return false;
+        };
+        let changed = overrides.room_appearance.remove(room_id).is_some();
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+        changed
+    }
+
+    /// Remove one account's appearance preferences, its theme mode, its
+    /// colors and its rooms' appearance, and nothing of any other account.
+    /// The entry itself goes once nothing else remains in it. Returns
+    /// whether anything changed.
     pub fn clear_account_appearance(&mut self, account_id: &str) -> bool {
         let Some(overrides) = self.account_overrides.get_mut(account_id) else {
             return false;
         };
-        let changed = overrides.theme.take().is_some() || !overrides.colors.is_empty();
+        let changed = overrides.theme.take().is_some()
+            | !overrides.colors.is_empty()
+            | !overrides.room_appearance.is_empty();
         overrides.colors.clear();
+        overrides.room_appearance.clear();
         if *overrides == AccountOverrides::default() {
             self.account_overrides.remove(account_id);
         }
@@ -755,6 +850,9 @@ impl Default for Appearance {
 #[serde(default, deny_unknown_fields)]
 pub struct Typography {
     pub message_font_family: Option<String>,
+    /// The message and thread composers' font family; `None` follows the
+    /// message font family. An installed family name, never a path.
+    pub composer_font_family: Option<String>,
     pub monospace_font_family: String,
     pub message_size: u16,
     /// Omission preserves each sender surface's existing weight.
@@ -767,12 +865,22 @@ pub struct Typography {
     pub timestamp_size: Option<u16>,
     /// Composer text and placeholder; omission follows `message_size`.
     pub composer_size: Option<u16>,
+    /// Line spacing, in percent of each font's natural line height, of the
+    /// composer and plain-text previews. Omission keeps natural spacing.
+    /// Rich message bodies are drawn as styled text, which has no line
+    /// spacing setting in the toolkit, and keep their natural spacing.
+    pub line_height_percent: Option<u16>,
+    /// Default font weight (300 to 800), inherited by rich message bodies,
+    /// composers and text without an explicit weight. Sender, heading and
+    /// Markdown span overrides stay explicit. Omission keeps platform defaults.
+    pub body_weight: Option<u16>,
 }
 
 impl Default for Typography {
     fn default() -> Self {
         Self {
             message_font_family: None,
+            composer_font_family: None,
             monospace_font_family: "monospace".into(),
             message_size: 14,
             sender_weight: None,
@@ -780,6 +888,8 @@ impl Default for Typography {
             sender_size: None,
             timestamp_size: None,
             composer_size: None,
+            line_height_percent: None,
+            body_weight: None,
         }
     }
 }
@@ -788,6 +898,9 @@ impl Typography {
     fn validate(&self) -> Result<(), ConfigError> {
         if let Some(family) = &self.message_font_family {
             validate_font_family("typography.message_font_family", family)?;
+        }
+        if let Some(family) = &self.composer_font_family {
+            validate_font_family("typography.composer_font_family", family)?;
         }
         validate_font_family(
             "typography.monospace_font_family",
@@ -802,6 +915,8 @@ impl Typography {
             ("typography.sender_size", self.sender_size),
             ("typography.timestamp_size", self.timestamp_size),
             ("typography.composer_size", self.composer_size),
+            ("typography.line_height_percent", self.line_height_percent),
+            ("typography.body_weight", self.body_weight),
         ] {
             if let Some(value) = value {
                 validate_field(key, value)?;
@@ -814,6 +929,14 @@ impl Typography {
         self.message_font_family
             .as_deref()
             .unwrap_or(&appearance.font_family)
+    }
+
+    /// The composers' family: its own, else the message family, else the
+    /// interface family.
+    pub fn composer_family<'a>(&'a self, appearance: &'a Appearance) -> &'a str {
+        self.composer_font_family
+            .as_deref()
+            .unwrap_or_else(|| self.message_family(appearance))
     }
 }
 
@@ -935,6 +1058,8 @@ impl Config {
             "typography.sender_size" => optional(typography.sender_size),
             "typography.timestamp_size" => optional(typography.timestamp_size),
             "typography.composer_size" => optional(typography.composer_size),
+            "typography.line_height_percent" => optional(typography.line_height_percent),
+            "typography.body_weight" => optional(typography.body_weight),
             "geometry.control_radius" => optional(geometry.control_radius),
             "geometry.input_radius" => optional(geometry.input_radius),
             "geometry.composer_radius" => optional(geometry.composer_radius),
@@ -960,6 +1085,10 @@ impl Config {
             "typography.sender_size" => MetricSlot::Optional(&mut typography.sender_size),
             "typography.timestamp_size" => MetricSlot::Optional(&mut typography.timestamp_size),
             "typography.composer_size" => MetricSlot::Optional(&mut typography.composer_size),
+            "typography.line_height_percent" => {
+                MetricSlot::Optional(&mut typography.line_height_percent)
+            }
+            "typography.body_weight" => MetricSlot::Optional(&mut typography.body_weight),
             "geometry.control_radius" => MetricSlot::Optional(&mut geometry.control_radius),
             "geometry.input_radius" => MetricSlot::Optional(&mut geometry.input_radius),
             "geometry.composer_radius" => MetricSlot::Optional(&mut geometry.composer_radius),
@@ -1506,6 +1635,12 @@ pub struct AccountOverrides {
     /// [`MAX_ROOM_NOTIFICATION_OVERRIDES`] rooms per account.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub room_notifications: BTreeMap<String, RoomNotificationLocal>,
+    /// Appearance for single rooms of this account, keyed by Matrix room ID.
+    /// While such a room is open its settings draw over the account's, which
+    /// draw over the global ones. A room absent here, and a setting a room
+    /// omits, inherit. At most [`MAX_ROOM_APPEARANCES`] rooms per account.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub room_appearance: BTreeMap<String, RoomAppearance>,
 }
 
 /// Most rooms with their own local notification behavior per account.
@@ -1560,6 +1695,31 @@ fn validate_room_notifications(
         return Err(field_error(FIELD, Problem::RoomId));
     }
     Ok(())
+}
+
+
+/// Most rooms with their own appearance per account.
+pub const MAX_ROOM_APPEARANCES: usize = 64;
+
+/// One room's own appearance: only what differs from its account. It holds
+/// a theme mode and color overrides, never credentials, paths or
+/// expressions.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoomAppearance {
+    /// The theme mode while this room is open; omitted inherits.
+    pub theme: Option<ThemeMode>,
+    /// Sparse color overrides while this room is open, keyed like the global
+    /// `[colors]` table.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub colors: BTreeMap<String, String>,
+}
+
+impl RoomAppearance {
+    /// Whether the room sets nothing of its own (and so inherits everything).
+    pub fn is_empty(&self) -> bool {
+        self.theme.is_none() && self.colors.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2011,36 +2171,31 @@ impl ConfigStore {
     pub fn load_or_create(&self) -> Result<Config, ConfigError> {
         if !self.path.exists() {
             let config = Config::default();
-            self.save(&config)?;
-            return Ok(config);
+            match self.create(&config) {
+                Ok(_) => return Ok(config),
+                // Created meanwhile by another Morpheus instance or an
+                // editor: that file is loaded below, never replaced.
+                Err(CommitError::Changed { .. }) => {}
+                Err(error) => return Err(error.into_config_error()),
+            }
         }
         self.load()
     }
 
     pub fn load(&self) -> Result<Config, ConfigError> {
-        let raw = read_bounded(&self.path, MAX_CONFIG_BYTES)?;
-        let config: Config = parse_toml(&raw, diagnostics::FileKind::Config)?;
-        config.validate()?;
-        Ok(config)
+        self.load_revision().map(|(config, _)| config)
     }
 
+    /// Write `config` whatever the file holds now: the last writer wins.
+    /// A change decided on a read of the file uses `commit` instead. This
+    /// holds the same writer locks, so it never lands between another
+    /// Morpheus writer's comparison and rename, and it waits a bounded time
+    /// for them (see the `commit` module). It is for background tasks and
+    /// startup, not the UI thread.
     pub fn save(&self, config: &Config) -> Result<(), ConfigError> {
-        config.validate()?;
-        let parent = self.path.parent().ok_or_else(|| {
-            ConfigError::Invalid("configuration path has no parent directory".into())
-        })?;
-        fs::create_dir_all(parent)?;
-        let raw = toml::to_string_pretty(config)?;
-        // A unique file in the same directory makes concurrent saves safe and
-        // lets persist replace the destination atomically on each platform.
-        // If replacement fails, the previous valid config stays in place.
-        let mut staging = tempfile::NamedTempFile::new_in(parent)?;
-        staging.write_all(raw.as_bytes())?;
-        staging.as_file().sync_all()?;
-        staging
-            .persist(&self.path)
-            .map_err(|error| ConfigError::Io(error.error))?;
-        Ok(())
+        self.replace(config)
+            .map(drop)
+            .map_err(CommitError::into_config_error)
     }
 
     /// Poll the user-editable TOML file. Invalid edits yield an error; consumers
@@ -2345,6 +2500,18 @@ pub struct ThemeStates {
     pub icon: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_active: Option<String>,
+    /// Navigation rail and sidebar route icons; follow `icon` until set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_navigation: Option<String>,
+    /// Conversation header actions; follow `icon` until set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_header: Option<String>,
+    /// Composer tools; follow `icon` until set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_composer: Option<String>,
+    /// Message quick actions; follow `icon` until set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nav_hover: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2358,7 +2525,7 @@ pub struct ThemeStates {
 }
 
 impl ThemeStates {
-    pub fn entries(&self) -> [(&'static str, Option<&str>); 16] {
+    pub fn entries(&self) -> [(&'static str, Option<&str>); 20] {
         [
             ("message_hover", self.message_hover.as_deref()),
             ("control_hover", self.control_hover.as_deref()),
@@ -2371,6 +2538,10 @@ impl ThemeStates {
             ("composer_focus", self.composer_focus.as_deref()),
             ("icon", self.icon.as_deref()),
             ("icon_active", self.icon_active.as_deref()),
+            ("icon_navigation", self.icon_navigation.as_deref()),
+            ("icon_header", self.icon_header.as_deref()),
+            ("icon_composer", self.icon_composer.as_deref()),
+            ("icon_message", self.icon_message.as_deref()),
             ("nav_hover", self.nav_hover.as_deref()),
             ("nav_selected", self.nav_selected.as_deref()),
             ("nav_selected_ink", self.nav_selected_ink.as_deref()),
@@ -2446,6 +2617,7 @@ impl ThemeColors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn audio_ids_roundtrip_without_device_names_or_schema_changes() {
@@ -4507,6 +4679,18 @@ mod tests {
                         path[4..].join(".")
                     )
                 }
+                Some("account_overrides")
+                    if path.get(2).is_some_and(|key| key == "room_appearance") =>
+                {
+                    if path.get(4).is_some_and(|key| key == "colors") {
+                        "account_overrides.<account>.room_appearance.<room>.colors.<token>".into()
+                    } else {
+                        format!(
+                            "account_overrides.<account>.room_appearance.<room>.{}",
+                            path[4..].join(".")
+                        )
+                    }
+                }
                 Some("account_overrides") => {
                     format!("account_overrides.<account>.{}", path[2..].join("."))
                 }
@@ -4522,6 +4706,9 @@ mod tests {
         full.typography.sender_size = Some(15);
         full.typography.timestamp_size = Some(11);
         full.typography.composer_size = Some(16);
+        full.typography.line_height_percent = Some(140);
+        full.typography.composer_font_family = Some("monospace".into());
+        full.typography.body_weight = Some(500);
         full.geometry.control_radius = Some(4);
         full.geometry.input_radius = Some(5);
         full.geometry.composer_radius = Some(6);
@@ -4549,6 +4736,13 @@ mod tests {
                         quiet: true,
                         hide_preview: true,
                         no_highlights: true,
+                    },
+                )]),
+                room_appearance: BTreeMap::from([(
+                    "!d:example.org".into(),
+                    RoomAppearance {
+                        theme: Some(ThemeMode::Dark),
+                        colors: BTreeMap::from([("link".into(), "#654321".into())]),
                     },
                 )]),
             },
@@ -4588,6 +4782,7 @@ mod tests {
         fn document(key: &str, name: &str, value: &str) -> String {
             let key = key
                 .replace("<account>", "account")
+                .replace("<room>", "\"!room:example.org\"")
                 .replace("<token>", name)
                 .replace("<action>", name)
                 .replace("<room>", "\"!room:example.org\"");
