@@ -369,6 +369,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || !ui.get_shortcut_recording().is_empty()
         || ui.get_poll_dialog_open()
         || ui.global::<crate::RoomNotificationState>().get_open()
+        || ui.global::<crate::RoomActivity>().get_seen_open()
 }
 
 fn visible_rooms(ui: &AppWindow) -> Vec<RoomItem> {

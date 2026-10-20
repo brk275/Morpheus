@@ -75,8 +75,10 @@ export component TypingFooter inherits Rectangle {
     }
 }
 
-// Who has a public read receipt at or after one event. Modal; Escape and
-// Close dismiss it.
+// Who has a public read receipt at or after one event. Modal: clicks and
+// scrolling never reach the window behind it, Tab and Shift+Tab stay inside,
+// shortcuts pause (shortcuts::blocked), and Escape or Close dismiss it; the
+// action that opened it takes focus back.
 export component SeenByDialog inherits Rectangle {
     in property <color> ink;
     in property <color> muted;
@@ -87,9 +89,20 @@ export component SeenByDialog inherits Rectangle {
     background: root.scrim;
     accessible-role: region;
     accessible-label: RoomActivity.seen-title;
-    TouchArea { }
+    TouchArea {
+        scroll-event(event) => { accept }
+    }
     keys := FocusScope {
         init => { close-focus.focus(); }
+        // Close is the dialog's only control, so focus stays on it.
+        capture-key-pressed(event) => {
+            if event.text == Key.Tab || event.text == Key.Backtab {
+                close-focus.focus();
+                accept
+            } else {
+                reject
+            }
+        }
         key-pressed(event) => {
             if event.text == Key.Escape {
                 RoomActivity.close-seen-by();

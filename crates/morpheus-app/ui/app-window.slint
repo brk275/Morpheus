@@ -5791,12 +5791,24 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 // Public read receipts at or after this message (room activity).
+                                // Focus comes back here when the view it opened closes.
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "✓✓"; label: "Seen by: who has read up to this message from " + message.sender;
                                     ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     enabled: root.live-session;
-                                    activated => { RoomActivity.show-seen-by(message.event-id, false); }
+                                    property <string> return-to;
+                                    property <bool> seen-open: RoomActivity.seen-open;
+                                    changed seen-open => {
+                                        if !self.seen-open && self.return-to != "" {
+                                            if self.return-to == message.event-id { self.focus(); }
+                                            self.return-to = "";
+                                        }
+                                    }
+                                    activated => {
+                                        RoomActivity.show-seen-by(message.event-id, false);
+                                        if RoomActivity.seen-open { self.return-to = message.event-id; }
+                                    }
                                 }
                                 if message-row.pin-action : IconAction {
                                     quiet: !message.pinned; context-hover: message-hover.has-hover;
@@ -9401,12 +9413,24 @@ export component AppWindow inherits Window {
                                         }
                                         Rectangle { horizontal-stretch: 1; min-width: 0px; }
                                         // This thread's read receipts at or after the reply (room activity).
+                                        // Focus comes back here when the view it opened closes.
                                         if reply.event-id != "" : IconAction {
                                             quiet: true;
                                             width: 24px; height: 20px; icon: "✓✓"; label: "Seen in this thread: who has read up to this reply from " + reply.sender;
                                             ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                             enabled: root.live-session;
-                                            activated => { RoomActivity.show-seen-by(reply.event-id, true); }
+                                            property <string> return-to;
+                                            property <bool> seen-open: RoomActivity.seen-open;
+                                            changed seen-open => {
+                                                if !self.seen-open && self.return-to != "" {
+                                                    if self.return-to == reply.event-id { self.focus(); }
+                                                    self.return-to = "";
+                                                }
+                                            }
+                                            activated => {
+                                                RoomActivity.show-seen-by(reply.event-id, true);
+                                                if RoomActivity.seen-open { self.return-to = reply.event-id; }
+                                            }
                                         }
                                     }
                                     StyledText {

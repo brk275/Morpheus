@@ -3359,6 +3359,71 @@ async fn assert_shortcut_customization(ui: &AppWindow, directory: &std::path::Pa
     settle(ui).await;
 }
 
+/// Seen by is a real modal on the generated window: opening it hands focus to
+/// its Close control, Tab and Shift+Tab stay there, shortcuts pause while it
+/// is open, and Escape closes it and returns focus to the action that opened
+/// it. The room-activity controller needs a signed-in account, so a stand-in
+/// opens and closes the view the way the controller does.
+async fn assert_seen_by_modal_guard(ui: &AppWindow) {
+    use crate::RoomActivity;
+    use slint::private_unstable_api::re_exports::AccessibilityAction;
+
+    let activity = ui.global::<RoomActivity>();
+    let weak = ui.as_weak();
+    activity.on_show_seen_by(move |_, _| {
+        if let Some(ui) = weak.upgrade() {
+            let activity = ui.global::<RoomActivity>();
+            activity.set_seen_state(2);
+            activity.set_seen_open(true);
+        }
+    });
+    let weak = ui.as_weak();
+    activity.on_close_seen_by(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<RoomActivity>().set_seen_open(false);
+        }
+    });
+    let live = ui.get_live_session();
+    let messages = ui.get_messages();
+    ui.set_page(0);
+    ui.set_live_session(true);
+    let row = MessageItem {
+        event_id: "$seen:example.org".into(),
+        sender: "Robin".into(),
+        body: "Seen-by modal check".into(),
+        ..Default::default()
+    };
+    ui.set_messages(ModelRc::new(VecModel::from(vec![row])));
+    settle(ui).await;
+    let opener = "Seen by: who has read up to this message from Robin";
+    let close = "Close read receipts";
+    let press = |text: &str| ui.invoke_dispatch_shortcut(text.into(), true, false, true, false);
+    control_with_label(ui, opener).accessible_action(&AccessibilityAction::Default);
+    settle(ui).await;
+    assert!(activity.get_seen_open());
+    assert!(focused_control_has_label(ui, close));
+    assert!(!press("d"), "a shortcut ran behind the Seen-by view");
+    for tab in [Key::Tab, Key::Tab, Key::Backtab] {
+        key(ui, tab);
+        assert!(focused_control_has_label(ui, close), "focus left the Seen-by view");
+    }
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!activity.get_seen_open());
+    assert!(
+        focused_control_has_label(ui, opener),
+        "focus did not return to the action that opened Seen by"
+    );
+    // Shortcuts run again once it is closed (the details panel, twice).
+    assert!(press("d"));
+    assert!(press("d"));
+    activity.on_show_seen_by(|_, _| {});
+    activity.on_close_seen_by(|| {});
+    ui.set_messages(messages);
+    ui.set_live_session(live);
+    settle(ui).await;
+}
+
 /// Style profiles on the real generated window. Save current look stores the
 /// look only. A preview changes the window and saves nothing; Cancel restores
 /// the look exactly. A newer look, an account switch or a Settings save ends
@@ -3785,6 +3850,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_account_scoped_appearance(&ui, directory.path()).await;
     phase.set(14);
     assert_shortcut_customization(&ui, directory.path()).await;
+    phase.set(30);
+    assert_seen_by_modal_guard(&ui).await;
     phase.set(18);
     assert_style_profiles(&ui, directory.path()).await;
     phase.set(19);
