@@ -224,21 +224,45 @@ pub(super) fn may_mark_read(gate: &ReadGate) -> bool {
         && gate.same_scope
 }
 
+/// A view's last automatic receipt attempt: its event, when it began, and
+/// whether it settled (reached the SDK or failed there) rather than being
+/// withdrawn before the SDK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LastAttempt<'a> {
+    pub(super) event: &'a str,
+    pub(super) at: Instant,
+    pub(super) settled: bool,
+}
+
 /// When an automatic receipt for `event`, shown since `since`, may go out:
-/// never again for the last event sent, otherwise once it stayed in view for
-/// READ_SETTLE and READ_INTERVAL passed since the last receipt.
+/// never again for an event whose last attempt settled; otherwise once it
+/// stayed in view for READ_SETTLE and READ_INTERVAL passed since the last
+/// attempt of any outcome. A withdrawn, revoked or refocused attempt still
+/// counts, so a duplicate never comes sooner than READ_INTERVAL.
 pub(super) fn read_wait(
     since: Instant,
-    last: Option<(&str, Instant)>,
+    last: Option<LastAttempt<'_>>,
     event: &str,
     now: Instant,
 ) -> Option<Duration> {
-    if event.is_empty() || last.is_some_and(|(sent, _)| sent == event) {
+    if event.is_empty() || last.is_some_and(|last| last.settled && last.event == event) {
         return None;
     }
-    let settled = since + READ_SETTLE;
-    let due = last.map_or(settled, |(_, at)| settled.max(at + READ_INTERVAL));
+    let in_view = since + READ_SETTLE;
+    let due = last.map_or(in_view, |last| in_view.max(last.at + READ_INTERVAL));
     Some(due.saturating_duration_since(now))
+}
+
+/// The idle deadline of a typing start decided at `now`: the moment the
+/// newest edit of a composer still typing goes idle. A start still waiting
+/// to be handed to the SDK then is withdrawn.
+pub(super) fn typing_deadline(composers: &[Composer], now: Instant) -> Option<Instant> {
+    composers
+        .iter()
+        .filter(|composer| composer.typing(now))
+        .filter_map(|composer| composer.last_edit)
+        .map(|edit| edit + TYPING_IDLE)
+        .max()
 }
 
 #[cfg(test)]
@@ -277,24 +301,42 @@ mod tests {
         assert_eq!(typing_step(false, &typing, None, now), TypingStep::Nothing);
         // Keystrokes within the renewal interval send nothing more.
         let soon = now + TYPING_RESEND / 2;
-        assert_eq!(typing_step(true, &[typing_now(soon)], started(now), soon), TypingStep::Nothing);
+        assert_eq!(
+            typing_step(true, &[typing_now(soon)], started(now), soon),
+            TypingStep::Nothing
+        );
         let renew = now + TYPING_RESEND;
-        assert_eq!(typing_step(true, &[typing_now(renew)], started(now), renew), TypingStep::Start);
+        assert_eq!(
+            typing_step(true, &[typing_now(renew)], started(now), renew),
+            TypingStep::Start
+        );
         // Disabling while a start is active stops it at once.
-        assert_eq!(typing_step(false, &typing, started(now), now), TypingStep::Stop);
+        assert_eq!(
+            typing_step(false, &typing, started(now), now),
+            TypingStep::Stop
+        );
         // Idle, an empty composer (sent or cleared) and blur all stop.
         let idle = now + TYPING_IDLE;
-        assert_eq!(typing_step(true, &typing, started(now), idle), TypingStep::Stop);
+        assert_eq!(
+            typing_step(true, &typing, started(now), idle),
+            TypingStep::Stop
+        );
         let empty = [Composer {
             has_text: false,
             ..typing_now(now)
         }];
-        assert_eq!(typing_step(true, &empty, started(now), now), TypingStep::Stop);
+        assert_eq!(
+            typing_step(true, &empty, started(now), now),
+            TypingStep::Stop
+        );
         let blurred = [Composer {
             focused: false,
             ..typing_now(now)
         }];
-        assert_eq!(typing_step(true, &blurred, started(now), now), TypingStep::Stop);
+        assert_eq!(
+            typing_step(true, &blurred, started(now), now),
+            TypingStep::Stop
+        );
         // A room, thread or account switch stops the old start first.
         let moved = Some(Started {
             same_target: false,
@@ -389,21 +431,54 @@ mod tests {
     }
 
     #[test]
-    fn automatic_receipts_settle_and_are_throttled() {
+    fn automatic_receipts_settle_and_are_throttled_by_every_attempt() {
         let now = Instant::now();
+        let attempt = |event, settled| LastAttempt {
+            event,
+            at: now,
+            settled,
+        };
         assert_eq!(read_wait(now, None, "$a", now), Some(READ_SETTLE));
-        assert_eq!(read_wait(now, None, "$a", now + READ_SETTLE), Some(Duration::ZERO));
-        assert_eq!(read_wait(now, None, "", now), None);
-        // The same event is never sent twice.
-        assert_eq!(read_wait(now, Some(("$a", now)), "$a", now + READ_INTERVAL), None);
-        // A newer event waits for the interval since the last receipt.
-        let shown = now + READ_SETTLE;
         assert_eq!(
-            read_wait(now, Some(("$a", now)), "$b", shown),
+            read_wait(now, None, "$a", now + READ_SETTLE),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(read_wait(now, None, "", now), None);
+        // A settled event is never sent twice.
+        let settled = Some(attempt("$a", true));
+        assert_eq!(read_wait(now, settled, "$a", now + READ_INTERVAL), None);
+        // A withdrawn attempt (cancelled, revoked or refocused) still holds
+        // its event back for READ_INTERVAL, then lets it go once.
+        let withdrawn = Some(attempt("$a", false));
+        let soon = now + READ_SETTLE;
+        assert_eq!(
+            read_wait(now, withdrawn, "$a", soon),
             Some(READ_INTERVAL - READ_SETTLE)
         );
         let due = now + READ_INTERVAL;
-        assert_eq!(read_wait(now, Some(("$a", now)), "$b", due), Some(Duration::ZERO));
+        assert_eq!(read_wait(now, withdrawn, "$a", due), Some(Duration::ZERO));
+        // A newer event waits for the interval since the last attempt.
+        assert_eq!(
+            read_wait(now, settled, "$b", soon),
+            Some(READ_INTERVAL - READ_SETTLE)
+        );
+        assert_eq!(read_wait(now, settled, "$b", due), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_typing_start_expires_when_its_newest_edit_goes_idle() {
+        let now = Instant::now();
+        let earlier = typing_now(now);
+        let later = typing_now(now + TYPING_IDLE / 2);
+        let at = now + TYPING_IDLE / 2;
+        assert_eq!(
+            typing_deadline(&[earlier, later], at),
+            Some(now + TYPING_IDLE / 2 + TYPING_IDLE)
+        );
+        // Nothing typing: no start, so no deadline.
+        assert_eq!(typing_deadline(&[Composer::default()], now), None);
+        let idle = now + TYPING_IDLE;
+        assert_eq!(typing_deadline(&[earlier], idle), None);
     }
 
     #[test]

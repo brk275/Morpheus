@@ -25,7 +25,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use matrix_sdk::{
@@ -84,17 +84,28 @@ impl ReceiptScope {
 struct CancellationState {
     cancelled: AtomicBool,
     notify: Notify,
+    /// Cancelled from this moment on, without anyone calling cancel.
+    deadline: Option<Instant>,
 }
 
-/// Withdraws one queued receipt or read marker write. It takes effect up to
-/// the moment the request is handed to the SDK; cancelling never recalls a
-/// request the homeserver may already have received.
+/// Withdraws one queued receipt, read marker or typing write. It takes effect
+/// up to the moment the request is handed to the SDK; cancelling never
+/// recalls a request the homeserver may already have received.
 #[derive(Clone, Default)]
 pub struct ActivityCancellation(Arc<CancellationState>);
 
 impl ActivityCancellation {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cancelled at `deadline` at the latest, such as a typing start that
+    /// must not go out once its idle deadline has passed.
+    pub fn until(deadline: Instant) -> Self {
+        Self(Arc::new(CancellationState {
+            deadline: Some(deadline),
+            ..CancellationState::default()
+        }))
     }
 
     pub fn cancel(&self) {
@@ -104,23 +115,38 @@ impl ActivityCancellation {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
+            || self.0.deadline.is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    /// Resolves once any clone is cancelled.
+    /// Resolves once any clone is cancelled or the deadline passes.
     pub async fn cancelled(&self) {
-        loop {
-            let notified = self.0.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.is_cancelled() {
-                return;
+        let expired = async {
+            match self.0.deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => std::future::pending().await,
             }
-            notified.await;
+        };
+        let flagged = async {
+            loop {
+                let notified = self.0.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.0.cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::select! {
+            () = expired => {}
+            () = flagged => {}
         }
     }
 }
 
-/// What became of one receipt or read marker write.
+/// What became of one receipt, read marker or typing write. A typing notice
+/// handed to the SDK is `Sent` even when the SDK's own 3-second throttle sent
+/// nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReceiptOutcome {
     /// The homeserver accepted it.
@@ -263,19 +289,27 @@ impl AccountManager {
 
     /// Start or stop this account's typing notice in one room. The SDK sends
     /// a start at most every 3 seconds (each lasts 4) and a stop only while a
-    /// start is active. An error or timeout means the stop may not have
-    /// arrived; the server still ends it after its timeout.
+    /// start is active. `cancellation` withdraws it up to the moment it is
+    /// handed to the SDK: the room lookup waits on the account lock, so a
+    /// start whose idle deadline passes while it waits never goes out. An
+    /// error, timeout or interruption means a stop may not have arrived; the
+    /// server still ends the start after its timeout.
     pub async fn send_typing_selected(
         &self,
         selection: &AccountSelection,
         room_id: &str,
         typing: bool,
-    ) -> Result<()> {
-        let room = self.activity_room(selection, room_id).await?;
-        ensure_current(selection)?;
-        let sent = tokio::time::timeout(WRITE_LIMIT, room.typing_notice(typing)).await;
-        sent.map_err(|_| MatrixCoreError::Sdk("typing notice timed out".into()))?
-            .map_err(|_| MatrixCoreError::Sdk("typing notice failed".into()))
+        cancellation: &ActivityCancellation,
+    ) -> Result<ReceiptOutcome> {
+        let lookup = Box::pin(self.activity_room(selection, room_id));
+        send_unless_cancelled(cancellation, lookup, |room| async move {
+            ensure_current(selection)?;
+            let sent = tokio::time::timeout(WRITE_LIMIT, room.typing_notice(typing)).await;
+            sent.map_err(|_| MatrixCoreError::Sdk("typing notice timed out".into()))?
+                .map_err(|_| MatrixCoreError::Sdk("typing notice failed".into()))?;
+            Ok::<bool, MatrixCoreError>(true)
+        })
+        .await
     }
 
     /// "Mark as read", only ever on the user's explicit choice: the
@@ -524,6 +558,39 @@ mod tests {
     }
 
     #[test]
+    fn a_typing_start_waiting_for_the_account_lock_expires_at_its_idle_deadline() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let selection = manager.account_selection(&account.id).unwrap();
+            let room = "!typing:example.org";
+            // The account lock is held past the start's idle deadline.
+            let state = manager.state.lock().await;
+            let deadline = Instant::now() + Duration::from_millis(20);
+            let expiring = ActivityCancellation::until(deadline);
+            let start = manager.send_typing_selected(&selection, room, true, &expiring);
+            let outcome = tokio::time::timeout(Duration::from_secs(2), start).await;
+            assert_eq!(outcome.unwrap().unwrap(), ReceiptOutcome::Withdrawn);
+            assert!(expiring.is_cancelled());
+            drop(state);
+            // A deadline that already passed hands nothing over, lock or not.
+            let elapsed = ActivityCancellation::until(Instant::now());
+            let late = manager
+                .send_typing_selected(&selection, room, true, &elapsed)
+                .await;
+            assert_eq!(late.unwrap(), ReceiptOutcome::Withdrawn);
+            // Without a deadline the same start runs on to the room lookup, so
+            // the withdrawals above came before anything reached the SDK.
+            let open = ActivityCancellation::new();
+            let reached = manager
+                .send_typing_selected(&selection, room, true, &open)
+                .await;
+            assert!(matches!(reached, Err(MatrixCoreError::RoomNotFound(_))));
+            drop(manager);
+            std::fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
     fn nothing_is_handed_to_the_sdk_once_a_write_is_cancelled() {
         let mut context = Context::from_waker(noop_waker_ref());
         let handed = AtomicUsize::new(0);
@@ -563,7 +630,10 @@ mod tests {
         assert_eq!(handed.load(Ordering::SeqCst), 1);
         cancel.cancel();
         let polled = write.as_mut().poll(&mut context);
-        assert!(matches!(polled, Poll::Ready(Ok(ReceiptOutcome::Interrupted))));
+        assert!(matches!(
+            polled,
+            Poll::Ready(Ok(ReceiptOutcome::Interrupted))
+        ));
         // Not cancelled: the SDK's own answer.
         for (sent, outcome) in [
             (true, ReceiptOutcome::Sent),
@@ -582,11 +652,15 @@ mod tests {
     #[test]
     fn a_room_event_never_counts_a_thread_receipt() {
         let room = ReceiptScope::Room.threads().unwrap();
+        // Exactly these two: never a thread receipt.
         assert_eq!(room, [ReceiptThread::Unthreaded, ReceiptThread::Main]);
-        assert!(!room.iter().any(|thread| matches!(thread, ReceiptThread::Thread(_))));
         let scope = ReceiptScope::Thread("$root:example.org".into());
         let thread = scope.threads().unwrap();
-        assert!(matches!(&thread[0], ReceiptThread::Thread(root) if root == "$root:example.org"));
+        let root = crate::parse_event_id("$root:example.org").unwrap();
+        assert_eq!(
+            thread,
+            [ReceiptThread::Thread(root), ReceiptThread::Unthreaded]
+        );
         // The main timeline's receipts never count for a thread's events.
         assert!(!thread.contains(&ReceiptThread::Main));
         let invalid = ReceiptScope::Thread("not an event".into());

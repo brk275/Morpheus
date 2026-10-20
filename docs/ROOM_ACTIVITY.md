@@ -32,8 +32,11 @@ All three choices are off by default (`[activity]` in `config.toml`, or
   at most one notice per 3 seconds and each lasts 4. It stops on idle, blur
   (including the window becoming inactive), an empty composer, sending, a room,
   thread, page or account change, account lock, and turning the setting off.
-  Blur, an emptied or sent composer, a hidden conversation, a room or account
-  change and turning the setting off also drop a notice not yet sent. One
+  Blur, an emptied or sent composer, another or a closed thread, a hidden
+  conversation, a room or account change and turning the setting off also
+  drop a notice not yet sent, and so does its own idle deadline: a notice
+  still waiting (for example on the account lock) when the last edit is 5
+  seconds old never goes out. One
   worker sends them: keystrokes only update its state. A stop goes only to the
   account and room the notice was sent for. It is not sent while account
   access is locked or once that account is no longer selected; the server then
@@ -52,7 +55,9 @@ All three choices are off by default (`[activity]` in `config.toml`, or
   bottom message, leaving the bottom, losing focus, hiding the conversation,
   another room, thread or account, and changing either receipt setting
   withdraw a receipt that is still waiting: nothing is sent for it. A receipt
-  already handed to the Matrix SDK cannot be recalled.
+  already handed to the Matrix SDK cannot be recalled. A withdrawn receipt
+  still counts for the 3-second interval, so refocusing never sends the same
+  receipt again sooner.
 - **Mark as read** (room menu, or Menu / Shift+F10 on a room row). Moves the
   fully-read marker and a read receipt (private unless public receipts are on)
   to the room's latest event. Turning public read receipts off, or quitting,

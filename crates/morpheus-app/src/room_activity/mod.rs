@@ -76,6 +76,11 @@ struct State {
     /// A typing start that may be active, the context it was sent for and
     /// when.
     started: Option<(Arc<Context>, Instant)>,
+    /// The typing start still on its way to the SDK and what withdraws it:
+    /// every later input that ends typing, a thread or context replacement,
+    /// and its idle deadline.
+    pending_start: Option<(u64, ActivityCancellation)>,
+    start_op: u64,
     stopping: bool,
     seen_op: u64,
     /// The Seen-by view shows a thread reply.
@@ -87,7 +92,59 @@ struct State {
     notice_op: u64,
     /// Automatic receipts of the conversation and of the thread.
     views: [reading::View; 2],
+    /// Their last attempts, which outlive a revoked request and the view.
+    attempts: [Option<reading::Attempt>; 2],
     read_op: u64,
+}
+
+/// Withdraws the typing start still on its way to the SDK, if any.
+fn revoke_start(state: &mut State) {
+    if let Some((_, cancellation)) = state.pending_start.take() {
+        cancellation.cancel();
+    }
+}
+
+/// Queues a typing start that expires at `deadline`, replacing (and
+/// withdrawing) any start still queued.
+fn queue_start(state: &mut State, deadline: Instant) -> (u64, ActivityCancellation) {
+    revoke_start(state);
+    state.start_op = state.start_op.wrapping_add(1);
+    let cancellation = ActivityCancellation::until(deadline);
+    state.pending_start = Some((state.start_op, cancellation.clone()));
+    (state.start_op, cancellation)
+}
+
+/// The thread shown beside the conversation became another one or none.
+/// The old thread's composer, automatic receipt view and queued typing start
+/// go with it. Returns whether it changed.
+fn replace_thread(state: &mut State, thread: String) -> bool {
+    if state.thread == thread {
+        return false;
+    }
+    // A composer removed while focused reports no blur, so a closed thread
+    // pane is never taken for an active window.
+    let focused = !thread.is_empty() && state.composers[THREAD].focused;
+    state.composers[THREAD] = Composer {
+        focused,
+        ..Composer::default()
+    };
+    state.thread = thread;
+    state.views[THREAD] = reading::View::default();
+    revoke_start(state);
+    true
+}
+
+/// What the typing worker does next.
+enum TypingAction {
+    Start {
+        context: Arc<Context>,
+        op: u64,
+        cancellation: ActivityCancellation,
+        /// An earlier start for the same context may still be active.
+        renewal: bool,
+    },
+    Stop(Arc<Context>),
+    Nothing,
 }
 
 pub(crate) struct RoomActivityUi {
@@ -101,8 +158,6 @@ pub(crate) struct RoomActivityUi {
     seen_task: Mutex<Option<JoinHandle<()>>>,
     /// Wakes the typing worker; any number of composer events coalesce.
     wake: Notify,
-    /// Drops a typing start the worker has not sent yet.
-    cancel_start: Notify,
 }
 
 fn preferences(ui: &AppWindow) -> Preferences {
@@ -177,7 +232,6 @@ impl RoomActivityUi {
             watcher: Mutex::new(None),
             seen_task: Mutex::new(None),
             wake: Notify::new(),
-            cancel_start: Notify::new(),
         });
         let activity = ui.global::<RoomActivity>();
         let this = owner.clone();
@@ -322,6 +376,9 @@ impl RoomActivityUi {
             state.notice_op = state.notice_op.wrapping_add(1);
             state.views = Default::default();
             state.read_op = state.read_op.wrapping_add(1);
+            // An unsent start for the old context never goes out; one that
+            // may have gone out is stopped by the worker.
+            revoke_start(&mut state);
         }
         self.release_watcher();
         self.abort_seen_task();
@@ -334,9 +391,6 @@ impl RoomActivityUi {
         activity.set_seen_state(0);
         activity.set_seen_rows(ModelRc::new(VecModel::<SeenByRow>::default()));
         activity.set_seen_summary("".into());
-        // An unsent start for the old context never goes out; one that may
-        // have gone out is stopped by the worker.
-        self.cancel_start.notify_waiters();
         self.wake.notify_one();
     }
 
@@ -384,21 +438,14 @@ impl RoomActivityUi {
         };
         let (context, thread_changed, close_seen) = {
             let mut state = self.lock();
-            let thread_changed = state.thread != thread;
-            if thread_changed {
-                // A composer removed while focused reports no blur, so a
-                // closed thread pane is never taken for an active window.
-                let focused = !thread.is_empty() && state.composers[THREAD].focused;
-                state.composers[THREAD] = Composer {
-                    focused,
-                    ..Composer::default()
-                };
-                state.thread = thread;
-                state.views[THREAD] = reading::View::default();
-            }
+            // Another thread or none, including a closed thread pane while
+            // the conversation stays shown.
+            let thread_changed = replace_thread(&mut state, thread);
             if !chat_shown {
                 state.composers = Default::default();
                 state.views = Default::default();
+                // Hidden conversation: an unsent typing start is dropped.
+                revoke_start(&mut state);
             }
             state.chat_shown = chat_shown;
             let close_seen = !chat_shown || (thread_changed && state.seen_thread);
@@ -406,10 +453,6 @@ impl RoomActivityUi {
         };
         if thread_changed {
             reading::stop_timer(THREAD);
-        }
-        if !chat_shown {
-            // Hidden conversation: an unsent typing start is dropped.
-            self.cancel_start.notify_waiters();
         }
         if close_seen {
             self.close_seen_by(ui);
@@ -432,7 +475,7 @@ impl RoomActivityUi {
     /// off also withdraws a public Mark as read not yet handed to the SDK.
     fn preferences_changed(self: &Arc<Self>, ui: &AppWindow) {
         let prefs = preferences(ui);
-        let typing_off = {
+        {
             let mut state = self.lock();
             let before = state.prefs;
             state.prefs = prefs;
@@ -447,10 +490,9 @@ impl RoomActivityUi {
             {
                 cancellation.cancel();
             }
-            before.send_typing && !prefs.send_typing
-        };
-        if typing_off {
-            self.cancel_start.notify_waiters();
+            if before.send_typing && !prefs.send_typing {
+                revoke_start(&mut state);
+            }
         }
         if !prefs.read_tracking {
             reading::stop_timers();
@@ -464,16 +506,15 @@ impl RoomActivityUi {
     /// focus, automatic receipts have lost their active-window gate and are
     /// withdrawn.
     fn composer(&self, thread: bool, change: impl FnOnce(&mut Composer)) {
-        let typing = {
+        {
             let mut state = self.lock();
             change(&mut state.composers[usize::from(thread)]);
             if !state.composers.iter().any(|composer| composer.focused) {
                 reading::revoke_all(&mut state);
             }
-            model::start_wanted(&state.composers)
-        };
-        if !typing {
-            self.cancel_start.notify_waiters();
+            if !model::start_wanted(&state.composers) {
+                revoke_start(&mut state);
+            }
         }
         self.wake.notify_one();
     }
@@ -538,77 +579,113 @@ impl RoomActivityUi {
         });
     }
 
-    /// Decides under the state lock; never holds it across a request.
-    fn typing_plan(&self, now: Instant) -> (TypingStep, Option<Arc<Context>>, Duration, bool) {
+    /// Decides under the state lock and never holds it across a request. A
+    /// start is queued here, under the same lock, so any later input that
+    /// ends typing finds and withdraws it.
+    fn typing_plan(&self, now: Instant) -> (TypingAction, Duration, bool) {
         let unlocked =
             self.live.is_live.load(Ordering::Acquire) && !self.live.security_gate.blocked();
-        let state = self.lock();
-        let current = state.context.as_ref().filter(|context| context.alive());
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let current = state.context.clone().filter(|context| context.alive());
         let enabled = unlocked
             && state.prefs.send_typing
             && state.chat_shown
             && !state.stopping
             && current.is_some();
         let started = state.started.as_ref().map(|(context, at)| Started {
-            same_target: current.is_some_and(|current| current.id == context.id),
+            same_target: current.as_ref().is_some_and(|current| current.id == context.id),
             at: *at,
         });
         let step = model::typing_step(enabled, &state.composers, started, now);
-        let target = match step {
-            TypingStep::Start => current.cloned(),
-            TypingStep::Stop => state.started.as_ref().map(|(context, _)| context.clone()),
-            TypingStep::Nothing => None,
-        };
         let started_at = state.started.as_ref().map(|(_, at)| *at);
         let wait = model::typing_wait(&state.composers, started_at, now);
-        (step, target, wait, state.stopping)
+        let deadline = model::typing_deadline(&state.composers, now);
+        let action = match (step, current, deadline) {
+            (TypingStep::Start, Some(context), Some(deadline)) => {
+                let renewal = started.is_some();
+                let (op, cancellation) = queue_start(state, deadline);
+                // Recorded before the outcome is known: a start that may
+                // reach the server is always followed by a stop.
+                state.started = Some((context.clone(), now));
+                TypingAction::Start {
+                    context,
+                    op,
+                    cancellation,
+                    renewal,
+                }
+            }
+            (TypingStep::Stop, ..) => {
+                revoke_start(state);
+                match state.started.take() {
+                    Some((context, _)) => TypingAction::Stop(context),
+                    None => TypingAction::Nothing,
+                }
+            }
+            _ => TypingAction::Nothing,
+        };
+        (action, wait, state.stopping)
     }
 
     /// The one typing worker. A start goes out with the account selection of
-    /// its context only, and is dropped unsent when typing stops being wanted
-    /// before it goes out. A stop goes to the account and room the start was
-    /// for; it is not sent while account access is locked, and fails (never
-    /// switching accounts) once that selection ended. In both cases the
-    /// server ends the start after its 4 seconds; nothing claims a stop
-    /// arrived.
+    /// its context only. It is withdrawn unsent when, before it reaches the
+    /// SDK, typing stops being wanted, the thread or context is replaced, or
+    /// its idle deadline passes (the room lookup can wait on the account
+    /// lock). A stop goes to the account and room the start was for; it is
+    /// not sent while account access is locked, and fails (never switching
+    /// accounts) once that selection ended. A lease already sent then ends
+    /// on the server after its 4 seconds; nothing claims a stop arrived.
     async fn typing_worker(self: Arc<Self>) {
         loop {
-            // Registered before deciding, so a disable or switch after the
-            // decision still drops the start below.
-            let cancelled = self.cancel_start.notified();
-            tokio::pin!(cancelled);
-            cancelled.as_mut().enable();
             let now = Instant::now();
-            let (step, target, wait, stopping) = self.typing_plan(now);
-            match (step, target) {
-                (TypingStep::Start, Some(context)) => {
+            let (action, wait, stopping) = self.typing_plan(now);
+            match action {
+                TypingAction::Start {
+                    context,
+                    op,
+                    cancellation,
+                    renewal,
+                } => {
                     let manager = self.live.manager.clone();
-                    // Recorded before the outcome is known: a start that may
-                    // have reached the server is always followed by a stop.
-                    self.lock().started = Some((context.clone(), now));
-                    let send =
-                        manager.send_typing_selected(&context.selection, &context.room, true);
-                    tokio::select! {
-                        biased;
-                        () = &mut cancelled => {}
-                        _ = send => {}
+                    let sent = manager
+                        .send_typing_selected(
+                            &context.selection,
+                            &context.room,
+                            true,
+                            &cancellation,
+                        )
+                        .await;
+                    let mut state = self.lock();
+                    if state.pending_start.as_ref().is_some_and(|(id, _)| *id == op) {
+                        state.pending_start = None;
+                    }
+                    // Withdrawn: nothing reached the SDK, so there is no new
+                    // lease to stop; an earlier one (a renewal) still is.
+                    let ours = |(started, at): &(Arc<Context>, Instant)| {
+                        started.id == context.id && *at == now
+                    };
+                    if matches!(sent, Ok(ReceiptOutcome::Withdrawn))
+                        && !renewal
+                        && state.started.as_ref().is_some_and(ours)
+                    {
+                        state.started = None;
                     }
                     continue;
                 }
-                (TypingStep::Stop, Some(context)) => {
-                    self.lock().started = None;
+                TypingAction::Stop(context) => {
                     // Nothing is sent while account access is locked; the
                     // server ends the start within its 4 seconds.
                     if self.live.security_gate.blocked() {
                         continue;
                     }
                     let manager = self.live.manager.clone();
+                    let stop = ActivityCancellation::new();
                     let _ = manager
-                        .send_typing_selected(&context.selection, &context.room, false)
+                        .send_typing_selected(&context.selection, &context.room, false, &stop)
                         .await;
                     continue;
                 }
-                _ => {}
+                TypingAction::Nothing => {}
             }
             if stopping {
                 break;
@@ -826,5 +903,39 @@ impl RoomActivityUi {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_or_replacing_the_thread_withdraws_a_queued_typing_start() {
+        let deadline = Instant::now() + model::TYPING_IDLE;
+        let mut state = State::default();
+        state.thread = "$first:example.org".into();
+        state.composers[THREAD].focused = true;
+        // Another thread replaces the open one while the conversation stays
+        // shown: the start queued for typing in the old thread is withdrawn.
+        let (_, first) = queue_start(&mut state, deadline);
+        assert!(replace_thread(&mut state, "$second:example.org".into()));
+        assert!(first.is_cancelled() && state.pending_start.is_none());
+        assert!(state.composers[THREAD].focused);
+        // Closing the thread pane withdraws it too, and the removed composer
+        // no longer counts as focused.
+        let (_, second) = queue_start(&mut state, deadline);
+        assert!(replace_thread(&mut state, String::new()));
+        assert!(second.is_cancelled() && !state.composers[THREAD].focused);
+        // The same thread again changes nothing and keeps the queued start.
+        let (_, kept) = queue_start(&mut state, deadline);
+        assert!(!replace_thread(&mut state, String::new()));
+        assert!(!kept.is_cancelled());
+        // A newer start replaces, and withdraws, the one still queued.
+        let (_, newer) = queue_start(&mut state, deadline);
+        assert!(kept.is_cancelled() && !newer.is_cancelled());
+        // A queued start also lapses on its own at its idle deadline.
+        let (_, lapsed) = queue_start(&mut state, Instant::now());
+        assert!(lapsed.is_cancelled());
     }
 }
