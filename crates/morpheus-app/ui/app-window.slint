@@ -25,6 +25,8 @@ import { RoomActivity, SeenByDialog, SeenByRow, TypingFooter } from "room-activi
 // Rust drives typing names, Seen by, Mark as read and the activity settings
 // through this global.
 export { RoomActivity, SeenByRow } from "room-activity.slint";
+import { SpaceRooms, SpaceRoomsPanel } from "space-management.slint";
+export { SpaceRoomEntry, SpaceRooms } from "space-management.slint";
 import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "device-sessions.slint";
 import { NotificationRules, RoomNotificationPanel, RoomNotificationState } from "notification-settings.slint";
 // Rust drives the notification rules and the room panel through these globals.
@@ -3256,7 +3258,8 @@ export component AppWindow inherits Window {
             && !root.show-sign-in && !root.manage-accounts-open && !root.access-open
             && !root.account-menu-open && !root.room-actions-open && !root.room-admin-open
             && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog
-            && !root.quick-switcher-open && !root.image-preview-open && root.security-recovery-key == "" {
+            && !root.quick-switcher-open && !root.image-preview-open && root.security-recovery-key == ""
+            && !SpaceRooms.open {
             account-trigger.focus();
         }
         root.navigation-mode = mode;
@@ -4129,6 +4132,10 @@ export component AppWindow inherits Window {
     callback load-older-messages();
     callback refresh-room-members();
     callback submit-member-action(int, string, string);
+    // The member action and redaction in flight end with their context
+    // (moderation_ui): 0 the account or room changed, 2 the redaction dialog
+    // closed or shows something else, 3 its Close/Escape control before hide.
+    callback moderation-context-changed(int);
     callback submit-room-admin(int, string, string);
     callback open-room-settings();
     callback cancel-room-settings();
@@ -4261,7 +4268,7 @@ export component AppWindow inherits Window {
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-switch-pending && !root.account-menu-open
         && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy
-        && !root.account-profile-open && !SpaceExplorer.open && !MemberPrivacy.inspector.open
+        && !root.account-profile-open && !SpaceExplorer.open && !MemberPrivacy.inspector.open && !SpaceRooms.open
         && !RoomNotificationState.open && !RoomActivity.seen-open
         && !root.quick-switcher-open && !root.room-actions-open && !root.room-admin-open
         && !root.member-confirm-open && !root.native-capture-picker-open
@@ -4276,7 +4283,7 @@ export component AppWindow inherits Window {
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-switch-pending && !root.account-menu-open
         && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy && root.sas-stage == 0
-        && !root.account-profile-open && !SpaceExplorer.open
+        && !root.account-profile-open && !SpaceExplorer.open && !SpaceRooms.open
         && !RoomNotificationState.open && !RoomActivity.seen-open
         && !root.quick-switcher-open && !root.people-open
         && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open
@@ -4519,7 +4526,7 @@ export component AppWindow inherits Window {
         && RoomNotificationState.account-id == root.active-account-local-id
         && RoomNotificationState.room-id == root.active-room-id && root.active-room-id != ""
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
-        && root.security-recovery-key == "" && !root.account-profile-open && !SpaceExplorer.open
+        && root.security-recovery-key == "" && !root.account-profile-open && !SpaceExplorer.open && !SpaceRooms.open
         && !root.people-open && !MemberPrivacy.inspector.open;
     // Another account or room, a lock or a detach clears the panel's rows.
     changed room-notifications-current => {
@@ -4627,7 +4634,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !MemberPrivacy.inspector.open && !root.image-preview-open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !MemberPrivacy.inspector.open && !root.image-preview-open && !SpaceRooms.open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -4704,19 +4711,22 @@ export component AppWindow inherits Window {
         if !root.image-previews-encrypted-enabled { root.cancel-room-settings(); }
     }
     changed room-admin-open => {
-        if !root.room-admin-open { root.cancel-room-settings(); }
+        if !root.room-admin-open { root.cancel-room-settings(); root.moderation-context-changed(2); }
     }
     changed room-admin-mode => {
         if root.room-admin-mode != 0 { root.cancel-room-settings(); }
+        if root.room-admin-mode != 2 { root.moderation-context-changed(2); }
     }
     changed active-account-local-id => {
         root.close-people();
         MemberPrivacy.close-inspector();
+        root.moderation-context-changed(0);
         root.details-reveal-open = false;
         root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {
         MemberPrivacy.close-inspector();
+        root.moderation-context-changed(0);
         root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); root.attachment-context-changed(); RoomOrganizationState.active-room-changed();
         root.appearance-room-changed(); }
     changed thread-root-id => {
@@ -6966,6 +6976,17 @@ export component AppWindow inherits Window {
                     function reveal(offset: length) {
                         self.content-y = -max(0px, min(offset - 16px, self.content-height - self.visible-height));
                     }
+                    // Keep a retained focus target visible after layout changes,
+                    // moving only when an edge crosses the live viewport. A
+                    // target taller than the viewport keeps its leading edge.
+                    function reveal-region(offset: length, extent: length) {
+                        let shown = -self.content-y;
+                        let target = offset < shown ? offset
+                            : offset + extent > shown + self.visible-height
+                                ? min(offset, offset + extent - self.visible-height) : shown;
+                        let bounded = max(0px, min(target, max(0px, self.content-height - self.visible-height)));
+                        if self.content-y != -bounded { self.content-y = -bounded; }
+                    }
                     settings-content := VerticalLayout {
                         width: settings-scroll.visible-width;
                         min-width: 0px;
@@ -7421,22 +7442,36 @@ export component AppWindow inherits Window {
                         ActionRect {
                             height: 42px * root.text-scale;
                             property <int> reveal-request: root.reveal-request("appearance.reduce_motion");
-                            // Keyboard focus and search share the same bounded reveal.
+                            // This is a direct child of settings-content: its
+                            // layout-local y changes on reflow, never on scroll.
+                            // FocusScope keeps focus across text-scale changes
+                            // without another focus-gained event, so also reveal
+                            // that retained target when its geometry changes.
+                            property <length> reveal-top: self.y;
+                            property <length> reveal-view: settings-scroll.visible-height;
+                            property <length> reveal-content: settings-scroll.content-height;
+                            function reveal-focused() {
+                                if self.has-focus { settings-scroll.reveal-region(self.reveal-top, self.height); }
+                            }
+                            changed reveal-top => { self.reveal-focused(); }
+                            changed height => { self.reveal-focused(); }
+                            changed reveal-view => { self.reveal-focused(); }
+                            changed reveal-content => { self.reveal-focused(); }
+                            // Keyboard focus, retained focus and search share
+                            // the same bounded whole-control reveal.
                             changed has-focus => {
-                                if self.has-focus {
-                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                }
+                                self.reveal-focused();
                             }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
-                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    settings-scroll.reveal-region(self.reveal-top, self.height);
                                     self.focus();
                                     if self.has-focus { root.settings-revealed-id = "appearance.reduce_motion"; }
                                 }
                             }
                             focus-state-changed(focused) => {
                                 if focused {
-                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    settings-scroll.reveal-region(self.reveal-top, self.height);
                                 }
                             }
                             label: "Reduce motion" + (StyleTokens.reduced-motion ? ", on" : ", off");
@@ -10980,6 +11015,47 @@ export component AppWindow inherits Window {
         save => { root.save-attachment(root.image-preview-event-id, root.image-preview-title); }
     }
 
+    // An exact open Space form never survives navigation, account access,
+    // a sign-in surface, or a pending/completed security/SAS presentation.
+    // The Rust admission additionally keeps navigation and gate epochs so
+    // an unsettled A→B→A or begin→end never revives a queued confirmation.
+    property <string> space-management-context: root.active-account-local-id + "\n" + root.active-room-id
+        + "\n" + root.active-space-id + "\n" + root.page + "\n" + root.navigation-mode
+        + "\n" + (root.live-session ? "1" : "0") + (root.show-sign-in ? "1" : "0")
+        + (root.access-open ? "1" : "0") + (root.account-switch-pending ? "1" : "0")
+        + (root.manage-accounts-open ? "1" : "0") + (root.security-busy ? "1" : "0")
+        + (root.security-recovery-key != "" ? "1" : "0") + (root.sas-busy ? "1" : "0")
+        + "\n" + root.sas-stage
+        + (MemberPrivacy.inspector.open ? "1" : "0") + (root.people-open ? "1" : "0")
+        + (root.account-profile-open ? "1" : "0") + (RoomNotificationState.open ? "1" : "0")
+        + (RoomActivity.seen-open ? "1" : "0") + (root.quick-switcher-open ? "1" : "0")
+        + (root.room-actions-open ? "1" : "0") + (root.room-admin-open ? "1" : "0")
+        + (root.member-confirm-open ? "1" : "0") + (root.native-capture-picker-open ? "1" : "0")
+        + (root.leave-call-dialog ? "1" : "0") + (root.image-preview-open ? "1" : "0")
+        + (root.poll-dialog-open ? "1" : "0") + (root.account-menu-open ? "1" : "0");
+    changed space-management-context => { SpaceRooms.context-changed(); }
+
+    // Managing a Space's rooms (space-management.slint); Rust owns its state.
+    if SpaceRooms.open : SpaceRoomsPanel {
+        text-scale: root.text-scale;
+        button-colors: root.button-colors;
+        palette: {
+            ink: root.ink,
+            muted: root.muted,
+            accent: root.accent,
+            surface: root.dialog-surface,
+            elevated: root.elevated,
+            hover: root.hover,
+            divider: root.divider,
+            error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b,
+            selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover,
+            selection-ink: StyleTokens.roles.selection-ink.color,
+            has-selection-ink: StyleTokens.roles.selection-ink.present,
+            focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+            scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa,
+        };
+    }
+
     // The Space explorer (space-explorer.slint); Rust owns its state.
     if SpaceExplorer.open : SpaceExplorerPanel {
         text-scale: root.text-scale;
@@ -11757,7 +11833,8 @@ export component AppWindow inherits Window {
     if root.room-admin-open && root.room-admin-mode == 2 : FocusScope {
         init => { admin-close.focus(); }
         key-pressed(event) => {
-            if event.text == Key.Escape && !root.room-admin-busy {
+            if event.text == Key.Escape {
+                root.moderation-context-changed(3);
                 root.room-admin-open = false;
                 account-trigger.focus();
                 accept
@@ -11822,8 +11899,11 @@ export component AppWindow inherits Window {
                         admin-close := Button {
                             width: 94px; height: 36px;
                             text: root.room-admin-mode == 2 ? "Cancel" : "Close";
-                            enabled: !root.room-admin-busy;
-                            clicked => { root.room-admin-open = false; account-trigger.focus(); }
+                            clicked => {
+                                root.moderation-context-changed(3);
+                                root.room-admin-open = false;
+                                account-trigger.focus();
+                            }
                         }
                         if root.room-admin-mode == 2 : Button {
                             width: 145px; height: 36px;

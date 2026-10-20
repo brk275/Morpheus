@@ -12,6 +12,7 @@
 import { ListView } from "std-widgets.slint";
 import { StyleTokens } from "style-tokens.slint";
 import { ActionRect, ControlColors, TokenButton } from "controls.slint";
+import { SpaceRooms } from "space-management.slint";
 
 export struct SpaceExplorerRow {
     // The stable Matrix room ID.
@@ -275,6 +276,15 @@ export component SpaceExplorerPanel inherits FocusScope {
                         text: "Open Space";
                         label: "Open Space " + SpaceExplorer.title + " in the room list";
                         activated => { SpaceExplorer.open-room(SpaceExplorer.space-id); }
+                    }
+                    // Add or remove existing rooms (space-management.slint), one modal at a time.
+                    if SpaceExplorer.can-open-space : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Manage rooms";
+                        label: "Add or remove your rooms in Space " + SpaceExplorer.title;
+                        activated => {
+                            SpaceRooms.show(SpaceExplorer.space-id, SpaceExplorer.title);
+                            SpaceExplorer.close();
+                        }
                     }
                 }
                 // The trail of Spaces opened to reach this one.

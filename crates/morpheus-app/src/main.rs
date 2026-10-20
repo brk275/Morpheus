@@ -32,6 +32,7 @@ mod member_privacy;
 mod message_metadata;
 mod message_search;
 mod metric_editor;
+mod moderation_ui;
 mod navigation;
 mod navigation_target;
 mod notification_center;
@@ -52,6 +53,7 @@ mod sender_palette_editor;
 mod settings_search;
 mod shortcuts;
 mod space_explorer;
+mod space_management;
 mod sso;
 #[cfg(not(morpheus_timeline_acceptance))]
 mod startup_error;
@@ -2296,6 +2298,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
             space_explorer::clear(&ui);
+            space_management::clear(&ui);
         }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
@@ -2678,243 +2681,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    let weak = ui.as_weak();
-    let member_action_live = live.clone();
-    let member_action_handle = runtime.handle().clone();
-    ui.on_submit_member_action(move |kind, user_id, value| {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !member_action_live.is_live.load(Ordering::Acquire) || window.get_member_action_busy() {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        let user_id = user_id.trim().to_owned();
-        if account_id.is_empty() || room_id.is_empty() || user_id.is_empty() {
-            window.set_member_action_error("Choose a room and enter a Matrix user ID".into());
-            return;
-        }
-        let label = match kind {
-            0 => "invite",
-            1 => "kick",
-            2 => "ban",
-            3 => "unban",
-            4 => "change power for",
-            _ => return,
-        };
-        let value = value.to_string();
-        let power_level = if kind == 4 {
-            match value.trim().parse::<i64>() {
-                Ok(level) => Some(level),
-                Err(_) => {
-                    window.set_member_action_error("Enter a whole-number power level".into());
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let operation = window.get_member_action_operation().wrapping_add(1);
-        window.set_member_action_operation(operation);
-        window.set_member_action_busy(true);
-        window.set_member_action_error("".into());
-        window.set_member_action_notice("".into());
-        let navigation_epoch = member_action_live.current_navigation_epoch();
-        let live = member_action_live.clone();
-        let weak = weak.clone();
-        member_action_handle.spawn(async move {
-            // A room or account switch can invalidate the action before its
-            // Tokio task reaches the network. The core checks the account ID
-            // again while it holds the selection lock.
-            if !live.navigation_is_current(navigation_epoch) {
-                return;
-            }
-            let manager = live.manager.clone();
-            let result = match kind {
-                0 => {
-                    manager
-                        .invite_user_for(&account_id, &room_id, &user_id)
-                        .await
-                }
-                1 => {
-                    manager
-                        .kick_user_for(&account_id, &room_id, &user_id, None)
-                        .await
-                }
-                2 => {
-                    manager
-                        .ban_user_for(&account_id, &room_id, &user_id, None)
-                        .await
-                }
-                3 => {
-                    manager
-                        .unban_user_for(&account_id, &room_id, &user_id, None)
-                        .await
-                }
-                4 => {
-                    manager
-                        .set_member_power_level_for(
-                            &account_id,
-                            &room_id,
-                            &user_id,
-                            power_level.expect("parsed for power action"),
-                        )
-                        .await
-                }
-                _ => return,
-            };
-            if result.is_ok() && live.navigation_is_current(navigation_epoch) {
-                // The SDK member snapshot may still contain the previous
-                // sync state immediately after the homeserver accepts a
-                // change. Wait briefly for the target state before repainting.
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-                loop {
-                    if !live.navigation_is_current(navigation_epoch) {
-                        break;
-                    }
-                    let settled = manager
-                        .room_members_for(&account_id, &room_id)
-                        .await
-                        .ok()
-                        .is_some_and(|members| {
-                            let member = members.iter().find(|member| member.user_id == user_id);
-                            match kind {
-                                0 => member.is_some_and(|member| {
-                                    member.membership == "invite" || member.membership == "join"
-                                }),
-                                1 | 3 => member.is_none(),
-                                2 => member.is_some_and(|member| member.membership == "ban"),
-                                4 => member.is_some_and(|member| member.power_level == power_level),
-                                _ => false,
-                            }
-                        });
-                    if settled || tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                }
-                live.refresh_members_for(account_id.clone(), room_id.clone(), weak.clone(), true)
-                    .await;
-            }
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                    || window.get_member_action_operation() != operation
-                {
-                    return;
-                }
-                window.set_member_action_busy(false);
-                match result {
-                    Ok(()) => {
-                        if kind == 0 && window.get_member_invite_user_id().as_str() == user_id {
-                            window.set_member_invite_user_id("".into());
-                        }
-                        if kind != 0 && kind != 4 {
-                            window.set_member_selected_user_id("".into());
-                        }
-                        window.set_member_action_notice(
-                            format!("Room member action completed: {label} {user_id}").into(),
-                        );
-                        window.set_member_action_error("".into());
-                    }
-                    Err(error) => {
-                        window.set_member_action_error(
-                            directory_plain_text(
-                                &format!("Could not {label} {user_id}: {error}"),
-                                240,
-                            )
-                            .into(),
-                        );
-                    }
-                }
-            });
-        });
-    });
-
-    let weak = ui.as_weak();
-    let admin_live = live.clone();
-    let admin_handle = runtime.handle().clone();
-    let admin_settings = room_settings.clone();
-    ui.on_submit_room_admin(move |kind, value, _reason| {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if matches!(kind, 0 | 1) {
-            admin_settings.save_text(&window, kind, value.to_string());
-            return;
-        }
-        if kind != 2
-            || !window.get_room_admin_open()
-            || window.get_room_admin_mode() != 2
-            || !admin_live.is_live.load(Ordering::Acquire)
-            || window.get_room_admin_busy()
-        {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        if account_id.is_empty()
-            || room_id.is_empty()
-            || window.get_room_admin_account_id().as_str() != account_id
-            || window.get_room_admin_room_id().as_str() != room_id
-        {
-            window
-                .set_room_admin_error("Room or account changed. Reopen message redaction.".into());
-            return;
-        }
-        if value.is_empty() || window.get_room_admin_event_id() != value {
-            window.set_room_admin_error("Choose a message to redact".into());
-            return;
-        }
-        let value = value.to_string();
-        let operation = window.get_room_admin_operation().wrapping_add(1);
-        window.set_room_admin_operation(operation);
-        window.set_room_admin_busy(true);
-        window.set_room_admin_error("".into());
-        window.set_room_admin_notice("".into());
-        let navigation_epoch = admin_live.current_navigation_epoch();
-        let live = admin_live.clone();
-        let weak = weak.clone();
-        admin_handle.spawn(async move {
-            if !live.navigation_is_current(navigation_epoch) {
-                return;
-            }
-            let result = live
-                .manager
-                .redact_message_for(&account_id, &room_id, &value, None)
-                .await;
-            let refresh = result.is_ok() && live.navigation_is_current(navigation_epoch);
-            let error = result.err().map(|error| {
-                directory_plain_text(&format!("Could not redact message: {error}"), 240)
-            });
-            let completion_live = live.clone();
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if !window.get_room_admin_open()
-                    || window.get_room_admin_mode() != 2
-                    || !completion_live.navigation_is_current(navigation_epoch)
-                    || window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                    || window.get_room_admin_account_id().as_str() != account_id
-                    || window.get_room_admin_room_id().as_str() != room_id
-                    || window.get_room_admin_event_id().as_str() != value
-                    || window.get_room_admin_operation() != operation
-                {
-                    return;
-                }
-                window.set_room_admin_busy(false);
-                if let Some(error) = error {
-                    window.set_room_admin_error(error.into());
-                } else {
-                    window.set_room_admin_notice("Message redacted".into());
-                    window.set_room_admin_event_id("".into());
-                }
-            });
-            if refresh {
-                let _ = live.refresh(weak).await;
-            }
-        });
-    });
+    // Member actions and message redaction, each owned by what it was
+    // confirmed in (moderation_ui); the room name and topic of the shared
+    // admin callback stay with the room settings form.
+    let room_text = room_settings.clone();
+    let moderation = moderation_ui::ModerationUi::register(
+        &ui,
+        live.clone(),
+        runtime.handle(),
+        manager.clone(),
+        move |window, kind, value| room_text.save_text(window, kind, value),
+    );
 
     let weak = ui.as_weak();
     ui.on_open_discovery(move || {
@@ -2927,6 +2704,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     message_search::register(&ui, live.clone(), runtime.handle().clone());
     space_explorer::register(&ui, live.clone(), runtime.handle().clone());
+    space_management::register(&ui, live.clone(), runtime.handle().clone());
     thread_history::register(&ui, live.clone(), runtime.handle().clone());
     account_identity::register(&ui, live.clone(), runtime.handle().clone());
     people_directory::register(&ui, live.clone(), runtime.handle().clone());
@@ -4118,6 +3896,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     live.voice_spaces.forget_account(&account_id).await;
                     live.forget_account_drafts(&account_id);
+                    space_management::forget_account(&account_id);
                     live.clear_feed().await;
                     live.account_detached(ui.clone()).await;
                     let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -4482,6 +4261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     room_media.shutdown(&ui);
     room_activity.shutdown(&ui);
     room_settings.shutdown(&ui);
+    moderation.shutdown();
     image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]
     voice_presence.shutdown(&ui);

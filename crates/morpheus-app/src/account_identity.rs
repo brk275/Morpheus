@@ -526,6 +526,8 @@ fn unobstructed(ui: &AppWindow, live: &LiveUi) -> bool {
         && !ui.get_image_preview_open()
         && !ui.get_poll_dialog_open()
         && !ui.get_people_open()
+        && !crate::member_privacy::is_open(ui)
+        && !crate::space_management::is_open(ui)
 }
 
 /// What an operation captured when it started.

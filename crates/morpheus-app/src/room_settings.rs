@@ -34,6 +34,12 @@ pub(crate) fn chooser_owner() -> Option<crate::image_previews::avatar::AvatarCon
     )
 }
 const REFRESH_FIRST: &str = "The change may have reached your homeserver. Refresh room details before making another change.";
+const NOTHING_CHANGED: &str =
+    "Nothing was changed. Refresh room details before making another change.";
+const SAVED_NOT_READ: &str =
+    "The change was saved. Refresh room details to see the current settings.";
+const AVATAR_NOT_CHANGED: &str =
+    "The room avatar was not changed. Refresh room details before making another change.";
 const UNAVAILABLE: &str = "Room settings are unavailable. Close this form and reopen it.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -277,6 +283,12 @@ impl RoomSettingsUi {
             && ui.get_room_admin_account_id().as_str() == form.selection.account_id()
             && ui.get_room_admin_room_id().as_str() == form.room
     }
+    /// Writes are admitted only while no account access, restart or recovery
+    /// step holds the security gate; the core asks right before each send.
+    fn admission(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let gate = self.live.security_gate.clone();
+        Arc::new(move || !gate.blocked())
+    }
     fn current_for(&self, ui: &AppWindow) -> Option<Arc<Form>> {
         let form = self
             .current
@@ -385,7 +397,7 @@ impl RoomSettingsUi {
                     if !this.active(&form) { return Err(RoomSettingsError::Cancelled); }
                     match session {
                         Some(session) => { let snapshot = session.refresh().await?; Ok((session, snapshot)) },
-                        None => { let session = Arc::new(this.live.manager.open_room_settings_for(&form.selection, &form.room, form.cancellation.clone()).await?);
+                        None => { let session = Arc::new(this.live.manager.open_room_settings_for(&form.selection, &form.room, form.cancellation.clone()).await?.with_admission(this.admission()));
                             let snapshot = session.snapshot(); Ok((session, snapshot)) },
                     }
                 } => result,
@@ -755,7 +767,7 @@ impl RoomSettingsUi {
             }
             Err(error) => {
                 state.error = settings_error(error);
-                state.notice = REFRESH_FIRST;
+                state.notice = write_notice(error);
             }
         }
         drop(state);
@@ -966,6 +978,49 @@ fn settings_error(error: RoomSettingsError) -> &'static str {
         RoomSettingsError::EncryptedPreviewDisabled => {
             "Enable previews in encrypted rooms in Appearance before viewing this avatar."
         }
+        RoomSettingsError::SecurityBusy => {
+            "Finish the account or security step in progress first. Nothing was sent."
+        }
+        RoomSettingsError::Refused => "The homeserver refused this change. Nothing was changed.",
+        RoomSettingsError::SignInExpired => {
+            "This sign-in needs renewing. The homeserver did not apply the change."
+        }
+        RoomSettingsError::UploadFailed => {
+            "The image could not be uploaded. The room avatar was not changed."
+        }
+        RoomSettingsError::Unknown => {
+            "No answer came back. The setting may or may not have changed; it is not sent again."
+        }
+        RoomSettingsError::AvatarUnknown => {
+            "The image was uploaded, but whether the room avatar changed is unknown. It is \
+             not sent again."
+        }
+        RoomSettingsError::SavedNotRead => {
+            "Saved, but the current settings could not be read back."
+        }
+        RoomSettingsError::AvatarUploadedNotChanged => {
+            "The image was uploaded to your homeserver, but the room avatar was not changed. \
+             It is not uploaded again unless you save again."
+        }
+        RoomSettingsError::AvatarUploadUnknown => {
+            "No answer came back for the image upload. The image may be on your homeserver, \
+             but the room avatar was not changed. It is not uploaded again unless you save \
+             again."
+        }
+    }
+}
+/// What a failed write may have done. Only an unknown outcome may have
+/// changed the room; every failure still asks for a refresh first.
+fn write_notice(error: RoomSettingsError) -> &'static str {
+    match error {
+        RoomSettingsError::Unknown | RoomSettingsError::AvatarUnknown => REFRESH_FIRST,
+        RoomSettingsError::SavedNotRead => SAVED_NOT_READ,
+        // The image left this device, or may have; only the room is
+        // unchanged.
+        RoomSettingsError::AvatarUploadedNotChanged | RoomSettingsError::AvatarUploadUnknown => {
+            AVATAR_NOT_CHANGED
+        }
+        _ => NOTHING_CHANGED,
     }
 }
 /// Clears the chooser owner before the permit is released (declared after
@@ -1086,6 +1141,39 @@ fn read_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_an_unknown_write_says_it_may_have_reached_the_homeserver() {
+        use RoomSettingsError as Error;
+        for error in [Error::Unknown, Error::AvatarUnknown] {
+            assert_eq!(write_notice(error), REFRESH_FIRST);
+        }
+        assert_eq!(write_notice(Error::SavedNotRead), SAVED_NOT_READ);
+        // After a confirmed upload nothing claims that nothing was sent.
+        let uploaded = Error::AvatarUploadedNotChanged;
+        assert_eq!(write_notice(uploaded), AVATAR_NOT_CHANGED);
+        assert!(settings_error(uploaded).contains("image was uploaded"));
+        assert!(!settings_error(uploaded).contains("Nothing was sent"));
+        // An upload handed over without an answer may have stored the image.
+        let unanswered = Error::AvatarUploadUnknown;
+        assert_eq!(write_notice(unanswered), AVATAR_NOT_CHANGED);
+        assert!(settings_error(unanswered).contains("may be on your homeserver"));
+        assert!(!settings_error(unanswered).contains("Nothing was sent"));
+        assert!(!settings_error(unanswered).contains("could not be uploaded"));
+        for error in [
+            Error::SecurityBusy,
+            Error::Refused,
+            Error::SignInExpired,
+            Error::UploadFailed,
+            Error::PermissionDenied,
+            Error::RateLimited,
+            Error::BaselineChanged,
+        ] {
+            assert_eq!(write_notice(error), NOTHING_CHANGED);
+        }
+        assert!(settings_error(Error::Unknown).contains("may or may not have changed"));
+        assert!(settings_error(Error::AvatarUnknown).contains("image was uploaded"));
+        assert!(settings_error(Error::SecurityBusy).contains("Nothing was sent"));
+    }
     #[test]
     fn stale_forms_do_not_match_returning_to_same_account_and_room() {
         assert!(form_matches(

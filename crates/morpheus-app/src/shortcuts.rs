@@ -367,6 +367,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || crate::space_explorer::is_open(ui)
         || ui.get_account_profile_open()
         || crate::member_privacy::is_open(ui)
+        || crate::space_management::is_open(ui)
         || ui.get_image_preview_open()
         || !ui.get_shortcut_recording().is_empty()
         || ui.get_poll_dialog_open()

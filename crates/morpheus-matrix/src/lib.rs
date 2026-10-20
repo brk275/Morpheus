@@ -34,6 +34,11 @@ pub use discovery::{
     MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery, ResolvedRoomAlias,
     parse_matrix_link_target,
 };
+mod space_management;
+pub use space_management::{
+    LinkIntent, LinkWarning, MAX_LINK_VIA, MAX_SPACE_CANDIDATES, MAX_SPACE_LINKS, SpaceLinkChange,
+    SpaceLinkResult, SpaceManageError, SpaceRoomCandidate, SpaceRoomsView,
+};
 mod space_explorer;
 pub use space_explorer::{
     MAX_SPACE_ALIAS_CHARS, MAX_SPACE_LEVEL_LINKS, MAX_SPACE_LINK_VIA, MAX_SPACE_NAME_CHARS,
@@ -101,6 +106,10 @@ pub use notification_rules::{
     MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_KEYWORDS, MAX_NOTIFICATION_ROOMS,
     NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT, PushRuleSyncWatch,
     RoomNotificationRule, RoomUnreadCounts,
+};
+mod moderation;
+pub use moderation::{
+    MemberAction, ModerationCancellation, ModerationError, ModerationOutcome, ModerationScope,
 };
 pub use room_tags::{
     ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, RoomTagState,
@@ -2478,22 +2487,6 @@ impl AccountManager {
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
     }
 
-    pub async fn redact_message(
-        &self,
-        room_id: &str,
-        event_id: &str,
-        reason: Option<&str>,
-    ) -> Result<()> {
-        let state = self.state.lock().await;
-        let loaded = selected_loaded(&state)?;
-        let timeline = loaded.timeline(room_id).await?;
-        let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
-        timeline
-            .redact(&item_id, reason)
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
-    }
-
     /// Search locally indexed events in a room. More history is indexed as it
     /// syncs or paginates; this does not query a homeserver search endpoint.
     pub async fn search_room(
@@ -2762,68 +2755,14 @@ impl AccountManager {
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
     }
 
+    /// Invite through the selected account's bounded invite (`moderation`):
+    /// one request after a fresh permission read, never retried.
     pub async fn invite_user(&self, room_id: &str, user_id: &str) -> Result<()> {
-        let state = self.state.lock().await;
-        let room = selected_room(&state, room_id)?;
-        let user_id = parse_user_id(user_id)?;
-        room.invite_user_by_id(&user_id)
+        let account = self
+            .active_account()
             .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
-    }
-
-    pub async fn kick_user(
-        &self,
-        room_id: &str,
-        user_id: &str,
-        reason: Option<&str>,
-    ) -> Result<()> {
-        let state = self.state.lock().await;
-        let room = selected_room(&state, room_id)?;
-        let user_id = parse_user_id(user_id)?;
-        room.kick_user(&user_id, reason)
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
-    }
-
-    pub async fn ban_user(&self, room_id: &str, user_id: &str, reason: Option<&str>) -> Result<()> {
-        let state = self.state.lock().await;
-        let room = selected_room(&state, room_id)?;
-        let user_id = parse_user_id(user_id)?;
-        room.ban_user(&user_id, reason)
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
-    }
-
-    pub async fn unban_user(
-        &self,
-        room_id: &str,
-        user_id: &str,
-        reason: Option<&str>,
-    ) -> Result<()> {
-        let state = self.state.lock().await;
-        let room = selected_room(&state, room_id)?;
-        let user_id = parse_user_id(user_id)?;
-        room.unban_user(&user_id, reason)
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
-    }
-
-    pub async fn rename_room(&self, room_id: &str, name: &str) -> Result<()> {
-        let state = self.state.lock().await;
-        selected_room(&state, room_id)?
-            .set_name(name.into())
-            .await
-            .map(|_| ())
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
-    }
-
-    pub async fn set_room_topic(&self, room_id: &str, topic: &str) -> Result<()> {
-        let state = self.state.lock().await;
-        selected_room(&state, room_id)?
-            .set_room_topic(topic)
-            .await
-            .map(|_| ())
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+            .ok_or(MatrixCoreError::NoActiveAccount)?;
+        self.invite_user_for(&account.id, room_id, user_id).await
     }
 
     pub async fn security_info(&self) -> Result<SecurityInfo> {

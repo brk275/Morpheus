@@ -1,13 +1,32 @@
 //! Revocable, exact-room settings sessions. Reads are authoritative server GETs;
 //! per-field baseline checks detect observed changes, never promise atomic CAS.
 //! Room-avatar state is shared metadata even when the room's messages are encrypted.
+//!
+//! Each write (name, topic, join rule, avatar, avatar removal) is one state
+//! request, and an avatar adds one media upload before it, a typed request
+//! like the writes (the SDK's own upload first reads the server's size limit,
+//! unbounded). Both are sent at most once: no HTTP retry, no automatic
+//! authentication refresh and replay
+//! (`disable_auth_refresh`, STAGED from root's SDK checkpoint d4c5d08, so this
+//! compiles only on c7d0e12 combined with it), a timeout and a 64 KiB answer,
+//! on the account's no-redirect transport. The final checks run after the
+//! last await, right before the hand-off: the form is open, the exact
+//! selection is current, the room is joined on this device, the app's
+//! admission (its security gate) allows it, and the fresh permission read
+//! just before allowed it. Every wait races the form's cancellation first,
+//! then `AccountSelection::guard` (root's d56ba8b lets a ready revocation win
+//! before the work is polled). Before the hand-off a stop sends nothing.
+//! After it, a stop, a timeout or an answer other than a 4xx is `Unknown`
+//! (the setting may or may not have changed), never resent; a refresh shows
+//! what the room has. An avatar upload handed over without an answer is
+//! `AvatarUploadUnknown`: the image may be stored, and no state was sent.
 
 use std::{
     collections::BTreeSet,
     future::Future,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -16,13 +35,16 @@ use matrix_sdk::{
     HttpError, Room, RoomState,
     config::RequestConfig,
     ruma::{
-        OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, RoomVersionId, UInt,
+        OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, RoomId, RoomVersionId, UInt,
         api::{
-            client::state::{get_state_event_for_key, send_state_event},
+            client::{
+                media::create_content,
+                state::{get_state_event_for_key, send_state_event},
+            },
             error::ErrorKind,
         },
         events::{
-            EmptyStateKey, StateEventContent, StateEventType,
+            StateEventType,
             room::{
                 MediaSource,
                 avatar::{ImageInfo, RoomAvatarEventContent},
@@ -39,7 +61,7 @@ use matrix_sdk::{
     },
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, value::RawValue};
 use tokio::{
     sync::{Mutex, Notify},
     time,
@@ -58,6 +80,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(45);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Most bytes accepted in a write's or an upload's answer: an event ID, a
+/// content URI or an error.
+const MAX_WRITE_RESPONSE_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RoomSettingsError {
@@ -89,6 +114,24 @@ pub enum RoomSettingsError {
     InvalidText,
     #[error("Image previews in encrypted rooms are disabled")]
     EncryptedPreviewDisabled,
+    #[error("Finish the account or security step in progress first; nothing was sent")]
+    SecurityBusy,
+    #[error("The homeserver refused this change; nothing was changed")]
+    Refused,
+    #[error("This sign-in needs renewing; the homeserver did not apply the change")]
+    SignInExpired,
+    #[error("The image could not be uploaded; the room avatar was not changed")]
+    UploadFailed,
+    #[error("No answer came back; the setting may or may not have changed")]
+    Unknown,
+    #[error("The image was uploaded, but whether the room avatar changed is unknown")]
+    AvatarUnknown,
+    #[error("The change was saved, but reading the settings back failed; refresh to see them")]
+    SavedNotRead,
+    #[error("The image was uploaded, but the room avatar was not changed")]
+    AvatarUploadedNotChanged,
+    #[error("The image may have reached the homeserver, but the room avatar was not changed")]
+    AvatarUploadUnknown,
 }
 type Result<T> = std::result::Result<T, RoomSettingsError>;
 
@@ -236,11 +279,19 @@ pub struct RoomAvatarPreview {
 #[derive(Clone)]
 struct Loaded {
     snapshot: RoomSettingsSnapshot,
-    name: Option<Value>,
-    topic: Option<Value>,
-    avatar: Option<Value>,
-    join_rule: Option<Value>,
+    raw: RawContents,
     avatar_source: Option<MediaSource>,
+}
+
+/// Each editable field's stored content as the exact text the server sent,
+/// `None` without the event: the baseline a save must still find byte for
+/// byte, and the content a save edits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RawContents {
+    name: Option<String>,
+    topic: Option<String>,
+    avatar: Option<String>,
+    join_rule: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -257,20 +308,20 @@ enum SettingsField {
 // current permissions, room version and encryption state remain fresh.
 fn preserve_other_fields(previous: &Loaded, mut fresh: Loaded, saved: SettingsField) -> Loaded {
     if saved != SettingsField::Name {
-        fresh.name = previous.name.clone();
+        fresh.raw.name = previous.raw.name.clone();
         fresh.snapshot.name = previous.snapshot.name.clone();
     }
     if saved != SettingsField::Topic {
-        fresh.topic = previous.topic.clone();
+        fresh.raw.topic = previous.raw.topic.clone();
         fresh.snapshot.topic = previous.snapshot.topic.clone();
     }
     if saved != SettingsField::Avatar {
-        fresh.avatar = previous.avatar.clone();
+        fresh.raw.avatar = previous.raw.avatar.clone();
         fresh.avatar_source = previous.avatar_source.clone();
         fresh.snapshot.avatar = previous.snapshot.avatar.clone();
     }
     if saved != SettingsField::JoinRule {
-        fresh.join_rule = previous.join_rule.clone();
+        fresh.raw.join_rule = previous.raw.join_rule.clone();
         fresh.snapshot.join_rule = previous.snapshot.join_rule.clone();
     }
     fresh
@@ -283,6 +334,47 @@ pub struct RoomSettingsSession {
     own_user: OwnedUserId,
     loaded: RwLock<Loaded>,
     operation: Mutex<()>,
+    admission: Option<Admission>,
+}
+
+/// Asked right before each request of a write is handed to the homeserver:
+/// false refuses it with nothing sent.
+type Admission = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// What one write has done so far, so that a stop or a failure is reported
+/// by what may have reached the homeserver, never as nothing sent.
+#[derive(Default)]
+struct Dispatch {
+    /// The avatar image's upload: APPLIED once its address is confirmed.
+    upload: AtomicU8,
+    state: AtomicU8,
+}
+/// `Dispatch::state` and `Dispatch::upload` (0, the default: not handed
+/// over): handed to the SDK, so it may or may not apply.
+const SENT: u8 = 1;
+/// Answered with a 4xx: not applied.
+const REFUSED: u8 = 2;
+/// Answered with success: applied.
+const APPLIED: u8 = 3;
+
+impl Dispatch {
+    fn outcome(&self, error: RoomSettingsError) -> RoomSettingsError {
+        let upload = self.upload.load(Ordering::Acquire);
+        match self.state.load(Ordering::Acquire) {
+            SENT if upload == APPLIED => RoomSettingsError::AvatarUnknown,
+            SENT => RoomSettingsError::Unknown,
+            APPLIED => RoomSettingsError::SavedNotRead,
+            // Unsent or refused after a confirmed upload: the image did
+            // leave this device, though no room state changed.
+            _ if upload == APPLIED => RoomSettingsError::AvatarUploadedNotChanged,
+            // An upload handed over and never answered (stopped, timed out,
+            // unreadable, too large or a 5xx): the image may be stored, and
+            // no room state was sent. Never "nothing was uploaded".
+            _ if upload == SENT => RoomSettingsError::AvatarUploadUnknown,
+            // Unsent or refused: nothing changed, and the error says why.
+            _ => error,
+        }
+    }
 }
 
 impl AccountManager {
@@ -328,11 +420,19 @@ impl AccountManager {
             own_user,
             loaded: RwLock::new(loaded),
             operation: Mutex::new(()),
+            admission: None,
         })
     }
 }
 
 impl RoomSettingsSession {
+    /// Every write asks `admission` right before each of its requests is
+    /// handed to the homeserver, after every await; false refuses the write
+    /// with nothing sent (`SecurityBusy`). The app passes its security gate.
+    pub fn with_admission(mut self, admission: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
     pub fn account_id(&self) -> &str {
         self.selection.account_id()
     }
@@ -358,6 +458,89 @@ impl RoomSettingsSession {
         })
         .await
     }
+    /// A write under `run`: once its state request was handed over, a stop
+    /// or a failure is reported by what it may have done.
+    async fn run_write<T>(
+        &self,
+        dispatch: &Dispatch,
+        work: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        self.run(WRITE_TIMEOUT, work)
+            .await
+            .map_err(|error| dispatch.outcome(error))
+    }
+    /// The checks right before a request is handed to the homeserver, after
+    /// the last await: the form is open, the exact selection is current, the
+    /// room is joined on this device and the app admits a change.
+    fn admit(&self) -> Result<()> {
+        self.check()?;
+        if self.admission.as_ref().is_some_and(|admitted| !admitted()) {
+            return Err(RoomSettingsError::SecurityBusy);
+        }
+        Ok(())
+    }
+    /// The one state request of a write, its content sent as the exact text
+    /// built by `edited_content`. Nothing is awaited between the final checks
+    /// and the hand-off.
+    async fn send_state(
+        &self,
+        dispatch: &Dispatch,
+        kind: StateEventType,
+        content: Box<RawValue>,
+    ) -> Result<()> {
+        let room_id = self.room.room_id().to_owned();
+        let content = matrix_sdk::ruma::serde::Raw::from_json(content);
+        let request = send_state_event::v3::Request::new_raw(room_id, kind, String::new(), content);
+        let client = self.room.client();
+        self.admit()?;
+        dispatch.state.store(SENT, Ordering::Release);
+        let sent = client
+            .send(request)
+            .with_request_config(write_config())
+            .await;
+        match sent {
+            Ok(_) => {
+                dispatch.state.store(APPLIED, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                let refused = refusal(error.as_client_api_error());
+                if refused.is_some() {
+                    dispatch.state.store(REFUSED, Ordering::Release);
+                }
+                Err(refused.unwrap_or(RoomSettingsError::Unknown))
+            }
+        }
+    }
+    /// The avatar's one media upload, a typed request on the bounded upload
+    /// config. The SDK's media upload would first read the server's size
+    /// limit (`/media/config`, on the default config, unbounded) after the
+    /// final checks; here nothing is awaited between them and the hand-off.
+    /// Once handed over, only a 4xx answer means nothing was stored.
+    async fn upload_avatar(&self, dispatch: &Dispatch, bytes: Vec<u8>) -> Result<OwnedMxcUri> {
+        let mut request = create_content::v3::Request::new(bytes);
+        request.content_type = Some("image/png".to_owned());
+        let client = self.room.client();
+        self.admit()?;
+        dispatch.upload.store(SENT, Ordering::Release);
+        let sent = client
+            .send(request)
+            .with_request_config(upload_config())
+            .await;
+        match sent {
+            Ok(response) => {
+                dispatch.upload.store(APPLIED, Ordering::Release);
+                Ok(response.content_uri)
+            }
+            Err(error) => match refusal(error.as_client_api_error()) {
+                Some(refused) => {
+                    dispatch.upload.store(REFUSED, Ordering::Release);
+                    Err(refused)
+                }
+                None => Err(RoomSettingsError::AvatarUploadUnknown),
+            },
+        }
+    }
     fn publish(&self, fresh: Loaded) -> Result<RoomSettingsSnapshot> {
         self.check()?;
         let snapshot = fresh.snapshot.clone();
@@ -380,20 +563,24 @@ impl RoomSettingsSession {
     }
     pub async fn set_name(&self, name: &str) -> Result<RoomSettingsSnapshot> {
         let name = editable_text(name, true)?;
-        self.run(WRITE_TIMEOUT, async {
+        let dispatch = Dispatch::default();
+        self.run_write(&dispatch, async {
             let baseline = self
                 .loaded
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
+                .raw
                 .name
                 .clone();
             let fresh = read_settings(&self.room, &self.own_user).await?;
-            require_baseline(&baseline, &fresh.name)?;
+            require_baseline(&baseline, &fresh.raw.name)?;
             if !fresh.snapshot.permissions.name {
                 return Err(RoomSettingsError::PermissionDenied);
             }
-            self.check()?;
-            send_state(&self.room, RoomNameEventContent::new(name.to_owned())).await?;
+            let typed = RoomNameEventContent::new(name.to_owned());
+            let content = edited_content(fresh.raw.name.as_deref(), &["name"], typed)?;
+            self.send_state(&dispatch, StateEventType::RoomName, content)
+                .await?;
             self.check()?;
             self.publish_write(
                 read_settings(&self.room, &self.own_user).await?,
@@ -404,20 +591,27 @@ impl RoomSettingsSession {
     }
     pub async fn set_topic(&self, topic: &str) -> Result<RoomSettingsSnapshot> {
         let topic = editable_text(topic, false)?;
-        self.run(WRITE_TIMEOUT, async {
+        let dispatch = Dispatch::default();
+        self.run_write(&dispatch, async {
             let baseline = self
                 .loaded
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
+                .raw
                 .topic
                 .clone();
             let fresh = read_settings(&self.room, &self.own_user).await?;
-            require_baseline(&baseline, &fresh.topic)?;
+            require_baseline(&baseline, &fresh.raw.topic)?;
             if !fresh.snapshot.permissions.topic {
                 return Err(RoomSettingsError::PermissionDenied);
             }
-            self.check()?;
-            send_state(&self.room, RoomTopicEventContent::new(topic.to_owned())).await?;
+            // Both the plain and the rich form are rewritten, so neither
+            // keeps the old topic.
+            let typed = RoomTopicEventContent::new(topic.to_owned());
+            let stored = fresh.raw.topic.as_deref();
+            let content = edited_content(stored, &["topic", "m.topic"], typed)?;
+            self.send_state(&dispatch, StateEventType::RoomTopic, content)
+                .await?;
             self.check()?;
             self.publish_write(
                 read_settings(&self.room, &self.own_user).await?,
@@ -428,15 +622,17 @@ impl RoomSettingsSession {
     }
     pub async fn set_join_rule(&self, rule: EditableJoinRule) -> Result<RoomSettingsSnapshot> {
         let wire = rule.wire()?;
-        self.run(WRITE_TIMEOUT, async {
+        let dispatch = Dispatch::default();
+        self.run_write(&dispatch, async {
             let baseline = self
                 .loaded
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
+                .raw
                 .join_rule
                 .clone();
             let fresh = read_settings(&self.room, &self.own_user).await?;
-            require_baseline(&baseline, &fresh.join_rule)?;
+            require_baseline(&baseline, &fresh.raw.join_rule)?;
             if !matches!(fresh.snapshot.join_rule, CurrentJoinRule::Editable(_)) {
                 return Err(RoomSettingsError::ReadOnly);
             }
@@ -446,8 +642,13 @@ impl RoomSettingsSession {
             if !fresh.snapshot.permissions.join_rule {
                 return Err(RoomSettingsError::PermissionDenied);
             }
-            self.check()?;
-            send_state(&self.room, RoomJoinRulesEventContent::new(wire)).await?;
+            // An editable rule has no other fields (unknown structure is
+            // read-only), so the stored allow list is replaced, not merged.
+            let typed = RoomJoinRulesEventContent::new(wire);
+            let stored = fresh.raw.join_rule.as_deref();
+            let content = edited_content(stored, &["join_rule", "allow"], typed)?;
+            self.send_state(&dispatch, StateEventType::RoomJoinRules, content)
+                .await?;
             self.check()?;
             self.publish_write(
                 read_settings(&self.room, &self.own_user).await?,
@@ -457,43 +658,35 @@ impl RoomSettingsSession {
         .await
     }
     pub async fn set_avatar(&self, image: AvatarPng) -> Result<RoomSettingsSnapshot> {
-        self.run(WRITE_TIMEOUT, async {
+        let dispatch = Dispatch::default();
+        self.run_write(&dispatch, async {
             let baseline = self
                 .loaded
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
+                .raw
                 .avatar
                 .clone();
             self.avatar_permission(&baseline).await?;
-            self.check()?;
             // Deliberately split upload and state write. A revoked form can
             // leave an unused upload, but never starts the later state change.
             let size = image.bytes.len();
-            let upload = self
-                .room
-                .client()
-                .media()
-                .upload(
-                    &mime::IMAGE_PNG,
-                    image.bytes,
-                    Some(RequestConfig::new().retry_limit(0).timeout(UPLOAD_TIMEOUT)),
-                )
-                .await
-                .map_err(|_| RoomSettingsError::Unavailable)?;
+            let content_uri = self.upload_avatar(&dispatch, image.bytes).await?;
             self.check()?;
-            crate::media::validate_media_address(&upload.content_uri)
+            crate::media::validate_media_address(&content_uri)
                 .map_err(|_| RoomSettingsError::InvalidState)?;
-            self.avatar_permission(&baseline).await?;
+            let stored = self.avatar_permission(&baseline).await?;
             let mut info = ImageInfo::new();
             info.width = Some(UInt::from(image.width));
             info.height = Some(UInt::from(image.height));
             info.size = Some(UInt::try_from(size).map_err(|_| RoomSettingsError::InvalidAvatar)?);
             info.mimetype = Some("image/png".into());
-            self.check()?;
             let mut avatar = RoomAvatarEventContent::new();
-            avatar.url = Some(upload.content_uri);
+            avatar.url = Some(content_uri);
             avatar.info = Some(Box::new(info));
-            send_state(&self.room, avatar).await?;
+            let content = edited_content(stored.as_deref(), &["url", "info"], avatar)?;
+            self.send_state(&dispatch, StateEventType::RoomAvatar, content)
+                .await?;
             self.check()?;
             self.publish_write(
                 read_settings(&self.room, &self.own_user).await?,
@@ -502,26 +695,32 @@ impl RoomSettingsSession {
         })
         .await
     }
-    async fn avatar_permission(&self, baseline: &Option<Value>) -> Result<()> {
+    /// The fresh avatar content as stored, once the permission and the
+    /// baseline allow a change.
+    async fn avatar_permission(&self, baseline: &Option<String>) -> Result<Option<String>> {
         let fresh = read_settings(&self.room, &self.own_user).await?;
         self.check()?;
-        require_baseline(baseline, &fresh.avatar)?;
+        require_baseline(baseline, &fresh.raw.avatar)?;
         if !fresh.snapshot.permissions.avatar {
             return Err(RoomSettingsError::PermissionDenied);
         }
-        Ok(())
+        Ok(fresh.raw.avatar)
     }
     pub async fn remove_avatar(&self) -> Result<RoomSettingsSnapshot> {
-        self.run(WRITE_TIMEOUT, async {
+        let dispatch = Dispatch::default();
+        self.run_write(&dispatch, async {
             let baseline = self
                 .loaded
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
+                .raw
                 .avatar
                 .clone();
-            self.avatar_permission(&baseline).await?;
-            self.check()?;
-            send_state(&self.room, RoomAvatarEventContent::new()).await?;
+            let stored = self.avatar_permission(&baseline).await?;
+            let typed = RoomAvatarEventContent::new();
+            let content = edited_content(stored.as_deref(), &["url", "info"], typed)?;
+            self.send_state(&dispatch, StateEventType::RoomAvatar, content)
+                .await?;
             self.check()?;
             self.publish_write(
                 read_settings(&self.room, &self.own_user).await?,
@@ -582,11 +781,14 @@ async fn guarded<T>(
     work: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     ensure_scope(selection, cancellation)?;
+    // The form first, then the shared selection guard.
     let result = tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(RoomSettingsError::Cancelled),
-        _ = selection.revoked() => Err(RoomSettingsError::AccountChanged),
-        result = time::timeout(limit, work) => result.map_err(|_| RoomSettingsError::TimedOut)?,
+        result = selection.guard(time::timeout(limit, work)) => match result {
+            Some(result) => result.map_err(|_| RoomSettingsError::TimedOut)?,
+            None => Err(RoomSettingsError::AccountChanged),
+        },
     }?;
     ensure_scope(selection, cancellation)?;
     Ok(result)
@@ -605,7 +807,9 @@ fn editable_text(value: &str, name: bool) -> Result<&str> {
     }
     Ok(value)
 }
-fn require_baseline(expected: &Option<Value>, current: &Option<Value>) -> Result<()> {
+/// The stored content must be exactly the reviewed text: a value differing
+/// only in a number's spelling, or reformatted, counts as a change.
+fn require_baseline(expected: &Option<String>, current: &Option<String>) -> Result<()> {
     if expected != current {
         return Err(RoomSettingsError::BaselineChanged);
     }
@@ -647,6 +851,37 @@ fn parse_state(
     }
     Ok(event)
 }
+/// A state event whose content is kept exactly as the server sent it.
+#[derive(Deserialize)]
+struct RawStateEnvelope {
+    #[serde(rename = "event_id")]
+    _event_id: OwnedEventId,
+    room_id: OwnedRoomId,
+    #[serde(rename = "type")]
+    event_type: StateEventType,
+    state_key: String,
+    content: Box<RawValue>,
+}
+fn parse_raw_state(
+    raw: &str,
+    room: &RoomId,
+    kind: &StateEventType,
+    key: &str,
+) -> Result<Box<RawValue>> {
+    if raw.len() > MAX_STATE_BYTES {
+        return Err(RoomSettingsError::InvalidState);
+    }
+    let event: RawStateEnvelope =
+        serde_json::from_str(raw).map_err(|_| RoomSettingsError::InvalidState)?;
+    if event.room_id.as_str() != room.as_str()
+        || &event.event_type != kind
+        || event.state_key != key
+        || !event.content.get().trim_start().starts_with('{')
+    {
+        return Err(RoomSettingsError::InvalidState);
+    }
+    Ok(event.content)
+}
 fn missing(error: &HttpError) -> bool {
     error.as_client_api_error().is_some_and(|e| {
         e.status_code.as_u16() == 404 && e.error_kind() == Some(&ErrorKind::NotFound)
@@ -655,6 +890,10 @@ fn missing(error: &HttpError) -> bool {
 // Keep only a fixed category. Never retain reflected response bodies, URLs or
 // server-provided Retry-After text, and never retry a state write automatically.
 fn request_failure(error: HttpError) -> RoomSettingsError {
+    // A state event larger than the read limit is not one Morpheus accepts.
+    if matches!(error, HttpError::ResponseTooLarge { .. }) {
+        return RoomSettingsError::InvalidState;
+    }
     if error.as_client_api_error().is_some_and(|error| {
         error.status_code.as_u16() == 429
             || matches!(error.error_kind(), Some(ErrorKind::LimitExceeded(_)))
@@ -664,6 +903,17 @@ fn request_failure(error: HttpError) -> RoomSettingsError {
         RoomSettingsError::Unavailable
     }
 }
+/// One state read: no SDK retries, a timeout, and refused while its body
+/// arrives once it grows past what `parse_state` accepts, rather than read
+/// in full first. Room settings, Space placement and its power-level checks
+/// all read state through it.
+fn read_config() -> RequestConfig {
+    RequestConfig::new()
+        .retry_limit(0)
+        .timeout(REQUEST_TIMEOUT)
+        .max_response_bytes(MAX_STATE_BYTES as u64)
+}
+
 async fn state(room: &Room, kind: StateEventType, key: &str) -> Result<Option<StateEnvelope>> {
     let mut request = get_state_event_for_key::v3::Request::new(
         room.room_id().to_owned(),
@@ -674,7 +924,7 @@ async fn state(room: &Room, kind: StateEventType, key: &str) -> Result<Option<St
     match room
         .client()
         .send(request)
-        .with_request_config(RequestConfig::new().retry_limit(0).timeout(REQUEST_TIMEOUT))
+        .with_request_config(read_config())
         .await
     {
         Ok(response) => {
@@ -687,20 +937,145 @@ async fn state(room: &Room, kind: StateEventType, key: &str) -> Result<Option<St
 // The pinned client has encrypted-state events disabled; these standard room
 // settings are shared state. Typed direct requests let us bound every write
 // independently and avoid transparent retries of a changed baseline.
-async fn send_state(
+/// One attempt on the wire for a state write: no HTTP retry, no automatic
+/// authentication refresh and replay (STAGED: root's d4c5d08), a timeout and
+/// a small answer.
+fn write_config() -> RequestConfig {
+    RequestConfig::new()
+        .retry_limit(0)
+        .disable_auth_refresh()
+        .timeout(REQUEST_TIMEOUT)
+        .max_response_bytes(MAX_WRITE_RESPONSE_BYTES)
+}
+/// The same for the avatar's media upload, with the upload's timeout.
+fn upload_config() -> RequestConfig {
+    RequestConfig::new()
+        .retry_limit(0)
+        .disable_auth_refresh()
+        .timeout(UPLOAD_TIMEOUT)
+        .max_response_bytes(MAX_WRITE_RESPONSE_BYTES)
+}
+/// A definite 4xx answer, which applied nothing, as a fixed category. Any
+/// other failure may have applied. Server text is never kept.
+fn refusal(answer: Option<&matrix_sdk::ruma::api::error::Error>) -> Option<RoomSettingsError> {
+    let answer = answer?;
+    if !answer.status_code.is_client_error() {
+        return None;
+    }
+    Some(match answer.error_kind() {
+        Some(ErrorKind::LimitExceeded(_)) => RoomSettingsError::RateLimited,
+        _ if answer.status_code.as_u16() == 429 => RoomSettingsError::RateLimited,
+        Some(ErrorKind::UnknownToken(_)) => RoomSettingsError::SignInExpired,
+        Some(ErrorKind::Forbidden) => RoomSettingsError::PermissionDenied,
+        _ => RoomSettingsError::Refused,
+    })
+}
+/// One editable field's state event (the same bounded read as `state`),
+/// parsed for the snapshot and kept as the exact content text the server
+/// sent, for the baseline and the edit. Both `None` without the event.
+async fn state_and_raw(
     room: &Room,
-    content: impl StateEventContent<StateKey = EmptyStateKey>,
-) -> Result<()> {
-    ensure_joined(room)?;
-    let request =
-        send_state_event::v3::Request::new(room.room_id().to_owned(), &EmptyStateKey, &content)
-            .map_err(|_| RoomSettingsError::InvalidState)?;
-    room.client()
+    kind: StateEventType,
+) -> Result<(Option<StateEnvelope>, Option<String>)> {
+    let mut request = get_state_event_for_key::v3::Request::new(
+        room.room_id().to_owned(),
+        kind.clone(),
+        "".into(),
+    );
+    request.format = get_state_event_for_key::v3::StateEventFormat::Event;
+    let response = room
+        .client()
         .send(request)
-        .with_request_config(RequestConfig::new().retry_limit(0).timeout(REQUEST_TIMEOUT))
-        .await
-        .map_err(request_failure)?;
-    Ok(())
+        .with_request_config(read_config())
+        .await;
+    match response {
+        Ok(response) => {
+            let text = response.event_or_content.get();
+            let event = parse_state(text, room.room_id(), &kind, "")?;
+            let content = parse_raw_state(text, room.room_id(), &kind, "")?;
+            Ok((Some(event), Some(content.get().to_owned())))
+        }
+        Err(error) if missing(&error) => Ok((None, None)),
+        Err(error) => Err(request_failure(error)),
+    }
+}
+/// A content object's fields as raw text, in stored order. A normal map
+/// keeps only one of two equal names; such content is refused instead.
+struct ContentFields(Vec<(String, Box<RawValue>)>);
+impl<'de> Deserialize<'de> for ContentFields {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct FieldsVisitor;
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = ContentFields;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object with unique field names")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                let mut fields: Vec<(String, Box<RawValue>)> = Vec::new();
+                while let Some((name, value)) = map.next_entry::<String, Box<RawValue>>()? {
+                    if fields.iter().any(|(seen, _)| *seen == name) {
+                        return Err(serde::de::Error::custom("duplicate field"));
+                    }
+                    fields.push((name, value));
+                }
+                Ok(ContentFields(fields))
+            }
+        }
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+fn content_fields(text: &str) -> Result<Vec<(String, Box<RawValue>)>> {
+    let fields = serde_json::from_str::<ContentFields>(text);
+    fields
+        .map(|fields| fields.0)
+        .map_err(|_| RoomSettingsError::InvalidState)
+}
+/// `stored` (one content object's exact text; `None` without the event) with
+/// the fields of `typed` (what Morpheus writes) set in place or appended,
+/// and every other name in `replaced` dropped. Every other field keeps its
+/// exact text and order: unknown extensions, numbers beyond u64 and
+/// decimals included. Content that is not an object or repeats a name is
+/// refused, never rewritten, and nothing is sent.
+fn edited_content(
+    stored: Option<&str>,
+    replaced: &[&str],
+    typed: impl serde::Serialize,
+) -> Result<Box<RawValue>> {
+    let invalid = |_| RoomSettingsError::InvalidState;
+    let mut fields = match stored {
+        None => Vec::new(),
+        Some(text) => content_fields(text)?,
+    };
+    let Value::Object(typed) = serde_json::to_value(typed).map_err(invalid)? else {
+        return Err(RoomSettingsError::InvalidState);
+    };
+    fields.retain(|(name, _)| !replaced.contains(&name.as_str()) || typed.contains_key(name));
+    for (name, value) in typed {
+        let value = RawValue::from_string(value.to_string()).map_err(invalid)?;
+        match fields.iter_mut().find(|(existing, _)| *existing == name) {
+            Some((_, slot)) => *slot = value,
+            None => fields.push((name, value)),
+        }
+    }
+    let mut text = String::from("{");
+    for (index, (name, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            text.push(',');
+        }
+        text.push_str(&serde_json::to_string(name).map_err(invalid)?);
+        text.push(':');
+        text.push_str(value.get());
+    }
+    text.push('}');
+    if text.len() > MAX_STATE_BYTES {
+        return Err(RoomSettingsError::InvalidState);
+    }
+    RawValue::from_string(text).map_err(invalid)
 }
 fn content<T: serde::de::DeserializeOwned>(event: &StateEnvelope) -> Result<T> {
     serde_json::from_value(event.content.clone()).map_err(|_| RoomSettingsError::InvalidState)
@@ -718,13 +1093,13 @@ async fn read_settings(room: &Room, own: &OwnedUserId) -> Result<Loaded> {
         return Err(RoomSettingsError::NotJoined);
     }
     let power = state(room, StateEventType::RoomPowerLevels, "").await?;
-    let avatar = state(room, StateEventType::RoomAvatar, "").await?;
-    let join = state(room, StateEventType::RoomJoinRules, "").await?;
-    let name = state(room, StateEventType::RoomName, "").await?;
-    let topic = state(room, StateEventType::RoomTopic, "").await?;
+    let (avatar, avatar_raw) = state_and_raw(room, StateEventType::RoomAvatar).await?;
+    let (join, join_raw) = state_and_raw(room, StateEventType::RoomJoinRules).await?;
+    let (name, name_raw) = state_and_raw(room, StateEventType::RoomName).await?;
+    let (topic, topic_raw) = state_and_raw(room, StateEventType::RoomTopic).await?;
     let encryption = state(room, StateEventType::RoomEncryption, "").await?;
     ensure_joined(room)?;
-    assemble(
+    let mut loaded = assemble(
         own,
         &create,
         power.as_ref(),
@@ -733,7 +1108,14 @@ async fn read_settings(room: &Room, own: &OwnedUserId) -> Result<Loaded> {
         name.as_ref(),
         topic.as_ref(),
         encryption.is_some(),
-    )
+    )?;
+    loaded.raw = RawContents {
+        name: name_raw,
+        topic: topic_raw,
+        avatar: avatar_raw,
+        join_rule: join_raw,
+    };
+    Ok(loaded)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -748,34 +1130,9 @@ fn assemble(
     encrypted: bool,
 ) -> Result<Loaded> {
     let creation: RoomCreateEventContent = content(create)?;
-    let rules = creation.room_version.rules();
     let mut permissions = RoomSettingsPermissions::default();
     let available = rule_options(&creation.room_version);
-    if let Some(rules) = rules {
-        let mut creators = if rules.authorization.use_room_create_sender {
-            vec![create.sender.clone()]
-        } else {
-            #[allow(deprecated)]
-            vec![
-                creation
-                    .creator
-                    .clone()
-                    .ok_or(RoomSettingsError::InvalidState)?,
-            ]
-        };
-        if rules.authorization.additional_room_creators {
-            creators.extend(creation.additional_creators.clone());
-        }
-        if creators.len() > 64 {
-            return Err(RoomSettingsError::InvalidState);
-        }
-        let power = match power {
-            Some(event) => {
-                RoomPowerLevelsSource::Original(content::<RoomPowerLevelsEventContent>(event)?)
-            }
-            None => RoomPowerLevelsSource::None,
-        };
-        let levels = RoomPowerLevels::new(power, &rules.authorization, creators);
+    if let Some(levels) = power_levels(create, power)? {
         permissions = RoomSettingsPermissions {
             name: levels.user_can_send_state(own, StateEventType::RoomName),
             topic: levels.user_can_send_state(own, StateEventType::RoomTopic),
@@ -815,10 +1172,8 @@ fn assemble(
             room_version: creation.room_version.as_str().to_owned(),
             encrypted,
         },
-        avatar: avatar.map(|e| e.content.clone()),
-        name: name.map(|e| e.content.clone()),
-        topic: topic.map(|e| e.content.clone()),
-        join_rule: join.map(|e| e.content.clone()),
+        // The exact stored text is filled in by `read_settings`.
+        raw: RawContents::default(),
         avatar_source,
     })
 }
@@ -829,6 +1184,106 @@ fn state_text(event: Option<&StateEnvelope>, key: &str, maximum: usize) -> Resul
         _ => Err(RoomSettingsError::InvalidState),
     }
 }
+/// The power levels of a room from its create and power-level state, with
+/// the creators its room version names. `None` for a room version these
+/// rules do not cover, which grants nothing.
+fn power_levels(
+    create: &StateEnvelope,
+    power: Option<&StateEnvelope>,
+) -> Result<Option<RoomPowerLevels>> {
+    let creation: RoomCreateEventContent = content(create)?;
+    let Some(rules) = creation.room_version.rules() else {
+        return Ok(None);
+    };
+    let mut creators = if rules.authorization.use_room_create_sender {
+        vec![create.sender.clone()]
+    } else {
+        #[allow(deprecated)]
+        vec![
+            creation
+                .creator
+                .clone()
+                .ok_or(RoomSettingsError::InvalidState)?,
+        ]
+    };
+    if rules.authorization.additional_room_creators {
+        creators.extend(creation.additional_creators.clone());
+    }
+    if creators.len() > 64 {
+        return Err(RoomSettingsError::InvalidState);
+    }
+    let power = match power {
+        Some(event) => {
+            RoomPowerLevelsSource::Original(content::<RoomPowerLevelsEventContent>(event)?)
+        }
+        None => RoomPowerLevelsSource::None,
+    };
+    Ok(Some(RoomPowerLevels::new(
+        power,
+        &rules.authorization,
+        creators,
+    )))
+}
+
+/// Whether `own` may send `kind` state in the joined `room` now, from a
+/// fresh read of its create and power-level state (no SDK retries).
+pub(crate) async fn can_send_state(
+    room: &Room,
+    own: &OwnedUserId,
+    kind: StateEventType,
+) -> Result<bool> {
+    ensure_joined(room)?;
+    let create = state(room, StateEventType::RoomCreate, "")
+        .await?
+        .ok_or(RoomSettingsError::InvalidState)?;
+    let power = state(room, StateEventType::RoomPowerLevels, "").await?;
+    ensure_joined(room)?;
+    Ok(power_levels(&create, power.as_ref())?
+        .is_some_and(|levels| levels.user_can_send_state(own, kind)))
+}
+
+/// The content of one state event of the joined `room`, read fresh (bounded,
+/// no SDK retries), or `None` when there is none. Every field is kept, so a
+/// write built from it loses nothing another client stored.
+pub(crate) async fn state_content(
+    room: &Room,
+    kind: StateEventType,
+    key: &str,
+) -> Result<Option<Value>> {
+    ensure_joined(room)?;
+    Ok(state(room, kind, key).await?.map(|event| event.content))
+}
+
+/// One state event's content as the server sent it, every value byte for
+/// byte (numbers beyond u64 and decimals included), for a write that keeps
+/// what it does not change. The same bounded read as state_content; `None`
+/// without the event.
+pub(crate) async fn state_content_raw(
+    room: &Room,
+    kind: StateEventType,
+    key: &str,
+) -> Result<Option<Box<RawValue>>> {
+    ensure_joined(room)?;
+    let mut request = get_state_event_for_key::v3::Request::new(
+        room.room_id().to_owned(),
+        kind.clone(),
+        key.into(),
+    );
+    request.format = get_state_event_for_key::v3::StateEventFormat::Event;
+    match room
+        .client()
+        .send(request)
+        .with_request_config(read_config())
+        .await
+    {
+        Ok(response) => {
+            parse_raw_state(response.event_or_content.get(), room.room_id(), &kind, key).map(Some)
+        }
+        Err(error) if missing(&error) => Ok(None),
+        Err(error) => Err(request_failure(error)),
+    }
+}
+
 fn rule_options(version: &RoomVersionId) -> Vec<JoinRuleKind> {
     let Some(rules) = version.rules() else {
         return Vec::new();
@@ -999,9 +1454,15 @@ fn crc32(bytes: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use crate::account_selection::Selections;
+    use crate::history::tests::{fixture, runtime as history_runtime};
     use matrix_sdk::ruma::{room_id, user_id};
     use serde_json::json;
-    use std::sync::atomic::AtomicUsize;
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::{Mutex as StdMutex, atomic::AtomicUsize},
+    };
 
     #[test]
     fn request_errors_keep_only_fixed_rate_limit_or_unavailable_categories() {
@@ -1233,26 +1694,51 @@ mod tests {
     }
 
     #[test]
-    fn per_field_baselines_preserve_unknown_content_and_do_not_claim_cas() {
-        let avatar = Some(json!({"url":"mxc://example.org/image","org.example.metadata":1}));
-        assert_eq!(
-            require_baseline(
-                &avatar,
-                &Some(json!({"org.example.metadata":1,"url":"mxc://example.org/image"}))
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            require_baseline(&avatar, &Some(json!({"url":"mxc://example.org/image"}))),
-            Err(RoomSettingsError::BaselineChanged)
-        );
+    fn raw_state_content_keeps_every_value_as_sent() {
+        let raw = r#"{"event_id":"$fixture","room_id":"!space:example.org","sender":"@casey:example.org","type":"m.space.child","state_key":"!child:example.org","content":{"via":["example.org"],"org.example.big":184467440737095516160,"org.example.rate":1.10}}"#;
+        let (space, kind) = (room_id!("!space:example.org"), StateEventType::SpaceChild);
+        let content = parse_raw_state(raw, space, &kind, "!child:example.org").unwrap();
+        // Beyond u64 and a decimal with its trailing zero, byte for byte.
+        assert!(content.get().contains("184467440737095516160"));
+        assert!(content.get().contains("1.10"));
+        // Bound to the exact room, type and state key, and to an object.
+        let child = "!child:example.org";
+        let other = room_id!("!other:example.org");
+        assert!(parse_raw_state(raw, other, &kind, child).is_err());
+        assert!(parse_raw_state(raw, space, &kind, "!other:example.org").is_err());
+        assert!(parse_raw_state(raw, space, &StateEventType::RoomTopic, child).is_err());
+        let listed = raw
+            .replace(r#""content":{"#, r#""content":[{"#)
+            .replace("}}", "}]}");
+        assert!(parse_raw_state(&listed, space, &kind, child).is_err());
+        let oversized = " ".repeat(MAX_STATE_BYTES + 1);
+        assert!(parse_raw_state(&oversized, space, &kind, child).is_err());
+    }
+
+    #[test]
+    fn per_field_baselines_compare_the_exact_stored_text_and_do_not_claim_cas() {
+        let text = |raw: &str| Some(raw.to_owned());
+        let avatar = text(r#"{"url":"mxc://example.org/image","org.example.metadata":1.10}"#);
+        assert_eq!(require_baseline(&avatar, &avatar.clone()), Ok(()));
+        // Equal as parsed values, yet a different stored text: a change,
+        // never silently accepted (a number's spelling, field order).
+        for changed in [
+            r#"{"url":"mxc://example.org/image","org.example.metadata":1.1}"#,
+            r#"{"org.example.metadata":1.10,"url":"mxc://example.org/image"}"#,
+            r#"{"url":"mxc://example.org/image"}"#,
+        ] {
+            assert_eq!(
+                require_baseline(&avatar, &text(changed)),
+                Err(RoomSettingsError::BaselineChanged),
+                "{changed}"
+            );
+        }
         assert_eq!(
             require_baseline(&avatar, &None),
             Err(RoomSettingsError::BaselineChanged)
         );
         // Only the relevant field is compared; an unrelated topic edit is not
         // a conflict. An intervening edit back to equal content is unobservable.
-        assert_eq!(require_baseline(&avatar, &avatar.clone()), Ok(()));
     }
 
     #[test]
@@ -1560,15 +2046,15 @@ mod tests {
     fn saving_one_field_does_not_accept_an_unseen_edit_to_another() {
         let join = envelope(StateEventType::RoomJoinRules, json!({"join_rule":"invite"}));
         let mut previous = loaded(&creation("11"), None, Some(&join));
-        previous.name = Some(json!({"name":"Before"}));
-        previous.topic = Some(json!({"topic":"Before topic"}));
+        previous.raw.name = Some(r#"{"name":"Before"}"#.into());
+        previous.raw.topic = Some(r#"{"topic":"Before topic"}"#.into());
         previous.snapshot.name = "Before".into();
         previous.snapshot.topic = "Before topic".into();
         let mut fresh = previous.clone();
-        fresh.name = Some(json!({"name":"After"}));
-        fresh.topic = Some(json!({"topic":"Remote topic"}));
-        fresh.avatar = Some(json!({"url":"mxc://example.org/new"}));
-        fresh.join_rule = Some(json!({"join_rule":"public"}));
+        fresh.raw.name = Some(r#"{"name":"After"}"#.into());
+        fresh.raw.topic = Some(r#"{"topic":"Remote topic"}"#.into());
+        fresh.raw.avatar = Some(r#"{"url":"mxc://example.org/new"}"#.into());
+        fresh.raw.join_rule = Some(r#"{"join_rule":"public"}"#.into());
         fresh.snapshot.name = "After".into();
         fresh.snapshot.topic = "Remote topic".into();
         fresh.snapshot.avatar.present = true;
@@ -1602,13 +2088,13 @@ mod tests {
             } else {
                 &previous
             };
-            assert_eq!(published.name, expected_name.name);
+            assert_eq!(published.raw.name, expected_name.raw.name);
             assert_eq!(published.snapshot.name, expected_name.snapshot.name);
-            assert_eq!(published.topic, expected_topic.topic);
+            assert_eq!(published.raw.topic, expected_topic.raw.topic);
             assert_eq!(published.snapshot.topic, expected_topic.snapshot.topic);
-            assert_eq!(published.avatar, expected_avatar.avatar);
+            assert_eq!(published.raw.avatar, expected_avatar.raw.avatar);
             assert_eq!(published.snapshot.avatar, expected_avatar.snapshot.avatar);
-            assert_eq!(published.join_rule, expected_join.join_rule);
+            assert_eq!(published.raw.join_rule, expected_join.raw.join_rule);
             assert_eq!(
                 published.snapshot.join_rule,
                 expected_join.snapshot.join_rule
@@ -1665,5 +2151,725 @@ mod tests {
             injected.extend_from_slice(&PNG[33..]);
             assert!(AvatarPng::new(injected, 1, 1).is_err());
         }
+    }
+
+    // Writes against a loopback homeserver: one joined room of one account
+    // with a restored synthetic session. No real account or network.
+    const ROOM: &str = "!settings:example.org";
+    const ME: &str = "@casey:example.org";
+
+    #[derive(Clone, Default)]
+    struct Served {
+        /// Each state event's content as stored text, served byte for byte.
+        state: Arc<StdMutex<BTreeMap<(String, String), String>>>,
+        syncs: Arc<StdMutex<VecDeque<Value>>>,
+        /// Each write's event type and body as sent.
+        writes: Arc<StdMutex<Vec<(String, String)>>>,
+        write_reply: Arc<StdMutex<Option<(u16, Value)>>>,
+        upload_reply: Arc<StdMutex<Option<(u16, Value)>>>,
+        uploads: Arc<AtomicUsize>,
+        /// An upload taken while uploads are held is never answered.
+        hold_uploads: Arc<AtomicBool>,
+        /// Reads of the server's media limits, which are never served.
+        media_config: Arc<AtomicUsize>,
+        power_reads: Arc<AtomicUsize>,
+        hold_power: Arc<AtomicBool>,
+        /// The power-level read with this number waits until it is reset.
+        hold_power_read: Arc<AtomicUsize>,
+        hold_writes: Arc<AtomicBool>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    /// It answers the version check, queued syncs, state reads from its
+    /// current state, state writes (recorded, then applied unless a reply is
+    /// set) and media uploads, each connection on its own thread. Power-level
+    /// reads can be held until released; a state write or an upload taken
+    /// while held is never answered or applied, like a lost connection. It
+    /// has no media limits (`/media/config`): it only counts their reads.
+    struct SettingsServer {
+        url: String,
+        served: Served,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SettingsServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let served = Served::default();
+            *served.state.lock().unwrap() = initial_state();
+            let serving = served.clone();
+            let worker = std::thread::spawn(move || {
+                while !serving.stopped.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let serving = serving.clone();
+                            std::thread::spawn(move || answer(stream, &serving));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                url,
+                served,
+                worker: Some(worker),
+            }
+        }
+
+        fn writes(&self) -> Vec<(String, String)> {
+            self.served.writes.lock().unwrap().clone()
+        }
+
+        fn uploads(&self) -> usize {
+            self.served.uploads.load(Ordering::SeqCst)
+        }
+
+        fn media_config_reads(&self) -> usize {
+            self.served.media_config.load(Ordering::SeqCst)
+        }
+
+        async fn wait_for_uploads(&self, count: usize) {
+            while self.uploads() < count {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        fn power_reads(&self) -> usize {
+            self.served.power_reads.load(Ordering::SeqCst)
+        }
+
+        async fn wait_for_writes(&self, count: usize) {
+            while self.writes().len() < count {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        async fn wait_for_power_reads(&self, count: usize) {
+            while self.power_reads() < count {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    impl Drop for SettingsServer {
+        fn drop(&mut self) {
+            self.served.stopped.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn initial_state() -> BTreeMap<(String, String), String> {
+        let mut state = BTreeMap::new();
+        let mut put = |kind: &str, key: &str, content: Value| {
+            state.insert((kind.to_owned(), key.to_owned()), content.to_string());
+        };
+        let create = json!({"creator": ME, "room_version": "10"});
+        put("m.room.create", "", create);
+        put("m.room.member", ME, json!({"membership": "join"}));
+        put("m.room.power_levels", "", json!({"users": {ME: 100}}));
+        put("m.room.join_rules", "", json!({"join_rule": "invite"}));
+        state
+    }
+
+    /// The whole state event, its content inserted as the stored text.
+    fn full_event(kind: &str, key: &str, content: &str) -> String {
+        let head = json!({
+            "type": kind,
+            "state_key": key,
+            "sender": ME,
+            "event_id": format!("$state-{kind}"),
+            "room_id": ROOM,
+            "origin_server_ts": 1,
+        });
+        let head = head.to_string();
+        format!("{},\"content\":{content}}}", &head[..head.len() - 1])
+    }
+
+    /// The first sync: the account is joined to the room.
+    fn joined_room() -> Value {
+        let state = initial_state();
+        let events: Vec<_> = state
+            .iter()
+            .filter(|((kind, _), _)| kind == "m.room.create" || kind == "m.room.member")
+            .map(|((kind, key), content)| {
+                serde_json::from_str::<Value>(&full_event(kind, key, content)).unwrap()
+            })
+            .collect();
+        let mut join = serde_json::Map::new();
+        let room = json!({
+            "state": {"events": events},
+            "timeline": {"events": [], "limited": false},
+        });
+        join.insert(ROOM.to_owned(), room);
+        json!({"next_batch": "s1", "rooms": {"join": join}})
+    }
+
+    fn answer(mut stream: TcpStream, served: &Served) {
+        stream.set_nonblocking(false).unwrap();
+        let timeout = Some(Duration::from_secs(2));
+        stream.set_read_timeout(timeout).unwrap();
+        let (line, body) = read_request(&mut stream);
+        let mut parts = line.split(' ');
+        let method = parts.next().unwrap_or("").to_owned();
+        let path = parts.next().unwrap_or("").to_owned();
+        let not_found = json!({"errcode": "M_NOT_FOUND", "error": "x"});
+        let (status, reply) = if path.starts_with("/_matrix/client/versions") {
+            (200, json!({"versions": ["v1.15"]}).to_string())
+        } else if path.contains("/sync") {
+            let next = served.syncs.lock().unwrap().pop_front();
+            (
+                200,
+                next.unwrap_or_else(|| json!({"next_batch": "idle"}))
+                    .to_string(),
+            )
+        } else if path.contains("/media/config") {
+            served.media_config.fetch_add(1, Ordering::SeqCst);
+            (
+                404,
+                json!({"errcode": "M_UNRECOGNIZED", "error": "x"}).to_string(),
+            )
+        } else if method == "POST" && path.contains("/upload") {
+            served.uploads.fetch_add(1, Ordering::SeqCst);
+            if served.hold_uploads.load(Ordering::SeqCst) {
+                while !served.stopped.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return;
+            }
+            let uploaded = json!({"content_uri": "mxc://example.org/avatar1"});
+            let reply = served.upload_reply.lock().unwrap().clone();
+            let (status, reply) = reply.unwrap_or((200, uploaded));
+            (status, reply.to_string())
+        } else if let Some((kind, key)) = state_target(&path) {
+            if method == "PUT" {
+                let write = (kind.clone(), body.clone());
+                served.writes.lock().unwrap().push(write);
+                if served.hold_writes.load(Ordering::SeqCst) {
+                    while !served.stopped.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    return;
+                }
+                let reply = served.write_reply.lock().unwrap().clone();
+                match reply {
+                    Some((status, reply)) => (status, reply.to_string()),
+                    None => {
+                        served.state.lock().unwrap().insert((kind, key), body);
+                        (200, json!({"event_id": "$written"}).to_string())
+                    }
+                }
+            } else {
+                if kind == "m.room.power_levels" {
+                    let read = served.power_reads.fetch_add(1, Ordering::SeqCst) + 1;
+                    while served.hold_power.load(Ordering::SeqCst)
+                        || served.hold_power_read.load(Ordering::SeqCst) == read
+                    {
+                        if served.stopped.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                let entry = (kind.clone(), key.clone());
+                let content = served.state.lock().unwrap().get(&entry).cloned();
+                match content {
+                    Some(content) => (200, full_event(&kind, &key, &content)),
+                    None => (404, not_found.to_string()),
+                }
+            }
+        } else {
+            (
+                404,
+                json!({"errcode": "M_UNRECOGNIZED", "error": "x"}).to_string(),
+            )
+        };
+        let response = format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    }
+
+    /// The request line and body of one HTTP/1.1 request.
+    fn read_request(stream: &mut TcpStream) -> (String, String) {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(size) = stream.read(&mut chunk) {
+            if size == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..size]);
+            let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..end]).to_string();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    let length = name.eq_ignore_ascii_case("content-length");
+                    length.then(|| value.trim().parse::<usize>().ok()).flatten()
+                })
+                .unwrap_or(0);
+            if request.len() >= end + 4 + length {
+                let line = headers.lines().next().unwrap_or("").to_owned();
+                let body = String::from_utf8_lossy(&request[end + 4..end + 4 + length]);
+                return (line, body.to_string());
+            }
+        }
+        (String::new(), String::new())
+    }
+
+    /// The decoded event type and state key of a state request path.
+    fn state_target(path: &str) -> Option<(String, String)> {
+        let path = path.split('?').next()?;
+        let (_, rest) = path.split_once("/state/")?;
+        let (kind, key) = rest.split_once('/').unwrap_or((rest, ""));
+        Some((decode(kind)?, decode(key)?))
+    }
+
+    fn decode(segment: &str) -> Option<String> {
+        let mut decoded = Vec::new();
+        let mut rest = segment.as_bytes();
+        while let Some((&first, tail)) = rest.split_first() {
+            if first == b'%' && tail.len() >= 2 {
+                let hex = std::str::from_utf8(&tail[..2]).ok()?;
+                decoded.push(u8::from_str_radix(hex, 16).ok()?);
+                rest = &tail[2..];
+            } else {
+                decoded.push(first);
+                rest = tail;
+            }
+        }
+        String::from_utf8(decoded).ok()
+    }
+
+    /// A fresh manager whose selected account is signed in with a synthetic
+    /// session against `server` and synced once into the joined room.
+    async fn signed_in(
+        server: &SettingsServer,
+    ) -> (std::path::PathBuf, Arc<AccountManager>, crate::AccountInfo) {
+        let account = crate::AccountInfo {
+            id: uuid::Uuid::new_v4().to_string(),
+            user_id: ME.into(),
+            device_id: "SETTINGS-FIXTURE".into(),
+            homeserver: server.url.clone(),
+        };
+        let (directory, manager, account) = fixture(Some(account)).await;
+        let client = {
+            let state = manager.state.lock().await;
+            state.loaded[&account.id].client.clone()
+        };
+        let session = matrix_sdk::authentication::matrix::MatrixSession {
+            meta: matrix_sdk::SessionMeta {
+                user_id: user_id!("@casey:example.org").to_owned(),
+                device_id: "SETTINGS-FIXTURE".into(),
+            },
+            tokens: matrix_sdk::SessionTokens {
+                access_token: "synthetic access token".into(),
+                refresh_token: None,
+            },
+        };
+        let restored = client
+            .matrix_auth()
+            .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
+            .await;
+        restored.unwrap();
+        server.served.syncs.lock().unwrap().push_back(joined_room());
+        let settings = matrix_sdk::config::SyncSettings::default();
+        client.sync_once(settings).await.unwrap();
+        (directory, manager, account)
+    }
+
+    /// A form for the room under the account's current selection, admitted
+    /// while `gate` is true.
+    async fn open(
+        manager: &AccountManager,
+        account: &crate::AccountInfo,
+        gate: &Arc<AtomicBool>,
+        form: RoomSettingsCancellation,
+    ) -> RoomSettingsSession {
+        let selection = manager.account_selection(&account.id).unwrap();
+        let session = manager.open_room_settings_for(&selection, ROOM, form).await;
+        let gate = gate.clone();
+        session
+            .unwrap()
+            .with_admission(Arc::new(move || gate.load(Ordering::SeqCst)))
+    }
+
+    #[test]
+    fn every_write_is_one_bounded_request_and_an_avatar_adds_one_upload() {
+        for config in [write_config(), upload_config()] {
+            let config = format!("{config:?}");
+            assert!(config.contains("retry_limit: 0"), "{config}");
+            assert!(config.contains("max_response_bytes: 65536"), "{config}");
+            // STAGED: root's d4c5d08.
+            assert!(config.contains("disable_auth_refresh: true"), "{config}");
+        }
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in(&server).await;
+            let gate = Arc::new(AtomicBool::new(true));
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            assert_eq!(session.set_name("Plans").await.unwrap().name, "Plans");
+            session.set_topic("Weekly plans").await.unwrap();
+            let knock = EditableJoinRule::Knock;
+            session.set_join_rule(knock).await.unwrap();
+            let image = AvatarPng::new(PNG.to_vec(), 1, 1).unwrap();
+            assert!(session.set_avatar(image).await.unwrap().avatar.present);
+            assert!(!session.remove_avatar().await.unwrap().avatar.present);
+            let writes = server.writes();
+            let kinds: Vec<_> = writes.iter().map(|(kind, _)| kind.as_str()).collect();
+            assert_eq!(
+                kinds,
+                [
+                    "m.room.name",
+                    "m.room.topic",
+                    "m.room.join_rules",
+                    "m.room.avatar",
+                    "m.room.avatar",
+                ]
+            );
+            assert_eq!(writes[0].1, r#"{"name":"Plans"}"#);
+            assert_eq!(writes[2].1, r#"{"join_rule":"knock"}"#);
+            assert_eq!(server.uploads(), 1);
+            // The upload is the typed request alone: no media-limits read.
+            assert_eq!(server.media_config_reads(), 0);
+            drop(session);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn a_closed_gate_or_a_changed_account_during_the_permission_read_sends_nothing() {
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in(&server).await;
+            let gate = Arc::new(AtomicBool::new(true));
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            // The security gate closes while the fresh permission read waits.
+            server.served.hold_power.store(true, Ordering::SeqCst);
+            let reads = server.power_reads();
+            let close = async {
+                server.wait_for_power_reads(reads + 1).await;
+                gate.store(false, Ordering::SeqCst);
+                server.served.hold_power.store(false, Ordering::SeqCst);
+            };
+            let (result, ()) = tokio::join!(session.set_name("Plans"), close);
+            assert_eq!(result.err(), Some(RoomSettingsError::SecurityBusy));
+            // An avatar is refused before its upload as well.
+            let image = AvatarPng::new(PNG.to_vec(), 1, 1).unwrap();
+            let refused = session.set_avatar(image).await;
+            assert_eq!(refused.err(), Some(RoomSettingsError::SecurityBusy));
+            assert_eq!(server.uploads(), 0);
+            // The account changes while the permission read waits.
+            gate.store(true, Ordering::SeqCst);
+            server.served.hold_power.store(true, Ordering::SeqCst);
+            let reads = server.power_reads();
+            let switch = async {
+                server.wait_for_power_reads(reads + 1).await;
+                manager.publish_active_account(None);
+                server.served.hold_power.store(false, Ordering::SeqCst);
+            };
+            let (result, ()) = tokio::join!(session.set_topic("Weekly plans"), switch);
+            assert_eq!(result.err(), Some(RoomSettingsError::AccountChanged));
+            assert!(server.writes().is_empty());
+            drop(session);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn a_write_handed_over_then_stopped_or_unanswered_is_unknown_and_never_resent() {
+        use RoomSettingsError as Error;
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in(&server).await;
+            let gate = Arc::new(AtomicBool::new(true));
+            server.served.hold_writes.store(true, Ordering::SeqCst);
+            // The form closes while the write is with the homeserver.
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form.clone()).await;
+            let close = async {
+                server.wait_for_writes(1).await;
+                form.cancel();
+            };
+            let (result, ()) = tokio::join!(session.set_name("Plans"), close);
+            assert_eq!(result.err(), Some(Error::Unknown));
+            // The account changes while the next one is with the homeserver.
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            let switch = async {
+                server.wait_for_writes(2).await;
+                manager.publish_active_account(None);
+            };
+            let (result, ()) = tokio::join!(session.set_topic("Weekly plans"), switch);
+            assert_eq!(result.err(), Some(Error::Unknown));
+            manager.publish_active_account(Some(account.clone()));
+            // A confirmed upload, then a stopped state write: said exactly so.
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form.clone()).await;
+            let close = async {
+                server.wait_for_writes(3).await;
+                form.cancel();
+            };
+            let image = AvatarPng::new(PNG.to_vec(), 1, 1).unwrap();
+            let (result, ()) = tokio::join!(session.set_avatar(image), close);
+            assert_eq!(result.err(), Some(Error::AvatarUnknown));
+            assert_eq!(server.uploads(), 1);
+            // No answer within the request's timeout.
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            let unanswered = time::timeout(Duration::from_secs(30), session.set_name("Plans"));
+            assert_eq!(unanswered.await.unwrap().err(), Some(Error::Unknown));
+            // None of them was sent again.
+            assert_eq!(server.writes().len(), 4);
+            // Answers: a 4xx changed nothing; anything else may have.
+            server.served.hold_writes.store(false, Ordering::SeqCst);
+            let error = |code: &str| json!({"errcode": code, "error": "homeserver text"});
+            // The unknown-token answer comes last: it marks the token expired.
+            let answers = [
+                (429, error("M_LIMIT_EXCEEDED"), Error::RateLimited),
+                (403, error("M_FORBIDDEN"), Error::PermissionDenied),
+                (400, error("M_BAD_JSON"), Error::Refused),
+                (500, error("M_UNKNOWN"), Error::Unknown),
+                (502, json!("not json"), Error::Unknown),
+                (401, error("M_UNKNOWN_TOKEN"), Error::SignInExpired),
+            ];
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            for (sent, (status, body, expected)) in answers.into_iter().enumerate() {
+                if status == 401 {
+                    // An upload the homeserver refuses changes nothing either.
+                    let refused = Some((413, error("M_TOO_LARGE")));
+                    *server.served.upload_reply.lock().unwrap() = refused;
+                    let image = AvatarPng::new(PNG.to_vec(), 1, 1).unwrap();
+                    let result = session.set_avatar(image).await;
+                    assert_eq!(result.err(), Some(Error::Refused));
+                    assert_eq!(server.uploads(), 2);
+                    assert_eq!(server.writes().len(), 4 + sent);
+                }
+                *server.served.write_reply.lock().unwrap() = Some((status, body));
+                let result = session.set_name("Plans").await;
+                assert_eq!(result.err(), Some(expected), "status {status}");
+                assert_eq!(server.writes().len(), 4 + sent + 1, "status {status}");
+                assert!(!expected.to_string().contains("homeserver text"));
+            }
+            drop(session);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn every_state_read_is_capped_at_the_transport_and_oversize_is_a_fixed_error() {
+        let config = format!("{:?}", read_config());
+        assert!(config.contains("retry_limit: 0"), "{config}");
+        assert!(
+            config.contains(&format!("max_response_bytes: {MAX_STATE_BYTES}")),
+            "{config}"
+        );
+        // Refused while the body arrives; the label is fixed, no size or text.
+        let too_large = HttpError::ResponseTooLarge {
+            limit: MAX_STATE_BYTES as u64,
+        };
+        let failure = request_failure(too_large);
+        assert_eq!(failure, RoomSettingsError::InvalidState);
+        assert!(!failure.to_string().contains(&MAX_STATE_BYTES.to_string()));
+    }
+
+    #[test]
+    fn an_edit_sets_only_the_known_fields_and_keeps_every_other_byte() {
+        const BIG: &str = "123456789012345678901234567890";
+        let named = |name: &str| RoomNameEventContent::new(name.to_owned());
+        let stored = format!(r#"{{"name":"Old","org.example.big":{BIG},"org.example.x":1.10}}"#);
+        let edited = edited_content(Some(&stored), &["name"], named("New")).unwrap();
+        let expected = stored.replace(r#""name":"Old""#, r#""name":"New""#);
+        assert_eq!(edited.get(), expected);
+        // Both topic forms are rewritten: nothing of the old topic remains.
+        let topic = concat!(
+            r#"{"m.topic":{"m.text":[{"body":"Old"}]},"#,
+            r#""topic":"Old","org.example.x":2.5E-3}"#,
+        );
+        let typed = RoomTopicEventContent::new("New".to_owned());
+        let edited = edited_content(Some(topic), &["topic", "m.topic"], typed).unwrap();
+        assert!(!edited.get().contains("Old"), "{}", edited.get());
+        assert!(edited.get().contains(r#""org.example.x":2.5E-3"#));
+        // A cleared avatar loses its address and description, nothing else.
+        let avatar = r#"{"url":"mxc://example.org/a","info":{"w":1},"org.example.x":1}"#;
+        let cleared = RoomAvatarEventContent::new();
+        let cleared = edited_content(Some(avatar), &["url", "info"], cleared).unwrap();
+        assert_eq!(cleared.get(), r#"{"org.example.x":1}"#);
+        // Leaving a restricted rule drops its allow list.
+        let restricted = r#"{"join_rule":"restricted","allow":[]}"#;
+        let invite = RoomJoinRulesEventContent::new(JoinRule::Invite);
+        let edited = edited_content(Some(restricted), &["join_rule", "allow"], invite).unwrap();
+        assert_eq!(edited.get(), r#"{"join_rule":"invite"}"#);
+        // Nothing stored yet: only the typed fields.
+        let first = edited_content(None, &["name"], named("New")).unwrap();
+        assert_eq!(first.get(), r#"{"name":"New"}"#);
+        // Odd stored content is refused, never rewritten.
+        for odd in ["[]", r#""text""#, r#"{"name":"a","name":"b"}"#] {
+            let refused = edited_content(Some(odd), &["name"], named("New"));
+            assert_eq!(
+                refused.err(),
+                Some(RoomSettingsError::InvalidState),
+                "{odd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_save_keeps_unknown_fields_byte_for_byte_and_a_respelled_baseline_is_a_change() {
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let stored = concat!(
+                r#"{"name":"Old","org.example.rate":1.10,"#,
+                r#""org.example.big":123456789012345678901234567890}"#,
+            );
+            let name = ("m.room.name".to_owned(), String::new());
+            let state = server.served.state.clone();
+            state
+                .lock()
+                .unwrap()
+                .insert(name.clone(), stored.to_owned());
+            let (directory, manager, account) = signed_in(&server).await;
+            let gate = Arc::new(AtomicBool::new(true));
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            assert_eq!(session.snapshot().name, "Old");
+            session.set_name("New").await.unwrap();
+            let expected = stored.replace(r#""name":"Old""#, r#""name":"New""#);
+            assert_eq!(server.writes()[0].1, expected);
+            // Another client respells only a number: equal as values, yet a
+            // different stored text, so nothing is sent.
+            let respelled = expected.replace("1.10", "1.1");
+            state.lock().unwrap().insert(name, respelled);
+            let refused = session.set_name("Newer").await;
+            assert_eq!(refused.err(), Some(RoomSettingsError::BaselineChanged));
+            assert_eq!(server.writes().len(), 1);
+            drop(session);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn a_confirmed_upload_then_a_closed_gate_says_the_image_left_and_nothing_changed() {
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in(&server).await;
+            let gate = Arc::new(AtomicBool::new(true));
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            // The permission read after the upload waits while the security
+            // gate closes.
+            let reads = server.power_reads();
+            let held = &server.served.hold_power_read;
+            held.store(reads + 2, Ordering::SeqCst);
+            let close = async {
+                server.wait_for_power_reads(reads + 2).await;
+                gate.store(false, Ordering::SeqCst);
+                held.store(0, Ordering::SeqCst);
+            };
+            let image = AvatarPng::new(PNG.to_vec(), 1, 1).unwrap();
+            let (result, ()) = tokio::join!(session.set_avatar(image), close);
+            let uploaded = RoomSettingsError::AvatarUploadedNotChanged;
+            assert_eq!(result.err(), Some(uploaded));
+            // The image left once; no state was sent and nothing is resent.
+            assert_eq!(server.uploads(), 1);
+            assert!(server.writes().is_empty());
+            drop(session);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
+    }
+
+    #[test]
+    fn an_upload_handed_over_without_an_answer_may_be_stored_and_writes_no_state() {
+        use RoomSettingsError as Error;
+        let image = || AvatarPng::new(PNG.to_vec(), 1, 1).unwrap();
+        history_runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in(&server).await;
+            let gate = Arc::new(AtomicBool::new(true));
+            // The gate closes during the permission read just before the
+            // upload: the final check after it refuses, nothing leaves.
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            let reads = server.power_reads();
+            let held = &server.served.hold_power_read;
+            held.store(reads + 1, Ordering::SeqCst);
+            let close = async {
+                server.wait_for_power_reads(reads + 1).await;
+                gate.store(false, Ordering::SeqCst);
+                held.store(0, Ordering::SeqCst);
+            };
+            let (result, ()) = tokio::join!(session.set_avatar(image()), close);
+            assert_eq!(result.err(), Some(Error::SecurityBusy));
+            assert_eq!(server.uploads(), 0);
+            gate.store(true, Ordering::SeqCst);
+            // The form closes while the upload is with the homeserver.
+            server.served.hold_uploads.store(true, Ordering::SeqCst);
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form.clone()).await;
+            let close = async {
+                server.wait_for_uploads(1).await;
+                form.cancel();
+            };
+            let (result, ()) = tokio::join!(session.set_avatar(image()), close);
+            assert_eq!(result.err(), Some(Error::AvatarUploadUnknown));
+            // The account changes while the next one is with the homeserver.
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            let switch = async {
+                server.wait_for_uploads(2).await;
+                manager.publish_active_account(None);
+            };
+            let (result, ()) = tokio::join!(session.set_avatar(image()), switch);
+            assert_eq!(result.err(), Some(Error::AvatarUploadUnknown));
+            manager.publish_active_account(Some(account.clone()));
+            server.served.hold_uploads.store(false, Ordering::SeqCst);
+            // Answers: only a 4xx says nothing was stored. A 5xx, one that is
+            // not JSON or one past the answer limit may follow a stored image.
+            let error = |code: &str| json!({"errcode": code, "error": "homeserver text"});
+            let padding = "x".repeat(MAX_WRITE_RESPONSE_BYTES as usize);
+            let too_large = json!({"content_uri": "mxc://example.org/avatar1", "pad": padding});
+            let answers = [
+                (500, error("M_UNKNOWN"), Error::AvatarUploadUnknown),
+                (502, json!("not json"), Error::AvatarUploadUnknown),
+                (200, too_large, Error::AvatarUploadUnknown),
+                (413, error("M_TOO_LARGE"), Error::Refused),
+            ];
+            let form = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, form).await;
+            for (sent, (status, body, expected)) in answers.into_iter().enumerate() {
+                *server.served.upload_reply.lock().unwrap() = Some((status, body));
+                let result = session.set_avatar(image()).await;
+                assert_eq!(result.err(), Some(expected), "status {status}");
+                // One upload per save, never resent.
+                assert_eq!(server.uploads(), 2 + sent + 1, "status {status}");
+                assert!(!expected.to_string().contains("homeserver text"));
+            }
+            assert!(!Error::AvatarUploadUnknown.to_string().contains("could not"));
+            // No room state was sent, and no media limits were read.
+            assert!(server.writes().is_empty());
+            assert_eq!(server.media_config_reads(), 0);
+            drop(session);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
     }
 }

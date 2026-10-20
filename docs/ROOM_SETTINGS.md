@@ -55,11 +55,50 @@ account and form, refreshes permission information, and rejects an observed
 change to that field since it was loaded. This detects stale edits but cannot
 make a read and write atomic across clients.
 
-After an uncertain or failed save, refresh before trying again. A request already
-sent may have been applied even if the app did not receive its result. Closing
-the form cancels pending work; it cannot undo a request the server has received.
-An interrupted avatar upload can leave an unused media object without changing
-the room's avatar.
+## How a save is sent
+
+Each save is one request to the homeserver; saving an avatar adds one image
+upload before it, sent as it is: the homeserver refuses an image larger than it
+accepts. Morpheus does not retry either one, does not renew an expired
+sign-in to send it again, waits a bounded time and accepts only a small answer.
+Right before each request is sent, after every other step, the form checks that
+it is still open, that the same account is still selected, that you are still
+in the room, that the fresh permission read allowed the change and that no
+account or security step is in progress. If any check fails, nothing is sent.
+
+Once a request is sent, the result shown is what is known:
+
+- **Saved**: the homeserver applied it. If the settings could not be read back
+  afterwards, the form says so.
+- **Refused or limited**: the homeserver answered that it did not apply it.
+- **Unknown**: no answer came back, the answer could not be read, or the form
+  closed or the account changed while the request was on its way. The setting
+  may or may not have changed, and the request is not sent again. For an
+  avatar, the form says when the image was uploaded but whether the room
+  avatar changed is unknown.
+- **Image uploaded, avatar not changed**: the image reached your homeserver,
+  but the room avatar was not changed (for example, a security step started
+  before the change was sent). The image is not uploaded again unless you
+  save again.
+- **Image may have been uploaded, avatar not changed**: the image upload was
+  sent but no usable answer came back, or the form closed or the account
+  changed while it was on its way. The image may be on your homeserver; the
+  room avatar was not changed, because the change is sent only after a
+  confirmed upload. The image is not uploaded again unless you save again.
+
+A save changes only the field it is for. Anything else another app stored in
+that setting, including fields Morpheus does not know and the exact spelling
+of numbers, is kept as it was; a topic's plain and formatted forms are both
+replaced. Settings content that is not a plain object, or names a field twice,
+is not rewritten. A setting counts as changed on the server if its stored text
+differs in any way from what the form loaded, even only in how a number is
+written. Every read of room settings is limited in size while it arrives; a
+larger answer is refused as unsupported.
+
+After any failed or uncertain save, refresh before trying again: a refresh shows
+what the room has. Closing the form cancels pending work; it cannot undo a
+request the server has received. An interrupted avatar upload can leave an
+unused media object without changing the room's avatar.
 
 See [the feature matrix](FEATURE_MATRIX.md) and [release gates](RELEASE_CHECKLIST.md)
 for the broader administration and platform acceptance requirements.

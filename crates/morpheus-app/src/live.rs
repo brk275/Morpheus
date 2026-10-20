@@ -1500,6 +1500,8 @@ impl LiveUi {
     /// Hide revoked account data without automatically activating another account.
     pub(crate) async fn account_detached(self: &Arc<Self>, ui: Weak<AppWindow>) {
         self.is_live.store(false, Ordering::Release);
+        // What the Space panel learned never outlives the shown account.
+        crate::space_management::forget_all();
         self.invalidate_navigation();
         self.render_epoch.fetch_add(1, Ordering::AcqRel);
         self.clear_feed().await;
@@ -3817,6 +3819,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     ui.set_directory_server("".into());
     ui.set_directory_join_input("".into());
     crate::space_explorer::clear(ui);
+    // Room names and any reviewed change of a Space being managed.
+    crate::space_management::clear(ui);
     ui.set_invitations(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_results(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_open(false);

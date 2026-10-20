@@ -407,6 +407,7 @@ impl AccountAccessUi {
                         }
                         let result = result?;
                         access.live.forget_account_drafts(&id);
+                        crate::space_management::forget_account(&id);
                         access.live.voice_spaces.forget_account(&id).await;
                         if result.complete {
                             if let Err(error) = access.live.voice_spaces.clear_logged_out_account(&id) {

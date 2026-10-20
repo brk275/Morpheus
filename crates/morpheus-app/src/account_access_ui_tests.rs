@@ -3897,6 +3897,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     )));
     let live = LiveUi::new(manager.clone(), runtime.clone(), ui.as_weak(), voices);
     assert_pane_navigation_epoch(&ui, &live, directory.path()).await;
+    phase.set(73);
+    assert_moderation_stops_with_its_context(&ui, &live, &runtime).await;
     phase.set(74);
     assert_room_media_scope_and_privacy(&ui, &live, &runtime).await;
     #[cfg(feature = "native-calls")]
@@ -6966,6 +6968,153 @@ async fn assert_room_notification_panel(ui: &AppWindow) {
     let (page, live, account, room) = before;
     ui.set_page(page);
     ui.set_live_session(live);
+    ui.set_active_account_local_id(account);
+    ui.set_active_room_id(room);
+    settle(ui).await;
+}
+
+/// MOD01 through the registered production callbacks and Slint change
+/// hooks, with the core's permission read held: a redaction whose dialog
+/// closed, a member action whose room changed and came back (A-B-A, no
+/// change fired) and one across a security step that began and ended are
+/// never handed off; with nothing changed each kind is sent once. The
+/// held core stands in for the account (no account, network or vault).
+async fn assert_moderation_stops_with_its_context(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+) {
+    use crate::moderation_ui::{HeldModerator, ModerationUi};
+    use std::sync::atomic::Ordering;
+
+    async fn within(wait: impl std::future::Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the held moderation core answers");
+    }
+    async fn until(ui: &AppWindow, done: impl Fn(&AppWindow) -> bool) {
+        let wait = async {
+            while !done(ui) {
+                settle(ui).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the moderation completion reaches the window");
+    }
+
+    let account = ui.get_active_account_local_id();
+    let room = ui.get_active_room_id();
+    let shown = "!moderated:example.org";
+    let event = "$moderated:example.org";
+    let dana = "@dana:example.org";
+    ui.set_active_account_local_id("moderation-account".into());
+    ui.set_active_room_id(shown.into());
+    ui.set_room_admin_account_id("moderation-account".into());
+    ui.set_room_admin_room_id(shown.into());
+    ui.set_room_admin_event_id(event.into());
+    ui.set_room_admin_mode(2);
+    ui.set_room_admin_open(true);
+    settle(ui).await;
+    let was_live = live.is_live.swap(true, Ordering::AcqRel);
+    let core = Arc::new(HeldModerator::new());
+    let moderation = ModerationUi::register(ui, live.clone(), runtime, core.clone(), |_, _, _| {});
+
+    // Actual Escape closes while busy, cancelling before the held read is
+    // released. No direct property setter bypasses the visible control.
+    ui.invoke_submit_room_admin(2, event.into(), "".into());
+    assert!(ui.get_room_admin_busy());
+    within(core.wait_reads(1)).await;
+    key(ui, Key::Escape);
+    assert!(!ui.get_room_admin_open());
+    assert!(
+        !ui.get_room_admin_busy(),
+        "closing the dialog ends its redaction"
+    );
+    core.release();
+    within(core.wait_answered(1)).await;
+    assert!(core.sent().is_empty());
+
+    // The visible Cancel button stays focused and enabled during the next
+    // held read. Return activates that button through normal key routing.
+    ui.set_room_admin_open(true);
+    settle(ui).await;
+    ui.invoke_submit_room_admin(2, event.into(), "".into());
+    assert!(ui.get_room_admin_busy());
+    within(core.wait_reads(2)).await;
+    key(ui, Key::Return);
+    assert!(!ui.get_room_admin_open());
+    assert!(!ui.get_room_admin_busy());
+    core.release();
+    within(core.wait_answered(2)).await;
+    assert!(core.sent().is_empty());
+
+    // The room changes and comes back before the hand-off, unsettled:
+    // whether or not equal final strings fire a change, the navigation
+    // epoch captured at confirmation refuses it.
+    ui.invoke_submit_member_action(1, dana.into(), "".into());
+    assert!(ui.get_member_action_busy());
+    within(core.wait_reads(3)).await;
+    live.invalidate_navigation();
+    ui.set_active_room_id("!elsewhere:example.org".into());
+    live.invalidate_navigation();
+    ui.set_active_room_id(shown.into());
+    core.release();
+    within(core.wait_answered(3)).await;
+    assert!(core.sent().is_empty());
+    until(ui, |ui| !ui.get_member_action_busy()).await;
+    assert!(!ui.get_member_action_error().is_empty());
+
+    // A security step in progress refuses at once; one that began and ended
+    // while the read was held refuses at the hand-off.
+    let gate = &live.security_gate;
+    let lease = gate.try_account_access().expect("the gate is idle");
+    ui.invoke_submit_member_action(2, dana.into(), "".into());
+    assert!(!ui.get_member_action_busy());
+    assert!(ui.get_member_action_error().contains("Nothing was sent"));
+    drop(lease);
+    ui.invoke_submit_member_action(2, dana.into(), "".into());
+    assert!(ui.get_member_action_busy());
+    within(core.wait_reads(4)).await;
+    drop(gate.try_account_access().expect("the gate is idle"));
+    assert!(!gate.blocked());
+    core.release();
+    within(core.wait_answered(4)).await;
+    assert!(core.sent().is_empty());
+    until(ui, |ui| !ui.get_member_action_busy()).await;
+
+    // Nothing changed: each kind is handed off exactly once.
+    ui.set_room_admin_open(true);
+    settle(ui).await;
+    ui.invoke_submit_room_admin(2, event.into(), "".into());
+    core.release();
+    within(core.wait_answered(5)).await;
+    until(ui, |ui| !ui.get_room_admin_busy()).await;
+    assert_eq!(ui.get_room_admin_notice().as_str(), "Message redacted");
+    ui.invoke_submit_member_action(0, dana.into(), "".into());
+    core.release();
+    within(core.wait_answered(6)).await;
+    assert_eq!(core.sent(), ["redact", "member"]);
+    // Ends the member refresh wait; the completion still clears busy.
+    live.invalidate_navigation();
+    until(ui, |ui| !ui.get_member_action_busy()).await;
+    assert!(ui.get_member_action_notice().contains("completed"));
+
+    moderation.shutdown();
+    live.is_live.store(was_live, Ordering::Release);
+    ui.on_submit_member_action(|_, _, _| {});
+    ui.on_submit_room_admin(|_, _, _| {});
+    ui.on_moderation_context_changed(|_| {});
+    ui.set_room_admin_open(false);
+    ui.set_room_admin_mode(0);
+    ui.set_room_admin_account_id("".into());
+    ui.set_room_admin_room_id("".into());
+    ui.set_room_admin_event_id("".into());
+    ui.set_room_admin_error("".into());
+    ui.set_room_admin_notice("".into());
+    ui.set_member_action_error("".into());
+    ui.set_member_action_notice("".into());
     ui.set_active_account_local_id(account);
     ui.set_active_room_id(room);
     settle(ui).await;
