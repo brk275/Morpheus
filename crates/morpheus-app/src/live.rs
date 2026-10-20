@@ -3785,6 +3785,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     crate::account_identity::clear_presentation(ui);
     // Directory rows, chosen person and notices end with the account.
     crate::people_directory::clear_presentation(ui);
+    // Member details and the ignore list belong to this account.
+    crate::member_privacy::clear_presentation(ui);
     // Decrypted pinned rows are account-private and never wait for a task.
     ui.invoke_reset_pinned_messages();
     // So is who is in this account's voice rooms.

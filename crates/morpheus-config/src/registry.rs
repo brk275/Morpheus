@@ -2448,6 +2448,22 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             "trusted devices",
         ],
     )),
+    live(target(
+        "privacy.ignored_users",
+        "Security",
+        "Settings › Security & recovery › Ignored users",
+        "Ignored users",
+        "People this account ignores: search the list and stop ignoring someone.",
+        &[
+            "ignored users",
+            "ignore list",
+            "unignore",
+            "stop ignoring",
+            "blocked users",
+            "unblock",
+            "block list",
+        ],
+    )),
     target(
         "media.image_previews",
         "Media",

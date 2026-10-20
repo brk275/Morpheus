@@ -336,6 +336,10 @@ impl Rules {
         global.set_default_direct(0);
         global.set_default_group_mixed(false);
         global.set_default_direct_mixed(false);
+        // Banners of an account whose ignore list could not be read are
+        // paused; the list is read again below, and only a successful read
+        // resumes them.
+        global.set_ignore_paused(self.notifications.ignore_paused(&account_id));
         let Some(selection) = selection else {
             global.set_loading(false);
             return;
@@ -349,6 +353,12 @@ impl Rules {
                 manager.notification_defaults_selected(&selection),
                 manager.notification_keywords_selected(&selection),
             );
+            // The strict reader takes the manager's state lock briefly; none
+            // is held here.
+            let ignore = manager.cached_ignored_users_selected(&selection).await;
+            rules
+                .notifications
+                .record_ignore_read(selection.account_id(), &ignore);
             let weak = rules.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 rules.apply_loaded(&ui, operation, &selection, rooms, defaults, keywords);

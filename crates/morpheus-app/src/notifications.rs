@@ -11,7 +11,7 @@
 mod presenter;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -24,7 +24,9 @@ use matrix_sdk::{
     sync::Notification as MatrixNotification,
 };
 use morpheus_config::Config;
-use morpheus_matrix::{AccountInfo, AccountManager, AccountSelection, NotificationMode};
+use morpheus_matrix::{
+    AccountInfo, AccountManager, AccountSelection, MemberPrivacyError, NotificationMode,
+};
 use serde_json::Value;
 use slint::{ComponentHandle, Weak as UiWeak};
 use tokio::{
@@ -54,6 +56,94 @@ const ACTIVATION_CAPACITY: usize = 4;
 struct VisibleRoom {
     account_id: String,
     room_id: String,
+}
+
+/// What the account's ignore list allows for one banner's sender, read with
+/// the strict reader (`m.ignored_user_list` as this device's store has it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SenderIgnore {
+    /// Read, and the sender is not on it.
+    Allowed,
+    /// Read, and the sender is on it (or is no valid user ID): no banner.
+    Dropped,
+    /// The list could not be read: notifications are paused for the
+    /// account, failing closed, until a later read succeeds.
+    Paused,
+    /// The read was for another account selection: no banner.
+    Stale,
+}
+
+/// `ignored` is whether the sender is on the list, or why the list was not
+/// read. Only an authoritative read (`Ok`) allows a banner.
+fn sender_ignore(ignored: Result<bool, MemberPrivacyError>) -> SenderIgnore {
+    match ignored {
+        Ok(false) => SenderIgnore::Allowed,
+        Ok(true) => SenderIgnore::Dropped,
+        Err(MemberPrivacyError::AccountChanged) => SenderIgnore::Stale,
+        Err(_) => SenderIgnore::Paused,
+    }
+}
+
+/// Accounts whose ignore list could not be read: their banners are paused.
+/// Each change of an account's state gets a new number, so a window post can
+/// tell whether a later change superseded it.
+#[derive(Debug, Default)]
+struct IgnorePause {
+    paused: HashSet<String>,
+    versions: HashMap<String, u64>,
+    next: u64,
+}
+
+impl IgnorePause {
+    /// Record one read; returns the account's new paused state when it
+    /// changed. Only an unreadable list pauses, and only a successful read
+    /// (whatever it says about the sender) resumes; a stale read is no
+    /// evidence either way.
+    fn observe(&mut self, account_id: &str, gate: SenderIgnore) -> Option<bool> {
+        let changed = match gate {
+            SenderIgnore::Paused => self.paused.insert(account_id.to_owned()).then_some(true),
+            SenderIgnore::Allowed | SenderIgnore::Dropped => {
+                self.paused.remove(account_id).then_some(false)
+            }
+            SenderIgnore::Stale => None,
+        };
+        if changed.is_some() {
+            self.next = self.next.wrapping_add(1);
+            self.versions.insert(account_id.to_owned(), self.next);
+        }
+        changed
+    }
+
+    fn paused(&self, account_id: &str) -> bool {
+        self.paused.contains(account_id)
+    }
+
+    /// The number of `account_id`'s latest change; 0 before any.
+    fn version(&self, account_id: &str) -> u64 {
+        self.versions.get(account_id).copied().unwrap_or(0)
+    }
+}
+
+/// What a window post for `account_id`'s change number `version` shows: the
+/// pause state as it is when the post runs, never the one the change saw, and
+/// nothing once a later change superseded it or another account is `shown`.
+fn shown_pause(pause: &IgnorePause, account_id: &str, version: u64, shown: &str) -> Option<bool> {
+    let latest = shown == account_id && pause.version(account_id) == version;
+    latest.then(|| pause.paused(account_id))
+}
+
+/// The body of the window post for `account_id`'s change number `version`:
+/// given the account on screen when the post runs, what the paused line
+/// shows then (see `shown_pause`).
+fn line_post(
+    pause: Arc<Mutex<IgnorePause>>,
+    account_id: String,
+    version: u64,
+) -> impl FnOnce(&str) -> Option<bool> + Send + 'static {
+    move |shown: &str| {
+        let state = pause.lock().unwrap_or_else(|error| error.into_inner());
+        shown_pause(&state, &account_id, version, shown)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -245,6 +335,9 @@ pub struct DesktopNotifications {
     shown: Mutex<ShownBanners>,
     next_token: AtomicU64,
     room_modes: Mutex<HashMap<(String, String), (NotificationMode, Instant)>>,
+    /// Accounts whose ignore list could not be read (fail closed). Shared
+    /// with the window's posts, which read it again when they run.
+    ignore_pause: Arc<Mutex<IgnorePause>>,
     presenter_events: mpsc::Sender<PresenterEvent>,
     activation_tx: mpsc::Sender<NavigationTarget>,
     activations: Mutex<Option<mpsc::Receiver<NavigationTarget>>>,
@@ -269,6 +362,7 @@ impl DesktopNotifications {
             shown: Mutex::new(ShownBanners::default()),
             next_token: AtomicU64::new(1),
             room_modes: Mutex::new(HashMap::new()),
+            ignore_pause: Arc::new(Mutex::new(IgnorePause::default())),
             presenter_events,
             activation_tx,
             activations: Mutex::new(Some(activations)),
@@ -333,6 +427,70 @@ impl DesktopNotifications {
             .get(&(account_id.to_owned(), room_id.to_owned()))
             .filter(|(_, noted)| noted.elapsed() < ROOM_MODE_TTL)
             .map(|(mode, _)| *mode)
+    }
+
+    /// Read the account's ignore list strictly and judge `sender_id` by it,
+    /// recording whether the account's banners are paused. The reader takes
+    /// the manager's state lock briefly; no lock is held here.
+    async fn read_ignore(&self, selection: &AccountSelection, sender_id: &str) -> SenderIgnore {
+        let read = self.manager.cached_ignored_users_selected(selection).await;
+        // A sender that is no valid user ID is not allowed either.
+        let sender = matrix_sdk::ruma::UserId::parse(sender_id).ok();
+        let ignored = read.map(|users| sender.as_ref().is_none_or(|sender| users.contains(sender)));
+        let gate = sender_ignore(ignored);
+        self.record_ignore(selection.account_id(), gate);
+        gate
+    }
+
+    /// Record an ignore-list read for `account_id` (also from Settings) and
+    /// show a change of its paused state on screen.
+    pub(crate) fn record_ignore_read(
+        &self,
+        account_id: &str,
+        read: &Result<morpheus_matrix::IgnoredUsers, MemberPrivacyError>,
+    ) {
+        let gate = match read {
+            Ok(_) => SenderIgnore::Allowed,
+            Err(error) => sender_ignore(Err(*error)),
+        };
+        self.record_ignore(account_id, gate);
+    }
+
+    /// The delivery gate does not depend on what this shows: each banner
+    /// judges its own strict read.
+    fn record_ignore(&self, account_id: &str, gate: SenderIgnore) {
+        let version = {
+            let mut pause = self
+                .ignore_pause
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pause
+                .observe(account_id, gate)
+                .map(|_| pause.version(account_id))
+        };
+        let Some(version) = version else {
+            return;
+        };
+        // Posts of different reads can reach the window out of order. Only
+        // the post of an account's latest change shows anything, and it shows
+        // the state as it is when it runs (see `shown_pause`).
+        let post = line_post(self.ignore_pause.clone(), account_id.to_owned(), version);
+        let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            let shown = ui.get_active_account_local_id();
+            if let Some(paused) = post(shown.as_str()) {
+                ui.global::<crate::NotificationRulesState>()
+                    .set_ignore_paused(paused);
+            }
+        });
+    }
+
+    /// Whether `account_id`'s banners are paused because its ignore list
+    /// could not be read.
+    pub(crate) fn ignore_paused(&self, account_id: &str) -> bool {
+        self.ignore_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .paused(account_id)
     }
 
     /// The room was read: withdraw its banners where the platform allows.
@@ -453,10 +611,15 @@ impl DesktopNotifications {
                 .ok()
                 .map(|rule| rule.effective)
         };
-        let snapshot = move || async move {
-            let active = self.manager.active_account().await?;
-            let ui = self.ui_snapshot().await?;
-            Some((active, ui))
+        // The ignore list is read strictly here, at both preflights (before
+        // queuing and at final delivery): unreadable fails closed. It is read
+        // before the account and the window, never after them.
+        let snapshot = move || {
+            final_snapshot(
+                self.read_ignore(&queued.selection, &candidate.sender_id),
+                self.manager.active_account(),
+                self.ui_snapshot(),
+            )
         };
         let config = || {
             self.config
@@ -752,8 +915,12 @@ impl Candidate {
 /// policy, the room mode accepted in this window and the clock that ages the
 /// message, is read only after that lookup and after the last await, so a
 /// ceiling raised, a Mute accepted or the age passed during the lookup
-/// applies to this banner. Both preflights, before queuing and right before
-/// the operating system takes the banner, plan this way.
+/// applies to this banner. The ignore list is judged in the same last
+/// snapshot, read just before the account and the window (see
+/// `final_snapshot`): only a sender an authoritative read allows gets a
+/// banner, so an ignore added after enqueue, or a list that became
+/// unreadable, drops it. Both preflights, before queuing and right before the
+/// operating system takes the banner, plan this way.
 async fn plan_after_lookup<S>(
     candidate: &Candidate,
     noted: impl Fn() -> Option<NotificationMode>,
@@ -764,7 +931,7 @@ async fn plan_after_lookup<S>(
     now_ms: impl FnOnce() -> u64,
 ) -> Option<PlannedNotification>
 where
-    S: Future<Output = Option<(AccountInfo, UiSnapshot)>>,
+    S: Future<Output = Option<(AccountInfo, UiSnapshot, SenderIgnore)>>,
 {
     let held = match noted() {
         Some(_) => lookup.await,
@@ -773,8 +940,11 @@ where
     if !current() {
         return None;
     }
-    let (active, ui) = snapshot().await?;
+    let (active, ui, ignore) = snapshot().await?;
     if !current() || !ui.live || ui.account_id != candidate.account_id {
+        return None;
+    }
+    if ignore != SenderIgnore::Allowed {
         return None;
     }
     let mut config = config();
@@ -788,6 +958,21 @@ where
         noted_override(noted(), held),
         now_ms(),
     )
+}
+
+/// The last snapshot of a plan. The ignore list is read first; the active
+/// account and then the window (live, the privacy screens, the visible room)
+/// only after it, so whatever changed while the ignore list was read applies
+/// to this banner. Each source is a future that does nothing until awaited.
+async fn final_snapshot(
+    ignore: impl Future<Output = SenderIgnore>,
+    active: impl Future<Output = Option<AccountInfo>>,
+    ui: impl Future<Output = Option<UiSnapshot>>,
+) -> Option<(AccountInfo, UiSnapshot, SenderIgnore)> {
+    let ignore = ignore.await;
+    let active = active.await?;
+    let ui = ui.await?;
+    Some((active, ui, ignore))
 }
 
 fn noted_override(
@@ -947,6 +1132,15 @@ mod tests {
         }
     }
 
+    /// A window and ignore-list snapshot as `plan_after_lookup` reads it.
+    fn ready(
+        active: &AccountInfo,
+        ui: UiSnapshot,
+        ignore: SenderIgnore,
+    ) -> std::future::Ready<Option<(AccountInfo, UiSnapshot, SenderIgnore)>> {
+        std::future::ready(Some((active.clone(), ui, ignore)))
+    }
+
     fn candidate() -> Candidate {
         Candidate {
             account_id: "alice".into(),
@@ -1090,7 +1284,7 @@ mod tests {
             &event,
             || Some(NotificationMode::AllMessages),
             lookup,
-            || std::future::ready(Some((active.clone(), ui.lock().unwrap().clone()))),
+            || ready(&active, ui.lock().unwrap().clone(), SenderIgnore::Allowed),
             || config.lock().unwrap().clone(),
             || true,
             || 1_000_000,
@@ -1121,7 +1315,7 @@ mod tests {
             &event,
             || Some(NotificationMode::AllMessages),
             lookup,
-            || std::future::ready(Some((active.clone(), ui.lock().unwrap().clone()))),
+            || ready(&active, ui.lock().unwrap().clone(), SenderIgnore::Allowed),
             || config.lock().unwrap().clone(),
             || !lost.load(Ordering::Acquire),
             || 1_000_000,
@@ -1164,7 +1358,7 @@ mod tests {
             &event,
             || *noted.lock().unwrap(),
             delayed(reached, released),
-            || std::future::ready(Some((active.clone(), ui.clone()))),
+            || ready(&active, ui.clone(), SenderIgnore::Allowed),
             || config.clone(),
             || true,
             || sent_at,
@@ -1193,7 +1387,7 @@ mod tests {
             &event,
             || *noted.lock().unwrap(),
             lookup,
-            || std::future::ready(Some((active.clone(), ui.clone()))),
+            || ready(&active, ui.clone(), SenderIgnore::Allowed),
             || config.clone(),
             || true,
             || sent_at,
@@ -1216,7 +1410,7 @@ mod tests {
             &event,
             || Some(NotificationMode::AllMessages),
             delayed(reached, released),
-            || std::future::ready(Some((active.clone(), ui.clone()))),
+            || ready(&active, ui.clone(), SenderIgnore::Allowed),
             || config.clone(),
             || true,
             || clock.load(Ordering::Acquire),
@@ -1236,7 +1430,7 @@ mod tests {
             &event,
             || Some(NotificationMode::AllMessages),
             delayed(reached, released),
-            || std::future::ready(Some((active.clone(), ui.clone()))),
+            || ready(&active, ui.clone(), SenderIgnore::Allowed),
             || config.clone(),
             || true,
             || sent_at,
@@ -1247,6 +1441,242 @@ mod tests {
         };
         let (plan, ()) = tokio::join!(plan, wait);
         assert!(plan.is_some());
+    }
+
+    #[test]
+    fn an_unreadable_ignore_list_pauses_banners_until_a_successful_read() {
+        // Only an authoritative read allows a banner.
+        assert_eq!(sender_ignore(Ok(false)), SenderIgnore::Allowed);
+        assert_eq!(sender_ignore(Ok(true)), SenderIgnore::Dropped);
+        for unreadable in [
+            MemberPrivacyError::Unavailable,
+            MemberPrivacyError::TimedOut,
+        ] {
+            assert_eq!(sender_ignore(Err(unreadable)), SenderIgnore::Paused);
+        }
+        assert_eq!(
+            sender_ignore(Err(MemberPrivacyError::AccountChanged)),
+            SenderIgnore::Stale
+        );
+        let mut pause = IgnorePause::default();
+        assert_eq!(pause.observe("work", SenderIgnore::Paused), Some(true));
+        assert_eq!(pause.observe("work", SenderIgnore::Paused), None);
+        assert!(pause.paused("work") && !pause.paused("home"));
+        // A stale read is no evidence; a successful read resumes, whatever it
+        // says about the sender.
+        assert_eq!(pause.observe("work", SenderIgnore::Stale), None);
+        assert!(pause.paused("work"));
+        assert_eq!(pause.observe("work", SenderIgnore::Dropped), Some(false));
+        assert!(!pause.paused("work"));
+        assert_eq!(pause.observe("work", SenderIgnore::Allowed), None);
+    }
+
+    #[test]
+    fn only_the_latest_change_posts_and_it_shows_the_state_as_it_is() {
+        // What record_ignore does under its lock: observe, and number the
+        // change it posts for.
+        let pause = Arc::new(Mutex::new(IgnorePause::default()));
+        let record = |account: &str, gate| {
+            let mut state = pause.lock().unwrap();
+            state.observe(account, gate).map(|_| state.version(account))
+        };
+        // Two reads post their changes, paused and then resumed, and the
+        // posts run in the other order. The newer one shows the state as it
+        // is; the older one, run last, shows nothing, so "paused" never comes
+        // back.
+        let paused = record("work", SenderIgnore::Paused).unwrap();
+        let resumed = record("work", SenderIgnore::Allowed).unwrap();
+        let older = line_post(pause.clone(), "work".into(), paused);
+        let newer = line_post(pause.clone(), "work".into(), resumed);
+        assert_eq!(newer("work"), Some(false));
+        assert_eq!(older("work"), None);
+        // A read that changes nothing makes no post.
+        assert_eq!(record("work", SenderIgnore::Stale), None);
+        // A post for an account not on screen shows nothing. The state is per
+        // account: after A to B and back to A, A's latest post still shows A's
+        // state as it is, whatever another account did meanwhile.
+        let elsewhere = line_post(pause.clone(), "work".into(), resumed);
+        assert_eq!(elsewhere("home"), None);
+        assert!(record("home", SenderIgnore::Paused).is_some());
+        let back = line_post(pause.clone(), "work".into(), resumed);
+        assert_eq!(back("work"), Some(false));
+    }
+
+    #[tokio::test]
+    async fn the_ignore_list_and_settings_are_judged_at_final_delivery() {
+        let active = account("alice", "@alice:example.org");
+        let ui = UiSnapshot {
+            account_id: "alice".into(),
+            live: true,
+            visible_room: None,
+            private: false,
+        };
+        let event = candidate();
+        let plan = |ignore| {
+            let snapshot = ready(&active, ui.clone(), ignore);
+            plan_after_lookup(
+                &event,
+                || None,
+                async { None },
+                || snapshot,
+                Config::default,
+                || true,
+                || 1_000_000,
+            )
+        };
+        assert!(plan(SenderIgnore::Allowed).await.is_some());
+        // Unreadable list, ignored sender, stale selection: no banner.
+        for ignore in [
+            SenderIgnore::Paused,
+            SenderIgnore::Dropped,
+            SenderIgnore::Stale,
+        ] {
+            assert!(plan(ignore).await.is_none(), "{ignore:?}");
+        }
+        // Held until delivery: an ignore added, or notifications turned off,
+        // after the banner was queued drops it.
+        async fn delayed(
+            reached: oneshot::Sender<()>,
+            released: oneshot::Receiver<()>,
+        ) -> Option<NotificationMode> {
+            let _ = reached.send(());
+            let _ = released.await;
+            Some(NotificationMode::AllMessages)
+        }
+        let ignore = std::sync::Mutex::new(SenderIgnore::Allowed);
+        let settings = std::sync::Mutex::new(Config::default());
+        for change in 0..2 {
+            *ignore.lock().unwrap() = SenderIgnore::Allowed;
+            *settings.lock().unwrap() = Config::default();
+            let (reached, suspended) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            let plan = plan_after_lookup(
+                &event,
+                || Some(NotificationMode::AllMessages),
+                delayed(reached, released),
+                || ready(&active, ui.clone(), *ignore.lock().unwrap()),
+                || settings.lock().unwrap().clone(),
+                || true,
+                || 1_000_000,
+            );
+            let after_enqueue = async {
+                suspended.await.unwrap();
+                if change == 0 {
+                    *ignore.lock().unwrap() = SenderIgnore::Dropped;
+                } else {
+                    settings.lock().unwrap().notifications.enabled = false;
+                }
+                release.send(()).unwrap();
+            };
+            let (plan, ()) = tokio::join!(plan, after_enqueue);
+            assert!(
+                plan.is_none(),
+                "change {change} after enqueue was not honoured"
+            );
+        }
+    }
+
+    /// The production last snapshot (`final_snapshot`, as `plan_current`
+    /// calls it). While the ignore list is still being read, the window moves
+    /// to another account, the session ends, or a privacy screen opens. The
+    /// window is read after the ignore list, so its new state decides.
+    #[tokio::test]
+    async fn the_window_is_read_after_a_delayed_ignore_read() {
+        let active = account("alice", "@alice:example.org");
+        let event = candidate();
+        let alice = UiSnapshot {
+            account_id: "alice".into(),
+            live: true,
+            visible_room: None,
+            private: false,
+        };
+        let window = std::sync::Mutex::new(alice.clone());
+        let mut config = Config::default();
+        config.notifications.show_message_preview = true;
+        for change in 0..3 {
+            *window.lock().unwrap() = alice.clone();
+            let (reached, suspended) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            let ignore = async {
+                let _ = reached.send(());
+                let _ = released.await;
+                SenderIgnore::Allowed
+            };
+            let ui = async { Some(window.lock().unwrap().clone()) };
+            let plan = plan_after_lookup(
+                &event,
+                || None,
+                async { None },
+                || final_snapshot(ignore, std::future::ready(Some(active.clone())), ui),
+                || config.clone(),
+                || true,
+                || 1_000_000,
+            );
+            let meanwhile = async {
+                suspended.await.unwrap();
+                {
+                    let mut shown = window.lock().unwrap();
+                    match change {
+                        0 => shown.account_id = "bob".into(),
+                        1 => shown.live = false,
+                        _ => shown.private = true,
+                    }
+                }
+                release.send(()).unwrap();
+            };
+            let (plan, ()) = tokio::join!(plan, meanwhile);
+            if change < 2 {
+                assert!(
+                    plan.is_none(),
+                    "change {change} during the ignore read was ignored"
+                );
+            } else {
+                // A privacy screen opened meanwhile: the banner names only
+                // the account.
+                let plan = plan.expect("a banner naming only the account");
+                assert_eq!(plan.summary, "@alice:example.org");
+                assert_eq!(plan.body, "New message");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ignore_list_over_the_byte_cap_keeps_banners_paused() {
+        // The strict reader refuses a stored list over its byte cap before
+        // parsing it, as Unavailable (morpheus-matrix member_privacy tests).
+        // However often it is read again, banners stay paused and none is
+        // planned; only a later read within the cap resumes them.
+        let over_cap = || sender_ignore(Err(MemberPrivacyError::Unavailable));
+        assert_eq!(over_cap(), SenderIgnore::Paused);
+        let mut pause = IgnorePause::default();
+        assert_eq!(pause.observe("alice", over_cap()), Some(true));
+        for _ in 0..3 {
+            assert_eq!(pause.observe("alice", over_cap()), None);
+            assert!(pause.paused("alice"));
+        }
+        let active = account("alice", "@alice:example.org");
+        let ui = UiSnapshot {
+            account_id: "alice".into(),
+            live: true,
+            visible_room: None,
+            private: false,
+        };
+        let event = candidate();
+        let plan = plan_after_lookup(
+            &event,
+            || None,
+            async { None },
+            || ready(&active, ui.clone(), over_cap()),
+            Config::default,
+            || true,
+            || 1_000_000,
+        );
+        assert!(plan.await.is_none());
+        assert_eq!(
+            pause.observe("alice", sender_ignore(Ok(false))),
+            Some(false)
+        );
+        assert!(!pause.paused("alice"));
     }
 
     #[test]

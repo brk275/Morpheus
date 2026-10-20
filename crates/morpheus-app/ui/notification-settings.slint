@@ -23,6 +23,9 @@ export global NotificationRulesState {
     in-out property <bool> show-room-and-sender: true;
     // The visible account's own switch; off silences only this account.
     in-out property <bool> account-enabled: true;
+    // The visible account's ignored-users list could not be read on this
+    // device, so its banners are paused (fail closed) until a read succeeds.
+    in-out property <bool> ignore-paused: false;
     // At most 100 rooms matching the search, sorted like the room list.
     in-out property <[NotificationRoomItem]> rooms;
     // Rooms matching the search, including ones past the listed bound.
@@ -530,6 +533,14 @@ export component NotificationRules inherits VerticalLayout {
                 }
             }
         }
+    }
+
+    if root.live && NotificationRulesState.ignore-paused: Text {
+        text: "Desktop notifications are paused for this account: its list of ignored users could not be read on this device, so no banner can be checked against it. They resume once the list is read again.";
+        color: root.palette.error;
+        font-size: 11px * root.text-scale;
+        wrap: word-wrap;
+        accessible-live-region: polite;
     }
 
     account-switch := RuleAction {

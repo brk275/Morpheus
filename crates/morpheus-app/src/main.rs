@@ -28,6 +28,7 @@ mod kept_replies;
 mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
+mod member_privacy;
 mod message_metadata;
 mod message_search;
 mod metric_editor;
@@ -1588,6 +1589,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         room_activity::RoomActivityUi::register(&ui, live.clone(), store.clone(), runtime.handle());
     let device_sessions =
         device_sessions::DeviceSessionsUi::register(&ui, live.clone(), runtime.handle());
+    let member_privacy =
+        member_privacy::MemberPrivacyUi::register(&ui, live.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
@@ -4467,6 +4470,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
     let ui_result = ui.run();
     device_sessions.shutdown(&ui);
+    member_privacy.shutdown(&ui);
     pinned_messages.shutdown(&ui);
     room_activity.shutdown(&ui);
     room_settings.shutdown(&ui);

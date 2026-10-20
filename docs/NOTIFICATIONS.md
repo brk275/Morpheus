@@ -46,6 +46,18 @@ may include decrypted message text; unreadable encrypted events remain generic.
 With `show_room_and_sender = false` (Settings › Notifications › Room and
 sender names), a banner names only the account and says “New message” or “New
 invitation”; it never previews text, whatever `show_message_preview` says.
+A message or invitation from a user on the account's ignore list
+(`m.ignored_user_list`, the same account data the incoming-call policy reads)
+never becomes a banner. The list is read strictly from this device's store, as
+of the last sync, both when a banner is queued and again right before the
+operating system takes it, so an ignore added meanwhile, or notifications
+turned off meanwhile, still stops it. When the list cannot be read (unreadable,
+the wrong shape, too large, or the read timed out), Morpheus fails closed: no
+banner is shown for that account, and Settings › Notifications says that
+desktop notifications are paused for it because its list of ignored users
+could not be read. Only a later successful read, on the next banner or when
+that section is shown again, resumes them; banners dropped meanwhile are not
+shown later. Incoming-call ringing keeps its own ignore policy, unchanged.
 Local highlight words mark an SDK-approved notification as a highlight; they
 do not override a muted room. Sounds play only when both the local switch and
 the Matrix push action request a sound, and the room is not quiet on this

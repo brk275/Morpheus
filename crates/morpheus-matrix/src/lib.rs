@@ -61,6 +61,11 @@ pub use account_access::{
     ActivationCancellation, ActivationChallenge, ActivationGrant, AppPasswordStatus, RemovalResult,
 };
 mod admin;
+mod member_privacy;
+pub use member_privacy::{
+    IgnoreBaseline, IgnoreChange, IgnoredUsers, IgnoredUsersSnapshot, MAX_IGNORE_ENTRIES,
+    MAX_MEMBER_NAME_CHARS, MemberDetails, MemberPrivacyCancellation, MemberPrivacyError,
+};
 mod own_profile;
 mod room_settings;
 pub use own_profile::{

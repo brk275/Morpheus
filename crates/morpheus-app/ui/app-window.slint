@@ -29,6 +29,9 @@ import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "devic
 import { NotificationRules, RoomNotificationPanel, RoomNotificationState } from "notification-settings.slint";
 // Rust drives the notification rules and the room panel through these globals.
 export { NotificationRoomItem, NotificationRulesState, RoomNotificationState } from "notification-settings.slint";
+import { IgnoredUsersPanel, MemberInspector, MemberPrivacy } from "member-privacy.slint";
+// Rust drives member details and the ignore list through this global.
+export { IgnoredUserRow, IgnoredUsersView, MemberInspectorView, MemberPrivacy } from "member-privacy.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
 // One row of the pane arrangement editor, in the current order.
@@ -4246,13 +4249,30 @@ export component AppWindow inherits Window {
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && !root.account-switch-pending && !root.account-menu-open
         && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy
-        && !root.account-profile-open && !SpaceExplorer.open
+        && !root.account-profile-open && !SpaceExplorer.open && !MemberPrivacy.inspector.open
         && !RoomNotificationState.open && !RoomActivity.seen-open
         && !root.quick-switcher-open && !root.room-actions-open && !root.room-admin-open
         && !root.member-confirm-open && !root.native-capture-picker-open
         && !root.leave-call-dialog && !root.image-preview-open && !root.poll-dialog-open);
     changed people-context-current => {
         if !root.people-context-current { root.close-people(); }
+    }
+    // The inspector is another account-private modal. A lock, pending
+    // security/key/SAS step or another modal closes it and cancels its read;
+    // returning focus must never jump behind the replacing modal.
+    property <bool> member-inspector-allowed: root.live-session && root.active-room-id != ""
+        && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
+        && !root.account-switch-pending && !root.account-menu-open
+        && root.security-recovery-key == "" && !root.security-busy && !root.sas-busy && root.sas-stage == 0
+        && !root.account-profile-open && !SpaceExplorer.open
+        && !RoomNotificationState.open && !RoomActivity.seen-open
+        && !root.quick-switcher-open && !root.people-open
+        && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open
+        && !root.native-capture-picker-open && !root.leave-call-dialog
+        && !root.image-preview-open && !root.poll-dialog-open;
+    property <bool> member-inspector-current: !MemberPrivacy.inspector.open || root.member-inspector-allowed;
+    changed member-inspector-current => {
+        if !root.member-inspector-current { MemberPrivacy.close-inspector(); }
     }
     // Presentation only: show the thread tab of the side panel.
     public function show-thread-panel() {
@@ -4465,7 +4485,7 @@ export component AppWindow inherits Window {
         && RoomNotificationState.room-id == root.active-room-id && root.active-room-id != ""
         && !root.show-sign-in && !root.access-open && !root.manage-accounts-open
         && root.security-recovery-key == "" && !root.account-profile-open && !SpaceExplorer.open
-        && !root.people-open;
+        && !root.people-open && !MemberPrivacy.inspector.open;
     // Another account or room, a lock or a detach clears the panel's rows.
     changed room-notifications-current => {
         if !root.room-notifications-current && RoomNotificationState.open {
@@ -4572,7 +4592,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !root.image-preview-open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.people-open && !MemberPrivacy.inspector.open && !root.image-preview-open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -4656,10 +4676,12 @@ export component AppWindow inherits Window {
     }
     changed active-account-local-id => {
         root.close-people();
+        MemberPrivacy.close-inspector();
         root.details-reveal-open = false;
         root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {
+        MemberPrivacy.close-inspector();
         root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); root.attachment-context-changed(); RoomOrganizationState.active-room-changed();
         root.appearance-room-changed(); }
     changed thread-root-id => {
@@ -9105,6 +9127,20 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                            Rectangle {
+                                border-radius: StyleTokens.radius * 1; background: root.elevated;
+                                VerticalLayout {
+                                    padding: 14px;
+                                    IgnoredUsersPanel {
+                                        colors: root.button-colors;
+                                        text-scale: root.text-scale;
+                                        scope-key: root.live-session ? root.active-account-local-id : "";
+                                        reveal-request: root.reveal-request("privacy.ignored_users");
+                                        reveal-at(y) => { settings-scroll.reveal(y - settings-content.absolute-position.y); }
+                                        revealed(id) => { root.settings-revealed-id = id; }
+                                    }
+                                }
+                            }
                         }
                         Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Image previews"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
@@ -9791,45 +9827,98 @@ export component AppWindow inherits Window {
                     member-list := ListView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
-                        for member in root.members : Rectangle {
+                        // Details and Manage sit beside the name when they leave it room,
+                        // otherwise in one line below it, otherwise one per line, so at
+                        // the narrowest details pane (200 px) and 200% text both stay
+                        // whole and reachable.
+                        for member in root.members : member-row := Rectangle {
                             width: member-list.visible-width;
-                            height: max(55px, 34px * root.text-scale + 16px);
+                            property <length> top-h: max(55px, 34px * root.text-scale + 16px);
+                            property <length> action-h: 30px * root.text-scale;
+                            property <length> details-w: 62px * root.text-scale;
+                            property <length> manage-w: 72px * root.text-scale;
+                            // Where the name starts: padding, avatar and one gap.
+                            property <length> lead: 12px + 32px + 9px;
+                            property <length> below-w: max(0px, self.width - self.lead - 12px);
+                            // 0: beside the name (with at least 96 px for it); 1: one
+                            // line below; 2: one per line below.
+                            property <int> mode: !root.live-session ? 0
+                                : self.width >= self.lead + 96px + 9px + self.details-w + 9px + self.manage-w + 12px ? 0
+                                : self.below-w >= self.details-w + 8px + self.manage-w ? 1 : 2;
+                            height: self.mode == 0 ? self.top-h
+                                : self.mode == 1 ? self.top-h + self.action-h + 6px
+                                : self.top-h + 2 * self.action-h + 12px;
                             background: transparent;
                             HorizontalLayout {
-                                padding-left: 12px; padding-right: 12px; padding-top: 11px; padding-bottom: 11px; spacing: 9px;
+                                y: 0; height: member-row.top-h;
+                                padding-left: 12px; padding-top: 11px; padding-bottom: 11px; spacing: 9px;
+                                padding-right: root.live-session && member-row.mode == 0 ? 12px + member-row.details-w + 9px + member-row.manage-w + 9px : 12px;
                                 VerticalLayout { width: 32px; alignment: center; AvatarBadge { width: 32px; height: 32px; built-in-radius: 11px; initials: member.initials; accent: member.accent; } }
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1; spacing: 2px;
                                     Text { text: member.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
                                     Text { text: member.detail; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
                                 }
-                                if root.live-session : ActionRect {
-                                    width: 72px * root.text-scale; height: 30px * root.text-scale;
-                                    horizontal-stretch: 0; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
-                                    background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
-                                    focus-color: root.accent;
-                                    enabled: !root.member-action-busy;
-                                    label: "Manage room member " + member.name + " · " + member.user-id;
-                                    activated => {
-                                        root.member-selected-user-id = member.user-id;
-                                        root.member-selected-name = member.name;
-                                        root.member-selected-membership = member.membership;
-                                        root.member-selected-power = member.power-level-text;
-                                        root.member-selected-self = member.is-account-user;
-                                        root.member-selected-creator = member.is-creator;
-                                        root.member-action-error = "";
-                                        root.member-action-notice = "";
-                                    }
-                                    Text {
-                                        text: "Manage";
-                                        color: root.member-action-busy ? root.muted : root.ink;
-                                        font-size: 11px * root.text-scale;
-                                        horizontal-alignment: center; vertical-alignment: center;
-                                    }
-                                }
                                 if !root.live-session : Rectangle {
                                     width: 7px; background: transparent;
                                     Rectangle { y: (parent.height - 7px) / 2; width: 7px; height: 7px; border-radius: 4px; background: member.online ? (StyleTokens.roles.presence-online.present ? StyleTokens.roles.presence-online.color : #64c9a7) : root.muted; }
+                                }
+                            }
+                            // Member details and ignore (member_privacy). Focus comes back
+                            // here when the details this opened close.
+                            if root.live-session : ActionRect {
+                                x: member-row.mode == 0 ? parent.width - 12px - member-row.manage-w - 9px - member-row.details-w : member-row.lead;
+                                y: member-row.mode == 0 ? (member-row.top-h - member-row.action-h) / 2 : member-row.top-h - 5px;
+                                width: member-row.mode == 0 ? member-row.details-w : member-row.mode == 1 ? (member-row.below-w - 8px) * 62 / 134 : member-row.below-w;
+                                height: member-row.action-h;
+                                horizontal-stretch: 0; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
+                                background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
+                                focus-color: root.accent;
+                                label: "Details for room member " + member.name + " · " + member.user-id;
+                                property <string> return-to;
+                                property <bool> details-open: MemberPrivacy.inspector.open;
+                                changed details-open => {
+                                    if !self.details-open && self.return-to != "" {
+                                        if self.return-to == member.user-id && root.member-inspector-allowed { self.focus(); }
+                                        self.return-to = "";
+                                    }
+                                }
+                                activated => {
+                                    MemberPrivacy.inspect(member.user-id);
+                                    if MemberPrivacy.inspector.open { self.return-to = member.user-id; }
+                                }
+                                Text {
+                                    text: "Details";
+                                    color: root.ink;
+                                    font-size: 11px * root.text-scale;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
+                            }
+                            if root.live-session : ActionRect {
+                                x: member-row.mode == 0 ? parent.width - 12px - member-row.manage-w : member-row.mode == 1 ? member-row.lead + (member-row.below-w - 8px) * 62 / 134 + 8px : member-row.lead;
+                                y: member-row.mode == 2 ? member-row.top-h - 5px + member-row.action-h + 6px : member-row.mode == 0 ? (member-row.top-h - member-row.action-h) / 2 : member-row.top-h - 5px;
+                                width: member-row.mode == 0 ? member-row.manage-w : member-row.mode == 1 ? (member-row.below-w - 8px) * 72 / 134 : member-row.below-w;
+                                height: member-row.action-h;
+                                horizontal-stretch: 0; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
+                                background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
+                                focus-color: root.accent;
+                                enabled: !root.member-action-busy;
+                                label: "Manage room member " + member.name + " · " + member.user-id;
+                                activated => {
+                                    root.member-selected-user-id = member.user-id;
+                                    root.member-selected-name = member.name;
+                                    root.member-selected-membership = member.membership;
+                                    root.member-selected-power = member.power-level-text;
+                                    root.member-selected-self = member.is-account-user;
+                                    root.member-selected-creator = member.is-creator;
+                                    root.member-action-error = "";
+                                    root.member-action-notice = "";
+                                }
+                                Text {
+                                    text: "Manage";
+                                    color: root.member-action-busy ? root.muted : root.ink;
+                                    font-size: 11px * root.text-scale;
+                                    horizontal-alignment: center; vertical-alignment: center;
                                 }
                             }
                         }
@@ -11219,6 +11308,13 @@ export component AppWindow inherits Window {
         }
     }
 
+    // A room member's details and ignore controls (member_privacy). Modal.
+    if MemberPrivacy.inspector.open && root.member-inspector-allowed : MemberInspector {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        colors: root.button-colors; surface: root.dialog-surface;
+        scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
+        text-scale: root.text-scale;
+    }
     if root.room-actions-open : FocusScope {
         focus-on-tab-navigation: false;
         init => { room-action-input.focus(); }

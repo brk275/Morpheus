@@ -3889,6 +3889,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_font_browser(&ui, directory.path()).await;
     phase.set(57);
     assert_people_window_privacy(&ui).await;
+    phase.set(72);
+    assert_member_row_actions_fit(&ui).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
@@ -7736,5 +7738,145 @@ async fn assert_theme_studio_draft(ui: &AppWindow, directory: &std::path::Path) 
     ui.invoke_studio_notice_dismiss();
     crate::theme_studio::reset_for_test();
     ui.set_page(0);
+    settle(ui).await;
+}
+
+/// A member row's Details and Manage actions on the real generated window:
+/// at the default and narrowest details pane, at 100% and 200% text, both
+/// are instantiated once, whole inside the details pane and the window, and
+/// never overlap each other.
+async fn assert_member_row_actions_fit(ui: &AppWindow) {
+    let size = ui.window().size();
+    let saved = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_details_width(),
+        ui.get_show_side_panel(),
+        ui.get_font_scale_percent(),
+    );
+    let privacy_scope = (
+        ui.get_active_account_local_id(),
+        ui.get_active_room_id(),
+        ui.get_access_open(),
+        ui.get_security_busy(),
+        ui.get_sas_busy(),
+        ui.get_security_recovery_key(),
+        ui.get_account_switch_pending(),
+        ui.get_account_profile_open(),
+        ui.get_people_open(),
+        ui.get_sas_stage(),
+    );
+    ui.set_active_account_local_id("member-layout".into());
+    ui.set_active_room_id("!member-layout:example.org".into());
+    ui.set_access_open(false);
+    ui.set_security_busy(false);
+    ui.set_sas_busy(false);
+    ui.set_sas_stage(0);
+    ui.set_security_recovery_key("".into());
+    ui.set_account_switch_pending(false);
+    ui.set_account_profile_open(false);
+    ui.set_people_open(false);
+    // Wide enough that the details pane is shown at its configured width;
+    // 620 px is the short height the actions must survive.
+    ui.window().set_size(slint::PhysicalSize::new(1280, 620));
+    ui.set_page(0);
+    ui.set_show_side_panel(true);
+    ui.set_live_session(true);
+    ui.set_members(ModelRc::new(VecModel::from(vec![MemberItem {
+        user_id: "@synthetic-member:example.org".into(),
+        name: "Synthetic member with a long display name".into(),
+        initials: "SM".into(),
+        ..Default::default()
+    }])));
+    let who = "Synthetic member with a long display name \u{b7} @synthetic-member:example.org";
+    for (pane, scale) in [(250, 100), (200, 100), (250, 200), (200, 200), (520, 200)] {
+        ui.set_details_width(pane);
+        ui.set_font_scale_percent(scale);
+        settle(ui).await;
+        let details = control_bounds(ui, &format!("Details for room member {who}"));
+        let manage = control_bounds(ui, &format!("Manage room member {who}"));
+        assert_eq!(
+            (details.len(), manage.len()),
+            (1, 1),
+            "{pane} px at {scale}%"
+        );
+        let (width, _) = window_size(ui);
+        let pane_left = width - pane as f32 - 0.5;
+        for bounds in [details[0], manage[0]] {
+            assert!(
+                inside_window(ui, bounds),
+                "{pane} px at {scale}%: inside the window"
+            );
+            assert!(
+                bounds.left >= pane_left,
+                "{pane} px at {scale}%: inside the details pane"
+            );
+        }
+        let (details, manage) = (details[0], manage[0]);
+        assert!(
+            details.right <= manage.left + 0.5 || details.bottom <= manage.top + 0.5,
+            "{pane} px at {scale}%: Details and Manage do not overlap"
+        );
+    }
+    // Use the real generated modal context, with a stand-in only for the
+    // controller's Close callback: no account or homeserver read is made.
+    let privacy = ui.global::<crate::MemberPrivacy>();
+    let weak = ui.as_weak();
+    privacy.on_close_inspector(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<crate::MemberPrivacy>()
+                .set_inspector(crate::MemberInspectorView::default());
+        }
+    });
+    for held in 0..8 {
+        privacy.set_inspector(crate::MemberInspectorView {
+            open: true,
+            name: "Synthetic member".into(),
+            user_id: "@synthetic-member:example.org".into(),
+            ..Default::default()
+        });
+        settle(ui).await;
+        assert!(privacy.get_inspector().open, "the ordinary inspector opens");
+        match held {
+            0 => ui.set_access_open(true),
+            1 => ui.set_security_busy(true),
+            2 => ui.set_sas_busy(true),
+            3 => ui.set_security_recovery_key("synthetic-key-not-a-credential".into()),
+            4 => ui.set_account_switch_pending(true),
+            5 => ui.set_account_profile_open(true),
+            6 => ui.set_people_open(true),
+            _ => ui.set_sas_stage(4),
+        }
+        settle(ui).await;
+        assert!(
+            !privacy.get_inspector().open,
+            "context {held} closes private details"
+        );
+        ui.set_access_open(false);
+        ui.set_security_busy(false);
+        ui.set_sas_busy(false);
+        ui.set_sas_stage(0);
+        ui.set_security_recovery_key("".into());
+        ui.set_account_switch_pending(false);
+        ui.set_account_profile_open(false);
+        ui.set_people_open(false);
+    }
+    ui.set_members(ModelRc::new(VecModel::<MemberItem>::default()));
+    ui.set_active_account_local_id(privacy_scope.0);
+    ui.set_active_room_id(privacy_scope.1);
+    ui.set_access_open(privacy_scope.2);
+    ui.set_security_busy(privacy_scope.3);
+    ui.set_sas_busy(privacy_scope.4);
+    ui.set_security_recovery_key(privacy_scope.5);
+    ui.set_account_switch_pending(privacy_scope.6);
+    ui.set_account_profile_open(privacy_scope.7);
+    ui.set_people_open(privacy_scope.8);
+    ui.set_sas_stage(privacy_scope.9);
+    ui.set_page(saved.0);
+    ui.set_live_session(saved.1);
+    ui.set_details_width(saved.2);
+    ui.set_show_side_panel(saved.3);
+    ui.set_font_scale_percent(saved.4);
+    ui.window().set_size(size);
     settle(ui).await;
 }
