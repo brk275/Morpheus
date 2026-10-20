@@ -294,6 +294,7 @@ async fn guarded<T>(
 fn single_send() -> RequestConfig {
     RequestConfig::new()
         .retry_limit(0)
+        .disable_auth_refresh()
         .timeout(WRITE_TIMEOUT)
         .force_auth()
         .max_response_bytes(MAX_PROFILE_RESPONSE_BYTES)
@@ -542,6 +543,7 @@ impl AccountManager {
                     Some(
                         RequestConfig::new()
                             .retry_limit(0)
+                            .disable_auth_refresh()
                             .timeout(UPLOAD_TIMEOUT)
                             .force_auth()
                             .max_response_bytes(MAX_PROFILE_RESPONSE_BYTES),
