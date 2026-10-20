@@ -34,6 +34,11 @@ pub use discovery::{
     JoinCancellation, JoinError, MAX_JOIN_VIA, MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage,
     PublicRoomsQuery, ResolvedRoomAlias, parse_matrix_link_target,
 };
+mod matrix_links;
+pub use matrix_links::{
+    LinkError, LinkPreview, LinkRoom, MAX_LINK_ID_BYTES, MAX_LINK_NAME_CHARS,
+    MAX_MESSAGE_LINK_BYTES, MessageLink, message_link,
+};
 mod space_management;
 pub use space_management::{
     LinkIntent, LinkWarning, MAX_LINK_VIA, MAX_SPACE_CANDIDATES, MAX_SPACE_LINKS, SpaceLinkChange,

@@ -187,6 +187,7 @@ impl AccountAccessUi {
                 return;
             }
             crate::room_addresses::clear(&ui);
+            crate::matrix_links::clear(&ui);
             clear_passwords(&ui);
             ui.set_access_mode(mode);
             ui.set_access_target(label.into());
@@ -205,6 +206,7 @@ impl AccountAccessUi {
             if self.switch_generation.load(Ordering::Acquire) == generation {
                 if pending {
                     crate::room_addresses::clear(&ui);
+                    crate::matrix_links::clear(&ui);
                 }
                 ui.set_account_switch_pending(pending);
             }
@@ -215,6 +217,7 @@ impl AccountAccessUi {
                 if access.switch_generation.load(Ordering::Acquire) == generation {
                     if pending {
                         crate::room_addresses::clear(&ui);
+                        crate::matrix_links::clear(&ui);
                     }
                     ui.set_account_switch_pending(pending);
                 }

@@ -895,6 +895,7 @@ fn show(
             explorer,
         });
     });
+    crate::matrix_links::clear(ui);
     ui.global::<SpaceExplorer>().set_open(true);
     step(ui, live, handle, Explorer::next_request);
 }

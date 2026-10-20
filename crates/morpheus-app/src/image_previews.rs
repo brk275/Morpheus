@@ -411,6 +411,7 @@ impl Opener {
         ui.set_image_preview_status("Loading image into memory…".into());
         ui.set_image_preview_loading(true);
         publish_position(ui, event);
+        crate::matrix_links::clear(ui);
         ui.set_image_preview_open(true);
         controller
             .state

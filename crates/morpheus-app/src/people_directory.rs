@@ -274,6 +274,7 @@ fn open(ui: &AppWindow, live: &LiveUi, prefill: &str) {
         .take(morpheus_matrix::MAX_USER_QUERY_CHARS)
         .collect();
     ui.set_people_query(prefill.as_str().into());
+    crate::matrix_links::clear(ui);
     ui.set_people_open(true);
     project(ui);
 }

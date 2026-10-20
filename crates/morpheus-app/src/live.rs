@@ -90,6 +90,17 @@ pub(crate) struct JoinAsked {
     security: u64,
     cancellation: JoinCancellation,
     authority: NavigationAuthority,
+    /// The join's own open, once its snapshot was shown (`owned_open`).
+    opened: Arc<std::sync::Mutex<Option<JoinOpened>>>,
+}
+
+/// What a join's own open showed: the navigation it took under the join's
+/// authority (open_joined), and the exact room. A follow-up on that screen
+/// runs only under this receipt (`JoinAsked::owned_open`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JoinOpened {
+    pub(crate) navigation: u64,
+    pub(crate) room_id: String,
 }
 
 impl JoinAsked {
@@ -106,7 +117,63 @@ impl JoinAsked {
             security,
             cancellation: JoinCancellation::new(),
             authority: NavigationAuthority::default(),
+            opened: Arc::default(),
         }
+    }
+
+    /// Record the join's own open once its snapshot was shown
+    /// (open_joined only).
+    fn record_opened(&self, navigation: u64, room_id: String) {
+        let opened = JoinOpened {
+            navigation,
+            room_id,
+        };
+        *self
+            .opened
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(opened);
+    }
+
+    /// The join's own open, only while it still owns what is shown: its
+    /// navigation is still the current one (nothing navigated since, a
+    /// same-room activation or an account switch included) and no security
+    /// step began since its click. The join's authority is no part of it:
+    /// join_target_for withdraws that once it returns (JoinNavigationWait),
+    /// and the requester's Close or replacement ends its own record first.
+    /// A follow-up on that screen runs under this receipt's navigation; one
+    /// taken later is never proof of it. Callers: matrix_links' finish_join
+    /// only; every other join path ignores it.
+    pub(crate) fn owned_open(&self, live: &LiveUi) -> Option<JoinOpened> {
+        let opened = self
+            .opened
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()?;
+        let owned = live.navigation_is_current(opened.navigation)
+            && live.security_gate.ringing_allowed(self.security);
+        owned.then_some(opened)
+    }
+
+    /// The authority a follow-up of the join's own open runs under (a joined
+    /// link's message): it holds only while the session is live, the join's
+    /// exact `selection` is current and no security step began since the
+    /// join's click (the generation the join itself was admitted under).
+    /// Every synchronous commit and every admission of the follow-up asks
+    /// it, its requester withdraws it (Close, a newer link, an account
+    /// change, a protected surface), and it never takes, advances or blesses
+    /// a navigation. Callers: matrix_links' finish_join only.
+    pub(crate) fn follow_up_authority(
+        &self,
+        live: &LiveUi,
+        selection: &AccountSelection,
+    ) -> NavigationAuthority {
+        let (is_live, gate) = (live.is_live.clone(), live.security_gate.clone());
+        let (selection, security) = (selection.clone(), self.security);
+        NavigationAuthority::holding(Arc::new(move || {
+            is_live.load(Ordering::Acquire)
+                && selection.is_current()
+                && gate.ringing_allowed(security)
+        }))
     }
 
     /// Withdraw the join: before its hand-off nothing is sent (true); after
@@ -295,21 +362,88 @@ struct MemberRequest {
 /// lock, so once `withdraw` returns the navigation commits nothing more.
 /// Withdrawing never touches the shared navigation epoch, so it cannot
 /// cancel a newer navigation of anyone else.
+///
+/// An authority may also carry its requester's own captured conditions
+/// (`holding`: for example a joined link's session, exact selection and
+/// security gate as they were at its click). They are asked at every
+/// synchronous commit, under the withdrawal lock (`commit_guard`), and
+/// wherever `withdrawn` is asked, including a snapshot's or a focused view's
+/// admission on the UI thread, so a security step that began (and maybe
+/// ended) since the click stops the navigation there, with no navigation
+/// change and no watcher needed.
+///
+/// It may also name the surfaces that end it (`blocked_by`, asked on the
+/// UI thread by `admits`): a step admitted while one of them is up
+/// withdraws the authority for good, so that surface closing again never
+/// revives it.
 #[derive(Clone, Default)]
-pub(crate) struct NavigationAuthority(Arc<std::sync::Mutex<bool>>);
+pub(crate) struct NavigationAuthority {
+    withdrawn: Arc<std::sync::Mutex<bool>>,
+    /// The requester's conditions besides its withdrawal; `None`: none.
+    holds: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Whether another surface is up, asked on the UI thread; `None`: none.
+    blocked_by: Option<fn(&AppWindow) -> bool>,
+}
 
 impl NavigationAuthority {
+    /// An authority that also needs `holds` at every commit and admission.
+    /// Callers: JoinAsked::follow_up_authority (a joined link's message).
+    pub(crate) fn holding(holds: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self {
+            withdrawn: Arc::default(),
+            holds: Some(holds),
+            blocked_by: None,
+        }
+    }
+
+    /// The same authority, also ended for good by its first UI-thread
+    /// admission while `blocked` says another surface is up. Set before it
+    /// is cloned. Callers: matrix_links' finish_join (a joined link's
+    /// message, blocked by matrix_links::surface_blocked).
+    pub(crate) fn blocked_by(mut self, blocked: fn(&AppWindow) -> bool) -> Self {
+        self.blocked_by = Some(blocked);
+        self
+    }
+
+    /// A UI-thread admission: not withdrawn, its own conditions holding and
+    /// no surface it names up. A surface that is up withdraws it first.
+    pub(crate) fn admits(&self, ui: &AppWindow) -> bool {
+        if self.withdrawn() {
+            return false;
+        }
+        if self.blocked_by.is_some_and(|blocked| blocked(ui)) {
+            self.withdraw();
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn withdraw(&self) {
         *self.state() = true;
     }
 
+    /// Withdrawn, or its own conditions no longer hold.
     pub(crate) fn withdrawn(&self) -> bool {
-        *self.state()
+        *self.state() || !self.holds()
     }
 
-    /// True once withdrawn. Held only around synchronous commits.
+    fn holds(&self) -> bool {
+        self.holds.as_ref().is_none_or(|holds| holds())
+    }
+
+    /// True once withdrawn.
     fn state(&self) -> std::sync::MutexGuard<'_, bool> {
-        self.0.lock().unwrap_or_else(|error| error.into_inner())
+        self.withdrawn
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// The withdrawal lock, held around one synchronous commit, only while
+    /// the navigation may still commit: not withdrawn, and its own
+    /// conditions holding when the commit takes it.
+    fn commit_guard(&self) -> Option<std::sync::MutexGuard<'_, bool>> {
+        let state = self.state();
+        (!*state && self.holds()).then_some(state)
     }
 }
 
@@ -400,18 +534,16 @@ impl<V> Default for FocusSlot<V> {
 
 impl<V: Clone> FocusSlot<V> {
     /// Install `view` under a new feed generation, only while `authority`
-    /// holds. Withdrawal takes the same lock, so a superseded view whose
-    /// open was withdrawn is never installed. Returns that generation.
+    /// holds (with its own conditions). Withdrawal takes the same lock, so a
+    /// superseded view whose open was withdrawn is never installed. Returns
+    /// that generation.
     fn commit(
         &mut self,
         generation: &AtomicU64,
         authority: &NavigationAuthority,
         view: V,
     ) -> Option<u64> {
-        let withdrawn = authority.state();
-        if *withdrawn {
-            return None;
-        }
+        let _admitted = authority.commit_guard()?;
         let installed = generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.shown = Some((installed, view));
         Some(installed)
@@ -2003,6 +2135,7 @@ impl LiveUi {
             }
             self.invalidate_navigation()
         };
+        let shown_room = room_id.clone();
         let opened = match open {
             JoinedNavigation::Room => {
                 self.reveal_room_locked(&selection, room_id, epoch, &asked.authority, &ui)
@@ -2013,7 +2146,10 @@ impl LiveUi {
                     .await
             }
         };
-        if !matches!(opened, Ok(true)) {
+        if matches!(opened, Ok(true)) {
+            // Its receipt: the navigation this open took and the exact room.
+            asked.record_opened(epoch, shown_room);
+        } else {
             self.reopen_unrevealed(&selection, epoch, ui).await;
         }
         opened
@@ -2393,8 +2529,8 @@ impl LiveUi {
     ) -> Option<(Option<String>, Option<String>)> {
         let mut space = self.selected_space.lock().await;
         let mut room = self.selected_room.lock().await;
-        let withdrawn = authority.state();
-        if *withdrawn || !selection.is_current() || !self.navigation_is_current(navigation) {
+        let _admitted = authority.commit_guard()?;
+        if !selection.is_current() || !self.navigation_is_current(navigation) {
             return None;
         }
         let previous = (space.clone(), room.clone());
@@ -2438,8 +2574,8 @@ impl LiveUi {
     ) -> Option<(Option<String>, Option<String>)> {
         let mut space = self.selected_space.lock().await;
         let mut room = self.selected_room.lock().await;
-        let withdrawn = authority.state();
-        if *withdrawn || !self.navigation_is_current(navigation_epoch) {
+        let _admitted = authority.commit_guard()?;
+        if !self.navigation_is_current(navigation_epoch) {
             return None;
         }
         let previous = (space.clone(), room.clone());
@@ -3207,6 +3343,7 @@ impl LiveUi {
     /// Its rows are published under the live feed's account, room, feed
     /// generation and navigation checks; while it runs, refreshes keep it
     /// (open_room sees a running feed for the room). Withdrawing `authority`
+    /// (or its own conditions failing, see NavigationAuthority::holding)
     /// before the commit installs nothing; after it but before the view's
     /// first rows are shown, the view shows nothing and the room returns to
     /// its live feed. `selection` and `navigation_epoch` are the opening's
@@ -3235,6 +3372,8 @@ impl LiveUi {
             .manager
             .focused_view_selected(&selection, &room_id, event_id, FOCUS_CONTEXT_EVENTS)
             .await?;
+        #[cfg(test)]
+        self.pauses.reach("focus.before_commit").await;
         // Take every lock the install needs before the commit, in open_room's
         // order (key, then feed), and check every fence after the last wait.
         // From the commit on nothing suspends, so cancelling this future
@@ -3298,8 +3437,9 @@ impl LiveUi {
                             return;
                         };
                         // Withdrawn after the commit, before any row of the
-                        // view was shown: show none and give the room back.
-                        if unshown.load(Ordering::Acquire) && authority.withdrawn() {
+                        // view was shown (or another surface is up, which
+                        // withdraws it): show none and give the room back.
+                        if unshown.load(Ordering::Acquire) && !authority.admits(&ui) {
                             back.give_back(selected_account, room_id);
                             return;
                         }
@@ -4241,6 +4381,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     // Room names and any reviewed change of a Space being managed.
     crate::space_management::clear(ui);
     crate::room_addresses::clear(ui);
+    // A link's read and join are withdrawn before its card is hidden.
+    crate::matrix_links::clear(ui);
     ui.set_invitations(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_results(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_open(false);
@@ -4707,6 +4849,45 @@ mod account_presentation_tests {
             .expect("feed cancellation must drop its retained work");
     }
 
+    /// A join's receipt owns what is shown only while nothing navigated since
+    /// its own open and no security step began since its click; the join's
+    /// own withdrawal once it returned (JoinNavigationWait) is no part of it.
+    #[tokio::test]
+    async fn a_join_receipt_owns_the_screen_only_until_the_next_navigation() {
+        let (directory, live) = empty_profile();
+        live.is_live.store(true, Ordering::Release);
+        let asked = live.join_asked();
+        assert_eq!(asked.owned_open(&live), None, "no open, no receipt");
+        // Its own open took the next navigation and showed the room.
+        let opened = live.invalidate_navigation();
+        asked.record_opened(opened, "!room:example.org".into());
+        let receipt = JoinOpened {
+            navigation: opened,
+            room_id: "!room:example.org".into(),
+        };
+        assert_eq!(asked.owned_open(&live), Some(receipt));
+        asked.withdraw();
+        assert!(asked.owned_open(&live).is_some());
+        // A newer activation, of the same room too, ends it for good.
+        let newer = live.invalidate_navigation();
+        assert_eq!(asked.owned_open(&live), None);
+        assert!(live.navigation_is_current(newer));
+        // So does a security step begun and ended since the click.
+        let other = live.join_asked();
+        let taken = live.invalidate_navigation();
+        other.record_opened(taken, "!room:example.org".into());
+        assert!(other.owned_open(&live).is_some());
+        drop(live.security_gate.try_account_access());
+        assert_eq!(other.owned_open(&live), None);
+        // And the session ending.
+        let last = live.join_asked();
+        let shown = live.invalidate_navigation();
+        last.record_opened(shown, "!room:example.org".into());
+        live.is_live.store(false, Ordering::Release);
+        assert_eq!(last.owned_open(&live), None);
+        close_profile(directory, live).await;
+    }
+
     async fn close_profile(directory: tempfile::TempDir, live: Arc<LiveUi>) {
         let manager = live.manager.clone();
         drop(live);
@@ -4909,6 +5090,72 @@ mod account_presentation_tests {
         assert_eq!(slot.view(live), None);
         slot.drop_stale(live);
         assert!(slot.shown.is_none());
+    }
+
+    /// An authority carrying its requester's click-time security generation
+    /// (the shape of JoinAsked::follow_up_authority, whose selection part
+    /// needs the opt-in fixture) refuses a held focused-view commit and a
+    /// held room commit once a real security step began and ended since the
+    /// click, and reports itself withdrawn to every later admission, with no
+    /// withdraw call and no navigation change.
+    #[tokio::test]
+    async fn a_follow_up_held_at_its_commit_refuses_after_a_security_step_since_its_click() {
+        fn clicked(live: &LiveUi) -> NavigationAuthority {
+            let (gate, is_live) = (live.security_gate.clone(), live.is_live.clone());
+            let security = gate.ringing_generation();
+            NavigationAuthority::holding(Arc::new(move || {
+                is_live.load(Ordering::Acquire) && gate.ringing_allowed(security)
+            }))
+        }
+        let (directory, live) = empty_profile();
+        live.is_live.store(true, Ordering::Release);
+        let (old_room, hit_room) = ("!old-room:example.org", "!hit-room:example.org");
+        *live.selected_room.lock().await = Some(old_room.into());
+        let navigation = live.invalidate_navigation();
+        let authority = clicked(&live);
+        assert!(!authority.withdrawn());
+
+        // The focused view loaded; a step begins and ends before its commit.
+        let generation = AtomicU64::new(3);
+        let mut slot = FocusSlot::default();
+        let step = live.security_gate.try_account_access();
+        assert!(step.is_some(), "an idle gate begins a step");
+        assert!(authority.withdrawn(), "while the step runs");
+        drop(step);
+        assert!(authority.withdrawn(), "and after it ended");
+        assert_eq!(slot.commit(&generation, &authority, "view"), None);
+        assert_eq!(generation.load(Ordering::Acquire), 3);
+        assert!(slot.shown.is_none());
+
+        // A room commit held at its lock is refused the same way.
+        let authority = clicked(&live);
+        let held = live.selected_room.lock().await;
+        let commit = {
+            let (live, authority) = (live.clone(), authority.clone());
+            tokio::spawn(async move {
+                live.commit_reveal(hit_room, &[], true, navigation, &authority)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(live.security_gate.try_account_access());
+        drop(held);
+        assert_eq!(commit.await.unwrap(), None);
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(old_room));
+        assert!(
+            live.navigation_is_current(navigation),
+            "no navigation was taken"
+        );
+
+        // Unchanged since its click, it commits; the session ending stops it.
+        let authority = clicked(&live);
+        let shown = slot.commit(&generation, &authority, "view");
+        assert_eq!(shown, Some(4));
+        live.is_live.store(false, Ordering::Release);
+        assert!(authority.withdrawn());
+        assert_eq!(slot.commit(&generation, &authority, "later"), None);
+        assert_eq!(slot.view(4), Some("view"));
+        close_profile(directory, live).await;
     }
 
     #[tokio::test]

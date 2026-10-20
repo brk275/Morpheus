@@ -54,9 +54,10 @@ const REVEAL_TIMEOUT: Duration = Duration::from_secs(30);
 const FOCUS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Feeds apply loaded rows asynchronously; a row is looked for this often,
 /// this many times, before the conversation around it is opened instead.
-const JUMP_RETRY: Duration = Duration::from_millis(120);
+/// The opt-in live controller suite steps Slint's mock clock by these.
+pub(crate) const JUMP_RETRY: Duration = Duration::from_millis(120);
 const JUMP_ATTEMPTS: u8 = 10;
-const ARRIVAL_ATTEMPTS: u8 = 5;
+pub(crate) const ARRIVAL_ATTEMPTS: u8 = 5;
 /// Events per Load newer page of a focused conversation view.
 const NEWER_PAGE: u16 = 50;
 /// How long a target in another account waits for that account to become
@@ -228,6 +229,24 @@ impl Opening {
     /// The target's room is the open one.
     fn here(&self, window: &AppWindow) -> bool {
         window.get_active_room_id().as_str() == self.hit.room_id
+    }
+
+    /// Whether a delayed step (a scroll retry, the focused view's result)
+    /// may still show anything: the owner is current, its room is open, its
+    /// authority admits it (its own conditions, and no surface it names up,
+    /// which would withdraw it for good) and this open's own navigation is
+    /// still the current one. A newer navigation, even of the same room or a
+    /// Space whose snapshot is still held, withdraws this open alone; no
+    /// epoch is taken or advanced.
+    fn admitted(&self, window: &AppWindow, live: &LiveUi) -> bool {
+        if !self.current(window) || !self.here(window) || !self.authority.admits(window) {
+            return false;
+        }
+        if live.navigation_is_current(self.navigation) {
+            return true;
+        }
+        self.authority.withdraw();
+        false
     }
 
     fn searching(&self) -> bool {
@@ -1074,6 +1093,63 @@ pub(crate) fn open_conversation(
     window.invoke_switch_account(account.index);
 }
 
+/// NAVIGATION SEAM, owned continuation: show `target`'s event in the room
+/// an owner's own navigation already shows, under that navigation's epoch
+/// (`navigation`), never a new one. Nothing happens unless the owner's exact
+/// `selection` is current and on screen, `navigation` is still the current
+/// navigation, `authority` (the owner's own, with its click-time
+/// conditions and the surfaces that end it) admits it and the room open now
+/// is the target's. That authority is registered like any open's, so a
+/// newer activation or search open withdraws it too, and every later step
+/// (each scroll retry, the focused view's commit, its first rows and its
+/// scroll) asks it and `navigation` again (Opening::admitted). Callers:
+/// matrix_links' finish_join, under the join's own receipt (LiveUi's
+/// JoinAsked::owned_open and follow_up_authority).
+pub(crate) fn continue_conversation(
+    window: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+    selection: AccountSelection,
+    target: ConversationTarget,
+    navigation: u64,
+    authority: NavigationAuthority,
+) {
+    let owned = live.navigation_is_current(navigation)
+        && authority.admits(window)
+        && selection.is_current()
+        && window.get_live_session()
+        && selection.account_id() == target.account_id
+        && window.get_active_account_local_id().as_str() == target.account_id
+        && window.get_active_room_id().as_str() == target.room_id;
+    if !owned {
+        return;
+    }
+    let generation = with(|controller| {
+        controller.activation = controller.activation.wrapping_add(1);
+        controller.pending = None;
+        controller.activation
+    });
+    with(|controller| controller.claim_navigation(authority.clone(), false));
+    let hit = Hit {
+        room_id: target.room_id,
+        event_id: target.event_id.unwrap_or_default(),
+        thread_root: target.thread_root.unwrap_or_default(),
+    };
+    let owner = Owner::Activation {
+        selection,
+        account: target.account_id,
+        generation,
+    };
+    let opening = Opening {
+        owner,
+        hit,
+        authority,
+        navigation,
+    };
+    // The room was just opened: its latest messages may still be arriving.
+    arrived(window, live, runtime, &opening, true);
+}
+
 /// The visible account changed (called once its snapshot is applied). A
 /// pending target for that account opens now; any other one is dropped.
 pub(crate) fn account_shown(window: &AppWindow) {
@@ -1249,7 +1325,8 @@ fn arrived(
 }
 
 /// Jump to the target once its row is loaded, checking `attempts` more
-/// times; then open the conversation around it instead.
+/// times; then open the conversation around it instead. Every check is the
+/// opening's own admission, its navigation included.
 fn jump_or_focus(
     weak: Weak<AppWindow>,
     live: &Arc<LiveUi>,
@@ -1260,7 +1337,7 @@ fn jump_or_focus(
     let Some(window) = weak.upgrade() else {
         return;
     };
-    if !opening.current(&window) || !opening.here(&window) || opening.authority.withdrawn() {
+    if !opening.admitted(&window, live) {
         return;
     }
     if jump_timeline(&window, &opening.hit.event_id) {
@@ -1292,12 +1369,15 @@ fn focus(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Ope
         let focus =
             task_live.focus_event_for(selection, room, event, epoch, authority, weak.clone());
         let outcome = tokio::time::timeout(FOCUS_TIMEOUT, focus).await;
-        let _ = weak.upgrade_in_event_loop(move |window| focused(&window, &opening, outcome));
+        let _ = weak.upgrade_in_event_loop(move |window| {
+            focused(&window, &task_live, &opening, outcome);
+        });
     });
 }
 
 fn focused(
     window: &AppWindow,
+    live: &Arc<LiveUi>,
     opening: &Opening,
     outcome: Result<Result<bool, MatrixCoreError>, tokio::time::error::Elapsed>,
 ) {
@@ -1305,14 +1385,20 @@ fn focused(
         return;
     }
     match outcome {
+        // Withdrawn (by its requester or its own conditions) or navigated
+        // since: nothing of it is shown or scrolled to.
+        _ if !opening.admitted(window, live) => opening.notice(window, ""),
         Ok(Ok(true)) => {
             reset_history(window);
             opening.notice(window, "");
-            if !opening.authority.withdrawn() {
-                jump_when_loaded(window.as_weak(), opening.clone(), JUMP_ATTEMPTS);
-            }
+            jump_when_loaded(
+                window.as_weak(),
+                live.clone(),
+                opening.clone(),
+                JUMP_ATTEMPTS,
+            );
         }
-        // Withdrawn, or the room or account changed meanwhile.
+        // The room or account changed meanwhile.
         Ok(Ok(false)) => opening.notice(window, ""),
         Ok(Err(_)) | Err(_) => opening.notice(window, FOCUS_FAILED),
     }
@@ -1322,12 +1408,14 @@ fn focused(
 /// the reply is loaded. The thread panel shows what was loaded.
 fn reveal(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Opening) {
     opening.notice(window, FINDING);
-    let manager = live.manager.clone();
+    let task_live = live.clone();
     let opening = opening.clone();
     let weak = window.as_weak();
     let task = runtime.spawn(async move {
-        let outcome = reveal_hit(&manager, &opening).await;
-        let _ = weak.upgrade_in_event_loop(move |window| revealed(&window, &opening, outcome));
+        let outcome = reveal_hit(&task_live.manager, &opening).await;
+        let _ = weak.upgrade_in_event_loop(move |window| {
+            revealed(&window, &task_live, &opening, outcome);
+        });
     });
     with(|controller| {
         abort(controller.reveal_task.take());
@@ -1347,8 +1435,14 @@ async fn reveal_hit(manager: &AccountManager, opening: &Opening) -> Option<Histo
     outcome.ok().and_then(Result::ok)
 }
 
-fn revealed(window: &AppWindow, opening: &Opening, outcome: Option<HistoryReveal>) {
+fn revealed(window: &AppWindow, live: &LiveUi, opening: &Opening, outcome: Option<HistoryReveal>) {
     if !opening.current(window) || !opening.here(window) {
+        return;
+    }
+    // Navigated since or withdrawn: the thread panel is no longer this
+    // open's to mark.
+    if !opening.admitted(window, live) {
+        opening.notice(window, "");
         return;
     }
     let thread_open = window.get_thread_root_id().as_str() == opening.hit.thread_root;
@@ -1364,20 +1458,21 @@ fn revealed(window: &AppWindow, opening: &Opening, outcome: Option<HistoryReveal
     opening.notice(window, notice);
 }
 
-/// Jump once the hit's row reaches the conversation model.
-fn jump_when_loaded(weak: Weak<AppWindow>, opening: Opening, attempts: u8) {
+/// Jump once the hit's row reaches the conversation model, under the
+/// opening's own admission at every check.
+fn jump_when_loaded(weak: Weak<AppWindow>, live: Arc<LiveUi>, opening: Opening, attempts: u8) {
     Timer::single_shot(JUMP_RETRY, move || {
         let Some(window) = weak.upgrade() else {
             return;
         };
-        if !opening.current(&window) || !opening.here(&window) || opening.authority.withdrawn() {
+        if !opening.admitted(&window, &live) {
             return;
         }
         if jump_timeline(&window, &opening.hit.event_id) {
             return;
         }
         if attempts > 1 {
-            jump_when_loaded(weak, opening, attempts - 1);
+            jump_when_loaded(weak, live, opening, attempts - 1);
         } else {
             opening.notice(&window, NOT_SHOWN);
         }

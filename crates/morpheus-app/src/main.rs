@@ -28,6 +28,7 @@ mod kept_replies;
 mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
+mod matrix_links;
 mod member_privacy;
 mod message_metadata;
 mod message_search;
@@ -763,6 +764,25 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
 
 fn preview_event_index(event_id: &str) -> Option<usize> {
     event_id.strip_prefix("preview:")?.parse().ok()
+}
+
+/// The external-link confirmation: an http(s) link opens in the system
+/// browser only after the person confirms it in a native dialog. Anything
+/// else (a `matrix:` URI included) is never handed to the system.
+fn confirm_external_link(link: &str) {
+    if let Some(url) = safe_message_url(link) {
+        thread::spawn(move || {
+            let accepted = rfd::MessageDialog::new()
+                .set_title("Open external link?")
+                .set_description(format!("The message links to:\n\n{url}"))
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show()
+                == rfd::MessageDialogResult::Ok;
+            if accepted {
+                let _ = webbrowser::open(&url);
+            }
+        });
+    }
 }
 
 fn safe_message_url(link: &str) -> Option<String> {
@@ -1518,6 +1538,7 @@ fn ask_to_leave_call(ui: &slint::Weak<AppWindow>, calls: &CallController, action
         return false;
     }
     if let Some(ui) = ui.upgrade() {
+        matrix_links::clear(&ui);
         ui.set_native_leave_unconfirmed(matches!(status, CallStatus::CleanupFailed { .. }));
         ui.set_pending_account_index(action);
         ui.set_leave_call_dialog(true);
@@ -2452,6 +2473,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             space_explorer::clear(&ui);
             space_management::clear(&ui);
             room_addresses::clear(&ui);
+            matrix_links::clear(&ui);
         }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
@@ -2547,6 +2569,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if !voice_live.is_live.load(Ordering::Acquire) {
             window.invoke_open_room(room_id);
+            matrix_links::clear(&window);
             window.set_page(2);
             return;
         }
@@ -2585,6 +2608,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             return;
                         }
+                        matrix_links::clear(&window);
                         window.set_page(2);
                         #[cfg(feature = "native-calls")]
                         if !calls.status().blocks_account_switch() {
@@ -2858,6 +2882,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     message_search::register(&ui, live.clone(), runtime.handle().clone());
     space_explorer::register(&ui, live.clone(), runtime.handle().clone());
+    matrix_links::register(&ui, live.clone(), runtime.handle().clone());
     space_management::register(&ui, live.clone(), runtime.handle().clone());
     room_addresses::register(&ui, live.clone(), runtime.handle().clone());
     thread_history::register(&ui, live.clone(), runtime.handle().clone());
@@ -3263,20 +3288,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let send_live = live.clone();
     let send_handle = runtime.handle().clone();
     let send_composers = composer_ui.clone();
+    let link_weak = ui.as_weak();
+    let link_live = live.clone();
+    let link_handle = runtime.handle().clone();
     ui.on_open_message_link(move |link| {
-        if let Some(url) = safe_message_url(link.as_str()) {
-            thread::spawn(move || {
-                let accepted = rfd::MessageDialog::new()
-                    .set_title("Open external link?")
-                    .set_description(format!("The message links to:\n\n{url}"))
-                    .set_buttons(rfd::MessageButtons::OkCancel)
-                    .show()
-                    == rfd::MessageDialogResult::Ok;
-                if accepted {
-                    let _ = webbrowser::open(&url);
-                }
-            });
+        // A Matrix link opens inside Morpheus and never reaches the browser
+        // by itself; any other link keeps the external-link confirmation.
+        if let Some(window) = link_weak.upgrade()
+            && matrix_links::open(&window, &link_live, &link_handle, link.as_str())
+        {
+            return;
         }
+        confirm_external_link(link.as_str());
     });
     ui.on_send_message(move |body| {
         let submitted_text = body.to_string();
@@ -3772,6 +3795,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         if let Some(ui) = weak.upgrade() {
+            matrix_links::clear(&ui);
             ui.set_login_error("".into());
             ui.set_show_sign_in(true);
         }

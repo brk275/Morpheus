@@ -609,6 +609,7 @@ fn open(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     ui.set_account_menu_open(false);
     // The identity being edited, from the switcher, until the server answers.
     ui.set_account_profile_user_id(ui.get_active_account_handle());
+    crate::matrix_links::clear(ui);
     ui.set_account_profile_open(true);
     read(ui, live, runtime, true);
 }

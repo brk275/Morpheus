@@ -361,6 +361,7 @@ impl RoomSettingsUi {
         ui.set_room_settings_refresh_required(false);
         ui.set_room_admin_error("".into());
         ui.set_room_admin_notice("".into());
+        crate::matrix_links::clear(ui);
         ui.set_room_admin_open(true);
         let this = self.clone();
         let watched = form.clone();

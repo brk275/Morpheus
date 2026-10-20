@@ -746,6 +746,7 @@ impl RoomActivityUi {
         };
         activity.set_seen_title(title.into());
         activity.set_seen_state(1);
+        crate::matrix_links::clear(ui);
         activity.set_seen_open(true);
         let this = self.clone();
         let task = self.runtime.spawn(async move {

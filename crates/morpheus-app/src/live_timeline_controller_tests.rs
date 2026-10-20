@@ -30,6 +30,15 @@
 //! are queued on the event loop, and performs A -> B -> A; the held loop then
 //! runs those callbacks, which must publish nothing.
 //!
+//! A joined message link's continuation is then driven through its actual
+//! completion (matrix_links' finish_join), the owned continuation and its
+//! Slint retry timers on the harness's mock clock: a same-room navigation
+//! before a retry, and a security step, Settings, a newer link, or the quick
+//! switcher or account menu opened and closed again while the focused view
+//! is held before its commit, show and scroll nothing; an unchanged owner
+//! still scrolls and focuses. The join's own open is the
+//! real `open_joined` of the already joined fixture room; no join is sent.
+//!
 //! Each fixed `MORPHEUS_LIVE_TIMELINE_CHECK name=true` record is printed once,
 //! only after its assertions passed. Records carry no IDs, values or text.
 
@@ -320,6 +329,29 @@ async fn feeds_running(live: &LiveUi) -> (bool, bool) {
     (room, thread)
 }
 
+/// What arrives while a joined link's focused view is held before its
+/// commit (`Scenario::link_continuation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Intent {
+    SecurityStep,
+    Settings,
+    NewerLink,
+    /// The quick switcher opened through its real callback, then closed.
+    QuickSwitcher,
+    /// The account menu opened through its real entry, then closed.
+    AccountMenu,
+}
+
+/// Move Slint's mock clock past every scroll retry a continuation may still
+/// have pending, one retry period at a time, so each timer that fires can
+/// schedule the next and the last one opens the focused view.
+async fn advance_retries(ui: &AppWindow) {
+    for _ in 0..=message_search::ARRIVAL_ATTEMPTS {
+        i_slint_backend_testing::mock_elapsed_time(message_search::JUMP_RETRY);
+        settle(ui).await;
+    }
+}
+
 async fn exercise(runtime: Handle, alice: FixtureAccount, carol: FixtureAccount, room: String) {
     stage!(setup);
     let directory = tempfile::tempdir().unwrap();
@@ -500,6 +532,7 @@ impl Scenario {
         check!(renewed_thread_delivery);
 
         self.queued_across_revocation(&root, &other_id).await;
+        self.link_continuation(&root).await;
         other_id
     }
 
@@ -628,6 +661,263 @@ impl Scenario {
             reply_back,
         )
         .await;
+    }
+
+    /// A joined message link's message, through the actual completion
+    /// (matrix_links' finish_join), the owned continuation and its Slint
+    /// timers, with this real window, selection and join receipt. The
+    /// harness runs Slint on mock time, so a retry fires only when
+    /// `advance_retries` moves the clock. The message is `root`, a row of
+    /// the live conversation, taken out of the window before each follow-up
+    /// so the continuation has to wait for it.
+    async fn link_continuation(&self, root: &str) {
+        stage!(link_continuation);
+        let ui = &self.ui;
+        crate::matrix_links::register(ui, self.live.clone(), self.runtime.clone());
+        // The quick switcher's real open callback (shortcuts::open_picker).
+        let shortcuts = tempfile::tempdir().unwrap();
+        let store = morpheus_config::ConfigStore::at(shortcuts.path().join("shortcuts.toml"));
+        crate::shortcuts::register(ui, store);
+        ui.set_show_sign_in(false);
+        ui.set_page(0);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        assert!(ui.get_live_session(), "The session must be live");
+        assert!(
+            !ui.get_matrix_link_protected(),
+            "No protected surface may be up"
+        );
+        let selection = self.manager.account_selection(&self.account).unwrap();
+        let row = |ui: &AppWindow| has_event_id(&ui.get_messages(), root);
+
+        // An ordinary same-room navigation (a room-list click) lands between
+        // the absent row and its retry, and the reopened room delivers the
+        // row: the old continuation neither scrolls nor focuses, and the
+        // newer epoch is untouched.
+        let asked = self.joined_open(root).await;
+        let jumps = ui.get_timeline_jump_request();
+        self.follow_link(&selection, root, &asked);
+        assert_eq!(ui.get_timeline_jump_request(), jumps, "The row is absent");
+        self.select_room().await;
+        let newer = self.live.current_navigation_epoch();
+        wait_for_ui(ui, "The reselected room did not deliver the row", row).await;
+        let thread = ui.get_thread_root_id();
+        advance_retries(ui).await;
+        assert_eq!(
+            ui.get_timeline_jump_request(),
+            jumps,
+            "A stale retry scrolled"
+        );
+        assert!(
+            self.live.navigation_is_current(newer),
+            "A stale retry touched the newer navigation"
+        );
+        assert!(
+            !ui.get_conversation_focused() && self.live.focused_view(&self.room).is_none(),
+            "A stale retry focused the conversation"
+        );
+        assert!(
+            ui.get_thread_root_id() == thread,
+            "A stale retry changed the thread"
+        );
+        check!(link_follow_up_stale_retry_rejected);
+
+        // The same continuation with nothing navigated since: the row arrives
+        // before the retry, which scrolls to it under the receipt's epoch.
+        let asked = self.joined_open(root).await;
+        let receipt = self.live.current_navigation_epoch();
+        let rows = ui.get_messages();
+        let jumps = ui.get_timeline_jump_request();
+        self.follow_link(&selection, root, &asked);
+        ui.set_messages(rows);
+        advance_retries(ui).await;
+        assert_eq!(
+            ui.get_timeline_jump_request(),
+            jumps.wrapping_add(1),
+            "The owned retry must scroll once"
+        );
+        assert!(ui.get_timeline_jump_event_id().as_str() == root);
+        assert!(
+            self.live.navigation_is_current(receipt),
+            "The continuation took no navigation"
+        );
+        check!(link_follow_up_owned_retry);
+
+        // The focused view held after its load, before its commit, while the
+        // person's newer intent arrives: a security step begun and ended, a
+        // protected surface (Settings), a newer link replacing this one, or a
+        // modal opened and closed again before the release (the quick
+        // switcher, the account menu). Nothing of the view is installed,
+        // shown or scrolled to, and the room's live feed and the newer state
+        // stay: a modal's entry ended the message for good.
+        let intents = [
+            Intent::SecurityStep,
+            Intent::Settings,
+            Intent::NewerLink,
+            Intent::QuickSwitcher,
+            Intent::AccountMenu,
+        ];
+        for intent in intents {
+            let asked = self.joined_open(root).await;
+            let held = self.focus_held(&selection, root, &asked).await;
+            let generation = self.live.generation.load(Ordering::Acquire);
+            let jumps = ui.get_timeline_jump_request();
+            match intent {
+                Intent::SecurityStep => {
+                    let step = self.live.security_gate.try_account_access();
+                    assert!(step.is_some(), "An idle gate must begin a step");
+                    drop(step);
+                }
+                Intent::Settings => {
+                    ui.set_page(1);
+                    i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+                    settle(ui).await;
+                }
+                Intent::NewerLink => crate::matrix_links::clear(ui),
+                Intent::QuickSwitcher => {
+                    ui.invoke_open_quick_switcher();
+                    assert!(ui.get_quick_switcher_open(), "The real entry must open it");
+                    ui.set_quick_switcher_open(false);
+                    i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+                    settle(ui).await;
+                }
+                Intent::AccountMenu => {
+                    ui.invoke_open_account_menu();
+                    assert!(ui.get_account_menu_open(), "The real entry must open it");
+                    ui.set_account_menu_open(false);
+                    i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+                    settle(ui).await;
+                }
+            }
+            held.proceed();
+            // A bounded window for the released load to reach its commit and
+            // queue anything, then drain the loop in order.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            settle(ui).await;
+            advance_retries(ui).await;
+            assert!(
+                self.live.focused_view(&self.room).is_none(),
+                "A refused focused view was installed"
+            );
+            assert_eq!(
+                self.live.generation.load(Ordering::Acquire),
+                generation,
+                "A refused focused view replaced the live feed"
+            );
+            let key = Some((self.account.clone(), self.room.clone()));
+            assert!(
+                *self.live.feed_key.lock().await == key,
+                "The room's live feed must stay"
+            );
+            assert!(
+                !ui.get_conversation_focused(),
+                "Refused focused rows were shown"
+            );
+            assert_eq!(
+                ui.get_timeline_jump_request(),
+                jumps,
+                "A refused focused view scrolled"
+            );
+            if intent == Intent::Settings {
+                assert_eq!(ui.get_page(), 1, "The person must stay in Settings");
+                ui.set_page(0);
+                i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+                settle(ui).await;
+            }
+        }
+        check!(link_follow_up_held_focus_rejected);
+
+        // Unchanged since its click, the held view commits, shows its rows,
+        // and its retry scrolls to the message.
+        let asked = self.joined_open(root).await;
+        let held = self.focus_held(&selection, root, &asked).await;
+        let jumps = ui.get_timeline_jump_request();
+        held.proceed();
+        let focused = |ui: &AppWindow| ui.get_conversation_focused() && row(ui);
+        wait_for_ui(ui, "The owned focused view did not show its rows", focused).await;
+        settle(ui).await;
+        assert!(self.live.focused_view(&self.room).is_some());
+        advance_retries(ui).await;
+        assert_eq!(
+            ui.get_timeline_jump_request(),
+            jumps.wrapping_add(1),
+            "The owned focused view must scroll once"
+        );
+        assert!(ui.get_timeline_jump_event_id().as_str() == root);
+        check!(link_follow_up_owned_focus);
+
+        // Back to the room's live conversation.
+        self.select_room().await;
+        let live_rows = |ui: &AppWindow| !ui.get_conversation_focused() && row(ui);
+        wait_for_ui(ui, "The live conversation did not return", live_rows).await;
+    }
+
+    /// The join's own open of this (already joined) room, as join_target_for
+    /// runs it once sync shows a confirmed join: under the join's click-time
+    /// capture it takes the next navigation, shows the room and records its
+    /// receipt. No join request is sent. Returns once the reopened feed shows
+    /// `root` and has had a moment to settle.
+    async fn joined_open(&self, root: &str) -> JoinAsked {
+        let asked = self.live.join_asked();
+        let selection = self.manager.account_selection(&self.account).unwrap();
+        let (live, weak) = (self.live.clone(), self.ui.as_weak());
+        let (room, joining) = (self.room.clone(), asked.clone());
+        let opened = on_runtime(&self.runtime, async move {
+            let open = JoinedNavigation::Room;
+            live.open_joined(selection, room, open, joining, weak).await
+        })
+        .await;
+        assert!(
+            matches!(opened, Ok(true)),
+            "The join's own open must show the room"
+        );
+        assert!(
+            asked.owned_open(&self.live).is_some(),
+            "Its receipt must own the screen"
+        );
+        let row = |ui: &AppWindow| has_event_id(&ui.get_messages(), root);
+        wait_for_ui(&self.ui, "The joined room did not show the row", row).await;
+        // Let the reopened feed's first publications land before the row
+        // is taken out of the window.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        settle(&self.ui).await;
+        asked
+    }
+
+    /// The link's confirmed join completes with the message's row not (yet)
+    /// in the window, as right after the join's own open.
+    fn follow_link(&self, selection: &AccountSelection, event: &str, asked: &JoinAsked) {
+        let ui = &self.ui;
+        ui.set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
+        crate::matrix_links::tests::finish_joined_link(
+            ui,
+            &self.live,
+            &self.runtime,
+            selection.clone(),
+            &self.room,
+            event,
+            asked,
+        );
+    }
+
+    /// Follow the link with the row absent until its continuation opens the
+    /// conversation around the message, and hold that focused view after its
+    /// load, before its commit.
+    async fn focus_held(
+        &self,
+        selection: &AccountSelection,
+        event: &str,
+        asked: &JoinAsked,
+    ) -> Arc<PausePoint> {
+        let held = self.live.pauses.install("focus.before_commit");
+        self.follow_link(selection, event, asked);
+        advance_retries(&self.ui).await;
+        let loaded = tokio::time::timeout(Duration::from_secs(60), held.entered()).await;
+        assert!(
+            loaded.is_ok(),
+            "The continuation must load the focused view"
+        );
+        held
     }
 
     fn shows_scope(&self, ui: &AppWindow) -> bool {

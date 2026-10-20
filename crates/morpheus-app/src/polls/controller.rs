@@ -499,6 +499,7 @@ fn open_dialog(ui: &AppWindow, live: &Arc<LiveUi>) {
     let rows = vec![SharedString::new(); MIN_POLL_ANSWER_COUNT];
     global.set_dialog_answers(ModelRc::new(VecModel::from(rows)));
     publish_dialog(ui);
+    crate::matrix_links::clear(ui);
     ui.set_poll_dialog_open(true);
 }
 

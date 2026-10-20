@@ -270,6 +270,7 @@ impl RoomPanel {
         if let Ok(config) = self.store.load() {
             apply_local(&global, &config, account_id, room_id);
         }
+        crate::matrix_links::clear(&ui);
         global.set_open(true);
         self.read(&ui, operation, selection, room_id.to_owned());
     }

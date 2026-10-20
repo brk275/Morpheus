@@ -338,6 +338,7 @@ impl MemberPrivacyUi {
         if crate::room_addresses::is_open(ui) {
             return;
         }
+        crate::matrix_links::clear(ui);
         let room = ui.get_active_room_id().to_string();
         let Some(selection) = self.live_account(ui) else {
             return;

@@ -167,6 +167,7 @@ impl IncomingUi {
                                             ui.set_native_call_joined(true);
                                             ui.set_native_leave_unconfirmed(false);
                                             ui.set_incoming_call_notice("".into());
+                                            crate::matrix_links::clear(&ui);
                                             ui.set_page(2);
                                         } else {
                                             ui.set_incoming_call_notice("The call is no longer active.".into());

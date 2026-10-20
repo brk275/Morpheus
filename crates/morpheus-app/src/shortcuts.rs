@@ -365,6 +365,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || ui.get_quick_switcher_open()
         || ui.get_people_open()
         || crate::space_explorer::is_open(ui)
+        || crate::matrix_links::is_open(ui)
         || ui.get_account_profile_open()
         || crate::member_privacy::is_open(ui)
         || crate::space_management::is_open(ui)
@@ -436,6 +437,8 @@ fn open_picker(ui: &AppWindow) {
     if blocked(ui) {
         return;
     }
+    // A link, and a joined link's message still to come, end first.
+    crate::matrix_links::clear(ui);
     ui.set_quick_switcher_account_id(ui.get_active_account_local_id());
     ui.set_quick_switcher_account_index(ui.get_active_account_index());
     ui.set_quick_switcher_space_id(ui.get_active_space_id());
@@ -481,6 +484,7 @@ fn run(ui: &AppWindow, action: ShortcutAction) -> bool {
         ShortcutAction::GoHome => ui.invoke_go_home(),
         // Like the Settings entries, which also refresh the security status.
         ShortcutAction::OpenSettings => {
+            crate::matrix_links::clear(ui);
             ui.set_page(1);
             ui.invoke_open_security();
         }

@@ -332,6 +332,10 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             "STAGE queued_revocation", "CHECK queued_callbacks_observed=true",
             "STAGE queued_drain", "CHECK queued_room_rejected=true",
             "CHECK queued_thread_rejected=true", "STAGE queued_reopen",
+            "STAGE link_continuation", "CHECK link_follow_up_stale_retry_rejected=true",
+            "CHECK link_follow_up_owned_retry=true",
+            "CHECK link_follow_up_held_focus_rejected=true",
+            "CHECK link_follow_up_owned_focus=true",
             "STAGE cleanup", "CHECK cleanup_complete=true", "STAGE complete",
         )
         lines = ["running 1 test"]
@@ -339,14 +343,16 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         lines.append("test result: ok. 1 passed; 0 failed; 0 ignored;")
         return "\n".join(lines) + "\n"
 
-    def test_one_harness_requires_all_fifteen_observable_facts_and_cleanup(self):
+    def test_one_harness_requires_all_nineteen_observable_facts_and_cleanup(self):
         checks = acceptance_module.app_timeline_evidence(self.output())
-        self.assertEqual(len(checks), 15)
+        self.assertEqual(len(checks), 19)
         self.assertEqual(set(checks), acceptance_module.APP_TIMELINE_CHECKS)
         self.assertTrue(all(checks.values()))
         self.assertIn("queued_callbacks_observed", checks)
         self.assertIn("queued_room_rejected", checks)
         self.assertIn("queued_thread_rejected", checks)
+        self.assertIn("link_follow_up_stale_retry_rejected", checks)
+        self.assertIn("link_follow_up_held_focus_rejected", checks)
         self.assertIn("cleanup_complete", checks)
 
     def test_every_missing_fact_is_fatal_even_after_a_green_test_summary(self):
@@ -412,7 +418,7 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             arguments = {"ring_case": None, "oauth_checks": None, "element_checks": None}
             record = runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=True, **arguments)
             self.assertEqual(record["passed"], 1)
-            self.assertEqual(len(record["app_timeline_checks"]), 15)
+            self.assertEqual(len(record["app_timeline_checks"]), 19)
             self.assertTrue(all(record["app_timeline_checks"].values()))
             with self.assertRaises(RuntimeError):
                 runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=False, **arguments)

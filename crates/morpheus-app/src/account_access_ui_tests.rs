@@ -4093,6 +4093,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_discovery_join_withdrawal(&ui, &live, &runtime).await;
     phase.set(82);
     assert_room_permissions_editor(&ui, &live, &runtime).await;
+    phase.set(83);
+    crate::matrix_links::tests::assert_link_card(&ui, &live, &runtime).await;
     #[cfg(feature = "native-calls")]
     crate::voice_rosters::assert_unowned_presentation_is_cleared(&ui, live.clone(), &runtime);
     // This suite tests the actual dialog/controller boundary, not credentials.

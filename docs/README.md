@@ -16,6 +16,7 @@ implemented and what still needs verification.
 ## Use the app
 
 - [Messages and formatting](MESSAGING_FORMAT.md), [emoji](EMOJI_CATALOG.md) and [image previews](IMAGE_PREVIEWS.md).
+- [Matrix links in messages](MATRIX_LINKS.md).
 - [Room settings](ROOM_SETTINGS.md) and [notifications](NOTIFICATIONS.md).
 - [Room media browser](ROOM_MEDIA.md).
 - [Room roles and permissions](ROOM_PERMISSIONS.md).

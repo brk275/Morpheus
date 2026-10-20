@@ -108,12 +108,14 @@ APP_TIMELINE_CHECKS = frozenset((
     "old_lease_revoked", "idle_feeds_stopped", "late_events_in_core",
     "stale_room_rejected", "stale_thread_rejected", "renewed_thread_delivery",
     "renewed_room_delivery", "queued_callbacks_observed", "queued_room_rejected",
-    "queued_thread_rejected", "cleanup_complete",
+    "queued_thread_rejected", "link_follow_up_stale_retry_rejected",
+    "link_follow_up_owned_retry", "link_follow_up_held_focus_rejected",
+    "link_follow_up_owned_focus", "cleanup_complete",
 ))
 APP_TIMELINE_STAGES = frozenset((
     "setup", "activation", "room_open", "room_delivery", "thread_delivery",
     "revocation", "renewal", "reopen", "queued_revocation", "queued_drain",
-    "queued_reopen", "cleanup", "complete",
+    "queued_reopen", "link_continuation", "cleanup", "complete",
 ))
 APP_TIMELINE_STAGE = re.compile(r"^MORPHEUS_LIVE_TIMELINE_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_TIMELINE_CHECK = re.compile(r"MORPHEUS_LIVE_TIMELINE_CHECK ([a-z_]{1,48})=(true|false)")
