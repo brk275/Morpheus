@@ -3777,6 +3777,9 @@ export component AppWindow inherits Window {
     }
 
     callback submit-room-action(int, string);
+    // Withdraw the dialog's join in progress (a real Close, Cancel or Escape):
+    // nothing is sent before its hand-off, nothing opened after it.
+    callback cancel-room-join();
     callback respond-invite(string, bool);
     callback send-message(string);
     callback open-message-link(string);
@@ -9980,6 +9983,10 @@ export component AppWindow inherits Window {
         init => { room-action-input.focus(); }
         capture-key-pressed(event) => {
             if root.room-action-busy && (event.text == Key.Tab || event.text == Key.Backtab) {
+                // A join stays withdrawable: Tab moves between Close and Cancel.
+                if root.room-action-mode == 1 {
+                    if room-action-cancel.has-focus { room-action-close.focus(); } else { room-action-cancel.focus(); }
+                }
                 accept
             } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && room-action-close.has-focus {
                 if root.live-session { room-action-submit.focus(); }
@@ -9991,7 +9998,8 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         key-pressed(event) => {
-            if event.text == Key.Escape && !root.room-action-busy {
+            if event.text == Key.Escape && (!root.room-action-busy || root.room-action-mode == 1) {
+                if root.room-action-busy { root.cancel-room-join(); }
                 root.room-actions-open = false;
                 room-action-trigger.focus();
                 accept
@@ -10019,9 +10027,13 @@ export component AppWindow inherits Window {
                         Text { text: "Rooms and Spaces"; color: root.ink; font-size: 19px * root.text-scale; font-weight: 750; horizontal-stretch: 1; }
                         room-action-close := Button {
                             width: 34px; height: 31px; text: "×";
-                            enabled: !root.room-action-busy;
-                            accessible-label: "Close room actions";
-                            clicked => { root.room-actions-open = false; room-action-trigger.focus(); }
+                            // A join in progress can always be withdrawn.
+                            enabled: !root.room-action-busy || root.room-action-mode == 1;
+                            accessible-label: root.room-action-busy ? "Cancel the join and close room actions" : "Close room actions";
+                            clicked => {
+                                if root.room-action-busy { root.cancel-room-join(); }
+                                root.room-actions-open = false; room-action-trigger.focus();
+                            }
                         }
                     }
                     HorizontalLayout {
@@ -10056,7 +10068,12 @@ export component AppWindow inherits Window {
                             font-size: 13px * root.text-scale;
                             enabled: !root.room-action-busy;
                             accessible-label: root.room-action-mode == 1 ? "Room ID, alias, or Matrix link" : "Room or Space name";
-                            accepted => { if !root.room-action-busy { root.submit-room-action(root.room-action-mode, root.room-action-input); } }
+                            accepted => {
+                                if !root.room-action-busy {
+                                    root.submit-room-action(root.room-action-mode, root.room-action-input);
+                                    if root.room-action-busy && root.room-action-mode == 1 { room-action-cancel.focus(); }
+                                }
+                            }
                         }
                     }
                     Text {
@@ -10075,8 +10092,12 @@ export component AppWindow inherits Window {
                         room-action-cancel := Button {
                             width: 88px;
                             text: "Cancel";
-                            enabled: !root.room-action-busy;
-                            clicked => { root.room-actions-open = false; room-action-trigger.focus(); }
+                            enabled: !root.room-action-busy || root.room-action-mode == 1;
+                            accessible-label: root.room-action-busy ? "Cancel the join" : "Cancel";
+                            clicked => {
+                                if root.room-action-busy { root.cancel-room-join(); }
+                                root.room-actions-open = false; room-action-trigger.focus();
+                            }
                         }
                         room-action-submit := Button {
                             width: 134px;
@@ -10084,7 +10105,11 @@ export component AppWindow inherits Window {
                             text: root.room-action-busy ? "Working…" : root.room-action-mode == 1 ? "Join room" : root.room-action-mode == 2 ? "Create Space" : "Create room";
                             accessible-label: root.room-action-mode == 1 ? "Join Matrix room" : root.room-action-mode == 2 ? "Create private Matrix Space" : "Create private Matrix room";
                             enabled: root.live-session && !root.room-action-busy;
-                            clicked => { root.submit-room-action(root.room-action-mode, root.room-action-input); }
+                            clicked => {
+                                root.submit-room-action(root.room-action-mode, root.room-action-input);
+                                // The keyboard stays on a control that can withdraw the join.
+                                if root.room-action-busy && root.room-action-mode == 1 { room-action-cancel.focus(); }
+                            }
                         }
                     }
                 }

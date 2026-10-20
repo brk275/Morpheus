@@ -367,6 +367,19 @@ fn statuses_decide_what_may_be_joined_or_opened() {
     assert!(failure.contains("may or may not have joined") && !failure.contains("Could not"));
     let changed = MatrixCoreError::Join(morpheus_matrix::JoinError::AccountChanged);
     assert!(target.failure(&changed).contains("Nothing was sent"));
+    // Withdrawn, refused by the gate, stalled, or not resent: each says what
+    // was sent. Another room answering is never "joined" or "could not".
+    for (error, said) in [
+        (morpheus_matrix::JoinError::Cancelled, "Nothing was sent"),
+        (morpheus_matrix::JoinError::Blocked, "Nothing was sent"),
+        (morpheus_matrix::JoinError::Unavailable, "Nothing was sent"),
+        (morpheus_matrix::JoinError::Pending, "Nothing more was sent"),
+        (morpheus_matrix::JoinError::EarlierUnknown, "may or may not have happened"),
+        (morpheus_matrix::JoinError::UnexpectedRoom, "nothing was opened"),
+    ] {
+        let failure = target.failure(&MatrixCoreError::Join(error));
+        assert!(failure.contains(said) && !failure.contains("Could not"), "{failure}");
+    }
     // A target without route servers is routed through its own server.
     let MatrixLinkTarget::Room { via_servers, .. } = target.link() else {
         panic!("a room target");

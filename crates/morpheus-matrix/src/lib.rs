@@ -26,8 +26,8 @@ pub use polls::{
 };
 mod discovery;
 pub use discovery::{
-    JoinError, MAX_JOIN_VIA, MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery,
-    ResolvedRoomAlias, parse_matrix_link_target,
+    JoinCancellation, JoinError, MAX_JOIN_VIA, MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage,
+    PublicRoomsQuery, ResolvedRoomAlias, parse_matrix_link_target,
 };
 mod space_explorer;
 pub use space_explorer::{
@@ -2697,7 +2697,8 @@ impl AccountManager {
             event_id: None,
             via_servers: Vec::new(),
         };
-        Ok(self.join_room_for(&selection, &target, || true).await?)
+        let cancellation = discovery::JoinCancellation::new();
+        Ok(self.join_room_for(&selection, &target, &cancellation, || true).await?)
     }
 
     pub async fn leave_room(&self, room_id: &str) -> Result<()> {

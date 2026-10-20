@@ -75,9 +75,10 @@ remaining acceptance checks recorded in the feature matrix.
   client has already indexed.
 - `public_rooms_for` pages a homeserver's public directory;
   `resolve_room_alias_for`, `parse_matrix_link_target`, and
-  `join_room_for` (one bounded join for the exact selected account; the room
-  appears once sync shows it, `await_joined_for`) support room aliases and
-  Matrix links.
+  `join_room_for` (one bounded join for the exact selected account, a typed
+  room ID joined exactly, withdrawable with `JoinCancellation` until it is
+  handed off; the room appears once sync shows it, `await_joined_for`)
+  support room aliases and Matrix links.
 - Room operations include `create_private_room`, `create_dm`, `join_room`,
   `leave_room`, `invite_user`, `kick_user`, `ban_user`, `unban_user`,
   `rename_room`, and `set_room_topic`. `room_members_for` lists joined,

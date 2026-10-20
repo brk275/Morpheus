@@ -16,19 +16,30 @@
 //! and no homeserver text is kept. Nothing local changes: the room appears
 //! once sync shows it joined (`await_joined_for`).
 //!
+//! The requester's withdrawal (`JoinCancellation`, a Close or Escape) and
+//! the hand-off are one atomic decision: a withdrawal that wins sends
+//! nothing; one that loses leaves the request to its own bounds and
+//! withdraws only the wait for sync. Every wait before the hand-off (the
+//! account's client, under the manager's lock) is bounded and withdrawable.
+//! A typed room ID is joined exactly: a reply naming another room is never
+//! taken as that room.
+//!
 //! `disable_auth_refresh()` is root's SDK change d4c5d08, not in this base
 //! (c7d0e12): this module compiles only once combined with it.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
 use std::time::Duration;
 
 use matrix_sdk::{
-    HttpError, RoomState,
+    Client, HttpError, RoomState,
     config::RequestConfig,
     ruma::{
-        MatrixToUri, MatrixUri, OwnedRoomOrAliasId, OwnedServerName, RoomAliasId, RoomId,
-        RoomOrAliasId, ServerName, UserId,
+        MatrixToUri, MatrixUri, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName, RoomAliasId,
+        RoomId, RoomOrAliasId, ServerName, UserId,
         api::{
             client::{directory::get_public_rooms_filtered, membership::join_room_by_id_or_alias},
             error::ErrorKind,
@@ -39,6 +50,7 @@ use matrix_sdk::{
     },
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::{AccountManager, AccountSelection, MatrixCoreError, Result, selected_loaded_for};
 
@@ -49,6 +61,9 @@ const MAX_JOIN_REPLY_BYTES: u64 = 64 * 1024;
 /// How long a confirmed join waits for sync to show the room joined.
 const JOIN_SYNC_WAIT: Duration = Duration::from_secs(15);
 const JOIN_SYNC_POLL: Duration = Duration::from_millis(250);
+/// How long a join waits for the account's client (the manager's lock).
+/// Two such waits, the request and the sync wait stay under a minute.
+const JOIN_CLIENT_WAIT: Duration = Duration::from_secs(5);
 
 /// Why a join did not complete, as a fixed sentence: the homeserver's own
 /// text is never kept.
@@ -62,6 +77,16 @@ pub enum JoinError {
     InvalidTarget,
     #[error("That link names more servers than Morpheus joins through.")]
     TooManyRoutes,
+    #[error("The join was cancelled before it was sent. Nothing was sent.")]
+    Cancelled,
+    #[error("A join of this room is still waiting for its reply. Nothing more was sent.")]
+    Pending,
+    /// An earlier join of the same room for this account had no definite
+    /// reply; this one sent nothing, so the next one is the user's choice.
+    #[error(
+        "An earlier join of this room may or may not have happened. Check your room list; joining again sends it once more. Nothing was sent."
+    )]
+    EarlierUnknown,
     #[error("You are not allowed to join that room. Nothing was joined.")]
     NotAllowed,
     #[error("That room or address was not found, or no server could reach it. Nothing was joined.")]
@@ -75,6 +100,12 @@ pub enum JoinError {
         "No reply arrived, so you may or may not have joined. Check your room list before joining again."
     )]
     OutcomeUnknown,
+    /// A typed room ID was joined and the reply named another room: nothing
+    /// is opened, and whether either room was joined is not known.
+    #[error(
+        "The homeserver answered for a different room, so nothing was opened. Check your room list before joining again."
+    )]
+    UnexpectedRoom,
     #[error("This account cannot join rooms right now. Nothing was sent.")]
     Unavailable,
 }
@@ -82,7 +113,71 @@ pub enum JoinError {
 impl JoinError {
     /// Whether the join may have happened.
     pub fn may_have_joined(self) -> bool {
-        self == Self::OutcomeUnknown
+        matches!(self, Self::OutcomeUnknown | Self::UnexpectedRoom)
+    }
+}
+
+const JOIN_SENT: u8 = 1;
+const JOIN_WITHDRAWN: u8 = 2;
+
+/// One join's withdrawal, shared by its requester (a Close or Escape) and
+/// the join. Withdrawing and handing the request off are one atomic choice:
+/// whichever comes first wins, so a withdrawal either sent nothing or came
+/// after the request left. After the hand-off the request keeps its own
+/// bounds and is never dropped by a withdrawal; only the wait for sync (and
+/// opening the room) is withdrawn.
+#[derive(Clone, Default)]
+pub struct JoinCancellation(Arc<JoinCancellationState>);
+
+#[derive(Default)]
+struct JoinCancellationState {
+    state: AtomicU8,
+    notify: Notify,
+}
+
+impl JoinCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Withdraw the join. True when it was withdrawn before its request was
+    /// handed off (nothing was sent), false once it had been.
+    pub fn cancel(&self) -> bool {
+        let before = self.0.state.fetch_or(JOIN_WITHDRAWN, Ordering::AcqRel);
+        self.0.notify.notify_waiters();
+        before & JOIN_SENT == 0
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) & JOIN_WITHDRAWN != 0
+    }
+
+    /// Whether the request was handed off, whatever happened since.
+    pub fn sent(&self) -> bool {
+        self.0.state.load(Ordering::Acquire) & JOIN_SENT != 0
+    }
+
+    /// Take the hand-off: false (nothing may be sent) once withdrawn.
+    fn begin_send(&self) -> bool {
+        self.0
+            .state
+            .compare_exchange(0, JOIN_SENT, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Wait until withdrawn. Registration precedes the state check, so a
+    /// withdrawal cannot be missed while going to sleep.
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            // Register before checking: notify_waiters keeps no permit.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -337,42 +432,65 @@ impl AccountManager {
     /// Join a parsed room ID, alias, or room or event link for the exact
     /// `selection`, using its `via` servers, in one bounded request (see the
     /// module notes). `admit` is the caller's own check (the app's security
-    /// gate), asked at the hand-off with the selection, with no await
-    /// before the send. Returns the joined room's ID; nothing local changes
-    /// here.
+    /// gate), asked at the hand-off with the selection and `cancellation`,
+    /// with no await before the send. Returns the joined room's ID: for a
+    /// typed room ID exactly that room. Nothing local changes here.
     pub async fn join_room_for(
         &self,
         selection: &AccountSelection,
         target: &MatrixLinkTarget,
+        cancellation: &JoinCancellation,
         admit: impl Fn() -> bool,
     ) -> std::result::Result<String, JoinError> {
         let (id, via) = join_route(target)?;
-        let client = self
-            .hierarchy_client_for(selection)
-            .await
-            .map_err(|error| match error {
-                MatrixCoreError::SelectedAccountChanged => JoinError::AccountChanged,
-                _ => JoinError::Unavailable,
-            })?;
-        let mut request = join_room_by_id_or_alias::v3::Request::new(id);
+        let client = self.join_client(selection, cancellation).await?;
+        let mut request = join_room_by_id_or_alias::v3::Request::new(id.clone());
         request.via = via;
         let sending = async { client.send(request).with_request_config(join_config()).await };
-        let response = hand_off(selection, self.owns_selection(selection), admit(), sending)
+        let owned = self.owns_selection(selection);
+        let response = hand_off(selection, owned, cancellation, admit(), sending)
             .await?
             .map_err(|error| join_failure(&error))?;
-        Ok(response.room_id.to_string())
+        Ok(joined_room(&id, &response.room_id)?.to_string())
+    }
+
+    /// The account's client for a join: the manager's lock is waited for at
+    /// most JOIN_CLIENT_WAIT, under the selection and `cancellation`.
+    async fn join_client(
+        &self,
+        selection: &AccountSelection,
+        cancellation: &JoinCancellation,
+    ) -> std::result::Result<Client, JoinError> {
+        if cancellation.is_cancelled() {
+            return Err(JoinError::Cancelled);
+        }
+        let acquiring =
+            tokio::time::timeout(JOIN_CLIENT_WAIT, self.hierarchy_client_for(selection));
+        let acquired = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(JoinError::Cancelled),
+            acquired = acquiring => acquired,
+        };
+        match acquired {
+            Ok(Ok(client)) => Ok(client),
+            Ok(Err(MatrixCoreError::SelectedAccountChanged)) => Err(JoinError::AccountChanged),
+            // A stalled manager or an ineligible account: nothing was sent.
+            Ok(Err(_)) | Err(_) => Err(JoinError::Unavailable),
+        }
     }
 
     /// Wait, at most JOIN_SYNC_WAIT, for sync to show `room_id` joined for
     /// the exact `selection`: `Some(is_space)` then, `None` if it did not in
-    /// time or the selection departed. Sends nothing and changes nothing.
+    /// time, the selection departed or the join was withdrawn. Sends
+    /// nothing and changes nothing.
     pub async fn await_joined_for(
         &self,
         selection: &AccountSelection,
         room_id: &str,
+        cancellation: &JoinCancellation,
     ) -> Option<bool> {
         let room_id = RoomId::parse(room_id).ok()?;
-        let client = self.hierarchy_client_for(selection).await.ok()?;
+        let client = self.join_client(selection, cancellation).await.ok()?;
         let joined = async {
             loop {
                 if let Some(room) = client
@@ -384,12 +502,27 @@ impl AccountManager {
                 tokio::time::sleep(JOIN_SYNC_POLL).await;
             }
         };
-        let waited = selection
-            .guard(tokio::time::timeout(JOIN_SYNC_WAIT, joined))
-            .await?;
+        let waited = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return None,
+            waited = selection.guard(tokio::time::timeout(JOIN_SYNC_WAIT, joined)) => waited?,
+        };
         let is_space = waited.ok()?;
-        self.owns_selection(selection).then_some(is_space)
+        (self.owns_selection(selection) && !cancellation.is_cancelled()).then_some(is_space)
     }
+}
+
+/// The room a join's reply names: for a typed room ID exactly that room
+/// (a reply naming any other is not trusted, and may have joined
+/// something), for an alias the room the homeserver resolved it to.
+pub(crate) fn joined_room(
+    asked: &RoomOrAliasId,
+    answered: &RoomId,
+) -> std::result::Result<OwnedRoomId, JoinError> {
+    if asked.is_room_id() && asked.as_str() != answered.as_str() {
+        return Err(JoinError::UnexpectedRoom);
+    }
+    Ok(answered.to_owned())
 }
 
 /// The room and the validated routes of a join: a room link only, at most
@@ -421,35 +554,40 @@ pub(crate) fn join_route(
 
 /// Hand one request off for `selection`, raced against its revocation with
 /// root's selection guard (cancellation first, d56ba8b). Nothing is sent
-/// unless the selection is still owned and current and `admitted` holds,
-/// all checked with no await before the send. When the guard drops the
-/// request, it was never sent if it had not taken its first step
-/// (AccountChanged), and may have been otherwise (OutcomeUnknown). It is
-/// never sent again.
+/// unless the requester has not withdrawn, the selection is still owned
+/// and current and `admitted` holds, all checked with no await before the
+/// send; the hand-off itself is taken atomically against a withdrawal.
+/// When the guard drops the request, it was never sent if it had not been
+/// handed off (AccountChanged), and may have been otherwise
+/// (OutcomeUnknown). It is never sent again.
 pub(crate) async fn hand_off<F: Future>(
     selection: &AccountSelection,
     owned: bool,
+    cancellation: &JoinCancellation,
     admitted: bool,
     send: F,
 ) -> std::result::Result<F::Output, JoinError> {
+    if cancellation.is_cancelled() {
+        return Err(JoinError::Cancelled);
+    }
     if !owned || !selection.is_current() {
         return Err(JoinError::AccountChanged);
     }
     if !admitted {
         return Err(JoinError::Blocked);
     }
-    let started = AtomicBool::new(false);
     let sending = async {
-        started.store(true, Ordering::Release);
-        send.await
-    };
-    selection.guard(sending).await.ok_or_else(|| {
-        if started.load(Ordering::Acquire) {
-            JoinError::OutcomeUnknown
-        } else {
-            JoinError::AccountChanged
+        if !cancellation.begin_send() {
+            return None;
         }
-    })
+        Some(send.await)
+    };
+    match selection.guard(sending).await {
+        Some(Some(output)) => Ok(output),
+        Some(None) => Err(JoinError::Cancelled),
+        None if cancellation.sent() => Err(JoinError::OutcomeUnknown),
+        None => Err(JoinError::AccountChanged),
+    }
 }
 
 /// One attempt on the wire: no HTTP retries, no automatic token refresh and
@@ -597,24 +735,24 @@ mod tests {
             };
             // A refusing gate, or a selection this manager no longer owns.
             assert_eq!(
-                hand_off(&selection, true, false, send()).await,
+                hand_off(&selection, true, &JoinCancellation::new(), false, send()).await,
                 Err(JoinError::Blocked)
             );
             assert_eq!(
-                hand_off(&selection, false, true, send()).await,
+                hand_off(&selection, false, &JoinCancellation::new(), true, send()).await,
                 Err(JoinError::AccountChanged)
             );
             assert_eq!(sends.load(Ordering::SeqCst), 0);
             // Admitted: one request, its answer kept.
             assert_eq!(
-                hand_off(&selection, true, true, send()).await,
+                hand_off(&selection, true, &JoinCancellation::new(), true, send()).await,
                 Ok("!joined:example.org")
             );
             assert_eq!(sends.load(Ordering::SeqCst), 1);
             // The account changed before the hand-off: nothing is sent.
             selections.replace(Some("b"));
             assert_eq!(
-                hand_off(&selection, true, true, send()).await,
+                hand_off(&selection, true, &JoinCancellation::new(), true, send()).await,
                 Err(JoinError::AccountChanged)
             );
             assert_eq!(sends.load(Ordering::SeqCst), 1);
@@ -643,8 +781,9 @@ mod tests {
                     "!joined:example.org"
                 }
             };
-            let joining =
-                tokio::spawn(async move { hand_off(&selection, true, true, send).await });
+            let joining = tokio::spawn(async move {
+                hand_off(&selection, true, &JoinCancellation::new(), true, send).await
+            });
             while sends.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
@@ -654,6 +793,109 @@ mod tests {
             held.notify_waiters();
             tokio::task::yield_now().await;
             assert_eq!(sends.load(Ordering::SeqCst), 1, "a join was sent again");
+        });
+    }
+
+    #[test]
+    fn a_typed_room_id_is_joined_exactly_and_an_alias_takes_its_answer() {
+        let asked = RoomOrAliasId::parse("!asked:example.org").unwrap();
+        let same = RoomId::parse("!asked:example.org").unwrap();
+        let other = RoomId::parse("!other:example.org").unwrap();
+        assert_eq!(joined_room(&asked, &same).unwrap(), same);
+        // Another room for a typed room ID is never taken as the joined one.
+        let unexpected = joined_room(&asked, &other).unwrap_err();
+        assert_eq!(unexpected, JoinError::UnexpectedRoom);
+        assert!(unexpected.may_have_joined(), "it may have joined something");
+        assert!(unexpected.to_string().contains("nothing was opened"));
+        // An alias resolves to whatever room the homeserver names.
+        let alias = RoomOrAliasId::parse("#lobby:example.org").unwrap();
+        assert_eq!(joined_room(&alias, &other).unwrap(), other);
+    }
+
+    #[test]
+    fn a_withdrawal_before_the_hand_off_sends_nothing_and_after_it_keeps_the_reply() {
+        use crate::account_selection::Selections;
+        use std::sync::atomic::AtomicUsize;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("a"));
+            let selection = selections.for_account("a").unwrap();
+            let sends = Arc::new(AtomicUsize::new(0));
+            // Withdrawn first: nothing is sent, whatever else admits it.
+            let withdrawn = JoinCancellation::new();
+            assert!(withdrawn.cancel(), "withdrawn before any hand-off");
+            let counted = sends.clone();
+            let send = async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+            };
+            assert_eq!(
+                hand_off(&selection, true, &withdrawn, true, send).await,
+                Err(JoinError::Cancelled)
+            );
+            assert!(!withdrawn.sent());
+            assert_eq!(sends.load(Ordering::SeqCst), 0);
+            // Withdrawn after the hand-off: the request is not dropped, its
+            // reply is kept and nothing is sent again.
+            let cancellation = JoinCancellation::new();
+            let held = Arc::new(Notify::new());
+            let send = {
+                let (sends, held) = (sends.clone(), held.clone());
+                async move {
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    held.notified().await;
+                    "!joined:example.org"
+                }
+            };
+            let joining = tokio::spawn({
+                let cancellation = cancellation.clone();
+                async move { hand_off(&selection, true, &cancellation, true, send).await }
+            });
+            while sends.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!cancellation.cancel(), "the request had already left");
+            assert!(cancellation.sent() && cancellation.is_cancelled());
+            held.notify_waiters();
+            assert_eq!(joining.await.unwrap(), Ok("!joined:example.org"));
+            assert_eq!(sends.load(Ordering::SeqCst), 1, "a join was sent again");
+            // The hand-off and a withdrawal are one choice: once withdrawn,
+            // it can no longer be taken.
+            let late = JoinCancellation::new();
+            late.cancel();
+            assert!(!late.begin_send());
+            let first = JoinCancellation::new();
+            assert!(first.begin_send());
+            assert!(!first.begin_send(), "handed off once");
+            assert!(!first.cancel());
+        });
+    }
+
+    #[test]
+    fn a_withdrawal_wakes_every_wait_on_it() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cancellation = JoinCancellation::new();
+            let waiting = tokio::spawn({
+                let cancellation = cancellation.clone();
+                async move { cancellation.cancelled().await }
+            });
+            tokio::task::yield_now().await;
+            cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .expect("a withdrawal must end the wait")
+                .unwrap();
+            // Already withdrawn: the wait ends at once.
+            tokio::time::timeout(Duration::from_secs(2), cancellation.cancelled())
+                .await
+                .expect("an earlier withdrawal is not missed");
         });
     }
 

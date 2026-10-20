@@ -2998,6 +2998,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
+            // The navigation and security generations at this click.
+            let asked = directory_live.join_asked();
             let operation = window.get_directory_join_operation().wrapping_add(1);
             window.set_directory_join_operation(operation);
             window.set_directory_join_error("".into());
@@ -3008,12 +3010,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let live = directory_live.clone();
             let weak = weak.clone();
             directory_handle.spawn(async move {
+                // Every wait inside is bounded; this one only backs them up,
+                // and says nothing was sent unless the request had left.
                 let result = tokio::time::timeout(
                     Duration::from_secs(60),
-                    live.join_target_for(&selection, &target, weak.clone()),
+                    live.join_target_for(&selection, &target, &asked, weak.clone()),
                 )
                 .await
-                .map_err(|_| morpheus_matrix::JoinError::OutcomeUnknown.to_string())
+                .map_err(|_| asked.expired().to_string())
                 .and_then(|result| result.map(|_| ()).map_err(|error| error.to_string()));
                 let _ = weak.upgrade_in_event_loop(move |window| {
                     if window.get_active_account_local_id().as_str() != account_id
@@ -3037,9 +3041,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
+    // The Join a room dialog's join in progress, withdrawn by a real Close,
+    // Cancel or Escape (cancel-room-join) with the operation that owns it.
+    let room_join: Arc<Mutex<Option<(i32, live::JoinAsked)>>> = Arc::default();
+    let weak = ui.as_weak();
+    let join_slot = room_join.clone();
+    ui.on_cancel_room_join(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !window.get_room_action_busy() || window.get_room_action_mode() != 1 {
+            return;
+        }
+        let taken = join_slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some((_, asked)) = taken {
+            // Before the hand-off nothing is sent; after it the request keeps
+            // its bounds, nothing is opened, and its outcome stays recorded.
+            asked.withdraw();
+        }
+        // A newer operation: this join's late result no longer reaches the
+        // dialog, which closes now.
+        window.set_room_action_operation(window.get_room_action_operation().wrapping_add(1));
+        window.set_room_action_busy(false);
+        window.set_room_action_error("".into());
+    });
+
     let weak = ui.as_weak();
     let action_live = live.clone();
     let action_handle = runtime.handle().clone();
+    let join_slot = room_join.clone();
     ui.on_submit_room_action(move |mode, input| {
         let Some(window) = weak.upgrade() else {
             return;
@@ -3069,25 +3102,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let live = action_live.clone();
         let weak = weak.clone();
         let submitted = input.to_string();
-        // A join is bound to the exact account shown at the click.
+        // A join is bound to the exact account shown at the click, and to
+        // the navigation and security generations at it.
         let selection = action_live
             .manager
             .account_selection(&account_id)
             .filter(morpheus_matrix::AccountSelection::is_current);
+        let asked = action.is_none().then(|| action_live.join_asked());
+        if let Some(asked) = &asked {
+            *join_slot.lock().unwrap_or_else(|error| error.into_inner()) =
+                Some((operation, asked.clone()));
+        }
+        let join_slot = join_slot.clone();
         action_handle.spawn(async move {
-            let result = match action {
-                Some(action) => live
+            let result = match (action, asked) {
+                (Some(action), _) => live
                     .run_room_action(&account_id, action, &submitted, weak.clone())
                     .await
                     .map_err(|error| error.to_string()),
-                None => match (room_join_target(&submitted, "", ""), selection) {
-                    (Ok(target), Some(selection)) => live
-                        .join_target_for(&selection, &target, weak.clone())
+                (None, asked) => match (room_join_target(&submitted, "", ""), selection, asked) {
+                    (Ok(target), Some(selection), Some(asked)) => live
+                        .join_target_for(&selection, &target, &asked, weak.clone())
                         .await
                         .map(|_| ())
                         .map_err(|error| error.to_string()),
-                    (Ok(_), None) => Err(morpheus_matrix::JoinError::AccountChanged.to_string()),
-                    (Err(error), _) => Err(error),
+                    (Ok(_), _, _) => Err(morpheus_matrix::JoinError::AccountChanged.to_string()),
+                    (Err(error), _, _) => Err(error),
                 },
             };
             let _ = weak.upgrade_in_event_loop(move |window| {
@@ -3096,6 +3136,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return;
                 }
+                let mut slot = join_slot.lock().unwrap_or_else(|error| error.into_inner());
+                if slot.as_ref().is_some_and(|(owner, _)| *owner == operation) {
+                    *slot = None;
+                }
+                drop(slot);
                 window.set_room_action_busy(false);
                 match result {
                     Ok(()) => {

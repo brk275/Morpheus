@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use morpheus_matrix::{
     AccountInfo, AccountManager, AccountSelection, ComposeSendTarget, ComposeText,
-    DownloadedAttachment, EditBaseline, Generation, JoinError, MatrixCoreError, MatrixLinkTarget,
+    DownloadedAttachment, EditBaseline, Generation, JoinCancellation, JoinError, MatrixCoreError,
+    MatrixLinkTarget,
     MessageInfo,
     MessageSendState, PublicMediaConsent, QueuedAttachment, QueuedMessage, QueuedSendUpdate,
     RecoveredDraft, RoomInfo, RoomMemberInfo, RoomMembership, StickerCatalog, SyncBackend,
@@ -79,6 +80,152 @@ pub(crate) fn joined_navigation(synced: Option<bool>) -> Option<JoinedNavigation
             JoinedNavigation::Room
         }
     })
+}
+
+/// What a join captures synchronously at the user's click, on the UI
+/// thread: the navigation and security generations then, and its
+/// withdrawal (a Close or Escape). Sampled later, in the worker, either
+/// would admit a click made before a navigation or a security step.
+#[derive(Clone)]
+pub(crate) struct JoinAsked {
+    navigation: u64,
+    security: u64,
+    cancellation: JoinCancellation,
+    authority: NavigationAuthority,
+}
+
+impl JoinAsked {
+    /// A join asked for now, with the navigation generation `navigation`.
+    /// The gate's generation is read first: a step beginning after it
+    /// shows either as blocked here or as a newer generation at the
+    /// hand-off. A step running now refuses the join (u64::MAX never
+    /// admits).
+    fn at(gate: &crate::security::SecurityGate, navigation: u64) -> Self {
+        let generation = gate.ringing_generation();
+        let security = if gate.blocked() { u64::MAX } else { generation };
+        Self {
+            navigation,
+            security,
+            cancellation: JoinCancellation::new(),
+            authority: NavigationAuthority::default(),
+        }
+    }
+
+    /// Withdraw the join: before its hand-off nothing is sent (true); after
+    /// it the request keeps its own bounds and only opening the room is
+    /// withdrawn (false). Its outcome stays in the join record either way.
+    pub(crate) fn withdraw(&self) -> bool {
+        self.authority.withdraw();
+        self.cancellation.cancel()
+    }
+
+    /// What a caller's own bound reports when it ends the join: unknown
+    /// once the request was handed off, nothing sent before.
+    pub(crate) fn expired(&self) -> JoinError {
+        if self.cancellation.sent() {
+            JoinError::OutcomeUnknown
+        } else {
+            JoinError::Unavailable
+        }
+    }
+}
+
+/// Joins asked for in this run whose outcome a join UI may no longer show:
+/// one still in flight, or one handed off with no definite reply. Kept per
+/// account and typed room or address, whatever the Join a room dialog, the
+/// directory or the Space explorer shows, hides or reopens since.
+#[derive(Default)]
+struct JoinOutcomes(std::sync::Mutex<HashMap<(String, String), JoinOutcome>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinOutcome {
+    InFlight,
+    Unknown,
+}
+
+/// Joins remembered at most; unknown ones are forgotten first.
+const MAX_JOIN_OUTCOMES: usize = 64;
+
+impl JoinOutcomes {
+    fn outcomes(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), JoinOutcome>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Start a join of `key`. Refused while another is in flight. An earlier
+    /// unknown outcome is reported once instead, sending nothing, so the
+    /// next join is the user's informed choice, never a blind resend.
+    fn begin(&self, key: &(String, String)) -> Result<(), JoinError> {
+        let mut outcomes = self.outcomes();
+        match outcomes.get(key) {
+            Some(JoinOutcome::InFlight) => return Err(JoinError::Pending),
+            Some(JoinOutcome::Unknown) => {
+                outcomes.remove(key);
+                return Err(JoinError::EarlierUnknown);
+            }
+            None => {}
+        }
+        if outcomes.len() >= MAX_JOIN_OUTCOMES {
+            outcomes.retain(|_, outcome| *outcome == JoinOutcome::InFlight);
+            if outcomes.len() >= MAX_JOIN_OUTCOMES {
+                return Err(JoinError::Pending);
+            }
+        }
+        outcomes.insert(key.clone(), JoinOutcome::InFlight);
+        Ok(())
+    }
+
+    /// The join of `key` ended: kept as unknown when it may have happened.
+    fn settle(&self, key: &(String, String), unknown: bool) {
+        let mut outcomes = self.outcomes();
+        if unknown {
+            outcomes.insert(key.clone(), JoinOutcome::Unknown);
+        } else {
+            outcomes.remove(key);
+        }
+    }
+
+    #[cfg(test)]
+    fn get(&self, key: &(String, String)) -> Option<JoinOutcome> {
+        self.outcomes().get(key).copied()
+    }
+}
+
+/// Settles a join's record however its future ends. Dropped by a caller's
+/// bound before settling, it is unknown once its request was handed off,
+/// and forgotten before (nothing was sent).
+struct JoinRecord<'a> {
+    outcomes: &'a JoinOutcomes,
+    key: (String, String),
+    cancellation: JoinCancellation,
+    settled: bool,
+}
+
+impl<'a> JoinRecord<'a> {
+    fn new(
+        outcomes: &'a JoinOutcomes,
+        key: (String, String),
+        cancellation: JoinCancellation,
+    ) -> Self {
+        Self {
+            outcomes,
+            key,
+            cancellation,
+            settled: false,
+        }
+    }
+
+    fn settle(mut self, unknown: bool) {
+        self.settled = true;
+        self.outcomes.settle(&self.key, unknown);
+    }
+}
+
+impl Drop for JoinRecord<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.outcomes.settle(&self.key, self.cancellation.sent());
+        }
+    }
 }
 
 struct KnownSpace {
@@ -152,6 +299,8 @@ pub struct LiveUi {
     pub(crate) voice_spaces: Arc<VoiceSpaces>,
     pub is_live: Arc<AtomicBool>,
     pub(crate) security_gate: Arc<crate::security::SecurityGate>,
+    /// Joins whose outcome no UI may still show (see JoinOutcomes).
+    join_outcomes: JoinOutcomes,
     drafts: Arc<DraftStore>,
     draft_write_tx: mpsc::Sender<()>,
     generation: Arc<AtomicU64>,
@@ -404,6 +553,7 @@ impl LiveUi {
             voice_spaces,
             is_live: Arc::new(AtomicBool::new(false)),
             security_gate: Arc::new(crate::security::SecurityGate::default()),
+            join_outcomes: JoinOutcomes::default(),
             drafts,
             draft_write_tx,
             generation: Arc::new(AtomicU64::new(0)),
@@ -440,6 +590,16 @@ impl LiveUi {
 
     pub(crate) fn current_navigation_epoch(&self) -> u64 {
         self.navigation_epoch.load(Ordering::Acquire)
+    }
+
+    /// Capture a join at the user's click; call it on the UI thread, in the
+    /// click's callback, before anything is spawned. The security gate's
+    /// generation advances with every reservation (a security step, account
+    /// access, a restart), so a step that began after the click is refused
+    /// at the hand-off even if it has already ended; one running at the
+    /// click is refused too.
+    pub(crate) fn join_asked(&self) -> JoinAsked {
+        JoinAsked::at(&self.security_gate, self.current_navigation_epoch())
     }
 
     pub fn composed_draft(&self, account: &str, room: &str, thread: Option<&str>) -> ComposeText {
@@ -1668,9 +1828,13 @@ impl LiveUi {
     /// Join a parsed room ID, alias, or Matrix link (the directory, Join a
     /// room, the Space explorer) for the exact `selection` captured when it
     /// was asked for (AccountManager::join_room_for): one bounded request,
-    /// refused while a security step runs, never sent again. A selection is
-    /// never current again once its account was left, so a join asked for
-    /// before an A-B-A switch is not sent after it.
+    /// refused while a security step runs or if one ran since the click
+    /// (`asked`), never sent again. A selection is never current again once
+    /// its account was left, so a join asked for before an A-B-A switch is
+    /// not sent after it. One join per account and typed room at a time; an
+    /// unknown outcome is kept (JoinOutcomes) whatever the UI does since.
+    /// A withdrawal (`asked`) before the hand-off sends nothing; after it,
+    /// nothing is opened.
     ///
     /// The account transition lock is not held across the request: a slow
     /// homeserver never holds up an account switch, and the selection
@@ -1683,51 +1847,73 @@ impl LiveUi {
         self: &Arc<Self>,
         selection: &AccountSelection,
         target: &MatrixLinkTarget,
+        asked: &JoinAsked,
         ui: Weak<AppWindow>,
     ) -> Result<bool, MatrixCoreError> {
         if !self.is_live.load(Ordering::Acquire) || !selection.is_current() {
             return Err(JoinError::AccountChanged.into());
         }
-        // Navigating anywhere after the join was asked for wins over opening
-        // the joined room.
-        let navigation = self.current_navigation_epoch();
-        let (gate, is_live) = (self.security_gate.clone(), self.is_live.clone());
-        let admit = move || is_live.load(Ordering::Acquire) && !gate.blocked();
-        let room_id = self.manager.join_room_for(selection, target, admit).await?;
-        let synced = self.manager.await_joined_for(selection, &room_id).await;
+        let MatrixLinkTarget::Room {
+            room_or_alias_id, ..
+        } = target
+        else {
+            return Err(JoinError::InvalidTarget.into());
+        };
+        let key = (selection.account_id().to_owned(), room_or_alias_id.clone());
+        self.join_outcomes.begin(&key)?;
+        let record = JoinRecord::new(&self.join_outcomes, key, asked.cancellation.clone());
+        // The gate as it was at the click, not as it is now.
+        let (gate, is_live, security) = (
+            self.security_gate.clone(),
+            self.is_live.clone(),
+            asked.security,
+        );
+        let admit = move || is_live.load(Ordering::Acquire) && gate.ringing_allowed(security);
+        let joined = self
+            .manager
+            .join_room_for(selection, target, &asked.cancellation, admit)
+            .await;
+        record.settle(joined.as_ref().is_err_and(|error| error.may_have_joined()));
+        let room_id = joined?;
+        let synced = self
+            .manager
+            .await_joined_for(selection, &room_id, &asked.cancellation)
+            .await;
         let Some(open) = joined_navigation(synced) else {
             return Ok(false);
         };
-        let live = self.clone();
-        let selection = selection.clone();
+        let (live, selection, asked) = (self.clone(), selection.clone(), asked.clone());
         tokio::spawn(async move {
-            live.open_joined(selection, room_id, open, navigation, ui)
-                .await;
+            live.open_joined(selection, room_id, open, asked, ui).await;
         });
         Ok(true)
     }
 
     /// Open a room or Space that sync shows joined, only while its selection
-    /// is current and nothing navigated since the join was asked for: a
-    /// room as an owned reveal (reveal_room_for: committed exactly, shown
-    /// only through its own admitted snapshot, given back otherwise), a
-    /// Space the way choosing it in the sidebar does (select_space_for).
+    /// is current, the join was not withdrawn and nothing navigated since
+    /// the click (`asked`): a room as an owned reveal (reveal_room_for:
+    /// committed exactly under the join's own authority, which a withdrawal
+    /// revokes, shown only through its own admitted snapshot, given back
+    /// otherwise), a Space the way choosing it in the sidebar does
+    /// (select_space_for).
     async fn open_joined(
         self: Arc<Self>,
         selection: AccountSelection,
         room_id: String,
         open: JoinedNavigation,
-        navigation: u64,
+        asked: JoinAsked,
         ui: Weak<AppWindow>,
     ) {
-        if !selection.is_current() || !self.navigation_is_current(navigation) {
+        if asked.cancellation.is_cancelled()
+            || !selection.is_current()
+            || !self.navigation_is_current(asked.navigation)
+        {
             return;
         }
         let epoch = self.invalidate_navigation();
         let _ = match open {
             JoinedNavigation::Room => {
-                let authority = NavigationAuthority::default();
-                self.reveal_room_for(selection, room_id, epoch, authority, ui)
+                self.reveal_room_for(selection, room_id, epoch, asked.authority, ui)
                     .await
             }
             JoinedNavigation::Space => {
@@ -6462,5 +6648,80 @@ mod join_tests {
         assert_eq!(joined_navigation(None), None);
         assert_eq!(joined_navigation(Some(false)), Some(JoinedNavigation::Room));
         assert_eq!(joined_navigation(Some(true)), Some(JoinedNavigation::Space));
+    }
+
+    /// The generations are the click's: a security step that began after
+    /// it refuses the hand-off even once it has ended, and one running at
+    /// the click refuses it too.
+    #[test]
+    fn a_join_is_admitted_only_by_the_security_gate_as_it_was_at_the_click() {
+        let gate = Arc::new(crate::security::SecurityGate::default());
+        let asked = JoinAsked::at(&gate, 7);
+        assert_eq!(asked.navigation, 7);
+        assert!(gate.ringing_allowed(asked.security));
+        // A step begins and ends while the join waits: the gate is idle now,
+        // and the join is still refused.
+        drop(gate.try_account_access().expect("the gate was idle"));
+        assert!(!gate.blocked());
+        assert!(!gate.ringing_allowed(asked.security));
+        // Asked while a step runs: refused, also after it ends.
+        let running = gate.try_account_access().expect("the gate was idle");
+        let during = JoinAsked::at(&gate, 7);
+        drop(running);
+        assert!(!gate.ringing_allowed(during.security));
+        // Asked now, with nothing since: admitted.
+        assert!(gate.ringing_allowed(JoinAsked::at(&gate, 8).security));
+    }
+
+    /// A withdrawal before the hand-off sends nothing and revokes the open;
+    /// a caller's own bound then reports nothing sent.
+    #[test]
+    fn a_withdrawn_join_opens_nothing_and_its_bound_reports_what_was_sent() {
+        let gate = crate::security::SecurityGate::default();
+        let asked = JoinAsked::at(&gate, 0);
+        assert_eq!(asked.expired(), JoinError::Unavailable);
+        assert!(asked.withdraw(), "nothing had been handed off");
+        assert!(asked.authority.withdrawn(), "opening the room is withdrawn");
+        assert!(asked.cancellation.is_cancelled() && !asked.cancellation.sent());
+        assert_eq!(asked.expired(), JoinError::Unavailable);
+        assert!(!JoinError::Unavailable.may_have_joined());
+    }
+
+    /// One join per account and typed room at a time, and an unknown
+    /// outcome survives the UI: the next join of that room reports it once
+    /// and sends nothing, so a resend is always the user's informed choice.
+    #[test]
+    fn one_join_per_room_and_an_unknown_one_is_never_resent_unseen() {
+        let outcomes = JoinOutcomes::default();
+        let key = ("a".to_owned(), "!room:example.org".to_owned());
+        let other_account = ("b".to_owned(), "!room:example.org".to_owned());
+        assert_eq!(outcomes.begin(&key), Ok(()));
+        assert_eq!(outcomes.begin(&key), Err(JoinError::Pending));
+        assert_eq!(outcomes.begin(&other_account), Ok(()), "accounts are apart");
+        // A definite answer forgets it.
+        outcomes.settle(&key, false);
+        assert_eq!(outcomes.get(&key), None);
+        // An unknown one is kept whatever the UI shows or hides since.
+        assert_eq!(outcomes.begin(&key), Ok(()));
+        outcomes.settle(&key, true);
+        assert_eq!(outcomes.get(&key), Some(JoinOutcome::Unknown));
+        let earlier = outcomes.begin(&key).unwrap_err();
+        assert_eq!(earlier, JoinError::EarlierUnknown);
+        assert!(earlier.to_string().contains("Nothing was sent"));
+        // Reported once: the next one is the user's choice.
+        assert_eq!(outcomes.begin(&key), Ok(()));
+        // A record dropped before its hand-off (a caller's bound) leaves
+        // nothing behind: nothing was sent.
+        let unsent = JoinCancellation::new();
+        drop(JoinRecord::new(&outcomes, key.clone(), unsent));
+        assert_eq!(outcomes.get(&key), None);
+        // Bounded: unknown outcomes give way, joins in flight do not.
+        for n in 0..MAX_JOIN_OUTCOMES {
+            let key = ("c".to_owned(), format!("!r{n}:example.org"));
+            outcomes.begin(&key).unwrap();
+            outcomes.settle(&key, true);
+        }
+        assert_eq!(outcomes.begin(&key), Ok(()));
+        assert_eq!(outcomes.get(&other_account), Some(JoinOutcome::InFlight));
     }
 }

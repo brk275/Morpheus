@@ -14,8 +14,8 @@ use matrix_sdk::{
     },
 };
 use morpheus_matrix::{
-    AccountManager, JoinError, MatrixCoreError, MatrixLinkTarget, PublicRoomsPage,
-    PublicRoomsQuery, parse_matrix_link_target,
+    AccountManager, JoinCancellation, JoinError, MatrixCoreError, MatrixLinkTarget,
+    PublicRoomsPage, PublicRoomsQuery, parse_matrix_link_target,
 };
 use serde::Deserialize;
 use tokio::time::{Instant, sleep};
@@ -214,22 +214,27 @@ fn public_directory_is_paginated_and_account_scoped() {
         // A departed selection, or a caller check refusing at the hand-off,
         // sends nothing.
         assert_eq!(
-            manager.join_room_for(&alice_selection, &target, || true).await,
+            manager.join_room_for(&alice_selection, &target, &JoinCancellation::new(), || true)
+                .await,
             Err(JoinError::AccountChanged)
         );
         let bob_selection = manager.account_selection(&bob_account.id)
             .expect("Bob selection missing");
         assert_eq!(
-            manager.join_room_for(&bob_selection, &target, || false).await,
+            manager.join_room_for(&bob_selection, &target, &JoinCancellation::new(), || false)
+                .await,
             Err(JoinError::Blocked)
         );
         assert_eq!(
-            manager.join_room_for(&bob_selection, &target, || true).await
+            manager.join_room_for(&bob_selection, &target, &JoinCancellation::new(), || true).await
                 .expect("Cannot join discovered room from matrix.to link"),
             a_one
         );
         // The room is shown as joined once sync says so, not before.
-        assert_eq!(manager.await_joined_for(&bob_selection, &a_one).await, Some(false));
+        assert_eq!(
+            manager.await_joined_for(&bob_selection, &a_one, &JoinCancellation::new()).await,
+            Some(false)
+        );
         manager.switch_to(&alice_account.id).await.expect("Cannot return to Alice");
         unpublish_room(&alice_client, &a_one).await;
         unpublish_room(&alice_client, &a_two).await;
