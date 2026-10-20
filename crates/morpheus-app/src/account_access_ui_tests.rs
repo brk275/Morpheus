@@ -1669,6 +1669,84 @@ fn assert_removed_account_menu_projection(ui: &AppWindow) {
     );
 }
 
+const ACCOUNT_UI_TOTAL_BUDGET: Duration = Duration::from_secs(180);
+const ACCOUNT_UI_PHASE_BUDGET: Duration = Duration::from_secs(30);
+
+// Bookkeeping for the existing single-window test. Use real monotonic time:
+// Slint's mock clock only runs the UI handlers and must not drive deadlines.
+struct AccountUiProgress {
+    phase: std::cell::Cell<u8>,
+    started: std::time::Instant,
+    phase_started: std::cell::Cell<std::time::Instant>,
+    observations: std::cell::Cell<u8>,
+}
+
+impl AccountUiProgress {
+    fn new(started: std::time::Instant) -> Self {
+        Self {
+            phase: std::cell::Cell::new(0),
+            started,
+            phase_started: std::cell::Cell::new(started),
+            observations: std::cell::Cell::new(0),
+        }
+    }
+
+    fn get(&self) -> u8 {
+        self.phase.get()
+    }
+
+    fn phase_expired_at(&self, now: std::time::Instant) -> bool {
+        now.duration_since(self.phase_started.get()) >= ACCOUNT_UI_PHASE_BUDGET
+    }
+
+    fn expired_at(&self, now: std::time::Instant) -> bool {
+        self.phase_expired_at(now) || now.duration_since(self.started) >= ACCOUNT_UI_TOTAL_BUDGET
+    }
+
+    fn observe(&self, now: std::time::Instant) {
+        let observations = self.observations.get();
+        if observations < 64 {
+            // Closed numeric fields only, bounded in both count and value.
+            // Deadline checks use uncapped durations, independently of logs.
+            let cap = ACCOUNT_UI_TOTAL_BUDGET.as_millis();
+            eprintln!(
+                "MORPHEUS_UI_PHASE phase={} elapsed_ms={} phase_ms={}",
+                self.get(),
+                now.duration_since(self.started).as_millis().min(cap),
+                now.duration_since(self.phase_started.get())
+                    .as_millis()
+                    .min(cap),
+            );
+            self.observations.set(observations + 1);
+        }
+    }
+
+    fn set(&self, next: u8) {
+        let now = std::time::Instant::now();
+        self.observe(now);
+        // A ready UI continuation may beat a timer poll. Check the completed
+        // phase before replacing its clock, so progress cannot hide a stall.
+        if self.expired_at(now) {
+            eprintln!("morpheus-ui-timeout-phase={}", self.get());
+            panic!("account UI scenario exceeded a finite phase or whole-suite deadline");
+        }
+        self.phase.set(next);
+        self.phase_started.set(now);
+    }
+
+    async fn wait_for_stall(&self) {
+        loop {
+            let deadline = self.phase_started.get() + ACCOUNT_UI_PHASE_BUDGET;
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            // Progress only moves the deadline forward. An old timer waking
+            // after progress must re-read the current phase before failing it.
+            if self.phase_expired_at(std::time::Instant::now()) {
+                return;
+            }
+        }
+    }
+}
+
 #[test]
 fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     // Slint's event-loop proxy is process-global. Keep all real-window account
@@ -1682,16 +1760,27 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     let _entered = runtime.enter();
     let runtime_handle = runtime.handle().clone();
     slint::spawn_local(async move {
-        let phase = std::rc::Rc::new(std::cell::Cell::new(0_u8));
         let started = std::time::Instant::now();
-        // One process-global event loop now covers fourteen appearance and
-        // keyboard scenarios plus account dialogs. Keep a finite whole-suite
-        // deadline without making each scenario share the old 20-second cap.
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(60),
-            exercise_account_ui(runtime_handle.clone(), phase.clone()),
-        )
-        .await;
+        let phase = std::rc::Rc::new(AccountUiProgress::new(started));
+        // The original fourteen-scenario budget now covers 44 transitions,
+        // including the thread browser and room leave. Keep a finite three-minute
+        // whole budget and a separate phase cap that catches one stall sooner.
+        let outcome = tokio::select! {
+            result = tokio::time::timeout(
+                ACCOUNT_UI_TOTAL_BUDGET,
+                exercise_account_ui(runtime_handle.clone(), phase.clone()),
+            ) => result.map_err(|_| ()),
+            () = phase.wait_for_stall() => Err(()),
+        };
+        let finished = std::time::Instant::now();
+        phase.observe(finished);
+        // Also check ready completion: cooperative timers cannot interrupt
+        // synchronous work, or take precedence over every ready continuation.
+        let outcome = if phase.expired_at(finished) {
+            Err(())
+        } else {
+            outcome
+        };
         eprintln!("morpheus-ui-scenario-ms={}", started.elapsed().as_millis());
         if outcome.is_err() {
             // A closed numeric stage only: never log UI text, files or accounts.
@@ -4098,7 +4187,7 @@ async fn assert_room_addresses_bounded_close_and_context(
     settle(ui).await;
 }
 
-async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell<u8>>) {
+async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgress>) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
     let directory = tempfile::tempdir().unwrap();
