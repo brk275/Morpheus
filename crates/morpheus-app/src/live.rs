@@ -808,6 +808,7 @@ pub struct LiveUi {
     drafts: Arc<DraftStore>,
     draft_write_tx: mpsc::Sender<()>,
     generation: Arc<AtomicU64>,
+    recovery_notices: Arc<crate::timeline_recovery::Notices>,
     render_epoch: Arc<AtomicU64>,
     navigation_epoch: Arc<AtomicU64>,
     member_epoch: Arc<AtomicU64>,
@@ -998,6 +999,7 @@ impl LiveUi {
         ui: Weak<AppWindow>,
         voice_spaces: Arc<VoiceSpaces>,
     ) -> Arc<Self> {
+        let recovery_notices = crate::timeline_recovery::Notices::new(ui.clone());
         let (draft_write_tx, mut draft_write_rx) = mpsc::channel(1);
         let drafts = Arc::new(DraftStore::default());
         let draft_worker_store = drafts.clone();
@@ -1059,6 +1061,7 @@ impl LiveUi {
             drafts,
             draft_write_tx,
             generation: Arc::new(AtomicU64::new(0)),
+            recovery_notices,
             render_epoch: Arc::new(AtomicU64::new(0)),
             navigation_epoch: Arc::new(AtomicU64::new(0)),
             member_epoch: Arc::new(AtomicU64::new(0)),
@@ -1087,7 +1090,9 @@ impl LiveUi {
     pub fn invalidate_navigation(&self) -> u64 {
         self.render_epoch.fetch_add(1, Ordering::AcqRel);
         self.member_epoch.fetch_add(1, Ordering::AcqRel);
-        self.navigation_epoch.fetch_add(1, Ordering::AcqRel) + 1
+        let navigation = self.navigation_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.recovery_notices.clear_all();
+        navigation
     }
 
     pub(crate) fn current_navigation_epoch(&self) -> u64 {
@@ -1131,6 +1136,7 @@ impl LiveUi {
         self.navigation_epoch
             .compare_exchange(epoch, next, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
+        self.recovery_notices.clear_all();
         self.render_epoch.fetch_add(1, Ordering::AcqRel);
         self.member_epoch.fetch_add(1, Ordering::AcqRel);
         Some(next)
@@ -3764,6 +3770,8 @@ impl LiveUi {
                     // has captured its draft and accepted this selection.
                     if retire_feed && room_id.is_none() {
                         self.generation.fetch_add(1, Ordering::AcqRel);
+                        self.recovery_notices
+                            .clear(crate::timeline_recovery::Pane::Room);
                         self.drop_stale_focus();
                         if let Some(task) = feed.take() {
                             task.abort();
@@ -4159,6 +4167,33 @@ impl LiveUi {
         *self.space_scan_failed_at.lock().await = None;
     }
 
+    fn recovery_lease(
+        &self,
+        selection: AccountSelection,
+        room: String,
+        root: Option<String>,
+        focused: bool,
+        generation_at: u64,
+        navigation_at: u64,
+    ) -> crate::timeline_recovery::Lease {
+        crate::timeline_recovery::Lease {
+            selection,
+            room,
+            generation: if root.is_some() {
+                self.thread_generation.clone()
+            } else {
+                self.generation.clone()
+            },
+            root,
+            focused,
+            navigation: self.navigation_epoch.clone(),
+            navigation_at,
+            generation_at,
+            live: self.is_live.clone(),
+            gate: self.security_gate.clone(),
+        }
+    }
+
     /// Open the live feed of `room_id` under the caller's exact `selection`.
     async fn open_room(
         self: &Arc<Self>,
@@ -4199,6 +4234,8 @@ impl LiveUi {
                 return;
             }
             let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            self.recovery_notices
+                .clear(crate::timeline_recovery::Pane::Room);
             // A live feed ends the focused view it replaces; a newer one
             // stays. No suspension through the claim and this cleanup.
             self.drop_stale_focus();
@@ -4255,26 +4292,40 @@ impl LiveUi {
             previous.abort();
         }
         *key_slot = Some(requested_key);
-        let mut updates = feed.subscribe();
+        let mut updates = feed.subscribe_presentation();
         let feed_generation = self.generation.clone();
         let feed_navigation_epoch = self.navigation_epoch.clone();
         let is_live = self.is_live.clone();
         // VIEWPORT LIFECYCLE: read-only, for the publication's security generation.
         let viewport_gate = self.security_gate.clone();
+        self.recovery_notices
+            .clear(crate::timeline_recovery::Pane::Room);
+        let recovery = self.recovery_notices.clone();
+        let recovery_lease = self.recovery_lease(
+            selection.clone(),
+            room_id.clone(),
+            None,
+            false,
+            generation,
+            navigation_epoch,
+        );
         let feed_account_id = account_id;
         let feed_room_id = room_id;
         let handle = tokio::spawn(async move {
             let _feed = feed;
             let delivery = Arc::new(crate::timeline_delivery::Latest::new());
             loop {
-                let messages = updates.borrow_and_update().clone();
+                let presentation = updates.borrow_and_update().clone();
                 #[cfg(test)]
-                let observed = messages.clone();
-                if delivery.submit(messages) {
+                let observed = presentation.messages.clone();
+                let security = crate::timeline_viewport::security_generation(&viewport_gate);
+                if delivery.submit((presentation, security)) {
                     let ui_for_update = ui.clone();
                     let current_generation = feed_generation.clone();
                     let current_navigation_epoch = feed_navigation_epoch.clone();
                     let live_flag = is_live.clone();
+                    let recovery = recovery.clone();
+                    let recovery_lease = recovery_lease.clone();
                     let gate = viewport_gate.clone();
                     let account_id = feed_account_id.clone();
                     let room_id = feed_room_id.clone();
@@ -4282,9 +4333,10 @@ impl LiveUi {
                     let selected_account = selection.clone();
                     if ui_for_update
                         .upgrade_in_event_loop(move |ui| {
-                            let Some(messages) = pending.take() else {
+                            let Some((presentation, security)) = pending.take() else {
                                 return;
                             };
+                            let messages = presentation.messages;
                             if selected_account.is_current()
                                 && live_flag.load(Ordering::Acquire)
                                 && current_generation.load(Ordering::Acquire) == generation
@@ -4298,6 +4350,13 @@ impl LiveUi {
                                 )
                             {
                                 publish_live_messages(&ui, messages.as_ref().clone());
+                                recovery.publish(
+                                    &ui,
+                                    crate::timeline_recovery::Pane::Room,
+                                    presentation.has_undecryptable,
+                                    recovery_lease,
+                                    security,
+                                );
                                 // VIEWPORT LIFECYCLE: under the checks above.
                                 crate::timeline_viewport::rows_published(
                                     &ui,
@@ -4335,6 +4394,7 @@ impl LiveUi {
 
     pub async fn clear_feed(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
+        self.recovery_notices.clear_all();
         self.drop_stale_focus();
         if let Some(task) = self.feed.lock().await.take() {
             task.abort();
@@ -4435,12 +4495,23 @@ impl LiveUi {
             previous.abort();
         }
         *key_slot = Some((account_id.clone(), room_id.clone()));
-        let mut updates = feed.subscribe();
+        let mut updates = feed.subscribe_presentation();
         let current_generation = self.generation.clone();
         let navigation_now = self.navigation_epoch.clone();
         let is_live = self.is_live.clone();
         // VIEWPORT LIFECYCLE: read-only, for the publication's security generation.
         let viewport_gate = self.security_gate.clone();
+        self.recovery_notices
+            .clear(crate::timeline_recovery::Pane::Room);
+        let recovery = self.recovery_notices.clone();
+        let recovery_lease = self.recovery_lease(
+            selection.clone(),
+            room_id.clone(),
+            None,
+            true,
+            generation,
+            navigation_epoch,
+        );
         let feed_account_id = account_id;
         // Withdrawal still counts until the view's first rows are shown,
         // checked on the UI thread where withdraw() happens.
@@ -4456,7 +4527,9 @@ impl LiveUi {
             let (_view, _feed) = (view, feed);
             let delivery = Arc::new(crate::timeline_delivery::Latest::new());
             loop {
-                if delivery.submit(updates.borrow_and_update().clone()) {
+                let presentation = updates.borrow_and_update().clone();
+                let security = crate::timeline_viewport::security_generation(&viewport_gate);
+                if delivery.submit((presentation, security)) {
                     let pending = delivery.clone();
                     let selected_account = selection.clone();
                     let current_generation = current_generation.clone();
@@ -4466,11 +4539,14 @@ impl LiveUi {
                     let room_id = room_id.clone();
                     let (unshown, authority) = (unshown.clone(), authority.clone());
                     let back = unshown_view.clone();
+                    let recovery = recovery.clone();
+                    let recovery_lease = recovery_lease.clone();
                     let gate = viewport_gate.clone();
                     let queued = ui.upgrade_in_event_loop(move |ui| {
-                        let Some(messages) = pending.take() else {
+                        let Some((presentation, security)) = pending.take() else {
                             return;
                         };
+                        let messages = presentation.messages;
                         // Withdrawn after the commit, before any row of the
                         // view was shown (or another surface is up, which
                         // withdraws it): show none and give the room back.
@@ -4495,6 +4571,13 @@ impl LiveUi {
                                 messages.as_ref().clone(),
                             ));
                             ui.set_conversation_focused(true);
+                            recovery.publish(
+                                &ui,
+                                crate::timeline_recovery::Pane::Room,
+                                presentation.has_undecryptable,
+                                recovery_lease,
+                                security,
+                            );
                             // VIEWPORT LIFECYCLE: under the checks above.
                             crate::timeline_viewport::rows_published(
                                 &ui,
@@ -4552,6 +4635,8 @@ impl LiveUi {
             }
             // No suspension from here to the end of the block.
             self.generation.fetch_add(1, Ordering::AcqRel);
+            self.recovery_notices
+                .clear(crate::timeline_recovery::Pane::Room);
             self.drop_stale_focus();
             if let Some(task) = feed_slot.take() {
                 task.abort();
@@ -4572,6 +4657,7 @@ impl LiveUi {
         generation: u64,
         ui: Weak<AppWindow>,
     ) -> Result<(), MatrixCoreError> {
+        let recovery_navigation = self.current_navigation_epoch();
         if self.thread_generation.load(Ordering::Acquire) != generation {
             return Ok(());
         }
@@ -4641,22 +4727,34 @@ impl LiveUi {
         if self.thread_generation.load(Ordering::Acquire) != generation {
             return Ok(());
         }
-        let mut updates = feed.subscribe();
+        let mut updates = feed.subscribe_presentation();
         let current_generation = self.thread_generation.clone();
         let is_live = self.is_live.clone();
         // VIEWPORT LIFECYCLE: read-only, for the publication's security generation.
         let viewport_gate = self.security_gate.clone();
+        let recovery = self.recovery_notices.clone();
+        let recovery_lease = self.recovery_lease(
+            selection.clone(),
+            room_id.clone(),
+            Some(root_event_id.clone()),
+            false,
+            generation,
+            recovery_navigation,
+        );
         let handle = tokio::spawn(async move {
             let _feed = feed;
             let delivery = Arc::new(crate::timeline_delivery::Latest::new());
             loop {
-                let messages = updates.borrow_and_update().clone();
+                let presentation = updates.borrow_and_update().clone();
                 #[cfg(test)]
-                let observed = messages.clone();
-                if delivery.submit(messages) {
+                let observed = presentation.messages.clone();
+                let security = crate::timeline_viewport::security_generation(&viewport_gate);
+                if delivery.submit((presentation, security)) {
                     let ui_for_update = ui.clone();
                     let current_generation = current_generation.clone();
                     let is_live = is_live.clone();
+                    let recovery = recovery.clone();
+                    let recovery_lease = recovery_lease.clone();
                     let gate = viewport_gate.clone();
                     let account_id = account_id.clone();
                     let room_id = room_id.clone();
@@ -4665,9 +4763,10 @@ impl LiveUi {
                     let selected_account = selection.clone();
                     if ui_for_update
                         .upgrade_in_event_loop(move |ui| {
-                            let Some(messages) = pending.take() else {
+                            let Some((presentation, security)) = pending.take() else {
                                 return;
                             };
+                            let messages = presentation.messages;
                             if selected_account.is_current()
                                 && is_live.load(Ordering::Acquire)
                                 && current_generation.load(Ordering::Acquire) == generation
@@ -4687,6 +4786,13 @@ impl LiveUi {
                                     ui.get_thread_messages(),
                                     replies,
                                 ));
+                                recovery.publish(
+                                    &ui,
+                                    crate::timeline_recovery::Pane::Thread,
+                                    presentation.has_undecryptable,
+                                    recovery_lease,
+                                    security,
+                                );
                                 // VIEWPORT LIFECYCLE: under the checks above.
                                 crate::timeline_viewport::replies_published(
                                     &ui,
@@ -4726,7 +4832,10 @@ impl LiveUi {
     }
 
     pub fn begin_thread_request(&self) -> u64 {
-        self.thread_generation.fetch_add(1, Ordering::AcqRel) + 1
+        let generation = self.thread_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.recovery_notices
+            .clear(crate::timeline_recovery::Pane::Thread);
+        generation
     }
 
     pub fn thread_request_is_current(&self, generation: u64) -> bool {

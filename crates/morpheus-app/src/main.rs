@@ -76,6 +76,7 @@ mod thread_history;
 mod timeline_acceptance;
 mod timeline_delivery;
 mod timeline_model;
+mod timeline_recovery;
 mod timeline_viewport;
 mod unread_navigation;
 mod update_controller;

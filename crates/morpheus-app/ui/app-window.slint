@@ -3335,6 +3335,45 @@ export component StartupErrorWindow inherits Window {
     }
 }
 
+// A loaded view can contain encrypted entries that are not ordinary message
+// rows. Keep one fixed notice outside the virtualized model: no event text,
+// decryption error or routing identifier is displayed or spoken.
+component TimelineRecoveryNotice inherits Rectangle {
+    in property <bool> action-enabled;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    callback open-recovery();
+    vertical-stretch: 0;
+    background: root.surface;
+    accessible-role: groupbox;
+    accessible-label: "Encrypted messages unavailable";
+    VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        Text {
+            text: "Some encrypted messages in this loaded view cannot be read on this device.";
+            color: root.muted;
+            font-size: 12px * root.text-scale;
+            wrap: word-wrap;
+            vertical-stretch: 0;
+            accessible-live-region: polite;
+        }
+        TextAction {
+            text: "Security & recovery";
+            enabled: root.action-enabled;
+            accessible-label: "Open Security and recovery settings for this account";
+            ink: root.ink; muted: root.muted; surface: root.surface;
+            hover-surface: root.hover-surface; outline: root.outline;
+            text-scale: root.text-scale; wrap-caption: true;
+            activated => { root.open-recovery(); }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Morpheus";
     preferred-width: 1310px;
@@ -4345,6 +4384,19 @@ export component AppWindow inherits Window {
         if !root.viewport-seek-allowed { root.viewport-seek-withdrawn(); }
     }
     callback viewport-seek-withdrawn();
+    // Rust publishes only these opaque serials beside the loaded rows. The
+    // retained account/view/security leases stay in timeline_recovery.rs.
+    // A changed context retires invalid owners; delayed notifications cannot
+    // retire a newer owner which still matches the current context.
+    in-out property <int> timeline-recovery-serial: 0;
+    in-out property <int> thread-recovery-serial: 0;
+    callback open-timeline-recovery(bool, int);
+    callback timeline-recovery-context-changed();
+    property <string> timeline-recovery-context: (root.live-session ? "1" : "0")
+        + "\n" + root.page + "\n" + root.active-account-local-id + "\n" + root.active-room-id
+        + "\n" + root.thread-root-id + "\n" + (root.conversation-focused ? "1" : "0")
+        + "\n" + (root.viewport-seek-allowed && !root.settings-reveal-protected ? "1" : "0");
+    changed timeline-recovery-context => { root.timeline-recovery-context-changed(); }
     // The conversation shows the messages around an opened search hit
     // instead of the latest ones, until Return to live or a room change.
     in-out property <bool> conversation-focused: false;
@@ -7190,6 +7242,12 @@ export component AppWindow inherits Window {
                                 activated => { root.return-to-live(); }
                             }
                         }
+                    }
+                    if root.live-session && root.page == 0 && root.active-room-id != "" && root.timeline-recovery-serial > 0 : TimelineRecoveryNotice {
+                        action-enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
+                        ink: root.ink; muted: root.muted; surface: root.elevated;
+                        hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                        open-recovery => { root.open-timeline-recovery(false, root.timeline-recovery-serial); }
                     }
                     if root.live-session && root.active-room-id != "" : HorizontalLayout {
                         height: max(36px, 32px * root.text-scale);
@@ -11746,6 +11804,12 @@ export component AppWindow inherits Window {
                         color: root.muted; font-size: 12px * root.text-scale;
                         wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
                         vertical-stretch: 1;
+                    }
+                    if root.live-session && root.page == 0 && root.thread-root-id != "" && root.thread-recovery-serial > 0 : TimelineRecoveryNotice {
+                        action-enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
+                        ink: root.ink; muted: root.muted; surface: root.elevated;
+                        hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                        open-recovery => { root.open-timeline-recovery(true, root.thread-recovery-serial); }
                     }
                     if root.thread-root-id != "" : thread-scroll := ScrollView {
                         vertical-stretch: 1;

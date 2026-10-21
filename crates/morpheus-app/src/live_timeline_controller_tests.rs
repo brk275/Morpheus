@@ -355,24 +355,32 @@ async fn advance_retries(ui: &AppWindow) {
 async fn exercise(runtime: Handle, alice: FixtureAccount, carol: FixtureAccount, room: String) {
     stage!(setup);
     let directory = tempfile::tempdir().unwrap();
+    stage!(setup_profile);
     let manager = Arc::new(AccountManager::open(directory.path().join("profile")).unwrap());
+    stage!(setup_config);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));
     // A second generated window on the harness's single event loop. Feed
     // callbacks publish to its properties and models, which is what the
     // desktop renders from; it need not be shown for that.
+    stage!(setup_window);
     let ui = AppWindow::new().unwrap();
+    stage!(setup_controller);
     let live = LiveUi::new(manager.clone(), runtime.clone(), ui.as_weak(), voices);
+    stage!(setup_dispatch);
     let account = {
         let manager = manager.clone();
         let room = room.clone();
         on_runtime(&runtime, async move {
+            stage!(setup_login);
             let added = manager
                 .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
                 .await;
             let account = added.expect("First login failed");
+            stage!(setup_rooms);
             wait_for_room(&manager, &room).await;
+            stage!(setup_ready);
             account.id
         })
         .await
@@ -443,6 +451,10 @@ impl Scenario {
             "The thread list must exclude its root"
         );
         check!(thread_root_excluded);
+
+        // Exact live account/view ownership on the generated recovery entry.
+        // Only the loaded UTD boolean is synthetic; no capability is fabricated.
+        self.recovery_page_roundtrip(&root, &reply_text).await;
 
         // Both subscriptions published into a live window and keep waiting
         // for the next update: from here only their lease can end them.
@@ -539,9 +551,389 @@ impl Scenario {
         wait_for_ui(&self.ui, "The reopened thread did not publish", reply_back).await;
         check!(renewed_thread_delivery);
 
+        // Reuse the actual A -> B -> A above: the original selection is
+        // revoked while a fresh original owner can still navigate.
+        self.recovery_revocation_and_late_clear(&root, &late_reply, &lease)
+            .await;
+
         self.queued_across_revocation(&root, &other_id).await;
         self.link_continuation(&root).await;
         other_id
+    }
+
+    /// Quiesce only this fixture's already-owned feed tasks. No SDK cache or
+    /// account authority is altered. This prevents a legitimate non-UTD SDK
+    /// publication from overwriting the synthetic missing-status input while
+    /// the actual notice publication/action/lease boundary is exercised.
+    async fn pause_recovery_feeds(&self) {
+        let room = { self.live.feed.lock().await.take() };
+        let thread = { self.live.thread_feed.lock().await.take() };
+        let tasks: Vec<_> = [room, thread].into_iter().flatten().collect();
+        assert_eq!(
+            tasks.len(),
+            2,
+            "the real feeds were owned before the recovery case"
+        );
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            if let Err(error) = task.await
+                && error.is_panic()
+            {
+                std::panic::resume_unwind(error.into_panic());
+            }
+        }
+        settle(&self.ui).await;
+    }
+
+    fn recovery_publication(&self, selection: AccountSelection, missing: bool) {
+        let lease = self.live.recovery_lease(
+            selection,
+            self.room.clone(),
+            None,
+            self.ui.get_conversation_focused(),
+            self.live.feed_generation(),
+            self.live.current_navigation_epoch(),
+        );
+        let security = crate::timeline_viewport::security_generation(&self.live.security_gate);
+        self.live.recovery_notices.publish(
+            &self.ui,
+            crate::timeline_recovery::Pane::Room,
+            missing,
+            lease,
+            security,
+        );
+    }
+
+    async fn restore_recovery_feeds(&self, root: &str, reply: &str) {
+        self.select_room().await;
+        wait_for_ui(
+            &self.ui,
+            "The real room feed must resume after the recovery boundary case",
+            |ui| has_event_id(&ui.get_messages(), root),
+        )
+        .await;
+        self.open_thread(root).await;
+        wait_for_ui(
+            &self.ui,
+            "The real thread feed must resume after the recovery boundary case",
+            |ui| delivered(&ui.get_thread_messages(), reply),
+        )
+        .await;
+        assert_eq!(feeds_running(&self.live).await, (true, true));
+    }
+
+    fn restore_recovery_panel(&self, saved: (i32, bool, bool)) {
+        let ui = &self.ui;
+        match saved.0 {
+            0 => ui.invoke_show_members_panel(),
+            1 => ui.invoke_show_thread_panel(),
+            2 => ui.invoke_focus_room_search(),
+            3 => ui.invoke_show_pinned_panel(),
+            4 => ui.invoke_show_transfer_panel(),
+            5 => ui.invoke_show_room_media(),
+            _ => panic!("unexpected details tab"),
+        }
+        ui.set_show_side_panel(saved.1);
+        ui.set_details_reveal_open(saved.2);
+    }
+
+    /// Real AccountSelection and actual generated action/settings routes.
+    /// The status boolean is a stand-in at the production publication API;
+    /// this does not claim an actual UTD sync, key recovery or overview read.
+    async fn recovery_page_roundtrip(&self, root: &str, reply: &str) {
+        use std::{cell::Cell, rc::Rc};
+        let ui = &self.ui;
+        let panel = (
+            ui.get_side_panel_tab(),
+            ui.get_show_side_panel(),
+            ui.get_details_reveal_open(),
+        );
+        self.pause_recovery_feeds().await;
+        // This is the same synthetic backend/window, shown only for the
+        // actual conditional Settings mount/focus handoff, then hidden again.
+        let was_visible = ui.window().is_visible();
+        if !was_visible {
+            ui.show().expect("the synthetic recovery window must show");
+        }
+        crate::settings_search::register(ui);
+        let opened = Rc::new(Cell::new(0u32));
+        let observed = opened.clone();
+        ui.on_open_security(move || observed.set(observed.get() + 1));
+        // This scenario has no CallBar controller. Observe its actual global
+        // withdrawal callback without changing any call or capture state.
+        let withdrawals = Rc::new(Cell::new(0u32));
+        let observed = withdrawals.clone();
+        ui.global::<crate::CallBar>()
+            .on_withdraw(move || observed.set(observed.get() + 1));
+        let selection = self.manager.account_selection(&self.account).unwrap();
+        assert!(selection.is_current() && self.shows_scope(ui));
+        assert!(ui.get_live_session() && ui.get_page() == 0 && ui.get_viewport_seek_allowed());
+        let generation = self.live.feed_generation();
+        let navigation = self.live.current_navigation_epoch();
+        self.recovery_publication(selection.clone(), true);
+        let initial = ui.get_timeline_recovery_serial();
+        assert!(
+            initial > 0,
+            "the actual admitted selection must own a visible action"
+        );
+        let thread_lease = self.live.recovery_lease(
+            selection.clone(),
+            self.room.clone(),
+            Some(root.to_owned()),
+            false,
+            self.live.thread_request_generation(),
+            navigation,
+        );
+        let security = crate::timeline_viewport::security_generation(&self.live.security_gate);
+        self.live.recovery_notices.publish(
+            ui,
+            crate::timeline_recovery::Pane::Thread,
+            true,
+            thread_lease,
+            security,
+        );
+        let initial_thread = ui.get_thread_recovery_serial();
+        assert!(
+            initial_thread > 0,
+            "the real open thread retains its own original scope"
+        );
+
+        // An ordinary Settings visit, then the real files.transfers registry
+        // return route. No room selection, feed open or SDK diff intervenes.
+        ui.invoke_navigate_page(1);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        assert_eq!(ui.get_timeline_recovery_serial(), 0);
+        assert_eq!(ui.get_thread_recovery_serial(), 0);
+        assert!(crate::settings_search::reveal(ui, "files.transfers"));
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        let returned = ui.get_timeline_recovery_serial();
+        assert_eq!(ui.get_page(), 0);
+        assert!(
+            returned > initial,
+            "local return reissues a fresh callback without an SDK update"
+        );
+        assert!(ui.get_thread_recovery_serial() > initial_thread);
+        assert_eq!(self.live.feed_generation(), generation);
+        assert_eq!(self.live.current_navigation_epoch(), navigation);
+        ui.invoke_open_timeline_recovery(false, initial);
+        assert_eq!(
+            ui.get_page(),
+            0,
+            "the old serial must not adopt the returned owner"
+        );
+        assert_eq!(ui.get_timeline_recovery_serial(), returned);
+
+        // Hidden replacement/removal must be retained too, never resurrected
+        // from a visible serial. Use the actual publication API on page1.
+        ui.invoke_navigate_page(1);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        self.recovery_publication(selection.clone(), false);
+        assert!(crate::settings_search::reveal(ui, "files.transfers"));
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        assert_eq!(
+            ui.get_timeline_recovery_serial(),
+            0,
+            "hidden redecryption/removal stays cleared"
+        );
+        ui.invoke_navigate_page(1);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        self.recovery_publication(selection.clone(), true);
+        assert_eq!(
+            ui.get_timeline_recovery_serial(),
+            0,
+            "hidden status creates no visible action"
+        );
+        assert!(crate::settings_search::reveal(ui, "files.transfers"));
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        let current = ui.get_timeline_recovery_serial();
+        assert!(current > returned);
+        ui.invoke_open_timeline_recovery(false, returned);
+        assert_eq!(
+            ui.get_timeline_recovery_serial(),
+            current,
+            "a forged old callback leaves the current valid owner intact"
+        );
+        assert_eq!(ui.get_page(), 0);
+
+        // A covering ordinary modal keeps the original loaded owner. Its
+        // own production entry withdraws first; a refused recovery action
+        // must not withdraw a peer, navigate or dismiss that admitted modal.
+        let before_menu = withdrawals.get();
+        ui.invoke_open_account_menu();
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        assert!(ui.get_account_menu_open());
+        assert!(
+            withdrawals.get() > before_menu,
+            "the actual menu entry withdraws peer work"
+        );
+        let during_menu = withdrawals.get();
+        ui.invoke_open_timeline_recovery(false, current);
+        assert!(ui.get_account_menu_open());
+        assert_eq!(ui.get_page(), 0);
+        assert_eq!(opened.get(), 0);
+        assert_eq!(
+            withdrawals.get(),
+            during_menu,
+            "refusal happens before any peer withdrawal"
+        );
+        assert_eq!(ui.get_timeline_recovery_serial(), current);
+        ui.set_account_menu_open(false);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        assert_eq!(
+            ui.get_timeline_recovery_serial(),
+            current,
+            "closing an ordinary modal needs no SDK publication"
+        );
+
+        // Positive control: actual owned callback -> exact static target and
+        // mounted focus handoff. The overview callback is observed, not run.
+        ui.invoke_open_timeline_recovery(false, current);
+        // A cold Settings conditional installs its Timer after the first
+        // mock tick. Drain that real pending request before checking focus.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ui.get_settings_reveal_pending() {
+                i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+                settle(ui).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the mounted Settings page consumes its one focus request");
+        // The mounted replay changes the child focus request; deliver that
+        // change handler as well, retaining the actual focus assertion below.
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        assert_eq!(opened.get(), 1);
+        assert!(
+            withdrawals.get() > during_menu,
+            "the still-current owned callback is admitted after the menu closes"
+        );
+        assert_eq!(ui.get_page(), 1);
+        assert_eq!(ui.get_settings_reveal_id().as_str(), "security.recovery");
+        assert_eq!(ui.get_timeline_recovery_serial(), 0);
+        assert!(
+            matches!(
+                ui.get_settings_revealed_id().as_str(),
+                "security.recovery" | "security.recovery:status"
+            ),
+            "the mounted existing target or its explicit busy status must actually receive focus"
+        );
+        assert!(crate::settings_search::reveal(ui, "files.transfers"));
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        let after_own_action = ui.get_timeline_recovery_serial();
+        assert!(
+            after_own_action > current,
+            "own recovery entry does not consume loaded status"
+        );
+        // The same retained-view path for a genuinely owned thread, admitted
+        // only after its actual pane entry makes it visible.
+        ui.invoke_show_thread_panel();
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        let thread_action = ui.get_thread_recovery_serial();
+        assert!(thread_action > initial_thread);
+        ui.invoke_open_timeline_recovery(true, thread_action);
+        assert_eq!(ui.get_page(), 1);
+        assert_eq!(opened.get(), 2);
+        assert_eq!(ui.get_settings_reveal_id().as_str(), "security.recovery");
+        assert!(crate::settings_search::reveal(ui, "files.transfers"));
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        assert!(ui.get_thread_recovery_serial() > thread_action);
+        assert_eq!(self.live.feed_generation(), generation);
+        assert_eq!(self.live.current_navigation_epoch(), navigation);
+        // A completed security step invalidates that original epoch even
+        // while away; returning cannot mint an action with a newer epoch.
+        ui.invoke_navigate_page(1);
+        let step = self
+            .live
+            .security_gate
+            .try_account_access()
+            .expect("idle security gate");
+        drop(step);
+        assert!(crate::settings_search::reveal(ui, "files.transfers"));
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        assert_eq!(ui.get_timeline_recovery_serial(), 0);
+        assert_eq!(ui.get_thread_recovery_serial(), 0);
+        self.restore_recovery_feeds(root, reply).await;
+        self.restore_recovery_panel(panel);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        if !was_visible {
+            ui.hide().expect("restore the fixture's hidden window");
+        }
+    }
+
+    async fn recovery_revocation_and_late_clear(
+        &self,
+        root: &str,
+        reply: &str,
+        old: &AccountSelection,
+    ) {
+        let ui = &self.ui;
+        let panel = (
+            ui.get_side_panel_tab(),
+            ui.get_show_side_panel(),
+            ui.get_details_reveal_open(),
+        );
+        assert!(
+            !old.is_current(),
+            "this is the real fixture's revoked A selection"
+        );
+        self.pause_recovery_feeds().await;
+        let selection = self.manager.account_selection(&self.account).unwrap();
+        assert!(selection.is_current() && self.shows_scope(ui));
+        self.recovery_publication(selection.clone(), true);
+        let first = ui.get_timeline_recovery_serial();
+        assert!(first > 0);
+        // Actual queued clear, then a newer actual publication before its UI
+        // callback executes. The old visual cleanup must leave the new ID.
+        self.live
+            .recovery_notices
+            .clear(crate::timeline_recovery::Pane::Room);
+        self.recovery_publication(selection.clone(), true);
+        let fresh = ui.get_timeline_recovery_serial();
+        assert!(fresh > first);
+        settle(ui).await;
+        assert_eq!(
+            ui.get_timeline_recovery_serial(),
+            fresh,
+            "late old clear cannot remove a newer owner"
+        );
+        ui.invoke_open_timeline_recovery(false, first);
+        assert_eq!(ui.get_timeline_recovery_serial(), fresh);
+        assert_eq!(ui.get_page(), 0);
+        // Keep every other view term current: only the actual revoked token
+        // differs. It cannot publish or erase the current original owner.
+        self.recovery_publication(old.clone(), true);
+        assert_eq!(ui.get_timeline_recovery_serial(), fresh);
+        ui.invoke_open_timeline_recovery(false, fresh);
+        assert_eq!(
+            ui.get_page(),
+            1,
+            "the unaffected current owner still navigates"
+        );
+        assert_eq!(ui.get_settings_reveal_id().as_str(), "security.recovery");
+        assert!(crate::settings_search::reveal(ui, "files.transfers"));
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
+        assert!(ui.get_timeline_recovery_serial() > fresh);
+        self.restore_recovery_feeds(root, reply).await;
+        self.restore_recovery_panel(panel);
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        settle(ui).await;
     }
 
     /// Queued case: callbacks carrying new server events are already queued

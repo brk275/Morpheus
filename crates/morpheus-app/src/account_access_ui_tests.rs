@@ -1400,6 +1400,150 @@ async fn assert_unread_jump_owner(ui: &AppWindow, live: &Arc<LiveUi>) {
     settle(ui).await;
 }
 
+/// Presentation and unowned-action refusal on the actual generated window.
+/// This window has no Matrix selection: a synthetic serial draws the fixed
+/// notice, but cannot authorize navigation. Owned account/view admission and
+/// real missing-key/re-decryption delivery require the disposable/live checks.
+async fn assert_timeline_recovery_notice(ui: &AppWindow) {
+    use slint::private_unstable_api::re_exports::{AccessibilityAction, AccessibleStringProperty};
+    const ACTION: &str = "Open Security and recovery settings for this account";
+    let saved_recovery_fixture = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_show_sign_in(),
+        ui.get_active_account_local_id(),
+        ui.get_active_room_id(),
+        ui.get_thread_root_id(),
+        ui.get_show_side_panel(),
+        ui.get_side_panel_tab(),
+        ui.get_details_reveal_open(),
+        ui.get_font_scale_percent(),
+        ui.window().size(),
+        ui.get_timeline_recovery_serial(),
+        ui.get_thread_recovery_serial(),
+    );
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_show_sign_in(false);
+    ui.set_active_account_local_id("recovery-presentation-only".into());
+    ui.set_active_room_id("!recovery-fixture:example.org".into());
+    ui.set_thread_recovery_serial(0);
+    ui.set_show_side_panel(false);
+    let before_reveal = ui.get_settings_reveal_serial();
+    for scale in [100, 200] {
+        ui.set_font_scale_percent(scale);
+        ui.window().set_size(slint::PhysicalSize::new(640, 760));
+        ui.set_timeline_recovery_serial(101);
+        settle(ui).await;
+        let bounds = button_bounds(ui, ACTION);
+        assert_eq!(
+            bounds.len(),
+            1,
+            "one fixed notice action, not an action per encrypted event"
+        );
+        let b = bounds[0];
+        let size = ui.window().size().to_logical(ui.window().scale_factor());
+        assert!(
+            b.left >= 0.0
+                && b.top >= 0.0
+                && b.right <= size.width + 0.5
+                && b.bottom <= size.height + 0.5
+                && b.right > b.left
+                && b.bottom > b.top
+        );
+        request_bridge_focus(ui, ACTION);
+        key(ui, Key::Return);
+        assert_eq!(
+            ui.get_page(),
+            0,
+            "a drawn serial without its retained owner cannot navigate"
+        );
+        assert_eq!(ui.get_settings_reveal_serial(), before_reveal);
+    }
+    assert!(ui.get_viewport_seek_allowed() && !ui.get_settings_reveal_protected());
+    ui.set_member_confirm_open(true);
+    settle(ui).await;
+    assert_eq!(
+        control_with_label(ui, ACTION)
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("false")
+    );
+    ui.invoke_open_timeline_recovery(false, 101);
+    assert_eq!(
+        ui.get_page(),
+        0,
+        "protected entry is refused before any Settings navigation"
+    );
+    ui.set_member_confirm_open(false);
+    settle(ui).await;
+    assert_eq!(
+        control_with_label(ui, ACTION)
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("true")
+    );
+    ui.set_timeline_recovery_serial(0);
+    ui.set_thread_root_id("$recovery-root:example.org".into());
+    ui.invoke_show_thread_panel();
+    ui.set_thread_recovery_serial(102);
+    settle(ui).await;
+    assert_eq!(button_bounds(ui, ACTION).len(), 1);
+    control_with_label(ui, ACTION).accessible_action(&AccessibilityAction::Default);
+    assert_eq!(
+        ui.get_page(),
+        0,
+        "the thread callback also refuses a serial without its owner"
+    );
+    assert_eq!(ui.get_settings_reveal_serial(), before_reveal);
+    // Same generated callback with a forged old serial never creates an owner.
+    ui.invoke_open_timeline_recovery(true, 101);
+    assert_eq!(ui.get_page(), 0);
+    ui.set_timeline_recovery_serial(0);
+    ui.set_thread_recovery_serial(0);
+    settle(ui).await;
+    assert!(button_bounds(ui, ACTION).is_empty());
+    let (
+        page,
+        live,
+        sign_in,
+        account,
+        room,
+        root,
+        side,
+        tab,
+        reveal,
+        scale,
+        size,
+        room_serial,
+        thread_serial,
+    ) = saved_recovery_fixture;
+    ui.set_thread_root_id(root);
+    ui.set_active_room_id(room);
+    ui.set_active_account_local_id(account);
+    // The tab is read-only from Rust. Use the actual presentation entries,
+    // restoring the old reveal as the existing member/header fixtures do.
+    match tab {
+        0 => ui.invoke_show_members_panel(),
+        1 => ui.invoke_show_thread_panel(),
+        2 => ui.invoke_focus_room_search(),
+        3 => ui.invoke_show_pinned_panel(),
+        4 => ui.invoke_show_transfer_panel(),
+        5 => ui.invoke_show_room_media(),
+        _ => panic!("unexpected details tab"),
+    }
+    ui.set_show_side_panel(side);
+    ui.set_details_reveal_open(reveal);
+    ui.set_font_scale_percent(scale);
+    ui.window().set_size(size);
+    ui.set_live_session(live);
+    ui.set_show_sign_in(sign_in);
+    ui.set_page(page);
+    ui.set_timeline_recovery_serial(room_serial);
+    ui.set_thread_recovery_serial(thread_serial);
+    settle(ui).await;
+}
+
 /// Root review findings #2 and #3 on the real window, live UI and security
 /// gate. A seek, an ownerless anchor too, is refused at its start and stops
 /// for good before it moves anything while a protected surface is up (the
@@ -5408,6 +5552,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert_unread_jump_owner(&ui, &live).await;
     phase.set(94);
     assert_seek_policy_and_thread_keeper(&ui, &live, &runtime).await;
+    assert_timeline_recovery_notice(&ui).await;
     phase.set(73);
     assert_moderation_stops_with_its_context(&ui, &live, &runtime).await;
     phase.set(74);

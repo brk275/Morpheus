@@ -981,18 +981,34 @@ async fn matching_send_update(
 /// Immutable timeline snapshot. Cloning it shares rows and message payloads.
 pub type MessageSnapshot = Arc<Vec<Arc<MessageInfo>>>;
 
+/// One atomic presentation of a loaded SDK view. The fixed status does not
+/// expose an encrypted event, its identifiers, ciphertext or decryption error.
+/// It never requests keys or moves a read marker.
+#[derive(Clone, Debug)]
+pub struct MessagePresentation {
+    pub messages: MessageSnapshot,
+    pub has_undecryptable: bool,
+}
+
 /// A selected account's live message list. Drop it when the room or account
 /// changes; the underlying SDK timeline subscriber is then stopped.
 pub struct MessageFeed {
     pub account_id: String,
     pub room_id: String,
     updates: watch::Receiver<MessageSnapshot>,
+    presentation: watch::Receiver<MessagePresentation>,
     task: JoinHandle<()>,
 }
 
 impl MessageFeed {
     pub fn subscribe(&self) -> watch::Receiver<MessageSnapshot> {
         self.updates.clone()
+    }
+
+    /// Rows and their loaded-view undecryptable status travel together. Legacy
+    /// row-only subscribers and owned snapshots keep their existing contract.
+    pub fn subscribe_presentation(&self) -> watch::Receiver<MessagePresentation> {
+        self.presentation.clone()
     }
 
     /// Explicit owned export; live subscribers use shared snapshots instead.
@@ -3495,6 +3511,28 @@ impl LoadedAccount {
     }
 }
 
+/// The existing message projection stays unchanged. UTDs contribute only a
+/// boolean alongside the same loaded-item vector, never another message row.
+fn presented_item(item: &TimelineItem, own: &UserId) -> (Option<Arc<MessageInfo>>, bool) {
+    (
+        message_info_for(item, Some(own)).map(Arc::new),
+        item.as_event()
+            .is_some_and(|event| event.content().is_unable_to_decrypt()),
+    )
+}
+
+fn presentation(mapped: &Vector<(Option<Arc<MessageInfo>>, bool)>) -> MessagePresentation {
+    MessagePresentation {
+        messages: Arc::new(
+            mapped
+                .iter()
+                .filter_map(|(message, _)| message.clone())
+                .collect(),
+        ),
+        has_undecryptable: mapped.iter().any(|(_, undecryptable)| *undecryptable),
+    }
+}
+
 async fn message_feed_from_timeline(
     account_id: String,
     room_id: &str,
@@ -3503,28 +3541,107 @@ async fn message_feed_from_timeline(
     let (items, mut stream) = timeline.subscribe().await;
     // A poll row shows this account's own counted vote.
     let own = timeline.room().own_user_id().to_owned();
-    let mut mapped: Vector<Option<Arc<MessageInfo>>> = items
+    let mut mapped: Vector<(Option<Arc<MessageInfo>>, bool)> = items
         .iter()
-        .map(|item| message_info_for(item, Some(&*own)).map(Arc::new))
+        .map(|item| presented_item(item, &own))
         .collect();
-    let initial: MessageSnapshot = Arc::new(mapped.iter().filter_map(Clone::clone).collect());
-    let (updates, receiver) = watch::channel(initial);
+    let initial = presentation(&mapped);
+    let (updates, receiver) = watch::channel(initial.messages.clone());
+    let (presentations, presentation_receiver) = watch::channel(initial);
     let task = tokio::spawn(async move {
         while let Some(diffs) = stream.next().await {
             for diff in diffs {
-                diff.map(|item| message_info_for(&item, Some(&*own)).map(Arc::new))
+                diff.map(|item| presented_item(&item, &own))
                     .apply(&mut mapped);
             }
-            // Unchanged rows retain their allocations. Publication copies only
-            // row handles; subscribers clone the outer Arc, not message text.
-            updates.send_replace(Arc::new(mapped.iter().filter_map(Clone::clone).collect()));
+            // Unchanged rows retain their allocations; no message text is
+            // cloned. Same shared row handles, plus one fixed boolean from exactly
+            // that projection. Redecryption/removal clears it in this update.
+            let next = presentation(&mapped);
+            updates.send_replace(next.messages.clone());
+            presentations.send_replace(next);
         }
     });
     MessageFeed {
         account_id,
         room_id: room_id.into(),
         updates: receiver,
+        presentation: presentation_receiver,
         task,
+    }
+}
+
+#[cfg(test)]
+mod message_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn loaded_undecryptable_status_changes_without_inserting_message_rows() {
+        use eyeball_im::VectorDiff;
+        let row = Arc::new(MessageInfo {
+            key: "fixture".into(),
+            event_id: Some("$fixture:example.org".into()),
+            sender: "@fixture:example.org".into(),
+            body: "Readable message".into(),
+            rich_markdown: None,
+            rich_accessible: None,
+            attachment_name: None,
+            attachment_is_image: false,
+            poll: None,
+            reply_preview: None,
+            reaction_summary: String::new(),
+            timestamp_ms: 0,
+            is_own: false,
+            is_local_echo: false,
+            send_state: MessageSendState::Sent,
+        });
+        // A readable row, a virtual/non-message item, and an undecryptable
+        // item. None of the latter's private content enters the projection.
+        let mut mapped: Vector<_> = [(Some(row.clone()), false), (None, false), (None, true)]
+            .into_iter()
+            .collect();
+        let shown = presentation(&mapped);
+        assert!(shown.has_undecryptable);
+        assert_eq!(shown.messages.len(), 1);
+        assert!(Arc::ptr_eq(&shown.messages[0], &row));
+        // SDK re-decryption can replace an item without changing the loaded
+        // vector's length. The same diff application as the feed clears it.
+        VectorDiff::Set {
+            index: 2,
+            value: (Some(row.clone()), false),
+        }
+        .apply(&mut mapped);
+        let decrypted = presentation(&mapped);
+        assert!(!decrypted.has_undecryptable);
+        assert_eq!(decrypted.messages.len(), 2);
+        assert!(Arc::ptr_eq(&decrypted.messages[0], &row));
+        VectorDiff::Set {
+            index: 2,
+            value: (None, true),
+        }
+        .apply(&mut mapped);
+        assert!(presentation(&mapped).has_undecryptable);
+        VectorDiff::Remove { index: 2 }.apply(&mut mapped);
+        assert!(
+            !presentation(&mapped).has_undecryptable,
+            "removing the last UTD clears the fixed status"
+        );
+        assert_eq!(presentation(&mapped).messages.len(), 1);
+        VectorDiff::Clear.apply(&mut mapped);
+        let cleared = presentation(&mapped);
+        assert!(cleared.messages.is_empty() && !cleared.has_undecryptable);
+    }
+
+    #[test]
+    fn unable_to_decrypt_is_typed_status_not_a_redaction_or_error_body() {
+        use matrix_sdk_ui::timeline::{EncryptedMessage, MsgLikeContent, TimelineItemContent};
+        let encrypted = TimelineItemContent::MsgLike(MsgLikeContent::unable_to_decrypt(
+            EncryptedMessage::Unknown,
+        ));
+        assert!(encrypted.is_unable_to_decrypt());
+        assert!(encrypted.as_message().is_none());
+        let redacted = TimelineItemContent::MsgLike(MsgLikeContent::redacted());
+        assert!(!redacted.is_unable_to_decrypt());
     }
 }
 

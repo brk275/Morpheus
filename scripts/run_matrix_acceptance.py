@@ -113,6 +113,8 @@ APP_TIMELINE_CHECKS = frozenset((
     "link_follow_up_owned_focus", "member_publication", "cleanup_complete",
 ))
 APP_TIMELINE_STAGES = frozenset((
+    "setup_profile", "setup_config", "setup_window", "setup_controller",
+    "setup_dispatch", "setup_login", "setup_rooms", "setup_ready",
     "setup", "activation", "room_open", "room_delivery", "thread_delivery",
     "revocation", "renewal", "reopen", "queued_revocation", "queued_drain",
     "queued_reopen", "link_continuation", "member_publication", "cleanup", "complete",

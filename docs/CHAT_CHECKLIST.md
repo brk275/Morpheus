@@ -79,6 +79,18 @@ fresh evidence. See [the verification log](VERIFICATION.md).
 
 - [ ] Verify devices and recover encrypted history with key backup after a
       fresh install. Show actionable errors for missing keys.
+      A fixed notice for undecryptable entries in the currently loaded room,
+      focused view or thread now offers Security & recovery for that view's
+      original account selection. It exposes no event/error payload and never
+      starts key requests, retries decryption or marks messages read. Existing
+      SDK encryption and backup policies are unchanged. Re-decryption
+      or removal updates the notice alongside the existing message rows.
+      Leaving chat retires the visible action; returning from Settings can
+      reissue it locally, with a fresh serial, only while the original loaded
+      view and account/security leases still hold. No new SDK event is needed.
+      Source proposal only: hosted native checks and real missing-key/backup
+      recovery behavior remain unverified; the fresh-install acceptance stays
+      open.
 - [ ] Manage room name, topic, avatar, join rules, invites, roles, power levels,
       bans, kicks, and redactions subject to Matrix permissions. Guarded
       name/topic/avatar/join-rule controls and staged image preparation are

@@ -348,7 +348,10 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         # the real queued_drain phase. Keep these independent of the parser's
         # allowlists so an incompatible whitelist fails this contract.
         records = (
-            "STAGE setup", "STAGE activation", "STAGE room_open",
+            "STAGE setup", "STAGE setup_profile", "STAGE setup_config",
+            "STAGE setup_window", "STAGE setup_controller", "STAGE setup_dispatch",
+            "STAGE setup_login", "STAGE setup_rooms", "STAGE setup_ready",
+            "STAGE activation", "STAGE room_open",
             "STAGE room_delivery", "CHECK room_delivery=true",
             "STAGE thread_delivery", "CHECK thread_delivery=true",
             "CHECK thread_root_excluded=true", "CHECK feeds_running=true",
@@ -454,6 +457,8 @@ class AppTimelineEvidenceTests(unittest.TestCase):
                          {"test_entered": True, "stage": "queued_drain"})
         self.assertEqual(acceptance_module.app_timeline_diagnostics("private-token"), {"test_entered": False})
         for stage in (
+            "setup_profile", "setup_config", "setup_window", "setup_controller",
+            "setup_dispatch", "setup_login", "setup_rooms", "setup_ready",
             "cleanup_logout_primary", "cleanup_logout_other", "cleanup_manager_stop",
             "cleanup_drop_live", "cleanup_drop_ui", "cleanup_wait_profile",
             "cleanup_drop_manager", "cleanup_remove_directory",
