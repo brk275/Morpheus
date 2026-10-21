@@ -347,7 +347,7 @@ ELEMENT_LABEL = "element-call-rc-sticky2025-presynced"
 # Setup/build/browser-install stages never prove that a peer check entered.
 ELEMENT_TEST_STAGES = frozenset((
     "browser_login", "browser_identity", "browser_room_sync", "native_join_wait",
-    "browser_join", "browser_roster", "browser_receive_video", "native_media_wait",
+    "browser_join", "browser_roster", "browser_receive_video", "browser_receive_audio", "native_media_wait",
     "browser_leave", "native_test", "complete",
 ))
 RTC_CHECKS = ("unsupported_transport_local", *RING_LABELS, *RTC_LABELS, ELEMENT_LABEL)
@@ -1313,9 +1313,9 @@ class Acceptance:
                 if any("element_checks" in item for item in self.results):
                     output.write(f"\nElement peer passed: `{ELEMENT_VERSION}`, `{ELEMENT_IMAGE_DIGEST}`. "
                                  "Only its pre-synced Sticky2025 mode was tested, with two-way synthetic video, "
-                                 "browser-to-native audio, roster and departure. This does not verify stable "
+                                 "two-way synthetic audio, roster and departure. This does not verify stable "
                                  "v0.26.1 Matrix 2.0, Morpheus's Current default, fresh-device late join, "
-                                 "native-to-browser audio, or full call release acceptance.\n")
+                                 "physical microphone/speaker devices, or full call release acceptance.\n")
                 if any("ring_checks" in item for item in self.results):
                     output.write("\nInvitation rows verify the actual app sender, unsolicited encrypted sync "
                                  "receipt with authenticated device metadata, independently fetched events, and "

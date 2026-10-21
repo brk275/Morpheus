@@ -1461,6 +1461,14 @@ class LiveEvidenceTests(unittest.TestCase):
                 runner.run("element-incomplete", [sys.executable, "-c", "print('MORPHEUS_ELEMENT_CHECK browser_roster=true')"], element_checks=True)
             self.assertEqual(len(runner.results), 1)
 
+            # The outer collector must also reject the formerly complete
+            # eleven-fact peer and any explicit reverse-audio failure.
+            for incomplete in (facts.replace("MORPHEUS_ELEMENT_CHECK browser_audio=true", ""),
+                               facts + "\nMORPHEUS_ELEMENT_CHECK browser_audio=false"):
+                with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                    runner.run("element-reverse-audio-incomplete", [sys.executable, "-c", f"print({incomplete!r})"], element_checks=True)
+                self.assertEqual(len(runner.results), 1)
+
     def test_summary_does_not_claim_element_ran_before_its_check(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -2636,6 +2644,7 @@ class ScopedContinuationTests(unittest.TestCase):
 
     def test_element_setup_deadline_is_fatal_and_only_actual_peer_stages_are_collectible(self):
         from run_element_acceptance import STAGES
+        self.assertIn("browser_receive_audio", acceptance_module.ELEMENT_TEST_STAGES)
         for stage in STAGES:
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as folder:
                 runner = Acceptance(Path(folder), "scanner")
