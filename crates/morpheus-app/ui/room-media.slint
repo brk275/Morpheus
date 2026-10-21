@@ -304,7 +304,9 @@ export component RoomMediaPanel inherits FocusScope {
                             Rectangle {
                                 // The typed search must not widen the panel.
                                 min-width: 0px;
-                                clip: true;
+                                // TextInput clips its own text. An ancestor clip
+                                // would hide it from Tab navigation while it is
+                                // scrolled out, before the viewport can reveal it.
                                 search-input := TextInput {
                                     width: parent.width;
                                     height: parent.height;
