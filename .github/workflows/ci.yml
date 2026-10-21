@@ -1,8 +1,8 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, personal-account, physical-device or artifact jobs.
-# Linux additionally runs the reviewed disposable app-timeline fixture after offline checks.
+# Linux runs the reviewed disposable app-timeline fixture after offline checks; call-native then runs the four ring cases.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed beta catch-up - 70bce70 - ${{ inputs.platform }}
+run-name: Reviewed beta catch-up - 5ee2734 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -17,11 +17,11 @@ on:
         type: choice
         required: true
         default: full
-        options: [full, failed-linux, account-ui, product-linux, app-linux, product-sdk-linux, helper-linux, app-timeline-linux, app-tests, media-native]
+        options: [full, failed-linux, account-ui, product-linux, app-linux, product-sdk-linux, helper-linux, app-timeline-linux, app-tests, media-native, call-native]
 permissions:
   contents: read
 concurrency:
-  group: beta-native-70bce70-${{ github.ref }}
+  group: beta-native-5ee2734-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -38,7 +38,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 70bce70aeb36e69433cdfd3c1a6abd450a4d1e78
+          ref: 5ee27349239147adcbc2efbb24ba948307e52287
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = 70bce70aeb36e69433cdfd3c1a6abd450a4d1e78
+          test "$(git -C candidate rev-parse HEAD)" = 5ee27349239147adcbc2efbb24ba948307e52287
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -86,7 +86,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 70bce70aeb36e69433cdfd3c1a6abd450a4d1e78
+          ref: 5ee27349239147adcbc2efbb24ba948307e52287
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -325,7 +325,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='70bce70aeb36e69433cdfd3c1a6abd450a4d1e78'
+          source='5ee27349239147adcbc2efbb24ba948307e52287'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -666,7 +666,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='70bce70aeb36e69433cdfd3c1a6abd450a4d1e78'
+          source='5ee27349239147adcbc2efbb24ba948307e52287'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -1039,24 +1039,36 @@ jobs:
                       'timeline::read_receipts::test_mark_as_read_with_unread_flag',
                   },set()))
           if os.environ.get('RUNNER_OS')=='Linux':
-              # Only the three existing selector/evidence/cleanup classes affected
-              # by the app-timeline selector change. Exact count; skips/xfails fail.
+              # Existing selector, timeline, ring/actor evidence and cleanup classes.
+              # Exact count; skips/xfails fail.
               helper_program = """import sys, unittest
           sys.path.insert(0, 'scripts/tests')
           names = ['test_matrix_acceptance.' + name for name in (
-              'FocusedSuiteTests', 'AppTimelineEvidenceTests', 'FinalizationTests')]
+              'FocusedSuiteTests', 'AppTimelineEvidenceTests', 'FinalizationTests',
+              'OutgoingRingTests', 'IncomingActorTests')]
           suite = unittest.defaultTestLoader.loadTestsFromNames(names)
-          if suite.countTestCases() != 43: raise SystemExit(1)
+          if suite.countTestCases() != 69: raise SystemExit(1)
           result = unittest.TextTestRunner(verbosity=2).run(suite)
-          okay = (result.wasSuccessful() and result.testsRun == 43 and not result.skipped
+          okay = (result.wasSuccessful() and result.testsRun == 69 and not result.skipped
                   and not result.expectedFailures and not result.unexpectedSuccesses)
           raise SystemExit(0 if okay else 1)
           """
               checks.append(('matrix_acceptance_helpers',
                   [sys.executable, '-I', '-B', '-c', helper_program], 300, None, set()))
+          # Require the eight reviewed V5 receipt/controller/worker boundaries.
+          needed_app.update({
+              'incoming_ring::controller::tests::only_verified_own_other_device_declines_qualify_at_receipt',
+              'incoming_ring::controller::tests::retained_declines_are_bounded_short_lived_and_scoped',
+              'incoming_ring::controller::tests::retained_declines_cannot_outlive_a_stop_or_scope_change',
+              'incoming_ring::controller::tests::a_held_decline_check_withholds_only_its_unshown_offer',
+              'incoming_ring::controller::tests::a_decline_settles_only_its_exact_offer_before_its_own_deadline',
+              'incoming_ring::worker::tests::a_decline_receipt_never_interrupts_another_calls_admission',
+              'incoming_ring::worker::tests::decline_checks_finish_while_another_calls_admission_is_held',
+              'incoming_ring::worker::tests::a_new_decline_is_checked_and_applied_while_another_call_admits',
+          })
           # Critical media repairs belong only to this affected-source scope.
           # Update the referenced sets before constructing the closed diagnostic IDs.
-          if os.environ.get('MORPHEUS_CHECK_SCOPE','full')=='media-native':
+          if os.environ.get('MORPHEUS_CHECK_SCOPE','full') in ('media-native','call-native'):
               needed_app.update({
                   'image_previews::animation::tests::autoplay_is_decided_when_playback_starts_and_explicit_play_still_works',
                   'image_previews::animation::tests::a_forced_pause_is_never_lost_behind_other_commands_or_a_playing_frame',
@@ -1076,7 +1088,7 @@ jobs:
           # successful production/RTC/config/SDK evidence on Linux, and reruns only
           # the two failed suites plus formatting. Other native platforms stay full.
           scope=os.environ.get('MORPHEUS_CHECK_SCOPE','full')
-          if scope not in ('full','failed-linux','account-ui','product-linux','app-linux','product-sdk-linux','helper-linux','app-timeline-linux','app-tests','media-native'):
+          if scope not in ('full','failed-linux','account-ui','product-linux','app-linux','product-sdk-linux','helper-linux','app-timeline-linux','app-tests','media-native','call-native'):
               raise SystemExit('unknown_check_scope')
           if scope=='helper-linux':
               if os.environ.get('RUNNER_OS')!='Linux':
@@ -1116,9 +1128,10 @@ jobs:
           if scope=='app-tests':
               checks=[check for check in checks if check[0] in
                   {'format','app_unit_controller','matrix_acceptance_helpers'}]
-          if scope=='media-native':
-              checks=[check for check in checks if check[0] in
-                  {'format','native_app_build','app_unit_controller','config_unit'}]
+          if scope in ('media-native','call-native'):
+              selected={'format','native_app_build','app_unit_controller','config_unit'}
+              if scope=='call-native': selected.add('matrix_acceptance_helpers')
+              checks=[check for check in checks if check[0] in selected]
               # Config and its 59 build/theme/example inputs are unchanged.
               # Reuse immutable platform-specific passes, not an App pass:
               # Linux9be6d31/39545876808; Mac/Windows987e5d0/39552046988.
@@ -1140,7 +1153,7 @@ jobs:
               checks.append(('app_timeline_compile',
                   ['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                       '--bin','morpheus-app','--no-run'],40*60,None,set()))
-          if os.environ.get('RUNNER_OS')=='Linux' and scope in ('full','app-timeline-linux','app-tests','media-native'):
+          if os.environ.get('RUNNER_OS')=='Linux' and scope in ('full','app-timeline-linux','app-tests','media-native','call-native'):
               # Isolated Python excludes script siblings. Add only this exact
               # reviewed checkout's helper directory after importing stdlib.
               fixture_program = """import pathlib, runpy, sys
@@ -1152,10 +1165,97 @@ jobs:
               checks.append(('app_timeline_disposable',
                   ['dbus-run-session','--',sys.executable,'-I','-B','-c',fixture_program,
                       '--suite','app-timeline','--gitleaks',str(scanner)],56*60,None,set()))
+              if scope=='call-native':
+                  # App unit execution already compiled the same target; no duplicate precompile.
+                  checks.append(('outgoing_ring_disposable',
+                      ['dbus-run-session','--',sys.executable,'-I','-B','-c',fixture_program,
+                          '--suite','outgoing-ring','--gitleaks',str(scanner)],56*60,None,set()))
+          # Parse only the new call check's independently scanned output. No candidate
+          # helper is imported here; rebuild public facts from fixed enums/booleans only.
+          def outgoing_ring_evidence(output, helper_ok):
+              import math
+              cases={
+                  'outgoing-ring-current-dm':('current','dm'),
+                  'outgoing-ring-current-room':('current','room'),
+                  'outgoing-ring-sticky-2025-dm':('sticky-2025','dm'),
+                  'outgoing-ring-sticky-2025-room':('sticky-2025','room'),
+              }
+              ring_keys={
+                  'sticky_sync','own_crypto','peer_trust','joined_without_media',
+                  'encrypted_membership','invitation_receipt','unsolicited_encrypted_notification',
+                  'fetched_decrypted_notification','targeted_reference','redaction_receipt',
+                  'redaction_observed','unsolicited_redaction_observed','cleanup',
+              }
+              actor_keys={
+                  'actor_discovered','exact_key_once','actor_withdrew','admitted_target_preserved',
+                  'accepted_join_identity','slot_unchanged','quiet_receive_only',
+                  'established_after_withdrawal','accepted_leave_observed','actor_cleanup',
+              }
+              fields={'check','status','passed','seconds','ring_checks','incoming_checks',
+                  'ring_mode','ring_target','account_replay_exercised','quiet_evidence',
+                  'withdrawal_evidence','actor_withdrawal_processing_confirmed'}
+              def unique_object(pairs):
+                  value={}
+                  for key,item in pairs:
+                      if key in value: raise ValueError('duplicate_json_key')
+                      value[key]=item
+                  return value
+              found={}; invalid=False; objects=0
+              for raw in io.StringIO(output):
+                  line=raw.strip()
+                  if not line.startswith('{'): continue
+                  objects+=1
+                  if objects>64 or len(line)>16384:
+                      invalid=True; break
+                  try: row=json.loads(line,object_pairs_hook=unique_object)
+                  except (ValueError,RecursionError,OverflowError):
+                      invalid=True; continue
+                  if type(row) is not dict:
+                      invalid=True; continue
+                  label=row.get('check')
+                  if type(label) is not str: continue
+                  if label not in cases:
+                      if label.startswith('outgoing-ring-'): invalid=True
+                      continue
+                  if label in found:
+                      invalid=True; continue
+                  mode,target=cases[label]
+                  replay=mode=='current' and target=='dm'
+                  expected_actor=actor_keys|({'account_replay_rejected'} if replay else set())
+                  ring=row.get('ring_checks'); actor=row.get('incoming_checks')
+                  seconds=row.get('seconds')
+                  seconds_ok=((type(seconds) is int and 0<=seconds<=360)
+                      or (type(seconds) is float and math.isfinite(seconds) and 0<=seconds<=360))
+                  valid=(set(row)==fields and row.get('status')=='passed'
+                      and type(row.get('passed')) is int and row['passed']==1 and seconds_ok
+                      and row.get('ring_mode')==mode and row.get('ring_target')==target
+                      and row.get('account_replay_exercised') is replay
+                      and row.get('actor_withdrawal_processing_confirmed') is False
+                      and row.get('quiet_evidence')=='sampled_cache_and_media_state'
+                      and row.get('withdrawal_evidence')=='joined_after_sdk_cache_removal'
+                      and type(ring) is dict and set(ring)==ring_keys
+                      and all(value is True for value in ring.values())
+                      and type(actor) is dict and set(actor)==expected_actor
+                      and all(value is True for value in actor.values()))
+                  if not valid:
+                      invalid=True; continue
+                  found[label]={'check':label,'ring_mode':mode,'ring_target':target,
+                      'tests_passed':1,'ring_checks':{key:True for key in sorted(ring_keys)},
+                      'incoming_checks':{key:True for key in sorted(expected_actor)},
+                      'account_replay_exercised':replay,
+                      'quiet_evidence_is_sampled_cache_and_media_state':True,
+                      'withdrawal_evidence_is_joined_after_sdk_cache_removal':True,
+                      'actor_withdrawal_processing_confirmed':False}
+              complete=helper_ok and not invalid and set(found)==set(cases)
+              return {'complete':complete,'helper_exit_ok':bool(helper_ok),
+                  'required_case_count':4,'valid_case_count':len(found),
+                  'cases':[found[label] for label in sorted(found)],
+                  # These existing cases do not exercise cross-device Decline delivery.
+                  'cross_device_decline_exercised':False}
           # All four platform scopes use this exact stable reviewed candidate.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
-              if name=='app_timeline_disposable' and not all_passed:
+              if name in ('app_timeline_disposable','outgoing_ring_disposable') and not all_passed:
                   print(json.dumps({'check':name,'status':'not_run','reason':'dependency_failed',
                       'source':source,'raw_logs_public':False},sort_keys=True),flush=True)
                   continue
@@ -1200,8 +1300,13 @@ jobs:
                       and ignored==allowed_ignored and required<=okay)
                   record.update({'complete_test_accounting':complete,'tests_passed':a,'tests_failed':b,
                       'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
-              record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
-              if not passed:
+              if name=='outgoing_ring_disposable':
+                  evidence=outgoing_ring_evidence(output,passed)
+                  passed=passed and evidence['complete']
+                  record['outgoing_ring_evidence']=evidence
+              if name!='outgoing_ring_disposable':
+                  record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
+              if not passed and name!='outgoing_ring_disposable':
                   # Compiler diagnostics leave this process only after the independent scan.
                   # Exclude panic/assertion/authentication bodies. Keep compiler type-chain notes
                   # needed to diagnose Send/Sync constraints, bounded to 4 KiB in total.
