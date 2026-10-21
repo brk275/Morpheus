@@ -2,7 +2,7 @@
 # No package, installed UI, Wayland, personal-account, physical-device or artifact jobs.
 # Linux runs disposable checks after offline checks; call-native owns timeline and four ring cases in one fixture lifecycle.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed beta catch-up - ec290f7 - ${{ inputs.platform }}
+run-name: Reviewed beta catch-up - 5661aef - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -21,7 +21,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-ec290f7-${{ github.ref }}
+  group: beta-native-5661aef-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -38,7 +38,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: ec290f75d8b486b8b58b458cc2cced5022f1edf8
+          ref: 5661aeff5a2f5abbc168847414210af2ccb61282
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = ec290f75d8b486b8b58b458cc2cced5022f1edf8
+          test "$(git -C candidate rev-parse HEAD)" = 5661aeff5a2f5abbc168847414210af2ccb61282
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -86,7 +86,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: ec290f75d8b486b8b58b458cc2cced5022f1edf8
+          ref: 5661aeff5a2f5abbc168847414210af2ccb61282
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -325,7 +325,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='ec290f75d8b486b8b58b458cc2cced5022f1edf8'
+          source='5661aeff5a2f5abbc168847414210af2ccb61282'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -666,7 +666,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='ec290f75d8b486b8b58b458cc2cced5022f1edf8'
+          source='5661aeff5a2f5abbc168847414210af2ccb61282'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
