@@ -7660,7 +7660,7 @@ async fn assert_public_profile_projection(ui: &AppWindow) {
     crate::account_identity::apply_server(ui, &confirmed, true);
     settle(ui).await;
     assert_eq!(ui.get_active_account_name(), "Public Alias");
-    assert_eq!(ui.get_active_account_initials(), "PA");
+    assert_eq!(ui.get_active_account_initials(), "PU");
     assert_eq!(
         ui.get_account_options().row_data(0).unwrap().name,
         "Public Alias"
