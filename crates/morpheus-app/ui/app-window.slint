@@ -3755,6 +3755,36 @@ export component AppWindow inherits Window {
     in-out property <string> settings-reveal-id;
     in-out property <int> settings-reveal-serial: 0;
     in-out property <string> settings-revealed-id;
+    // Only an explicit registry reveal can arm this one-attempt mount handoff.
+    in-out property <bool> settings-controls-mounted: false;
+    in-out property <bool> settings-reveal-pending: false;
+    in-out property <string> settings-pending-reveal-id;
+    in-out property <int> settings-pending-reveal-serial: 0;
+    callback settings-reveal-ready(string, int);
+    public function cancel-settings-reveal() {
+        root.settings-reveal-pending = false;
+        root.settings-pending-reveal-id = "";
+        root.settings-pending-reveal-serial = 0;
+    }
+    public function prepare-settings-reveal() {
+        root.cancel-settings-reveal();
+        root.settings-search-focus-pending = false;
+    }
+    // Page and session availability are checked separately. Inline Settings
+    // status/busy rows remain valid destinations; another modal owns its focus.
+    out property <bool> settings-reveal-protected: root.show-sign-in || root.access-open
+        || root.manage-accounts-open || root.account-menu-open || root.account-switch-pending
+        || root.security-recovery-key != "" || root.account-profile-open || root.people-open
+        || MemberPrivacy.inspector.open || SpaceExplorer.open || SpaceRooms.open || RoomAddresses.open
+        || RoomNotificationState.open || RoomActivity.seen-open || root.quick-switcher-open
+        || root.room-actions-open || root.room-admin-open || root.member-confirm-open
+        || root.native-capture-picker-open || root.leave-call-dialog || root.image-preview-open
+        || root.poll-dialog-open || ThreadBrowser.open || RoomLeave.view.open || MatrixLink.open
+        || root.header-more-open || IdentityWarnings.open || InvitationsState.open
+        || root.shortcut-recording != "";
+    changed settings-reveal-protected => {
+        if root.settings-reveal-protected { root.cancel-settings-reveal(); }
+    }
     // Manage accounts focuses "add", "protection", "profile" or its close action.
     in-out property <string> manage-accounts-focus;
     // Public profile editor (account_identity.rs) for the current account.
@@ -4119,7 +4149,11 @@ export component AppWindow inherits Window {
         root.verification-protected();
     }
     public function navigate-page(next: int) {
-        if next != 1 { root.withdraw-verification(); }
+        if next != 1 {
+            root.cancel-settings-reveal();
+            root.settings-controls-mounted = false;
+            root.withdraw-verification();
+        }
         root.page = next;
     }
     // While any of these holds, no SAS value stays in the window.
@@ -4712,6 +4746,7 @@ export component AppWindow inherits Window {
     property <int> settings-search-focus-request: 0;
     public function focus-settings-search() {
         if RoomLeave.view.open { return; }
+        root.cancel-settings-reveal();
         root.settings-search-focus-pending = true;
         MatrixLink.withdraw(); UnreadNavigation.withdraw-jump();
         IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
@@ -5354,6 +5389,8 @@ export component AppWindow inherits Window {
         root.cancel-room-settings();
         root.close-image-preview();
         if root.page != 1 {
+            root.cancel-settings-reveal();
+            root.settings-controls-mounted = false;
             // Leaving Settings ends a recording, so shortcuts never stay paused.
             if root.shortcut-recording != "" { root.shortcut-cancel-recording(); }
             root.security-recovery-input = "";
@@ -5562,7 +5599,7 @@ export component AppWindow inherits Window {
     // page keep the entry. A refused entry changes nothing.
     out property <bool> room-creation-entry-blocked: root.room-actions-open
         || RoomCreation.busy || RoomCreation.relinking || root.room-creation-blocked;
-    changed matrix-link-protected => { if root.matrix-link-protected { MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); } }
+    changed matrix-link-protected => { if root.matrix-link-protected { MatrixLink.context-protected(); UnreadNavigation.withdraw-jump(); } }
     // The thread browser (thread-browser.slint) may show and act only while
     // this holds; Rust's thread_browser::held reads it, so the two are one
     // predicate. The session is live, the conversation page is shown, and
@@ -8328,6 +8365,24 @@ export component AppWindow inherits Window {
                     }
                 }
                 if root.page == 1 : settings-scroll := ScrollView {
+                    init => { root.settings-controls-mounted = true; }
+                    // Start after this conditional installs its change trackers.
+                    // A retained subtree uses the same pending handoff after a
+                    // same-event leave/return. Consume before calling Rust: one
+                    // attempt, current registry identity, no repeating retry.
+                    Timer {
+                        interval: 0ms;
+                        running: root.settings-reveal-pending;
+                        triggered => {
+                            let id = root.settings-pending-reveal-id;
+                            let serial = root.settings-pending-reveal-serial;
+                            root.cancel-settings-reveal();
+                            if root.page == 1 {
+                                root.settings-controls-mounted = true;
+                                root.settings-reveal-ready(id, serial);
+                            }
+                        }
+                    }
                     vertical-stretch: 1;
                     horizontal-scrollbar-policy: always-off;
                     // This page scrolls vertically. Do not let a long label

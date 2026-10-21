@@ -14189,6 +14189,17 @@ async fn assert_media_viewer_keyboard(ui: &AppWindow) {
 async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     use std::{cell::Cell, rc::Rc};
 
+    async fn finish_reveal(ui: &AppWindow) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ui.get_settings_reveal_pending() {
+                settle(ui).await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the mounted Settings page consumes its one focus request");
+    }
+
     const ROW: &str = "Play animated images automatically when opened";
     let page = ui.get_page();
     let requested = Rc::new(Cell::new(None));
@@ -14201,6 +14212,18 @@ async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     crate::image_previews::apply_config(ui, &config);
     assert!(crate::settings_search::reveal(ui, "media.image_previews"));
     settle(ui).await;
+    // A cold Settings page delivers its pending request after mounting. Wait
+    // for that handoff, then require the same real control focus as a hot page.
+    finish_reveal(ui).await;
+    assert!(focused_control_has_label(
+        ui,
+        "Allow image previews in encrypted rooms"
+    ));
+    // Repeating a hot request, and choosing a different hot destination, use
+    // the live trackers without arming a delayed focus that could undo Tab.
+    assert!(crate::settings_search::reveal(ui, "media.image_previews"));
+    settle(ui).await;
+    assert!(!ui.get_settings_reveal_pending());
     assert!(focused_control_has_label(
         ui,
         "Allow image previews in encrypted rooms"
@@ -14220,6 +14243,73 @@ async fn assert_animation_autoplay_setting(ui: &AppWindow) {
     config.media.autoplay_animated_media = false;
     crate::image_previews::apply_config(ui, &config);
     assert!(!ui.get_image_previews_autoplay());
+    assert!(requested.take().is_none());
+
+    // Before mounting, the latest explicit destination wins. Merely revealing
+    // either setting must never request a configuration save. A live page0
+    // also exercises the normal link-protection fallback on entry to Settings.
+    let was_live = ui.get_live_session();
+    ui.set_live_session(true);
+    ui.invoke_navigate_page(0);
+    settle(ui).await;
+    assert!(crate::settings_search::reveal(ui, "media.image_previews"));
+    assert!(crate::settings_search::reveal(
+        ui,
+        "media.autoplay_animated_media"
+    ));
+    assert!(ui.get_settings_reveal_pending());
+    settle(ui).await;
+    finish_reveal(ui).await;
+    assert!(focused_control_has_label(ui, ROW));
+    assert!(requested.take().is_none());
+
+    // A mounted conditional can survive a same-event leave/explicit return.
+    // Its pending timer must still deliver the new request without another init.
+    ui.invoke_navigate_page(0);
+    assert!(crate::settings_search::reveal(ui, "media.image_previews"));
+    assert!(ui.get_settings_reveal_pending());
+    settle(ui).await;
+    finish_reveal(ui).await;
+    assert!(focused_control_has_label(
+        ui,
+        "Allow image previews in encrypted rooms"
+    ));
+    assert!(requested.take().is_none());
+
+    // Synchronous navigation retires a request even if the leave and return
+    // coalesce into one conditional update. A manual visit cannot replay it.
+    ui.invoke_navigate_page(0);
+    settle(ui).await;
+    ui.set_settings_revealed_id("".into());
+    assert!(crate::settings_search::reveal(ui, "media.image_previews"));
+    ui.invoke_navigate_page(0);
+    ui.invoke_navigate_page(1);
+    settle(ui).await;
+    assert!(!ui.get_settings_reveal_pending());
+    assert_eq!(ui.get_settings_revealed_id(), "");
+    assert!(!focused_control_has_label(
+        ui,
+        "Allow image previews in encrypted rooms"
+    ));
+
+    // Protected entries use the same synchronous retirement before their
+    // surface opens. Closing that surface grants no authority to replay.
+    ui.invoke_navigate_page(0);
+    settle(ui).await;
+    assert!(crate::settings_search::reveal(ui, "media.image_previews"));
+    assert!(ui.get_settings_reveal_pending());
+    crate::matrix_links::clear(ui);
+    ui.set_manage_accounts_open(true);
+    ui.set_manage_accounts_open(false);
+    settle(ui).await;
+    assert!(!ui.get_settings_reveal_pending());
+    assert_eq!(ui.get_settings_revealed_id(), "");
+    assert!(!focused_control_has_label(
+        ui,
+        "Allow image previews in encrypted rooms"
+    ));
+    assert!(requested.take().is_none());
+    ui.set_live_session(was_live);
     ui.on_set_animated_image_autoplay(|_| {});
     ui.set_settings_revealed_id("".into());
     ui.set_page(page);

@@ -534,6 +534,11 @@ fn next_operation() -> u64 {
 /// resets it calls this; a link's own ends and its stale cleanup call
 /// end_link, which leaves a newer open alone.
 pub(crate) fn clear(ui: &AppWindow) {
+    crate::settings_search::withdraw(ui);
+    clear_window_owners(ui);
+}
+
+fn clear_window_owners(ui: &AppWindow) {
     // Every route that takes over the window clears links here first, before
     // its surface opens; a held unread jump ends at the same moment, for good.
     crate::unread_navigation::withdraw_jump(ui);
@@ -617,6 +622,19 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     state.on_withdraw(move || {
         if let Some(ui) = weak.upgrade() {
             clear(&ui);
+        }
+    });
+    // The deferred protection fallback also runs when a reveal navigates from
+    // the conversation to Settings. Retire the same link/timeline owners, but
+    // do not cancel that destination's own focus handoff. Actual admitted
+    // surface entries still call clear/withdraw synchronously above.
+    let weak = ui.as_weak();
+    state.on_context_protected(move || {
+        if let Some(ui) = weak.upgrade() {
+            if ui.get_page() != 1 || ui.get_settings_reveal_protected() {
+                crate::settings_search::withdraw(&ui);
+            }
+            clear_window_owners(&ui);
         }
     });
 }

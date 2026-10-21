@@ -50,6 +50,9 @@ export global MatrixLink {
     callback close();
     // A protected surface took over: withdraw and hide, focus untouched.
     callback withdraw();
+    // Deferred context fallback, including the destination's own page change.
+    // Keeps the same link/seek retirement; admitted entries use withdraw.
+    callback context-protected();
 }
 
 export component MatrixLinkPanel inherits FocusScope {

@@ -24,6 +24,12 @@ pub(super) fn register(ui: &AppWindow) {
             reveal(&ui, id.as_str());
         }
     });
+    let weak = ui.as_weak();
+    ui.on_settings_reveal_ready(move |id, serial| {
+        if let Some(ui) = weak.upgrade() {
+            complete_mounted_reveal(&ui, id.as_str(), serial);
+        }
+    });
 }
 
 fn available(ui: &AppWindow, requirement: Requirement) -> bool {
@@ -226,7 +232,7 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
         // Selecting is presentation only; the file is not touched.
         crate::appearance_editor::select_token(ui, token);
         ui.set_settings_reveal_id(SharedString::from(COLOR_HEX_REVEAL));
-        request_settings_reveal(ui);
+        request_settings_reveal(ui, id);
         ui.set_settings_search_dismissed(true);
         return true;
     }
@@ -235,7 +241,7 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
         // field reports this result's own ID once it has focus.
         crate::metric_editor::select_metric(ui, field.key);
         ui.set_settings_reveal_id(SharedString::from(METRIC_VALUE_REVEAL));
-        request_settings_reveal(ui);
+        request_settings_reveal(ui, id);
         ui.set_settings_search_dismissed(true);
         return true;
     }
@@ -245,9 +251,10 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
     if !available(ui, target.requires) {
         return false;
     }
+    withdraw(ui);
     ui.set_settings_reveal_id(SharedString::from(target.id));
     match target.route {
-        Route::Settings => request_settings_reveal(ui),
+        Route::Settings => request_settings_reveal(ui, target.id),
         // Presentation only: the panel shows what is already there.
         Route::Transfers => ui.invoke_show_transfer_panel(),
         // Presentation only: Home with the center open, focused on its
@@ -301,12 +308,55 @@ pub(super) const COLOR_HEX_REVEAL: &str = "appearance.color_hex";
 /// is reached through a metric result, which it reports once focused.
 pub(super) const METRIC_VALUE_REVEAL: &str = "appearance.metric_value";
 
-fn request_settings_reveal(ui: &AppWindow) {
+/// Retire a delayed focus request before a newer route takes over the window.
+/// The destination itself stays selected; this grants no authority to replay it.
+pub(super) fn withdraw(ui: &AppWindow) {
+    ui.invoke_cancel_settings_reveal();
+}
+
+fn next_serial(serial: i32) -> i32 {
+    serial.checked_add(1).unwrap_or(1).max(1)
+}
+
+fn request_settings_reveal(ui: &AppWindow, id: &str) {
     crate::matrix_links::clear(ui);
     crate::thread_browser::withdraw(ui);
+    ui.invoke_prepare_settings_reveal();
     ui.invoke_navigate_page(1);
-    let serial = ui.get_settings_reveal_serial();
-    ui.set_settings_reveal_serial(serial.checked_add(1).unwrap_or(1).max(1));
+    let serial = next_serial(ui.get_settings_reveal_serial());
+    ui.set_settings_reveal_serial(serial);
+    // A mounted page handles the changed serial immediately. A new conditional
+    // starts with that value, so its trackers need one post-mount notification.
+    // Keep the original registry ID, including the selected color/metric key.
+    if !ui.get_settings_controls_mounted() {
+        ui.set_settings_pending_reveal_id(id.into());
+        ui.set_settings_pending_reveal_serial(serial);
+        ui.set_settings_reveal_pending(true);
+    }
+}
+
+/// Called once by the newly mounted page, after it consumes its pending request.
+/// Recheck the current destination; never navigate, select or activate here.
+fn complete_mounted_reveal(ui: &AppWindow, id: &str, serial: i32) {
+    if ui.get_page() != 1
+        || ui.get_settings_reveal_protected()
+        || ui.get_settings_reveal_serial() != serial
+    {
+        return;
+    }
+    let destination = if let Some(token) = registry::color_result(id) {
+        (ui.get_color_selected_id() == token.id).then_some(COLOR_HEX_REVEAL)
+    } else if let Some((field, _)) = registry::metric_result(id) {
+        (ui.get_metric_selected_key() == field.key).then_some(METRIC_VALUE_REVEAL)
+    } else {
+        registry::setting_target(id).and_then(|target| {
+            (matches!(target.route, Route::Settings) && available(ui, target.requires))
+                .then_some(target.id)
+        })
+    };
+    if destination.is_some_and(|destination| ui.get_settings_reveal_id() == destination) {
+        ui.set_settings_reveal_serial(next_serial(serial));
+    }
 }
 
 #[cfg(test)]
