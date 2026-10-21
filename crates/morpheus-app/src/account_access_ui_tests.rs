@@ -1640,19 +1640,55 @@ async fn assert_seek_policy_and_thread_keeper(
 
     // The person scrolls: the anchor follows them, and the keeper then
     // keeps the new place rather than pulling the old one back.
+    // An anchor can be mostly clipped, so its text center is not a valid
+    // wheel target. Aim inside the actual viewport containing that reply.
+    let target = control_with_label(ui, &rich_fixture(30_001 + index).body);
+    let mut viewports = Vec::new();
+    for node in geometry_nodes(ui) {
+        if node
+            .downcast::<slint::private_unstable_api::re_exports::Flickable>()
+            .is_none()
+        {
+            continue;
+        }
+        let contains_target = node
+            .visit_descendants(|item| {
+                if item == &target {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            })
+            .is_some();
+        if contains_target {
+            viewports.push(item_bounds(&node));
+        }
+    }
+    assert_eq!(viewports.len(), 1, "one actual thread scroll viewport");
+    let viewport = viewports[0];
+    assert!(inside_window(ui, viewport), "{viewport:?}");
     let position = slint::LogicalPosition::new(
-        (kept[0].left + kept[0].right) / 2.0,
-        (kept[0].top + kept[0].bottom) / 2.0,
+        (viewport.left + viewport.right) / 2.0,
+        (viewport.top + viewport.bottom) / 2.0,
     );
-    ui.window().dispatch_event(WindowEvent::PointerScrolled {
-        position,
-        delta_x: 0.0,
-        delta_y: -120.0,
-    });
+    assert_eq!(
+        ui.window()
+            .dispatch_event_with_result(WindowEvent::PointerScrolled {
+                position,
+                delta_x: 0.0,
+                delta_y: -120.0,
+            })
+            .unwrap(),
+        slint::platform::WindowEventDispatchResult::Accepted,
+        "the wheel was accepted inside the thread viewport: {viewport:?}"
+    );
     settle(ui).await;
     let (moved, scrolled) = reader();
     let followed = moved != index || (scrolled[0].top - kept[0].top).abs() > 1.0;
-    assert!(followed, "the anchor followed the scroll");
+    assert!(
+        followed,
+        "the anchor followed the scroll: viewport={viewport:?}, anchor={index}/{moved}, before={kept:?}, after={scrolled:?}"
+    );
     let shorter = height_of(&replies[0].body);
     grow(&mut replies, 9);
     settle(ui).await;
