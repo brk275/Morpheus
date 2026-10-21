@@ -2,7 +2,7 @@
 # No package, installed UI, Wayland, personal-account, physical-device or artifact jobs.
 # Linux additionally runs the reviewed disposable app-timeline fixture after offline checks.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed beta catch-up - 987e5d0 - ${{ inputs.platform }}
+run-name: Reviewed beta catch-up - 70bce70 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -21,7 +21,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-987e5d0-${{ github.ref }}
+  group: beta-native-70bce70-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -38,7 +38,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 987e5d0584469ede45655dea2712a0c8546c6907
+          ref: 70bce70aeb36e69433cdfd3c1a6abd450a4d1e78
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = 987e5d0584469ede45655dea2712a0c8546c6907
+          test "$(git -C candidate rev-parse HEAD)" = 70bce70aeb36e69433cdfd3c1a6abd450a4d1e78
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -86,7 +86,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 987e5d0584469ede45655dea2712a0c8546c6907
+          ref: 70bce70aeb36e69433cdfd3c1a6abd450a4d1e78
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -325,7 +325,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='987e5d0584469ede45655dea2712a0c8546c6907'
+          source='70bce70aeb36e69433cdfd3c1a6abd450a4d1e78'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -666,7 +666,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='987e5d0584469ede45655dea2712a0c8546c6907'
+          source='70bce70aeb36e69433cdfd3c1a6abd450a4d1e78'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -822,6 +822,25 @@ jobs:
               for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
                   known_test_ids.add(prefix+function)
           needed_app={
+              'incoming_ring::tests::decline_failure_needs_a_proven_client_rejection',
+              'incoming_ring::tests::a_decline_send_is_polled_only_while_its_original_fence_holds',
+              'incoming_ring::controller::tests::a_decline_claim_excludes_answer_and_ends_with_its_scope',
+              'incoming_ring::ui::tests::decline_notices_claim_a_decline_only_when_confirmed',
+              'incoming_ring::worker::tests::bounded_commands_drop_unhandled_answer_reply_and_wake_waiter',
+              'incoming_ring::desktop::tests::a_refreshed_offer_shows_once_and_only_newer_offers_show_again',
+              'incoming_ring::desktop::tests::ended_expired_or_revoked_offers_retire_and_withdraw_their_banners',
+              'incoming_ring::desktop::tests::a_stale_completion_never_brings_a_record_back',
+              'incoming_ring::desktop::tests::a_click_resolves_once_only_after_the_os_took_it_and_before_expiry',
+              'incoming_ring::desktop::tests::records_are_bounded_and_the_oldest_is_withdrawn',
+              'incoming_ring::desktop::tests::a_private_screen_opened_during_the_held_account_read_applies',
+              'incoming_ring::desktop::tests::account_only_permission_never_allows_a_named_banner',
+              'incoming_ring::desktop::tests::a_completion_that_named_more_than_now_allowed_is_withdrawn',
+              'incoming_ring::desktop::tests::delivery_threads_never_accumulate',
+              'incoming_ring::desktop::tests::a_late_delivery_nobody_waits_for_withdraws_itself',
+              'incoming_ring::desktop::tests::the_handover_window_sample_is_bounded',
+              'incoming_ring::desktop::tests::a_private_screen_opened_after_the_plan_refuses_a_named_handover',
+              'incoming_ring::desktop::tests::a_late_failure_finds_waiting_and_handed_banners_only',
+              'notifications::tests::call_banners_follow_alert_and_privacy_settings_and_stay_silent',
               'verification::tests::confirmation_requires_explicit_human_comparison',
               'verification::tests::verification_acts_only_on_the_unprotected_settings_page',
               'verification::tests::expiry_comes_from_the_request_and_is_never_restarted',
@@ -1100,11 +1119,20 @@ jobs:
           if scope=='media-native':
               checks=[check for check in checks if check[0] in
                   {'format','native_app_build','app_unit_controller','config_unit'}]
-              # Config inputs are byte-exact source9be6d31; Linux101/101 passed
-              # in39545876808. Reuse that immutable result; the other three
-              # native targets still need this config revision checked.
-              if os.environ.get('RUNNER_OS')=='Linux':
-                  checks=[check for check in checks if check[0]!='config_unit']
+              # Config and its 59 build/theme/example inputs are unchanged.
+              # Reuse immutable platform-specific passes, not an App pass:
+              # Linux9be6d31/39545876808; Mac/Windows987e5d0/39552046988.
+              checks=[check for check in checks if check[0]!='config_unit']
+              config_producer={
+                  ('Linux','X64'):(39545876808,119043889959,'9be6d31fda19195a3dd8492ab4f78405543897bf',101),
+                  ('macOS','ARM64'):(39552046988,119063295206,'987e5d0584469ede45655dea2712a0c8546c6907',101),
+                  ('macOS','X64'):(39552046988,119063295247,'987e5d0584469ede45655dea2712a0c8546c6907',101),
+                  ('Windows','X64'):(39552046988,119063295346,'987e5d0584469ede45655dea2712a0c8546c6907',94),
+              }[(os.environ['RUNNER_OS'],os.environ['RUNNER_ARCH'])]
+              print(json.dumps({'check':'config_unit','status':'reused','source':source,
+                  'producing_run':config_producer[0],'producing_job':config_producer[1],
+                  'producing_source':config_producer[2],'tests_passed':config_producer[3],
+                  'tests_failed':0,'candidate_config_executed':False}))
           if scope=='app-timeline-linux':
               if os.environ.get('RUNNER_OS')!='Linux':
                   raise SystemExit('app_timeline_linux_requires_linux')
