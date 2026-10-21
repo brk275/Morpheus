@@ -1,438 +1,382 @@
-name: CI
-
+# TEMPORARY affected69 Python helper diagnostic. NEVER MERGE. No native builds or history rerun.
+name: Reviewed call helper diagnostic
+run-name: Reviewed call helper69 - e03c719
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_BUILD_JOBS: "2"
-  CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
-
+  group: beta-call-helper69-e03c719-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  scope:
-    name: Security and change scope
-    # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      native: ${{ steps.scope.outputs.native }}
-      native_matrix: ${{ steps.scope.outputs.native_matrix }}
-      config: ${{ steps.scope.outputs.config }}
-      wayland: ${{ steps.scope.outputs.wayland }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          path: candidate
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Check out reviewed validation inputs
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          # PR input is read as data; classification code comes from its base.
-          # Push uses reviewed main; dispatch uses its owner-selected revision.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
-          path: trusted
-          persist-credentials: false
-      - name: Scan committed history for credentials
-        working-directory: candidate
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            --output "$archive"
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          # Scanner code and exact fixture manifest come from the reviewed base.
-          # The candidate's ignore files, attributes and config are not trusted.
-          python3 -I ../trusted/scripts/scan_history.py \
-            --candidate "$PWD" --scanner "$RUNNER_TEMP/gitleaks/gitleaks" \
-            --manifest ../trusted/scripts/public-fixtures.json \
-            --evidence "$RUNNER_TEMP/morpheus-history-scan"
-      - name: Select checks from changed inputs using reviewed classifier
-        id: scope
-        working-directory: candidate
-        # Isolated mode excludes the candidate working directory and Python
-        # environment hooks from import lookup. The classifier uses stdlib only.
-        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
-
   helpers:
-    name: Validation helper tests
-    needs: scope
-    if: github.event.repository.private == false
+    name: Linux existing69 helper diagnostic
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        env:
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
         with:
+          ref: e03c71932e743b3bb7da24b9b4159c2cc6033865
+          path: candidate
+          fetch-depth: 1
           persist-credentials: false
-      - name: Verify checkout identity before host provisioning
-        shell: bash
-        env:
-          REVIEWED_SOURCE: ${{ github.sha }}
+      - name: Run only reviewed helper69 and publish scanned closed diagnostics
+        timeout-minutes: 12
+        shell: python -I {0}
         run: |
-          set -euo pipefail
-          [[ "$REVIEWED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"
-      - name: Tighten hosted notice tree permissions before candidate imports
-        timeout-minutes: 5
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          # Bootstrap from this immutable reviewed workflow revision, including
-          # when the selected package source predates the provisioning helper.
-          git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |
-            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS /usr/bin/python3 -I -B -
-      - name: Check scope and packaging helpers
-        run: |
-          python3 -m unittest discover -s scripts/tests -v
-          python3 -m unittest discover -s scripts -p 'test_*.py' -v
-          python3 -m compileall -q scripts
-          node --check scripts/element_call_peer.mjs
-          node --check scripts/element_call_stock_peer.mjs
-          python3 scripts/package.py --check
+          import hashlib, io, json, os, pathlib, queue, re, signal, stat, subprocess, sys, tarfile, tempfile, threading, time, urllib.request
+          SOURCE='e03c71932e743b3bb7da24b9b4159c2cc6033865'
+          TREE='365113682494623a62ed87d3c0a80268f3c4acb4'
+          SCANNER_ARCHIVE='551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+          SCANNER_BINARY='88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509'
+          HISTORY={'producer_run': 39594161247, 'producer_job': 119202247915, 'producer_workflow': '4adba52d1c8ab8fd5bc5c2f5a42221980b731691', 'producer_workflow_sha256': '88bdcd8bf60056a962818363426b6260b94a6d41bafcccbe351a96a72fa6f37d', 'source': 'e03c71932e743b3bb7da24b9b4159c2cc6033865', 'source_tree': '365113682494623a62ed87d3c0a80268f3c4acb4', 'trusted_history_inputs_ref': '5b6aad377c86b9e98567fbc9181791fec900a065', 'source_scanner_sha256': '88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509', 'producer_report_sha256': '33bbfbefee02e0426cbeed75d64c70b426812c1a23515c8fa5a68092af3f8c3d', 'producer_log_sha256': 'c04a3ebef3c80774b5e9fbcd7721c7bfb862fda1c519d2bd99e83443f6bd5f29', 'reviewed_public_fixtures': 37, 'unexpected_findings': 0, 'producer_log_independent_default_scan_findings': 0, 'history_executed_now': False}
+          INPUT_DIGEST='ddb87f285b9ac706ad15cc613e48f665b1c7baac730be0a038f4de4d44931ae4'
+          CLASS_COUNTS={'FocusedSuiteTests': 11, 'AppTimelineEvidenceTests': 12, 'FinalizationTests': 20, 'OutgoingRingTests': 14, 'IncomingActorTests': 12}
+          PUBLIC_FILES={'scripts/tests/test_matrix_acceptance.py': {'sha256': '9eb1061f35d6bbbaf39787a05c18180510c75c7b9a7b9f556e6774ec28d10b89', 'bytes': 171851, 'lines': 2675}, 'scripts/run_matrix_acceptance.py': {'sha256': '6fcafe95cf24a01290f8f7c12e10056f3e189e247bbdcd5ce59dbfb19df3a690', 'bytes': 81029, 'lines': 1492}, 'scripts/run_timeline_acceptance.py': {'sha256': 'd15cf1350bac6557b638e05c058dedaad52514a1f1c12c67462f2b6f99c4091d', 'bytes': 19692, 'lines': 448}, 'scripts/fixture_paths.py': {'sha256': 'd296c2297f8988e04137b864fdaff1b000799128e81bb39fceefb233c8c65ea6', 'bytes': 1642, 'lines': 53}, 'scripts/element_peer_fixture.py': {'sha256': 'bbd3788aafb2f44cc86cf65827a112c6aa6bd6b086303098a485c1a282eccaf6', 'bytes': 15601, 'lines': 375}, 'scripts/run_element_acceptance.py': {'sha256': '88f466f996909840b8ce668d7bb9cc883a328e423bced3b98e4e27693612fdde', 'bytes': 15388, 'lines': 346}, 'scripts/matrix_fixture_diagnostics.py': {'sha256': '5adb6ec009e47049e02e13ef6cf320abd2b972593bf6021d28d3bdb8d1e5acf1', 'bytes': 2080, 'lines': 48}, 'scripts/sticker_diagnostics.py': {'sha256': '467fd964c91ffedf5e4587fbccacc4db49ab0c9843e69b554454eee317ee2f21', 'bytes': 2152, 'lines': 56}, 'scripts/element_process_namespace.py': {'sha256': '5a3762f32afd469fe5ebd35fbfef726a3d58382d019bfc346ee7d22782741ce4', 'bytes': 10619, 'lines': 255}}
+          KNOWN_CASES=frozenset(['test_matrix_acceptance.AppTimelineEvidenceTests.test_completion_must_follow_assertions_and_setup_must_precede_them', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_diagnostics_reveal_only_fixed_entered_and_stage_values', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_every_missing_fact_is_fatal_even_after_a_green_test_summary', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_excessive_stage_records_are_rejected_before_unbounded_proof_growth', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_false_duplicate_unknown_and_malformed_records_never_pass', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_live_ui_case_remains_required_in_full_and_timeline_profiles', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_member_publication_fact_cannot_be_false_duplicated_or_malformed', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_missing_or_repeated_lifecycle_markers_cannot_stand_in_for_completion', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_one_harness_requires_all_twenty_observable_facts_and_cleanup', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_validated_record_requires_native_test_mode_and_attaches_safe_facts', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_wrapper_uses_exact_ui_harness_fixture_and_process_containment', 'test_matrix_acceptance.AppTimelineEvidenceTests.test_wrong_count_or_skipped_harness_is_not_live_coverage', 'test_matrix_acceptance.FinalizationTests.test_app_timeline_selection_keeps_cleanup_after_success_or_incomplete_results', 'test_matrix_acceptance.FinalizationTests.test_broken_diagnostic_stream_does_not_replace_original_failure', 'test_matrix_acceptance.FinalizationTests.test_chat_assertion_failures_collect_independent_cases_and_keep_exact_prerequisite', 'test_matrix_acceptance.FinalizationTests.test_chat_budget_exhaustion_does_not_start_more_commands_or_extend_deadline', 'test_matrix_acceptance.FinalizationTests.test_chat_infrastructure_failure_remains_fatal_before_later_cases', 'test_matrix_acceptance.FinalizationTests.test_cleanup_interrupt_does_not_skip_second_service', 'test_matrix_acceptance.FinalizationTests.test_drafts_only_main_runs_only_drafts_and_preserves_cleanup', 'test_matrix_acceptance.FinalizationTests.test_each_cleanup_failure_is_fatal_after_both_attempts_and_never_formats_payload', 'test_matrix_acceptance.FinalizationTests.test_focused_suite_failure_cannot_become_success_and_still_cleans_up', 'test_matrix_acceptance.FinalizationTests.test_focused_suite_uses_only_its_declared_checks_and_preserves_cleanup', 'test_matrix_acceptance.FinalizationTests.test_known_chat_or_late_join_failure_does_not_starve_independent_element_check', 'test_matrix_acceptance.FinalizationTests.test_media_only_incomplete_results_still_fail_after_cleanup', 'test_matrix_acceptance.FinalizationTests.test_media_only_main_runs_only_media_and_preserves_cleanup', 'test_matrix_acceptance.FinalizationTests.test_original_body_exception_or_interrupt_survives_summary_and_cleanup_failures', 'test_matrix_acceptance.FinalizationTests.test_outgoing_ring_failure_keeps_original_failure_and_cleans_both_services', 'test_matrix_acceptance.FinalizationTests.test_successful_body_and_cleanup_return_success', 'test_matrix_acceptance.FinalizationTests.test_summary_failure_stays_distinct_and_still_cleans_both_services', 'test_matrix_acceptance.FinalizationTests.test_timeline_read_incomplete_results_still_fail_after_owned_cleanup', 'test_matrix_acceptance.FinalizationTests.test_timeline_read_main_uses_only_selected_checks_and_preserves_cleanup', 'test_matrix_acceptance.FinalizationTests.test_unverified_absence_is_fatal_even_when_both_down_commands_succeed', 'test_matrix_acceptance.FocusedSuiteTests.test_app_timeline_completion_and_summary_cannot_claim_other_checks', 'test_matrix_acceptance.FocusedSuiteTests.test_completion_requires_every_selected_check_and_default_still_requires_full', 'test_matrix_acceptance.FocusedSuiteTests.test_drafts_only_completion_and_summary_cannot_claim_other_checks', 'test_matrix_acceptance.FocusedSuiteTests.test_failed_prerequisite_skips_moderation_but_runs_independent_recovery', 'test_matrix_acceptance.FocusedSuiteTests.test_focused_order_includes_moderation_prerequisite_and_all_app_guards', 'test_matrix_acceptance.FocusedSuiteTests.test_media_only_completion_and_summary_cannot_claim_full_acceptance', 'test_matrix_acceptance.FocusedSuiteTests.test_summary_labels_focused_evidence_and_does_not_require_unselected_checks', 'test_matrix_acceptance.FocusedSuiteTests.test_timeline_failed_formatting_skips_moderation_without_hiding_failure', 'test_matrix_acceptance.FocusedSuiteTests.test_timeline_read_completion_requires_all_selected_checks_and_reports_partial_scope', 'test_matrix_acceptance.FocusedSuiteTests.test_timeline_read_order_keeps_both_sync_paths_and_recovery_fixture', 'test_matrix_acceptance.FocusedSuiteTests.test_unknown_suite_rejected_before_creating_directories', 'test_matrix_acceptance.IncomingActorTests.test_actor_cleanup_failure_stays_fatal_after_contained_test_entry', 'test_matrix_acceptance.IncomingActorTests.test_actor_schema_does_not_replace_the_thirteen_sender_checks', 'test_matrix_acceptance.IncomingActorTests.test_actual_run_publishes_case_specific_actor_facts_only_after_clean_scan', 'test_matrix_acceptance.IncomingActorTests.test_all_four_cases_require_actor_facts_and_only_current_dm_exercises_replay', 'test_matrix_acceptance.IncomingActorTests.test_departure_and_invitation_categories_are_fixed_failures_not_success_facts', 'test_matrix_acceptance.IncomingActorTests.test_each_known_error_or_failure_poisons_otherwise_complete_evidence', 'test_matrix_acceptance.IncomingActorTests.test_every_actor_fact_is_mandatory_and_false_is_permanent_for_every_case', 'test_matrix_acceptance.IncomingActorTests.test_fixed_diagnostics_preserve_false_and_last_known_stage', 'test_matrix_acceptance.IncomingActorTests.test_noncleanup_actor_failure_is_collectible_only_after_scan_and_containment', 'test_matrix_acceptance.IncomingActorTests.test_rust_actor_markers_match_the_exact_public_schema', 'test_matrix_acceptance.IncomingActorTests.test_scan_failure_withholds_actor_diagnostics', 'test_matrix_acceptance.IncomingActorTests.test_unknown_or_malformed_actor_markers_fail_closed_without_payload', 'test_matrix_acceptance.OutgoingRingTests.test_admission_diagnostics_preserve_only_fixed_categories_and_poison_a_pass', 'test_matrix_acceptance.OutgoingRingTests.test_admission_diagnostics_reject_suffixes_unknown_payloads_and_prefixed_lines', 'test_matrix_acceptance.OutgoingRingTests.test_diagnostics_allow_only_fixed_stages_and_failure_categories', 'test_matrix_acceptance.OutgoingRingTests.test_evidence_allows_only_exact_fixed_booleans_and_preserves_false', 'test_matrix_acceptance.OutgoingRingTests.test_exact_named_test_and_every_fixed_fact_are_required', 'test_matrix_acceptance.OutgoingRingTests.test_failed_scan_or_incomplete_case_cannot_publish_a_pass_record', 'test_matrix_acceptance.OutgoingRingTests.test_first_failed_case_stops_later_cases', 'test_matrix_acceptance.OutgoingRingTests.test_four_cases_use_fresh_fixtures_and_the_same_exact_ignored_app_test', 'test_matrix_acceptance.OutgoingRingTests.test_hosted_rust_facts_and_stages_match_public_schema', 'test_matrix_acceptance.OutgoingRingTests.test_invalid_case_is_rejected_before_starting_a_child', 'test_matrix_acceptance.OutgoingRingTests.test_observer_diagnostics_preserve_only_fixed_categories', 'test_matrix_acceptance.OutgoingRingTests.test_observer_diagnostics_reject_suffixes_unknown_payloads_and_prefixed_lines', 'test_matrix_acceptance.OutgoingRingTests.test_success_logs_only_fixed_facts_after_scan_and_retains_private_log', 'test_matrix_acceptance.OutgoingRingTests.test_summary_distinguishes_unsolicited_receipts_from_incoming_ringing'])
+          BUILTIN_EXCEPTIONS=frozenset(['AssertionError', 'AttributeError', 'FileNotFoundError', 'ImportError', 'IndexError', 'KeyError', 'MemoryError', 'ModuleNotFoundError', 'NameError', 'NotImplementedError', 'OSError', 'OverflowError', 'PermissionError', 'RecursionError', 'RuntimeError', 'StopIteration', 'SystemExit', 'TimeoutError', 'TypeError', 'UnboundLocalError', 'UnicodeDecodeError', 'UnicodeEncodeError', 'UnicodeError', 'ValueError', 'ZeroDivisionError'])
+          HELPER_PROGRAM="import sys, unittest\nsys.path.insert(0, 'scripts/tests')\nnames = ['test_matrix_acceptance.' + name for name in (\n    'FocusedSuiteTests', 'AppTimelineEvidenceTests', 'FinalizationTests',\n    'OutgoingRingTests', 'IncomingActorTests')]\nsuite = unittest.defaultTestLoader.loadTestsFromNames(names)\nif suite.countTestCases() != 69: raise SystemExit(1)\nresult = unittest.TextTestRunner(verbosity=2).run(suite)\nokay = (result.wasSuccessful() and result.testsRun == 69 and not result.skipped\n        and not result.expectedFailures and not result.unexpectedSuccesses)\nraise SystemExit(0 if okay else 1)\n"
+          SUPERVISOR="import json, os, subprocess, sys\nfd=int(sys.argv[1])\nargs=json.loads(sys.stdin.buffer.readline(65536))\ncode=subprocess.Popen(args,stdin=subprocess.DEVNULL,close_fds=True).wait()\nos.write(fd,(str(code)+'\\n').encode('ascii')); os.close(fd)\nsys.stdin.buffer.read(1)\n"
 
-  config:
-    name: Theme configuration tests
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.config == 'true'
-    runs-on: ubuntu-24.04
-    concurrency:
-      group: native-${{ github.sha }}-ubuntu-24.04
-      cancel-in-progress: false
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
-        with:
-          toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: cargo test --locked -p morpheus-config
+          def regular_bytes(path, limit):
+              before = path.lstat()
+              if not stat.S_ISREG(before.st_mode) or before.st_size > limit or getattr(before, 'st_file_attributes', 0) & 1024:
+                  raise ValueError('unsafe_regular_file')
+              flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_CLOEXEC', 0)
+              descriptor = os.open(path, flags)
+              with os.fdopen(descriptor, 'rb') as stream:
+                  opened = os.fstat(stream.fileno())
+                  if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino) or getattr(opened, 'st_file_attributes', 0) & 1024:
+                      raise ValueError('changed_regular_file')
+                  data = stream.read(limit + 1)
+                  after = os.fstat(stream.fileno())
+                  if len(data) > limit or len(data) != after.st_size or (opened.st_size, opened.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                      raise ValueError('changed_regular_file')
+                  return data
 
-  compile:
-    name: Check and test (${{ matrix.os }})
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
-    runs-on: ${{ matrix.os }}
-    concurrency:
-      group: native-${{ github.sha }}-${{ matrix.os }}
-      cancel-in-progress: false
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Linux native dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
-            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev libudev-dev \
-            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xdotool \
-            dbus-x11 gnome-keyring libsecret-tools libglib2.0-bin \
-            sway swaybg pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
-          # Ubuntu 24.04 Chromium dependencies from pinned Playwright 1.62.1.
-          # Install before the peer drops privileges inside its PID namespace.
-          sudo apt-get install -y \
-            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
-            libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
-            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
-            libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
-            fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
-            xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic \
-            fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
-        with:
-          toolchain: 1.99.0
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          # Preserve compiled dependencies when a later acceptance check fails.
-          # The save guard still makes untrusted/PR executions restore-only.
-          # Older SDK extractions lack the verified downloader's receipt.
-          # The key separates both primary and fallback cache namespaces.
-          key: verified-sdk-archives-v1
-          cache-on-failure: true
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - name: Check formatting
-        if: runner.os == 'Linux'
-        run: cargo fmt --all -- --check
-      - name: Check native interface compilation before desktop dependencies
-        run: cargo check --locked -p morpheus-ui-check
-      - name: Test configuration, Matrix, and RTC protocol models
-        id: model-tests
-        # Still fail the job below, but collect independent desktop/device
-        # results on this candidate instead of paying the compilation cost
-        # again merely because an authentication fixture failed first.
-        continue-on-error: true
-        run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
-      - name: Check desktop and Matrix crates
-        run: cargo check --locked -p morpheus-app -p morpheus-matrix
-      - name: Build desktop with native call and device adapters
-        run: cargo build --locked -p morpheus-app --features native-calls
-      - name: Capture actual native preview screens
-        id: preview-capture
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
-        continue-on-error: true
-        timeout-minutes: 2
-        env:
-          SLINT_SCALE_FACTOR: "1"
-          SLINT_BACKEND: winit-software
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          preview_root="$RUNNER_TEMP/morpheus-preview-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir "$preview_root"
-          # This debug-only early CLI renders fictional fixtures before any
-          # account/config store or network service initialization. Native
-          # logs and raw frames stay private and are never uploaded.
-          # Reviewed PRs capture their tested merge tree before integration;
-          # their PNGs remain untrusted until visual/privacy review.
-          if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1440x900x24' \
-            sh -c 'xdotool mousemove 1 1 && exec "$@"' sh \
-            target/debug/morpheus-app --morpheus-capture-preview "$preview_root/raw" \
-            >"$preview_root/native.log" 2>&1; then
-            echo "Native preview capture failed; private output was not published."
-            exit 1
-          fi
-          python3 scripts/encode_preview_pngs.py \
-            --input-dir "$preview_root/raw" --output-dir "$preview_root/png" \
-            --source-commit "$GITHUB_SHA" --binary target/debug/morpheus-app \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
-      - name: Upload native preview PNGs and provenance only
-        id: preview-upload
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && steps.preview-capture.outcome == 'success'
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: native-preview-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/desktop-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-switcher.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/incoming-call.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/room-settings.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/paper-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/manage-accounts.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-sidebar.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-space-labels.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery-thread-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-          include-hidden-files: false
-      - name: Smoke test Linux desktop startup under Xvfb
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set +e
-          timeout 12s xvfb-run -a -s '-screen 0 1280x800x24' target/debug/morpheus-app
-          result=$?
-          if [ "$result" -ne 124 ]; then
-            echo "Morpheus exited before the Linux desktop smoke window (status $result)"
-            exit 1
-          fi
-      - name: Test desktop controller and call guards
-        id: desktop-tests
-        # ElementHandle queries need compiler-generated element metadata even
-        # when Rust debug symbols are disabled for the hosted test build.
-        env:
-          SLINT_EMIT_DEBUG_INFO: "1"
-        # The independently built app can still exercise disposable fixtures
-        # after a unit assertion fails. Keep that evidence and reject the
-        # candidate at the final gate instead of rebuilding just to reach it.
-        continue-on-error: true
-        run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
-      - name: Test native device and call guards
-        run: cargo test --locked -p morpheus-rtc --features native-devices --lib
-      - name: Test Windows capture of an owned synthetic window and display
-        id: windows-capture-tests
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        timeout-minutes: 15
-        env:
-          MORPHEUS_WINDOWS_CAPTURE_ACCEPTANCE: "1"
-        run: python scripts/run_windows_capture_acceptance.py
-      - name: Test real Wayland portal streaming, source loss, and cancellation
-        id: wayland-tests
-        # Missing/malformed selection is fail-closed; the result gate below
-        # rejects it even if the fixture happens to pass.
-        if: runner.os == 'Linux' && needs.scope.outputs.wayland != 'false'
-        # Collect independent Matrix/OAuth/RTC evidence even if this desktop
-        # fixture fails. The final outcome gate still rejects the candidate.
-        continue-on-error: true
-        timeout-minutes: 15
-        run: python3 scripts/run_wayland_acceptance.py
-      - name: Test vendored security fixes
-        id: vendor-tests
-        # Keep independent SDK and live checks on the already-built app.
-        # The final gate still rejects any failed vendor regression command.
-        continue-on-error: true
-        shell: bash
-        run: |
-          cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
-          cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
-          cargo test --locked -p matrix-rtc-livekit --lib
-          cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
-          cargo test --locked -p cargo-packager-updater --lib
-          cargo test --locked -p webrtc-sys-build --lib
-      - name: Test pinned SDK sticky receipt and redaction regressions
-        id: sdk-receipt-tests
-        # Keep collecting the independently built app's live acceptance. The
-        # final outcome gate still rejects failed SDK unit regressions.
-        continue-on-error: true
-        shell: bash
-        run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
-      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
-        if: runner.os == 'Linux'
-        # Four fresh invitation cases each have a bounded 300-second command.
-        # Preserve room for the existing checks and their service cleanup.
-        timeout-minutes: 55
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            --output "$archive"
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir -p "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
-            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
-      - name: Require the selected Wayland result
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
-        env:
-          WAYLAND_SELECTED: ${{ needs.scope.outputs.wayland }}
-          WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
-        shell: bash
-        run: |
-          python3 - <<'PY_WAYLAND_ACCEPTANCE'
-          import os
-          import sys
+          def bounded(args, name, seconds, limit=64 * 1024 * 1024, cwd=None):
+              directory = logs / name
+              directory.mkdir(mode=448)
+              log = directory / 'output.log'
+              blocks = queue.Queue(maxsize=8)
+              status = queue.Queue(maxsize=1)
+              stop = threading.Event()
+              errors = []
+              code = None
+              reason = None
+              cleaned = False
+              cleanup_ok = False
+              read_fd, write_fd = os.pipe()
+              child = None
+              threads = []
+              kwargs = {'start_new_session': True, 'pass_fds': (write_fd,)}
+              status_arg = write_fd
 
-          def wayland_error(selected, outcome):
-              if selected not in ("true", "false"):
-                  return "Wayland selection is missing or malformed."
-              expected = "success" if selected == "true" else "skipped"
-              if outcome != expected:
-                  return "The selected Wayland check failed, was cancelled, or did not run."
-              return None
-
-          error = wayland_error(os.environ.get("WAYLAND_SELECTED"), os.environ.get("WAYLAND_OUTCOME"))
-          if error:
-              print(error, file=sys.stderr)
-              raise SystemExit(1)
-          if os.environ["WAYLAND_SELECTED"] == "false":
-              print("System Wayland was outside this change's inputs; its existing release gate remains open.")
-          PY_WAYLAND_ACCEPTANCE
-      - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
-        shell: bash
-        run: |
-          echo "Protocol model, native preview, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
-          exit 1
-
-  acceptance:
-    name: CI acceptance
-    needs: [scope, helpers, config, compile]
-    # Run after failed/skipped dependencies too. A selected check may never
-    # disappear behind a skipped aggregate that branch protection accepts.
-    if: always() && github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    permissions: {}
-    timeout-minutes: 2
-    steps:
-      # No checkout, dependency/cache restore, artifacts, or submitted code.
-      # This combines job conclusions; source/workflow review remains required.
-      - name: Require every selected check to succeed
-        env:
-          CHECK_RESULTS: ${{ toJSON(needs) }}
-        shell: bash
-        run: |
-          python3 - <<'PY_ACCEPTANCE'
-          import json
-          import os
-          import sys
-
-          def acceptance_error(needs):
-              if not isinstance(needs, dict) or set(needs) != {"scope", "helpers", "config", "compile"}:
-                  return "Missing dependency conclusions."
-              if any(not isinstance(value, dict) for value in needs.values()):
-                  return "Malformed dependency conclusions."
-              if needs["scope"].get("result") != "success":
-                  return "Security and change scope did not succeed."
-              if needs["helpers"].get("result") != "success":
-                  return "Validation helper tests did not succeed."
-              outputs = needs["scope"].get("outputs")
-              if not isinstance(outputs, dict):
-                  return "Scope outputs are missing."
-              native, config, wayland = outputs.get("native"), outputs.get("config"), outputs.get("wayland")
-              if any(flag not in ("true", "false") for flag in (native, config, wayland)):
-                  return "Scope flags are missing or malformed."
-              if native == config == "true":
-                  return "Native checks already include configuration tests."
+              def cleanup():
+                  nonlocal cleaned, cleanup_ok
+                  if cleaned:
+                      return
+                  cleaned = True
+                  if child is not None:
+                      try:
+                          os.killpg(child.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                  cleanup_ok = True
               try:
-                  matrix = json.loads(outputs.get("native_matrix", ""))
-              except (TypeError, ValueError):
-                  return "Native matrix is missing or malformed."
-              if not isinstance(matrix, dict) or set(matrix) != {"os"}:
-                  return "Native matrix must contain only standard operating systems."
-              platforms = matrix["os"]
-              allowed = {"macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"}
-              if (not isinstance(platforms, list)
-                      or any(not isinstance(item, str) or item not in allowed for item in platforms)
-                      or len(platforms) != len(set(platforms))
-                      or bool(platforms) != (native == "true")):
-                  return "Native matrix disagrees with the selected standard checks."
-              if wayland == "true" and "ubuntu-24.04" not in platforms:
-                  return "Selected Wayland acceptance requires the Linux native job."
-              for job, selected in (("config", config), ("compile", native)):
-                  expected = "success" if selected == "true" else "skipped"
-                  if needs[job].get("result") != expected:
-                      return "A selected check failed, was cancelled, or did not run."
-              return None
+                  with log.open('x+b') as output:
+                      try:
+                          child = subprocess.Popen([sys.executable, '-I', '-c', SUPERVISOR, str(status_arg)], cwd=cwd or workspace, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment, **kwargs)
+                          os.close(write_fd)
+                          write_fd = None
 
+                          def reader():
+                              try:
+                                  while not stop.is_set():
+                                      block = os.read(child.stdout.fileno(), 65536)
+                                      while not stop.is_set():
+                                          try:
+                                              blocks.put(block, timeout=0.2)
+                                              break
+                                          except queue.Full:
+                                              pass
+                                      if not block:
+                                          return
+                              except OSError:
+                                  if not stop.is_set():
+                                      errors.append(True)
+
+                          def read_status():
+                              try:
+                                  data = b''
+                                  while len(data) <= 32 and (not data.endswith(b'\n')):
+                                      block = os.read(read_fd, 33 - len(data))
+                                      if not block:
+                                          break
+                                      data += block
+                                  status.put(int(data) if re.fullmatch(b'-?[0-9]{1,10}\\n', data) else None)
+                              except (OSError, ValueError):
+                                  status.put(None)
+                          threads = [threading.Thread(target=reader, daemon=True), threading.Thread(target=read_status, daemon=True)]
+                          for thread in threads:
+                              thread.start()
+                          payload = (json.dumps(args, separators=(',', ':')) + '\n').encode('utf-8')
+                          if len(payload) > 65535:
+                              raise ValueError('command_too_large')
+                          child.stdin.write(payload)
+                          child.stdin.flush()
+                          deadline = time.monotonic() + seconds
+                          while True:
+                              if not cleaned:
+                                  try:
+                                      returned = status.get_nowait()
+                                  except queue.Empty:
+                                      pass
+                                  else:
+                                      if returned is None:
+                                          reason = 'process_error'
+                                          break
+                                      code = returned
+                                      cleanup()
+                                      deadline = min(deadline, time.monotonic() + 10)
+                              remaining = deadline - time.monotonic()
+                              if remaining <= 0:
+                                  reason = 'deadline'
+                                  break
+                              try:
+                                  block = blocks.get(timeout=min(0.2, remaining))
+                              except queue.Empty:
+                                  continue
+                              if not block:
+                                  if code is None:
+                                      reason = 'process_error'
+                                  break
+                              if output.tell() + len(block) > limit:
+                                  reason = 'output_limit'
+                                  break
+                              output.write(block)
+                      except (OSError, ValueError, subprocess.SubprocessError):
+                          reason = 'process_error'
+                      finally:
+                          try:
+                              cleanup()
+                          except OSError:
+                              reason = 'cleanup_failed'
+                          if not cleanup_ok:
+                              reason = 'cleanup_failed'
+                          if child is not None:
+                              try:
+                                  child.wait(timeout=10)
+                              except subprocess.SubprocessError:
+                                  reason = 'cleanup_failed'
+                              child.stdin.close()
+                          stop.set()
+                          if write_fd is not None:
+                              os.close(write_fd)
+                              write_fd = None
+                          for thread in threads:
+                              thread.join(timeout=2)
+                          if any((thread.is_alive() for thread in threads)):
+                              reason = 'cleanup_failed'
+                          if child is not None:
+                              child.stdout.close()
+                          os.close(read_fd)
+                      output.flush()
+                      output.seek(0)
+                      captured = output.read(limit + 1)
+                      if not stat.S_ISREG(os.fstat(output.fileno()).st_mode) or len(captured) > limit:
+                          reason = 'output_limit'
+                          captured = b''
+              finally:
+                  if write_fd is not None:
+                      os.close(write_fd)
+              if errors:
+                  reason = reason or 'process_error'
+              return {'code': code, 'reason': reason, 'bytes': len(captured), 'log': log, 'captured': captured}
+
+          def reduce_failures(output):
+              diagnostics={}; current=None; want_header=False; unknown=0; truncated=False
+              aliases={str(workspace/name):name for name in PUBLIC_FILES}
+              aliases.update({name:name for name in PUBLIC_FILES})
+              for raw in io.StringIO(output):
+                  line=raw.rstrip('\r\n')
+                  if line=='='*70:
+                      want_header=True; current=None; continue
+                  if want_header:
+                      want_header=False
+                      match=re.match(r'^(FAIL|ERROR): ([A-Za-z_][A-Za-z0-9_]*) \(([^()\r\n]{1,512})\)',line[:2048])
+                      if not match: continue
+                      outcome,function,identifier=match.groups()
+                      if identifier not in KNOWN_CASES or identifier.rsplit('.',1)[-1]!=function:
+                          unknown=min(unknown+1,65535); continue
+                      current=diagnostics.setdefault(identifier,{'failed':False,'errored':False,'exception_kinds':set(),'frames':[],'truncated':False})
+                      current['failed' if outcome=='FAIL' else 'errored']=True
+                      continue
+                  if current is None: continue
+                  if len(line)>8192:
+                      current['truncated']=True; truncated=True; continue
+                  frame=re.match(r'^\s*File "([^"\r\n]{1,4096})", line ([0-9]{1,7})(?:, in [^\r\n]{0,256})?$',line)
+                  if frame:
+                      filename,number=frame.groups(); public=aliases.get(filename); number=int(number)
+                      if public is not None and 0<number<=PUBLIC_FILES[public]['lines']:
+                          value={'file':public,'line':number}
+                          if value not in current['frames']:
+                              if len(current['frames'])==8:
+                                  current['frames'].pop(0); current['truncated']=True; truncated=True
+                              current['frames'].append(value)
+                  exception=re.match(r'^(?:builtins\.)?([A-Za-z_][A-Za-z0-9_]{0,63})(?::|$)',line)
+                  if exception and exception[1] in BUILTIN_EXCEPTIONS:
+                      if len(current['exception_kinds'])<8:current['exception_kinds'].add(exception[1])
+                      else:current['truncated']=True; truncated=True
+              cases=[]
+              for identifier in sorted(diagnostics):
+                  row=diagnostics[identifier]
+                  cases.append({'case_id':identifier,'failed':row['failed'],'errored':row['errored'],
+                      'exception_kinds':sorted(row['exception_kinds']),'frames':row['frames'],'truncated':row['truncated']})
+              ran=[int(value) for value in re.findall(r'^Ran ([0-9]{1,5}) tests? in ',output,re.MULTILINE)]
+              return {'cases':cases,'known_failed_or_error_cases':len(cases),'unmapped_failure_headers':unknown,
+                  'diagnostic_truncated':truncated,'exact69_summary':ran==[69]}
+
+
+          def main():
+              global workspace,private,logs,environment
+              assert os.name=='posix' and os.environ.get('GITHUB_ACTIONS')=='true'
+              assert os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted'
+              assert (os.environ.get('RUNNER_OS'),os.environ.get('RUNNER_ARCH'))==('Linux','X64')
+              os.umask(0o077)
+              workspace=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()/'candidate'
+              private=pathlib.Path(tempfile.mkdtemp(prefix='morpheus-helper-diagnostic-',dir=os.environ['RUNNER_TEMP']))
+              private.chmod(0o700); logs=private/'logs'; logs.mkdir(mode=0o700)
+              names=('PATH','HOME','TEMP','TMP','TMPDIR','LANG','LC_ALL','SSL_CERT_FILE','SSL_CERT_DIR',
+                  'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','RUNNER_ARCH','ImageOS','RUNNER_TEMP','RUNNER_TRACKING_ID')
+              environment={key:os.environ[key] for key in names if key in os.environ}
+              environment.update({'GIT_CONFIG_GLOBAL':os.devnull,'GIT_CONFIG_NOSYSTEM':'1',
+                  'GIT_TERMINAL_PROMPT':'0','GIT_OPTIONAL_LOCKS':'0','GIT_NO_REPLACE_OBJECTS':'1','RUST_LOG':'off'})
+              git=['git','--no-pager','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
+                  '-c','core.attributesFile='+os.devnull,'-c','core.useReplaceRefs=false']
+              identity=bounded(git+['rev-parse','HEAD','HEAD^{tree}'],'source-identity',15,4096)
+              if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').splitlines()!=[SOURCE,TREE]:
+                  print(json.dumps({'check':'source_identity','status':'failed'})); return 1
+              listing=bounded(git+['ls-tree','-r','-l','-z',SOURCE],'source-tree',15,1024*1024)
+              if listing['reason'] or listing['code']!=0: return 1
+              tracked=[]; total=0; seen=set()
+              for row in listing['captured'].split(b'\0'):
+                  if not row:continue
+                  header,name=row.split(b'\t',1); mode,kind,blob,size=header.split(); size=int(size)
+                  path=pathlib.PurePosixPath(os.fsdecode(name))
+                  if (mode not in (b'100644',b'100755') or kind!=b'blob' or path.is_absolute()
+                      or not path.parts or any(part in ('.','..') for part in path.parts)
+                      or str(path) in seen or size>32*1024*1024):return 1
+                  total+=size;seen.add(str(path))
+                  if len(tracked)>=10000 or total>256*1024*1024:return 1
+                  tracked.append((path,mode,blob,size))
+              if len(tracked)!=1345:return 1
+              pinned_head=regular_bytes(workspace/'.git/HEAD',4096)
+              if pinned_head.strip()!=SOURCE.encode('ascii'):return 1
+              def intact():
+                  try:
+                      if regular_bytes(workspace/'.git/HEAD',4096)!=pinned_head:return False
+                      for path,mode,blob,size in tracked:
+                          parent=workspace
+                          for component in path.parts[:-1]:
+                              parent=parent/component
+                              if not stat.S_ISDIR(parent.lstat().st_mode):return False
+                          file=workspace/path;data=regular_bytes(file,size)
+                          if len(data)!=size or hashlib.sha1(b'blob '+str(size).encode()+b'\0'+data).hexdigest().encode()!=blob:return False
+                          if bool(file.lstat().st_mode&stat.S_IXUSR)!=(mode==b'100755'):return False
+                      for path,value in PUBLIC_FILES.items():
+                          data=regular_bytes(workspace/path,value['bytes'])
+                          if len(data)!=value['bytes'] or hashlib.sha256(data).hexdigest()!=value['sha256']:return False
+                      return True
+                  except (OSError,ValueError):return False
+              if not intact():
+                  print(json.dumps({'check':'tracked_input_integrity','status':'failed'}));return 1
+              actual_binding={'files':PUBLIC_FILES,'classes':CLASS_COUNTS,'case_ids':sorted(KNOWN_CASES),'source':SOURCE,'tree':TREE}
+              if hashlib.sha256(json.dumps(actual_binding,sort_keys=True,separators=(',',':')).encode()).hexdigest()!=INPUT_DIGEST:return 1
+              print(json.dumps({'check':'history_reuse','status':'reused','input_sha256':INPUT_DIGEST,**HISTORY},sort_keys=True))
+              # Existing owner-generated lifecycle probes; no candidate code has run.
+              probe_root=private/'lifecycle-probe'; probe_root.mkdir(mode=0o700)
+              ready=probe_root/'ready'; late=probe_root/'late'
+              orphan_code="import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(2); pathlib.Path(sys.argv[2]).write_text('escaped'); time.sleep(30)"
+              parent_code="""import pathlib,subprocess,sys,time
+              child=subprocess.Popen([sys.executable,'-I','-c',sys.argv[1],sys.argv[2],sys.argv[3]],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True)
+              until=time.monotonic()+5
+              while not pathlib.Path(sys.argv[2]).exists():
+                  if time.monotonic()>=until: raise SystemExit(8)
+                  time.sleep(0.01)
+              sys.stdout.buffer.write(b'ready\\n'); sys.stdout.buffer.flush()
+              """
+              normal=bounded([sys.executable,'-I','-c',parent_code,orphan_code,str(ready),str(late)],'owner-orphan-probe',15,1024)
+              time.sleep(2.2)
+              nonzero=bounded([sys.executable,'-I','-c','raise SystemExit(7)'],'owner-exit-probe',10,1024)
+              deadline=bounded([sys.executable,'-I','-c','import time; time.sleep(30)'],'owner-deadline-probe',0.2,1024)
+              overflow=bounded([sys.executable,'-I','-c',"print('x'*4096,flush=True)"],'owner-output-probe',10,1024)
+              probe_ok=(normal['reason'] is None and normal['code']==0 and normal['captured']==b'ready\n'
+                  and ready.is_file() and not late.exists() and nonzero['reason'] is None and nonzero['code']==7
+                  and deadline['reason']=='deadline' and overflow['reason']=='output_limit')
+              print(json.dumps({'check':'owner_process_lifecycle','status':'passed' if probe_ok else 'failed',
+                  'candidate_executed':False,'raw_logs_public':False},sort_keys=True),flush=True)
+              if not probe_ok: raise SystemExit(1)
+              # Same pinned scanner archive and finite bootstrap as the admitted workflow.
+              data=bytearray();deadline=time.monotonic()+180
+              url='https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz'
+              with urllib.request.urlopen(url,timeout=30) as response:
+                  while True:
+                      chunk=response.read(65536)
+                      if not chunk:break
+                      data.extend(chunk)
+                      if len(data)>32*1024*1024 or time.monotonic()>deadline:raise ValueError('scanner_bound')
+              if hashlib.sha256(data).hexdigest()!=SCANNER_ARCHIVE:raise ValueError('scanner_digest')
+              with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as packaged:
+                  member=packaged.getmember('gitleaks')
+                  if not member.isfile() or member.size>64*1024*1024:raise ValueError('scanner_member')
+                  scanner_bytes=packaged.extractfile(member).read(64*1024*1024+1)
+              if not scanner_bytes or len(scanner_bytes)>64*1024*1024:raise ValueError('scanner_member')
+              if hashlib.sha256(scanner_bytes).hexdigest()!=SCANNER_BINARY:raise ValueError('scanner_binary')
+              if not intact():return 1
+              result=bounded([sys.executable,'-I','-B','-c',HELPER_PROGRAM],'helpers69',300)
+              if result['reason']=='cleanup_failed':
+                  print(json.dumps({'check':'matrix_acceptance_helpers','status':'failed','reason':'cleanup_failed','raw_logs_public':False}));return 1
+              if not intact():
+                  print(json.dumps({'check':'tracked_input_integrity','status':'failed','raw_logs_public':False}));return 1
+              # Reconstruct controls after candidate cleanup in a fresh owner-only directory.
+              with tempfile.TemporaryDirectory(prefix='morpheus-sealed-helper-',dir=os.environ['RUNNER_TEMP']) as folder:
+                  sealed=pathlib.Path(folder);sealed.chmod(0o700)
+                  binary=sealed/'gitleaks';rules=sealed/'default.toml';ignore=sealed/'empty.ignore'
+                  capture=sealed/'output.log';report=sealed/'report.json'
+                  for file,content in ((binary,scanner_bytes),(rules,b'[extend]\nuseDefault = true\n'),(ignore,b''),(capture,result['captured'])):
+                      with file.open('xb') as stream:stream.write(content)
+                      file.chmod(0o500 if file==binary else 0o400)
+                  scanned=bounded([str(binary),'dir',str(capture),'--redact=100','--ignore-gitleaks-allow',
+                      '--no-banner','--max-target-megabytes','0','--config',str(rules),
+                      '--gitleaks-ignore-path',str(ignore),'--report-format','json','--report-path',str(report)],
+                      'private-log-scan',60,8*1024*1024,cwd=sealed)
+                  clean=(scanned['reason'] is None and scanned['code']==0
+                      and regular_bytes(capture,64*1024*1024)==result['captured']
+                      and regular_bytes(rules,1024)==b'[extend]\nuseDefault = true\n'
+                      and regular_bytes(ignore,0)==b''
+                      and hashlib.sha256(regular_bytes(binary,64*1024*1024)).digest()==hashlib.sha256(scanner_bytes).digest()
+                      and json.loads(regular_bytes(report,8*1024*1024))==[])
+              if not clean:
+                  print(json.dumps({'check':'matrix_acceptance_helpers','status':'failed','reason':'private_log_scan_failed','raw_logs_public':False}));return 1
+              diagnostics=reduce_failures(result['captured'].decode('utf-8',errors='replace'))
+              passed=(result['reason'] is None and result['code']==0 and diagnostics['exact69_summary']
+                  and not diagnostics['cases'] and not diagnostics['unmapped_failure_headers'])
+              print(json.dumps({'check':'matrix_acceptance_helpers','status':'passed' if passed else 'failed',
+                  'source':SOURCE,'expected_cases':69,'exit_code':result['code'],'reason':result['reason'],
+                  'log_bytes':result['bytes'],'private_log_default_scan_passed':True,'raw_logs_public':False,
+                  'python_version':list(sys.version_info[:3]),'diagnostics':diagnostics},sort_keys=True),flush=True)
+              return 0 if passed else 1
           try:
-              error = acceptance_error(json.loads(os.environ["CHECK_RESULTS"]))
-          except (KeyError, ValueError):
-              error = "Dependency conclusions are missing or malformed."
-          if error:
-              print(error, file=sys.stderr)
-              raise SystemExit(1)
-          print("Security checks and every selected validation job succeeded.")
-          PY_ACCEPTANCE
+              outcome=main()
+          except Exception:
+              print(json.dumps({'check':'helper_diagnostic_owner_guard','status':'failed','raw_logs_public':False}),flush=True)
+              outcome=1
+          raise SystemExit(outcome)
