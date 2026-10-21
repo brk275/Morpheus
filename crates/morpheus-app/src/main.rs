@@ -4800,3 +4800,6 @@ mod discovery_tests {
         assert_eq!(directory_plain_text(&"a".repeat(500), 120).len(), 120);
     }
 }
+
+#[cfg(test)]
+mod webp_complexity_tests;

@@ -2274,6 +2274,8 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     let counted = actions.clone();
     ui.on_select_audio_microphone(move |_| counted.set(counted.get() + 1));
     let counted = actions.clone();
+    ui.on_set_animated_image_autoplay(move |_| counted.set(counted.get() + 1));
+    let counted = actions.clone();
     ui.on_add_account(move || counted.set(counted.get() + 1));
     let counted = actions.clone();
     ui.on_open_app_password(move |_| counted.set(counted.get() + 1));
@@ -2376,6 +2378,49 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
             ));
         }
     }
+    // These queries resolve to the autoplay setting itself, not the
+    // neighbouring encrypted-preview toggle. Choosing only reveals/focuses:
+    // no setting is toggled, callback invoked or media viewer opened.
+    let autoplay = ui.get_image_previews_autoplay();
+    let viewer_open = ui.get_image_preview_open();
+    for query in [
+        "autoplay",
+        "animated images",
+        "GIF playback",
+        "media.autoplay_animated_media",
+    ] {
+        ui.set_settings_search_query(query.into());
+        ui.invoke_settings_search(query.into());
+        settle(ui).await;
+        let result = ui
+            .get_settings_search_results()
+            .row_data(0)
+            .expect("an autoplay result");
+        assert_eq!(
+            result.id.as_str(),
+            "media.autoplay_animated_media",
+            "{query}"
+        );
+        assert_eq!(
+            result.key.as_str(),
+            "media.autoplay_animated_media",
+            "{query}"
+        );
+        ui.invoke_settings_search_choose(result.id);
+        settle(ui).await;
+        assert_eq!(
+            ui.get_settings_revealed_id(),
+            "media.autoplay_animated_media",
+            "{query}"
+        );
+        assert!(
+            focused_control_has_label(ui, "Play animated images automatically when opened"),
+            "{query}: the autoplay row has focus"
+        );
+        assert_eq!(ui.get_image_previews_autoplay(), autoplay, "{query}");
+        assert_eq!(ui.get_image_preview_open(), viewer_open, "{query}");
+        assert_eq!(actions.get(), 0, "{query}: search ran an action");
+    }
     for (target, label) in [
         ("appearance.reduce_motion", "Reduce motion, off"),
         ("notifications.desktop", "Desktop notifications"),
@@ -2428,6 +2473,7 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     ui.on_check_for_updates(|| {});
     ui.on_refresh_security(|| {});
     ui.on_select_audio_microphone(|_| {});
+    ui.on_set_animated_image_autoplay(|_| {});
     ui.set_security_busy(false);
     ui.set_audio_devices_busy(false);
     ui.set_manage_accounts_open(false);
@@ -4776,6 +4822,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     ui.set_image_preview_has_next(false);
     ui.set_image_preview_event_id("".into());
     ui.set_image_preview_image(slint::Image::default());
+    assert_media_viewer_keyboard(&ui).await;
+    assert_animation_autoplay_setting(&ui).await;
 
     // Measure the queue's real captions at large text too. These are inert
     // in-memory presentation rows; no file, upload or action is submitted.
@@ -12849,5 +12897,213 @@ async fn assert_room_permissions_editor(ui: &AppWindow, live: &Arc<LiveUi>, runt
     ui.set_active_account_local_id(account);
     ui.set_active_room_id(room);
     ui.set_live_session(was_session);
+    settle(ui).await;
+}
+
+/// The image viewer's own keys and pointer over one synthetic pixel. Tab
+/// skips unavailable actions and reaches Play and Replay only for an
+/// animation; Rotate stays outside the ring. Home and End ask only for an
+/// image that exists, ] and [ turn the view, the wheel zooms, K and R reach
+/// playback only for an animation, and the viewer reports its opening and
+/// every autoplay or reduced-motion change to Rust (which pauses the worker;
+/// see the player tests) without toggling playback itself. Spies stand in
+/// for the Rust controller, so nothing is fetched or decoded.
+async fn assert_media_viewer_keyboard(ui: &AppWindow) {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    let steps = Rc::new(RefCell::new(Vec::new()));
+    let seen = steps.clone();
+    ui.on_preview_adjacent_image(move |step| seen.borrow_mut().push(step));
+    let toggles = Rc::new(Cell::new(0));
+    let seen = toggles.clone();
+    ui.on_toggle_image_preview_playback(move || seen.set(seen.get() + 1));
+    let replays = Rc::new(Cell::new(0));
+    let seen = replays.clone();
+    ui.on_replay_image_preview(move || seen.set(seen.get() + 1));
+    let motions = Rc::new(Cell::new(0));
+    let seen = motions.clone();
+    ui.on_image_preview_motion_changed(move || seen.set(seen.get() + 1));
+    let tokens = ui.global::<crate::StyleTokens>();
+    let reduced = tokens.get_reduced_motion();
+    tokens.set_reduced_motion(false);
+    ui.set_image_preview_account_id(ui.get_active_account_local_id());
+    ui.set_image_preview_room_id(ui.get_active_room_id());
+    ui.set_image_preview_event_id("$image:example.org".into());
+    ui.set_image_preview_title("synthetic.png".into());
+    ui.set_image_preview_position("".into());
+    ui.set_image_preview_image(slint::Image::from_rgba8(slint::SharedPixelBuffer::<
+        slint::Rgba8Pixel,
+    >::new(1, 1)));
+    ui.set_image_preview_loading(false);
+    ui.set_image_preview_failed(false);
+    ui.set_image_preview_animated(false);
+    ui.set_image_preview_playing(false);
+    ui.set_image_preview_loaded(true);
+    ui.set_image_preview_has_previous(false);
+    ui.set_image_preview_has_next(true);
+    ui.set_image_preview_open(true);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Close image preview"));
+    // Opening reports the current motion preferences once.
+    assert!(motions.get() >= 1);
+    tab_to_control(ui, "Next image");
+    // Previous is unavailable, so Shift+Tab goes back to Save.
+    key(ui, Key::Backtab);
+    assert!(focused_control_has_label(
+        ui,
+        "Save synthetic.png to a location you choose"
+    ));
+    // A still image has no playback stops, and Rotate is outside the ring.
+    for label in ["Next image", "Zoom in", "Close image preview"] {
+        key(ui, Key::Tab);
+        assert!(focused_control_has_label(ui, label), "still: {label}");
+    }
+
+    // Turning and wheel zoom change only the view; focus stays on Close.
+    let picture = |view: &str| control_bounds(ui, &format!("Attachment synthetic.png, {view}"));
+    key(ui, "]");
+    settle(ui).await;
+    assert_eq!(picture("100% zoom, turned 90 degrees clockwise").len(), 1);
+    key(ui, "[");
+    settle(ui).await;
+    let fitted = picture("100% zoom");
+    assert_eq!(fitted.len(), 1);
+    let position = slint::LogicalPosition::new(
+        (fitted[0].left + fitted[0].right) / 2.0,
+        (fitted[0].top + fitted[0].bottom) / 2.0,
+    );
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y: 10.0,
+    });
+    settle(ui).await;
+    assert_eq!(picture("125% zoom").len(), 1);
+    key(ui, "0");
+    settle(ui).await;
+    assert_eq!(picture("100% zoom").len(), 1);
+    assert!(focused_control_has_label(ui, "Close image preview"));
+
+    // Home and End ask for the first or last loaded image only when there
+    // is one before or after; K and R do nothing for a still image.
+    key(ui, "k");
+    key(ui, "r");
+    key(ui, Key::Home);
+    key(ui, Key::End);
+    ui.set_image_preview_has_previous(true);
+    settle(ui).await;
+    key(ui, Key::Home);
+    assert_eq!(*steps.borrow(), [i32::MAX, -i32::MAX]);
+    assert_eq!((toggles.get(), replays.get()), (0, 0));
+
+    // An animation adds Play and Replay to the ring after Next.
+    ui.set_image_preview_animated(true);
+    settle(ui).await;
+    for label in [
+        "Save synthetic.png to a location you choose",
+        "Previous image",
+        "Next image",
+        "Play the animation",
+        "Replay the animation from its first frame",
+        "Zoom in",
+        "Close image preview",
+    ] {
+        key(ui, Key::Tab);
+        assert!(focused_control_has_label(ui, label), "animated: {label}");
+    }
+    for _ in 0..3 {
+        key(ui, Key::Backtab);
+    }
+    assert!(focused_control_has_label(ui, "Play the animation"));
+    key(ui, Key::Space);
+    key(ui, "k");
+    key(ui, "r");
+    assert_eq!((toggles.get(), replays.get()), (2, 1));
+    // The window shows the state the worker reports. Turning on reduced
+    // motion, or changing autoplay, is reported to Rust whatever `playing`
+    // shows; the viewer itself never toggles playback for it.
+    ui.set_image_preview_playing(true);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Pause the animation"));
+    let before = motions.get();
+    tokens.set_reduced_motion(true);
+    settle(ui).await;
+    assert_eq!(motions.get(), before + 1);
+    let autoplay = ui.get_image_previews_autoplay();
+    ui.set_image_previews_autoplay(!autoplay);
+    settle(ui).await;
+    assert_eq!(motions.get(), before + 2);
+    ui.set_image_previews_autoplay(autoplay);
+    settle(ui).await;
+    assert_eq!(toggles.get(), 2);
+    // A playback action that disappears never leaves the keyboard outside
+    // the dialog.
+    ui.set_image_preview_animated(false);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Image preview synthetic.png"));
+    assert!(!focused_control_has_label(ui, "Pause the animation"));
+
+    tokens.set_reduced_motion(reduced);
+    ui.set_image_preview_open(false);
+    ui.set_image_preview_loaded(false);
+    ui.set_image_preview_playing(false);
+    ui.set_image_preview_has_previous(false);
+    ui.set_image_preview_has_next(false);
+    ui.set_image_preview_event_id("".into());
+    ui.set_image_preview_title("".into());
+    ui.set_image_preview_image(slint::Image::default());
+    ui.on_preview_adjacent_image(|_| {});
+    ui.on_toggle_image_preview_playback(|| {});
+    ui.on_replay_image_preview(|| {});
+    ui.on_image_preview_motion_changed(|| {});
+    settle(ui).await;
+}
+
+/// The animation autoplay row follows the encrypted-preview row, is keyboard
+/// reachable and shows the saved value. Activating it only asks for a save:
+/// the window's value changes when the saved configuration is applied, never
+/// on the click itself.
+async fn assert_animation_autoplay_setting(ui: &AppWindow) {
+    use std::{cell::Cell, rc::Rc};
+
+    const ROW: &str = "Play animated images automatically when opened";
+    let page = ui.get_page();
+    let requested = Rc::new(Cell::new(None));
+    let seen = requested.clone();
+    ui.on_set_animated_image_autoplay(move |enabled| seen.set(Some(enabled)));
+    // The encrypted-preview value stays as it is, so applying the
+    // configuration never closes or cancels anything here.
+    let mut config = Config::default();
+    config.media.previews_in_encrypted_rooms = ui.get_image_previews_encrypted_enabled();
+    crate::image_previews::apply_config(ui, &config);
+    assert!(crate::settings_search::reveal(ui, "media.image_previews"));
+    settle(ui).await;
+    assert!(focused_control_has_label(
+        ui,
+        "Allow image previews in encrypted rooms"
+    ));
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(ui, ROW));
+    key(ui, Key::Space);
+    assert_eq!(requested.take(), Some(true));
+    assert!(!ui.get_image_previews_autoplay());
+    config.media.autoplay_animated_media = true;
+    crate::image_previews::apply_config(ui, &config);
+    settle(ui).await;
+    assert!(ui.get_image_previews_autoplay());
+    assert!(focused_control_has_label(ui, ROW));
+    key(ui, Key::Space);
+    assert_eq!(requested.take(), Some(false));
+    config.media.autoplay_animated_media = false;
+    crate::image_previews::apply_config(ui, &config);
+    assert!(!ui.get_image_previews_autoplay());
+    ui.on_set_animated_image_autoplay(|_| {});
+    ui.set_settings_revealed_id("".into());
+    ui.set_page(page);
     settle(ui).await;
 }

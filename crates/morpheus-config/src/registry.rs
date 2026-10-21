@@ -1664,12 +1664,12 @@ pub const FIELDS: &[FieldSpec] = &[
         "true",
         "Noise suppression; not used yet.",
     )),
-    inactive(field(
+    field(
         "media.autoplay_animated_media",
         Bool,
         "false",
-        "Animated media autoplay; not used yet.",
-    )),
+        "Start animated image previews playing when opened; reduced motion keeps them paused.",
+    ),
     field(
         "media.previews_in_encrypted_rooms",
         Bool,
@@ -2498,6 +2498,20 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         &["image", "images", "media", "preview", "photos"],
     ),
     target(
+        "media.autoplay_animated_media",
+        "Media",
+        "Settings › Image previews › Animated image playback",
+        "Animated image autoplay",
+        "Choose whether animated image previews start playing when opened; reduced motion keeps them paused.",
+        &[
+            "autoplay",
+            "animated images",
+            "gif playback",
+            "gif",
+            "playback",
+        ],
+    ),
+    target(
         "media.audio_devices",
         "Media",
         "Settings › Call audio devices",
@@ -2894,6 +2908,13 @@ mod tests {
         assert_eq!(first("opacity"), Some("appearance.window_opacity"));
         assert_eq!(first("font"), Some("appearance.fonts"));
         assert_eq!(first("animations"), Some("appearance.reduce_motion"));
+        for query in ["autoplay", "animated images", "GIF playback"] {
+            assert_eq!(
+                first(query),
+                Some("media.autoplay_animated_media"),
+                "{query}"
+            );
+        }
         assert_eq!(first("switch password"), Some("accounts.switch_password"));
         assert_eq!(first("microphone"), Some("media.audio_devices"));
         assert_eq!(first("hotkey"), Some("shortcuts"));

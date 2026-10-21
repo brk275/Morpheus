@@ -1,5 +1,7 @@
 [workspace]
 resolver = "3"
+# Keep upstream decoder dev tools outside the application workspace.
+exclude = ["vendor/image-webp"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
@@ -30,6 +32,8 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/brk275/Morpheus"
 
 [patch.crates-io]
+# Bound lossless WebP entropy-tree amplification before allocating groups.
+image-webp = { path = "vendor/image-webp" }
 # Isolate pinned WebRTC PipeWire stubs from the system PipeWire API on Linux.
 webrtc-sys = { path = "vendor/webrtc-sys" }
 # Verify pinned SDK archives before unpacking without unsafe ZIP extraction.

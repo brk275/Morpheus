@@ -585,6 +585,19 @@ controls and scrollbars, and automatic OS motion preferences, still need separat
 accessibility work. This is not complete reduced-motion or display-performance
 acceptance.
 
+Reduce motion also keeps an animated image preview (GIF, WebP or animated PNG)
+paused on its first frame, and pauses one that is playing. Otherwise an opened
+animation starts playing only when you choose **Settings → Image previews → Play
+animated images automatically** (off by default), or set:
+
+```toml
+[media]
+autoplay_animated_media = true
+```
+
+Play/Pause in the viewer works either way. This is source only and has not been
+built or run.
+
 ### Preferences awaiting implementation
 
 The following older fields can be stored in TOML but currently have no runtime
@@ -594,7 +607,6 @@ consumer. Changing them does not enable the described behavior:
 | --- | --- |
 | `media.camera_device` | Saved camera selection |
 | `media.noise_suppression` | Configurable noise suppression |
-| `media.autoplay_animated_media` | Animated-media autoplay policy |
 | `experimental.background_account_sync` | Background syncing of inactive accounts |
 
 Microphone and speaker selection, notification overrides and the appearance

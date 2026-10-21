@@ -7,6 +7,7 @@ provenance and regression tests when updating a dependency.
 | Crate | Purpose | Provenance |
 | --- | --- | --- |
 | lru 0.16.4 | Backport panic-safe cache removal | [Patch notes](lru/MORPHEUS_PATCH.md) |
+| image-webp 0.2.4 | Bound lossless entropy-tree complexity before group allocation | [Patch notes](image-webp/MORPHEUS_PATCH.md) |
 | matrix-rtc-livekit | Secure authorization and media endpoints | [Patch notes](matrix-rtc-livekit/README.md) |
 | matrix-rtc-core 0.5.0-rc.2 | Bounded encrypted membership renewal for newly joined devices | [Patch notes](matrix-rtc-core/MORPHEUS_PATCH.md) |
 | matrix-sdk 0.19.1 | Typed search entry points; optional per-request response-body limit; generated recovery-key handoff; opt-in stored-members identity status stream; opt-in receipt without the unread-flag write | [Patch notes](matrix-sdk/MORPHEUS_PATCH.md) |

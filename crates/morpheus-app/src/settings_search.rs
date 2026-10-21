@@ -126,6 +126,10 @@ const SECTION_KEYS: &[(&str, &[&str])] = &[
         "media.image_previews",
         &["media.previews_in_encrypted_rooms"],
     ),
+    (
+        "media.autoplay_animated_media",
+        &["media.autoplay_animated_media"],
+    ),
 ];
 
 fn section_keys(id: &str) -> &'static [&'static str] {
@@ -385,6 +389,7 @@ mod tests {
             "Typography.Message_Size",
             "appearance.font_family",
             " notifications.enabled ",
+            "media.autoplay_animated_media",
         ] {
             let hits = ranked_hits(key, |_| true);
             let lead = section_for_key(key).unwrap().id;

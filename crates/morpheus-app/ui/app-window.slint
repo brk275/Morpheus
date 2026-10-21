@@ -4336,10 +4336,17 @@ export component AppWindow inherits Window {
         shortcut-scope.focus();
     }
     callback set-encrypted-image-previews(bool);
+    // Saves media.autoplay_animated_media; the window shows the saved value.
+    callback set-animated-image-autoplay(bool);
     // Media viewer; see media-viewer.slint and src/image_previews.rs.
     callback preview-adjacent-image(int);
     callback retry-image-preview();
     callback cancel-image-preview-loading();
+    callback toggle-image-preview-playback();
+    callback replay-image-preview();
+    // The open viewer's autoplay setting or reduced motion changed (or it
+    // just opened); Rust reads both and pauses on a turn to reduced motion.
+    callback image-preview-motion-changed();
     in-out property <bool> image-preview-open: false;
     in-out property <bool> image-preview-loaded: false;
     in-out property <bool> image-preview-loading: false;
@@ -4351,6 +4358,10 @@ export component AppWindow inherits Window {
     in-out property <string> image-preview-position;
     in-out property <bool> image-preview-has-previous: false;
     in-out property <bool> image-preview-has-next: false;
+    in-out property <bool> image-preview-animated: false;
+    in-out property <bool> image-preview-playing: false;
+    // media.autoplay_animated_media; reduced motion still prevents autoplay.
+    in-out property <bool> image-previews-autoplay: false;
     in-out property <string> image-preview-token;
     in-out property <string> image-preview-account-id;
     in-out property <string> image-preview-room-id;
@@ -10380,7 +10391,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Image previews"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
-                        Text { text: "Images load only when clicked and stay in memory. Closing the viewer or switching rooms/accounts clears them. PNG and baseline JPEG only; animation, WebP, audio and video previews are not available yet."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        Text { text: "Images load only when clicked and stay in memory. Closing the viewer or switching rooms/accounts clears them. PNG, JPEG, GIF and WebP images open in the viewer, and animated ones can play there. Audio and video previews are not available yet."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         ActionRect {
                             height: 40px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                             focus-color: root.accent;
@@ -10403,6 +10414,30 @@ export component AppWindow inherits Window {
                             activated => { root.set-encrypted-image-previews(!root.image-previews-encrypted-enabled); }
                             Text { x: 12px; width: parent.width - 24px; text: (root.image-previews-encrypted-enabled ? "✓  " : "□  ") + "Allow previews in encrypted rooms"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
                         }
+                        // Same row pattern and save path as the encrypted-preview row.
+                        // Its own search target reveals and focuses without activating it.
+                        ActionRect {
+                            height: 40px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
+                            focus-color: root.accent;
+                            property <int> reveal-request: root.reveal-request("media.autoplay_animated_media");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "media.autoplay_animated_media"; }
+                                }
+                            }
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
+                            label: "Play animated images automatically when opened";
+                            accessible-checkable: true; accessible-checked: root.image-previews-autoplay;
+                            activated => { root.set-animated-image-autoplay(!root.image-previews-autoplay); }
+                            Text { x: 12px; width: parent.width - 24px; text: (root.image-previews-autoplay ? "✓  " : "□  ") + "Play animated images automatically"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide; }
+                        }
+                        Text { text: "Reduced motion pauses animations. You can still press Play. Autoplay changes apply when playback starts."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Call audio devices"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Saved for new calls. During a call, Use for this call switches it to these devices without leaving; your mute and deafen settings stay as they are. An unavailable selected device shows an error. System default follows your operating system's audio routing."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
@@ -12372,6 +12407,7 @@ export component AppWindow inherits Window {
         }
 
     if root.image-preview-open && root.image-preview-account-id == root.active-account-local-id && root.image-preview-room-id == root.active-room-id : MediaViewer {
+        item-key: root.image-preview-event-id;
         image: root.image-preview-image;
         loaded: root.image-preview-loaded;
         loading: root.image-preview-loading;
@@ -12382,6 +12418,10 @@ export component AppWindow inherits Window {
         has-previous: root.image-preview-has-previous;
         has-next: root.image-preview-has-next;
         can-save: root.image-preview-event-id != "" && root.downloading-event-id == "";
+        animated: root.image-preview-animated;
+        playing: root.image-preview-playing;
+        autoplay: root.image-previews-autoplay;
+        reduced-motion: StyleTokens.reduced-motion;
         text-scale: root.text-scale;
         palette: {
             ink: root.ink,
@@ -12414,8 +12454,14 @@ export component AppWindow inherits Window {
         close => { root.dismiss-image-preview(); }
         previous => { root.preview-adjacent-image(-1); }
         next => { root.preview-adjacent-image(1); }
+        // Steps past either end stop at the first or last loaded image.
+        first => { root.preview-adjacent-image(-2147483647); }
+        last => { root.preview-adjacent-image(2147483647); }
         cancel-loading => { root.cancel-image-preview-loading(); }
         retry => { root.retry-image-preview(); }
+        toggle-playback => { root.toggle-image-preview-playback(); }
+        replay => { root.replay-image-preview(); }
+        motion-changed => { root.image-preview-motion-changed(); }
         save => { root.save-attachment(root.image-preview-event-id, root.image-preview-title); }
     }
 
