@@ -1,0 +1,46 @@
+# Ledger: dense and square for reading many rooms at once. Light paper
+# surfaces, small type, columns, 24-hour clock and the text sidebar with
+# direct messages first. A sparse example: merge these keys into config.toml.
+schema_version = 1
+
+[appearance]
+theme = "light"
+theme_pack = "paper"
+density = "compact"
+
+[colors]
+accent = "#2F5D8A"
+link = "#2B5C8F"
+focus = "#B4561F"
+input_border = "#9AA3A0"
+control_hover = "#E3E7E2"
+mention = "#B4561F"
+mention_ink = "#FFFFFF"
+
+[typography]
+message_size = 13
+sidebar_size = 12
+timestamp_size = 10
+sender_weight = 650
+
+[geometry]
+corner_radius = 2
+message_gap = 4
+control_radius = 2
+input_radius = 2
+composer_radius = 3
+control_padding = 8
+input_padding = 6
+composer_padding = 6
+icon_size = 16
+avatar_size = 24
+avatar_roundness = 10
+
+[chat]
+layout = "columns"
+timestamp_format = "twenty_four_hour"
+
+[layout]
+navigation = "sidebar"
+direct_messages_first = true
+room_density = "compact"

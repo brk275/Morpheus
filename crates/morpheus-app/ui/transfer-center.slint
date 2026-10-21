@@ -1,0 +1,360 @@
+// The visible account's transfer center: uploads in every room, saves of
+// received attachments, and transfers that recently ended. Rust owns every
+// row's state and the actions it permits; this file only lays the rows out
+// and reports explicit choices. It cannot import the window's globals, so
+// the window passes resolved appearance preferences and text scale in.
+
+import { ListView } from "std-widgets.slint";
+
+export struct TransferItem {
+    // 0 upload, 1 download, 2 ended; with the ID it names one transfer.
+    kind: int,
+    // Stable while the transfer exists; zero is never a transfer.
+    id: int,
+    name: string,
+    room: string,
+    // "Upload" or "Download".
+    direction: string,
+    // Size and type, when known.
+    detail: string,
+    status: string,
+    // 0 to 1 when the transfer reports progress; negative otherwise.
+    progress: float,
+    // Working without measurable progress.
+    busy: bool,
+    // 0 in progress, 1 waiting for a choice, 2 ended.
+    group: int,
+    can-cancel: bool,
+    can-retry: bool,
+    can-remove: bool,
+    can-open: bool,
+}
+
+export struct TransferCenterPalette {
+    ink: color,
+    muted: color,
+    panel: color,
+    surface: color,
+    hover: color,
+    pressed: color,
+    accent: color,
+    divider: color,
+    focus: color,
+    error: color,
+}
+
+// Resolved existing appearance preferences; no settings store of its own.
+export struct TransferCenterStyle {
+    row-radius: length,
+    control-radius: length,
+    // Row outline: the line width in high contrast, otherwise none.
+    row-line-width: length,
+    focus-width: length,
+    action-padding: length,
+}
+
+// A keyboard and pointer action with a text label.
+component TransferAction inherits Rectangle {
+    in property <string> text;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <TransferCenterPalette> palette;
+    in property <TransferCenterStyle> style;
+    in property <float> text-scale: 1;
+    callback activated();
+    width: action-text.preferred-width + 2 * root.style.action-padding;
+    min-height: action-text.preferred-height + 8px;
+    border-radius: root.style.control-radius;
+    background: !root.enabled ? transparent
+        : hit.pressed ? root.palette.pressed
+        : hit.has-hover ? root.palette.hover
+        : transparent;
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if root.enabled { root.activated(); }
+    }
+    action-text := Text {
+        text: root.text;
+        color: root.enabled ? root.palette.ink : root.palette.muted;
+        font-size: 11px * root.text-scale;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    keyboard-focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if root.enabled && (event.text == Key.Space || event.text == Key.Return) {
+                root.activated();
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            keyboard-focus.focus();
+            root.activated();
+        }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: root.style.focus-width;
+        border-color: root.palette.focus;
+        background: transparent;
+    }
+}
+
+export component TransferCenterPanel inherits Rectangle {
+    in property <[TransferItem]> items;
+    // "2 in progress · 1 waiting for you", or that there are none.
+    in property <string> summary;
+    // A live session; otherwise the pane shows nothing to act on.
+    in property <bool> available;
+    in property <TransferCenterPalette> palette;
+    in property <TransferCenterStyle> style;
+    in property <float> text-scale: 1;
+    // Set by an explicit open (a shortcut or settings search); the pane
+    // focuses its heading once it exists, so merely showing it never moves
+    // focus.
+    in-out property <bool> focus-pending: false;
+    in property <int> focus-request: 0;
+    property <int> handled-focus-request: 0;
+    // (kind, id, 0 remove, 1 cancel, 2 retry, 3 open its room)
+    callback action(int, int, int);
+    callback clear-finished();
+    // The heading received focus, for settings search.
+    callback revealed();
+
+    property <bool> has-finished: root.items.length > 0 && root.items[root.items.length - 1].group == 2;
+
+    background: root.palette.panel;
+    accessible-role: region;
+    accessible-label: "Transfers";
+    forward-focus: heading-focus;
+
+    // A conditional panel's descendants and focus chain are ready only
+    // after instantiation. Defer one event-loop tick, as the account menu
+    // does for its repeater items. Each explicit request gets one attempt;
+    // a hidden/unfocusable panel never spins a repeating timer.
+    Timer {
+        interval: 1ms;
+        running: root.focus-pending && root.focus-request != root.handled-focus-request;
+        triggered => {
+            root.handled-focus-request = root.focus-request;
+            heading-focus.focus();
+            if heading-focus.has-focus {
+                root.focus-pending = false;
+                root.revealed();
+            }
+        }
+    }
+
+    function group-title(group: int) -> string {
+        if group == 0 {
+            return "IN PROGRESS";
+        }
+        if group == 1 {
+            return "WAITING FOR YOU";
+        }
+        return "ENDED";
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 10px;
+            padding-top: 10px;
+            padding-bottom: 8px;
+            spacing: 8px;
+            Rectangle {
+                horizontal-stretch: 1;
+                min-height: heading.preferred-height + summary-text.preferred-height + 4px;
+                accessible-role: none;
+                heading := Text {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    text: "Transfers";
+                    color: root.palette.ink;
+                    font-size: 13px * root.text-scale;
+                    font-weight: 700;
+                    overflow: elide;
+                    accessible-role: none;
+                }
+                summary-text := Text {
+                    x: 0px;
+                    y: heading.preferred-height + 2px;
+                    width: parent.width;
+                    text: root.available ? root.summary : "Sign in to see this account's transfers";
+                    color: root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    overflow: elide;
+                    accessible-live-region: polite;
+                    accessible-role: none;
+                }
+                heading-focus := FocusScope {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: parent.height;
+                    accessible-role: text;
+                    accessible-label: "Transfers: " + summary-text.text;
+                    changed has-focus => {
+                        if self.has-focus {
+                            root.focus-pending = false;
+                            root.revealed();
+                        }
+                    }
+                    key-pressed(event) => { reject }
+                }
+                if heading-focus.has-focus : Rectangle {
+                    border-radius: root.style.control-radius;
+                    border-width: root.style.focus-width;
+                    border-color: root.palette.focus;
+                    background: transparent;
+                }
+            }
+            if root.available && root.has-finished : TransferAction {
+                text: "Clear ended";
+                label: "Clear ended transfers";
+                palette: root.palette;
+                style: root.style;
+                text-scale: root.text-scale;
+                activated => { root.clear-finished(); }
+            }
+        }
+        Rectangle { height: root.style.row-line-width > 0px ? root.style.row-line-width : 1px; background: root.palette.divider; }
+        if root.available : list := ListView {
+            vertical-stretch: 1;
+            horizontal-scrollbar-policy: always-off;
+            for item[index] in root.items : VerticalLayout {
+                width: list.visible-width;
+                padding-left: 8px;
+                padding-right: 8px;
+                padding-top: index == 0 || root.items[index - 1].group != item.group ? 10px : 3px;
+                padding-bottom: 3px;
+                spacing: 4px;
+                if index == 0 || root.items[index - 1].group != item.group : Text {
+                    text: root.group-title(item.group);
+                    color: root.palette.muted;
+                    font-size: 10px * root.text-scale;
+                    font-weight: 750;
+                    letter-spacing: 1px;
+                    accessible-role: none;
+                }
+                Rectangle {
+                    border-radius: root.style.row-radius;
+                    border-width: root.style.row-line-width;
+                    border-color: root.palette.divider;
+                    background: root.palette.surface;
+                    accessible-role: list-item;
+                    accessible-label: item.direction + ", " + item.name + (item.room != "" ? ", " + item.room : "") + ", " + item.status;
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 4px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: item.name;
+                                color: root.palette.ink;
+                                font-size: 12px * root.text-scale;
+                                font-weight: 700;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                accessible-role: none;
+                            }
+                            Text {
+                                text: item.direction;
+                                color: root.palette.muted;
+                                font-size: 10px * root.text-scale;
+                                vertical-alignment: center;
+                                accessible-role: none;
+                            }
+                        }
+                        if item.room != "" || item.detail != "" : Text {
+                            text: item.room + (item.room != "" && item.detail != "" ? " · " : "") + item.detail;
+                            color: root.palette.muted;
+                            font-size: 10px * root.text-scale;
+                            overflow: elide;
+                            accessible-role: none;
+                        }
+                        Text {
+                            text: item.status;
+                            // Choices waiting for the user use the theme's
+                            // error ink as text only, never a banner.
+                            color: item.group == 1 && item.status != "Ready to send" ? root.palette.error : root.palette.muted;
+                            font-size: 10px * root.text-scale;
+                            wrap: word-wrap;
+                            accessible-role: none;
+                        }
+                        if item.progress >= 0 || item.busy : Rectangle {
+                            height: 5px;
+                            border-radius: 2.5px;
+                            background: root.palette.divider;
+                            accessible-role: progress-indicator;
+                            accessible-label: item.progress >= 0 ? item.direction + " progress" : item.direction + " in progress";
+                            accessible-value: item.progress >= 0 ? round(item.progress * 100) + "%" : "";
+                            // No measurable progress: a fixed partial mark,
+                            // never a made-up percentage.
+                            Rectangle {
+                                x: item.progress >= 0 ? 0px : parent.width * 0.35;
+                                width: item.progress >= 0 ? parent.width * min(1, max(0, item.progress)) : parent.width * 0.3;
+                                height: parent.height;
+                                border-radius: parent.border-radius;
+                                background: root.palette.accent;
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            alignment: end;
+                            if item.can-open : TransferAction {
+                                text: "Open room";
+                                label: "Open the room of " + item.name;
+                                palette: root.palette;
+                                style: root.style;
+                                text-scale: root.text-scale;
+                                activated => { root.action(item.kind, item.id, 3); }
+                            }
+                            if item.can-retry : TransferAction {
+                                text: "Retry";
+                                label: "Retry " + item.name;
+                                palette: root.palette;
+                                style: root.style;
+                                text-scale: root.text-scale;
+                                activated => { root.action(item.kind, item.id, 2); }
+                            }
+                            if item.can-cancel : TransferAction {
+                                text: "Cancel";
+                                label: "Cancel " + item.name;
+                                palette: root.palette;
+                                style: root.style;
+                                text-scale: root.text-scale;
+                                activated => { root.action(item.kind, item.id, 1); }
+                            }
+                            if item.can-remove : TransferAction {
+                                text: item.group == 2 ? "Clear" : "Remove";
+                                label: (item.group == 2 ? "Clear " : "Remove ") + item.name;
+                                palette: root.palette;
+                                style: root.style;
+                                text-scale: root.text-scale;
+                                activated => { root.action(item.kind, item.id, 0); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !root.available || root.items.length == 0 : Rectangle {
+            vertical-stretch: 1;
+        }
+    }
+}

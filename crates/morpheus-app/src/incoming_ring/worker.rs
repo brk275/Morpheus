@@ -1,22 +1,27 @@
 //! Bounded, passive incoming-call discovery. No room/event fetch, join, key
 //! verification or capture occurs here. Admission and Answer retain the actual
-//! SDK receipt and current trust checks in IncomingOffer.
+//! SDK receipt and current trust checks in IncomingOffer. Declines from this
+//! user's other devices are retained as bounded receipts (Gate::decisions) and
+//! settled by the controller.
 
 use super::{
+    IncomingOffer,
     controller::{
-        AcceptedOffer, ControllerFailure, IncomingController, InvalidationHandle, OfferPresentation,
+        AcceptedOffer, ControllerFailure, DeclineCheck, DeclineClaim, DeclineReceipt,
+        IncomingController, InvalidationHandle, MAX_DECLINE_RECEIPTS, OfferPresentation,
+        ScopedReceipts,
     },
     membership_envelope,
 };
 use crate::voice_spaces::{IncomingPolicyRegistration, VoiceSpaces};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use matrix_sdk::{
     Client, Room, RoomState,
-    deserialized_responses::VerificationState,
+    deserialized_responses::{EncryptionInfo, VerificationState},
     event_handler::EventHandlerHandle,
     ruma::{
         OwnedEventId, OwnedRoomId,
-        events::{AnyGlobalAccountDataEvent, AnySyncStateEvent},
+        events::{AnyGlobalAccountDataEvent, AnySyncStateEvent, rtc::decline::SyncRtcDeclineEvent},
     },
 };
 use morpheus_matrix::{AccountManager, AccountSelection, SyncBackend, SyncStatus};
@@ -27,7 +32,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     runtime::Handle,
@@ -57,6 +62,10 @@ const RECEIPTS: usize = 128;
 const KEY_BYTES: usize = 64;
 const ROOM_BYTES: usize = 256 * 1024;
 const CACHE_INTERVAL: Duration = Duration::from_secs(1);
+/// Owned decline trust checks (DeclineCheck::trust), polled by the actor.
+type Checks = FuturesUnordered<
+    std::pin::Pin<Box<dyn std::future::Future<Output = (DeclineCheck, bool)> + Send>>,
+>;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct State {
@@ -71,9 +80,58 @@ struct Gate {
     state: Mutex<State>,
     invalidate: InvalidationHandle,
     offers: watch::Sender<Vec<OfferPresentation>>,
+    /// Real invalidation only (account, policy, room, crypto, stop): it
+    /// cancels an admission in progress.
     wake: Notify,
+    /// A decline receipt arrived. Kept apart from `wake` on purpose: a
+    /// receipt is evidence about one call, never an invalidation, so it must
+    /// not drop another offer's admission (whose ledger observation is
+    /// one-time). The actor services it in its main loop and, without
+    /// interrupting, during an admission (race_admission).
+    decision_wake: Notify,
+    /// Receipt-checked declines from this user's other devices, retained
+    /// briefly in case their offer is admitted after them (the notification
+    /// and its decline may arrive in one sync), together with the scope that
+    /// may hold them. All admission, insertion, restoration and clearing
+    /// happen under this one lock (ScopedReceipts). Lock order where both are
+    /// taken: state, then decisions.
+    decisions: Mutex<ScopedReceipts<DeclineReceipt, AccountSelection>>,
 }
 impl Gate {
+    fn decisions(
+        &self,
+    ) -> std::sync::MutexGuard<'_, ScopedReceipts<DeclineReceipt, AccountSelection>> {
+        self.decisions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+    /// Retain one receipt-checked decline, only while the gate is not stopped
+    /// and its own captured selection is the current scope, and tell the
+    /// actor (decisions_arrived, never the invalidation wake).
+    fn retain_decision(&self, receipt: DeclineReceipt) {
+        if self.decisions().insert(receipt, Instant::now()) {
+            self.decisions_arrived();
+        }
+    }
+    /// Only the receipt wake: no admission is cancelled by it.
+    fn decisions_arrived(&self) {
+        self.decision_wake.notify_one();
+    }
+    /// The scope whose own declines may be retained, set before its handlers
+    /// are registered; select() with the same selection keeps them.
+    fn scope_decisions(&self, scope: Option<AccountSelection>) {
+        self.decisions().reset(scope);
+    }
+    fn take_decisions(&self) -> Vec<DeclineReceipt> {
+        self.decisions().take(Instant::now())
+    }
+    /// Admission is rechecked under the lock: a stop or scope change that
+    /// happened meanwhile keeps them out.
+    fn restore_decisions(&self, earlier: Vec<DeclineReceipt>) {
+        if !earlier.is_empty() {
+            self.decisions().restore(earlier, Instant::now());
+        }
+    }
     fn invalidate(&self) {
         diagnostic!(self, GateInvalidation);
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -83,6 +141,7 @@ impl Gate {
         } else {
             state.stopped = true;
             self.invalidate.shutdown();
+            self.decisions().stop();
         }
         self.offers.send_replace(Vec::new());
         drop(state);
@@ -91,6 +150,9 @@ impl Gate {
     fn select(&self, selection: Option<AccountSelection>) {
         self.invalidate();
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // No decline received under an earlier selection survives it, and
+        // only the new selection's own receipts may enter from now on.
+        self.decisions().reset(selection.clone());
         state.selected = selection;
         state.interests.clear();
     }
@@ -127,6 +189,7 @@ impl Gate {
         state.stopped = true;
         self.invalidate.shutdown();
         self.offers.send_replace(Vec::new());
+        self.decisions().stop();
         drop(state);
         self.wake.notify_one();
     }
@@ -183,6 +246,10 @@ enum Command {
     Dismiss {
         key: String,
     },
+    Decline {
+        key: String,
+        reply: oneshot::Sender<Result<DeclineClaim, ControllerFailure>>,
+    },
 }
 #[derive(Clone)]
 pub(crate) struct IncomingHandle {
@@ -220,6 +287,19 @@ impl IncomingHandle {
             .try_send(Command::Dismiss { key })
             .map_err(|_| ControllerFailure::Capacity)
     }
+    /// Takes the offer for one explicit Decline; the caller makes the bounded
+    /// send off the actor. A dropped reply drops and revokes the claim.
+    pub(crate) async fn decline(&self, key: String) -> Result<DeclineClaim, ControllerFailure> {
+        require_key(&key)?;
+        if self.gate.current().is_none() {
+            return Err(ControllerFailure::Unavailable);
+        }
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .try_send(Command::Decline { key, reply })
+            .map_err(|_| ControllerFailure::Capacity)?;
+        result.await.map_err(|_| ControllerFailure::Unavailable)?
+    }
 }
 fn require_key(key: &str) -> Result<(), ControllerFailure> {
     if key.is_empty() || key.len() > KEY_BYTES || key.chars().any(char::is_control) {
@@ -254,6 +334,8 @@ impl IncomingWorker {
             invalidate: controller.invalidation_handle(),
             offers,
             wake: Notify::new(),
+            decision_wake: Notify::new(),
+            decisions: Mutex::new(ScopedReceipts::default()),
         });
         let (commands, receiver) = mpsc::channel(COMMANDS);
         let handle = IncomingHandle {
@@ -367,6 +449,13 @@ async fn run(
         gate.clone(),
     ))]);
     let mut scope: Option<Scope> = None;
+    // Decline trust checks in flight, owned by this actor and polled after the
+    // commands and wake-ups (biased below, and inside race_admission while an
+    // admission runs), so a waiting check never holds up Answer, Decline,
+    // Dismiss or stopping, and new declines are matched and checked, and
+    // finished checks applied, even during another call's admission. Bounded
+    // by MAX_DECLINE_RECEIPTS.
+    let mut checks: Checks = FuturesUnordered::new();
     let mut tick = time::interval(CACHE_INTERVAL);
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     loop {
@@ -379,7 +468,14 @@ async fn run(
                 Some(command) => dispatch(command, &mut controller, &gate),
                 None => break,
             },
-            _ = gate.wake.notified() => { controller.reap(); publish(&mut controller, &gate); },
+            _ = gate.wake.notified() => { controller.reap(); start_declines(&mut controller, &gate, &mut checks); publish(&mut controller, &gate); },
+            _ = gate.decision_wake.notified() => { controller.reap(); start_declines(&mut controller, &gate, &mut checks); publish(&mut controller, &gate); },
+            finished = checks.next(), if !checks.is_empty() => {
+                if let Some((check, trusted)) = finished {
+                    controller.finish_decline(check, trusted);
+                }
+                controller.reap(); start_declines(&mut controller, &gate, &mut checks); publish(&mut controller, &gate);
+            },
             _ = tick.tick() => {
                 let current = manager.subscribe_active_account().borrow().clone();
                 let sync_ok = sticky_running(&manager.subscribe_sync_status().borrow());
@@ -390,11 +486,16 @@ async fn run(
                 if !keep {
                     if !usable { diagnostic!(gate, ScopeUnavailable); }
                     scope = None;
+                    // No old check survives its scope (their offers go too).
+                    checks.clear();
                     controller.select(None);
                     gate.select(None);
                     // A->B->A cannot resurrect any queued old candidate.
                     while incoming.try_recv().is_ok() {}
                     if usable && let Some(selection) = selection {
+                        // Declines may arrive while the scope's handlers are
+                        // being set up; only this selection's own are kept.
+                        gate.scope_decisions(Some(selection.clone()));
                         let prepared = time::timeout(SETUP_TIMEOUT, prepare_scope(&manager, selection.clone(), gate.clone())).await;
                         if let Ok(Some(prepared)) = prepared {
                             if selection.is_current() && !gate.stopped() {
@@ -406,31 +507,60 @@ async fn run(
                     }
                 }
                 if let Some(scope) = scope.as_mut() { discover_rooms(scope, &gate, &candidates); }
-                controller.reap(); publish(&mut controller, &gate);
+                controller.reap(); start_declines(&mut controller, &gate, &mut checks); publish(&mut controller, &gate);
             },
             candidate = incoming.recv() => {
                 let Some(candidate) = candidate else { break; };
                 if gate.current() != Some(candidate.epoch) { diagnostic!(gate, CandidateStaleEpoch); continue; }
                 diagnostic!(gate, AdmissionStarted);
-                enum Outcome { Command(Option<Command>), Changed, Finished }
-                let outcome = {
-                    let receive = controller.receive(&manager, &preferences, &candidate.room, &candidate.event);
-                    tokio::pin!(receive);
-                    tokio::select! {
-                        biased;
-                        command = commands.recv() => { diagnostic!(gate, CandidateInterrupted); Outcome::Command(command) },
-                        _ = gate.wake.notified() => { diagnostic!(gate, CandidateInvalidated); Outcome::Changed },
-                        _result = &mut receive => {
-                            #[cfg(test)]
-                            gate.diagnostics.result(&_result);
-                            Outcome::Finished
-                        },
+                let ticket = match controller.begin_receive(&candidate.room, &candidate.event) {
+                    Ok(ticket) => ticket,
+                    Err(_failure) => {
+                        #[cfg(test)]
+                        gate.diagnostics.result(&Err::<(), _>(_failure));
+                        controller.reap(); start_declines(&mut controller, &gate, &mut checks); publish(&mut controller, &gate);
+                        continue;
                     }
                 };
+                // The one admission future, with the controller's shared
+                // ledger: it holds no controller borrow, so declines that
+                // arrive meanwhile are matched and checked, and finished
+                // checks applied, at once (below) while it keeps its original
+                // pinned future and one-time observation. A decline for this
+                // admission's own call matches no offer yet and stays
+                // retained, with its original deadline, until it is admitted.
+                let ledger = controller.ledger();
+                let outcome = race_admission(
+                    IncomingOffer::admit(&manager, &preferences, &candidate.room, &candidate.event, &*ledger),
+                    &mut commands,
+                    &gate,
+                    &mut checks,
+                    |event, checks| {
+                        if let AdmissionEvent::Completed((check, trusted)) = event {
+                            controller.finish_decline(check, trusted);
+                        }
+                        controller.reap(); start_declines(&mut controller, &gate, checks); publish(&mut controller, &gate);
+                    },
+                )
+                .await;
                 match outcome {
-                    Outcome::Command(Some(command)) => dispatch(command, &mut controller, &gate),
-                    Outcome::Command(None) => break,
-                    Outcome::Changed | Outcome::Finished => { controller.reap(); publish(&mut controller, &gate); },
+                    Err(Interrupt::Command(command)) => {
+                        diagnostic!(gate, CandidateInterrupted);
+                        match command {
+                            Some(command) => dispatch(command, &mut controller, &gate),
+                            None => break,
+                        }
+                    }
+                    Err(Interrupt::Changed) => {
+                        diagnostic!(gate, CandidateInvalidated);
+                        controller.reap(); start_declines(&mut controller, &gate, &mut checks); publish(&mut controller, &gate);
+                    }
+                    Ok(admitted) => {
+                        let _result = controller.finish_receive(ticket, admitted);
+                        #[cfg(test)]
+                        gate.diagnostics.result(&_result);
+                        controller.reap(); start_declines(&mut controller, &gate, &mut checks); publish(&mut controller, &gate);
+                    }
                 }
             },
         }
@@ -438,6 +568,55 @@ async fn run(
     gate.shutdown();
     controller.shutdown();
     drop(scope);
+}
+/// What interrupted an admission before it finished.
+enum Interrupt {
+    Command(Option<Command>),
+    Changed,
+}
+/// Useful work while an admission runs, handed to one callback (so only one
+/// closure ever borrows the controller): decline receipts are ready to be
+/// matched (`Gate::decision_wake`), or a decline check finished.
+enum AdmissionEvent<C> {
+    Receipts,
+    Completed(C),
+}
+/// Drive one admission (its original future, polled until it finishes or is
+/// interrupted, never rebuilt) while servicing decline work meanwhile: each
+/// receipt arrival and each finished check is handed to `on_event` (which
+/// matches receipts, starts checks within the existing bounds, applies
+/// completions and publishes) and the same admission future keeps going. It
+/// is interrupted only by a command (first) or real invalidation
+/// (`Gate::wake`: account, policy, room, crypto, stop), as before. A receipt
+/// arrival is readiness only, never cancellation: it can neither drop this
+/// admission nor consume its one-time ledger observation, whatever that
+/// receipt later proves.
+async fn race_admission<F, Fut, C>(
+    receive: F,
+    commands: &mut mpsc::Receiver<Command>,
+    gate: &Gate,
+    checks: &mut FuturesUnordered<Fut>,
+    mut on_event: impl FnMut(AdmissionEvent<C>, &mut FuturesUnordered<Fut>),
+) -> Result<F::Output, Interrupt>
+where
+    F: std::future::Future,
+    Fut: std::future::Future<Output = C>,
+{
+    tokio::pin!(receive);
+    loop {
+        tokio::select! {
+            biased;
+            command = commands.recv() => return Err(Interrupt::Command(command)),
+            _ = gate.wake.notified() => return Err(Interrupt::Changed),
+            _ = gate.decision_wake.notified() => on_event(AdmissionEvent::Receipts, checks),
+            done = checks.next(), if !checks.is_empty() => {
+                if let Some(done) = done {
+                    on_event(AdmissionEvent::Completed(done), checks);
+                }
+            },
+            result = &mut receive => return Ok(result),
+        }
+    }
 }
 fn sticky_running(status: &SyncStatus) -> bool {
     matches!(
@@ -451,6 +630,28 @@ fn publish(controller: &mut IncomingController, gate: &Gate) {
     if let Some(epoch) = gate.current() {
         gate.publish(epoch, controller.presentations());
     }
+}
+/// Begin trust checks for retained own-device declines that match exact
+/// offers, before publishing. An offer not yet shown is withheld while its
+/// check runs, so a decline that arrived first (even in the same sync)
+/// retires it, once authenticated, before it is ever shown or rung; if the
+/// check fails it is shown then. At most MAX_DECLINE_RECEIPTS checks run at
+/// once; receipts beyond that, or matching no offer yet, stay retained until
+/// they expire.
+fn start_declines(controller: &mut IncomingController, gate: &Gate, checks: &mut Checks) {
+    let room = MAX_DECLINE_RECEIPTS.saturating_sub(checks.len());
+    if room == 0 {
+        return;
+    }
+    let receipts = gate.take_decisions();
+    if receipts.is_empty() {
+        return;
+    }
+    let (started, unmatched) = controller.match_declines(receipts, room);
+    for check in started {
+        checks.push(Box::pin(check.trust()));
+    }
+    gate.restore_decisions(unmatched);
 }
 fn dispatch(command: Command, controller: &mut IncomingController, gate: &Gate) {
     // Re-read current actor-owned offers at command execution, never parse text
@@ -472,6 +673,14 @@ fn dispatch(command: Command, controller: &mut IncomingController, gate: &Gate) 
         Command::Dismiss { key } => {
             if let Some(token) = lookup(&offers, &key) {
                 let _ = controller.dismiss(token);
+            }
+        }
+        Command::Decline { key, reply } => {
+            if !reply.is_closed() {
+                let result = lookup(&offers, &key)
+                    .ok_or(ControllerFailure::Stale)
+                    .and_then(|token| controller.decline(token));
+                let _ = reply.send(result); // Dropped receiver drops/revokes DeclineClaim.
             }
         }
     }
@@ -528,7 +737,42 @@ async fn prepare_scope(
     }
     let devices = client.encryption().devices_stream().await.ok()?;
     let identities = client.encryption().user_identities_stream().await.ok()?;
+    // This scope's own identity, before any handler exists (an early return
+    // below must not leave a handler registered).
+    let receipt_user = client.user_id()?.to_string();
+    let receipt_device = client.device_id()?.to_string();
     let mut handles = Vec::new();
+    // Declines (MSC4310) as this account's sync delivers them. The SDK runs
+    // event handlers only for sync responses (sync and sliding sync), never
+    // for fetched, backfilled or paginated events, and passes each event's
+    // own decryption metadata: an undecryptable event keeps its encrypted
+    // type and never reaches this handler, a plaintext one has none, and a
+    // redacted one has no original content. Only receipt-checked declines
+    // from this user's other devices are retained (bounded, short-lived);
+    // the actor settles them against exact offers after checking the
+    // device's current trust. Nothing is fetched or sent here. The legacy
+    // sender-only Room::subscribe_to_call_decline_events is not used.
+    let decisions = gate.clone();
+    let receipt_selection = selection.clone();
+    handles.push(client.add_event_handler(
+        move |event: SyncRtcDeclineEvent, room: Room, encryption: Option<EncryptionInfo>| {
+            if let Some(original) = event.as_original()
+                && let Some(receipt) = DeclineReceipt::from_sync(
+                    &receipt_selection,
+                    &receipt_user,
+                    &receipt_device,
+                    room.room_id().as_str(),
+                    original.sender.as_str(),
+                    original.content.relates_to.event_id.as_str(),
+                    encryption.as_ref(),
+                    Instant::now(),
+                )
+            {
+                decisions.retain_decision(receipt);
+            }
+            async {}
+        },
+    ));
     let changed = gate.clone();
     handles.push(
         client.add_event_handler(move |event: AnyGlobalAccountDataEvent| {
@@ -959,6 +1203,8 @@ mod tests {
             invalidate: controller.invalidation_handle(),
             offers,
             wake: Notify::new(),
+            decision_wake: Notify::new(),
+            decisions: Mutex::new(ScopedReceipts::default()),
         });
         (controller, gate)
     }
@@ -1061,6 +1307,404 @@ mod tests {
         gate.room_changed("relevant-room");
         assert_eq!(gate.state.lock().unwrap().epoch, 2);
     }
+    /// A decline receipt for call A arriving while call B's admission is held
+    /// (say, waiting on trust or membership after its one-time ledger
+    /// observation) does not interrupt it: B keeps its original admission
+    /// future, which then finishes. The receipt's own result is irrelevant
+    /// here (one that later fails current trust has no effect on B either):
+    /// only its arrival is signalled, on its own wake. Real invalidation, a
+    /// stop and a command still interrupt an admission as before.
+    #[tokio::test]
+    async fn a_decline_receipt_never_interrupts_another_calls_admission() {
+        let (_controller, gate) = gate();
+        let (send, mut commands) = mpsc::channel(1);
+        // No decline check is in flight in this test.
+        let mut idle = FuturesUnordered::<std::future::Ready<u8>>::new();
+
+        let (release, held) = oneshot::channel::<u8>();
+        let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission = {
+            let polled = polled.clone();
+            async move {
+                polled.fetch_add(1, Ordering::SeqCst);
+                held.await.unwrap_or(0)
+            }
+        };
+        let ready = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let seen = ready.clone();
+            let race = race_admission(admission, &mut commands, &gate, &mut idle, |event, _| {
+                if matches!(event, AdmissionEvent::Receipts) {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            tokio::pin!(race);
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            // Receipt A arrives (whether or not it will prove trusted).
+            gate.decisions_arrived();
+            assert!(
+                futures_util::poll!(race.as_mut()).is_pending(),
+                "B is not dropped"
+            );
+            release.send(7).unwrap();
+            assert!(
+                matches!(race.await, Ok(7)),
+                "B finishes its original admission"
+            );
+        }
+        assert_eq!(
+            polled.load(Ordering::SeqCst),
+            1,
+            "never rebuilt or re-observed"
+        );
+        // V5: the receipt's readiness is serviced in the seam (matching and
+        // checking run during B), not by cancelling B; it is consumed there.
+        assert_eq!(
+            ready.load(Ordering::SeqCst),
+            1,
+            "readiness serviced during B"
+        );
+
+        // Real invalidation still cancels an admission.
+        {
+            let race = race_admission(
+                std::future::pending::<u8>(),
+                &mut commands,
+                &gate,
+                &mut idle,
+                |_, _| {},
+            );
+            tokio::pin!(race);
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            gate.invalidate();
+            assert!(matches!(race.await, Err(Interrupt::Changed)));
+        }
+        // So does a command.
+        send.try_send(Command::Dismiss {
+            key: "incoming-1".into(),
+        })
+        .unwrap_or_else(|_| panic!("command failed"));
+        {
+            let race = race_admission(
+                std::future::pending::<u8>(),
+                &mut commands,
+                &gate,
+                &mut idle,
+                |_, _| {},
+            );
+            assert!(matches!(race.await, Err(Interrupt::Command(Some(_)))));
+        }
+        // And a stop.
+        {
+            let race = race_admission(
+                std::future::pending::<u8>(),
+                &mut commands,
+                &gate,
+                &mut idle,
+                |_, _| {},
+            );
+            tokio::pin!(race);
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            gate.shutdown();
+            assert!(matches!(race.await, Err(Interrupt::Changed)));
+        }
+    }
+    /// The actual admission seam (race_admission, as run() uses it) keeps
+    /// servicing decline checks while call B's admission is held: call A's
+    /// check that finishes meanwhile (here untrusted, as a failed or timed-out
+    /// check would) is applied at once, not after B, so A is shown or retired
+    /// without waiting for B's admission limit; a check that application
+    /// starts is serviced too. B keeps its one original admission future,
+    /// polled on, never rebuilt, and then finishes. A command still
+    /// interrupts as before.
+    #[tokio::test]
+    async fn decline_checks_finish_while_another_calls_admission_is_held() {
+        type Check =
+            std::pin::Pin<Box<dyn std::future::Future<Output = (&'static str, bool)> + Send>>;
+        let (_controller, gate) = gate();
+        let (send, mut commands) = mpsc::channel(1);
+        let (release_b, held_b) = oneshot::channel::<u8>();
+        let (finish_a, check_a) = oneshot::channel::<bool>();
+        let (finish_c, check_c) = oneshot::channel::<bool>();
+        let mut checks: FuturesUnordered<Check> = FuturesUnordered::new();
+        checks.push(Box::pin(
+            async move { ("A", check_a.await.unwrap_or(false)) },
+        ));
+        let mut started: Option<Check> =
+            Some(Box::pin(
+                async move { ("C", check_c.await.unwrap_or(false)) },
+            ));
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission = {
+            let built = built.clone();
+            built.fetch_add(1, Ordering::SeqCst);
+            async move { held_b.await.unwrap_or(0) }
+        };
+        {
+            let record = applied.clone();
+            let race = race_admission(
+                admission,
+                &mut commands,
+                &gate,
+                &mut checks,
+                |event, checks| {
+                    if let AdmissionEvent::Completed(done) = event {
+                        record.lock().unwrap().push(done);
+                        // Applying a completion may start another check.
+                        if let Some(next) = started.take() {
+                            checks.push(next);
+                        }
+                    }
+                },
+            );
+            tokio::pin!(race);
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            finish_a.send(false).unwrap();
+            assert!(
+                futures_util::poll!(race.as_mut()).is_pending(),
+                "B is still admitting"
+            );
+            assert_eq!(
+                *applied.lock().unwrap(),
+                [("A", false)],
+                "A applied during B"
+            );
+            finish_c.send(true).unwrap();
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            assert_eq!(*applied.lock().unwrap(), [("A", false), ("C", true)]);
+            release_b.send(9).unwrap();
+            assert!(
+                matches!(race.await, Ok(9)),
+                "B finishes its original admission"
+            );
+        }
+        assert_eq!(
+            built.load(Ordering::SeqCst),
+            1,
+            "B's admission was built once"
+        );
+
+        // A command still interrupts an admission while a check is held.
+        let (_finish, held) = oneshot::channel::<bool>();
+        checks.push(Box::pin(async move { ("D", held.await.unwrap_or(false)) }));
+        send.try_send(Command::Dismiss {
+            key: "incoming-1".into(),
+        })
+        .unwrap_or_else(|_| panic!("command failed"));
+        let race = race_admission(
+            std::future::pending::<u8>(),
+            &mut commands,
+            &gate,
+            &mut checks,
+            |_, _| {},
+        );
+        assert!(matches!(race.await, Err(Interrupt::Command(Some(_)))));
+        assert_eq!(
+            checks.len(),
+            1,
+            "the held check survives for the outer loop"
+        );
+    }
+    /// A NEW decline that arrives while call B's admission is held is served
+    /// in the same seam: its readiness begins checks (one per declining device
+    /// and offer, in the real call book), they resolve and are applied with
+    /// the real settlement rule BEFORE B is released, and B's one original
+    /// admission future still finishes once. A trusted decline retires ringing
+    /// call A; an untrusted one ends the withholding of never-shown call E,
+    /// which is then shown normally; one resolving after its receipt's own
+    /// original deadline settles nothing; a replayed arrival begins no second
+    /// check. A command, real invalidation and a stop keep priority over
+    /// receipt readiness.
+    #[tokio::test]
+    async fn a_new_decline_is_checked_and_applied_while_another_call_admits() {
+        use super::super::controller::{ActionToken, Lease, OfferBook, decline_still_settles};
+        type Check = std::pin::Pin<
+            Box<dyn std::future::Future<Output = (ActionToken, bool, Instant)> + Send>,
+        >;
+        let (_controller, gate) = gate();
+        let (send, mut commands) = mpsc::channel(1);
+        let now = Instant::now();
+        let lease = Arc::new(Lease::new(1, now + Duration::from_secs(30)));
+        let book = Arc::new(Mutex::new(OfferBook::default()));
+        let (ringing, unshown, late) = {
+            let mut book = book.lock().unwrap();
+            let ringing = book.insert(1u8, lease.clone()).unwrap();
+            book.mark_presented(ringing);
+            let unshown = book.insert(2u8, lease.clone()).unwrap();
+            let late = book.insert(3u8, lease.clone()).unwrap();
+            book.mark_presented(late);
+            (ringing, unshown, late)
+        };
+        // Each offer's one check, reporting its trust result and its
+        // receipt's original deadline (already passed for `late`).
+        let (trust_ringing, ringing_trust) = oneshot::channel::<bool>();
+        let (trust_unshown, unshown_trust) = oneshot::channel::<bool>();
+        let (trust_late, late_trust) = oneshot::channel::<bool>();
+        let later = now + Duration::from_secs(60);
+        let mut ready: Vec<(ActionToken, Option<Check>)> =
+            vec![
+                (
+                    ringing,
+                    Some(Box::pin(
+                        async move { (ringing, ringing_trust.await.unwrap_or(false), later) },
+                    ) as Check),
+                ),
+                (
+                    unshown,
+                    Some(Box::pin(
+                        async move { (unshown, unshown_trust.await.unwrap_or(false), later) },
+                    ) as Check),
+                ),
+                (
+                    late,
+                    Some(
+                        Box::pin(async move { (late, late_trust.await.unwrap_or(false), now) })
+                            as Check,
+                    ),
+                ),
+            ];
+        let mut checks: FuturesUnordered<Check> = FuturesUnordered::new();
+        let begun = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let settled = Arc::new(Mutex::new(Vec::new()));
+        let (release_b, held_b) = oneshot::channel::<u8>();
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission = {
+            built.fetch_add(1, Ordering::SeqCst);
+            async move { held_b.await.unwrap_or(0) }
+        };
+        {
+            let (shared, count, done) = (book.clone(), begun.clone(), settled.clone());
+            let race = race_admission(
+                admission,
+                &mut commands,
+                &gate,
+                &mut checks,
+                |event, checks| {
+                    let mut book = shared.lock().unwrap();
+                    match event {
+                        // Match each fresh decline to its exact offer; a device
+                        // already checked for that offer begins nothing.
+                        AdmissionEvent::Receipts => {
+                            for (token, check) in ready.iter_mut() {
+                                if book.begin_check(*token, "PHONE") {
+                                    checks.push(check.take().expect("one check per device"));
+                                    count.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                        AdmissionEvent::Completed((token, trusted, expires)) => {
+                            book.end_check(token);
+                            if decline_still_settles(
+                                trusted,
+                                true,
+                                expires,
+                                Instant::now(),
+                                true,
+                                true,
+                            ) && book.take(token).is_ok()
+                            {
+                                done.lock().unwrap().push(token);
+                            }
+                        }
+                    }
+                },
+            );
+            tokio::pin!(race);
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            // Fresh declines arrive during B.
+            gate.decisions_arrived();
+            assert!(
+                futures_util::poll!(race.as_mut()).is_pending(),
+                "B keeps admitting"
+            );
+            assert_eq!(begun.load(Ordering::SeqCst), 3, "checks begun during B");
+            assert!(
+                book.lock().unwrap().withheld(unshown),
+                "never shown: waits for its check"
+            );
+            assert!(
+                !book.lock().unwrap().withheld(ringing),
+                "ringing: keeps ringing"
+            );
+            // Trusted: the ringing call is retired, before B is released.
+            trust_ringing.send(true).unwrap();
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            assert_eq!(*settled.lock().unwrap(), [ringing]);
+            // Untrusted: the never-shown call is shown normally.
+            trust_unshown.send(false).unwrap();
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            assert!(!book.lock().unwrap().withheld(unshown));
+            // Trusted, but after its receipt's own deadline: nothing settles.
+            trust_late.send(true).unwrap();
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            assert_eq!(
+                *settled.lock().unwrap(),
+                [ringing],
+                "late settlement refused"
+            );
+            // A replayed arrival begins no second check.
+            gate.decisions_arrived();
+            assert!(futures_util::poll!(race.as_mut()).is_pending());
+            assert_eq!(begun.load(Ordering::SeqCst), 3, "no second check");
+            release_b.send(9).unwrap();
+            assert!(
+                matches!(race.await, Ok(9)),
+                "B finishes its original admission"
+            );
+        }
+        assert_eq!(
+            built.load(Ordering::SeqCst),
+            1,
+            "B's admission was built once"
+        );
+        // Neither the untrusted nor the late decline removed its call.
+        assert!(book.lock().unwrap().take(unshown).is_ok());
+        assert!(book.lock().unwrap().take(late).is_ok());
+
+        // Receipt readiness never outranks a command, real invalidation or a
+        // stop.
+        let mut idle = FuturesUnordered::<std::future::Ready<u8>>::new();
+        gate.decisions_arrived();
+        send.try_send(Command::Dismiss {
+            key: "incoming-1".into(),
+        })
+        .unwrap_or_else(|_| panic!("command failed"));
+        {
+            let race = race_admission(
+                std::future::pending::<u8>(),
+                &mut commands,
+                &gate,
+                &mut idle,
+                |_, _| {},
+            );
+            assert!(matches!(race.await, Err(Interrupt::Command(Some(_)))));
+        }
+        gate.decisions_arrived();
+        gate.invalidate();
+        {
+            let race = race_admission(
+                std::future::pending::<u8>(),
+                &mut commands,
+                &gate,
+                &mut idle,
+                |_, _| {},
+            );
+            assert!(matches!(race.await, Err(Interrupt::Changed)));
+        }
+        gate.decisions_arrived();
+        gate.shutdown();
+        {
+            let race = race_admission(
+                std::future::pending::<u8>(),
+                &mut commands,
+                &gate,
+                &mut idle,
+                |_, _| {},
+            );
+            assert!(matches!(race.await, Err(Interrupt::Changed)));
+        }
+    }
     #[test]
     fn scope_replacement_and_epoch_exhaustion_cannot_revive_old_intake() {
         let (_controller, gate) = gate();
@@ -1085,6 +1729,22 @@ mod tests {
         assert!(
             send.try_send(Command::Dismiss {
                 key: "incoming-2".into()
+            })
+            .is_err()
+        );
+        drop(receive.recv().await);
+        assert!(result.await.is_err());
+        // A Decline command is bounded the same way: an unhandled command
+        // drops its reply, so its waiter wakes with no claim and sends nothing.
+        let (reply, result) = oneshot::channel();
+        send.try_send(Command::Decline {
+            key: "incoming-3".into(),
+            reply,
+        })
+        .unwrap_or_else(|_| panic!("decline command failed"));
+        assert!(
+            send.try_send(Command::Dismiss {
+                key: "incoming-4".into()
             })
             .is_err()
         );

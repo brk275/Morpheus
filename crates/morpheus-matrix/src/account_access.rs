@@ -1527,6 +1527,7 @@ mod tests {
                         room_id,
                         None,
                         &ComposeText::plain("delayed draft"),
+                        &DraftEnvelope::fresh(),
                     )
                     .await,
                 Err(MatrixCoreError::AccountRemovalPending)
@@ -1784,12 +1785,22 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
+            // This manual LoadedAccount fixture must match build_client.
+            client.send_queue().set_enabled(false).await;
             let (incoming_verification_tx, _) = watch::channel(Vec::new());
+            let e2ee = crate::account_recovery::E2eeReadiness::of(&client);
             let loaded = Arc::new(LoadedAccount {
                 client: client.clone(),
+                e2ee,
                 timelines: Mutex::new(HashMap::new()),
                 composed_edits: Mutex::new(HashMap::new()),
+                pending_sends: Mutex::new(HashMap::new()),
+                originals: Mutex::new(HashMap::new()),
+                recovered: Mutex::new(Vec::new()),
+                recovery_gate: Mutex::new(RecoveryGate::default()),
+                recovery_ready: watch::channel(false).0,
                 incoming_verification_tx,
+                verification_book: Default::default(),
                 notification_handler_registered: Mutex::new(false),
                 token_task: Mutex::new(Some(SyncTask {
                     shutdown: Some(shutdown),
@@ -1823,8 +1834,11 @@ mod tests {
                     manager.pause_active_sync_for(rejected).await,
                     Err(MatrixCoreError::SelectedAccountChanged)
                 ));
-                assert!(client.send_queue().is_enabled());
+                // The client-wide queue is never enabled; the live sync task
+                // and the current selection show the account is still active.
+                assert!(!client.send_queue().is_enabled());
                 assert!(manager.state.lock().await.sync_task.is_some());
+                assert!(current.is_current());
             }
             manager.pause_active_sync_for(&current).await.unwrap();
             assert!(!client.send_queue().is_enabled());
@@ -1938,7 +1952,16 @@ mod tests {
             assert_eq!(manager.activate(grant).await.unwrap(), second.clone());
             assert!(!previous.is_current());
             assert!(!client_a.send_queue().is_enabled());
-            assert!(client_b.send_queue().is_enabled());
+            // Never client-wide: the selected account is known by its
+            // discovery readiness, not by a global queue flag.
+            assert!(!client_b.send_queue().is_enabled());
+            assert!(
+                manager
+                    .take_recovered_drafts(&manager.account_selection(&second.id).unwrap())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             let removal = manager.remove_account(&second.id).await.unwrap();
             assert!(removal.complete);
             assert!(manager.active_account().await.is_none());

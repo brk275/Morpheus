@@ -3,13 +3,16 @@
 use std::sync::{Mutex, PoisonError};
 
 use morpheus_config::{
-    BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, MessageLayout, NavigationMode,
-    NicknameAlignment, ThemeMode, ThemePack, TimestampFormat,
+    BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, Density, DetailsSide,
+    MessageLayout, NavigationMode, NicknameAlignment, ThemeMode, ThemePack, TimestampFormat,
 };
 use slint::fontique_011::fontique;
 use slint::{ComponentHandle, ModelRc, VecModel};
 
-use super::{AppWindow, ColorRole, StyleTokens, ThemeRoleSet, color_from_hex, save_config_change};
+use super::{
+    AppWindow, BaseColorSet, ColorRole, StyleTokens, ThemeRoleSet, ThemeStateSet, color_from_hex,
+    save_config_change,
+};
 
 /// Theme-mode preferences of the last configuration this window accepted.
 /// Only a successfully loaded configuration replaces them, so a rejected
@@ -17,11 +20,22 @@ use super::{AppWindow, ColorRole, StyleTokens, ThemeRoleSet, color_from_hex, sav
 /// the window's active account ID, which the live controller publishes only
 /// after a successful activation and clears whenever no account is active;
 /// a wrong password, a cancelled or stale switch never changes it.
-static THEME_SOURCE: Mutex<Option<Config>> = Mutex::new(None);
+/// The theme pack and per-account colors follow the same rule.
+static THEME_SOURCE: Mutex<Option<(Config, Option<ThemePack>)>> = Mutex::new(None);
 
-/// Record the last valid configuration's theme preferences.
-pub(crate) fn remember_theme_preferences(config: &Config) {
-    *THEME_SOURCE.lock().unwrap_or_else(PoisonError::into_inner) = Some(config.clone());
+/// Record the last valid configuration's theme preferences and theme pack.
+pub(crate) fn remember_theme_preferences(config: &Config, theme: Option<&ThemePack>) {
+    *THEME_SOURCE.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some((config.clone(), theme.cloned()));
+}
+
+/// The configuration and theme pack whose look the window shows: the last
+/// accepted one, or a style profile preview while one is shown.
+pub(crate) fn remembered_theme_source() -> Option<(Config, Option<ThemePack>)> {
+    THEME_SOURCE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// Show the theme mode configured for the window's active account, or the
@@ -29,14 +43,164 @@ pub(crate) fn remember_theme_preferences(config: &Config) {
 /// The Settings picker shows the global choice separately, with a notice
 /// while the active account overrides it.
 pub(crate) fn apply_theme_mode(ui: &AppWindow) {
+    // Every account switch or detach publishes here, so a style profile
+    // preview started for another account is cancelled first.
+    crate::style_profiles::check_account(ui);
+    // Drafted account colors never carry over to another account.
+    crate::theme_studio::check_account(ui);
     let account = ui.get_active_account_local_id();
-    let projection = {
-        let source = THEME_SOURCE.lock().unwrap_or_else(PoisonError::into_inner);
-        theme_projection_for(source.as_ref(), account.as_str())
-    };
+    // The open room's own appearance draws over its account's (global ->
+    // account -> room). Every room change re-projects here.
+    let room = ui.get_active_room_id();
+    let source = THEME_SOURCE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let projection = theme_projection_in(
+        source.as_ref().map(|(config, _)| config),
+        account.as_str(),
+        room.as_str(),
+    );
     ui.set_theme_mode(theme_mode_index(projection.effective));
     ui.set_global_theme_mode(theme_mode_index(projection.global));
     ui.set_account_theme_notice(projection.notice.into());
+    // High contrast keeps every configured border at least one pixel wide.
+    ui.global::<StyleTokens>()
+        .set_high_contrast(projection.effective == ThemeMode::HighContrast);
+    // The active account's own colors draw over the global ones. An account
+    // switch, detach or reload re-projects them, so no other account's
+    // colors stay on screen.
+    let default = (Config::default(), None);
+    let (config, theme) = source.as_ref().unwrap_or(&default);
+    apply_theme(ui, config, theme.as_ref());
+    crate::appearance_editor::refresh(ui);
+    crate::theme_studio::font_browser_refresh(ui);
+    crate::sender_palette_editor::refresh(ui);
+}
+
+/// Re-project the look whenever the open room changes, so a room's own
+/// appearance shows only while that room is open and never in another room
+/// or account. Scopes observe the room here too (see `theme_studio::scope`).
+pub(crate) fn register_room_hook(ui: &AppWindow) {
+    let weak = ui.as_weak();
+    ui.on_appearance_room_changed(move || {
+        if let Some(ui) = weak.upgrade() {
+            apply_theme_mode(&ui);
+        }
+    });
+}
+
+/// The configuration as the active account sees its colors in the open
+/// room: global, then the account's, then the room's.
+fn account_view<'a>(
+    config: &'a Config,
+    account_id: &str,
+    room_id: &str,
+) -> std::borrow::Cow<'a, Config> {
+    let has_colors = config
+        .account_overrides
+        .get(account_id)
+        .is_some_and(|overrides| !overrides.colors.is_empty());
+    let room_colors = config
+        .room_appearance(Some(account_id), Some(room_id))
+        .is_some_and(|room| !room.colors.is_empty());
+    if account_id.is_empty() || !(has_colors || room_colors) {
+        return std::borrow::Cow::Borrowed(config);
+    }
+    let mut view = config.clone();
+    view.colors = config.colors_for_room(Some(account_id), Some(room_id));
+    std::borrow::Cow::Owned(view)
+}
+
+/// The timeline clock size when `typography.timestamp_size` is omitted.
+const BUILT_IN_TIMESTAMP_SIZE: u16 = 10;
+
+/// Every typography and geometry metric as the window draws it, in logical
+/// pixels before text scaling. An omitted optional metric becomes the
+/// sentinel its surfaces read as "keep the built-in value": zero for a size,
+/// negative for a radius or roundness.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MetricProjection {
+    sidebar_font_size: f32,
+    sender_font_size: f32,
+    timestamp_font_size: f32,
+    composer_font_size: f32,
+    control_radius: f32,
+    input_radius: f32,
+    composer_radius: f32,
+    border_width: f32,
+    focus_width: f32,
+    control_padding: f32,
+    input_padding: f32,
+    composer_padding: f32,
+    icon_size: f32,
+    message_avatar_size: f32,
+    avatar_roundness: i32,
+    popup_fade_ms: i32,
+    panel_fade_ms: i32,
+    /// Multiplies each font's natural line height; 1 keeps it.
+    line_height_factor: f32,
+    /// A font weight, or 0 to keep each surface's own weight.
+    body_font_weight: i32,
+}
+
+fn metric_projection(config: &Config) -> MetricProjection {
+    let (typography, geometry) = (&config.typography, &config.geometry);
+    let size = |value: Option<u16>| value.map_or(0.0, f32::from);
+    let radius = |value: Option<u16>| value.map_or(-1.0, f32::from);
+    MetricProjection {
+        sidebar_font_size: typography.sidebar_size.into(),
+        sender_font_size: size(typography.sender_size),
+        timestamp_font_size: typography
+            .timestamp_size
+            .unwrap_or(BUILT_IN_TIMESTAMP_SIZE)
+            .into(),
+        composer_font_size: size(typography.composer_size),
+        control_radius: radius(geometry.control_radius),
+        input_radius: radius(geometry.input_radius),
+        composer_radius: radius(geometry.composer_radius),
+        border_width: geometry.border_width.into(),
+        focus_width: geometry.focus_width.into(),
+        control_padding: geometry.control_padding.into(),
+        input_padding: geometry.input_padding.into(),
+        composer_padding: geometry.composer_padding.into(),
+        icon_size: geometry.icon_size.into(),
+        message_avatar_size: size(geometry.avatar_size),
+        avatar_roundness: geometry.avatar_roundness.map_or(-1, i32::from),
+        popup_fade_ms: config.appearance.popup_fade_ms.into(),
+        panel_fade_ms: config.appearance.panel_fade_ms.into(),
+        line_height_factor: typography
+            .line_height_percent
+            .map_or(1.0, |percent| f32::from(percent) / 100.0),
+        body_font_weight: typography.body_weight.map_or(0, i32::from),
+    }
+}
+
+/// Apply the complete metric projection, including the sentinels of omitted
+/// metrics, so removing a value from the file restores the built-in look.
+/// Only global tokens change: model rows and the timeline are not rebuilt.
+fn apply_metrics(ui: &AppWindow, config: &Config) {
+    let metrics = metric_projection(config);
+    let tokens = ui.global::<StyleTokens>();
+    tokens.set_sidebar_font_size(metrics.sidebar_font_size);
+    tokens.set_sender_font_size(metrics.sender_font_size);
+    tokens.set_timestamp_font_size(metrics.timestamp_font_size);
+    tokens.set_composer_font_size(metrics.composer_font_size);
+    tokens.set_control_radius(metrics.control_radius);
+    tokens.set_input_radius(metrics.input_radius);
+    tokens.set_composer_radius(metrics.composer_radius);
+    tokens.set_border_width(metrics.border_width);
+    tokens.set_focus_width(metrics.focus_width);
+    tokens.set_control_padding(metrics.control_padding);
+    tokens.set_input_padding(metrics.input_padding);
+    tokens.set_composer_padding(metrics.composer_padding);
+    tokens.set_icon_size(metrics.icon_size);
+    tokens.set_message_avatar_size(metrics.message_avatar_size);
+    tokens.set_avatar_roundness(metrics.avatar_roundness);
+    tokens.set_popup_fade_ms(metrics.popup_fade_ms);
+    tokens.set_panel_fade_ms(metrics.panel_fade_ms);
+    tokens.set_line_height_factor(metrics.line_height_factor);
+    tokens.set_body_font_weight(metrics.body_font_weight);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,26 +214,45 @@ struct ThemeModeProjection {
 }
 
 fn theme_projection_for(source: Option<&Config>, account_id: &str) -> ThemeModeProjection {
+    theme_projection_in(source, account_id, "")
+}
+
+/// The theme mode with global -> account -> room precedence, and a notice
+/// naming the level that overrides the global choice, if any.
+fn theme_projection_in(
+    source: Option<&Config>,
+    account_id: &str,
+    room_id: &str,
+) -> ThemeModeProjection {
     let default = Config::default();
     let config = source.unwrap_or(&default);
     let global = config.theme_for(None);
-    let effective = config.theme_for(Some(account_id));
+    let effective = config.theme_for_room(Some(account_id), Some(room_id));
+    let room_overrides = config
+        .room_appearance(Some(account_id), Some(room_id))
+        .is_some_and(|room| room.theme.is_some());
     let overridden = !account_id.is_empty()
         && config
             .account_overrides
             .get(account_id)
             .is_some_and(|overrides| overrides.theme.is_some());
+    let notice = if room_overrides {
+        format!(
+            "This room overrides it with {} in config.toml.",
+            theme_mode_name(effective)
+        )
+    } else if overridden {
+        format!(
+            "This account overrides it with {} in config.toml.",
+            theme_mode_name(effective)
+        )
+    } else {
+        String::new()
+    };
     ThemeModeProjection {
         effective,
         global,
-        notice: if overridden {
-            format!(
-                "This account overrides it with {} in config.toml.",
-                theme_mode_name(effective)
-            )
-        } else {
-            String::new()
-        },
+        notice,
     }
 }
 
@@ -98,9 +281,17 @@ pub(crate) fn theme_mode_index(mode: ThemeMode) -> i32 {
 
 /// Apply a complete projection every time, including clearing omitted overrides.
 /// Sender colors are a live UI model: existing message rows need no rebuilding.
-pub(super) fn apply_theme(ui: &AppWindow, theme: Option<&ThemePack>) {
-    let (roles, senders) = theme_projection(theme);
-    ui.global::<StyleTokens>().set_roles(roles);
+/// A `[colors]` override in `config.toml` wins over the theme pack, which wins
+/// over each control's built-in color.
+pub(super) fn apply_theme(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
+    let account = ui.get_active_account_local_id();
+    let room = ui.get_active_room_id();
+    let config = account_view(config, account.as_str(), room.as_str());
+    let (roles, senders) = theme_projection(&config, theme);
+    let tokens = ui.global::<StyleTokens>();
+    tokens.set_roles(roles);
+    tokens.set_states(state_projection(&config, theme));
+    tokens.set_base(base_projection(&config));
     ui.set_sender_palette(ModelRc::new(VecModel::from(senders)));
 }
 
@@ -111,43 +302,124 @@ fn color_role(value: Option<&str>) -> ColorRole {
     })
 }
 
-fn theme_projection(theme: Option<&ThemePack>) -> (ThemeRoleSet, Vec<slint::Color>) {
-    let Some(theme) = theme else {
-        return (ThemeRoleSet::default(), Vec::new());
+fn base_projection(config: &Config) -> BaseColorSet {
+    let base = |id: &str| color_role(config.colors.get(id).map(String::as_str));
+    BaseColorSet {
+        rail: base("rail"),
+        sidebar: base("sidebar"),
+        canvas: base("canvas"),
+        panel: base("panel"),
+        elevated: base("elevated"),
+        hover: base("hover"),
+        ink: base("ink"),
+        muted: base("muted"),
+        divider: base("divider"),
+        accent: base("accent"),
+        accent_ink: base("accent_ink"),
+    }
+}
+
+fn theme_projection(
+    config: &Config,
+    theme: Option<&ThemePack>,
+) -> (ThemeRoleSet, Vec<slint::Color>) {
+    let role = |id: &str| {
+        let value = config
+            .colors
+            .get(id)
+            .map(String::as_str)
+            .or_else(|| theme.and_then(|theme| theme.roles.get(id)));
+        color_role(value)
     };
-    let roles = &theme.roles;
+    // A `config.toml` palette replaces the theme's; slots stay stable.
+    let senders = config
+        .senders
+        .colors
+        .as_deref()
+        .or_else(|| theme.and_then(|theme| theme.senders.colors.as_deref()))
+        .unwrap_or_default()
+        .iter()
+        .map(|value| color_from_hex(value))
+        .collect();
     (
         ThemeRoleSet {
-            error: color_role(roles.error.as_deref()),
-            error_surface: color_role(roles.error_surface.as_deref()),
-            error_ink: color_role(roles.error_ink.as_deref()),
-            success: color_role(roles.success.as_deref()),
-            success_surface: color_role(roles.success_surface.as_deref()),
-            success_ink: color_role(roles.success_ink.as_deref()),
-            selection: color_role(roles.selection.as_deref()),
-            selection_ink: color_role(roles.selection_ink.as_deref()),
-            focus: color_role(roles.focus.as_deref()),
-            link: color_role(roles.link.as_deref()),
-            unread: color_role(roles.unread.as_deref()),
-            unread_ink: color_role(roles.unread_ink.as_deref()),
-            destructive: color_role(roles.destructive.as_deref()),
-            destructive_ink: color_role(roles.destructive_ink.as_deref()),
-            voice: color_role(roles.voice.as_deref()),
-            timestamp: color_role(roles.timestamp.as_deref()),
-            sender: color_role(roles.sender.as_deref()),
-            message: color_role(roles.message.as_deref()),
-            own_message: color_role(roles.own_message.as_deref()),
-            own_surface: color_role(roles.own_surface.as_deref()),
+            error: role("error"),
+            error_surface: role("error_surface"),
+            error_ink: role("error_ink"),
+            success: role("success"),
+            success_surface: role("success_surface"),
+            success_ink: role("success_ink"),
+            selection: role("selection"),
+            selection_ink: role("selection_ink"),
+            focus: role("focus"),
+            link: role("link"),
+            unread: role("unread"),
+            unread_ink: role("unread_ink"),
+            destructive: role("destructive"),
+            destructive_ink: role("destructive_ink"),
+            voice: role("voice"),
+            timestamp: role("timestamp"),
+            sender: role("sender"),
+            message: role("message"),
+            own_message: role("own_message"),
+            own_surface: role("own_surface"),
+            scrim: role("scrim"),
+            shadow: role("shadow"),
+            media_backdrop: role("media_backdrop"),
+            presence_online: role("presence_online"),
+            avatar_ink: role("avatar_ink"),
         },
-        theme
-            .senders
-            .colors
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|value| color_from_hex(value))
-            .collect(),
+        senders,
     )
+}
+
+/// Interaction states: a `[colors]` override, then the theme pack's `[states]`.
+/// An absent state keeps the color each control used before it existed.
+fn state_projection(config: &Config, theme: Option<&ThemePack>) -> ThemeStateSet {
+    let state = |id: &str| {
+        let value = config
+            .colors
+            .get(id)
+            .map(String::as_str)
+            .or_else(|| theme.and_then(|theme| theme.states.get(id)));
+        color_role(value)
+    };
+    ThemeStateSet {
+        message_hover: state("message_hover"),
+        control_hover: state("control_hover"),
+        control_pressed: state("control_pressed"),
+        control_disabled: state("control_disabled"),
+        input_surface: state("input_surface"),
+        input_border: state("input_border"),
+        composer_surface: state("composer_surface"),
+        composer_border: state("composer_border"),
+        composer_focus: state("composer_focus"),
+        icon: state("icon"),
+        icon_active: state("icon_active"),
+        icon_navigation: state("icon_navigation"),
+        icon_header: state("icon_header"),
+        icon_composer: state("icon_composer"),
+        icon_message: state("icon_message"),
+        nav_hover: state("nav_hover"),
+        nav_selected: state("nav_selected"),
+        nav_selected_ink: state("nav_selected_ink"),
+        mention: state("mention"),
+        mention_ink: state("mention_ink"),
+    }
+}
+
+/// Fixed status for the window transparency control. Support depends on the
+/// window system; nothing here can observe whether a compositor blends it.
+fn transparency_status(percent: u8) -> &'static str {
+    if percent >= 100 {
+        "Opaque. Lower the value to let the desktop show through the window's panes."
+    } else if cfg!(target_os = "macos") {
+        "Applied to the window as you change it. No blur is added. Not yet verified on this build."
+    } else if cfg!(target_os = "windows") {
+        "Requested from Windows. Whether the desktop shows through depends on desktop composition and the graphics driver. No blur or acrylic is added. Not yet verified on this build."
+    } else {
+        "Requested from the window system. Wayland compositors, and X11 with a running compositing manager, can show the desktop; without one the panes may look black or stay opaque. No blur is added. Not yet verified on this build."
+    }
 }
 
 /// Stable identity token, independent of message text, palette length and theme.
@@ -203,9 +475,29 @@ fn font_family_with_resolver(
         .unwrap_or_else(|| requested.to_owned())
 }
 
+#[cfg(test)]
+thread_local! {
+    static MOTION_PROBE: std::cell::Cell<(u32, bool, bool)> =
+        const { std::cell::Cell::new((0, false, false)) };
+}
+
+/// Test-only facts: callback count, last requested value and save success.
+/// No paths, errors, accounts or preference values from an owner profile.
+#[cfg(test)]
+pub(super) fn take_motion_probe() -> (u32, bool, bool) {
+    MOTION_PROBE.with(|probe| probe.replace((0, false, false)))
+}
+
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.global::<StyleTokens>()
         .set_reduced_motion(config.appearance.reduce_motion);
+    ui.global::<StyleTokens>()
+        .set_hover_duration_ms(config.appearance.hover_duration_ms.into());
+    let opacity = config.window.opacity_percent;
+    ui.global::<StyleTokens>()
+        .set_window_opacity(f32::from(opacity) / 100.0);
+    ui.set_window_opacity_percent(opacity.into());
+    ui.set_window_transparency_status(transparency_status(opacity).into());
     // Move only a focused, disappearing navigation control before changing its
     // conditional subtree. Other input and modal focus remains untouched.
     ui.invoke_apply_navigation_mode(match config.layout.navigation {
@@ -222,6 +514,9 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.set_ui_font_family(display_font_family(&config.appearance.font_family));
     ui.set_message_font_family(display_font_family(
         config.typography.message_family(&config.appearance),
+    ));
+    ui.set_composer_font_family(display_font_family(
+        config.typography.composer_family(&config.appearance),
     ));
     ui.set_monospace_font_family(display_font_family(
         &config.typography.monospace_font_family,
@@ -241,6 +536,7 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.set_rail_width_px(config.geometry.rail_width.into());
     ui.global::<StyleTokens>()
         .set_radius(config.geometry.corner_radius.into());
+    apply_metrics(ui, config);
     ui.set_message_layout(match config.chat.layout {
         MessageLayout::Stacked => 0,
         MessageLayout::Compact => 1,
@@ -264,6 +560,14 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
             .unwrap_or("")
             .into(),
     );
+    ui.set_appearance_composer_font_input(
+        config
+            .typography
+            .composer_font_family
+            .as_deref()
+            .unwrap_or("")
+            .into(),
+    );
     ui.set_appearance_mono_font_input(config.typography.monospace_font_family.as_str().into());
 }
 
@@ -272,8 +576,13 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     let store_for_motion = store.clone();
     ui.on_set_reduce_motion(move |reduced| {
         if let Some(ui) = weak.upgrade() {
-            let _ = save_config_change(&ui, &store_for_motion, |config| {
+            let _saved = save_config_change(&ui, &store_for_motion, |config| {
                 config.appearance.reduce_motion = reduced;
+            });
+            #[cfg(test)]
+            MOTION_PROBE.with(|probe| {
+                let (count, _, _) = probe.get();
+                probe.set((count.saturating_add(1), reduced, _saved.is_some()));
             });
         }
     });
@@ -306,6 +615,52 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
         if let Some(ui) = weak.upgrade() {
             let _ = save_config_change(&ui, &store_for_grouping, |config| {
                 config.layout.group_direct_messages = group;
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let store_for_side = store.clone();
+    ui.on_choose_details_side(move |index| {
+        let side = match index {
+            0 => DetailsSide::Right,
+            1 => DetailsSide::Left,
+            _ => return,
+        };
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_side, |config| {
+                config.layout.details_side = side;
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let store_for_order = store.clone();
+    ui.on_set_direct_messages_first(move |first| {
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_order, |config| {
+                config.layout.direct_messages_first = first;
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let store_for_density = store.clone();
+    ui.on_choose_pane_density(move |pane, index| {
+        let density = match index {
+            -1 => None,
+            0 => Some(Density::Compact),
+            1 => Some(Density::Comfortable),
+            2 => Some(Density::Spacious),
+            _ => return,
+        };
+        if !(0..=1).contains(&pane) {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_density, |config| {
+                if pane == 0 {
+                    config.layout.room_density = density;
+                } else {
+                    config.layout.message_density = density;
+                }
             });
         }
     });
@@ -373,13 +728,31 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
 
     let weak = ui.as_weak();
     let store_for_fonts = store.clone();
-    ui.on_set_style_fonts(move |interface, messages, monospace| {
+    ui.on_set_style_fonts(move |interface, messages, composer, monospace| {
         if let Some(ui) = weak.upgrade() {
             let _ = save_config_change(&ui, &store_for_fonts, |config| {
                 config.appearance.font_family = interface.trim().to_owned();
                 config.typography.message_font_family =
                     (!messages.trim().is_empty()).then(|| messages.trim().to_owned());
+                // Blank follows the message font.
+                config.typography.composer_font_family =
+                    (!composer.trim().is_empty()).then(|| composer.trim().to_owned());
                 config.typography.monospace_font_family = monospace.trim().to_owned();
+            });
+        }
+    });
+
+    let weak = ui.as_weak();
+    let store_for_font_reset = store.clone();
+    ui.on_reset_style_fonts(move || {
+        if let Some(ui) = weak.upgrade() {
+            // Only the font families; every other preference is kept.
+            let defaults = Config::default();
+            let _ = save_config_change(&ui, &store_for_font_reset, |config| {
+                config.appearance.font_family = defaults.appearance.font_family;
+                config.typography.message_font_family = defaults.typography.message_font_family;
+                config.typography.composer_font_family = defaults.typography.composer_font_family;
+                config.typography.monospace_font_family = defaults.typography.monospace_font_family;
             });
         }
     });
@@ -387,7 +760,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     let weak = ui.as_weak();
     let store_for_number = store.clone();
     ui.on_change_style_number(move |field, value| {
-        if !(0..=6).contains(&field) {
+        if !(0..=7).contains(&field) {
             return;
         }
         if let Some(ui) = weak.upgrade() {
@@ -399,6 +772,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
                 4 => config.geometry.rail_width = value.clamp(44, 100) as u16,
                 5 => config.chat.nickname_width = value.clamp(64, 240) as u16,
                 6 => config.chat.timestamp_width = value.clamp(48, 160) as u16,
+                7 => config.appearance.hover_duration_ms = value.clamp(0, 1000) as u16,
                 _ => unreachable!("validated appearance field"),
             });
         }
@@ -496,10 +870,59 @@ mod theme_tests {
     }
 
     #[test]
+    fn rooms_draw_over_their_account_which_draws_over_global() {
+        use morpheus_config::RoomAppearance;
+        let room = "!harbor:example.org";
+        let mut config = Config::default();
+        config.appearance.theme = ThemeMode::System;
+        config.colors.insert("link".into(), "#111111".into());
+        config.colors.insert("accent".into(), "#121212".into());
+        let account = config.account_overrides.entry("alice".into()).or_default();
+        account.theme = Some(ThemeMode::Light);
+        account.colors.insert("link".into(), "#222222".into());
+        account.room_appearance.insert(
+            room.into(),
+            RoomAppearance {
+                theme: Some(ThemeMode::HighContrast),
+                colors: [("link".to_owned(), "#333333".to_owned())].into(),
+            },
+        );
+        // The room wins where it sets a value; absent values inherit.
+        let shown = theme_projection_in(Some(&config), "alice", room);
+        assert_eq!(shown.effective, ThemeMode::HighContrast);
+        assert_eq!(shown.global, ThemeMode::System);
+        assert!(shown.notice.starts_with("This room overrides it"));
+        let view = account_view(&config, "alice", room);
+        assert_eq!(view.colors["link"], "#333333");
+        assert_eq!(view.colors["accent"], "#121212");
+        // Another room, and the same room in another account, inherit.
+        let other = theme_projection_in(Some(&config), "alice", "!other:example.org");
+        assert_eq!(other.effective, ThemeMode::Light);
+        assert_eq!(account_view(&config, "alice", "").colors["link"], "#222222");
+        assert_eq!(
+            theme_projection_in(Some(&config), "bob", room).effective,
+            ThemeMode::System
+        );
+        assert_eq!(account_view(&config, "bob", room).colors["link"], "#111111");
+        // Reset of the room removes only that override.
+        assert!(config.clear_room_appearance("alice", room));
+        assert_eq!(
+            theme_projection_in(Some(&config), "alice", room).effective,
+            ThemeMode::Light
+        );
+        assert_eq!(
+            account_view(&config, "alice", room).colors["link"],
+            "#222222"
+        );
+        assert!(!config.clear_room_appearance("alice", room));
+    }
+
+    #[test]
     fn omitted_roles_and_sender_palette_restore_legacy_bindings() {
-        let (roles, senders) = theme_projection(None);
+        let (roles, senders) = theme_projection(&Config::default(), None);
         assert_eq!(roles, ThemeRoleSet::default());
         assert!(senders.is_empty());
+        assert_eq!(base_projection(&Config::default()), BaseColorSet::default());
         assert!(!color_role(None).present);
         let black = color_role(Some("#000000"));
         assert!(black.present, "black is an explicit color, not an omission");
@@ -521,7 +944,7 @@ mod theme_tests {
             "senders": {"colors": ["#414243", "#515253"]}
         }))
         .unwrap();
-        let (roles, senders) = theme_projection(Some(&theme));
+        let (roles, senders) = theme_projection(&Config::default(), Some(&theme));
         assert_eq!(
             roles.error.color,
             slint::Color::from_rgb_u8(0x12, 0x13, 0x14)
@@ -545,9 +968,167 @@ mod theme_tests {
         );
         theme.roles = Default::default();
         theme.senders = Default::default();
-        let (roles, senders) = theme_projection(Some(&theme));
+        let (roles, senders) = theme_projection(&Config::default(), Some(&theme));
         assert_eq!(roles, ThemeRoleSet::default());
         assert!(senders.is_empty());
+    }
+
+    #[test]
+    fn config_overrides_win_over_the_theme_and_accept_alpha() {
+        let mut theme = morpheus_config::BuiltInStylePreset::Nocturne
+            .theme()
+            .unwrap();
+        theme.roles.link = Some("#111111".into());
+        let mut config = Config::default();
+        config.colors.insert("link".into(), "#22222280".into());
+        config.colors.insert("canvas".into(), "#33333300".into());
+        config.colors.insert("scrim".into(), "#000000CC".into());
+        let (roles, _) = theme_projection(&config, Some(&theme));
+        assert!(roles.link.present);
+        assert_eq!(
+            roles.link.color,
+            slint::Color::from_argb_u8(0x80, 0x22, 0x22, 0x22)
+        );
+        assert_eq!(roles.scrim.color, slint::Color::from_argb_u8(0xcc, 0, 0, 0));
+        // Without the override the theme's role applies again.
+        config.colors.remove("link");
+        let (roles, _) = theme_projection(&config, Some(&theme));
+        assert_eq!(
+            roles.link.color,
+            slint::Color::from_rgb_u8(0x11, 0x11, 0x11)
+        );
+        let base = base_projection(&config);
+        assert!(base.canvas.present && !base.panel.present);
+        assert_eq!(
+            base.canvas.color,
+            slint::Color::from_argb_u8(0, 0x33, 0x33, 0x33)
+        );
+        assert!(transparency_status(100).starts_with("Opaque"));
+        assert!(transparency_status(40).contains("Not yet verified"));
+    }
+
+    #[test]
+    fn states_follow_config_then_theme_and_sender_palettes_prefer_config() {
+        // Nothing set: every state is absent, so controls keep their colors.
+        assert_eq!(
+            state_projection(&Config::default(), None),
+            ThemeStateSet::default()
+        );
+        let mut theme = morpheus_config::BuiltInStylePreset::Nocturne
+            .theme()
+            .unwrap();
+        assert_eq!(
+            state_projection(&Config::default(), Some(&theme)),
+            ThemeStateSet::default(),
+            "shipped presets set no states"
+        );
+        theme.states.mention = Some("#AA3344".into());
+        theme.states.control_pressed = Some("#00000033".into());
+        let mut config = Config::default();
+        let states = state_projection(&config, Some(&theme));
+        assert!(states.mention.present && states.control_pressed.present);
+        assert_eq!(
+            states.control_pressed.color,
+            slint::Color::from_argb_u8(0x33, 0, 0, 0)
+        );
+        assert!(!states.nav_hover.present && !states.icon.present);
+        // A config.toml override wins over the theme pack.
+        config.colors.insert("mention".into(), "#112233".into());
+        let states = state_projection(&config, Some(&theme));
+        assert_eq!(
+            states.mention.color,
+            slint::Color::from_rgb_u8(0x11, 0x22, 0x33)
+        );
+        // The config palette replaces the theme's sender colors, and its
+        // removal restores the theme palette.
+        config.senders.colors = Some(vec!["#010203".into()]);
+        let (_, senders) = theme_projection(&config, Some(&theme));
+        assert_eq!(senders, vec![slint::Color::from_rgb_u8(1, 2, 3)]);
+        config.senders.colors = None;
+        let (_, senders) = theme_projection(&config, Some(&theme));
+        assert_eq!(senders.len(), theme.senders.colors.as_ref().unwrap().len());
+    }
+
+    #[test]
+    fn omitted_metrics_project_sentinels_that_keep_built_in_surfaces() {
+        let defaults = metric_projection(&Config::default());
+        // The defaults equal the window's own built-in token values.
+        assert_eq!(
+            defaults,
+            MetricProjection {
+                sidebar_font_size: 13.0,
+                sender_font_size: 0.0,
+                timestamp_font_size: 10.0,
+                composer_font_size: 0.0,
+                control_radius: -1.0,
+                input_radius: -1.0,
+                composer_radius: -1.0,
+                border_width: 1.0,
+                focus_width: 2.0,
+                control_padding: 12.0,
+                input_padding: 10.0,
+                composer_padding: 10.0,
+                icon_size: 18.0,
+                message_avatar_size: 0.0,
+                avatar_roundness: -1,
+                popup_fade_ms: 0,
+                panel_fade_ms: 0,
+                line_height_factor: 1.0,
+                body_font_weight: 0,
+            }
+        );
+        let mut config = Config::default();
+        for (key, value) in [
+            ("typography.sender_size", 18),
+            ("typography.timestamp_size", 12),
+            ("typography.composer_size", 16),
+            ("geometry.control_radius", 0),
+            ("geometry.input_radius", 0),
+            ("geometry.composer_radius", 0),
+            ("geometry.avatar_size", 48),
+            ("geometry.avatar_roundness", 0),
+            ("geometry.border_width", 0),
+        ] {
+            config
+                .set_metric(key, morpheus_config::MetricValue::Set(value))
+                .unwrap();
+        }
+        let custom = metric_projection(&config);
+        // An explicit zero radius or roundness is a square, not an omission.
+        assert_eq!(custom.control_radius, 0.0);
+        assert_eq!(custom.input_radius, 0.0);
+        assert_eq!(custom.composer_radius, 0.0);
+        assert_eq!(custom.avatar_roundness, 0);
+        assert_eq!(custom.border_width, 0.0);
+        assert_eq!(
+            (
+                custom.sender_font_size,
+                custom.timestamp_font_size,
+                custom.composer_font_size,
+                custom.message_avatar_size
+            ),
+            (18.0, 12.0, 16.0, 48.0)
+        );
+        // Every editor metric reaches the projection: changing each one alone
+        // changes it, so no shipped metric is inert.
+        for (field, _) in morpheus_config::registry::metric_fields() {
+            let (minimum, maximum) = field.integer_range().unwrap();
+            let mut single = Config::default();
+            let value = if field.integer_default() == Some(maximum) {
+                minimum
+            } else {
+                maximum
+            };
+            single
+                .set_metric(field.key, morpheus_config::MetricValue::Set(value as u16))
+                .unwrap();
+            assert_ne!(
+                metric_projection(&single),
+                defaults,
+                "{} is inert",
+                field.key
+            );
+        }
     }
 
     #[test]

@@ -1,16 +1,23 @@
 [workspace]
 resolver = "3"
+# Keep upstream decoder dev tools outside the application workspace.
+exclude = ["vendor/image-webp"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
     "crates/morpheus-matrix",
     "crates/morpheus-rtc",
+    "crates/morpheus-ui-check",
     "vendor/lru",
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
     "vendor/matrix-rtc-core",
     "vendor/cargo-packager-updater",
+    "vendor/matrix-sdk",
     "vendor/matrix-sdk-base",
+    "vendor/matrix-sdk-search",
+    "vendor/matrix-sdk-ui",
+    "vendor/webrtc-sys-build",
 ]
 default-members = [
     "crates/morpheus-app",
@@ -25,8 +32,12 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/brk275/Morpheus"
 
 [patch.crates-io]
+# Bound lossless WebP entropy-tree amplification before allocating groups.
+image-webp = { path = "vendor/image-webp" }
 # Isolate pinned WebRTC PipeWire stubs from the system PipeWire API on Linux.
 webrtc-sys = { path = "vendor/webrtc-sys" }
+# Verify pinned SDK archives before unpacking without unsafe ZIP extraction.
+webrtc-sys-build = { path = "vendor/webrtc-sys-build" }
 cargo-packager-updater = { path = "vendor/cargo-packager-updater" }
 lru = { path = "vendor/lru" }
 # Enforce secure signaling URLs and prohibit authenticated redirects.
@@ -49,3 +60,10 @@ matrix-rtc-core = { path = "vendor/matrix-rtc-core" }
 [patch."https://github.com/matrix-org/matrix-rust-sdk"]
 # Preserve decrypted keyless sticky receipts without altering the keyed map.
 matrix-sdk-base = { path = "vendor/matrix-sdk-base" }
+# Keep locally consumed custom room state available through native sliding sync.
+matrix-sdk-ui = { path = "vendor/matrix-sdk-ui" }
+
+# Typed local search restrictions and normalized replacement indexing.
+# Dependency resolution and compatibility remain subject to hosted verification.
+matrix-sdk = { path = "vendor/matrix-sdk" }
+matrix-sdk-search = { path = "vendor/matrix-sdk-search" }

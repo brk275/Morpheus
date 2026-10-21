@@ -1,0 +1,38 @@
+# Morpheus style profile: Meadow. A calm light look: soft green surfaces,
+# readable ink, rounded cards and open spacing. Every color keeps text
+# readable on its own background. See docs/STYLE_PROFILES.md.
+profile_version = 1
+name = "Meadow"
+
+[appearance]
+theme = "light"
+
+[typography]
+message_size = 15
+sender_size = 14
+
+[geometry]
+corner_radius = 12
+message_gap = 12
+content_padding = 24
+avatar_roundness = 50
+
+[colors]
+rail = "#E4EBDD"
+sidebar = "#EDF2E7"
+canvas = "#F7F9F3"
+panel = "#F1F5EC"
+elevated = "#FFFFFF"
+hover = "#E2EAD9"
+ink = "#1E2A1F"
+muted = "#536452"
+divider = "#D3DDC8"
+accent = "#3F7D4E"
+accent_ink = "#FFFFFF"
+link = "#2F6A8A"
+focus = "#8A5A00"
+selection = "#CFE3D2"
+selection_ink = "#13251A"
+message_hover = "#EEF3E8"
+icon = "#5E6F5C"
+icon_active = "#3F7D4E"

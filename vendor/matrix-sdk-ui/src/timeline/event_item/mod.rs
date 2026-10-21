@@ -1,0 +1,1119 @@
+// Copyright 2022 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::{
+    ops::{Deref, DerefMut},
+    sync::{Arc, LazyLock},
+};
+
+use as_variant::as_variant;
+use indexmap::IndexMap;
+use matrix_sdk::{
+    Error, Room,
+    deserialized_responses::{EncryptionInfo, ShieldState},
+    send_queue::SendHandle,
+};
+use matrix_sdk_base::deserialized_responses::ShieldStateCode;
+#[cfg(feature = "unstable-msc4426")]
+use ruma::profile::{CallProfileField, StatusProfileField};
+use ruma::{
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedTransactionId,
+    OwnedUserId, TransactionId, UserId,
+    events::{AnySyncTimelineEvent, receipt::Receipt, room::message::MessageType},
+    room_version_rules::RedactionRules,
+    serde::Raw,
+};
+use tracing::error;
+use unicode_segmentation::UnicodeSegmentation;
+
+mod content;
+mod local;
+mod remote;
+
+pub use self::{
+    content::{
+        AnyOtherStateEventContentChange, BeaconInfo, EmbeddedEvent, EncryptedMessage,
+        InReplyToDetails, LiveLocationState, MemberProfileChange, MembershipChange, Message,
+        MsgLikeContent, MsgLikeKind, OtherMessageLike, OtherState, PollResult, PollState,
+        RoomMembershipChange, RoomPinnedEventsChange, Sticker, ThreadSummary, TimelineItemContent,
+    },
+    local::{EventSendState, MediaUploadProgress},
+};
+pub(super) use self::{
+    content::{
+        beacon_info_matches, extract_bundled_edit_event_json, extract_poll_edit_content,
+        extract_room_msg_edit_content,
+    },
+    local::LocalEventTimelineItem,
+    remote::{RemoteEventOrigin, RemoteEventTimelineItem},
+};
+
+/// An item in the timeline that represents at least one event.
+///
+/// There is always one main event that gives the `EventTimelineItem` its
+/// identity but in many cases, additional events like reactions and edits are
+/// also part of the item.
+#[derive(Clone, Debug)]
+pub struct EventTimelineItem {
+    /// The sender of the event.
+    pub(super) sender: OwnedUserId,
+    /// The sender's profile of the event.
+    pub(super) sender_profile: TimelineDetails<Profile>,
+    /// If the keys used to decrypt this event were shared-on-invite as part of
+    /// an [MSC4268] key bundle, the user ID of the forwarder.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub(super) forwarder: Option<OwnedUserId>,
+    /// If the keys used to decrypt this event were shared-on-invite as part of
+    /// an [MSC4268] key bundle, the forwarder's profile, if present.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub(super) forwarder_profile: Option<TimelineDetails<Profile>>,
+    /// The timestamp of the event.
+    pub(super) timestamp: MilliSecondsSinceUnixEpoch,
+    /// The content of the event. Might be redacted if a redaction for this
+    /// event is currently being sent or has been received from the server.
+    pub(super) content: TimelineItemContent,
+    /// If a redaction for this event is currently being sent but the server
+    /// hasn't yet acknowledged it via its remote echo, the data before
+    /// redaction. This applies to all sorts of timeline items, including state
+    /// events. If no redaction is in flight, None.
+    pub(super) unredacted_item: Option<UnredactedEventTimelineItem>,
+    /// Send state of our own pending redaction of this event, if any.
+    pub(super) redaction_send_state: Option<EventSendState>,
+    /// Send state of our own pending edits of this event, if any.
+    pub(super) edit_send_state: Option<EventSendState>,
+    /// The reactions of the event, grouped by key and then by sender.
+    pub(super) reactions: ReactionsByKeyBySender,
+    /// The message before our pending edits, put back if they're all dropped.
+    pub(super) unedited_kind: Option<Box<MsgLikeKind>>,
+    /// The kind of event timeline item, local or remote.
+    pub(super) kind: EventTimelineItemKind,
+    /// Whether or not the event belongs to an encrypted room.
+    ///
+    /// May be false when we don't know about the room encryption status yet.
+    pub(super) is_room_encrypted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum EventTimelineItemKind {
+    /// A local event, not yet echoed back by the server.
+    Local(LocalEventTimelineItem),
+    /// An event received from the server.
+    Remote(RemoteEventTimelineItem),
+}
+
+/// A wrapper that can contain either a transaction id, or an event id.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum TimelineEventItemId {
+    /// The item is local, identified by its transaction id (to be used in
+    /// subsequent requests).
+    TransactionId(OwnedTransactionId),
+    /// The item is remote, identified by its event id.
+    EventId(OwnedEventId),
+}
+
+/// An handle that usually allows to perform an action on a timeline event.
+///
+/// If the item represents a remote item, then the event id is usually
+/// sufficient to perform an action on it. Otherwise, the send queue handle is
+/// returned, if available.
+pub(crate) enum TimelineItemHandle<'a> {
+    Remote(&'a EventId),
+    Local(&'a SendHandle),
+}
+
+/// A single revision in the edit history of a message.
+///
+/// Created on-demand by querying the Event Cache for all `m.replace` relations
+/// targeting a particular event.
+#[derive(Clone, Debug)]
+pub struct EditRevision {
+    /// The timeline item content after this revision.
+    pub content: TimelineItemContent,
+    /// The timestamp of the event that created this revision.
+    pub timestamp: Option<MilliSecondsSinceUnixEpoch>,
+}
+
+/// A container for temporarily holding onto data that is going to be erased by
+/// a redaction once the server plays it back.
+#[derive(Clone, Debug)]
+pub(super) struct UnredactedEventTimelineItem {
+    /// The original content before redaction.
+    content: TimelineItemContent,
+
+    /// The reactions before redaction.
+    reactions: ReactionsByKeyBySender,
+
+    /// JSON of the original event.
+    pub(crate) original_json: Option<Raw<AnySyncTimelineEvent>>,
+
+    /// JSON of the latest edit to this item.
+    pub(crate) latest_edit_json: Option<Raw<AnySyncTimelineEvent>>,
+}
+
+impl EventTimelineItem {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        sender: OwnedUserId,
+        sender_profile: TimelineDetails<Profile>,
+        forwarder: Option<OwnedUserId>,
+        forwarder_profile: Option<TimelineDetails<Profile>>,
+        timestamp: MilliSecondsSinceUnixEpoch,
+        content: TimelineItemContent,
+        kind: EventTimelineItemKind,
+        is_room_encrypted: bool,
+    ) -> Self {
+        Self {
+            sender,
+            sender_profile,
+            forwarder,
+            forwarder_profile,
+            timestamp,
+            content,
+            unredacted_item: None,
+            redaction_send_state: None,
+            edit_send_state: None,
+            reactions: Default::default(),
+            unedited_kind: None,
+            kind,
+            is_room_encrypted,
+        }
+    }
+
+    /// The reactions of this event, grouped by key and then by sender.
+    pub fn reactions(&self) -> &ReactionsByKeyBySender {
+        &self.reactions
+    }
+
+    /// A mutable handle to the reactions of this event.
+    pub(crate) fn reactions_mut(&mut self) -> &mut ReactionsByKeyBySender {
+        &mut self.reactions
+    }
+
+    /// Clone this item with a different set of reactions.
+    pub fn with_reactions(&self, reactions: ReactionsByKeyBySender) -> Self {
+        Self { reactions, ..self.clone() }
+    }
+
+    /// Check whether this item is a local echo.
+    ///
+    /// This returns `true` for events created locally, until the server echoes
+    /// back the full event as part of a sync response.
+    ///
+    /// This is the opposite of [`Self::is_remote_event`].
+    pub fn is_local_echo(&self) -> bool {
+        matches!(self.kind, EventTimelineItemKind::Local(_))
+    }
+
+    /// Check whether this item is a remote event.
+    ///
+    /// This returns `true` only for events that have been echoed back from the
+    /// homeserver. A local echo sent but not echoed back yet will return
+    /// `false` here.
+    ///
+    /// This is the opposite of [`Self::is_local_echo`].
+    pub fn is_remote_event(&self) -> bool {
+        matches!(self.kind, EventTimelineItemKind::Remote(_))
+    }
+
+    /// Get the `LocalEventTimelineItem` if `self` is `Local`.
+    pub(super) fn as_local(&self) -> Option<&LocalEventTimelineItem> {
+        as_variant!(&self.kind, EventTimelineItemKind::Local(local_event_item) => local_event_item)
+    }
+
+    /// Get a reference to a [`RemoteEventTimelineItem`] if it's a remote echo.
+    pub(super) fn as_remote(&self) -> Option<&RemoteEventTimelineItem> {
+        as_variant!(&self.kind, EventTimelineItemKind::Remote(remote_event_item) => remote_event_item)
+    }
+
+    /// Get a mutable reference to a [`RemoteEventTimelineItem`] if it's a
+    /// remote echo.
+    pub(super) fn as_remote_mut(&mut self) -> Option<&mut RemoteEventTimelineItem> {
+        as_variant!(&mut self.kind, EventTimelineItemKind::Remote(remote_event_item) => remote_event_item)
+    }
+
+    /// Get the event's send state of a local echo.
+    pub fn send_state(&self) -> Option<&EventSendState> {
+        as_variant!(&self.kind, EventTimelineItemKind::Local(local) => &local.send_state)
+    }
+
+    /// Send state of our own pending redaction of this event, if any. `None`
+    /// when the event isn't redacted or the redaction came from the server.
+    pub fn redaction_send_state(&self) -> Option<&EventSendState> {
+        self.redaction_send_state.as_ref()
+    }
+
+    /// Send state of our own pending edits of this event: a failed edit wins
+    /// over a pending one, which wins over a sent one. `None` when there is no
+    /// local edit.
+    pub fn edit_send_state(&self) -> Option<&EventSendState> {
+        self.edit_send_state.as_ref()
+    }
+
+    /// Get the time that the local event was pushed in the send queue at.
+    pub fn local_created_at(&self) -> Option<MilliSecondsSinceUnixEpoch> {
+        match &self.kind {
+            EventTimelineItemKind::Local(local) => local.send_handle.as_ref().map(|s| s.created_at),
+            EventTimelineItemKind::Remote(_) => None,
+        }
+    }
+
+    /// Get the unique identifier of this item.
+    ///
+    /// Returns the transaction ID for a local echo item that has not been sent
+    /// and the event ID for a local echo item that has been sent or a remote
+    /// item.
+    pub fn identifier(&self) -> TimelineEventItemId {
+        match &self.kind {
+            EventTimelineItemKind::Local(local) => local.identifier(),
+            EventTimelineItemKind::Remote(remote) => {
+                TimelineEventItemId::EventId(remote.event_id.clone())
+            }
+        }
+    }
+
+    /// Get the transaction ID of a local echo item.
+    ///
+    /// The transaction ID is currently only kept until the remote echo for a
+    /// local event is received.
+    pub fn transaction_id(&self) -> Option<&TransactionId> {
+        as_variant!(&self.kind, EventTimelineItemKind::Local(local) => &local.transaction_id)
+    }
+
+    /// Get the event ID of this item.
+    ///
+    /// If this returns `Some(_)`, the event was successfully created by the
+    /// server.
+    ///
+    /// Even if this is a local event, this can be `Some(_)` as the event ID can
+    /// be known not just from the remote echo via `sync_events`, but also from
+    /// the response of the send request that created the event.
+    pub fn event_id(&self) -> Option<&EventId> {
+        match &self.kind {
+            EventTimelineItemKind::Local(local_event) => local_event.event_id(),
+            EventTimelineItemKind::Remote(remote_event) => Some(&remote_event.event_id),
+        }
+    }
+
+    /// Get the sender of this item.
+    pub fn sender(&self) -> &UserId {
+        &self.sender
+    }
+
+    /// Get the profile of the sender.
+    pub fn sender_profile(&self) -> &TimelineDetails<Profile> {
+        &self.sender_profile
+    }
+
+    /// If the keys used to decrypt this event were shared-on-invite as part of
+    /// an [MSC4268] key bundle, returns the user ID of the forwarder.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub fn forwarder(&self) -> Option<&UserId> {
+        self.forwarder.as_deref()
+    }
+
+    /// If the keys used to decrypt this event were shared-on-invite as part of
+    /// an [MSC4268] key bundle, returns the profile of the forwarder.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub fn forwarder_profile(&self) -> Option<&TimelineDetails<Profile>> {
+        self.forwarder_profile.as_ref()
+    }
+
+    /// Get the content of this item.
+    pub fn content(&self) -> &TimelineItemContent {
+        &self.content
+    }
+
+    /// Get a mutable handle to the content of this item.
+    pub(crate) fn content_mut(&mut self) -> &mut TimelineItemContent {
+        &mut self.content
+    }
+
+    /// Get the read receipts of this item.
+    ///
+    /// The key is the ID of a room member and the value are details about the
+    /// read receipt.
+    ///
+    /// Note that currently this ignores threads.
+    pub fn read_receipts(&self) -> &IndexMap<OwnedUserId, Receipt> {
+        static EMPTY_RECEIPTS: LazyLock<IndexMap<OwnedUserId, Receipt>> =
+            LazyLock::new(Default::default);
+        match &self.kind {
+            EventTimelineItemKind::Local(_) => &EMPTY_RECEIPTS,
+            EventTimelineItemKind::Remote(remote_event) => &remote_event.read_receipts,
+        }
+    }
+
+    /// Get the timestamp of this item.
+    ///
+    /// If this event hasn't been echoed back by the server yet, returns the
+    /// time the local event was created. Otherwise, returns the origin server
+    /// timestamp.
+    pub fn timestamp(&self) -> MilliSecondsSinceUnixEpoch {
+        self.timestamp
+    }
+
+    /// Whether this timeline item was sent by the logged-in user themselves.
+    pub fn is_own(&self) -> bool {
+        match &self.kind {
+            EventTimelineItemKind::Local(_) => true,
+            EventTimelineItemKind::Remote(remote_event) => remote_event.is_own,
+        }
+    }
+
+    /// Flag indicating this timeline item can be edited by the current user.
+    pub fn is_editable(&self) -> bool {
+        // Steps here should be in sync with [`EventTimelineItem::edit_info`]
+        // and [`Timeline::edit_poll`].
+
+        if !self.is_own() {
+            // In theory could work, but it's hard to compute locally.
+            return false;
+        }
+
+        match self.content() {
+            TimelineItemContent::MsgLike(msglike) => match &msglike.kind {
+                MsgLikeKind::Message(message) => match message.msgtype() {
+                    MessageType::Text(_)
+                    | MessageType::Emote(_)
+                    | MessageType::Audio(_)
+                    | MessageType::File(_)
+                    | MessageType::Image(_)
+                    | MessageType::Video(_) => true,
+                    #[cfg(feature = "unstable-msc4274")]
+                    MessageType::Gallery(_) => true,
+                    _ => false,
+                },
+                MsgLikeKind::Poll(poll) => {
+                    poll.response_data.is_empty() && poll.end_event_timestamp.is_none()
+                }
+                // Other MsgLike timeline items can't be edited at the moment.
+                _ => false,
+            },
+            _ => {
+                // Other timeline items can't be edited at the moment.
+                false
+            }
+        }
+    }
+
+    /// Whether the event should be highlighted in the timeline.
+    pub fn is_highlighted(&self) -> bool {
+        match &self.kind {
+            EventTimelineItemKind::Local(_) => false,
+            EventTimelineItemKind::Remote(remote_event) => remote_event.is_highlighted,
+        }
+    }
+
+    /// Get the encryption information for the event, if any.
+    pub fn encryption_info(&self) -> Option<&EncryptionInfo> {
+        match &self.kind {
+            EventTimelineItemKind::Local(_) => None,
+            EventTimelineItemKind::Remote(remote_event) => remote_event.encryption_info.as_deref(),
+        }
+    }
+
+    /// Gets the [`TimelineEventShieldState`] which can be used to decorate
+    /// messages in the recommended way.
+    pub fn get_shield(&self, strict: bool) -> TimelineEventShieldState {
+        if !self.is_room_encrypted || self.is_local_echo() {
+            return TimelineEventShieldState::None;
+        }
+
+        // An unable-to-decrypt message has no authenticity shield.
+        if self.content().is_unable_to_decrypt() {
+            return TimelineEventShieldState::None;
+        }
+
+        // A live-location item originates from a `beacon_info` _state_ event,
+        // which cannot be encrypted (except with
+        // `experimental-encrypted-state-events` flag). The actual location
+        // updates (`beacon` message-like events) _are_ encrypted.
+        //
+        // When there are no beacons yet we return `None` (the state event
+        // itself is inherently unencrypted, so no warning is warranted). Once
+        // at least one beacon has been aggregated, we derive the shield from
+        // the _last_ beacon's encryption info so the UI accurately reflects the
+        // authenticity of the most recent location update.
+        if let Some(live_location) = self.content().as_live_location_state() {
+            return match live_location.latest_location() {
+                None => TimelineEventShieldState::None,
+                Some(beacon) => match beacon.encryption_info() {
+                    Some(info) => {
+                        if strict {
+                            info.verification_state.to_shield_state_strict().into()
+                        } else {
+                            info.verification_state.to_shield_state_lax().into()
+                        }
+                    }
+                    None => TimelineEventShieldState::Red {
+                        code: TimelineEventShieldStateCode::SentInClear,
+                    },
+                },
+            };
+        }
+
+        match self.encryption_info() {
+            Some(info) => {
+                if strict {
+                    info.verification_state.to_shield_state_strict().into()
+                } else {
+                    info.verification_state.to_shield_state_lax().into()
+                }
+            }
+            None => {
+                TimelineEventShieldState::Red { code: TimelineEventShieldStateCode::SentInClear }
+            }
+        }
+    }
+
+    /// Check whether this item can be replied to.
+    pub fn can_be_replied_to(&self) -> bool {
+        // This must be in sync with the early returns of `Timeline::send_reply`
+        if self.event_id().is_none() {
+            false
+        } else if self.content.is_message() {
+            true
+        } else if self.content().as_live_location_state().is_some() {
+            // Live location sharing session (MSC3489) events are state events,
+            // not always displayed in a timeline, so can't be replied to.
+            false
+        } else {
+            self.latest_json().is_some()
+        }
+    }
+
+    /// Get the raw JSON representation of the initial event (the one that
+    /// caused this timeline item to be created).
+    ///
+    /// Returns `None` if this event hasn't been echoed back by the server yet.
+    pub fn original_json(&self) -> Option<&Raw<AnySyncTimelineEvent>> {
+        match &self.kind {
+            EventTimelineItemKind::Local(_) => None,
+            EventTimelineItemKind::Remote(remote_event) => remote_event.original_json.as_ref(),
+        }
+    }
+
+    /// Get the raw JSON representation of the latest edit, if any.
+    pub fn latest_edit_json(&self) -> Option<&Raw<AnySyncTimelineEvent>> {
+        match &self.kind {
+            EventTimelineItemKind::Local(_) => None,
+            EventTimelineItemKind::Remote(remote_event) => remote_event.latest_edit_json.as_ref(),
+        }
+    }
+
+    /// Shorthand for
+    /// `item.latest_edit_json().or_else(|| item.original_json())`.
+    pub fn latest_json(&self) -> Option<&Raw<AnySyncTimelineEvent>> {
+        self.latest_edit_json().or_else(|| self.original_json())
+    }
+
+    /// Get the origin of the event, i.e. where it came from.
+    ///
+    /// May return `None` in some edge cases that are subject to change.
+    pub fn origin(&self) -> Option<EventItemOrigin> {
+        match &self.kind {
+            EventTimelineItemKind::Local(_) => Some(EventItemOrigin::Local),
+            EventTimelineItemKind::Remote(remote_event) => match remote_event.origin {
+                RemoteEventOrigin::Sync => Some(EventItemOrigin::Sync),
+                RemoteEventOrigin::Pagination => Some(EventItemOrigin::Pagination),
+                RemoteEventOrigin::Cache => Some(EventItemOrigin::Cache),
+                RemoteEventOrigin::Unknown => None,
+            },
+        }
+    }
+
+    pub(super) fn set_content(&mut self, content: TimelineItemContent) {
+        self.content = content;
+    }
+
+    /// Clone the current event item, and update its `kind`.
+    pub(super) fn with_kind(&self, kind: impl Into<EventTimelineItemKind>) -> Self {
+        Self { kind: kind.into(), ..self.clone() }
+    }
+
+    /// Clone the current event item, and update its content.
+    pub(super) fn with_content(&self, new_content: TimelineItemContent) -> Self {
+        let mut new = self.clone();
+        new.content = new_content;
+        new
+    }
+
+    /// Clone the current event item, and update its content.
+    ///
+    /// Optionally update `latest_edit_json` if the update is an edit received
+    /// from the server.
+    pub(super) fn with_content_and_latest_edit(
+        &self,
+        new_content: TimelineItemContent,
+        edit_json: Option<Raw<AnySyncTimelineEvent>>,
+    ) -> Self {
+        let mut new = self.clone();
+        new.content = new_content;
+        if let EventTimelineItemKind::Remote(r) = &mut new.kind {
+            r.latest_edit_json = edit_json;
+        }
+        new
+    }
+
+    /// Clone the current event item, and update its `sender_profile`.
+    pub(super) fn with_sender_profile(&self, sender_profile: TimelineDetails<Profile>) -> Self {
+        Self { sender_profile, ..self.clone() }
+    }
+
+    /// Clone the current event item, and update its `encryption_info`.
+    pub(super) fn with_encryption_info(
+        &self,
+        encryption_info: Option<Arc<EncryptionInfo>>,
+    ) -> Self {
+        let mut new = self.clone();
+        if let EventTimelineItemKind::Remote(r) = &mut new.kind {
+            r.encryption_info = encryption_info;
+        }
+
+        new
+    }
+
+    /// Create a clone of the current item, with content that's been redacted.
+    pub(super) fn redact(&self, rules: &RedactionRules, is_local: bool) -> Self {
+        let unredacted_item = is_local.then(|| UnredactedEventTimelineItem {
+            content: self.content.clone(),
+            reactions: self.reactions.clone(),
+            original_json: self.original_json().cloned(),
+            latest_edit_json: self.latest_edit_json().cloned(),
+        });
+        let content = self.content.redact(rules);
+        let kind = match &self.kind {
+            EventTimelineItemKind::Local(l) => EventTimelineItemKind::Local(l.clone()),
+            EventTimelineItemKind::Remote(r) => EventTimelineItemKind::Remote(r.redact()),
+        };
+        Self {
+            sender: self.sender.clone(),
+            sender_profile: self.sender_profile.clone(),
+            forwarder: self.forwarder.clone(),
+            forwarder_profile: self.forwarder_profile.clone(),
+            timestamp: self.timestamp,
+            content,
+            unredacted_item,
+            redaction_send_state: None,
+            edit_send_state: None,
+            reactions: Default::default(),
+            unedited_kind: None,
+            kind,
+            is_room_encrypted: self.is_room_encrypted,
+        }
+    }
+
+    /// Create a clone of the current item, with data restored from the item's
+    /// unredacted_item field (if it was previously set by a call to the
+    /// `redact(...)` method).
+    pub(super) fn unredact(&self) -> Self {
+        let Some(unredacted_item) = &self.unredacted_item else { return self.clone() };
+        let kind = match &self.kind {
+            EventTimelineItemKind::Local(l) => EventTimelineItemKind::Local(l.clone()),
+            EventTimelineItemKind::Remote(r) => {
+                EventTimelineItemKind::Remote(RemoteEventTimelineItem {
+                    original_json: unredacted_item.original_json.clone(),
+                    latest_edit_json: unredacted_item.latest_edit_json.clone(),
+                    ..r.clone()
+                })
+            }
+        };
+        Self {
+            sender: self.sender.clone(),
+            sender_profile: self.sender_profile.clone(),
+            forwarder: self.forwarder.clone(),
+            forwarder_profile: self.forwarder_profile.clone(),
+            timestamp: self.timestamp,
+            content: unredacted_item.content.clone(),
+            unredacted_item: None,
+            redaction_send_state: None,
+            edit_send_state: None,
+            reactions: unredacted_item.reactions.clone(),
+            unedited_kind: None,
+            kind,
+            is_room_encrypted: self.is_room_encrypted,
+        }
+    }
+
+    pub(super) fn handle(&self) -> TimelineItemHandle<'_> {
+        match &self.kind {
+            EventTimelineItemKind::Local(local) => {
+                if let Some(event_id) = local.event_id() {
+                    TimelineItemHandle::Remote(event_id)
+                } else {
+                    TimelineItemHandle::Local(
+                        // The send_handle must always be present, except in tests.
+                        local.send_handle.as_ref().expect("Unexpected missing send_handle"),
+                    )
+                }
+            }
+            EventTimelineItemKind::Remote(remote) => TimelineItemHandle::Remote(&remote.event_id),
+        }
+    }
+
+    /// For local echoes, return the associated send handle.
+    pub fn local_echo_send_handle(&self) -> Option<SendHandle> {
+        as_variant!(self.handle(), TimelineItemHandle::Local(handle) => handle.clone())
+    }
+
+    /// Some clients may want to know if a particular text message or media
+    /// caption contains only emojis so that they can render them bigger for
+    /// added effect.
+    ///
+    /// This function provides that feature with the following
+    /// behavior/limitations:
+    ///
+    /// - ignores leading and trailing white spaces
+    /// - fails texts bigger than 5 graphemes for performance reasons
+    /// - checks the body only for [`MessageType::Text`]
+    /// - only checks the caption for [`MessageType::Audio`],
+    ///   [`MessageType::File`], [`MessageType::Image`], and
+    ///   [`MessageType::Video`] if present
+    /// - all other message types will not match
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// # fn render_timeline_item(timeline_item: TimelineItem) {
+    /// if timeline_item.contains_only_emojis() {
+    ///     // e.g. increase the font size
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// See `test_emoji_detection` for more examples.
+    pub fn contains_only_emojis(&self) -> bool {
+        let body = match self.content() {
+            TimelineItemContent::MsgLike(msglike) => match &msglike.kind {
+                MsgLikeKind::Message(message) => match &message.msgtype {
+                    MessageType::Text(text) => Some(text.body.as_str()),
+                    MessageType::Audio(audio) => audio.caption(),
+                    MessageType::File(file) => file.caption(),
+                    MessageType::Image(image) => image.caption(),
+                    MessageType::Video(video) => video.caption(),
+                    _ => None,
+                },
+                MsgLikeKind::Sticker(_)
+                | MsgLikeKind::Poll(_)
+                | MsgLikeKind::Redacted
+                | MsgLikeKind::UnableToDecrypt(_)
+                | MsgLikeKind::Other(_)
+                | MsgLikeKind::LiveLocation(_) => None,
+            },
+            TimelineItemContent::MembershipChange(_)
+            | TimelineItemContent::ProfileChange(_)
+            | TimelineItemContent::OtherState(_)
+            | TimelineItemContent::FailedToParseMessageLike { .. }
+            | TimelineItemContent::FailedToParseState { .. }
+            | TimelineItemContent::CallInvite
+            | TimelineItemContent::RtcNotification { .. } => None,
+        };
+
+        if let Some(body) = body {
+            // Collect the graphemes after trimming white spaces.
+            let graphemes = body.trim().graphemes(true).collect::<Vec<&str>>();
+
+            // Limit the check to 5 graphemes for performance and security
+            // reasons. This will probably be used for every new message so we
+            // want it to be fast and we don't want to allow a DoS attack by
+            // sending a huge message.
+            if graphemes.len() > 5 {
+                return false;
+            }
+
+            graphemes.iter().all(|g| emojis::get(g).is_some())
+        } else {
+            false
+        }
+    }
+}
+
+impl From<LocalEventTimelineItem> for EventTimelineItemKind {
+    fn from(value: LocalEventTimelineItem) -> Self {
+        EventTimelineItemKind::Local(value)
+    }
+}
+
+impl From<RemoteEventTimelineItem> for EventTimelineItemKind {
+    fn from(value: RemoteEventTimelineItem) -> Self {
+        EventTimelineItemKind::Remote(value)
+    }
+}
+
+/// The display name and avatar URL of a room member.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Profile {
+    /// The display name, if set.
+    pub display_name: Option<String>,
+
+    /// Whether the display name is ambiguous.
+    ///
+    /// Note that in rooms with lazy-loading enabled, this could be `false` even
+    /// though the display name is actually ambiguous if not all member events
+    /// have been seen yet.
+    pub display_name_ambiguous: bool,
+
+    /// The avatar URL, if set.
+    pub avatar_url: Option<OwnedMxcUri>,
+
+    /// The user's status, taken from their global profile, if set.
+    #[cfg(feature = "unstable-msc4426")]
+    pub status: Option<StatusProfileField>,
+
+    /// The user's call indicator, taken from their global profile, if set.
+    #[cfg(feature = "unstable-msc4426")]
+    pub call: Option<CallProfileField>,
+}
+
+impl Profile {
+    pub async fn load(room: &Room, user_id: &UserId) -> Option<Self> {
+        match room.get_member_no_sync(user_id).await {
+            Ok(Some(member)) => Some(Profile {
+                display_name: member.display_name().map(ToOwned::to_owned),
+                display_name_ambiguous: member.name_ambiguous(),
+                avatar_url: member.avatar_url().map(ToOwned::to_owned),
+                #[cfg(feature = "unstable-msc4426")]
+                status: member.status().cloned(),
+                #[cfg(feature = "unstable-msc4426")]
+                call: member.call().cloned(),
+            }),
+            Ok(None) if room.are_members_synced() => Some(Profile::default()),
+            Ok(None) => None,
+            Err(e) => {
+                error!(%user_id, "Failed to fetch room member information: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// Some details of an [`EventTimelineItem`] that may require server requests
+/// other than just the regular
+/// [`sync_events`][ruma::api::client::sync::sync_events].
+#[derive(Clone, Debug)]
+pub enum TimelineDetails<T> {
+    /// The details are not available yet, and have not been requested from the
+    /// server.
+    Unavailable,
+
+    /// The details are not available yet, but have been requested.
+    Pending,
+
+    /// The details are available.
+    Ready(T),
+
+    /// An error occurred when fetching the details.
+    Error(Arc<Error>),
+}
+
+impl<T> TimelineDetails<T> {
+    /// Create a [`TimelineDetails`] from an initial value that may or may not
+    /// be available.
+    ///
+    /// Will be [`TimelineDetails::Ready`] if the value is `Some(_)`, and
+    /// [`TimelineDetails::Unavailable`] if the value is `None`.
+    pub fn from_initial_value(value: Option<T>) -> Self {
+        match value {
+            Some(v) => Self::Ready(v),
+            None => Self::Unavailable,
+        }
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+}
+
+/// Where this event came.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum EventItemOrigin {
+    /// The event was created locally.
+    Local,
+    /// The event came from a sync response.
+    Sync,
+    /// The event came from pagination.
+    Pagination,
+    /// The event came from a cache.
+    Cache,
+}
+
+/// Information about a single reaction stored in [`ReactionsByKeyBySender`].
+#[derive(Clone, Debug)]
+pub struct ReactionInfo {
+    pub timestamp: MilliSecondsSinceUnixEpoch,
+    /// Send state of the reaction when it's one of our own local echoes; `None`
+    /// when it came from the server.
+    pub send_state: Option<EventSendState>,
+}
+
+/// Reactions grouped by key first, then by sender.
+///
+/// This representation makes sure that a given sender has sent at most one
+/// reaction for an event.
+#[derive(Debug, Clone, Default)]
+pub struct ReactionsByKeyBySender(IndexMap<String, IndexMap<OwnedUserId, ReactionInfo>>);
+
+impl Deref for ReactionsByKeyBySender {
+    type Target = IndexMap<String, IndexMap<OwnedUserId, ReactionInfo>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ReactionsByKeyBySender {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl ReactionsByKeyBySender {
+    /// Removes (in place) a reaction from the sender with the given annotation
+    /// from the mapping.
+    ///
+    /// Returns true if the reaction was found and thus removed, false
+    /// otherwise.
+    pub(crate) fn remove_reaction(
+        &mut self,
+        sender: &UserId,
+        annotation: &str,
+    ) -> Option<ReactionInfo> {
+        if let Some(by_user) = self.0.get_mut(annotation)
+            && let Some(info) = by_user.swap_remove(sender)
+        {
+            // If this was the last reaction, remove the annotation entry.
+            if by_user.is_empty() {
+                self.0.swap_remove(annotation);
+            }
+            return Some(info);
+        }
+        None
+    }
+}
+
+/// Extends [`ShieldState`] to allow for a `SentInClear` code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimelineEventShieldState {
+    /// A red shield with a tooltip containing a message appropriate to the
+    /// associated code should be presented.
+    Red {
+        /// A machine-readable representation.
+        code: TimelineEventShieldStateCode,
+    },
+    /// A grey shield with a tooltip containing a message appropriate to the
+    /// associated code should be presented.
+    Grey {
+        /// A machine-readable representation.
+        code: TimelineEventShieldStateCode,
+    },
+    /// No shield should be presented.
+    None,
+}
+
+impl From<ShieldState> for TimelineEventShieldState {
+    fn from(value: ShieldState) -> Self {
+        match value {
+            ShieldState::Red { code, message: _ } => {
+                TimelineEventShieldState::Red { code: code.into() }
+            }
+            ShieldState::Grey { code, message: _ } => {
+                TimelineEventShieldState::Grey { code: code.into() }
+            }
+            ShieldState::None => TimelineEventShieldState::None,
+        }
+    }
+}
+
+/// Extends [`ShieldStateCode`] to allow for a `SentInClear` code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum TimelineEventShieldStateCode {
+    /// Not enough information available to check the authenticity.
+    AuthenticityNotGuaranteed,
+    /// The sending device isn't yet known by the Client.
+    UnknownDevice,
+    /// The sending device hasn't been verified by the sender.
+    UnsignedDevice,
+    /// The sender hasn't been verified by the Client's user.
+    UnverifiedIdentity,
+    /// The sender was previously verified but changed their identity.
+    VerificationViolation,
+    /// The `sender` field on the event does not match the owner of the device
+    /// that established the Megolm session.
+    MismatchedSender,
+    /// An unencrypted event in an encrypted room.
+    SentInClear,
+}
+
+impl From<ShieldStateCode> for TimelineEventShieldStateCode {
+    fn from(value: ShieldStateCode) -> Self {
+        use TimelineEventShieldStateCode::*;
+        match value {
+            ShieldStateCode::AuthenticityNotGuaranteed => AuthenticityNotGuaranteed,
+            ShieldStateCode::UnknownDevice => UnknownDevice,
+            ShieldStateCode::UnsignedDevice => UnsignedDevice,
+            ShieldStateCode::UnverifiedIdentity => UnverifiedIdentity,
+            ShieldStateCode::VerificationViolation => VerificationViolation,
+            ShieldStateCode::MismatchedSender => MismatchedSender,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use ruma::{
+        MilliSecondsSinceUnixEpoch,
+        events::{
+            AnySyncTimelineEvent,
+            beacon_info::BeaconInfoEventContent,
+            room::message::{MessageType, RoomMessageEventContent, TextMessageEventContent},
+        },
+        owned_event_id, owned_user_id,
+        serde::Raw,
+        uint,
+    };
+    use serde_json::json;
+
+    use super::{
+        EventSendState, EventTimelineItem, EventTimelineItemKind, LiveLocationState,
+        LocalEventTimelineItem, Message, MsgLikeContent, MsgLikeKind, RemoteEventOrigin,
+        RemoteEventTimelineItem, TimelineDetails, TimelineItemContent,
+    };
+
+    fn message_content() -> TimelineItemContent {
+        TimelineItemContent::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::Message(Message {
+                msgtype: MessageType::Text(TextMessageEventContent::plain("hello")),
+                edited: false,
+                mentions: None,
+            }),
+            thread_root: None,
+            in_reply_to: None,
+            thread_summary: None,
+        })
+    }
+
+    fn live_location_content() -> TimelineItemContent {
+        TimelineItemContent::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::LiveLocation(LiveLocationState::new(BeaconInfoEventContent::new(
+                None,
+                Duration::from_secs(300),
+                true,
+                Some(MilliSecondsSinceUnixEpoch(uint!(1))),
+            ))),
+            thread_root: None,
+            in_reply_to: None,
+            thread_summary: None,
+        })
+    }
+
+    fn remote_item(
+        content: TimelineItemContent,
+        original_json: Option<Raw<AnySyncTimelineEvent>>,
+    ) -> EventTimelineItem {
+        EventTimelineItem::new(
+            owned_user_id!("@alice:example.org"),
+            TimelineDetails::Unavailable,
+            None,
+            None,
+            MilliSecondsSinceUnixEpoch(uint!(1)),
+            content,
+            EventTimelineItemKind::Remote(RemoteEventTimelineItem {
+                event_id: owned_event_id!("$event"),
+                transaction_id: None,
+                read_receipts: Default::default(),
+                is_own: false,
+                is_highlighted: false,
+                encryption_info: None,
+                original_json,
+                latest_edit_json: None,
+                origin: RemoteEventOrigin::Sync,
+            }),
+            false,
+        )
+    }
+
+    fn local_unsent_item(content: TimelineItemContent) -> EventTimelineItem {
+        EventTimelineItem::new(
+            owned_user_id!("@alice:example.org"),
+            TimelineDetails::Unavailable,
+            None,
+            None,
+            MilliSecondsSinceUnixEpoch(uint!(1)),
+            content,
+            EventTimelineItemKind::Local(LocalEventTimelineItem {
+                send_state: EventSendState::NotSentYet { progress: None },
+                transaction_id: "t0".into(),
+                send_handle: None,
+            }),
+            false,
+        )
+    }
+
+    fn sample_raw_event() -> Raw<AnySyncTimelineEvent> {
+        Raw::from_json_string(
+            json!({
+                "content": RoomMessageEventContent::text_plain("hi"),
+                "type": "m.room.message",
+                "event_id": "$event",
+                "room_id": "!room:example.org",
+                "origin_server_ts": 1,
+                "sender": "@alice:example.org",
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cannot_reply_to_local_unsent_events() {
+        let item = local_unsent_item(message_content());
+        assert!(!item.can_be_replied_to());
+    }
+
+    #[test]
+    fn can_reply_to_messages() {
+        let item = remote_item(message_content(), None);
+        assert!(item.can_be_replied_to());
+    }
+
+    #[test]
+    fn cannot_reply_to_live_location_events() {
+        let item = remote_item(live_location_content(), Some(sample_raw_event()));
+        assert!(!item.can_be_replied_to());
+    }
+
+    #[test]
+    fn cannot_reply_to_non_messages_with_no_json() {
+        let item = remote_item(TimelineItemContent::CallInvite, None);
+        assert!(!item.can_be_replied_to());
+    }
+
+    #[test]
+    fn can_reply_to_non_messages_with_json() {
+        let item = remote_item(TimelineItemContent::CallInvite, Some(sample_raw_event()));
+        assert!(item.can_be_replied_to());
+    }
+}

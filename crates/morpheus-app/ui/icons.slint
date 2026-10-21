@@ -1,0 +1,145 @@
+// Original Morpheus interface icons, drawn as native vector paths.
+//
+// Every path here was written for Morpheus by hand in a 24-unit square with a
+// 2-unit safe margin (artwork stays within 2..22), so all icons share the
+// same optical bounds at 16, 20, 24 and 32 px. No icon pack, generated image,
+// remote URL or runtime-loaded SVG is used. Paths are stroked with round caps
+// and joins; a closed shape may additionally be filled with a themed color.
+//
+// The ID set is closed and stable: callers name icons by these IDs, and an
+// unknown ID draws nothing (IconAction keeps its bounded text fallback for
+// strings that are neither an ID nor a mapped legacy glyph). Add IDs only;
+// never rename or reuse one. The reference list is docs/ICONS.md.
+//
+// Icons are decorative: the control that hosts one owns its label, focus,
+// hit target and action. Icons never animate, so reduced motion needs no
+// special case; ink follows the host's state immediately.
+
+import { StyleTokens } from "style-tokens.slint";
+
+export global MorpheusIcons {
+    // The stroke path of a stable icon ID, or "" for an unknown ID.
+    pure public function outline(id: string) -> string {
+        if id == "home" { return "M 3 11 L 12 3.5 L 21 11 M 5.5 9 L 5.5 20 L 10 20 L 10 14.5 L 14 14.5 L 14 20 L 18.5 20 L 18.5 9"; }
+        if id == "direct-messages" { return "M 4 4.5 L 20 4.5 L 20 15.5 L 11 15.5 L 6.5 19.5 L 6.5 15.5 L 4 15.5 Z M 10.1 8.6 A 1.9 1.9 0 1 0 13.9 8.6 A 1.9 1.9 0 1 0 10.1 8.6 M 8.6 13.2 C 9.4 11.4 14.6 11.4 15.4 13.2"; }
+        if id == "spaces" { return "M 4 4 L 10.5 4 L 10.5 10.5 L 4 10.5 Z M 13.5 4 L 20 4 L 20 10.5 L 13.5 10.5 Z M 4 13.5 L 10.5 13.5 L 10.5 20 L 4 20 Z M 13.5 16.75 A 3.25 3.25 0 1 0 20 16.75 A 3.25 3.25 0 1 0 13.5 16.75"; }
+        if id == "search" { return "M 4.5 10.5 A 6 6 0 1 0 16.5 10.5 A 6 6 0 1 0 4.5 10.5 M 15 15 L 20.5 20.5"; }
+        if id == "explore" { return "M 3.5 12 A 8.5 8.5 0 1 0 20.5 12 A 8.5 8.5 0 1 0 3.5 12 M 15.5 8.5 L 13.4 13.4 L 8.5 15.5 L 10.6 10.6 Z"; }
+        if id == "calls" { return "M 6.5 3.5 L 9.5 3.5 L 11 7.5 L 9 9 C 10 11.5 12.5 14 15 15 L 16.5 13 L 20.5 14.5 L 20.5 17.5 C 20.5 19 19 20.5 17.5 20.5 C 10 20 4 14 3.5 6.5 C 3.5 5 5 3.5 6.5 3.5 Z"; }
+        if id == "settings" { return "M 20.82 10.21 L 20.82 13.79 L 18.18 14.33 L 18.01 14.72 L 19.50 16.97 L 16.97 19.50 L 14.72 18.01 L 14.33 18.18 L 13.79 20.82 L 10.21 20.82 L 9.67 18.18 L 9.28 18.01 L 7.03 19.50 L 4.50 16.97 L 5.99 14.72 L 5.82 14.33 L 3.18 13.79 L 3.18 10.21 L 5.82 9.67 L 5.99 9.28 L 4.50 7.03 L 7.03 4.50 L 9.28 5.99 L 9.67 5.82 L 10.21 3.18 L 13.79 3.18 L 14.33 5.82 L 14.72 5.99 L 16.97 4.50 L 19.50 7.03 L 18.01 9.28 L 18.18 9.67 Z M 9 12 A 3 3 0 1 0 15 12 A 3 3 0 1 0 9 12"; }
+        if id == "notifications" { return "M 6 16.5 L 6 10.5 C 6 3 18 3 18 10.5 L 18 16.5 L 19.5 18 L 4.5 18 Z M 10 20.5 L 14 20.5"; }
+        if id == "notifications-off" { return "M 6 16.5 L 6 10.5 C 6 3 18 3 18 10.5 L 18 16.5 L 19.5 18 L 4.5 18 Z M 10 20.5 L 14 20.5 M 4 3.5 L 20 20.5"; }
+        if id == "add-account" { return "M 6.5 8 A 3.5 3.5 0 1 0 13.5 8 A 3.5 3.5 0 1 0 6.5 8 M 3.5 19.5 C 4.5 14.5 15.5 14.5 16.5 19.5 M 19 8 L 19 14 M 16 11 L 22 11"; }
+        if id == "manage-accounts" { return "M 5.8 8 A 3.2 3.2 0 1 0 12.2 8 A 3.2 3.2 0 1 0 5.8 8 M 3 19 C 4 14.5 14 14.5 15 19 M 16 15 L 21 15 M 16 18.5 L 21 18.5 M 17.5 13.5 L 17.5 16.5 M 19.5 17 L 19.5 20"; }
+        if id == "log-out" { return "M 13 4 L 5 4 L 5 20 L 13 20 M 10 12 L 20.5 12 M 17 8.5 L 20.5 12 L 17 15.5"; }
+        if id == "members" { return "M 5.8 8 A 3.2 3.2 0 1 0 12.2 8 A 3.2 3.2 0 1 0 5.8 8 M 3 19 C 4 14.5 14 14.5 15 19 M 14 7.5 A 2.5 2.5 0 1 0 19 7.5 A 2.5 2.5 0 1 0 14 7.5 M 16 12.6 C 18.5 12.4 20.5 13.8 21 16.5"; }
+        if id == "thread" { return "M 3.5 4 L 15.5 4 L 15.5 12 L 8.5 12 L 5.5 15 L 5.5 12 L 3.5 12 Z M 18 8 L 20.5 8 L 20.5 16 L 18.5 16 L 18.5 19 L 15.5 16 L 10 16 L 10 14.5"; }
+        if id == "pin" { return "M 9 3.5 L 15 3.5 L 14 9 L 17.5 12.5 L 17.5 14 L 6.5 14 L 6.5 12.5 L 10 9 Z M 12 14 L 12 20.5"; }
+        if id == "files" { return "M 6 3 L 14 3 L 19 8 L 19 21 L 6 21 Z M 14 3 L 14 8 L 19 8 M 9 12.5 L 16 12.5 M 9 16 L 14 16"; }
+        if id == "transfers" { return "M 8 20 L 8 4 M 4.5 7.5 L 8 4 L 11.5 7.5 M 16 4 L 16 20 M 12.5 16.5 L 16 20 L 19.5 16.5"; }
+        if id == "media" { return "M 3.5 5 L 20.5 5 L 20.5 19 L 3.5 19 Z M 3.5 16 L 9 11 L 13 15 L 15.5 12.5 L 20.5 17 M 14 9 A 1.5 1.5 0 1 0 17 9 A 1.5 1.5 0 1 0 14 9"; }
+        if id == "details-panel" { return "M 3.5 4.5 L 20.5 4.5 L 20.5 19.5 L 3.5 19.5 Z M 14.5 4.5 L 14.5 19.5"; }
+        if id == "layout" { return "M 3.5 4.5 L 20.5 4.5 L 20.5 19.5 L 3.5 19.5 Z M 9 4.5 L 9 19.5 M 15 4.5 L 15 19.5"; }
+        if id == "attach" { return "M 16 8 L 9 15 C 8 16 8 17.2 9 18 C 9.8 19 11 19 12 18 L 19 11 C 20.8 9.2 20.8 6.4 19 4.8 C 17.4 3 14.6 3 12.8 4.8 L 5.5 12 C 3 14.5 3 18.4 5.5 20.6"; }
+        if id == "send" { return "M 4 4.5 L 20.5 12 L 4 19.5 L 6.5 12 Z M 6.5 12 L 12 12"; }
+        if id == "emoji" { return "M 3.5 12 A 8.5 8.5 0 1 0 20.5 12 A 8.5 8.5 0 1 0 3.5 12 M 8.5 14 C 9.5 16 14.5 16 15.5 14 M 9.5 9.5 L 9.5 10.5 M 14.5 9.5 L 14.5 10.5"; }
+        if id == "sticker" { return "M 4 4 L 20 4 L 20 13 L 13 20 L 4 20 Z M 20 13 L 15 13 C 13.9 13 13 13.9 13 15 L 13 20"; }
+        if id == "poll" { return "M 5 20 L 5 12 M 10 20 L 10 5 M 15 20 L 15 9 M 20 20 L 20 14"; }
+        if id == "mic" { return "M 9 6 C 9 2.5 15 2.5 15 6 L 15 11.5 C 15 15 9 15 9 11.5 Z M 5.5 11 C 5.5 19.5 18.5 19.5 18.5 11 M 12 17.5 L 12 21 M 8.5 21 L 15.5 21"; }
+        if id == "mic-off" { return "M 9 6 C 9 2.5 15 2.5 15 6 L 15 11.5 C 15 15 9 15 9 11.5 Z M 5.5 11 C 5.5 19.5 18.5 19.5 18.5 11 M 12 17.5 L 12 21 M 8.5 21 L 15.5 21 M 4 3.5 L 20 20.5"; }
+        if id == "headphones" { return "M 4 17 L 4 12 C 4 2 20 2 20 12 L 20 17 M 4 14 L 7.5 14 L 7.5 20 L 4 20 Z M 20 14 L 16.5 14 L 16.5 20 L 20 20 Z"; }
+        if id == "headphones-off" { return "M 4 17 L 4 12 C 4 2 20 2 20 12 L 20 17 M 4 14 L 7.5 14 L 7.5 20 L 4 20 Z M 20 14 L 16.5 14 L 16.5 20 L 20 20 Z M 4 3.5 L 20 20.5"; }
+        if id == "camera" { return "M 3.5 7 L 15 7 L 15 17 L 3.5 17 Z M 15 10.5 L 20.5 7.5 L 20.5 16.5 L 15 13.5"; }
+        if id == "camera-off" { return "M 3.5 7 L 15 7 L 15 17 L 3.5 17 Z M 15 10.5 L 20.5 7.5 L 20.5 16.5 L 15 13.5 M 4 3.5 L 20 20.5"; }
+        if id == "screen-share" { return "M 3 5 L 21 5 L 21 16 L 3 16 Z M 8.5 20 L 15.5 20 M 12 16 L 12 20 M 12 13 L 12 8 M 9.5 10.5 L 12 8 L 14.5 10.5"; }
+        if id == "screen-share-stop" { return "M 3 5 L 21 5 L 21 16 L 3 16 Z M 8.5 20 L 15.5 20 M 12 16 L 12 20 M 9.5 8 L 14.5 13 M 14.5 8 L 9.5 13"; }
+        if id == "call-leave" { return "M 3 13.5 C 7.5 9 16.5 9 21 13.5 L 19.5 16.5 L 16 15.5 L 15.5 13 C 13.2 12.2 10.8 12.2 8.5 13 L 8 15.5 L 4.5 16.5 Z"; }
+        if id == "chat" { return "M 4 5 L 20 5 L 20 16 L 11 16 L 6.5 20 L 6.5 16 L 4 16 Z M 7.5 9 L 16.5 9 M 7.5 12 L 13.5 12"; }
+        if id == "add" { return "M 12 5 L 12 19 M 5 12 L 19 12"; }
+        if id == "remove" { return "M 5 12 L 19 12"; }
+        if id == "close" { return "M 6 6 L 18 18 M 18 6 L 6 18"; }
+        if id == "check" { return "M 5 12.5 L 10 17.5 L 19 7"; }
+        if id == "refresh" { return "M 19.5 12 A 7.5 7.5 0 1 1 17 6.4 M 17.5 3 L 17.5 6.8 L 13.7 6.8"; }
+        if id == "download" { return "M 12 3.5 L 12 15 M 7 10 L 12 15 L 17 10 M 4 15.5 L 4 20 L 20 20 L 20 15.5"; }
+        if id == "reply" { return "M 9.5 5 L 3.5 10.5 L 9.5 16 M 3.5 10.5 L 14 10.5 C 18 10.5 20.5 13.5 20.5 19"; }
+        if id == "react" { return "M 12 20 C 9.5 17.8 3.5 13.5 3.5 8.5 C 3.5 4.5 9.5 3 12 7.5 C 14.5 3 20.5 4.5 20.5 8.5 C 20.5 13.5 14.5 17.8 12 20 Z"; }
+        if id == "redact" { return "M 4 6.5 L 20 6.5 M 9 6.5 L 9 3.5 L 15 3.5 L 15 6.5 M 6 6.5 L 7 20.5 L 17 20.5 L 18 6.5 M 10 10 L 10 17 M 14 10 L 14 17"; }
+        if id == "edit" { return "M 4.5 19.5 L 9 18.5 L 19 8.5 L 15.5 5 L 5.5 15 Z M 14 6.5 L 17.5 10"; }
+        if id == "chevron-up" { return "M 6 15 L 12 9 L 18 15"; }
+        if id == "chevron-down" { return "M 6 9 L 12 15 L 18 9"; }
+        if id == "more" { return "M 4.75 12 A 1.25 1.25 0 1 0 7.25 12 A 1.25 1.25 0 1 0 4.75 12 M 10.75 12 A 1.25 1.25 0 1 0 13.25 12 A 1.25 1.25 0 1 0 10.75 12 M 16.75 12 A 1.25 1.25 0 1 0 19.25 12 A 1.25 1.25 0 1 0 16.75 12"; }
+        if id == "chevrons-left" { return "M 12 6 L 6 12 L 12 18 M 18 6 L 12 12 L 18 18"; }
+        if id == "chevrons-right" { return "M 6 6 L 12 12 L 6 18 M 12 6 L 18 12 L 12 18"; }
+        if id == "arrow-left" { return "M 20 12 L 4 12 M 10 6 L 4 12 L 10 18"; }
+        if id == "arrow-up" { return "M 12 20 L 12 4 M 6 10 L 12 4 L 18 10"; }
+        if id == "arrow-down" { return "M 12 4 L 12 20 M 6 14 L 12 20 L 18 14"; }
+        return "";
+    }
+
+    // The icon ID a legacy one-glyph IconAction caption stood for, or "".
+    pure public function from-legacy(glyph: string) -> string {
+        if glyph == "⌂" { return "home"; }
+        if glyph == "S" { return "search"; }
+        if glyph == "C" { return "calls"; }
+        if glyph == "P" { return "details-panel"; }
+        if glyph == "+" { return "add"; }
+        if glyph == "↓" { return "arrow-down"; }
+        if glyph == "F" { return "files"; }
+        if glyph == "↩" { return "reply"; }
+        if glyph == "♥" { return "react"; }
+        if glyph == "⌫" { return "redact"; }
+        if glyph == "✎" { return "edit"; }
+        if glyph == "Pin" { return "pin"; }
+        if glyph == "☷" { return "thread"; }
+        if glyph == "×" { return "close"; }
+        if glyph == "−" { return "remove"; }
+        if glyph == "✓" { return "check"; }
+        if glyph == "⚙" { return "settings"; }
+        if glyph == "➤" { return "send"; }
+        if glyph == "✿" { return "sticker"; }
+        if glyph == "☺" { return "emoji"; }
+        if glyph == "↻" { return "refresh"; }
+        if glyph == "✕" { return "mic-off"; }
+        if glyph == "♩" { return "mic"; }
+        if glyph == "V" { return "camera"; }
+        if glyph == "R" { return "chat"; }
+        if glyph == "⇅" { return "transfers"; }
+        if glyph == "▲" { return "chevron-up"; }
+        if glyph == "▼" { return "chevron-down"; }
+        if glyph == "«" { return "chevrons-left"; }
+        if glyph == "»" { return "chevrons-right"; }
+        if glyph == "←" { return "arrow-left"; }
+        if glyph == "↑" { return "arrow-up"; }
+        if glyph == "▤" { return "poll"; }
+        if glyph == "▣" { return "layout"; }
+        return "";
+    }
+}
+
+// One icon. Size it with width and height (square; 20 px by default). The
+// stroke width follows the drawn size so 16, 20, 24 and 32 px icons keep the
+// same visual weight, and grows by half a pixel under high contrast.
+export component MorpheusIcon inherits Path {
+    // A stable icon ID (see MorpheusIcons). A legacy glyph is mapped too.
+    in property <string> icon;
+    // Current ink: the host's resolved state color.
+    in property <color> ink;
+    // Fill the closed shapes with `fill-ink` (for example a selected pin).
+    in property <bool> filled: false;
+    in property <color> fill-ink: root.ink;
+    out property <string> icon-id: MorpheusIcons.outline(root.icon) != "" ? root.icon : MorpheusIcons.from-legacy(root.icon);
+    property <length> drawn: min(root.width, root.height);
+    width: 20px;
+    height: 20px;
+    viewbox-x: 0;
+    viewbox-y: 0;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    commands: MorpheusIcons.outline(root.icon-id);
+    stroke: root.ink;
+    stroke-width: clamp(root.drawn * 0.0625 + 0.5px, 1.25px, 2.75px) + (StyleTokens.high-contrast ? 0.5px : 0px);
+    stroke-line-cap: round;
+    stroke-line-join: round;
+    fill: root.filled ? root.fill-ink : transparent;
+    accessible-role: none;
+}

@@ -1,0 +1,193 @@
+// The Matrix link card: what a room, address, message or user link from a
+// message names for the account on screen, with at most one explicit action
+// (Join, Open, or Open in browser) where it applies. Rust (matrix_links.rs)
+// owns every value and decides every step; this file lays the card out and
+// reports Close and the action. The room ID, address or user ID is bounded
+// plain text with control and direction characters removed. Nothing here
+// joins, opens or fetches anything by itself.
+//
+// Keyboard: the action (or Close) has focus; Tab and Shift+Tab move between
+// the two and never leave the card; Escape closes, and focus goes back to the
+// composer. The scrim takes clicks and the wheel. The text scrolls above a
+// fixed footer.
+
+import { ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton } from "controls.slint";
+
+export struct MatrixLinkPalette {
+    ink: color,
+    muted: color,
+    accent: color,
+    surface: color,
+    divider: color,
+    error: color,
+    focus: color,
+    scrim: color,
+}
+
+export global MatrixLink {
+    in-out property <bool> open: false;
+    // Room link, Message link, Space link, User link or Matrix link.
+    in-out property <string> title;
+    // The room ID, address or user ID the link names.
+    in-out property <string> target;
+    // What the link carries: a message, routing servers.
+    in-out property <string> detail;
+    // Inline status: what this device knows, a reading or joining state, or
+    // why nothing more can happen here.
+    in-out property <string> status;
+    in-out property <bool> status-error: false;
+    // A read or a join is running; Close withdraws it.
+    in-out property <bool> busy: false;
+    // 0 none, 1 Join, 2 Open, 3 Open in browser (via the external-link
+    // confirmation).
+    in-out property <int> action: 0;
+    in-out property <string> action-text;
+    in-out property <string> action-label;
+    callback act();
+    // Close or Escape: withdraw, hide, and give focus back to the composer.
+    callback close();
+    // A protected surface took over: withdraw and hide, focus untouched.
+    callback withdraw();
+    // Deferred context fallback, including the destination's own page change.
+    // Keeps the same link/seek retirement; admitted entries use withdraw.
+    callback context-protected();
+}
+
+export component MatrixLinkPanel inherits FocusScope {
+    in property <float> text-scale: 1;
+    in property <ControlColors> button-colors;
+    in property <MatrixLinkPalette> palette;
+    property <bool> has-action: MatrixLink.action != 0;
+    property <bool> action-enabled: root.has-action && !MatrixLink.busy;
+    property <length> pad: 16px;
+
+    focus-on-tab-navigation: false;
+    init => {
+        if root.action-enabled {
+            action-button.focus();
+        } else {
+            close-button.focus();
+        }
+    }
+    // A control that stops applying gives its focus to Close, so focus never
+    // rests on a disabled or hidden button.
+    changed action-enabled => {
+        if !root.action-enabled && !close-button.has-focus {
+            close-button.focus();
+        }
+    }
+
+    capture-key-pressed(event) => {
+        if event.text == Key.Escape {
+            MatrixLink.close();
+            accept
+        } else if event.text == Key.Tab || event.text == Key.Backtab {
+            if root.action-enabled && close-button.has-focus {
+                action-button.focus();
+            } else {
+                close-button.focus();
+            }
+            accept
+        } else {
+            reject
+        }
+    }
+
+    Rectangle {
+        background: root.palette.scrim;
+        // The scrim takes clicks and the wheel: nothing behind the card acts.
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            scroll-event(event) => { accept }
+        }
+        card := Rectangle {
+            property <length> natural: content.preferred-height + footer.preferred-height
+                + 2 * root.pad + 10px;
+            width: min(parent.width - 32px, 460px * min(1.5, max(1, root.text-scale)));
+            height: min(parent.height - 32px, self.natural);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.palette.surface;
+            border-radius: StyleTokens.radius * 1.4;
+            border-color: root.palette.divider;
+            border-width: StyleTokens.line-width;
+            accessible-role: groupbox;
+            accessible-label: MatrixLink.title + ": " + MatrixLink.target;
+            VerticalLayout {
+                padding: root.pad;
+                spacing: 10px;
+                body := ScrollView {
+                    vertical-stretch: 1;
+                    content-width: self.visible-width;
+                    content-height: content.preferred-height;
+                    content-x: 0px;
+                    horizontal-scrollbar-policy: always-off;
+                    content := VerticalLayout {
+                        x: 0px;
+                        y: 0px;
+                        width: body.visible-width;
+                        height: self.preferred-height;
+                        // Leave room for styles whose scrollbar overlays the
+                        // viewport.
+                        padding-right: 12px;
+                        spacing: 6px;
+                        Text {
+                            text: MatrixLink.title;
+                            color: root.palette.ink;
+                            font-size: 17px * root.text-scale;
+                            font-weight: 750;
+                            wrap: word-wrap;
+                            accessible-role: none;
+                        }
+                        if MatrixLink.target != "" : Text {
+                            text: MatrixLink.target;
+                            color: root.palette.ink;
+                            font-size: 13px * root.text-scale;
+                            wrap: word-wrap;
+                        }
+                        if MatrixLink.detail != "" : Text {
+                            text: MatrixLink.detail;
+                            color: root.palette.muted;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                        }
+                        if MatrixLink.status != "" : Text {
+                            text: MatrixLink.status;
+                            color: MatrixLink.status-error ? root.palette.error
+                                : root.palette.accent;
+                            font-size: 12px * root.text-scale;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                    }
+                }
+                footer := HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    // Always laid out so focus can name it; hidden and inert
+                    // (never focusable) when the link has no action.
+                    action-button := TokenButton {
+                        colors: root.button-colors;
+                        text-scale: root.text-scale;
+                        primary: true;
+                        visible: root.has-action;
+                        enabled: root.action-enabled;
+                        text: MatrixLink.action-text;
+                        label: MatrixLink.action-label;
+                        activated => { MatrixLink.act(); }
+                    }
+                    close-button := TokenButton {
+                        colors: root.button-colors;
+                        text-scale: root.text-scale;
+                        text: MatrixLink.busy ? "Cancel" : "Close";
+                        label: MatrixLink.busy ? "Cancel and close the link" : "Close the link";
+                        activated => { MatrixLink.close(); }
+                    }
+                }
+            }
+        }
+    }
+}

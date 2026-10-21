@@ -11,14 +11,15 @@ from scripts import encode_preview_pngs as preview
 
 
 class PreviewEncodingTests(unittest.TestCase):
-    def test_capture_encoder_and_workflow_share_the_exact_twelve_frame_allowlist(self):
+    def test_capture_encoder_and_workflow_share_the_exact_fourteen_frame_allowlist(self):
         expected = ("desktop-preview", "account-switcher", "sign-in", "incoming-call", "room-settings",
                     "paper-preview", "manage-accounts", "account-password", "account-password-large",
-                    "sign-in-large", "terminal-sidebar", "terminal-space-labels")
+                    "sign-in-large", "terminal-sidebar", "terminal-space-labels",
+                    "send-recovery", "send-recovery-thread-large")
         self.assertEqual(preview.NAMES, expected)
         root = Path(__file__).resolve().parents[2]
         capture = (root / "crates/morpheus-app/src/preview_capture.rs").read_text()
-        names = re.search(r"const FILES: \[&str; 12\] = \[(.*?)\];", capture, re.S)
+        names = re.search(r"const FILES: \[&str; 14\] = \[(.*?)\];", capture, re.S)
         self.assertIsNotNone(names)
         self.assertEqual(tuple(re.findall(r'"([a-z-]+)\.ppm"', names.group(1))), expected)
         workflow = (root / ".github/workflows/ci.yml").read_text()

@@ -661,12 +661,16 @@ impl ComposerUi {
         self.publish(window, true);
     }
 
-    pub(super) fn reserve_send(&self, scope: &Scope) -> Option<super::send::SendLease> {
+    pub(super) fn reserve_send(
+        &self,
+        scope: &Scope,
+        selection: &AccountSelection,
+    ) -> Option<super::send::SendLease> {
         self.state
             .lock()
             .expect("composer mutex poisoned")
             .sends
-            .reserve(scope.clone())
+            .reserve(scope.clone(), Some(selection.clone()))
     }
 
     pub(super) fn release_send(&self, lease: &super::send::SendLease) -> bool {

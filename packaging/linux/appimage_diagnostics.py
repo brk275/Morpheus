@@ -33,7 +33,12 @@ REASONS = frozenset(("command_deadline", "command_output", "command_exit", "comm
                      "inventory_input", "inventory_tool", "inventory_elf", "inventory_dependency",
                      "inventory_package", "inventory_notice", "inventory_deployment", "inventory_limit",
                      "inventory_elf_build_id", "inventory_elf_needed", "inventory_elf_soname",
-                     "inventory_elf_search", "inventory_search"))
+                     "inventory_elf_search", "inventory_search",
+                     # Which root-owned path property failed for a system
+                     # library, its copyright file or a referenced common license.
+                     *("inventory_" + family + "_" + kind
+                       for family in ("library_path", "copyright", "common_license")
+                       for kind in ("missing", "owner", "mode", "type", "access"))))
 CLEANUP = frozenset(("not_started", "passed", "failed"))
 POSITIONS = ("wrapper_phase", "command_stage", "capture_mode", "capture_phase")
 FIELDS = frozenset((*POSITIONS, "schema", "peer_facts", "failure", "inner_cleanup"))

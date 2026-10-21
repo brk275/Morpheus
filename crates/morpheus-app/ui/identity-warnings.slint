@@ -1,0 +1,353 @@
+// Members of the open room whose cryptographic identity changed
+// (src/identity_warnings.rs, morpheus_matrix::room_identity_warnings).
+// Read-only: Rust owns every value; this file shows them and reports explicit
+// choices. Nothing here changes trust, acknowledges an identity, dismisses a
+// warning or sends anything. A row key is an exact Matrix user ID that only
+// routes View member to the existing member inspector; it is never shown or
+// read aloud. Every shown or spoken ID is the row's display-id.
+
+import { StyleTokens } from "style-tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { ControlColors, TextAction, TokenButton } from "controls.slint";
+import { MemberPrivacy } from "member-privacy.slint";
+
+export struct IdentityWarningItem {
+    // Exact Matrix user ID; routes View member only. Never shown or read
+    // aloud: an accepted ID may hold line-break, control or direction
+    // characters and has no length bound.
+    user-id: string,
+    // The same ID as it is shown and read aloud: bounded, with every
+    // character outside printable ASCII escaped visibly (\n, \u{202e}...),
+    // and one "…" where a long ID was shortened.
+    display-id: string,
+    // The member's local display name, sanitized and bounded, or display-id.
+    label: string,
+    // What the SDK reported, e.g. "Identity changed after you verified it".
+    detail: string,
+}
+
+export global IdentityWarnings {
+    // The open room's warned members, verified-identity changes first.
+    in-out property <[IdentityWarningItem]> rows;
+    // The row under the room header, or empty for no row (nobody warned
+    // about, or the room was not checked).
+    in-out property <string> summary;
+    // "And 3 more members." or "And at least 3 more members.", or empty.
+    in-out property <string> overflow;
+    // The details dialog is shown.
+    in-out property <bool> open;
+    // The person closed the details (Close, Escape, or a View member the
+    // inspector refused): focus may return to the row's Details. Never set
+    // by a withdrawal (protected surface, another modal, scope change).
+    in-out property <bool> return-focus;
+    // View member closed the dialog and opened the inspector; focus returns
+    // to the row when the inspector closes, unless something replaced the
+    // conversation meanwhile.
+    in-out property <bool> awaiting-inspector;
+    callback show-details();
+    // Closes the details without returning focus.
+    callback close-details();
+    // Rust checks, when pressed, that the details are still open and allowed
+    // and the security gate idle, closes the dialog, then opens the member
+    // inspector through its guarded entry.
+    callback view-member(string);
+    // The live account, room or page changed; Rust re-reads the window.
+    callback context-changed();
+    // Synchronous: no row, summary or dialog of the previous scope survives.
+    callback reset();
+    // A protected surface's actual entry. End only the details and their
+    // focus return before that surface changes its flag; the room feed stays.
+    public function withdraw() {
+        IdentityWarnings.return-focus = false;
+        IdentityWarnings.awaiting-inspector = false;
+        IdentityWarnings.open = false;
+    }
+}
+
+// One quiet line under the room header. Not a banner: it only reports what
+// the SDK says and offers the details.
+export component IdentityWarningRow inherits Rectangle {
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    // This conversation still owns focus: the same live account, room and
+    // page with no protected surface or other modal over it
+    // (AppWindow.identity-warnings-allowed). Read when the details or the
+    // inspector close, so a withdrawal never pulls focus behind what
+    // replaced them.
+    in property <bool> allowed;
+    property <bool> open: IdentityWarnings.open;
+    property <bool> inspecting: MemberPrivacy.inspector.open;
+    changed open => {
+        if !self.open && IdentityWarnings.return-focus {
+            IdentityWarnings.return-focus = false;
+            if root.allowed { details.focus(); }
+        }
+    }
+    changed inspecting => {
+        if !self.inspecting && IdentityWarnings.awaiting-inspector {
+            IdentityWarnings.awaiting-inspector = false;
+            if root.allowed { details.focus(); }
+        }
+    }
+    height: max(36px, 30px * root.text-scale + 6px);
+    background: root.surface;
+    accessible-role: groupbox;
+    accessible-label: "Identity change warning";
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 24px;
+        padding-top: 3px;
+        padding-bottom: 3px;
+        spacing: 10px;
+        Text {
+            text: IdentityWarnings.summary;
+            color: root.ink;
+            font-size: 11px * root.text-scale;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            min-width: 0px;
+            overflow: elide;
+            accessible-live-region: polite;
+        }
+        details := TextAction {
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            text: "Details";
+            accessible-label: "Show identity change details";
+            activated => { IdentityWarnings.show-details(); }
+        }
+    }
+}
+
+// Who in the open room has a changed identity. Modal: clicks and scrolling
+// never reach the window behind it, Tab and Shift+Tab stay inside (the member
+// list, View member, Close), shortcuts pause (shortcuts::blocked), and Escape
+// or Close dismiss it; the row's Details takes focus back. The text and list
+// scroll; the action row never does, so Close stays reachable at any window
+// height and text scale.
+export component IdentityWarningsDialog inherits Rectangle {
+    in property <ControlColors> colors;
+    in property <color> surface;
+    in property <color> scrim;
+    in property <float> text-scale: 1;
+    property <int> selected: 0;
+    property <int> count: IdentityWarnings.rows.length;
+    property <length> row-height: max(46px, 30px * root.text-scale + 16px);
+    // The one gap between the heading, each row and the overflow line: the
+    // list's layout spacing and the pitch reveal() scrolls by both use it.
+    property <length> row-gap: 8px;
+    property <length> row-step: root.row-height + root.row-gap;
+    changed count => {
+        if root.selected >= root.count { root.selected = max(0, root.count - 1); }
+    }
+    changed selected => { root.reveal(); }
+    // A text-scale or window change moves the rows: keep the selection in
+    // view (reveal only scrolls, so this never feeds back into itself).
+    property <length> geometry: root.row-step + heading.height + body.visible-height;
+    changed geometry => { root.reveal(); }
+    pure function row-top(index: int) -> length {
+        return heading.height + root.row-gap + index * root.row-step;
+    }
+    function reveal() {
+        if root.row-top(root.selected) + body.viewport-y < 0px {
+            body.viewport-y = -root.row-top(root.selected);
+        } else if root.row-top(root.selected) + root.row-height + body.viewport-y > body.visible-height {
+            body.viewport-y = body.visible-height - root.row-top(root.selected) - root.row-height;
+        }
+    }
+    function view() {
+        if root.selected >= 0 && root.selected < root.count {
+            IdentityWarnings.view-member(IdentityWarnings.rows[root.selected].user-id);
+        }
+    }
+    // The person closed the details: focus may go back to the row.
+    function dismiss() {
+        IdentityWarnings.return-focus = true;
+        IdentityWarnings.close-details();
+    }
+    background: root.scrim;
+    accessible-role: region;
+    accessible-label: "Identity change details";
+    TouchArea {
+        scroll-event(event) => { accept }
+    }
+    keys := FocusScope {
+        init => {
+            if root.count > 0 { list-focus.focus(); } else { close.focus(); }
+        }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.dismiss();
+                accept
+            } else if event.text == Key.Tab || event.text == Key.Backtab {
+                close.focus();
+                accept
+            } else {
+                reject
+            }
+        }
+        card := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 32px, 440px * root.text-scale);
+            height: min(parent.height - 32px, 480px * root.text-scale);
+            background: root.surface;
+            border-radius: StyleTokens.radius * 1.2;
+            clip: true;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+                list-focus := FocusScope {
+                    vertical-stretch: 1;
+                    accessible-role: list;
+                    accessible-label: root.count == 0 ? "No members listed"
+                        : "Member " + (root.selected + 1) + " of " + root.count + ": "
+                            + IdentityWarnings.rows[root.selected].label + ", "
+                            + IdentityWarnings.rows[root.selected].display-id + ", "
+                            + IdentityWarnings.rows[root.selected].detail;
+                    key-pressed(event) => {
+                        if event.text == Key.UpArrow {
+                            root.selected = max(0, root.selected - 1);
+                            accept
+                        } else if event.text == Key.DownArrow {
+                            root.selected = min(max(0, root.count - 1), root.selected + 1);
+                            accept
+                        } else if event.text == Key.Home {
+                            root.selected = 0;
+                            accept
+                        } else if event.text == Key.End {
+                            root.selected = max(0, root.count - 1);
+                            accept
+                        } else if event.text == Key.Return || event.text == Key.Space {
+                            root.view();
+                            accept
+                        } else if event.text == Key.Tab && !event.modifiers.shift {
+                            if view-button.enabled { view-button.focus(); } else { close.focus(); }
+                            accept
+                        } else if event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift) {
+                            close.focus();
+                            accept
+                        } else if event.text == Key.Escape {
+                            root.dismiss();
+                            accept
+                        } else {
+                            reject
+                        }
+                    }
+                    body := ScrollView {
+                        width: parent.width;
+                        height: parent.height;
+                        horizontal-scrollbar-policy: always-off;
+                        content := VerticalLayout {
+                            // From the card's width, never the scroll area's;
+                            // 12px is kept for the scrollbar.
+                            width: max(0px, card.width - 2 * 16px - 12px);
+                            spacing: root.row-gap;
+                            heading := VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "Identity changes in this room";
+                                    color: root.colors.ink;
+                                    font-size: 15px * root.text-scale;
+                                    font-weight: 750;
+                                    wrap: word-wrap;
+                                }
+                                Text {
+                                    text: "The encryption identity of these members changed. This often happens when someone resets their encryption. If you did not expect it, check with them another way before sharing anything sensitive. Nothing about who you trust was changed.";
+                                    color: root.colors.muted;
+                                    font-size: 11px * root.text-scale;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            for row[index] in IdentityWarnings.rows : Rectangle {
+                                height: root.row-height;
+                                border-radius: StyleTokens.radius * 0.6;
+                                border-width: index == root.selected && list-focus.has-focus ? StyleTokens.focus-width : 0px;
+                                border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.colors.accent;
+                                background: index == root.selected ? root.colors.hover : transparent;
+                                accessible-role: list-item;
+                                accessible-label: row.label + ", " + row.display-id + ", " + row.detail;
+                                TouchArea {
+                                    clicked => {
+                                        root.selected = index;
+                                        list-focus.focus();
+                                    }
+                                    double-clicked => {
+                                        root.selected = index;
+                                        root.view();
+                                    }
+                                }
+                                VerticalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    alignment: center;
+                                    Text {
+                                        text: row.label;
+                                        color: root.colors.ink;
+                                        font-size: 12px * root.text-scale;
+                                        overflow: elide;
+                                        accessible-role: none;
+                                    }
+                                    Text {
+                                        text: row.display-id + " · " + row.detail;
+                                        color: root.colors.muted;
+                                        font-size: 10px * root.text-scale;
+                                        overflow: elide;
+                                        accessible-role: none;
+                                    }
+                                }
+                            }
+                            if IdentityWarnings.overflow != "" : Text {
+                                text: IdentityWarnings.overflow;
+                                color: root.colors.muted;
+                                font-size: 11px * root.text-scale;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+                actions := HorizontalLayout {
+                    vertical-stretch: 0;
+                    alignment: end;
+                    spacing: 8px;
+                    view-button := TokenButton {
+                        colors: root.colors;
+                        text-scale: root.text-scale;
+                        text: "View member";
+                        label: root.count == 0 ? "View member"
+                            : "View member details for " + IdentityWarnings.rows[root.selected].label;
+                        enabled: root.count > 0;
+                        trap-tab: true;
+                        cancel-on-escape: true;
+                        next-focus => { close.focus(); }
+                        previous-focus => {
+                            if root.count > 0 { list-focus.focus(); } else { close.focus(); }
+                        }
+                        cancelled => { root.dismiss(); }
+                        activated => { root.view(); }
+                    }
+                    close := TokenButton {
+                        colors: root.colors;
+                        text-scale: root.text-scale;
+                        text: "Close";
+                        label: "Close identity changes";
+                        trap-tab: true;
+                        cancel-on-escape: true;
+                        next-focus => {
+                            if root.count > 0 { list-focus.focus(); } else { close.focus(); }
+                        }
+                        previous-focus => {
+                            if view-button.enabled { view-button.focus(); } else if root.count > 0 { list-focus.focus(); }
+                        }
+                        cancelled => { root.dismiss(); }
+                        activated => { root.dismiss(); }
+                    }
+                }
+            }
+        }
+    }
+}

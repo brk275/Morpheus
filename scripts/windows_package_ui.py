@@ -28,9 +28,11 @@ from pathlib import Path, PureWindowsPath
 if __package__:
     from . import package_smoke as smoke
     from . import run_windows_capture_acceptance as capture
+    from . import windows_window_probe as window_probe
 else:
     import package_smoke as smoke
     import run_windows_capture_acceptance as capture
+    import windows_window_probe as window_probe
 
 CHECK = "installed_windows_keyboard_uia"
 # Both are the standard x64 Windows Server2025 family; Visual Studio packaging
@@ -78,10 +80,13 @@ class Diagnostics:
     def __init__(self, report):
         self.value = report["diagnostic"] = {
             "step": "setup", "operation": "none", "failure": "none", "bridge_error": "none",
+            "appearance_stage": "not_started",
             "owned_window_seen": False, "uia_root_seen": False, "homeserver_seen": False,
             "username_seen": False, "password_seen": False,
             "selector_matches": 0, "incomplete_passes": 0, "foreground_recoveries": 0,
             "bounded_snapshots": 0, "password_semantics": "unchecked",
+            "window_candidates": 0, "event_targets_ignored": 0,
+            "window_inventory": {"status": "not_collected", "windows": [], "truncated": False, "discarded": 0},
             "traversed_node_matched": False, "cleanup": "not_started", "profile_owned": False,
         }
         self.deadline = time.monotonic() + ACCEPTANCE_SECONDS
@@ -89,6 +94,10 @@ class Diagnostics:
     def step(self, step):
         self.value["step"] = step
         self.value["operation"] = "none"
+
+    def appearance_stage(self, stage):
+        require_ui(type(stage) is str and stage in smoke.APPEARANCE_STAGES, "unclassified")
+        self.value["appearance_stage"] = stage
 
     def operation(self, operation):
         self.value["operation"] = operation
@@ -644,6 +653,7 @@ def menu_keyboard(ui):
 
 
 def appearance_keyboard(ui):
+    ui.diagnostics.appearance_stage("open_settings")
     ui.focus("Open settings")
     ui.key("Return")
     # Settings rows below the fold are clipped out of the accessibility tree
@@ -651,6 +661,7 @@ def appearance_keyboard(ui):
     # for from here. Reach the control with bounded real Tab presses, checking
     # the owned focused name after each one; focus reveals the row, and only
     # then is its label queried.
+    ui.diagnostics.appearance_stage("reach_scale")
     for _ in range(SETTINGS_TAB_BOUND):
         focused = ui.focused_name()
         require_ui(focused is not None, "focus_unowned")
@@ -660,12 +671,16 @@ def appearance_keyboard(ui):
         ui.wait_for(lambda: (name := ui.focused_name()) is not None and name != focused)
     else:
         raise DiagnosticFailure("scale_unreachable")
+    ui.diagnostics.appearance_stage("read_seed_scale")
     ui.wait("110% · text throughout the app")
+    ui.diagnostics.appearance_stage("increase_scale")
     ui.key("Space")
+    ui.diagnostics.appearance_stage("read_changed_scale")
     ui.wait("120% · text throughout the app")
 
 
 def config_persisted(config, diagnostics, seconds=10):
+    diagnostics.appearance_stage("persist_scale")
     deadline = time.monotonic() + seconds
     while True:
         diagnostics.check_deadline()
@@ -675,24 +690,176 @@ def config_persisted(config, diagnostics, seconds=10):
         except (OSError, ValueError):
             value = {}
         if value.get("appearance", {}).get("scale_percent") == 120:
+            diagnostics.appearance_stage("complete")
             return
         require_ui(time.monotonic() < deadline, "config_mismatch")
         time.sleep(0.2)
 
 
-def owned_window(job, handle, pid, diagnostics, seconds=30):
+def keyboard_window_kind(api, window, pid):
+    """Query a borrowed handle without reading titles or retaining raw names."""
+    try:
+        require_ui(api.process_of(window) == pid, "window_unowned")
+        name = api.class_name(window)
+        style = api.long(window, window_probe.GWL_STYLE)
+        exstyle = api.long(window, window_probe.GWL_EXSTYLE)
+        owner = api.owner(window)
+        visible = api.is_visible(window)
+        require_ui(api.process_of(window) == pid, "window_unowned")
+    except window_probe.ApiError:
+        if not api.is_window(window):
+            return "vanished"
+        raise DiagnosticFailure("window_facts") from None
+    if not visible:
+        return "hidden"
+    # Pinned winit 0.30.13 create_event_target_window. Compare complete raw
+    # style words, not the probe's projection of named flags. The installed
+    # native-calls build in run 39156003947 observed WS_CLIPSIBLINGS as well.
+    # Accept exactly these two words; no other bits, class or owner qualify.
+    # Geometry is not identity: hosted event targets have nonzero area.
+    if (name == "Winit Thread Event Target" and style in (0x90000000, 0x94000000)
+            and exstyle == 0x080800A0 and not owner):
+        return "event_target"
+    return "candidate"
+
+
+def keyboard_window_candidates(pid, diagnostics, api, *, seen=None):
+    """Ignore only the pinned Winit event target's complete fixed signature.
+
+    Every other owned visible window remains a candidate. Unknown windows and
+    a second real window are never silently discarded or selected by order.
+    The shared read-only provider rechecks handle ownership around queries.
+    The optional seen list receives the bounded handles of this poll for the
+    diagnostic inventory only; it never takes part in selection.
+    """
+    windows = smoke.visible_windows(pid)
+    require_ui(len(windows) <= window_probe.WINDOW_BOUND, "window_bound")
+    if seen is not None:
+        seen.extend(windows)
+    candidates = []
+    ignored = 0
+    for window in windows:
+        diagnostics.check_deadline()
+        kind = keyboard_window_kind(api, window, pid)
+        if kind in {"vanished", "hidden"}:
+            continue
+        if kind == "event_target":
+            ignored += 1
+        else:
+            candidates.append(window)
+    # Diagnostic counts use the same explicit 0/1/2-or-more convention as
+    # selector_matches. A successful candidate count of one remains exact.
+    diagnostics.value["window_candidates"] = min(len(candidates), 2)
+    diagnostics.value["event_targets_ignored"] = max(
+        diagnostics.value["event_targets_ignored"], min(ignored, 2))
+    return candidates
+
+
+def window_facts(api, window, pid):
+    """Publishable facts for one borrowed handle of the task-owned process.
+
+    Returns None, keeping no facts, unless the handle belongs to pid before
+    and after the query group. A query that fails on a live owned window yields
+    None for that fact only. The class name is reduced to a closed family
+    here and never kept; titles, handles, process IDs and positions are never
+    read into the result.
+    """
+    def query(call, *arguments):
+        try:
+            return call(*arguments)
+        except window_probe.ApiError:
+            return None
+
+    def word(value):
+        return value & 0xFFFFFFFF if type(value) is int else None
+
+    def extent(low, high):
+        return min(max(int(high) - int(low), 0), smoke.WINDOWS_WINDOW_EXTENT)
+
+    if query(api.process_of, window) != pid:
+        return None
+    name = query(api.class_name, window)
+    style = query(api.long, window, window_probe.GWL_STYLE)
+    exstyle = query(api.long, window, window_probe.GWL_EXSTYLE)
+    visible = query(api.is_visible, window)
+    try:
+        owner = api.owner(window)
+        owner_pid = query(api.process_of, owner) if owner else None
+        owner_kind = ("none" if not owner else None if owner_pid is None
+                      else "same_process" if owner_pid == pid else "other_process")
+    except window_probe.ApiError:
+        owner_kind = None
+    rect = query(api.rect, window)
+    cloaked = query(api.cloaked, window)
+    # Discard facts if the handle vanished or now belongs to another process.
+    if not api.is_window(window) or query(api.process_of, window) != pid:
+        return None
+    family = window_probe.family(name) if name is not None else None
+    return {
+        "family": family if family is None or family in smoke.WINDOWS_WINDOW_FAMILIES else "other",
+        "style": word(style),
+        "exstyle": word(exstyle),
+        "visible": None if visible is None else bool(visible),
+        "owner": owner_kind,
+        "cloaked": None if cloaked is None else bool(cloaked),
+        "width": None if rect is None else extent(rect[0], rect[2]),
+        "height": None if rect is None else extent(rect[1], rect[3]),
+    }
+
+
+def record_window_inventory(api, windows, pid, diagnostics):
+    """Diagnostic facts for the windows of the poll the selector decided on.
+
+    Runs only after the unchanged selector has decided and never selects,
+    excludes or retries a window: any error here becomes the fixed status
+    "failed" instead of changing the selection outcome. Entries are sorted so
+    enumeration order is not reported, and at most a fixed number are kept.
+    """
+    entries, discarded, status = [], 0, "collected"
+    try:
+        for window in windows[:window_probe.WINDOW_BOUND]:
+            if time.monotonic() >= diagnostics.deadline:
+                status = "incomplete"
+                break
+            facts = window_facts(api, window, pid)
+            if facts is None:
+                discarded += 1
+            else:
+                entries.append(facts)
+    except Exception:  # noqa: BLE001 - diagnostics must not change the outcome
+        entries, discarded, status = [], 0, "failed"
+    entries.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    diagnostics.value["window_inventory"] = {
+        "status": status,
+        "windows": entries[:smoke.WINDOWS_INVENTORY_BOUND],
+        "truncated": len(entries) > smoke.WINDOWS_INVENTORY_BOUND,
+        "discarded": min(discarded, 2),
+    }
+
+
+def owned_window(job, handle, pid, diagnostics, seconds=30, *, api=None):
     deadline = time.monotonic() + seconds
+    if api is None:
+        try:
+            api = window_probe.Win32()
+        except window_probe.ProbeFailure:
+            raise DiagnosticFailure("window_facts") from None
     while True:
         diagnostics.check_deadline()
         diagnostics.operation("process_status")
         require_ui(job.kernel.WaitForSingleObject(handle, 0) == 258, "app_exited")
         diagnostics.operation("window_enumeration")
-        windows = smoke.visible_windows(pid)
+        seen = []
+        windows = keyboard_window_candidates(pid, diagnostics, api, seen=seen)
         if windows:
+            # Facts for the deciding poll are recorded after the decision.
+            record_window_inventory(api, seen, pid, diagnostics)
             require_ui(len(windows) == 1, "window_count")
             diagnostics.value["owned_window_seen"] = True
             return int(windows[0])
-        require_ui(time.monotonic() < deadline, "wait_timeout")
+        if time.monotonic() >= deadline:
+            record_window_inventory(api, seen, pid, diagnostics)
+            raise DiagnosticFailure("wait_timeout")
         time.sleep(0.25)
 
 

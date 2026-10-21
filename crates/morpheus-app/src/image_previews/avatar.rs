@@ -13,12 +13,37 @@ use morpheus_matrix::{
 };
 use std::{
     io::{self, Write},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use zeroize::Zeroizing;
 
 pub(crate) const MAX_PREPARED_AVATAR_SIDE: u32 = 512;
 static PREPARATION_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Which form holds the shared worker (an `AvatarConsumer` as u8, 0 none),
+/// only so a waiting form can say who has it. Never used for admission.
+static PREPARATION_OWNER: AtomicU8 = AtomicU8::new(0);
+
+/// The forms that share the one chooser and preparation worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum AvatarConsumer {
+    RoomSettings = 1,
+    AccountProfile = 2,
+}
+impl AvatarConsumer {
+    pub(crate) fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::RoomSettings),
+            2 => Some(Self::AccountProfile),
+            _ => None,
+        }
+    }
+}
+
+/// The form holding the preparation worker now, if it said.
+pub(crate) fn preparation_owner() -> Option<AvatarConsumer> {
+    AvatarConsumer::from_u8(PREPARATION_OWNER.load(Ordering::Acquire))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AvatarPrepareError {
@@ -79,10 +104,26 @@ impl PreparedAvatar {
     /// background save task: core envelope validation includes bounded CRC work.
     /// After transfer, the SDK/core owns the PNG; this helper cannot promise
     /// zeroization of their upload buffers. No image decoding/encoding occurs here.
+    /// A validated copy of the staged PNG for one upload attempt, keeping the
+    /// staged image so a failed attempt can be retried without choosing the
+    /// file again. Like `into_upload`, call from a background task.
+    pub(crate) fn upload_copy(&self) -> Result<AvatarPng, AvatarPrepareError> {
+        AvatarPng::new(self.png.to_vec(), self.pixels.width, self.pixels.height)
+            .map_err(|_| AvatarPrepareError::Invalid)
+    }
     pub(crate) fn into_upload(mut self) -> Result<AvatarPng, AvatarPrepareError> {
         let bytes = std::mem::take(&mut *self.png);
         AvatarPng::new(bytes, self.pixels.width, self.pixels.height)
             .map_err(|_| AvatarPrepareError::Invalid)
+    }
+}
+
+/// Clears the owner mark before the permit is released (declared after the
+/// permit, so it drops first).
+struct OwnerMark<'a>(&'a AtomicU8);
+impl Drop for OwnerMark<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
     }
 }
 
@@ -111,12 +152,24 @@ pub(crate) async fn prepare_avatar(
     selection: AccountSelection,
     cancellation: RoomSettingsCancellation,
 ) -> Result<PreparedAvatar, AvatarPrepareError> {
+    prepare_avatar_for(AvatarConsumer::RoomSettings, bytes, selection, cancellation).await
+}
+
+/// `prepare_avatar` for a named form, so another form waiting on the shared
+/// worker can say which one holds it.
+pub(crate) async fn prepare_avatar_for(
+    consumer: AvatarConsumer,
+    bytes: Zeroizing<Vec<u8>>,
+    selection: AccountSelection,
+    cancellation: RoomSettingsCancellation,
+) -> Result<PreparedAvatar, AvatarPrepareError> {
     let active = || selection.is_current() && !cancellation.is_cancelled();
     require_active(active())?;
     if bytes.len() > MAX_IMAGE_PREVIEW_BYTES {
         return Err(AvatarPrepareError::TooLarge);
     }
     let permit = WorkerPermit::acquire(&PREPARATION_ACTIVE).ok_or(AvatarPrepareError::Busy)?;
+    PREPARATION_OWNER.store(consumer as u8, Ordering::Release);
     let worker_selection = selection.clone();
     let worker_cancel = cancellation.clone();
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -124,6 +177,7 @@ pub(crate) async fn prepare_avatar(
         .name("morpheus-avatar-preparation".into())
         .spawn(move || {
             let _permit = permit;
+            let _owner = OwnerMark(&PREPARATION_OWNER);
             let result = prepare_image(bytes, || {
                 worker_selection.is_current() && !worker_cancel.is_cancelled()
             });
@@ -131,7 +185,10 @@ pub(crate) async fn prepare_avatar(
             // owned buffers are zeroized; the permit is released only afterward.
             let _ = sender.send(result);
         })
-        .map_err(|_| AvatarPrepareError::Unavailable)?;
+        .map_err(|_| {
+            PREPARATION_OWNER.store(0, Ordering::Release);
+            AvatarPrepareError::Unavailable
+        })?;
     let result = tokio::select! {
         biased;
         _=selection.revoked()=>return Err(AvatarPrepareError::Cancelled),

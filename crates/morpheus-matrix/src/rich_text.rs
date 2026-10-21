@@ -239,10 +239,18 @@ fn safe_link(source: &str) -> Option<String> {
         return None;
     }
     let parsed = Url::parse(source).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
+    // A `matrix:` URI is kept only when Morpheus opens it itself
+    // (matrix_links); its click never reaches the browser or the system.
+    let native_matrix = parsed.scheme() == "matrix"
+        && matches!(
+            crate::matrix_links::message_link(parsed.as_str()),
+            Some(crate::MessageLink::Native(_))
+        );
+    if !native_matrix
+        && (!matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some())
     {
         return None;
     }
@@ -314,6 +322,26 @@ mod tests {
             matrix_html_to_markdown("<a href=\"https://x.test\" onclick=\"x\">go</a>").is_none()
         );
         assert!(matrix_html_to_markdown("<a href=\"https://user:pass@x.test\">go</a>").is_none());
+    }
+
+    #[test]
+    fn keeps_only_matrix_uris_that_morpheus_opens_itself() {
+        // Kept as a link, but its action never runs: a click opens a preview.
+        let html = "<a href=\"matrix:r/lobby:example.org?action=join\">lobby</a>";
+        let markdown = matrix_html_to_markdown(html).unwrap();
+        assert!(
+            markdown.contains("[lobby](matrix:r/lobby:example.org?action=join)"),
+            "{markdown}"
+        );
+        for href in [
+            "matrix://attacker.example/r/lobby:example.org",
+            "matrix:r/lobby:example.org#x",
+            "matrix:r/not-an-alias",
+            "mxc://example.org/media",
+        ] {
+            let html = format!("<a href=\"{href}\">go</a>");
+            assert!(matrix_html_to_markdown(&html).is_none(), "{href}");
+        }
     }
 
     #[test]

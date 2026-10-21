@@ -1,0 +1,215 @@
+// Room activity: who is typing, who has read, and this account's own read
+// markers. Rust owns every value and request (src/room_activity); this file
+// shows them and reports explicit choices. Only booleans and event IDs cross
+// from the composer: typed text never does.
+
+import { StyleTokens } from "style-tokens.slint";
+
+export struct SeenByRow {
+    // Sanitized, bounded display name, or the ID's localpart.
+    name: string,
+    // Sanitized, bounded Matrix ID. Server data, not a verified identity.
+    user-id: string,
+    // "Read up to here · 10:42" or "Read further".
+    detail: string,
+}
+
+export global RoomActivity {
+    // What this account publishes, from config.toml [activity]; all off
+    // unless chosen. Rust sets them; Settings shows them.
+    in-out property <bool> send-typing: false;
+    in-out property <bool> public-receipts: false;
+    in-out property <bool> read-tracking: false;
+    // 0 send typing, 1 public read receipts, 2 automatic read tracking.
+    callback set-preference(int, bool);
+    callback preferences-changed();
+    // "Alice is typing…" for the open room, or empty.
+    in-out property <string> typing-text;
+    // A short result for the open room (Mark read), or empty.
+    in-out property <string> notice;
+    // The Seen-by view of one event.
+    in-out property <bool> seen-open;
+    // 1 loading, 2 ready, 3 failed.
+    in-out property <int> seen-state: 0;
+    in-out property <string> seen-title;
+    in-out property <[SeenByRow]> seen-rows;
+    in-out property <string> seen-summary;
+    callback context-changed();
+    // An account or room change cleared everything above.
+    callback reset();
+    // Composer events: thread composer or not, and only whether text is
+    // present. Nothing typed is passed.
+    callback composer-changed(bool, bool);
+    callback composer-focus(bool, bool);
+    callback composer-sent(bool);
+    // The conversation (false) or the shown thread (true) is scrolled to its
+    // bottom with this event as its last row, or stopped being so (empty).
+    // Rust checks the window, focus, setting and scope itself.
+    callback read-view(bool, string);
+    callback show-seen-by(string, bool);
+    callback close-seen-by();
+    // Mark as read, chosen for a room of the active account; one at a time.
+    in-out property <bool> marking: false;
+    callback mark-read(string);
+}
+
+// The footer under a conversation: who is typing, then any notice.
+export component TypingFooter inherits Rectangle {
+    in property <color> muted;
+    in property <float> text-scale: 1;
+    property <string> shown: RoomActivity.typing-text != "" ? RoomActivity.typing-text : RoomActivity.notice;
+    height: root.shown != "" ? max(18px, 14px * root.text-scale) + 4px : 0px;
+    background: transparent;
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 24px;
+        Text {
+            text: root.shown;
+            color: root.muted;
+            font-size: 11px * root.text-scale;
+            font-italic: RoomActivity.typing-text != "";
+            vertical-alignment: center;
+            overflow: elide;
+            accessible-live-region: polite;
+        }
+    }
+}
+
+// Who has a public read receipt at or after one event. Modal: clicks and
+// scrolling never reach the window behind it, Tab and Shift+Tab stay inside,
+// shortcuts pause (shortcuts::blocked), and Escape or Close dismiss it; the
+// action that opened it takes focus back.
+export component SeenByDialog inherits Rectangle {
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> accent;
+    in property <color> surface;
+    in property <color> scrim;
+    in property <float> text-scale: 1;
+    background: root.scrim;
+    accessible-role: region;
+    accessible-label: RoomActivity.seen-title;
+    TouchArea {
+        scroll-event(event) => { accept }
+    }
+    keys := FocusScope {
+        init => { close-focus.focus(); }
+        // Close is the dialog's only control, so focus stays on it.
+        capture-key-pressed(event) => {
+            if event.text == Key.Tab || event.text == Key.Backtab {
+                close-focus.focus();
+                accept
+            } else {
+                reject
+            }
+        }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                RoomActivity.close-seen-by();
+                accept
+            } else {
+                reject
+            }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 32px, 360px * root.text-scale);
+            height: min(parent.height - 32px, 420px * root.text-scale);
+            background: root.surface;
+            border-radius: StyleTokens.radius * 1.2;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+                Text {
+                    text: RoomActivity.seen-title;
+                    color: root.ink;
+                    font-size: 15px * root.text-scale;
+                    font-weight: 750;
+                    overflow: elide;
+                }
+                Text {
+                    text: RoomActivity.seen-state == 1 ? "Checking read receipts…"
+                        : RoomActivity.seen-state == 3 ? "Read receipts could not be checked."
+                        : RoomActivity.seen-summary;
+                    color: root.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                list := Flickable {
+                    vertical-stretch: 1;
+                    content-width: self.width;
+                    content-height: rows.preferred-height;
+                    rows := VerticalLayout {
+                        x: 0px;
+                        y: 0px;
+                        width: list.width;
+                        height: self.preferred-height;
+                        spacing: 6px;
+                        for row in RoomActivity.seen-rows : Rectangle {
+                            accessible-role: list-item;
+                            accessible-label: row.name + ", " + row.user-id + ", " + row.detail;
+                            VerticalLayout {
+                                Text {
+                                    text: row.name;
+                                    color: root.ink;
+                                    font-size: 12px * root.text-scale;
+                                    overflow: elide;
+                                    accessible-role: none;
+                                }
+                                Text {
+                                    text: row.user-id + " · " + row.detail;
+                                    color: root.muted;
+                                    font-size: 10px * root.text-scale;
+                                    overflow: elide;
+                                    accessible-role: none;
+                                }
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: "From public read receipts the server shared. People who read privately, or whose receipts have not synced, are not listed.";
+                    color: root.muted;
+                    font-size: 10px * root.text-scale;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Rectangle {
+                        width: close-text.preferred-width + 24px;
+                        height: max(28px, 16px * root.text-scale + 12px);
+                        border-radius: StyleTokens.radius * 0.6;
+                        border-width: close-focus.has-focus ? 2px : 1px;
+                        border-color: close-focus.has-focus ? root.accent : root.muted;
+                        accessible-role: button;
+                        accessible-label: "Close read receipts";
+                        accessible-action-default => { RoomActivity.close-seen-by(); }
+                        close-text := Text {
+                            text: "Close";
+                            color: root.ink;
+                            font-size: 12px * root.text-scale;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        close-focus := FocusScope {
+                            key-pressed(event) => {
+                                if event.text == Key.Return || event.text == Key.Space {
+                                    RoomActivity.close-seen-by();
+                                    accept
+                                } else {
+                                    reject
+                                }
+                            }
+                        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { RoomActivity.close-seen-by(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,416 @@
+// The read-only Space explorer: one Space's rooms and nested Spaces, a level
+// at a time, before anything is joined. Rust (space_explorer.rs) owns every
+// value in SpaceExplorer and every request; this file lays the level out and
+// reports explicit choices. Names, topics and addresses are other users'
+// bounded plain text. No media is shown: rows carry a monogram.
+//
+// Keyboard: the search field leads. Up and Down select a row, Enter browses
+// the selected Space or opens a joined room, Alt+Left (or Backspace in an
+// empty field) goes back to the parent Space, and Escape clears the search,
+// then closes. Join is always its own button.
+
+import { ListView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ActionRect, ControlColors, TokenButton } from "controls.slint";
+import { SpaceRooms } from "space-management.slint";
+
+export struct SpaceExplorerRow {
+    // The stable Matrix room ID.
+    id: string,
+    name: string,
+    initials: string,
+    // Address, member or link count, Suggested, Already shown above.
+    detail: string,
+    topic: string,
+    // Joined, Invited, Anyone can join, Restricted, Invite only, ...
+    status: string,
+    is-space: bool,
+    joined: bool,
+    can-open: bool,
+    // A Space that may be shown as the next level, or gone back to.
+    can-browse: bool,
+    can-join: bool,
+    // This Space is already on the trail: a cycle, shown by going back.
+    in-trail: bool,
+}
+
+export struct SpaceExplorerCrumb {
+    id: string,
+    name: string,
+    index: int,
+}
+
+export struct SpaceExplorerPalette {
+    ink: color,
+    muted: color,
+    accent: color,
+    surface: color,
+    elevated: color,
+    hover: color,
+    divider: color,
+    error: color,
+    selection: color,
+    selection-ink: color,
+    has-selection-ink: bool,
+    focus: color,
+    scrim: color,
+}
+
+export global SpaceExplorer {
+    in-out property <bool> open: false;
+    in-out property <[SpaceExplorerRow]> rows;
+    in-out property <[SpaceExplorerCrumb]> crumbs;
+    // The Space shown now.
+    in-out property <string> space-id;
+    in-out property <string> title;
+    in-out property <string> space-status;
+    in-out property <bool> can-join-space: false;
+    in-out property <bool> can-open-space: false;
+    in-out property <string> summary;
+    in-out property <string> error;
+    in-out property <string> notice;
+    in-out property <bool> loading: false;
+    in-out property <bool> can-load-more: false;
+    // The room a join waits for; while set, no other join starts.
+    in-out property <string> joining-id;
+    in-out property <string> query;
+    // Space ID, name, a route server name and the canonical address.
+    callback show(string, string, string, string);
+    callback browse(string);
+    callback crumb(int);
+    callback back();
+    callback load-more();
+    callback retry();
+    callback filter(string);
+    callback join(string);
+    callback open-room(string);
+    callback close();
+}
+
+component ExplorerRowView inherits Rectangle {
+    in property <SpaceExplorerRow> entry;
+    in property <bool> current;
+    in property <bool> busy;
+    in property <float> text-scale: 1;
+    in property <ControlColors> button-colors;
+    in property <SpaceExplorerPalette> palette;
+    callback chosen();
+    property <bool> inked: root.current && root.palette.has-selection-ink;
+
+    background: root.current ? root.palette.selection : root.palette.elevated;
+    border-radius: StyleTokens.radius * 0.8;
+    accessible-role: list-item;
+    accessible-item-selected: root.current;
+    accessible-label: (root.entry.is-space ? "Space " : "Room ") + root.entry.name + ", " + root.entry.status
+        + (root.entry.detail != "" ? ", " + root.entry.detail : "");
+    TouchArea {
+        width: parent.width; height: parent.height;
+        clicked => { root.chosen(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 6px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 32px * min(1.4, root.text-scale); height: self.width;
+                border-radius: root.entry.is-space ? StyleTokens.radius * 0.6 : self.width / 2;
+                background: root.palette.hover;
+                accessible-role: none;
+                Text {
+                    text: root.entry.initials;
+                    color: root.palette.ink;
+                    font-size: 13px * root.text-scale; font-weight: 700;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1; alignment: center; spacing: 2px;
+            Text {
+                text: (root.entry.is-space ? "◇ " : "# ") + root.entry.name;
+                color: root.inked ? root.palette.selection-ink : root.palette.ink;
+                font-size: 13px * root.text-scale; font-weight: 700; overflow: elide;
+            }
+            Text {
+                text: root.entry.status + (root.entry.detail != "" ? " · " + root.entry.detail : "");
+                color: root.inked ? root.palette.selection-ink : root.palette.accent;
+                font-size: 11px * root.text-scale; overflow: elide;
+            }
+            if root.entry.topic != "" : Text {
+                text: root.entry.topic;
+                color: root.inked ? root.palette.selection-ink : root.palette.muted;
+                font-size: 11px * root.text-scale; overflow: elide;
+            }
+        }
+        if root.entry.can-browse : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+            text: root.entry.in-trail ? "Go to" : "Browse ›";
+            label: (root.entry.in-trail ? "Go back to Space " : "Browse Space ") + root.entry.name;
+            activated => { SpaceExplorer.browse(root.entry.id); }
+        }
+        if root.entry.can-join : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+            primary: true;
+            text: SpaceExplorer.joining-id == root.entry.id ? "Joining…" : "Join";
+            label: "Join " + (root.entry.is-space ? "Space " : "room ") + root.entry.name;
+            enabled: !root.busy;
+            activated => { SpaceExplorer.join(root.entry.id); }
+        }
+        if root.entry.can-open : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+            text: "Open";
+            label: "Open " + (root.entry.is-space ? "Space " : "room ") + root.entry.name;
+            activated => { SpaceExplorer.open-room(root.entry.id); }
+        }
+    }
+}
+
+export component SpaceExplorerPanel inherits FocusScope {
+    in property <float> text-scale: 1;
+    in property <ControlColors> button-colors;
+    in property <SpaceExplorerPalette> palette;
+    // The selected row of the shown level.
+    property <int> current: 0;
+    property <length> row-height: 20px + 46px * root.text-scale;
+    property <length> row-gap: 4px;
+    property <int> count: SpaceExplorer.rows.length;
+    property <bool> busy: SpaceExplorer.joining-id != "";
+
+    focus-on-tab-navigation: false;
+    init => { search-input.focus(); }
+    changed count => {
+        root.current = max(0, min(root.current, root.count - 1));
+    }
+    // A new level starts at its first row.
+    property <string> shown-space: SpaceExplorer.space-id;
+    changed shown-space => { root.current = 0; list.viewport-y = 0; }
+
+    function reveal() {
+        let top = root.current * (root.row-height + root.row-gap);
+        if top < -list.viewport-y {
+            list.viewport-y = -top;
+        } else if top + root.row-height > -list.viewport-y + list.visible-height {
+            list.viewport-y = -(top + root.row-height - list.visible-height);
+        }
+    }
+    function choose() {
+        if root.current < 0 || root.current >= root.count {
+            return;
+        }
+        if SpaceExplorer.rows[root.current].can-browse {
+            SpaceExplorer.browse(SpaceExplorer.rows[root.current].id);
+        } else if SpaceExplorer.rows[root.current].can-open {
+            SpaceExplorer.open-room(SpaceExplorer.rows[root.current].id);
+        }
+    }
+
+    capture-key-pressed(event) => {
+        if event.text == Key.Escape {
+            if SpaceExplorer.query != "" {
+                SpaceExplorer.query = "";
+                SpaceExplorer.filter("");
+            } else {
+                SpaceExplorer.close();
+            }
+            accept
+        } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && back-button.has-focus {
+            close-button.focus();
+            accept
+        } else if event.text == Key.Tab && !event.modifiers.shift && close-button.has-focus {
+            back-button.focus();
+            accept
+        } else if search-input.has-focus && event.text == Key.DownArrow && root.count > 0 {
+            root.current = min(root.count - 1, root.current + 1);
+            root.reveal();
+            accept
+        } else if search-input.has-focus && event.text == Key.UpArrow && root.count > 0 {
+            root.current = max(0, root.current - 1);
+            root.reveal();
+            accept
+        } else if search-input.has-focus && SpaceExplorer.crumbs.length > 1 && ((event.text == Key.LeftArrow && event.modifiers.alt) || (event.text == Key.Backspace && SpaceExplorer.query == "")) {
+            SpaceExplorer.back();
+            accept
+        } else { reject }
+    }
+
+    Rectangle {
+        background: root.palette.scrim;
+        TouchArea { width: parent.width; height: parent.height; }
+        Rectangle {
+            width: min(720px, parent.width - 40px);
+            height: min(660px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.palette.surface;
+            border-radius: StyleTokens.radius * 1.4;
+            border-color: root.palette.divider; border-width: StyleTokens.line-width;
+            accessible-role: groupbox;
+            accessible-label: "Space explorer: " + SpaceExplorer.title;
+            VerticalLayout {
+                padding: 18px; spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    back-button := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: SpaceExplorer.crumbs.length > 1 ? "‹ Back" : "‹ Close";
+                        label: SpaceExplorer.crumbs.length > 1 ? "Back to the parent Space" : "Close the Space explorer";
+                        activated => { SpaceExplorer.back(); }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1; alignment: center; spacing: 1px;
+                        Text {
+                            text: "◇ " + SpaceExplorer.title;
+                            color: root.palette.ink; font-size: 17px * root.text-scale; font-weight: 750;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: SpaceExplorer.space-status;
+                            color: root.palette.muted; font-size: 11px * root.text-scale; overflow: elide;
+                        }
+                    }
+                    if SpaceExplorer.can-join-space : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        primary: true;
+                        text: SpaceExplorer.joining-id == SpaceExplorer.space-id ? "Joining…" : "Join Space";
+                        label: "Join Space " + SpaceExplorer.title;
+                        enabled: !root.busy;
+                        activated => { SpaceExplorer.join(SpaceExplorer.space-id); }
+                    }
+                    if SpaceExplorer.can-open-space : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Open Space";
+                        label: "Open Space " + SpaceExplorer.title + " in the room list";
+                        activated => { SpaceExplorer.open-room(SpaceExplorer.space-id); }
+                    }
+                    // Add or remove existing rooms (space-management.slint), one modal at a time.
+                    if SpaceExplorer.can-open-space : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Manage rooms";
+                        label: "Add or remove your rooms in Space " + SpaceExplorer.title;
+                        activated => {
+                            SpaceRooms.show(SpaceExplorer.space-id, SpaceExplorer.title);
+                            SpaceExplorer.close();
+                        }
+                    }
+                }
+                // The trail of Spaces opened to reach this one.
+                Rectangle {
+                    height: 26px * max(1, root.text-scale);
+                    clip: true;
+                    accessible-role: AccessibleRole.list;
+                    accessible-label: "Space path";
+                    HorizontalLayout {
+                        alignment: start; spacing: 2px;
+                        for crumb in SpaceExplorer.crumbs : HorizontalLayout {
+                            spacing: 2px;
+                            if crumb.index > 0 : Text {
+                                text: "›"; color: root.palette.muted;
+                                font-size: 12px * root.text-scale; vertical-alignment: center;
+                            }
+                            ActionRect {
+                                max-width: 160px * root.text-scale;
+                                border-radius: StyleTokens.radius * 0.5;
+                                background: self.has-hover ? root.palette.hover : transparent;
+                                focus-color: root.palette.focus;
+                                label: crumb.index == SpaceExplorer.crumbs.length - 1 ? crumb.name + ", shown now" : "Go back to " + crumb.name;
+                                enabled: crumb.index < SpaceExplorer.crumbs.length - 1;
+                                activated => { SpaceExplorer.crumb(crumb.index); }
+                                preferred-width: min(160px * root.text-scale, crumb-label.preferred-width + 8px);
+                                crumb-label := Text {
+                                    x: 4px; width: parent.width - 8px;
+                                    text: crumb.name;
+                                    color: crumb.index == SpaceExplorer.crumbs.length - 1 ? root.palette.ink : root.palette.accent;
+                                    font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
+                                }
+                            }
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 36px * max(1, root.text-scale);
+                    background: root.palette.elevated;
+                    border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                    border-width: StyleTokens.line-width;
+                    border-color: search-input.has-focus ? root.palette.focus : transparent;
+                    if SpaceExplorer.query == "" : Text {
+                        x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                        text: "Search the loaded rooms of this Space";
+                        color: root.palette.muted; font-size: 12px * root.text-scale; vertical-alignment: center;
+                    }
+                    search-input := TextInput {
+                        x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                        text <=> SpaceExplorer.query;
+                        color: root.palette.ink;
+                        selection-background-color: root.palette.selection;
+                        selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                        font-size: 12px * root.text-scale; vertical-alignment: center; single-line: true;
+                        accessible-label: "Search loaded rooms; arrows select, Enter browses or opens, Alt+Left goes back, Escape closes";
+                        edited => { root.current = 0; SpaceExplorer.filter(self.text); }
+                        accepted => { root.choose(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: SpaceExplorer.loading ? (SpaceExplorer.rows.length == 0 ? "Reading this Space…" : "Loading more…") : SpaceExplorer.summary;
+                        color: root.palette.muted; font-size: 11px * root.text-scale;
+                        vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                        accessible-live-region: polite;
+                    }
+                    if SpaceExplorer.can-load-more : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Load more";
+                        label: "Load more rooms of " + SpaceExplorer.title;
+                        activated => { SpaceExplorer.load-more(); }
+                    }
+                }
+                if SpaceExplorer.error != "" : HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: SpaceExplorer.error;
+                        color: root.palette.error; font-size: 12px * root.text-scale;
+                        wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center;
+                        accessible-live-region: polite;
+                    }
+                    TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Retry";
+                        label: "Read " + SpaceExplorer.title + " again";
+                        activated => { SpaceExplorer.retry(); }
+                    }
+                }
+                if SpaceExplorer.notice != "" : Text {
+                    text: SpaceExplorer.notice;
+                    color: root.palette.accent; font-size: 12px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if !SpaceExplorer.loading && SpaceExplorer.error == "" && SpaceExplorer.rows.length == 0 : Text {
+                    text: SpaceExplorer.query != "" ? "No loaded room matches. Load more or change the search." : "This Space lists no rooms you can see.";
+                    color: root.palette.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                // Lazy: only the rows in view are instantiated.
+                list := ListView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    accessible-role: AccessibleRole.list;
+                    accessible-label: "Rooms and Spaces in " + SpaceExplorer.title;
+                    for row[index] in SpaceExplorer.rows : Rectangle {
+                        width: list.visible-width;
+                        height: root.row-height + root.row-gap;
+                        ExplorerRowView {
+                            y: 0px; height: root.row-height;
+                            entry: row;
+                            current: index == root.current;
+                            busy: root.busy;
+                            text-scale: root.text-scale;
+                            button-colors: root.button-colors;
+                            palette: root.palette;
+                            chosen => { root.current = index; search-input.focus(); }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    close-button := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Close";
+                        label: "Close the Space explorer";
+                        activated => { SpaceExplorer.close(); }
+                    }
+                }
+            }
+        }
+    }
+}

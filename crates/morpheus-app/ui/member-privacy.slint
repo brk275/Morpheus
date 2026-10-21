@@ -1,0 +1,421 @@
+// A room member's details and this account's Matrix ignore list
+// (src/member_privacy.rs). Rust owns every value and request; this file shows
+// them and reports explicit choices. A row key is an exact Matrix user ID that
+// only routes a request: Rust re-reads the server's list and requires it to
+// be unchanged before the write. Nothing here claims a server result.
+
+import { StyleTokens } from "style-tokens.slint";
+import { ScrollView } from "std-widgets.slint";
+import { ControlColors, TokenButton, TokenField } from "controls.slint";
+
+// One ignored user. `user-id` is sanitized and bounded for display.
+export struct IgnoredUserRow {
+    key: string,
+    user-id: string,
+}
+
+export struct MemberInspectorView {
+    open: bool,
+    loading: bool,
+    // The room's display name for the member, sanitized; not a verified identity.
+    name: string,
+    user-id: string,
+    role: string,
+    you: bool,
+    // 0 not known, 1 not ignored, 2 ignored
+    ignored: int,
+    // 0 details, 1 review ignore, 2 review stop ignoring, 3 reading the list,
+    // 4 sending
+    stage: int,
+    error: string,
+    notice: string,
+}
+
+export struct IgnoredUsersView {
+    // A live account with the list open.
+    available: bool,
+    loading: bool,
+    loaded: bool,
+    // A change is being sent.
+    busy: bool,
+    summary: string,
+    // "Showing N of M" when searching or bounded.
+    shown: string,
+    error: string,
+    notice: string,
+    // The user under review for "Stop ignoring", displayed form.
+    review-id: string,
+    // 0 none, 1 review, 2 sending
+    stage: int,
+}
+
+export global MemberPrivacy {
+    in-out property <MemberInspectorView> inspector;
+    in-out property <IgnoredUsersView> ignored;
+    in-out property <[IgnoredUserRow]> ignored-rows;
+    in-out property <string> ignored-query;
+    // The inspector for one member of the open room.
+    callback inspect(string);
+    callback close-inspector();
+    // true: ignore, false: stop ignoring. Reads the server's list, then asks.
+    callback review(bool);
+    callback confirm();
+    callback cancel-review();
+    // Settings › Security & recovery › Ignored users.
+    callback ignored-scope-changed();
+    callback ignored-refresh();
+    callback ignored-search(string);
+    callback review-unignore(string);
+    callback confirm-unignore();
+    callback cancel-unignore();
+    // Account change, logout or detach cleared everything above.
+    callback reset();
+}
+
+// What ignoring does, said the same way wherever it is offered.
+export global MemberPrivacyText {
+    out property <string> ignore-effect: "Ignoring is saved on your homeserver for this account. Your Matrix apps then hide their messages, invitations and calls, and you get no notifications from them. It does not kick or ban them, does not delete past messages, and everyone else in the room still sees them. A call already in progress is not ended.";
+    out property <string> unignore-effect: "Their messages, invitations and calls can reach this account again. Messages hidden while they were ignored may not come back until the homeserver sends them again.";
+}
+
+// One member's details, with Ignore / Stop ignoring. Modal: clicks and
+// scrolling stay inside (the details scroll; the action row stays fixed and
+// visible), Tab and Shift+Tab move between its two buttons,
+// Escape cancels a review or closes it, and shortcuts pause while it is open.
+export component MemberInspector inherits Rectangle {
+    in property <ControlColors> colors;
+    in property <color> surface;
+    in property <color> scrim;
+    in property <float> text-scale: 1;
+    property <MemberInspectorView> view: MemberPrivacy.inspector;
+    property <int> stage: root.view.stage;
+    property <bool> reviewing: root.stage == 1 || root.stage == 2;
+    property <bool> can-change: root.stage == 0 && !root.view.loading && !root.view.you && root.view.ignored != 0;
+    property <color> error-ink: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
+    background: root.scrim;
+    accessible-role: region;
+    accessible-label: "Member details for " + root.view.name;
+    changed stage => {
+        // Show the end of the details, where the review or progress is.
+        body.viewport-y = min(0px, body.visible-height - body.viewport-height);
+        if root.reviewing {
+            first.focus();
+        } else if root.stage == 0 {
+            second.focus();
+        } else {
+            keys.focus();
+        }
+    }
+    TouchArea {
+        scroll-event(event) => { accept }
+    }
+    keys := FocusScope {
+        init => { second.focus(); }
+        // Only the two buttons take focus, so Tab never leaves the dialog.
+        capture-key-pressed(event) => {
+            if event.text == Key.Tab || event.text == Key.Backtab {
+                if first.has-focus && second.enabled {
+                    second.focus();
+                } else if first.enabled {
+                    first.focus();
+                } else if second.enabled {
+                    second.focus();
+                } else {
+                    keys.focus();
+                }
+                accept
+            } else {
+                reject
+            }
+        }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                if root.reviewing {
+                    MemberPrivacy.cancel-review();
+                } else if root.stage == 0 {
+                    MemberPrivacy.close-inspector();
+                }
+                accept
+            } else {
+                reject
+            }
+        }
+        card := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 32px, 420px * root.text-scale);
+            // The details and the review scroll; the action row below them
+            // never does, so Close, Cancel and the confirmation stay
+            // reachable at any window height and text scale.
+            height: min(parent.height - 32px,
+                details.preferred-height + actions.preferred-height + 2 * 16px + 8px);
+            background: root.surface;
+            border-radius: StyleTokens.radius * 1.2;
+            clip: true;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+                body := ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    details := VerticalLayout {
+                        // From the card's width, never the scroll area's, so
+                        // the card's height does not depend on the scrollbar
+                        // it may cause. 12px is kept for that scrollbar.
+                        width: max(0px, card.width - 2 * 16px - 12px);
+                        spacing: 8px;
+                        Text {
+                            text: root.view.loading && root.view.name == "" ? "Member details" : root.view.name;
+                            color: root.colors.ink;
+                            font-size: 15px * root.text-scale;
+                            font-weight: 750;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "Matrix ID: " + root.view.user-id;
+                            color: root.colors.muted;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.view.loading ? "Reading this room's member list on this device…"
+                                : root.view.you ? "This is your account. " + root.view.role
+                                : root.view.role;
+                            color: root.colors.muted;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.view.loading ? ""
+                                : root.view.ignored == 2 ? "You ignore this person (as of the last sync)."
+                                : root.view.ignored == 1 ? "You do not ignore this person (as of the last sync)."
+                                : root.view.you ? ""
+                                : "Whether you ignore this person is not known yet.";
+                            color: root.colors.ink;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                        }
+                        if root.reviewing : VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: (root.stage == 1 ? "Ignore " : "Stop ignoring ") + root.view.user-id + "?";
+                                color: root.colors.ink;
+                                font-size: 12px * root.text-scale;
+                                font-weight: 700;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: root.stage == 1 ? MemberPrivacyText.ignore-effect : MemberPrivacyText.unignore-effect;
+                                color: root.colors.muted;
+                                font-size: 11px * root.text-scale;
+                                wrap: word-wrap;
+                            }
+                        }
+                        if root.stage == 3 || root.stage == 4 : Text {
+                            text: root.stage == 3 ? "Reading this account's ignore list…" : "Sending the change…";
+                            color: root.colors.muted;
+                            font-size: 11px * root.text-scale;
+                            accessible-live-region: polite;
+                        }
+                        if root.view.error != "" : Text {
+                            text: root.view.error;
+                            color: root.error-ink;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                        if root.view.notice != "" : Text {
+                            text: root.view.notice;
+                            color: root.colors.ink;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                    }
+                }
+                actions := HorizontalLayout {
+                    vertical-stretch: 0;
+                    alignment: end;
+                    spacing: 8px;
+                    // Ignore… / Stop ignoring… while showing details; Cancel
+                    // while reviewing.
+                    first := TokenButton {
+                        colors: root.colors;
+                        text-scale: root.text-scale;
+                        visible: root.reviewing || root.can-change;
+                        enabled: root.reviewing || root.can-change;
+                        text: root.reviewing ? "Cancel" : root.view.ignored == 2 ? "Stop ignoring…" : "Ignore…";
+                        label: root.reviewing ? "Cancel and change nothing"
+                            : (root.view.ignored == 2 ? "Review stop ignoring " : "Review ignoring ") + root.view.user-id;
+                        activated => {
+                            if root.reviewing {
+                                MemberPrivacy.cancel-review();
+                            } else {
+                                MemberPrivacy.review(root.view.ignored != 2);
+                            }
+                        }
+                    }
+                    // Close while showing details; the confirmation while
+                    // reviewing.
+                    second := TokenButton {
+                        colors: root.colors;
+                        text-scale: root.text-scale;
+                        primary: root.reviewing;
+                        enabled: root.reviewing || root.stage == 0;
+                        text: root.stage == 1 ? "Ignore" : root.stage == 2 ? "Stop ignoring" : "Close";
+                        label: root.stage == 1 ? "Ignore " + root.view.user-id
+                            : root.stage == 2 ? "Stop ignoring " + root.view.user-id
+                            : "Close member details";
+                        activated => {
+                            if root.reviewing {
+                                MemberPrivacy.confirm();
+                            } else {
+                                MemberPrivacy.close-inspector();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Settings › Security & recovery › Ignored users.
+export component IgnoredUsersPanel inherits VerticalLayout {
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    // The live account. A change reopens the list for it.
+    in property <string> scope-key;
+    // Changes when settings search asks for this list.
+    in property <int> reveal-request;
+    // Scroll the Settings page so this absolute position is visible.
+    callback reveal-at(length);
+    callback revealed(string);
+    property <IgnoredUsersView> view: MemberPrivacy.ignored;
+    property <bool> can-refresh: !root.view.loading && !root.view.busy;
+    property <color> error-ink: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
+    init => { MemberPrivacy.ignored-scope-changed(); }
+    changed scope-key => { MemberPrivacy.ignored-scope-changed(); }
+    changed reveal-request => {
+        if root.reveal-request > 0 {
+            root.reveal-at(refresh.absolute-position.y);
+            if root.can-refresh {
+                refresh.focus();
+                if refresh.has-focus { root.revealed("privacy.ignored_users"); }
+            } else {
+                status.focus();
+                if status.has-focus { root.revealed("privacy.ignored_users:status"); }
+            }
+        }
+    }
+    spacing: 8px;
+    HorizontalLayout {
+        spacing: 8px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: "Ignored users";
+                color: root.colors.ink; font-size: 13px * root.text-scale; font-weight: 700;
+            }
+            status := TextInput {
+                text: root.view.summary;
+                read-only: true; single-line: false; wrap: word-wrap;
+                color: root.colors.muted; font-size: 11px * root.text-scale;
+                accessible-label: "Ignored users status: " + root.view.summary;
+                changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            refresh := TokenButton {
+                colors: root.colors; text-scale: root.text-scale;
+                text: root.view.loading ? "Loading…" : "Refresh";
+                label: "Refresh this account's ignore list from the homeserver";
+                enabled: root.can-refresh;
+                activated => { MemberPrivacy.ignored-refresh(); }
+                focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
+            }
+        }
+    }
+    Text {
+        text: "People you ignore stay hidden in your Matrix apps for this account. To ignore someone, open their details from a room's member list.";
+        color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+    if root.view.available && root.view.loaded : TokenField {
+        colors: root.colors; text-scale: root.text-scale;
+        text <=> MemberPrivacy.ignored-query;
+        placeholder-text: "Search ignored users";
+        label: "Search ignored users by Matrix ID";
+        edited(text) => { MemberPrivacy.ignored-search(text); }
+    }
+    if root.view.shown != "" : Text {
+        text: root.view.shown;
+        color: root.colors.muted; font-size: 11px * root.text-scale;
+    }
+    for row in MemberPrivacy.ignored-rows : HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: row.user-id;
+            color: root.colors.ink; font-size: 12px * root.text-scale;
+            vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+        }
+        TokenButton {
+            colors: root.colors; text-scale: root.text-scale;
+            text: "Stop ignoring…";
+            label: "Review stop ignoring " + row.user-id;
+            enabled: root.view.stage == 0 && !root.view.busy;
+            activated => { MemberPrivacy.review-unignore(row.key); }
+        }
+    }
+    if root.view.stage != 0 : Rectangle {
+        background: root.colors.surface;
+        border-radius: StyleTokens.radius * 0.8;
+        border-width: StyleTokens.line-width;
+        border-color: root.colors.outline;
+        VerticalLayout {
+            padding: 10px;
+            spacing: 6px;
+            Text {
+                text: "Stop ignoring " + root.view.review-id + "?";
+                color: root.colors.ink; font-size: 12px * root.text-scale; font-weight: 700;
+                wrap: word-wrap;
+            }
+            Text {
+                text: MemberPrivacyText.unignore-effect;
+                color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                TokenButton {
+                    colors: root.colors; text-scale: root.text-scale;
+                    text: "Cancel";
+                    label: "Cancel and keep ignoring " + root.view.review-id;
+                    enabled: root.view.stage == 1;
+                    init => { self.focus(); }
+                    activated => { MemberPrivacy.cancel-unignore(); }
+                }
+                TokenButton {
+                    colors: root.colors; text-scale: root.text-scale;
+                    primary: true;
+                    text: root.view.stage == 2 ? "Sending…" : "Stop ignoring";
+                    label: "Stop ignoring " + root.view.review-id;
+                    enabled: root.view.stage == 1;
+                    activated => { MemberPrivacy.confirm-unignore(); }
+                }
+            }
+        }
+    }
+    if root.view.error != "" : Text {
+        text: root.view.error;
+        color: root.error-ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    if root.view.notice != "" : Text {
+        text: root.view.notice;
+        color: root.colors.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+}
