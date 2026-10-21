@@ -1265,6 +1265,32 @@ class DraftStageTests(unittest.TestCase):
 
 class AppRecoveryEvidenceTests(unittest.TestCase):
     child = LiveStageTests.child
+    cases = {
+        "stale_observers_end_on_revocation_and_never_touch_the_departed_cache":
+            "observer_revocation",
+        "interrupted_prepare_keeps_its_committed_record_for_discovery_and_leaves_the_cache_consistent":
+            "interrupted_prepare",
+        "rollback_racing_a_switch_leaves_cache_and_row_agreeing":
+            "rollback_race",
+        "a_background_flush_cannot_commit_a_record_before_its_preparation_writes_it":
+            "writer_transaction",
+        "the_thread_index_is_durable_before_any_record_exists":
+            "thread_index",
+        "revocation_after_the_release_leaves_the_record_in_cache_and_row":
+            "release_revocation",
+        "revocation_during_the_rollback_write_converges_under_the_release":
+            "write_revocation",
+        "a_preparation_waiting_for_the_writer_lock_creates_nothing_once_its_selection_ended":
+            "writer_lock_revocation",
+        "a_submission_typed_over_during_preparation_is_kept_on_a_definite_failure":
+            "typed_retention",
+        "typing_while_the_rollback_waits_after_the_release_keeps_the_submission":
+            "late_typing_retention",
+        "a_revoked_rollback_retains_a_typed_over_uncommitted_record":
+            "revoked_retention",
+        "a_thread_submission_typed_over_during_preparation_is_kept_with_its_index":
+            "thread_retention",
+    }
 
     @staticmethod
     def complete():
@@ -1285,6 +1311,7 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
             complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=true\n",
             complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=false\n",
             complete.replace("12 passed", "11 passed"),
+            complete.replace("12 passed", "17 passed"),
             complete.replace("0 ignored", "1 ignored"),
             complete + "Skipped local fixture\n",
         ):
@@ -1294,13 +1321,33 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
     def test_exact_source_tokens_cover_each_real_test_and_follow_cleanup(self):
         source = (Path(__file__).resolve().parents[2] / "crates/morpheus-app/src/live.rs").read_text()
         source = source.split("mod stale_observer_tests {", 1)[1]
-        tests = re.split(r"#\[tokio::test\]", source)[1:]
+        bodies = re.split(r"#\[tokio::test\]", source)[1:]
+        tests = {}
+        for body in bodies:
+            name = re.match(r"\s*async fn ([a-z_]+)\s*\(\s*\)", body)
+            self.assertIsNotNone(name)
+            self.assertNotIn(name[1], tests)
+            tests[name[1]] = body
+        # These five native regressions share the module but have no recovery protocol.
+        other_cases = {
+            "a_departed_selection_neither_reveals_nor_focuses_after_a_switch_back",
+            "a_created_room_opens_only_for_its_own_click_and_admitted_snapshot",
+            "a_stale_snapshots_member_load_never_claims_over_a_newer_one",
+            "stale_creation_follow_ups_keep_a_newer_rooms_feed_and_transition",
+            "a_withdrawn_created_room_open_gives_up_held_waits_and_its_locks",
+        }
+        self.assertEqual(tests.keys(), self.cases.keys() | other_cases)
+        for name in other_cases:
+            self.assertNotRegex(tests.pop(name), r"recovery_(?:phase|check)!\(")
         self.assertEqual(len(tests), len(acceptance_module.APP_RECOVERY_CASES))
+        self.assertEqual(acceptance_module.APP_RECOVERY_TESTS,
+                         tuple("live::stale_observer_tests::" + name for name in self.cases))
         completed = []
-        for body in tests:
+        for name, body in tests.items():
             phases = re.findall(r"recovery_phase!\(([a-z_]+)\)", body)
             checks = re.findall(r"recovery_check!\(([a-z_]+)\)", body)
             self.assertEqual(phases, checks)
+            self.assertEqual(checks, [self.cases[name]])
             self.assertEqual(len(checks), 1)
             self.assertLess(body.index("fixture()"), body.index("recovery_phase!("))
             self.assertLess(body.index("close_profile(directory, live).await;"),
@@ -1317,7 +1364,8 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
             label, args = run.call_args.args
             self.assertEqual(label, acceptance_module.APP_RECOVERY_LABEL)
             self.assertEqual(args, ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
-                                    "--bin", "morpheus-app", "live::stale_observer_tests::", "--",
+                                    "--bin", "morpheus-app", "--", "--exact",
+                                    *("live::stale_observer_tests::" + name for name in self.cases),
                                     "--nocapture", "--test-threads=1"])
             self.assertEqual(run.call_args.kwargs, {
                 "extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(Path(folder) / "fixture.json")},

@@ -129,6 +129,21 @@ APP_RECOVERY_CASES = frozenset((
     "thread_index", "release_revocation", "write_revocation", "writer_lock_revocation",
     "typed_retention", "late_typing_retention", "revoked_retention", "thread_retention",
 ))
+# Keep this protocol suite separate from the module's navigation/creation tests.
+APP_RECOVERY_TESTS = tuple("live::stale_observer_tests::" + name for name in (
+    "stale_observers_end_on_revocation_and_never_touch_the_departed_cache",
+    "interrupted_prepare_keeps_its_committed_record_for_discovery_and_leaves_the_cache_consistent",
+    "rollback_racing_a_switch_leaves_cache_and_row_agreeing",
+    "a_background_flush_cannot_commit_a_record_before_its_preparation_writes_it",
+    "the_thread_index_is_durable_before_any_record_exists",
+    "revocation_after_the_release_leaves_the_record_in_cache_and_row",
+    "revocation_during_the_rollback_write_converges_under_the_release",
+    "a_preparation_waiting_for_the_writer_lock_creates_nothing_once_its_selection_ended",
+    "a_submission_typed_over_during_preparation_is_kept_on_a_definite_failure",
+    "typing_while_the_rollback_waits_after_the_release_keeps_the_submission",
+    "a_revoked_rollback_retains_a_typed_over_uncommitted_record",
+    "a_thread_submission_typed_over_during_preparation_is_kept_with_its_index",
+))
 APP_RECOVERY_STAGE = re.compile(r"^MORPHEUS_APP_RECOVERY_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_RECOVERY_CHECK = re.compile(r"^MORPHEUS_APP_RECOVERY_CHECK ([a-z_]{1,48})=(true|false)$", re.MULTILINE)
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
@@ -1054,7 +1069,7 @@ class Acceptance:
         self.run(
             APP_RECOVERY_LABEL,
             ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
-             "--bin", "morpheus-app", "live::stale_observer_tests::", "--",
+             "--bin", "morpheus-app", "--", "--exact", *APP_RECOVERY_TESTS,
              "--nocapture", "--test-threads=1"],
             extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
             test=True, pid_namespace=True,
