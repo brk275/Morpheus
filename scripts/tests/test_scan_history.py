@@ -155,7 +155,7 @@ class HistoryScannerTests(unittest.TestCase):
         base, _, _ = self.reviewed_branch()
         self.begin_merge(base)
         (self.repo / "fixture.txt").write_text(self.canary + "Changed whole-blob bytes\n")
-        (self.repo / "new-secret.txt").write_text(self.canary.replace("morpheusSynthetic", "unreviewedSynthetic"))
+        (self.repo / "new-secret.txt").write_text(self.canary.replace("X7d9R2s8F4w6N3t5Q1v0", "V9k2T8p4J6c1W7n5B3z0"))
         merge = self.commit("Modified fixture and unreviewed merge-only secret")
         result = self.execute("changed-merge")
         copies = [f for f in self.report("changed-merge") if f["Commit"] == merge]
