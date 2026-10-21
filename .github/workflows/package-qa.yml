@@ -146,6 +146,26 @@ jobs:
           ref: ${{ needs.scope.outputs.source_revision }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify checkout identity before host provisioning
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          REVIEWED_SOURCE: ${{ needs.scope.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          [[ "$REVIEWED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"
+      - name: Tighten hosted notice tree permissions before candidate imports
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          # Bootstrap from this immutable reviewed workflow revision, including
+          # when the selected package source predates the provisioning helper.
+          git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |
+            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS /usr/bin/python3 -I -B -
       - name: Verify exact reviewed source checkout
         run: python3 scripts/package_revision.py --verify-checkout .
       - name: Check Windows keyboard host before building
