@@ -365,7 +365,10 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             "CHECK link_follow_up_held_focus_rejected=true",
             "CHECK link_follow_up_owned_focus=true",
             "STAGE member_publication", "CHECK member_publication=true",
-            "STAGE cleanup", "CHECK cleanup_complete=true", "STAGE complete",
+            "STAGE cleanup", "STAGE cleanup_logout_primary", "STAGE cleanup_logout_other",
+            "STAGE cleanup_manager_stop", "STAGE cleanup_drop_live", "STAGE cleanup_drop_ui",
+            "STAGE cleanup_wait_profile", "STAGE cleanup_drop_manager", "STAGE cleanup_remove_directory",
+            "CHECK cleanup_complete=true", "STAGE complete",
         )
         lines = ["running 1 test"]
         lines.extend("MORPHEUS_LIVE_TIMELINE_" + record for record in records)
@@ -450,6 +453,17 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         self.assertEqual(acceptance_module.app_timeline_diagnostics(output),
                          {"test_entered": True, "stage": "queued_drain"})
         self.assertEqual(acceptance_module.app_timeline_diagnostics("private-token"), {"test_entered": False})
+        for stage in (
+            "cleanup_logout_primary", "cleanup_logout_other", "cleanup_manager_stop",
+            "cleanup_drop_live", "cleanup_drop_ui", "cleanup_wait_profile",
+            "cleanup_drop_manager", "cleanup_remove_directory",
+        ):
+            prefix = "MORPHEUS_LIVE_TIMELINE_STAGE setup\n"
+            marker = f"MORPHEUS_LIVE_TIMELINE_STAGE {stage}"
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(prefix + marker + "\n"),
+                             {"test_entered": True, "stage": stage})
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(prefix + marker + " private-token\n"),
+                             {"test_entered": True, "stage": "setup"})
 
     def test_validated_record_requires_native_test_mode_and_attaches_safe_facts(self):
         with tempfile.TemporaryDirectory() as folder:

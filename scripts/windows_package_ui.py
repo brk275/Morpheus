@@ -505,7 +505,7 @@ class WindowsUI:
             self.diagnostics.value["traversed_node_matched"] = False
             yield node
 
-    def find(self, label, *, prefix=False):
+    def find(self, label, *, prefix=False, control_type=None):
         smoke.require(0 < len(label) < NAME_BOUND, "Acceptance label exceeds the name bound")
         matches = []
         self.diagnostics.value["selector_matches"] = 0
@@ -515,6 +515,10 @@ class WindowsUI:
             # because the cut keeps the first 256 characters, but it never proves
             # a complete exact label.
             matched = node.name.startswith(label) if prefix else (node.name == label and not node.truncated)
+            # Select an action by its semantic type as well as its name: a
+            # button can expose a text caption with the same name.
+            # Still consume the full owned walk and reject duplicate controls.
+            matched = matched and (control_type is None or node.type == control_type)
             self.diagnostics.value["traversed_node_matched"] = matched
             if matched:
                 matches.append(node)
@@ -539,8 +543,8 @@ class WindowsUI:
             time.sleep(0.1)
         raise DiagnosticFailure("wait_timeout")
 
-    def wait(self, label, *, prefix=False):
-        return self.wait_for(lambda: self.find(label, prefix=prefix))
+    def wait(self, label, *, prefix=False, control_type=None):
+        return self.wait_for(lambda: self.find(label, prefix=prefix, control_type=control_type))
 
     def focused_name(self):
         self.diagnostics.operation("focused_element")
@@ -624,9 +628,9 @@ def menu_keyboard(ui):
     ui.focus(trigger, prefix=True)
     ui.key("Return")
     ui.expect_focus("Switch to ", prefix=True)
-    ui.wait("Manage accounts")
+    ui.wait("Manage accounts", control_type="button")
     ui.key("Escape")
-    ui.wait_for(lambda: ui.find("Manage accounts") is None)
+    ui.wait_for(lambda: ui.find("Manage accounts", control_type="button") is None)
     ui.expect_focus(trigger, prefix=True)
     ui.key("Space")
     ui.expect_focus("Switch to ", prefix=True)

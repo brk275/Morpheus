@@ -652,7 +652,7 @@ class MacUI:
             self.diagnostics.value["traversed_node_matched"] = False
             yield node
 
-    def find(self, label, *, prefix=False):
+    def find(self, label, *, prefix=False, role=None):
         smoke.require(0 < len(label) < NAME_BOUND, "Acceptance label exceeds the name bound")
         matches = []
         self.diagnostics.value["selector_matches"] = 0
@@ -662,6 +662,10 @@ class MacUI:
             # because the cut keeps the first 256 characters, but it never proves
             # a complete exact label.
             matched = node.name.startswith(label) if prefix else (node.name == label and not node.truncated)
+            # Select an action by its semantic role as well as its name: a
+            # button can expose a static-text caption with the same name.
+            # Still consume the full owned walk and reject duplicate controls.
+            matched = matched and (role is None or node.role == role)
             self.diagnostics.value["traversed_node_matched"] = matched
             if matched:
                 matches.append(node)
@@ -686,8 +690,8 @@ class MacUI:
             time.sleep(0.1)
         raise DiagnosticFailure("wait_timeout")
 
-    def wait(self, label, *, prefix=False):
-        return self.wait_for(lambda: self.find(label, prefix=prefix))
+    def wait(self, label, *, prefix=False, role=None):
+        return self.wait_for(lambda: self.find(label, prefix=prefix, role=role))
 
     def focused_name(self):
         self.diagnostics.operation("focused_element")
@@ -775,10 +779,10 @@ def menu_keyboard(ui):
     ui.diagnostics.step("menu_open_return")
     ui.key("Return")
     ui.expect_focus("Switch to ", prefix=True)
-    ui.wait("Manage accounts")
+    ui.wait("Manage accounts", role="AXButton")
     ui.diagnostics.step("menu_close_escape")
     ui.key("Escape")
-    ui.wait_for(lambda: ui.find("Manage accounts") is None)
+    ui.wait_for(lambda: ui.find("Manage accounts", role="AXButton") is None)
     ui.expect_focus(trigger, prefix=True)
     ui.diagnostics.step("menu_reopen_space")
     ui.key("Space")

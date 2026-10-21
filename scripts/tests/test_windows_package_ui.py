@@ -650,6 +650,49 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "selector_ambiguous")
         self.assertEqual(diagnostics.value["selector_matches"], 2)
 
+    def test_button_type_selects_the_control_without_counting_its_text_caption(self):
+        for caption_first in (False, True):
+            types = ("text", "button") if caption_first else ("button", "text")
+            items = [node(index, "Manage accounts", type=kind) for index, kind in enumerate(types, 1)]
+            instance, _, diagnostics = driver([snapshot(*items)])
+            with self.subTest(caption_first=caption_first):
+                found = instance.wait("Manage accounts", control_type="button")
+                self.assertEqual(found.id, 2 if caption_first else 1)
+                self.assertEqual(found.type, "button")
+                self.assertEqual(diagnostics.value["selector_matches"], 1)
+        # A caption alone is never evidence that the action is present.
+        instance, _, _ = driver([snapshot(node(1, "Manage accounts", type="text"))])
+        self.assertIsNone(instance.find("Manage accounts", control_type="button"))
+
+    def test_type_filter_keeps_duplicate_controls_and_untyped_ambiguity_fatal(self):
+        items = [node(1, "Manage accounts", type="button"), node(2, "Manage accounts", type="text")]
+        instance, _, _ = driver([snapshot(*items)])
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            instance.find("Manage accounts")
+        self.assertEqual(error.exception.code, "selector_ambiguous")
+        # Do not stop at the first matching button, even with its caption and
+        # an unread subtree between the two actual controls.
+        instance, _, diagnostics = driver([snapshot(*items, node(3, error=True),
+                                                   node(4, "Manage accounts", type="button"))])
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            instance.find("Manage accounts", control_type="button")
+        self.assertEqual(error.exception.code, "selector_ambiguous")
+        self.assertEqual(diagnostics.value["selector_matches"], 2)
+
+    def test_button_type_still_requires_a_complete_owned_unbounded_walk(self):
+        for remainder in (node(2, error=True), node(2, pid=78)):
+            for present in (False, True):
+                button = [node(1, "Manage accounts", type="button")] if present else [node(1)]
+                instance, _, diagnostics = driver([snapshot(*button, remainder)])
+                with self.subTest(present=present, error=remainder["error"]), \
+                        self.assertRaises(ui.IncompleteTraversal):
+                    instance.find("Manage accounts", control_type="button")
+                self.assertEqual(diagnostics.value["incomplete_passes"], 1)
+        instance, _, _ = driver([snapshot(node(1, "Manage accounts", type="button"), bounded=True)])
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            instance.find("Manage accounts", control_type="button")
+        self.assertEqual(error.exception.code, "tree_bound")
+
     def test_incomplete_pass_is_retried_until_a_complete_pass_decides(self):
         instance, bridge, diagnostics = driver([snapshot(node(1, "Done"), node(2, error=True)), snapshot(node(1, "Done"))])
         self.assertEqual(instance.wait("Done").id, 1)
@@ -799,6 +842,17 @@ class FocusAndKeyTests(unittest.TestCase):
             ui.appearance_keyboard(instance)
         self.assertEqual(error.exception.code, "scale_unreachable")
         self.assertLessEqual(sum(1 for command in bridge.commands if command["op"] == "key"), ui.SETTINGS_TAB_BOUND + 1)
+
+
+class AccountMenuSelectorTests(unittest.TestCase):
+    def test_menu_checks_the_button_type_for_action_presence_and_absence(self):
+        instance = Mock()
+        instance.focused_name.return_value = "Manage accounts"
+        ui.menu_keyboard(instance)
+        instance.wait.assert_any_call("Manage accounts", control_type="button")
+        instance.find.return_value = None
+        self.assertTrue(instance.wait_for.call_args_list[0].args[0]())
+        instance.find.assert_called_once_with("Manage accounts", control_type="button")
 
 
 class AppearanceStageTests(unittest.TestCase):

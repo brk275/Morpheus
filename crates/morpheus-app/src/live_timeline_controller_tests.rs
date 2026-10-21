@@ -1223,16 +1223,25 @@ impl Scenario {
         let manager = self.manager.clone();
         let account = self.account.clone();
         on_runtime(&self.runtime, async move {
-            for id in [account, other] {
+            for (index, id) in [account, other].into_iter().enumerate() {
+                if index == 0 {
+                    stage!(cleanup_logout_primary);
+                } else {
+                    stage!(cleanup_logout_other);
+                }
                 let removed = manager.logout_account(&id).await;
                 removed.expect("Cannot remove a fixture account");
             }
+            stage!(cleanup_manager_stop);
             manager.stop().await;
         })
         .await;
         let manager = self.manager;
+        stage!(cleanup_drop_live);
         drop(self.live);
+        stage!(cleanup_drop_ui);
         drop(self.ui);
+        stage!(cleanup_wait_profile);
         let deadline = Instant::now() + Duration::from_secs(60);
         while Arc::strong_count(&manager) != 1 {
             assert!(
@@ -1241,7 +1250,9 @@ impl Scenario {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        stage!(cleanup_drop_manager);
         drop(manager);
+        stage!(cleanup_remove_directory);
         directory.close().unwrap();
         check!(cleanup_complete);
         stage!(complete);

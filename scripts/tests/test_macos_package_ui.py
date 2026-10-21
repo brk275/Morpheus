@@ -645,6 +645,52 @@ class TraversalTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "selector_ambiguous")
         self.assertEqual(diagnostics.value["selector_matches"], 2)
 
+    def test_button_role_selects_the_control_without_counting_its_static_caption(self):
+        for caption_first in (False, True):
+            roles = ("AXStaticText", "AXButton") if caption_first else ("AXButton", "AXStaticText")
+            items = [node(index, "Manage accounts", role=role,
+                          name_source="value" if role == "AXStaticText" else "title")
+                     for index, role in enumerate(roles, 1)]
+            instance, _, diagnostics = driver([snapshot(*items)])
+            with self.subTest(caption_first=caption_first):
+                found = instance.wait("Manage accounts", role="AXButton")
+                self.assertEqual(found.id, 2 if caption_first else 1)
+                self.assertEqual(found.role, "AXButton")
+                self.assertEqual(diagnostics.value["selector_matches"], 1)
+        # A caption alone is never evidence that the action is present.
+        instance, _, _ = driver([snapshot(node(1, "Manage accounts", role="AXStaticText"))])
+        self.assertIsNone(instance.find("Manage accounts", role="AXButton"))
+
+    def test_role_filter_keeps_duplicate_controls_and_untyped_ambiguity_fatal(self):
+        items = [node(1, "Manage accounts", role="AXButton"),
+                 node(2, "Manage accounts", role="AXStaticText")]
+        instance, _, _ = driver([snapshot(*items)])
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            instance.find("Manage accounts")
+        self.assertEqual(error.exception.code, "selector_ambiguous")
+        # Do not stop at the first matching button, even with its caption and
+        # an unread subtree between the two actual controls.
+        instance, _, diagnostics = driver([snapshot(*items, node(3, error=True),
+                                                   node(4, "Manage accounts", role="AXButton"))])
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            instance.find("Manage accounts", role="AXButton")
+        self.assertEqual(error.exception.code, "selector_ambiguous")
+        self.assertEqual(diagnostics.value["selector_matches"], 2)
+
+    def test_button_role_still_requires_a_complete_owned_unbounded_walk(self):
+        for remainder in (node(2, error=True), node(2, pid=PID + 1)):
+            for present in (False, True):
+                button = [node(1, "Manage accounts", role="AXButton")] if present else [node(1)]
+                instance, _, diagnostics = driver([snapshot(*button, remainder)])
+                with self.subTest(present=present, error=remainder["error"]), \
+                        self.assertRaises(ui.IncompleteTraversal):
+                    instance.find("Manage accounts", role="AXButton")
+                self.assertEqual(diagnostics.value["incomplete_passes"], 1)
+        instance, _, _ = driver([snapshot(node(1, "Manage accounts", role="AXButton"), bounded=True)])
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            instance.find("Manage accounts", role="AXButton")
+        self.assertEqual(error.exception.code, "tree_bound")
+
     def test_incomplete_pass_is_retried_until_a_complete_pass_decides(self):
         instance, bridge, diagnostics = driver([snapshot(node(1, "Done"), node(2, error=True)), snapshot(node(1, "Done"))])
         self.assertEqual(instance.wait("Done").id, 1)
@@ -823,6 +869,10 @@ class AccountMenuStageTests(unittest.TestCase):
         ui.menu_keyboard(instance)
         self.assertEqual(diagnostics.value["step"], "menu_close_dialog")
         instance.expect_focus.assert_called_with("Account menu for ", prefix=True)
+        instance.wait.assert_any_call("Manage accounts", role="AXButton")
+        instance.find.return_value = None
+        self.assertTrue(instance.wait_for.call_args_list[0].args[0]())
+        instance.find.assert_called_once_with("Manage accounts", role="AXButton")
         # A completed menu cannot stand in for completion of all acceptance.
         with self.assertRaises(RuntimeError):
             smoke.validate_macos_keyboard_diagnostic(diagnostic(step="menu_close_dialog"), True)

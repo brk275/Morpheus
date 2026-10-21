@@ -116,6 +116,9 @@ APP_TIMELINE_STAGES = frozenset((
     "setup", "activation", "room_open", "room_delivery", "thread_delivery",
     "revocation", "renewal", "reopen", "queued_revocation", "queued_drain",
     "queued_reopen", "link_continuation", "member_publication", "cleanup", "complete",
+    "cleanup_logout_primary", "cleanup_logout_other", "cleanup_manager_stop",
+    "cleanup_drop_live", "cleanup_drop_ui", "cleanup_wait_profile",
+    "cleanup_drop_manager", "cleanup_remove_directory",
 ))
 APP_TIMELINE_STAGE = re.compile(r"^MORPHEUS_LIVE_TIMELINE_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_TIMELINE_CHECK = re.compile(r"MORPHEUS_LIVE_TIMELINE_CHECK ([a-z_]{1,48})=(true|false)")
