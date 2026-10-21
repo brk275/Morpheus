@@ -4194,6 +4194,9 @@ export component AppWindow inherits Window {
             root.withdraw-verification();
         }
         root.page = next;
+        // Returning in the same event batch can coalesce the deferred context
+        // change. Reissue retained notices under their original leases now.
+        root.timeline-recovery-context-changed();
     }
     // While any of these holds, no SAS value stays in the window.
     out property <bool> sas-protected: RoomLeave.view.open || RoomAddresses.open || root.security-busy || root.access-open

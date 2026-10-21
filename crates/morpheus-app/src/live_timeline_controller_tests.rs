@@ -847,10 +847,18 @@ impl Scenario {
         assert_eq!(ui.get_page(), 1);
         assert_eq!(opened.get(), 2);
         assert_eq!(ui.get_settings_reveal_id().as_str(), "security.recovery");
+        assert_eq!(ui.get_thread_recovery_serial(), 0);
+        // No clock tick or event-loop turn between leaving and returning:
+        // deferred context notifications can see only the final chat page.
         assert!(crate::settings_search::reveal(ui, "files.transfers"));
+        let returned_thread_action = ui.get_thread_recovery_serial();
+        assert!(
+            returned_thread_action > thread_action,
+            "a same-batch return must synchronously reissue the retained thread action"
+        );
         i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
         settle(ui).await;
-        assert!(ui.get_thread_recovery_serial() > thread_action);
+        assert_eq!(ui.get_thread_recovery_serial(), returned_thread_action);
         assert_eq!(self.live.feed_generation(), generation);
         assert_eq!(self.live.current_navigation_epoch(), navigation);
         // A completed security step invalidates that original epoch even
