@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import appimage_client as client
 from appimage_runtime import RuntimeIdentity
 import element_process_namespace as containment
-from linux_package_ui import AccessibleUI
+from linux_package_ui import AccessibleUI, IncompleteTraversal
 import package_smoke as smoke
 from run_wayland_acceptance import CappedPrivateLog, configs, private_environment
 from wayland_fixture_backend import prepare_backend
@@ -184,9 +184,16 @@ class InstalledUI(AccessibleUI):
                 interface = node.queryEditableText() if editable else node.queryAction()
                 if editable or interface.nActions:
                     matches.append((node, interface))
-            except (NotImplementedError, self.transient_error):
+                    require(len(matches) <= 1)
+            except NotImplementedError:
+                continue
+            except (LookupError, self.transient_error):
+                self.pass_incomplete = True
                 continue
         require(len(matches) <= 1)
+        if getattr(self, "pass_incomplete", False):
+            self.diagnostics.count("incomplete_passes")
+            raise IncompleteTraversal()
         return matches[0] if matches else None
 
     def enter(self, label, value, *, password=False):
