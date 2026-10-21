@@ -8045,7 +8045,7 @@ async fn assert_people_window_privacy(ui: &AppWindow) {
         "Start an encrypted direct conversation with @synthetic3:example.org",
         "Close",
     ] {
-        let bounds = control_bounds(ui, label);
+        let bounds = button_bounds(ui, label);
         assert_eq!(bounds.len(), 1, "{label}");
         assert!(
             inside_window(ui, bounds[0]),
@@ -8071,7 +8071,11 @@ async fn assert_people_window_privacy(ui: &AppWindow) {
     let padding = tokens.get_control_padding();
     tokens.set_control_padding(24.0);
     settle(ui).await;
-    let dialog = control_bounds(ui, "Start a conversation");
+    let dialog = labelled_bounds(
+        ui,
+        "Start a conversation",
+        Some(slint::private_unstable_api::re_exports::AccessibleRole::Region),
+    );
     assert_eq!(dialog.len(), 1);
     let footer: Vec<_> = [
         "Confirm starting an encrypted direct conversation with @synthetic3:example.org",
@@ -8080,7 +8084,7 @@ async fn assert_people_window_privacy(ui: &AppWindow) {
     ]
     .into_iter()
     .map(|label| {
-        let bounds = control_bounds(ui, label);
+        let bounds = button_bounds(ui, label);
         assert_eq!(bounds.len(), 1, "{label}");
         let bounds = bounds[0];
         assert!(
