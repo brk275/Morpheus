@@ -1,26 +1,26 @@
-# TEMPORARY focused stock Element acceptance only. NEVER MERGE this workflow.
-# No full/beta acceptance, broad native suites, packages, installed UI, physical devices or artifacts.
-name: Owner exacte868 stock Element reverse audio
-run-name: Exacte868 focused stock Element reverse audio
+# TEMPORARY affected helper checks only. NEVER MERGE this workflow.
+# Source-only proposal; independent workflow review and execution admission are separate.
+name: Owner exact47ef installed-menu and timeline helpers
+run-name: Exact47ef source installed-menu and timeline helpers
 on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Select only affected native platforms
+        description: Existing affected helpers on standard Linux only
         type: choice
         required: true
         default: linux
         options: [linux]
       checks:
-        description: Only three changed helper methods and one existing stock Element lifecycle
+        description: Only two package UI helper modules and AppTimelineEvidenceTests
         type: choice
         required: true
-        default: element-fixture-linux
-        options: [element-fixture-linux]
+        default: installed-helper-linux
+        options: [installed-helper-linux]
 permissions:
   contents: read
 concurrency:
-  group: beta-element-fixture-e86857c-${{ github.ref }}
+  group: beta-installed-helpers-47ef1f9-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -37,7 +37,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: e86857c6517980b5f8e421f2464d8954e898c4a8
+          ref: 47ef1f997735234d07771f2c268dbb6e088da07e
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -50,7 +50,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = e86857c6517980b5f8e421f2464d8954e898c4a8
+          test "$(git -C candidate rev-parse HEAD)" = 47ef1f997735234d07771f2c268dbb6e088da07e
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -63,15 +63,15 @@ jobs:
             --scanner "$RUNNER_TEMP/history-scanner/gitleaks" \
             --manifest trusted/scripts/public-fixtures.json \
             --evidence "$RUNNER_TEMP/reviewed-candidate-history"
-  native:
+  helpers:
     needs: security
-    name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && inputs.platform == 'linux' && inputs.checks == 'element-fixture-linux'
+    name: Helpers ${{ matrix.name }}
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && inputs.platform == 'linux' && inputs.checks == 'installed-helper-linux'
     strategy:
       fail-fast: false
       matrix: {include: [{name: 'Linux x64', runner: ubuntu-24.04, os: Linux, arch: X64}]}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 15
     env:
       MORPHEUS_EXPECTED_OS: ${{ matrix.os }}
       MORPHEUS_EXPECTED_ARCH: ${{ matrix.arch }}
@@ -85,7 +85,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: e86857c6517980b5f8e421f2464d8954e898c4a8
+          ref: 47ef1f997735234d07771f2c268dbb6e088da07e
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -324,7 +324,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='e86857c6517980b5f8e421f2464d8954e898c4a8'
+          source='47ef1f997735234d07771f2c268dbb6e088da07e'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -367,44 +367,8 @@ jobs:
           ignore=private/'empty.ignore'; ignore.write_bytes(b'')
           print(json.dumps({'check':'reviewed_source_and_private_scanner','status':'passed',
               'source':source,'raw_logs_public':False},sort_keys=True))
-      - name: Install reviewed Linux native compilation dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
-            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev \
-            libsystemd-dev libudev-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xauth \
-            dbus-x11 gnome-keyring libsecret-tools libgl1-mesa-dri fonts-noto-color-emoji
-          # Ubuntu 24.04 Chromium dependencies from pinned Playwright 1.62.1.
-          # Install before the peer drops privileges inside its PID namespace.
-          sudo apt-get install -y \
-            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
-            libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
-            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
-            libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
-            fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
-            xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic \
-            fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # reviewed action pin
-        with:
-          toolchain: 1.99.0
-          components: rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: verified-sdk-archives-v1
-          workspaces: candidate -> target
-          save-if: false
-      - name: Verify only changed Element evidence helpers and stock RC lifecycle
-        timeout-minutes: 160
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CARGO_INCREMENTAL: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-          CARGO_TERM_COLOR: never
-          SLINT_EMIT_DEBUG_INFO: "1"
+      - name: Verify only installed-menu and timeline evidence helpers
+        timeout-minutes: 8
         shell: python -I {0}
         run: |
           import hashlib, json, os, pathlib, queue, re, signal, subprocess, tempfile, threading, time
@@ -613,7 +577,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='e86857c6517980b5f8e421f2464d8954e898c4a8'
+          source='47ef1f997735234d07771f2c268dbb6e088da07e'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -717,148 +681,224 @@ jobs:
                           and hashlib.sha256(regular_bytes(binary,64*1024*1024)).digest()==hashlib.sha256(scanner_bytes).digest()
                           and json.loads(regular_bytes(report,8*1024*1024))==[])
                   except (OSError,ValueError): return False
-          if (os.environ.get('RUNNER_OS'), os.environ.get('RUNNER_ARCH'), os.environ.get('MORPHEUS_CHECK_SCOPE')) != ('Linux', 'X64', 'element-fixture-linux'):
-              raise SystemExit('focused_element_scope_required')
-          helper_program = r"""import json, pathlib, sys, unittest
+          if (os.environ.get('RUNNER_OS'), os.environ.get('RUNNER_ARCH'), os.environ.get('MORPHEUS_CHECK_SCOPE')) != ('Linux', 'X64', 'installed-helper-linux'):
+              raise SystemExit('focused_installed_helper_scope_required')
+          helper_program = r"""import hashlib, json, pathlib, sys, unittest
           scripts = pathlib.Path('scripts').resolve(strict=True)
+          # Both package UI modules import the reviewed scripts package explicitly.
+          sys.path.insert(0, str(scripts.parent))
           sys.path.insert(0, str(scripts))
           sys.path.insert(0, str(scripts / 'tests'))
           names = [
-              'test_element_acceptance.EvidenceTests.test_requires_every_fixed_assertion_and_preserves_failure',
-              'test_matrix_acceptance.LiveEvidenceTests.test_element_success_requires_all_protocol_facts_without_leaking_child_text',
-              'test_matrix_acceptance.ScopedContinuationTests.test_element_setup_deadline_is_fatal_and_only_actual_peer_stages_are_collectible',
+              'test_macos_package_ui.AccountMenuStageTests.test_completed_menu_keeps_the_final_boundary_until_the_next_check',
+              'test_macos_package_ui.AccountMenuStageTests.test_each_native_menu_boundary_keeps_a_closed_failure_position',
+              'test_macos_package_ui.AppearanceStageTests.test_complete_stage_requires_successful_persistence',
+              'test_macos_package_ui.AppearanceStageTests.test_failure_stage_survives_lower_level_operations_and_cleanup',
+              'test_macos_package_ui.AppearanceStageTests.test_report_accepts_only_closed_stages_and_requires_complete_on_success',
+              'test_macos_package_ui.AppearanceStageTests.test_unknown_stages_never_enter_a_report',
+              'test_macos_package_ui.AttachRegistrationTests.test_acceptance_attaches_only_after_the_ownership_proof',
+              'test_macos_package_ui.AttachRegistrationTests.test_acceptance_deadline_ends_the_wait_before_another_attempt',
+              'test_macos_package_ui.AttachRegistrationTests.test_expired_budget_starts_no_further_attempt',
+              'test_macos_package_ui.AttachRegistrationTests.test_identity_change_around_an_attempt_fails_closed',
+              'test_macos_package_ui.AttachRegistrationTests.test_late_success_is_refused',
+              'test_macos_package_ui.AttachRegistrationTests.test_normal_pending_then_complete_identity_passes',
+              'test_macos_package_ui.AttachRegistrationTests.test_only_absent_metadata_tokens_are_retryable',
+              'test_macos_package_ui.AttachRegistrationTests.test_positive_mismatches_fail_at_once',
+              'test_macos_package_ui.AttachRegistrationTests.test_process_death_stops_the_wait',
+              'test_macos_package_ui.AttachRegistrationTests.test_reply_deadline_is_optional_and_other_operations_keep_their_bounds',
+              'test_macos_package_ui.AttachRegistrationTests.test_stalled_reply_waits_only_for_the_remaining_registration_budget',
+              'test_macos_package_ui.AttachRegistrationTests.test_zero_budget_makes_no_attempt',
+              'test_macos_package_ui.BridgeProtocolTests.test_bridge_error_tokens_are_fixed_and_unknown_tokens_collapse',
+              'test_macos_package_ui.BridgeProtocolTests.test_bridge_starts_in_its_own_session_with_private_streams',
+              'test_macos_package_ui.BridgeProtocolTests.test_flooded_replies_stay_within_the_bounded_queue_without_pipe_capacity_assumptions',
+              'test_macos_package_ui.BridgeProtocolTests.test_handshake_without_ready_or_timeout_stops_the_child',
+              'test_macos_package_ui.BridgeProtocolTests.test_overlong_reply_is_rejected_before_it_is_buffered',
+              'test_macos_package_ui.BridgeProtocolTests.test_owned_window_requires_exactly_one_window_within_the_bound',
+              'test_macos_package_ui.BridgeProtocolTests.test_permission_check_requires_both_booleans_and_never_prompts',
+              'test_macos_package_ui.BridgeProtocolTests.test_spawn_failure_leaves_nothing_to_stop',
+              'test_macos_package_ui.BridgeProtocolTests.test_stop_failure_propagates_instead_of_pretending',
+              'test_macos_package_ui.CloseAndCleanupTests.test_acceptance_keeps_the_leader_unreaped_until_cleanup_and_never_touches_the_profile',
+              'test_macos_package_ui.CloseAndCleanupTests.test_bridge_close_and_acceptance_cleanup_stop_through_the_group_proof',
+              'test_macos_package_ui.CloseAndCleanupTests.test_bridge_command_requires_an_absolute_executable_regular_file',
+              'test_macos_package_ui.CloseAndCleanupTests.test_close_button_failures_map_to_fixed_tokens',
+              'test_macos_package_ui.CloseAndCleanupTests.test_close_is_refused_when_the_pid_no_longer_runs_the_installed_executable',
+              'test_macos_package_ui.CloseAndCleanupTests.test_launch_uses_a_new_session_and_the_nonce_environment',
+              'test_macos_package_ui.CloseAndCleanupTests.test_normal_close_requires_zero_exit_and_an_empty_live_group',
+              'test_macos_package_ui.CloseAndCleanupTests.test_stop_group_leaves_the_leader_anchored_when_a_member_remains_or_the_table_is_unknown',
+              'test_macos_package_ui.CloseAndCleanupTests.test_stop_group_proves_the_group_empty_before_the_anchored_leader_is_reaped',
+              'test_macos_package_ui.CloseAndCleanupTests.test_stop_group_rejects_a_reaped_leader_and_a_leader_that_never_stops',
+              'test_macos_package_ui.CloseAndCleanupTests.test_untrusted_table_after_exit_counts_as_a_remaining_member',
+              'test_macos_package_ui.DiagnosticsAndReportTests.test_config_persistence_requires_the_exact_saved_scale',
+              'test_macos_package_ui.DiagnosticsAndReportTests.test_diagnostics_map_exceptions_to_fixed_tokens_and_keep_the_first_failure',
+              'test_macos_package_ui.DiagnosticsAndReportTests.test_driver_launch_keeps_its_stream_private_and_reports_pass_and_verified_stop_separately',
+              'test_macos_package_ui.DiagnosticsAndReportTests.test_main_publishes_only_the_fixed_report_and_requires_three_arguments',
+              'test_macos_package_ui.DiagnosticsAndReportTests.test_smoke_parser_rejects_arbitrary_values_and_incomplete_success',
+              'test_macos_package_ui.FocusAndKeyTests.test_focus_command_targets_the_found_snapshot_element',
+              'test_macos_package_ui.FocusAndKeyTests.test_focus_outside_the_owned_process_fails_closed',
+              'test_macos_package_ui.FocusAndKeyTests.test_lost_frontmost_or_partial_chord_fails_through_the_real_transport_path',
+              'test_macos_package_ui.FocusAndKeyTests.test_no_key_is_sent_without_an_owned_focused_element',
+              'test_macos_package_ui.FocusAndKeyTests.test_only_reviewed_keys_are_sent',
+              'test_macos_package_ui.FocusAndKeyTests.test_settings_scale_control_is_reached_by_bounded_tabs_before_its_label_is_queried',
+              'test_macos_package_ui.FocusAndKeyTests.test_truncated_focus_or_node_name_matches_a_prefix_but_never_an_exact_label',
+              'test_macos_package_ui.FocusAndKeyTests.test_unreachable_scale_control_fails_within_the_tab_bound',
+              'test_macos_package_ui.GuardAndIdentityTests.test_guard_failure_happens_before_profile_bridge_or_process_work',
+              'test_macos_package_ui.GuardAndIdentityTests.test_guard_requires_fresh_hosted_macos_15',
+              'test_macos_package_ui.GuardAndIdentityTests.test_home_must_be_the_accounts_real_home_and_never_an_override',
+              'test_macos_package_ui.GuardAndIdentityTests.test_installed_bundle_requires_the_real_path_ancestry_and_identity',
+              'test_macos_package_ui.GuardAndIdentityTests.test_manual_only_helpers_do_not_trigger_the_native_matrix',
+              'test_macos_package_ui.OwnershipTests.test_executable_of_reads_libproc_with_a_bounded_buffer',
+              'test_macos_package_ui.OwnershipTests.test_owned_pid_requires_own_group_and_session_live_state_and_the_installed_executable',
+              'test_macos_package_ui.OwnershipTests.test_process_table_rejects_incomplete_snapshots_and_group_members_exclude_zombies',
+              'test_macos_package_ui.OwnershipTests.test_session_comes_from_getsid_and_never_from_the_darwin_process_table',
+              'test_macos_package_ui.ProfileLifecycleTests.test_bridge_build_uses_the_system_toolchain_privately_and_requires_a_binary',
+              'test_macos_package_ui.ProfileLifecycleTests.test_create_refuses_existing_project_folders_symlinks_or_missing_library_bases',
+              'test_macos_package_ui.ProfileLifecycleTests.test_create_seeds_markers_and_root_config_and_a_failed_create_removes_only_its_roots',
+              'test_macos_package_ui.ProfileLifecycleTests.test_existing_profile_is_refused_before_any_launch',
+              'test_macos_package_ui.ProfileLifecycleTests.test_open_accepts_only_the_marked_profile_even_after_the_app_created_its_store',
+              'test_macos_package_ui.ProfileLifecycleTests.test_permission_failure_stops_before_any_profile_or_launch',
+              'test_macos_package_ui.ProfileLifecycleTests.test_plain_launch_stops_through_the_given_callback_and_keeps_the_default_elsewhere',
+              'test_macos_package_ui.ProfileLifecycleTests.test_redirected_library_ancestor_is_refused_before_create_open_or_remove',
+              'test_macos_package_ui.ProfileLifecycleTests.test_release_profile_override_is_never_forwarded_and_home_is_untouched',
+              'test_macos_package_ui.ProfileLifecycleTests.test_remove_refuses_redirected_or_foreign_roots',
+              'test_macos_package_ui.ProfileLifecycleTests.test_smoke_compiles_probes_permissions_creates_the_profile_then_launches_and_removes_after_verified_stops',
+              'test_macos_package_ui.ProfileLifecycleTests.test_smoke_retains_the_profile_unless_both_stops_are_verified',
+              'test_macos_package_ui.SignInSemanticsTests.test_missing_second_field_retains_the_first_observation',
+              'test_macos_package_ui.SignInSemanticsTests.test_protected_password_field_passes_without_reading_values',
+              'test_macos_package_ui.SignInSemanticsTests.test_unprotected_or_non_text_field_password_cannot_pass',
+              'test_macos_package_ui.SwiftSourceTests.test_attach_and_close_verify_the_owned_process',
+              'test_macos_package_ui.SwiftSourceTests.test_every_key_transition_is_posted_to_the_owned_pid_after_its_own_frontmost_proof',
+              'test_macos_package_ui.SwiftSourceTests.test_guards_privacy_and_no_permission_requests',
+              'test_macos_package_ui.SwiftSourceTests.test_snapshot_bounds_are_enforced_before_enumeration_and_serialization',
+              'test_macos_package_ui.SwiftSourceTests.test_values_are_read_only_for_static_text_and_never_for_fields',
+              'test_macos_package_ui.TraversalTests.test_bounded_snapshot_is_not_evidence',
+              'test_macos_package_ui.TraversalTests.test_button_role_selects_the_control_without_counting_its_static_caption',
+              'test_macos_package_ui.TraversalTests.test_button_role_still_requires_a_complete_owned_unbounded_walk',
+              'test_macos_package_ui.TraversalTests.test_early_process_exit_is_not_a_wait_timeout',
+              'test_macos_package_ui.TraversalTests.test_incomplete_pass_is_retried_until_a_complete_pass_decides',
+              'test_macos_package_ui.TraversalTests.test_malformed_or_overlong_snapshot_entries_are_rejected',
+              'test_macos_package_ui.TraversalTests.test_node_read_error_marks_the_pass_incomplete_but_ambiguity_still_fails',
+              'test_macos_package_ui.TraversalTests.test_role_filter_keeps_duplicate_controls_and_untyped_ambiguity_fatal',
+              'test_macos_package_ui.TraversalTests.test_unowned_node_is_skipped_and_marks_the_pass_incomplete',
+              'test_macos_package_ui.TraversalTests.test_unowned_root_or_errored_root_is_not_a_tree',
+              'test_macos_package_ui.TraversalTests.test_value_sourced_names_are_accepted_only_for_static_text',
+              'test_windows_package_ui.AccountMenuSelectorTests.test_menu_checks_the_button_type_for_action_presence_and_absence',
+              'test_windows_package_ui.AppearanceStageTests.test_complete_stage_requires_successful_persistence',
+              'test_windows_package_ui.AppearanceStageTests.test_failure_stage_survives_lower_level_operations_and_cleanup',
+              'test_windows_package_ui.AppearanceStageTests.test_report_accepts_only_closed_stages_and_requires_complete_on_success',
+              'test_windows_package_ui.AppearanceStageTests.test_unknown_stages_never_enter_a_report',
+              'test_windows_package_ui.BridgeContainmentTests.test_acceptance_cleanup_never_removes_the_profile_and_reports_an_unverified_stop',
+              'test_windows_package_ui.BridgeContainmentTests.test_bridge_failure_mid_flow_keeps_the_first_failure_and_still_closes_bridge_and_job',
+              'test_windows_package_ui.BridgeContainmentTests.test_bridge_is_spawned_inside_the_job_with_private_pipes_and_no_subprocess',
+              'test_windows_package_ui.BridgeContainmentTests.test_flooded_replies_stay_within_the_bounded_queue',
+              'test_windows_package_ui.BridgeContainmentTests.test_handshake_timeout_is_bounded_and_terminates_the_child',
+              'test_windows_package_ui.BridgeContainmentTests.test_handshake_without_ready_terminates_the_contained_child',
+              'test_windows_package_ui.BridgeContainmentTests.test_overlong_reply_is_rejected_before_it_is_buffered',
+              'test_windows_package_ui.BridgeContainmentTests.test_spawn_failure_propagates_without_a_handle_to_terminate',
+              'test_windows_package_ui.BridgeContainmentTests.test_stop_that_cannot_be_verified_raises_instead_of_pretending',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_config_persistence_requires_the_exact_saved_scale',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_diagnostics_map_exceptions_to_fixed_tokens_and_keep_the_first_failure',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_driver_launch_keeps_its_stream_private_and_reports_pass_and_verified_stop_separately',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_event_target_alone_waits_for_the_actual_window',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_every_other_single_style_bit_change_remains_a_candidate',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_exact_event_target_identity_does_not_depend_on_geometry',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_exact_event_target_is_ignored_in_either_enumeration_order',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_failed_queries_on_live_owned_windows_publish_only_unavailable',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_foreign_and_reused_handles_fail_before_selection',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_hidden_windows_and_overflow_do_not_produce_a_candidate',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_installed_helper_signature_keeps_the_real_window_in_either_order',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_inventory_errors_never_change_the_selection_outcome',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_inventory_is_bounded_sorted_and_flags_truncation',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_inventory_is_recorded_on_success_and_does_not_depend_on_enumeration_order',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_inventory_keeps_no_facts_for_vanished_or_reused_handles',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_inventory_reduces_unknown_classes_to_a_closed_family',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_inventory_vocabulary_matches_the_probe_and_the_initial_record_validates',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_main_publishes_only_the_fixed_report_and_requires_the_nonce_argument',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_near_match_helpers_are_not_discarded',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_normal_close_requires_zero_exit_and_an_empty_job',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_smoke_parser_rejects_arbitrary_values_and_incomplete_success',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_vanished_windows_are_ignored_but_live_query_failures_reject',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_wait_timeout_records_the_last_poll',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_window_count_inventory_publishes_complete_words_for_the_deciding_poll',
+              'test_windows_package_ui.DiagnosticsAndReportTests.test_window_wait_requires_exactly_one_owned_visible_window',
+              'test_windows_package_ui.FocusAndKeyTests.test_bridge_error_replies_raise_even_where_the_caller_cannot_tolerate_them',
+              'test_windows_package_ui.FocusAndKeyTests.test_focus_command_targets_the_found_snapshot_element',
+              'test_windows_package_ui.FocusAndKeyTests.test_focus_outside_the_owned_process_fails_closed',
+              'test_windows_package_ui.FocusAndKeyTests.test_lost_foreground_or_partial_chord_fails_through_the_real_transport_path',
+              'test_windows_package_ui.FocusAndKeyTests.test_no_key_is_sent_without_an_owned_focused_element',
+              'test_windows_package_ui.FocusAndKeyTests.test_only_reviewed_keys_are_sent',
+              'test_windows_package_ui.FocusAndKeyTests.test_settings_scale_control_is_reached_by_bounded_tabs_before_its_label_is_queried',
+              'test_windows_package_ui.FocusAndKeyTests.test_truncated_focus_or_node_name_matches_a_prefix_but_never_an_exact_label',
+              'test_windows_package_ui.FocusAndKeyTests.test_unreachable_scale_control_fails_within_the_tab_bound',
+              'test_windows_package_ui.GuardTests.test_bridge_command_is_a_native_argument_list_with_identifiers_only',
+              'test_windows_package_ui.GuardTests.test_guard_failure_cannot_create_a_job_or_touch_a_profile',
+              'test_windows_package_ui.GuardTests.test_guard_requires_fresh_hosted_windows_2025',
+              'test_windows_package_ui.GuardTests.test_host_preflight_precedes_compilers_and_keeps_interactive_desktop_guard',
+              'test_windows_package_ui.GuardTests.test_installed_executable_must_match_the_single_registration',
+              'test_windows_package_ui.GuardTests.test_invalid_preflight_arguments_cannot_enter_the_installed_driver',
+              'test_windows_package_ui.GuardTests.test_manual_only_helpers_do_not_trigger_the_native_matrix',
+              'test_windows_package_ui.GuardTests.test_metadata_preflight_has_no_application_or_profile_side_effects',
+              'test_windows_package_ui.GuardTests.test_only_the_two_reviewed_windows_2025_images_are_accepted',
+              'test_windows_package_ui.GuardTests.test_preflight_still_rejects_nonhosted_and_unknown_images_without_mutation',
+              'test_windows_package_ui.KnownFolderTests.test_failure_status_frees_nothing_and_empty_or_relative_paths_still_free',
+              'test_windows_package_ui.KnownFolderTests.test_native_signatures_are_declared_before_use',
+              'test_windows_package_ui.KnownFolderTests.test_profile_roots_come_from_known_folders_not_environment_variables',
+              'test_windows_package_ui.KnownFolderTests.test_reads_advance_by_the_wide_character_stride',
+              'test_windows_package_ui.KnownFolderTests.test_success_reads_exactly_up_to_the_terminator_and_frees_the_allocation',
+              'test_windows_package_ui.KnownFolderTests.test_unterminated_allocation_stops_at_the_cap_and_frees',
+              'test_windows_package_ui.PowerShellSourceTests.test_each_key_is_one_native_sendinput_call_immediately_after_the_foreground_proof',
+              'test_windows_package_ui.PowerShellSourceTests.test_guards_and_privacy_invariants',
+              'test_windows_package_ui.PowerShellSourceTests.test_snapshot_bounds_are_enforced_before_enumeration_and_serialization',
+              'test_windows_package_ui.ProfileLifecycleTests.test_create_refuses_any_existing_organization_folder_root_or_reparse_point',
+              'test_windows_package_ui.ProfileLifecycleTests.test_create_seeds_markers_and_config_and_a_failed_create_removes_only_its_own_directories',
+              'test_windows_package_ui.ProfileLifecycleTests.test_existing_profile_is_refused_before_any_launch',
+              'test_windows_package_ui.ProfileLifecycleTests.test_full_smoke_runs_both_launches_between_registration_and_uninstall',
+              'test_windows_package_ui.ProfileLifecycleTests.test_open_accepts_only_the_marked_profile_even_after_the_app_created_its_store',
+              'test_windows_package_ui.ProfileLifecycleTests.test_release_profile_override_is_never_forwarded_and_no_folder_is_redirected',
+              'test_windows_package_ui.ProfileLifecycleTests.test_remove_refuses_redirected_or_foreign_roots_and_removes_app_data_inside_its_own',
+              'test_windows_package_ui.ProfileLifecycleTests.test_smoke_creates_the_profile_before_the_plain_launch_and_removes_it_after_verified_stops',
+              'test_windows_package_ui.ProfileLifecycleTests.test_smoke_retains_the_profile_unless_both_stops_are_verified',
+              'test_windows_package_ui.SignInSemanticsTests.test_missing_second_field_retains_the_first_observation',
+              'test_windows_package_ui.SignInSemanticsTests.test_protected_password_field_passes_without_reading_values',
+              'test_windows_package_ui.SignInSemanticsTests.test_unprotected_or_non_edit_password_cannot_pass',
+              'test_windows_package_ui.TraversalTests.test_bounded_snapshot_is_not_evidence',
+              'test_windows_package_ui.TraversalTests.test_button_type_selects_the_control_without_counting_its_text_caption',
+              'test_windows_package_ui.TraversalTests.test_button_type_still_requires_a_complete_owned_unbounded_walk',
+              'test_windows_package_ui.TraversalTests.test_early_process_exit_is_not_a_wait_timeout',
+              'test_windows_package_ui.TraversalTests.test_incomplete_pass_is_retried_until_a_complete_pass_decides',
+              'test_windows_package_ui.TraversalTests.test_malformed_or_overlong_snapshot_entries_are_rejected',
+              'test_windows_package_ui.TraversalTests.test_node_read_error_marks_the_pass_incomplete_but_ambiguity_still_fails',
+              'test_windows_package_ui.TraversalTests.test_prefix_and_exact_selectors_publish_only_booleans',
+              'test_windows_package_ui.TraversalTests.test_type_filter_keeps_duplicate_controls_and_untyped_ambiguity_fatal',
+              'test_windows_package_ui.TraversalTests.test_unowned_node_is_skipped_and_marks_the_pass_incomplete',
+              'test_windows_package_ui.TraversalTests.test_unowned_root_or_errored_root_is_not_a_tree',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_completion_must_follow_assertions_and_setup_must_precede_them',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_diagnostics_reveal_only_fixed_entered_and_stage_values',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_every_missing_fact_is_fatal_even_after_a_green_test_summary',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_excessive_stage_records_are_rejected_before_unbounded_proof_growth',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_false_duplicate_unknown_and_malformed_records_never_pass',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_live_ui_case_remains_required_in_full_and_timeline_profiles',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_member_publication_fact_cannot_be_false_duplicated_or_malformed',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_missing_or_repeated_lifecycle_markers_cannot_stand_in_for_completion',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_one_harness_requires_all_twenty_observable_facts_and_cleanup',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_validated_record_requires_native_test_mode_and_attaches_safe_facts',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_wrapper_uses_exact_ui_harness_fixture_and_process_containment',
+              'test_matrix_acceptance.AppTimelineEvidenceTests.test_wrong_count_or_skipped_harness_is_not_live_coverage',
           ]
           suite = unittest.defaultTestLoader.loadTestsFromNames(names)
           observed = [case.id() for group in suite for case in group]
-          if suite.countTestCases() != 3 or observed != names:
+          if suite.countTestCases() != 193 or observed != names:
               raise SystemExit(1)
           result = unittest.TextTestRunner(verbosity=2).run(suite)
-          okay = (result.wasSuccessful() and result.testsRun == 3 and not result.skipped
+          okay = (result.wasSuccessful() and result.testsRun == 193 and not result.skipped
                   and not result.expectedFailures and not result.unexpectedSuccesses)
-          print('MORPHEUS_ELEMENT_FOCUSED_HELPERS ' + json.dumps({
+          print('MORPHEUS_INSTALLED_TIMELINE_HELPERS ' + json.dumps({
               'tests_run': result.testsRun, 'zero_skips_xfails': not result.skipped and not result.expectedFailures and not result.unexpectedSuccesses,
-              'required_methods': {name: okay for name in names}, 'complete': okay,
+              'required_ids_sha256': hashlib.sha256(json.dumps(observed, separators=(',', ':')).encode('utf-8')).hexdigest(),
+              'complete': okay,
           }, sort_keys=True), flush=True)
           raise SystemExit(0 if okay else 1)
           """
-          focused_program = r"""import json, os, pathlib, shutil, subprocess, sys, tempfile, time
-          scripts = pathlib.Path('scripts').resolve(strict=True)
-          sys.path.insert(0, str(scripts))
-          import run_matrix_acceptance as acceptance_module
-          
-          ELEMENT_KEYS = frozenset((
-              'official_image', 'browser_identity', 'browser_presynced', 'browser_roster',
-              'browser_video', 'browser_audio', 'browser_leave', 'native_presynced_baseline',
-              'native_roster', 'native_audio', 'native_video', 'native_departure',
-          ))
-          ORDERED_STEPS = (
-              'unlock-disposable-keyring', 'vault-store', 'vault-read', 'vault-clear',
-              'acceptance-process-containment', 'local_matrix_env-up',
-              'local_matrix_rtc-up', 'local_matrix_rtc-probe', 'local_matrix_rtc-rtc-fixture',
-              'element-call-rc-sticky2025-presynced', 'element-fixture-down',
-              'local_matrix_rtc-down', 'local_matrix_env-down',
-              'verify-fixture-container-cleanup', 'verify-fixture-network-cleanup',
-          )
-          
-          def focused_element():
-              started = time.monotonic()
-              if os.environ.get('GITHUB_ACTIONS') != 'true' or os.environ.get('RUNNER_OS') != 'Linux':
-                  raise RuntimeError('focused_element_requires_hosted_linux')
-              if not os.environ.get('DBUS_SESSION_BUS_ADDRESS'):
-                  raise RuntimeError('focused_element_requires_disposable_dbus')
-              scanner = sys.argv[1]
-              for command in ('docker', 'cargo', 'gnome-keyring-daemon', 'secret-tool', scanner):
-                  if not shutil.which(command):
-                      raise RuntimeError('focused_element_required_command_missing')
-              # Exact existing main preownership absence checks: never adopt a live fixture.
-              for command, names in (
-                  (['docker', 'container', 'ls', '--all', '--format', '{{.Names}}'], acceptance_module.FIXTURE_CONTAINERS),
-                  (['docker', 'volume', 'ls', '--format', '{{.Name}}'], acceptance_module.FIXTURE_VOLUMES),
-                  (['docker', 'network', 'ls', '--format', '{{.Name}}'], (acceptance_module.FIXTURE_NETWORK,)),
-              ):
-                  result = subprocess.run(command, capture_output=True, text=True, timeout=30)
-                  if result.returncode or set(result.stdout.splitlines()).intersection(names):
-                      raise RuntimeError('focused_element_initial_absence_unproved')
-              root = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-focused-element-', dir=os.environ.get('RUNNER_TEMP')))
-              acceptance = acceptance_module.Acceptance(root, scanner, started=started)
-              body_ok = False
-              cleanup_failures = []
-              checks = {}
-              try:
-                  acceptance.start_keyring()
-                  acceptance.require_containment()
-                  acceptance.script('local_matrix_env', 'up')
-                  acceptance_module.fixture_from_output(str(root / 'accounts.json'), root)
-                  acceptance.script('local_matrix_rtc', 'up')
-                  acceptance.script('local_matrix_rtc', 'probe')
-                  # Real existing lifecycle includes fresh RTC users/room, exact native
-                  # target --no-run, normal stock peer, one exact test and nonce cleanup.
-                  acceptance.element_case()
-                  records = [item for item in acceptance.results if item['check'] == acceptance_module.ELEMENT_LABEL]
-                  if len(records) != 1:
-                      raise RuntimeError('focused_element_record_missing')
-                  checks = records[0].get('element_checks', {})
-                  if set(checks) != ELEMENT_KEYS or any(value is not True for value in checks.values()):
-                      raise RuntimeError('focused_element_twelve_facts_missing')
-                  peer = records[0].get('element_peer', {})
-                  if peer != {
-                      'version': 'v0.28.0-rc.1',
-                      'image_digest': 'sha256:6d83fe15c425e1139edafdffe2b2073256608dcafdc554da5bf840de496891fe',
-                      'protocol': 'matrix_2_0_sticky2025', 'baseline': 'presynced',
-                  }:
-                      raise RuntimeError('focused_element_peer_identity_missing')
-                  body_ok = True
-              finally:
-                  # Exact finalization behavior: both shared services and checked absence
-                  # are attempted despite body/peer errors. No full-suite summary/finish,
-                  # SUITES or planned_checks mutation, synthetic pass or missing-test reuse.
-                  acceptance.finalizing = True
-                  for name in ('local_matrix_rtc', 'local_matrix_env'):
-                      try:
-                          acceptance.script(name, 'down')
-                      except BaseException:
-                          cleanup_failures.append(name)
-                  try:
-                      acceptance.verify_fixture_absence()
-                  except BaseException:
-                      cleanup_failures.append('fixture_absence')
-              labels = tuple(item['check'] for item in acceptance.results)
-              ordered = labels == ORDERED_STEPS
-              complete = body_ok and not cleanup_failures and ordered
-              return {
-                  'complete': complete, 'initial_absence_proved': True,
-                  'ordered_steps': {name: ordered for name in ORDERED_STEPS},
-                  'shared_cleanup_complete': not cleanup_failures,
-                  'element_checks': checks if complete else {},
-                  'exact_native_test': 'element_call_browser_peer_encrypted_media_and_departure',
-                  'exact_native_test_required': complete, 'full_acceptance': False,
-              }
-          
-          try:
-              report = focused_element()
-          except BaseException:
-              report = {'complete': False}
-          print('MORPHEUS_ELEMENT_FOCUSED_RESULT ' + json.dumps(report, sort_keys=True), flush=True)
-          raise SystemExit(0 if report.get('complete') is True else 1)
-          """
-          helper_ids = {
-              'test_element_acceptance.EvidenceTests.test_requires_every_fixed_assertion_and_preserves_failure',
-              'test_matrix_acceptance.LiveEvidenceTests.test_element_success_requires_all_protocol_facts_without_leaking_child_text',
-              'test_matrix_acceptance.ScopedContinuationTests.test_element_setup_deadline_is_fatal_and_only_actual_peer_stages_are_collectible',
-          }
-          element_keys = {
-              'official_image', 'browser_identity', 'browser_presynced', 'browser_roster',
-              'browser_video', 'browser_audio', 'browser_leave', 'native_presynced_baseline',
-              'native_roster', 'native_audio', 'native_video', 'native_departure',
-          }
-          step_ids = {
-              'unlock-disposable-keyring', 'vault-store', 'vault-read', 'vault-clear',
-              'acceptance-process-containment', 'local_matrix_env-up',
-              'local_matrix_rtc-up', 'local_matrix_rtc-probe', 'local_matrix_rtc-rtc-fixture',
-              'element-call-rc-sticky2025-presynced', 'element-fixture-down',
-              'local_matrix_rtc-down', 'local_matrix_env-down',
-              'verify-fixture-container-cleanup', 'verify-fixture-network-cleanup',
-          }
+          required_ids_sha256 = '07ccbd74acd25b5699d094a4a6cbbb287bf35f2ffe28ed4330ff7ec1c3c20283'
           def unique_object(pairs):
               result = {}
               for key, value in pairs:
@@ -876,138 +916,39 @@ jobs:
                           records.append(json.loads(line[len(prefix):], object_pairs_hook=unique_object))
                       except (ValueError, TypeError): return None
               return records[0] if len(records) == 1 and type(records[0]) is dict else None
-          def exact_true_map(value, names):
-              return type(value) is dict and set(value) == names and all(item is True for item in value.values())
           def helper_evidence(output):
-              row = report_record(output, 'MORPHEUS_ELEMENT_FOCUSED_HELPERS ')
-              return (row is not None and set(row) == {'tests_run', 'zero_skips_xfails', 'required_methods', 'complete'}
-                  and type(row.get('tests_run')) is int and row['tests_run'] == 3
+              row = report_record(output, 'MORPHEUS_INSTALLED_TIMELINE_HELPERS ')
+              return (row is not None and set(row) == {'tests_run', 'zero_skips_xfails', 'required_ids_sha256', 'complete'}
+                  and type(row.get('tests_run')) is int and row['tests_run'] == 193
                   and row.get('zero_skips_xfails') is True and row.get('complete') is True
-                  and exact_true_map(row.get('required_methods'), helper_ids))
-          def element_evidence(output):
-              row = report_record(output, 'MORPHEUS_ELEMENT_FOCUSED_RESULT ')
-              return (row is not None and set(row) == {
-                      'complete', 'initial_absence_proved', 'ordered_steps', 'shared_cleanup_complete',
-                      'element_checks', 'exact_native_test', 'exact_native_test_required', 'full_acceptance'}
-                  and row.get('complete') is True and row.get('initial_absence_proved') is True
-                  and row.get('shared_cleanup_complete') is True and row.get('full_acceptance') is False
-                  and row.get('exact_native_test_required') is True
-                  and row.get('exact_native_test') == 'element_call_browser_peer_encrypted_media_and_departure'
-                  and exact_true_map(row.get('ordered_steps'), step_ids)
-                  and exact_true_map(row.get('element_checks'), element_keys))
-          def native_compile_evidence(output):
-              # Same existing Element test target, built without executing it.
-              # Keep generated paths private and require one actual test artifact.
-              if len(output) > 64 * 1024 * 1024: return False
-              artifacts = []
-              for line in output.splitlines():
-                  if not line.startswith('{'): continue
-                  if len(line) > 1024 * 1024: return False
-                  try: row = json.loads(line, object_pairs_hook=unique_object)
-                  except (ValueError, TypeError): return False
-                  if type(row) is not dict: continue
-                  target = row.get('target'); profile = row.get('profile')
-                  if (row.get('reason') != 'compiler-artifact' or type(target) is not dict
-                      or target.get('name') != 'element_call_peer' or type(profile) is not dict
-                      or profile.get('test') is not True): continue
-                  if target.get('kind') != ['test'] or type(row.get('executable')) is not str:
-                      return False
-                  try:
-                      candidate = pathlib.Path(row['executable'])
-                      target_root = workspace / 'target'
-                      if not candidate.is_absolute() or not candidate.is_relative_to(target_root): return False
-                      if any(part in ('.', '..') for part in candidate.relative_to(target_root).parts): return False
-                      parent = workspace
-                      for component in candidate.relative_to(workspace).parts[:-1]:
-                          parent = parent / component
-                          info = parent.lstat()
-                          if not stat.S_ISDIR(info.st_mode): return False
-                      info = candidate.lstat()
-                      if not stat.S_ISREG(info.st_mode) or not info.st_mode & stat.S_IXUSR: return False
-                      artifacts.append(candidate)
-                  except (OSError, ValueError, TypeError): return False
-              return len(artifacts) == 1
-          # Existing closed inner stage/failure diagnostics; no exception or raw line leaves this process.
-          element_stages = {
-              'configuration', 'tool_install', 'browser_install', 'native_test_build', 'media_fixture',
-              'browser_launch', 'browser_login', 'browser_identity', 'browser_room_sync', 'native_join_wait',
-              'browser_join', 'browser_roster', 'browser_receive_video', 'browser_receive_audio',
-              'native_media_wait', 'browser_leave', 'element_fixture_root', 'element_configuration',
-              'element_image_pull', 'element_image_verify', 'element_container_create',
-              'element_container_start', 'element_ready', 'element_cleanup', 'native_test', 'log_scan', 'complete',
-          }
-          element_failures = {'fixture_operation', 'browser_acceptance', 'native_acceptance', 'deadline', 'evidence', 'log_scan'}
-          def failure_evidence(output):
-              result = {}
-              if len(output) > 4 * 1024 * 1024: return result
-              for line in output.splitlines():
-                  if not line.startswith('{') or len(line) > 16384: continue
-                  try: row = json.loads(line, object_pairs_hook=unique_object)
-                  except (ValueError, TypeError): continue
-                  if type(row) is not dict or type(row.get('element_diagnostics')) is not dict: continue
-                  diagnostics = row['element_diagnostics']
-                  stage = diagnostics.get('stage'); failure = diagnostics.get('failure')
-                  if type(stage) is str and stage in element_stages: result['stage'] = stage
-                  if type(failure) is str and failure in element_failures: result['failure'] = failure
-              return result
-          checks = [
-              ('element_changed_helpers', [sys.executable, '-I', '-B', '-c', helper_program], 300),
-              ('element_native_target_compile', ['cargo', 'test', '--locked', '-p', 'morpheus-rtc',
-                  '--features', 'native-devices', '--test', 'element_call_peer', '--no-run', '--message-format=json'], 40 * 60),
-              ('element_stock_presynced', ['dbus-run-session', '--', sys.executable, '-I', '-B', '-c', focused_program, str(scanner)], 56 * 60),
-          ]
-          all_passed = True
-          for name, args, seconds in checks:
-              if not all_passed:
-                  print(json.dumps({'check': name, 'status': 'not_run', 'reason': 'dependency_failed',
-                      'source': source, 'focused_element_only': True, 'raw_logs_public': False}, sort_keys=True), flush=True)
-                  continue
-              if not tracked_intact() or not scanner_intact():
-                  print(json.dumps({'check': name, 'status': 'failed', 'reason': 'input_or_scanner_integrity_failed',
-                      'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
-                  raise SystemExit(1)
-              result = bounded(args, name, seconds)
-              if result['reason'] == 'cleanup_failed':
-                  print(json.dumps({'check': name, 'status': 'failed', 'reason': 'cleanup_failed',
-                      'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
-                  raise SystemExit(1)
-              if not tracked_intact() or not scanner_intact():
-                  print(json.dumps({'check': name, 'status': 'failed', 'reason': 'input_or_scanner_integrity_failed',
-                      'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
-                  raise SystemExit(1)
-              if not scan_captured(result, name):
-                  print(json.dumps({'check': name, 'status': 'failed', 'reason': 'private_log_scan_failed',
-                      'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
-                  raise SystemExit(1)
-              output = result['captured'].decode('utf-8', errors='replace')
-              command_ok = result['reason'] is None and result['code'] == 0
-              if name == 'element_changed_helpers':
-                  complete = helper_evidence(output)
-              elif name == 'element_native_target_compile':
-                  complete = native_compile_evidence(output)
-              else:
-                  complete = element_evidence(output)
-              passed = command_ok and complete
-              record = {
-                  'check': name, 'status': 'passed' if passed else 'failed', 'source': source,
-                  'reason': result['reason'], 'exit_code': result['code'], 'log_bytes': result['bytes'],
-                  'complete': complete, 'focused_element_only': True, 'full_acceptance': False,
-                  'raw_logs_public': False, 'real_accounts': False, 'physical_devices': False,
-                  'installed_app': False, 'packages_uploaded': False,
-              }
-              if name == 'element_changed_helpers':
-                  record['required_methods'] = {key: passed for key in sorted(helper_ids)}
-                  record['tests_required'] = 3
-              elif name == 'element_native_target_compile':
-                  record['test_target'] = 'element_call_peer'
-                  record['features'] = 'native-devices'
-                  record['compile_only'] = True
-                  record['one_test_artifact'] = complete
-              else:
-                  record['element_checks'] = {key: passed for key in sorted(element_keys)}
-                  record['exact_native_test_required'] = 'element_call_browser_peer_encrypted_media_and_departure'
-                  record['bootstrap_and_cleanup'] = {key: passed for key in sorted(step_ids)}
-                  if not passed: record['element_diagnostics'] = failure_evidence(output)
-              print(json.dumps(record, sort_keys=True), flush=True)
-              all_passed = all_passed and passed
-          if not all_passed: raise SystemExit(1)
+                  and row.get('required_ids_sha256') == required_ids_sha256)
+          name = 'installed_menu_timeline_helpers'
+          if not tracked_intact() or not scanner_intact():
+              print(json.dumps({'check': name, 'status': 'failed', 'reason': 'input_or_scanner_integrity_failed',
+                  'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
+              raise SystemExit(1)
+          result = bounded([sys.executable, '-I', '-B', '-c', helper_program], name, 300)
+          if result['reason'] == 'cleanup_failed':
+              print(json.dumps({'check': name, 'status': 'failed', 'reason': 'cleanup_failed',
+                  'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
+              raise SystemExit(1)
+          if not tracked_intact() or not scanner_intact():
+              print(json.dumps({'check': name, 'status': 'failed', 'reason': 'input_or_scanner_integrity_failed',
+                  'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
+              raise SystemExit(1)
+          if not scan_captured(result, name):
+              print(json.dumps({'check': name, 'status': 'failed', 'reason': 'private_log_scan_failed',
+                  'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
+              raise SystemExit(1)
+          output = result['captured'].decode('utf-8', errors='replace')
+          complete = helper_evidence(output)
+          passed = result['reason'] is None and result['code'] == 0 and complete
+          print(json.dumps({
+              'check': name, 'status': 'passed' if passed else 'failed', 'source': source,
+              'reason': result['reason'], 'exit_code': result['code'], 'log_bytes': result['bytes'],
+              'tests_required': 193, 'required_ids_sha256': required_ids_sha256,
+              'complete': complete, 'helper_only': True, 'raw_logs_public': False,
+              'native_build': False, 'installed_app': False, 'peer_fixture': False,
+              'packages_uploaded': False,
+          }, sort_keys=True), flush=True)
+          if not passed: raise SystemExit(1)
