@@ -70,7 +70,7 @@ when call services are unavailable.
 | Area | Implemented | Still required for beta |
 | --- | --- | --- |
 | Voice/video | Native encrypted transport, participant roster, mute/deafen, audio-device selection, reconnect handling and camera controls. | Reliable camera startup, received video in the native stage, physical routing/permissions/unplug and all-platform runtime acceptance. |
-| Incoming calls | Call-and-notify, bounded incoming offers, account-bound Answer/Dismiss and a native ringtone. | Live UI Answer, audible output, incoming OS alerts and protocol decline. |
+| Incoming calls | Call-and-notify, bounded incoming offers, account-bound Answer, a one-attempt protocol Decline, local-only Dismiss, a native ringtone and silent desktop alerts for the active account. | Live UI Answer and Decline, audible output, desktop alerts across all platforms and declines from other devices. |
 | Voice spaces | Shared/local room designation, navigation, participant roster and quiet join. | Complete drop-in UI behavior across platforms. |
 | Screen sharing | Window/display selection, Start/Stop controls and encrypted picture transport alongside microphone audio. | Remote unpublish after Stop, native received tiles, packaged permissions and cross-platform interoperability. |
 

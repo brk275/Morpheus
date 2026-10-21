@@ -4144,6 +4144,8 @@ export component AppWindow inherits Window {
     in-out property <[IncomingCallItem]> incoming-call-offers;
     in-out property <string> incoming-call-account-id;
     in-out property <bool> incoming-call-answering: false;
+    // One protocol Decline is being sent; cleared only by its settled outcome.
+    in-out property <bool> incoming-call-declining: false;
     in-out property <string> incoming-call-notice;
     in-out property <string> incoming-call-sound-status;
     in-out property <bool> native-call-joined: false;
@@ -4773,7 +4775,10 @@ export component AppWindow inherits Window {
     callback preview-demo-ready();
     callback toggle-stress-timeline();
     callback answer-incoming-call(string);
+    // Local only: removes the offer on this device and tells nobody.
     callback dismiss-incoming-call(string);
+    // Sends one protocol decline to the caller (incoming_ring::ui).
+    callback decline-incoming-call(string);
     callback start-native-call();
     callback notify-native-call();
     callback end-native-call();
@@ -6760,7 +6765,18 @@ export component AppWindow inherits Window {
                                         border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.6;
                                         background: root.control-fill(self.has-hover, self.has-pressed, root.canvas);
                                         focus-color: root.accent;
-                                        label: "Dismiss call from " + offer.caller + " in " + offer.room;
+                                        label: "Decline call from " + offer.caller + " in " + offer.room + "; tells the caller";
+                                        enabled: !root.incoming-call-declining && !root.incoming-call-answering;
+                                        activated => { root.decline-incoming-call(offer.token); }
+                                        Text { text: "Decline"; color: root.ink; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    ActionRect {
+                                        width: 110px;
+                                        height: 32px * root.text-scale;
+                                        border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.6;
+                                        background: root.control-fill(self.has-hover, self.has-pressed, root.canvas);
+                                        focus-color: root.accent;
+                                        label: "Dismiss call from " + offer.caller + " in " + offer.room + " on this device only";
                                         activated => { root.dismiss-incoming-call(offer.token); }
                                         Text { text: "Dismiss"; color: root.ink; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                                     }

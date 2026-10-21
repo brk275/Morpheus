@@ -14,6 +14,9 @@
 //!   withdrawal via `CloseNotification`.
 //! - macOS (Notification Center): click activation; no withdrawal API.
 //! - Windows (toast): click activation while the toast exists; no withdrawal API.
+//!
+//! A guarded show (`show_guarded`, incoming calls only) also checks its
+//! caller's handover right before the backend's actual send; see `Handover`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -36,24 +39,31 @@ pub(super) fn listeners_full() -> bool {
     LISTENERS.load(Ordering::Acquire) >= MAX_LISTENERS
 }
 
+/// What a banner's listener reports for its token. Shared with other
+/// Morpheus surfaces through `notifications` (incoming calls), each of which
+/// gives the presenter its own event channel and token space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PresenterEvent {
+pub(crate) enum PresenterEvent {
     Activated(u64),
     Closed(u64),
+    /// The backend failed the send it was handed: only a guarded macOS
+    /// listener, where the send is inside the wait, reports this.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Failed(u64),
 }
 
 /// Closes one shown banner. Dropping it leaves the banner in place.
 #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
-pub(super) struct Withdrawal(tokio::sync::oneshot::Sender<()>);
+pub(crate) struct Withdrawal(tokio::sync::oneshot::Sender<()>);
 
 impl Withdrawal {
-    pub(super) fn withdraw(self) {
+    pub(crate) fn withdraw(self) {
         let _ = self.0.send(());
     }
 
     /// A handle, and what its banner's listener would receive.
     #[cfg(test)]
-    pub(super) fn for_test() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+    pub(crate) fn for_test() -> (Self, tokio::sync::oneshot::Receiver<()>) {
         let (send, receive) = tokio::sync::oneshot::channel();
         (Self(send), receive)
     }
@@ -111,6 +121,35 @@ fn report(events: &mpsc::Sender<PresenterEvent>, token: u64, was_activated: bool
     });
 }
 
+/// A guarded macOS send failed. Bounded like `report`.
+#[cfg(target_os = "macos")]
+fn report_failure(events: &mpsc::Sender<PresenterEvent>, token: u64) {
+    let _ = events.try_send(PresenterEvent::Failed(token));
+}
+
+/// Checked on the thread that hands a banner to the OS, right before the
+/// backend's actual send: `false` refuses it. It may block for a bounded time
+/// (the caller's own sample of the window), so it never runs on the UI thread.
+/// Linux and Windows send inside `Notification::show`, so the check precedes
+/// that call. The macOS backend sends only when its handle is waited on or
+/// dropped, so there the check runs in the listener thread right before the
+/// wait, a refused banner never builds a handle that a drop would send, and a
+/// banner with no free listener fails instead of being sent unobserved. Only
+/// the incoming-call banners (incoming_ring::desktop) pass one; message
+/// banners are shown as before.
+pub(crate) type Handover = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// What a guarded show did.
+pub(crate) enum Guarded {
+    /// The handover check failed before anything reached the OS.
+    Refused,
+    /// Handed to the backend. A withdrawal handle comes back only on Linux,
+    /// and only when a listener slot was reserved and its thread started; no
+    /// other banner can be withdrawn. On macOS it was handed to its listener,
+    /// which sends it only once the handover check passes there, or never.
+    Handed(Option<Withdrawal>),
+}
+
 /// Hand one banner to the OS. Blocking; call from a blocking worker. Returns
 /// a withdrawal handle where the platform supports closing it.
 pub(super) fn show(
@@ -119,8 +158,37 @@ pub(super) fn show(
     events: mpsc::Sender<PresenterEvent>,
     runtime: Handle,
 ) -> Result<Option<Withdrawal>, String> {
+    match present(plan, token, events, runtime, None)? {
+        Guarded::Handed(withdrawal) => Ok(withdrawal),
+        Guarded::Refused => Ok(None),
+    }
+}
+
+/// `show`, checking `handover` at the actual send (see `Handover`). Blocking;
+/// call from a blocking thread.
+#[cfg(feature = "native-calls")]
+pub(super) fn show_guarded(
+    plan: PlannedNotification,
+    token: u64,
+    events: mpsc::Sender<PresenterEvent>,
+    runtime: Handle,
+    handover: Handover,
+) -> Result<Guarded, String> {
+    present(plan, token, events, runtime, Some(handover))
+}
+
+fn present(
+    plan: PlannedNotification,
+    token: u64,
+    events: mpsc::Sender<PresenterEvent>,
+    runtime: Handle,
+    handover: Option<Handover>,
+) -> Result<Guarded, String> {
     let mut notification = Notification::new();
     notification.summary(&plan.summary).body(&plan.body);
+    // Linux and Windows: the send is inside `show`, right after this.
+    #[cfg(not(target_os = "macos"))]
+    let refused = || handover.as_ref().is_some_and(|handover| !handover());
 
     #[cfg(target_os = "macos")]
     {
@@ -136,6 +204,43 @@ pub(super) fn show(
         if plan.sound {
             // The macOS backend reserves this exact name for the system sound.
             notification.sound_name("NSUserNotificationDefaultSoundName");
+        }
+        if let Some(handover) = handover {
+            // A guarded banner is sent only by a listener that can report its
+            // result. With none free it fails closed before any handle exists:
+            // a handle dropped here would send without a result to observe.
+            let Some(listener) = Listener::reserve() else {
+                return Err("no free listener".into());
+            };
+            // The notification moves into the listener unsent. On spawn
+            // failure it is dropped as plain data: no handle, no send.
+            return std::thread::Builder::new()
+                .name("morpheus-notification".into())
+                .spawn(move || {
+                    let _listener = listener;
+                    // The actual send is inside wait_for_response. Refused
+                    // here, no handle is built, so no drop sends it either.
+                    if !handover() {
+                        return;
+                    }
+                    let Ok(handle) = notification.show() else {
+                        report_failure(&events, token);
+                        return;
+                    };
+                    let mut was_activated = false;
+                    let sent = handle.wait_for_response(|response: &NotificationResponse| {
+                        was_activated = activated(response);
+                    });
+                    // The send is inside that wait: its error is reported,
+                    // never ignored.
+                    if sent.is_ok() {
+                        report(&events, token, was_activated);
+                    } else {
+                        report_failure(&events, token);
+                    }
+                })
+                .map(|_| Guarded::Handed(None))
+                .map_err(|_| "no listener thread".to_owned());
         }
         // This backend delivers when the handle is waited on or dropped.
         let handle = notification.show().map_err(|error| error.to_string())?;
@@ -153,7 +258,7 @@ pub(super) fn show(
                     report(&events, token, was_activated);
                 });
         }
-        Ok(None)
+        Ok(Guarded::Handed(None))
     }
     #[cfg(target_os = "windows")]
     {
@@ -161,6 +266,9 @@ pub(super) fn show(
         notification.app_id("io.github.brk275.morpheus");
         if plan.sound {
             notification.sound_name("IM");
+        }
+        if refused() {
+            return Ok(Guarded::Refused);
         }
         let handle = notification.show().map_err(|error| error.to_string())?;
         if let Some(listener) = Listener::reserve() {
@@ -175,7 +283,7 @@ pub(super) fn show(
                     report(&events, token, was_activated);
                 });
         }
-        Ok(None)
+        Ok(Guarded::Handed(None))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -189,9 +297,12 @@ pub(super) fn show(
         } else {
             notification.hint(notify_rust::Hint::SuppressSound(true));
         }
+        if refused() {
+            return Ok(Guarded::Refused);
+        }
         let handle = notification.show().map_err(|error| error.to_string())?;
         let Some(listener) = Listener::reserve_within(LISTENER_WAIT) else {
-            return Ok(None);
+            return Ok(Guarded::Handed(None));
         };
         let (withdraw, withdrawn) = tokio::sync::oneshot::channel::<()>();
         let spawned = std::thread::Builder::new()
@@ -211,6 +322,6 @@ pub(super) fn show(
                 });
                 report(&events, token, was_activated);
             });
-        Ok(spawned.ok().map(|_| Withdrawal(withdraw)))
+        Ok(Guarded::Handed(spawned.ok().map(|_| Withdrawal(withdraw))))
     }
 }

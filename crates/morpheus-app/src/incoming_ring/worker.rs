@@ -4,7 +4,8 @@
 
 use super::{
     controller::{
-        AcceptedOffer, ControllerFailure, IncomingController, InvalidationHandle, OfferPresentation,
+        AcceptedOffer, ControllerFailure, DeclineClaim, IncomingController, InvalidationHandle,
+        OfferPresentation,
     },
     membership_envelope,
 };
@@ -183,6 +184,10 @@ enum Command {
     Dismiss {
         key: String,
     },
+    Decline {
+        key: String,
+        reply: oneshot::Sender<Result<DeclineClaim, ControllerFailure>>,
+    },
 }
 #[derive(Clone)]
 pub(crate) struct IncomingHandle {
@@ -219,6 +224,19 @@ impl IncomingHandle {
         self.commands
             .try_send(Command::Dismiss { key })
             .map_err(|_| ControllerFailure::Capacity)
+    }
+    /// Takes the offer for one explicit Decline; the caller makes the bounded
+    /// send off the actor. A dropped reply drops and revokes the claim.
+    pub(crate) async fn decline(&self, key: String) -> Result<DeclineClaim, ControllerFailure> {
+        require_key(&key)?;
+        if self.gate.current().is_none() {
+            return Err(ControllerFailure::Unavailable);
+        }
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .try_send(Command::Decline { key, reply })
+            .map_err(|_| ControllerFailure::Capacity)?;
+        result.await.map_err(|_| ControllerFailure::Unavailable)?
     }
 }
 fn require_key(key: &str) -> Result<(), ControllerFailure> {
@@ -472,6 +490,14 @@ fn dispatch(command: Command, controller: &mut IncomingController, gate: &Gate) 
         Command::Dismiss { key } => {
             if let Some(token) = lookup(&offers, &key) {
                 let _ = controller.dismiss(token);
+            }
+        }
+        Command::Decline { key, reply } => {
+            if !reply.is_closed() {
+                let result = lookup(&offers, &key)
+                    .ok_or(ControllerFailure::Stale)
+                    .and_then(|token| controller.decline(token));
+                let _ = reply.send(result); // Dropped receiver drops/revokes DeclineClaim.
             }
         }
     }
@@ -1085,6 +1111,22 @@ mod tests {
         assert!(
             send.try_send(Command::Dismiss {
                 key: "incoming-2".into()
+            })
+            .is_err()
+        );
+        drop(receive.recv().await);
+        assert!(result.await.is_err());
+        // A Decline command is bounded the same way: an unhandled command
+        // drops its reply, so its waiter wakes with no claim and sends nothing.
+        let (reply, result) = oneshot::channel();
+        send.try_send(Command::Decline {
+            key: "incoming-3".into(),
+            reply,
+        })
+        .unwrap_or_else(|_| panic!("decline command failed"));
+        assert!(
+            send.try_send(Command::Dismiss {
+                key: "incoming-4".into()
             })
             .is_err()
         );

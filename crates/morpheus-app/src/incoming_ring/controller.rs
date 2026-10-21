@@ -1,4 +1,4 @@
-//! Bounded offer ownership and single-use Answer authorization.
+//! Bounded offer ownership and single-use Answer and Decline authorization.
 //!
 //! No discovery task, UI callback, slot write or media operation lives here.
 //! The bounded worker supplies retained sync event IDs and cached change hints;
@@ -8,7 +8,7 @@
 //! reviewed; real controller, watcher and media acceptance is still pending.
 
 use super::{
-    AdmissionFailure, IncomingOffer,
+    AdmissionFailure, DeclineOutcome, IncomingOffer,
     ledger::{OfferKey, OfferLedger},
 };
 use crate::voice_spaces::VoiceSpaces;
@@ -193,6 +193,9 @@ enum Phase {
     Ready,
     Joining,
     Established,
+    /// One explicit Decline owns the offer: no Answer, no ringing, and it
+    /// stays pending only until its scope or deadline ends.
+    Declining,
     Revoked,
 }
 struct LeaseState {
@@ -241,7 +244,7 @@ impl Lease {
             && now < state.deadline
             && matches!(
                 state.phase,
-                Phase::Offered | Phase::Reserved | Phase::Ready | Phase::Joining
+                Phase::Offered | Phase::Reserved | Phase::Ready | Phase::Joining | Phase::Declining
             )
     }
     fn advance(
@@ -471,6 +474,35 @@ impl IncomingController {
         self.retire(&pending.payload);
         Ok(())
     }
+    /// Explicit protocol Decline. Consumes the token synchronously, retires
+    /// its ledger key (the offer is never shown or answered again) and stops
+    /// its ringing, keeping the offer under its original lease, epoch and
+    /// selection. Nothing is sent here: DeclineClaim::send makes the one
+    /// bounded attempt, and dropping the claim revokes it.
+    pub(crate) fn decline(
+        &mut self,
+        token: ActionToken,
+    ) -> Result<DeclineClaim, ControllerFailure> {
+        self.reap();
+        let pending = self.book.take(token)?;
+        self.retire(&pending.payload);
+        if let Err(failure) = pending.lease.advance(
+            &self.signal,
+            Instant::now(),
+            pending.payload.selection.is_current(),
+            Phase::Offered,
+            Phase::Declining,
+            pending.payload.deadline(),
+        ) {
+            pending.lease.revoke();
+            return Err(failure);
+        }
+        Ok(DeclineClaim {
+            offer: pending.payload,
+            lease: pending.lease,
+            signal: Arc::clone(&self.signal),
+        })
+    }
     /// Retained for explicit diagnostics only. The live worker uses cached
     /// hints: cancelling this network pass would revoke an offer being answered.
     #[allow(dead_code)]
@@ -560,6 +592,62 @@ impl Drop for WorkGuard {
         if !self.complete {
             self.lease.revoke();
         }
+    }
+}
+
+/// One explicit Decline's single-use ownership of an offer, out of the book.
+/// It keeps the click's original offer (account, room, notification, receipt
+/// generation, selection) and lease. Dropping it, for example when its UI
+/// task is aborted at shutdown, revokes the lease; nothing is queued or
+/// retried afterwards.
+pub(crate) struct DeclineClaim {
+    offer: IncomingOffer,
+    lease: Arc<Lease>,
+    signal: Arc<Signal>,
+}
+impl fmt::Debug for DeclineClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeclineClaim { .. }")
+    }
+}
+impl Drop for DeclineClaim {
+    fn drop(&mut self) {
+        self.lease.revoke();
+    }
+}
+impl DeclineClaim {
+    pub(crate) fn selection(&self) -> &AccountSelection {
+        &self.offer.selection
+    }
+    /// The one bounded attempt. `allowed` is the click's own fence (its
+    /// security generation); with the lease, epoch and original selection it
+    /// is checked before the trust check, the fetch and the send. The scope
+    /// ending (account switch, lock, removal, policy change, worker stop,
+    /// expiry) cancels the attempt: before the send that is NotSent, during
+    /// it Unknown. Never reacquires authority.
+    pub(crate) async fn send(
+        mut self,
+        manager: &AccountManager,
+        preferences: &VoiceSpaces,
+        allowed: impl Fn() -> bool + Send + Sync,
+    ) -> DeclineOutcome {
+        let selection = self.offer.selection.clone();
+        let lease = Arc::clone(&self.lease);
+        let signal = Arc::clone(&self.signal);
+        let sending = AtomicBool::new(false);
+        let current =
+            || allowed() && lease.pending(&signal, Instant::now(), selection.is_current());
+        let outcome = tokio::select! {
+            biased;
+            _ = wait_invalid(&lease, &signal, &selection) => None,
+            outcome = self.offer.decline(manager, preferences, current, &sending) => Some(outcome),
+        };
+        self.lease.revoke();
+        outcome.unwrap_or(if sending.load(Ordering::Acquire) {
+            DeclineOutcome::Unknown
+        } else {
+            DeclineOutcome::NotSent
+        })
     }
 }
 
@@ -1121,6 +1209,60 @@ mod tests {
             drop(offer);
             require_owned(waiting);
         };
+    }
+
+    /// A Decline owns its offer exclusively: taking it stops the ringing at
+    /// once, Answer can no longer reserve or join it, and it stays pending
+    /// only while its account, epoch and deadline last. Its cancellation
+    /// fence resolves when the scope ends, so an attempt still before its
+    /// send reports NotSent rather than sending later.
+    #[tokio::test]
+    async fn a_decline_claim_excludes_answer_and_ends_with_its_scope() {
+        fn require_send<T: Send>() {}
+        fn require_send_future<F: Future + Send>(_: &F) {}
+        require_send::<DeclineClaim>();
+        let _check = |claim: DeclineClaim, manager: &AccountManager, preferences: &VoiceSpaces| {
+            let attempt = claim.send(manager, preferences, || true);
+            require_send_future(&attempt);
+        };
+
+        let (signal, lease, now) = setup();
+        advance(&lease, &signal, now, Phase::Offered, Phase::Declining).unwrap();
+        assert!(
+            !lease.audible.current(true, true, now),
+            "declining stops its ringing"
+        );
+        assert!(lease.pending(&signal, now, true));
+        for (from, to) in [
+            (Phase::Offered, Phase::Reserved),
+            (Phase::Reserved, Phase::Ready),
+            (Phase::Ready, Phase::Joining),
+            (Phase::Joining, Phase::Established),
+        ] {
+            assert_eq!(
+                advance(&lease, &signal, now, from, to),
+                Err(ControllerFailure::Stale),
+                "Answer cannot take a declining offer"
+            );
+        }
+        assert!(!lease.established(&signal, true));
+        assert!(wait_scope_invalid(&lease, &signal).now_or_never().is_none());
+        // Account switch, expiry and invalidation each end it.
+        assert!(!lease.pending(&signal, now, false));
+        assert!(!lease.pending(&signal, now + Duration::from_secs(30), true));
+        InvalidationHandle(signal.clone()).invalidate();
+        assert!(!lease.pending(&signal, now, true));
+        assert!(wait_scope_invalid(&lease, &signal).now_or_never().is_some());
+
+        // A dropped or finished claim's lease is revoked for good.
+        let (signal, lease, now) = setup();
+        advance(&lease, &signal, now, Phase::Offered, Phase::Declining).unwrap();
+        lease.revoke();
+        assert!(!lease.pending(&signal, now, true));
+        assert_eq!(
+            advance(&lease, &signal, now, Phase::Offered, Phase::Reserved),
+            Err(ControllerFailure::Stale)
+        );
     }
 
     #[test]

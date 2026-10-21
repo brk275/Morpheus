@@ -239,8 +239,11 @@ device switches and the call-ring separation remain to be accepted.
 
 [Incoming-call sounds](INCOMING_CALLS.md) use a separate native speaker path
 and the same local enabled/sounds preferences. They do not yet integrate with
-system Focus/Do Not Disturb or produce incoming-call OS banners. Their native
-tests and actual device behavior remain unverified.
+system Focus/Do Not Disturb. Their native tests and actual device behavior
+remain unverified. Each admitted incoming call also shows one silent banner
+through this presenter ([desktop alert](INCOMING_CALLS.md#desktop-alert)):
+it follows the enabled switches and the room-and-sender privacy above, adds no
+sound, and its click only brings the window back.
 
 Notifications are delivered by the running desktop process. Morpheus does not
 install a background notification helper or register a push endpoint, so a

@@ -2126,6 +2126,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         notifications.clone(),
         runtime.handle().clone(),
     );
+    // One silent desktop banner per admitted incoming call of the account on
+    // screen; a click only brings the window back (incoming_ring::desktop).
+    #[cfg(feature = "native-calls")]
+    let call_banners = incoming_ring::desktop::CallBanners::start(
+        &ui,
+        runtime.handle(),
+        incoming_calls.offers(),
+        live.clone(),
+        notifications.clone(),
+    );
 
     let watch = store.watch_with_theme(Duration::from_millis(700));
     let weak = ui.as_weak();
@@ -4659,6 +4669,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]
     voice_presence.shutdown(&ui);
+    // Before the incoming worker and notifications: no call banner outlives
+    // them, and those the platform can withdraw are withdrawn.
+    #[cfg(feature = "native-calls")]
+    call_banners.shutdown();
     #[cfg(feature = "native-calls")]
     incoming_calls.shutdown();
     notifications.shutdown();

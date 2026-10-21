@@ -34,7 +34,11 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-use self::presenter::{PresenterEvent, Withdrawal};
+// The presenter's report and withdrawal handle, for the one other surface
+// that shows banners through it (incoming calls, see `show_silent_banner`).
+#[cfg(feature = "native-calls")]
+pub(crate) use self::presenter::{Guarded, Handover};
+pub(crate) use self::presenter::{PresenterEvent, Withdrawal};
 use crate::{AppWindow, navigation_target::NavigationTarget};
 
 const MAX_NOTIFICATION_AGE: Duration = Duration::from_secs(5 * 60);
@@ -164,6 +168,64 @@ fn privacy_ceiling(config: &mut Config, private: bool) {
         config.notifications.show_message_preview = false;
     }
 }
+
+/// Sign-in, the app password, Manage accounts or a recovery key is on screen
+/// (see `UiSnapshot::private`). UI thread only.
+pub(crate) fn private_screen(ui: &AppWindow) -> bool {
+    ui.get_show_sign_in()
+        || ui.get_access_open()
+        || ui.get_manage_accounts_open()
+        || !ui.get_security_recovery_key().is_empty()
+}
+
+/// Whether a silent banner of another surface (an incoming call) may show
+/// for `account_id`, and if so whether it may name more than the account:
+/// `None` while notifications are off globally or for the account, never more
+/// than the account on a private screen or with room and sender hidden.
+#[cfg(feature = "native-calls")]
+fn silent_identity(config: &Config, account_id: &str, private: bool) -> Option<bool> {
+    let mut config = config.clone();
+    privacy_ceiling(&mut config, private);
+    config
+        .notifications_enabled_for(account_id)
+        .then_some(config.notifications.show_room_and_sender)
+}
+
+/// The text of an incoming call's banner: always its account, the caller's
+/// name only with `identity`, and never a room, event or anything the call
+/// says. Bounded plain text, made safe like this module's own banners.
+#[cfg(feature = "native-calls")]
+pub(crate) fn call_banner_text(
+    account_user_id: &str,
+    caller_user_id: &str,
+    identity: bool,
+) -> (String, String) {
+    let account = safe_text(account_user_id, 64);
+    let summary = format!("Incoming call · {account}");
+    let body = if identity {
+        let caller = safe_text(sender_localpart(caller_user_id), 48);
+        format!("{caller} is calling")
+    } else {
+        "Open Morpheus to see the call".to_owned()
+    };
+    (summary, body)
+}
+
+/// A banner another surface hands to the presenter: bounded plain text,
+/// and never a sound of its own.
+#[cfg(feature = "native-calls")]
+fn silent_plan(summary: &str, body: &str) -> PlannedNotification {
+    PlannedNotification {
+        summary: safe_text(summary, MAX_TEXT_CHARS),
+        body: safe_text(body, MAX_TEXT_CHARS),
+        sound: false,
+    }
+}
+
+/// The OS took no banner. It carries no backend or server text.
+#[cfg(feature = "native-calls")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BannerUnavailable;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -503,6 +565,75 @@ impl DesktopNotifications {
         self.shown().withdrawable_rooms(account_id)
     }
 
+    /// For a silent banner of another surface (an incoming call) on
+    /// `account_id`: `None` while Morpheus is quitting or notifications are
+    /// off globally or for the account, else whether it may name more than
+    /// the account (`private`: a private screen is up). Read from the latest
+    /// valid configuration each time.
+    #[cfg(feature = "native-calls")]
+    pub(crate) fn silent_banner_identity(&self, account_id: &str, private: bool) -> Option<bool> {
+        if self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        silent_identity(&config, account_id, private)
+    }
+
+    /// Hand one silent banner of another surface (an incoming call) to the
+    /// OS through this module's presenter: the same pinned backends,
+    /// application identity, bounded listener slots and Linux withdrawal.
+    /// Nothing of it is recorded here; its listener reports `token` on
+    /// `events`, the caller's own channel and token space. `handover`, and
+    /// Morpheus not quitting, are checked right before the backend's actual
+    /// send (`presenter::Handover`); refused, nothing reaches the OS. With
+    /// every listener taken, this module's oldest withdrawable banner is
+    /// withdrawn first, as for its own. Blocking: call from a blocking
+    /// thread, never from the async runtime's blocking pool.
+    #[cfg(feature = "native-calls")]
+    pub(crate) fn show_silent_banner(
+        self: &Arc<Self>,
+        summary: &str,
+        body: &str,
+        token: u64,
+        events: mpsc::Sender<PresenterEvent>,
+        runtime: Handle,
+        handover: Handover,
+    ) -> Result<Guarded, BannerUnavailable> {
+        if self.stopped.load(Ordering::Acquire) || !handover() {
+            return Ok(Guarded::Refused);
+        }
+        {
+            let mut shown = self.shown();
+            shown.prune(Instant::now());
+            if presenter::listeners_full() {
+                shown.withdraw_oldest();
+            }
+        }
+        // Quitting is part of the handover, wherever the send happens.
+        let service = Arc::downgrade(self);
+        let checked: Handover = Arc::new(move || {
+            service
+                .upgrade()
+                .is_some_and(|service| !service.stopped.load(Ordering::Acquire))
+                && handover()
+        });
+        // The backend's error text is dropped here: it reaches no status or log.
+        let shown =
+            presenter::show_guarded(silent_plan(summary, body), token, events, runtime, checked)
+                .map_err(|_| BannerUnavailable)?;
+        match shown {
+            // Quitting meanwhile: withdrawn where the platform allows.
+            Guarded::Handed(Some(withdrawal)) if self.stopped.load(Ordering::Acquire) => {
+                withdrawal.withdraw();
+                Ok(Guarded::Handed(None))
+            }
+            shown => Ok(shown),
+        }
+    }
+
     fn shown(&self) -> std::sync::MutexGuard<'_, ShownBanners> {
         self.shown.lock().unwrap_or_else(|error| error.into_inner())
     }
@@ -531,10 +662,7 @@ impl DesktopNotifications {
                 } else {
                     None
                 };
-                let private = ui.get_show_sign_in()
-                    || ui.get_access_open()
-                    || ui.get_manage_accounts_open()
-                    || !ui.get_security_recovery_key().is_empty();
+                let private = private_screen(&ui);
                 let _ = send.send(UiSnapshot {
                     account_id,
                     live,
@@ -797,8 +925,9 @@ async fn resolve_presenter_events(
         };
         match event {
             PresenterEvent::Activated(token) => service.resolve_activation(token).await,
-            // A dismissed banner can no longer be opened or withdrawn.
-            PresenterEvent::Closed(token) => {
+            // A dismissed banner can no longer be opened or withdrawn. Message
+            // banners are never guarded, so their listeners report no failure.
+            PresenterEvent::Closed(token) | PresenterEvent::Failed(token) => {
                 let _ = service.shown().take(token, Instant::now());
             }
         }
@@ -1868,5 +1997,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.summary, "room name · @alice:example.org");
+    }
+
+    /// Incoming-call banners follow the explicit alert switches (global and
+    /// per-account `notifications_enabled`), name the caller only where room
+    /// and sender may be named and never on a private screen, and never carry
+    /// a sound of their own: incoming_ring::audio alone rings.
+    #[cfg(feature = "native-calls")]
+    #[test]
+    fn call_banners_follow_alert_and_privacy_settings_and_stay_silent() {
+        let mut config = Config::default();
+        config.notifications.sounds = true;
+        assert_eq!(silent_identity(&config, "alice", false), Some(true));
+        assert_eq!(silent_identity(&config, "alice", true), Some(false));
+        config.notifications.show_room_and_sender = false;
+        assert_eq!(silent_identity(&config, "alice", false), Some(false));
+        config.notifications.show_room_and_sender = true;
+        config
+            .account_overrides
+            .entry("alice".into())
+            .or_default()
+            .notifications_enabled = Some(false);
+        assert_eq!(silent_identity(&config, "alice", false), None);
+        assert_eq!(silent_identity(&config, "bob", false), Some(true));
+        config.notifications.enabled = false;
+        assert_eq!(silent_identity(&config, "bob", false), None);
+
+        let (summary, body) = call_banner_text(
+            "@alice:example.org",
+            "@ca\u{202e}ller\u{200f}:example.org",
+            true,
+        );
+        assert_eq!(summary, "Incoming call · @alice:example.org");
+        assert_eq!(body, "caller is calling");
+        let (_, hidden) = call_banner_text("@alice:example.org", "@caller:example.org", false);
+        assert_eq!(hidden, "Open Morpheus to see the call");
+        let caller = format!("@{}:example.org", "x".repeat(400));
+        let (_, long) = call_banner_text("@alice:example.org", &caller, true);
+        assert_eq!(long, format!("{} is calling", "x".repeat(48)));
+        let plan = silent_plan(&summary, &format!("{body}\n<b>"));
+        assert!(!plan.sound);
+        assert_eq!(plan.body, "caller is calling ‹b›");
     }
 }
