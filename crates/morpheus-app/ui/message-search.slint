@@ -584,12 +584,13 @@ export component MessageSearchPanel inherits VerticalLayout {
             for item in root.context : context-row := Rectangle {
                 property <bool> target: item.event-id == root.selected-event-id;
                 property <bool> inked: context-row.target && root.palette.has-selection-ink;
-                min-height: 44px;
+                // Wrapped context messages must contribute to the scroll extent.
+                min-height: max(44px, context-body.min-height);
                 background: context-row.target ? root.palette.selection : root.palette.elevated;
                 border-radius: StyleTokens.radius * 0.7;
                 accessible-role: list-item;
                 accessible-label: (context-row.target ? "Matched message from " : "") + item.sender + ", " + item.time + ": " + item.body;
-                VerticalLayout {
+                context-body := VerticalLayout {
                     padding: 8px;
                     spacing: 3px;
                     Text {
