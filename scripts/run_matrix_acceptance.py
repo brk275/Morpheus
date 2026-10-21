@@ -366,7 +366,7 @@ MEDIA_ONLY_CHECKS = ("media_local",)
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
           "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
-          "app-timeline": APP_TIMELINE_ONLY_CHECKS}
+          "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1272,6 +1272,12 @@ class Acceptance:
                     output.write("Focused generated-window timeline checks: real Synapse and an ephemeral OS Secret Service. "
                                  "Only app-live-timeline ran, covering model delivery, stale callback rejection, member publication and cleanup. "
                                  "No draft recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
+                elif self.suite == "outgoing-ring":
+                    output.write("Focused encrypted invitation and incoming actor checks: real Synapse, "
+                                 "an ephemeral OS Secret Service and LiveKit, with fresh users and rooms "
+                                 "for Current/Sticky2025 and DM/room cases. "
+                                 "This is not full call, Element interoperability, UI, physical-device "
+                                 "or installed-package acceptance.\n\n")
                 elif self.suite == "media-only":
                     output.write("Focused encrypted media checks: real Synapse and an ephemeral OS Secret Service. "
                                  "Only media_local ran; this is not full acceptance. "
@@ -1351,6 +1357,14 @@ def main():
         acceptance.require_containment()
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "outgoing-ring":
+            def ring_checks():
+                acceptance.script("local_matrix_rtc", "up")
+                acceptance.script("local_matrix_rtc", "probe")
+                acceptance.outgoing_ring_cases()
+            acceptance.group(RING_LABELS, ring_checks)
+            acceptance.finish_checks()
+            return
         if args.suite == "app-timeline":
             acceptance.group(APP_TIMELINE_ONLY_CHECKS, lambda: acceptance.app_timeline(fixture))
             acceptance.finish_checks()
