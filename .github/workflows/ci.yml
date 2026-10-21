@@ -305,14 +305,7 @@ jobs:
               probe_root=private/'lifecycle-probe'; probe_root.mkdir(mode=0o700)
               ready=probe_root/'ready'; late=probe_root/'late'
               orphan_code="import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(2); pathlib.Path(sys.argv[2]).write_text('escaped'); time.sleep(30)"
-              parent_code="""import pathlib,subprocess,sys,time
-              child=subprocess.Popen([sys.executable,'-I','-c',sys.argv[1],sys.argv[2],sys.argv[3]],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True)
-              until=time.monotonic()+5
-              while not pathlib.Path(sys.argv[2]).exists():
-                  if time.monotonic()>=until: raise SystemExit(8)
-                  time.sleep(0.01)
-              sys.stdout.buffer.write(b'ready\\n'); sys.stdout.buffer.flush()
-              """
+              parent_code="import pathlib,subprocess,sys,time\nchild=subprocess.Popen([sys.executable,'-I','-c',sys.argv[1],sys.argv[2],sys.argv[3]],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True)\nuntil=time.monotonic()+5\nwhile not pathlib.Path(sys.argv[2]).exists():\n    if time.monotonic()>=until: raise SystemExit(8)\n    time.sleep(0.01)\nsys.stdout.buffer.write(b'ready\\n'); sys.stdout.buffer.flush()\n"
               normal=bounded([sys.executable,'-I','-c',parent_code,orphan_code,str(ready),str(late)],'owner-orphan-probe',15,1024)
               time.sleep(2.2)
               nonzero=bounded([sys.executable,'-I','-c','raise SystemExit(7)'],'owner-exit-probe',10,1024)
