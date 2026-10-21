@@ -172,8 +172,20 @@ fn a_held_jump_is_withdrawn_and_never_readopts_an_epoch() {
     let (_, clear) = matrix_links
         .split_once("pub(crate) fn clear(ui: &AppWindow) {")
         .unwrap();
-    let first = clear.lines().take(5).collect::<Vec<_>>().join("\n");
-    assert!(first.contains("crate::unread_navigation::withdraw_jump(ui);"));
+    // The entry forwards to the common retirement body; its withdrawal is
+    // unconditional and stays first, regardless of preceding documentation.
+    let clear = clear.split("\n}").next().unwrap();
+    assert!(clear.contains("clear_window_owners(ui);"));
+    let (_, owners) = matrix_links
+        .split_once("fn clear_window_owners(ui: &AppWindow) {")
+        .unwrap();
+    let owners = owners.split("\n}").next().unwrap();
+    let first = owners
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("//"))
+        .unwrap();
+    assert_eq!(first, "crate::unread_navigation::withdraw_jump(ui);");
     // The actual Thread browser and Leave entries: a visible owner refuses
     // first, before any peer is cleared, then the held jump ends before the
     // entry's own flag changes.
