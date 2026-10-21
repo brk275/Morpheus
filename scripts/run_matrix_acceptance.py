@@ -366,7 +366,8 @@ MEDIA_ONLY_CHECKS = ("media_local",)
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
           "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
-          "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS}
+          "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
+          "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS)}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1272,6 +1273,13 @@ class Acceptance:
                     output.write("Focused generated-window timeline checks: real Synapse and an ephemeral OS Secret Service. "
                                  "Only app-live-timeline ran, covering model delivery, stale callback rejection, member publication and cleanup. "
                                  "No draft recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
+                elif self.suite == "native-call":
+                    output.write("Focused generated-window timeline and encrypted invitation/incoming actor checks: "
+                                 "one disposable Synapse, OS Secret Service and LiveKit lifecycle. "
+                                 "Includes app-live-timeline followed by fresh Current/Sticky2025 DM/room cases. "
+                                 "No OAuth, broader call interoperability, physical-device or installed-package "
+                                 "checks; this is not full acceptance. "
+                                 "The invitation cases do not exercise live cross-device Decline.\n\n")
                 elif self.suite == "outgoing-ring":
                     output.write("Focused encrypted invitation and incoming actor checks: real Synapse, "
                                  "an ephemeral OS Secret Service and LiveKit, with fresh users and rooms "
@@ -1357,6 +1365,15 @@ def main():
         acceptance.require_containment()
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "native-call":
+            def native_call_checks():
+                acceptance.app_timeline(fixture)
+                acceptance.script("local_matrix_rtc", "up")
+                acceptance.script("local_matrix_rtc", "probe")
+                acceptance.outgoing_ring_cases()
+            acceptance.group(SUITES["native-call"], native_call_checks)
+            acceptance.finish_checks()
+            return
         if args.suite == "outgoing-ring":
             def ring_checks():
                 acceptance.script("local_matrix_rtc", "up")
