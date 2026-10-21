@@ -1,8 +1,8 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, personal-account, physical-device or artifact jobs.
 # Linux runs disposable checks after offline checks; call-native owns timeline and four ring cases in one fixture lifecycle.
-name: Owner fixed-caret live fixture
-run-name: Fixed-caret native live fixture b2976f0
+name: Owner cleanup-boundary live fixture
+run-name: Cleanup-boundary native live fixture 47ef1f9
 on:
   workflow_dispatch:
     inputs:
@@ -21,7 +21,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-call-fixture-b2976f0-${{ github.ref }}
+  group: beta-native-call-fixture-47ef1f9-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -38,7 +38,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: b2976f0e4eeb7c57a2299b2d4645517d3f996040
+          ref: 47ef1f997735234d07771f2c268dbb6e088da07e
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = b2976f0e4eeb7c57a2299b2d4645517d3f996040
+          test "$(git -C candidate rev-parse HEAD)" = 47ef1f997735234d07771f2c268dbb6e088da07e
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -86,7 +86,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: b2976f0e4eeb7c57a2299b2d4645517d3f996040
+          ref: 47ef1f997735234d07771f2c268dbb6e088da07e
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -325,7 +325,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='b2976f0e4eeb7c57a2299b2d4645517d3f996040'
+          source='47ef1f997735234d07771f2c268dbb6e088da07e'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -666,7 +666,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='b2976f0e4eeb7c57a2299b2d4645517d3f996040'
+          source='47ef1f997735234d07771f2c268dbb6e088da07e'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -1329,7 +1329,10 @@ jobs:
                   'docker_network','http','network','os','invalid_data','fixture_operation','deadline'}
               timeline_stages={'setup','activation','room_open','room_delivery','thread_delivery',
                   'revocation','renewal','reopen','queued_revocation','queued_drain',
-                  'queued_reopen','link_continuation','member_publication','cleanup','complete'}
+                  'queued_reopen','link_continuation','member_publication','cleanup','complete',
+                  'cleanup_logout_primary','cleanup_logout_other','cleanup_manager_stop',
+                  'cleanup_drop_live','cleanup_drop_ui','cleanup_wait_profile',
+                  'cleanup_drop_manager','cleanup_remove_directory'}
               fatal_messages={
                   'This harness is restricted to ephemeral Linux GitHub runners':'runner_guard',
                   'Run the harness inside dbus-run-session':'dbus_missing',
@@ -1420,7 +1423,7 @@ jobs:
                       if type(locations) is list and len(locations)<=24:
                           sources={
                               'crates/morpheus-app/src/account_access_ui_tests.rs':('account_ui',14317),
-                              'crates/morpheus-app/src/live_timeline_controller_tests.rs':('timeline_live',1300),
+                              'crates/morpheus-app/src/live_timeline_controller_tests.rs':('timeline_live',1311),
                               'crates/morpheus-app/src/people_directory_live_tests.rs':('people_live',361),
                               'crates/morpheus-app/src/people_directory.rs':('people_controller',696),
                               'crates/morpheus-app/src/live.rs':('live_controller',9490),
