@@ -7851,7 +7851,7 @@ async fn assert_public_profile_projection(ui: &AppWindow) {
     ui.set_account_profile_avatar_state(0);
     settle(ui).await;
     for label in ["Close", "Read the public profile again from the homeserver"] {
-        let bounds = control_bounds(ui, label);
+        let bounds = button_bounds(ui, label);
         assert_eq!(bounds.len(), 1, "{label}");
         assert!(inside_window(ui, bounds[0]), "{label} stays in the window");
     }
