@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "packaging/linux"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import appimage_capture as M
 import appimage_capture_worker as W
+import linux_package_ui as UI
 
 
 class ProofTests(unittest.TestCase):
@@ -59,6 +60,143 @@ class ProofTests(unittest.TestCase):
                     {"nodes": [output("HEADLESS-1", {"pid": 14}, {"pid": 14})]}, {}):
             with self.assertRaises(M.CaptureFailure):
                 M.owned_window_on_first_output(bad, 14)
+
+
+class SelectorTests(unittest.TestCase):
+    class TransientError(Exception):
+        pass
+
+    def node(self, label, *, children=(), action=None, editable=None, count=None):
+        def query(value):
+            if value is None:
+                return mock.Mock(side_effect=NotImplementedError)
+            if isinstance(value, BaseException):
+                return mock.Mock(side_effect=value)
+            return mock.Mock(return_value=value)
+        return SimpleNamespace(
+            name=label, clearCache=mock.Mock(), get_process_id=mock.Mock(return_value=42),
+            get_child_count=mock.Mock(return_value=len(children) if count is None else count),
+            get_child_at_index=mock.Mock(side_effect=lambda index: children[index]),
+            queryAction=query(action), queryEditableText=query(editable),
+            getState=mock.Mock(return_value=SimpleNamespace(contains=lambda _: True)))
+
+    def ui(self, children, *, foreign=()):
+        ui = M.InstalledUI.__new__(M.InstalledUI)
+        application = self.node("Owned app", children=children)
+        other = self.node("Other app", children=foreign)
+        other.get_process_id.return_value = 99
+        desktop = self.node("Desktop", children=(other, application))
+        ui.api = SimpleNamespace(Registry=SimpleNamespace(getDesktop=lambda _: desktop), STATE_ENABLED=1)
+        ui.transient_error = self.TransientError
+        ui.owned = mock.Mock(side_effect=lambda pid: pid == 42)
+        ui.diagnostics = UI.Diagnostics({})
+        return ui
+
+    def test_complete_owned_action_and_editable_matches_are_accepted(self):
+        for editable in (False, True):
+            with self.subTest(editable=editable):
+                interface = SimpleNamespace(nActions=1)
+                node = self.node("Target", **{"editable" if editable else "action": interface})
+                foreign = self.node("Target", action=SimpleNamespace(nActions=1), editable=object())
+                ui = self.ui((node,), foreign=(foreign,))
+                self.assertEqual(ui.find_control("Target", editable=editable), (node, interface))
+                self.assertFalse(ui.pass_incomplete)
+                self.assertEqual(ui.diagnostics.value["incomplete_passes"], 0)
+
+    def test_incomplete_owned_tree_cannot_prove_presence_or_absence(self):
+        for editable in (False, True):
+            for present in (False, True):
+                for missing_child in (False, True):
+                    with self.subTest(editable=editable, present=present, missing_child=missing_child):
+                        broken = self.node("Branch", children=(None,)) if missing_child else self.node("Branch", count=-1)
+                        found = self.node("Target", action=SimpleNamespace(nActions=1), editable=object())
+                        ui = self.ui((broken, found) if present else (broken,))
+                        with self.assertRaises(UI.IncompleteTraversal):
+                            ui.find_control("Target", editable=editable)
+                        self.assertTrue(ui.pass_incomplete)
+                        self.assertEqual(ui.diagnostics.value["incomplete_passes"], 1)
+
+    def test_transient_interface_errors_cannot_hide_a_potential_second_match(self):
+        for editable in (False, True):
+            for error_type in (self.TransientError, LookupError):
+                with self.subTest(editable=editable, error_type=error_type):
+                    good = self.node("Target", action=SimpleNamespace(nActions=1), editable=object())
+                    hidden = self.node("Target", **{"editable" if editable else "action": error_type()})
+                    ui = self.ui((hidden, good))
+                    with self.assertRaises(UI.IncompleteTraversal):
+                        ui.find_control("Target", editable=editable)
+                    self.assertTrue(ui.pass_incomplete)
+                    self.assertEqual(ui.diagnostics.value["incomplete_passes"], 1)
+
+    def test_unsupported_interface_and_zero_action_caption_are_ordinary_nonmatches(self):
+        for editable in (False, True):
+            with self.subTest(editable=editable):
+                interface = SimpleNamespace(nActions=1)
+                good = self.node("Target", **{"editable" if editable else "action": interface})
+                unsupported = self.node("Target")
+                captions = () if editable else (self.node("Target", action=SimpleNamespace(nActions=0)),)
+                ui = self.ui((unsupported, *captions, good))
+                self.assertEqual(ui.find_control("Target", editable=editable), (good, interface))
+                self.assertFalse(ui.pass_incomplete)
+                self.assertEqual(ui.diagnostics.value["incomplete_passes"], 0)
+
+    def test_duplicate_matches_still_fail_before_an_incomplete_pass_can_retry(self):
+        for editable in (False, True):
+            for interface_error in (False, True):
+                with self.subTest(editable=editable, interface_error=interface_error):
+                    first = self.node("Target", action=SimpleNamespace(nActions=1), editable=object())
+                    second = self.node("Target", action=SimpleNamespace(nActions=1), editable=object())
+                    broken = (self.node("Target", **{"editable" if editable else "action": self.TransientError()})
+                              if interface_error else self.node("Branch", count=-1))
+                    ui = self.ui((second, first, broken))
+                    with self.assertRaises(M.CaptureFailure):
+                        ui.find_control("Target", editable=editable)
+                    self.assertTrue(ui.pass_incomplete)
+                    self.assertEqual(ui.diagnostics.value["incomplete_passes"], 0)
+
+    def test_known_duplicate_is_fatal_before_a_later_name_lookup_failure(self):
+        for error_type in (self.TransientError, LookupError):
+            with self.subTest(error_type=error_type):
+                class NameUnavailable:
+                    def clearCache(self):
+                        pass
+                    @property
+                    def name(self):
+                        raise error_type()
+                first = self.node("Target", action=SimpleNamespace(nActions=1))
+                second = self.node("Target", action=SimpleNamespace(nActions=1))
+                ui = self.ui((NameUnavailable(), first, second))
+                with self.assertRaises(M.CaptureFailure):
+                    ui.find_control("Target")
+
+    def test_incomplete_pass_never_enters_text_or_presses_an_action(self):
+        for editable in (False, True):
+            with self.subTest(editable=editable):
+                action = SimpleNamespace(nActions=1, doAction=mock.Mock(return_value=True))
+                field = SimpleNamespace(setTextContents=mock.Mock(return_value=True))
+                good = self.node("Target", action=action, editable=field)
+                ui = self.ui((self.node("Branch", count=-1), good))
+                ui.process = object()
+                with mock.patch.object(UI.smoke, "process_status", return_value=None), \
+                        mock.patch.object(UI.time, "monotonic", side_effect=(0, 0, 13, 13)), \
+                        mock.patch.object(UI.time, "sleep"):
+                    with self.assertRaises(UI.DiagnosticFailure) as error:
+                        if editable:
+                            ui.enter("Target", "synthetic value")
+                        else:
+                            ui.press("Target")
+                self.assertEqual(error.exception.code, "wait_timeout")
+                action.doAction.assert_not_called()
+                field.setTextContents.assert_not_called()
+
+    def test_unowned_tree_and_the_existing_tree_bound_remain_enforced(self):
+        foreign = self.node("Target", action=SimpleNamespace(nActions=1))
+        ui = self.ui((), foreign=(foreign,))
+        self.assertIsNone(ui.find_control("Target"))
+        ui = self.ui((self.node("Other"),) * 5000)
+        with self.assertRaises(UI.DiagnosticFailure) as error:
+            ui.find_control("Target")
+        self.assertEqual(error.exception.code, "tree_bound")
 
 
 class OwnershipTests(unittest.TestCase):
