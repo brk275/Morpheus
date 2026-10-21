@@ -11834,7 +11834,11 @@ export component AppWindow inherits Window {
                                 // selected conversation row.
                                 property <bool> search-hit: reply.event-id != ""
                                     && (reply.event-id == root.room-search-selected-event-id || reply.event-id == root.timeline-jump-event-id);
-                                min-height: 43px;
+                                // At least 43 px and never less than its content. A repeated
+                                // row's explicit minimum replaces the one its content gives, and
+                                // the thread's scroll content is sized from the rows' minimums,
+                                // so a bare 43 px squeezed long replies into the next ones.
+                                min-height: max(43px, reply-body.min-height);
                                 vertical-stretch: 0;
                                 background: root.row-surface(thread-reply.search-hit, false, reply.is-own, root.elevated);
                                 border-radius: StyleTokens.radius * 0.8;
@@ -11903,7 +11907,7 @@ export component AppWindow inherits Window {
                                         triggered => { thread-reply.report-top(); }
                                     }
                                 }
-                                VerticalLayout {
+                                reply-body := VerticalLayout {
                                     padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
                                     HorizontalLayout {
                                         spacing: 6px;
