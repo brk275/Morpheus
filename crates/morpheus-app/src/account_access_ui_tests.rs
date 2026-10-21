@@ -955,6 +955,95 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
     settle(ui).await;
     assert_eq!(ui.get_messages().row_count(), 0);
     assert!(!has_label("Updated visible timeline fixture"));
+
+    // Same length and newest row after coalescing: redacting B and decrypting
+    // an earlier X must still request placement against the final model. Use
+    // the actual live-publication helper and generated unread-scope callback;
+    // this fixture does not fabricate an SDK marker or a placement result.
+    let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let (last, count, weak) = (observed.clone(), calls.clone(), ui.as_weak());
+    ui.global::<crate::UnreadNavigation>()
+        .on_context_changed(move || {
+            let ui = weak.upgrade().unwrap();
+            let rows = ui.get_messages();
+            *last.borrow_mut() = Some((
+                rows.row_count(),
+                rows.row_data(1).map(|row| row.event_id),
+                rows.row_data(rows.row_count().saturating_sub(1))
+                    .map(|row| row.event_id),
+                ui.get_conversation_focused(),
+            ));
+            count.set(count.get() + 1);
+        });
+    let before: Vec<_> = [1, 2, 3, 4]
+        .into_iter()
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    let after: Vec<_> = [1, 5, 3, 4]
+        .into_iter()
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    ui.set_conversation_focused(true);
+    crate::live::publish_live_messages(ui, before.clone());
+    settle(ui).await;
+    let initial_refreshes = calls.get();
+    assert!(initial_refreshes > 0);
+    assert_eq!(
+        observed
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .1
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "$fixture-2:example.org"
+    );
+    let delivery = crate::timeline_delivery::Latest::new();
+    let mut without_b = before.clone();
+    without_b.remove(1);
+    assert!(delivery.submit(without_b));
+    assert!(
+        !delivery.submit(after),
+        "only the final snapshot is delivered"
+    );
+    crate::live::publish_live_messages(ui, delivery.take().unwrap());
+    settle(ui).await;
+    assert!(
+        calls.get() > initial_refreshes,
+        "same count/newest must refresh placement"
+    );
+    assert_eq!(ui.get_messages().row_count(), before.len());
+    {
+        let final_rows = observed.borrow();
+        let final_rows = final_rows.as_ref().unwrap();
+        assert_eq!(final_rows.0, before.len());
+        assert_eq!(
+            final_rows.1.as_ref().unwrap().as_str(),
+            "$fixture-5:example.org"
+        );
+        assert_eq!(
+            final_rows.2.as_ref().unwrap().as_str(),
+            "$fixture-4:example.org"
+        );
+        assert!(!final_rows.3, "refresh observes the final live-view state");
+    }
+    let final_refreshes = calls.get();
+    ui.global::<crate::UnreadNavigation>()
+        .set_first_unread_event_id("$fixture-5:example.org".into());
+    settle(ui).await;
+    assert_eq!(
+        calls.get(),
+        final_refreshes,
+        "divider publication cannot refresh itself"
+    );
+    ui.global::<crate::UnreadNavigation>()
+        .on_context_changed(|| {});
+    ui.global::<crate::UnreadNavigation>()
+        .set_first_unread_event_id("".into());
+    ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    settle(ui).await;
 }
 
 async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
@@ -4248,6 +4337,11 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert_public_profile_projection(&ui).await;
     phase.set(21);
     assert_room_notification_panel(&ui).await;
+    // The whole invitations scenario: the center's gating, then the Home
+    // cards' outcome ownership (INVDA02-HOME).
+    phase.set(90);
+    assert_invitations_center_gating(&ui).await;
+    crate::invitations::tests::home_outcomes_belong_to_their_account(&ui);
     phase.set(50);
     assert_theme_studio_draft(&ui, directory.path()).await;
     assert_behavior_saves_with_broken_theme(&ui, directory.path()).await;
@@ -4295,6 +4389,9 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert_room_permissions_editor(&ui, &live, &runtime).await;
     phase.set(83);
     crate::matrix_links::tests::assert_link_card(&ui, &live, &runtime).await;
+    // The invitations case again, now that the link controller is registered.
+    phase.set(90);
+    assert_invitations_and_links_exclude_each_other(&ui, &live, &runtime).await;
     phase.set(89);
     crate::thread_browser::register(&ui, live.clone(), runtime.clone());
     crate::thread_browser::tests::assert_thread_browser_panel(&ui, &live, &runtime).await;
@@ -4304,6 +4401,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     crate::incoming_ring::ui::assert_answered_call_withdraws_leave(&ui).await;
     #[cfg(feature = "native-calls")]
     crate::voice_rosters::assert_unowned_presentation_is_cleared(&ui, live.clone(), &runtime);
+    phase.set(91);
+    crate::room_creation::tests::assert_creation_protected_entries(&ui).await;
     // This suite tests the actual dialog/controller boundary, not credentials.
     // A denied account-change guard also prevents any mistaken key sequence
     // from starting policy writes, account activation, or local deletion.
@@ -5656,7 +5755,12 @@ async fn assert_call_bar(ui: &AppWindow, runtime: &Handle) {
         frame_slot: -1,
         ..Default::default()
     }])));
+    // Admitted, Return also ends an automatic open a click still owns (an
+    // accepted invitation's) before the page changes.
+    let owned = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(owned.clone());
     bar.invoke_return_to_call();
+    assert!(owned.withdrawn(), "Return's entry ended the owned open");
     settle(ui).await;
     assert_eq!(ui.get_page(), 2);
     assert!(!ui.get_call_bar_visible());
@@ -5750,7 +5854,7 @@ async fn assert_call_bar(ui: &AppWindow, runtime: &Handle) {
     settle(ui).await;
     // Every surface that takes the window over protects the bar: the whole
     // list in call-bar-protected (one list with matrix-link-blocked).
-    let surfaces: [(&str, fn(&AppWindow, bool)); 32] = [
+    let surfaces: [(&str, fn(&AppWindow, bool)); 33] = [
         ("no live session", |ui, on| ui.set_live_session(!on)),
         ("link card", |ui, on| {
             ui.global::<crate::MatrixLink>().set_open(on);
@@ -5834,6 +5938,9 @@ async fn assert_call_bar(ui: &AppWindow, runtime: &Handle) {
         ("shortcut recording", |ui, on| {
             let recording = if on { "toggle_details_panel" } else { "" };
             ui.set_shortcut_recording(recording.into());
+        }),
+        ("the invitations center", |ui, on| {
+            ui.global::<crate::InvitationsState>().set_open(on)
         }),
     ];
     for (name, set) in surfaces {
@@ -6242,6 +6349,31 @@ async fn assert_call_bar(ui: &AppWindow, runtime: &Handle) {
     assert_eq!(refused(), refused_before_more + 1);
     assert!(stopped.borrow().is_empty());
     assert_eq!((toggled.get(), ended.get()), (0, 0));
+    // The invitations center's actual Home entry is another protected entry:
+    // admitted, it withdraws the held command before its flag, and closed
+    // again without a change handler the command stays withdrawn. While the
+    // center is open the bar and Return-to-call are held.
+    let center = ui.global::<crate::InvitationsState>();
+    let acted_before_center = acted().len();
+    let refused_before_center = refused();
+    let release = hold();
+    let op = handed_off(&|| bar.invoke_mute());
+    settle(ui).await;
+    ui.invoke_open_invitations();
+    assert!(center.get_open(), "the center's real entry opened it");
+    assert!(ui.get_call_bar_protected() && !ui.get_call_bar_visible());
+    not_handed_off(&|| {
+        bar.invoke_return_to_call();
+        bar.invoke_leave();
+        bar.invoke_mute();
+        bar.invoke_stop_camera();
+    });
+    assert_eq!(ui.get_page(), 0, "Return is held under the center");
+    center.set_open(false);
+    release.send(()).unwrap();
+    settle_until(ui, runtime, finished(op)).await;
+    assert_eq!(acted().len(), acted_before_center);
+    assert_eq!(refused(), refused_before_center + 1);
     // The call ends: the bar and its timer go.
     clear_for_test(ui);
     settle(ui).await;
@@ -8754,11 +8886,436 @@ async fn assert_room_notification_panel(ui: &AppWindow) {
     settle(ui).await;
 }
 
+/// The invitations center opens from its Home entry and from Settings
+/// search, takes focus in its search field, closes on Escape with focus back
+/// on the entry, and closes when Home, the listed account or the live session
+/// is left. No controller is registered, so nothing is read or answered.
+async fn assert_invitations_center_gating(ui: &AppWindow) {
+    use crate::{InvitationItem, InvitationsState};
+
+    let global = ui.global::<InvitationsState>();
+    let before = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_active_account_local_id(),
+    );
+    let invite = RoomItem {
+        id: "!invite:example.org".into(),
+        name: "Invited room".into(),
+        ..Default::default()
+    };
+    ui.set_invitations(ModelRc::new(VecModel::from(vec![invite.clone()])));
+    ui.set_home_invitations(ModelRc::new(VecModel::from(vec![invite])));
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("work".into());
+    settle(ui).await;
+
+    click_control_once(ui, "Open all 1 invitations");
+    settle(ui).await;
+    assert!(global.get_open());
+    assert!(focused_control_has_label(ui, "Search invitations"));
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!global.get_open());
+    assert!(focused_control_has_label(ui, "Open all 1 invitations"));
+
+    // Settings search opens it on Home and reports its destination.
+    ui.set_settings_revealed_id("".into());
+    ui.set_page(1);
+    settle(ui).await;
+    assert!(crate::settings_search::reveal(ui, "rooms.invitations"));
+    settle(ui).await;
+    assert_eq!(ui.get_page(), 0);
+    assert!(global.get_open());
+    assert_eq!(ui.get_settings_revealed_id(), "rooms.invitations");
+    // Leaving Home closes it.
+    ui.set_page(1);
+    settle(ui).await;
+    assert!(!global.get_open());
+
+    // A rebuilt list never strands keyboard focus: focus on a removed row's
+    // button goes back to the search field.
+    let row = |room: &str, name: &str| InvitationItem {
+        room_id: room.into(),
+        generation: 1,
+        name: name.into(),
+        detail: "Room".into(),
+        ..Default::default()
+    };
+    ui.set_page(0);
+    global.set_index(-1);
+    global.set_items(ModelRc::new(VecModel::from(vec![
+        row("!a:example.org", "Alpha"),
+        row("!b:example.org", "Beta"),
+    ])));
+    global.set_open(true);
+    settle(ui).await;
+    request_bridge_focus(ui, "Accept invitation to Alpha");
+    settle(ui).await;
+    assert_eq!(global.get_index(), 0, "focusing a row's answer chooses it");
+    global.set_items(ModelRc::new(VecModel::from(vec![row(
+        "!b:example.org",
+        "Beta",
+    )])));
+    global.set_focus_request(global.get_focus_request() + 1);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Search invitations"));
+    global.set_items(ModelRc::new(VecModel::<InvitationItem>::default()));
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!global.get_open());
+
+    // Modal: with focus on one of its controls, a real Mod+K chord reaches
+    // nothing behind the center, and window shortcuts are paused.
+    let modifier = if cfg!(target_os = "macos") {
+        Key::Meta
+    } else {
+        Key::Control
+    };
+    global.set_open(true);
+    settle(ui).await;
+    request_bridge_focus(ui, "Close invitations");
+    ui.window().dispatch_event(WindowEvent::KeyPressed {
+        text: modifier.into(),
+    });
+    key(ui, "k");
+    ui.window().dispatch_event(WindowEvent::KeyReleased {
+        text: modifier.into(),
+    });
+    settle(ui).await;
+    assert!(
+        !ui.get_quick_switcher_open(),
+        "a window shortcut ran behind the center"
+    );
+    assert!(global.get_open());
+    assert!(
+        !ui.invoke_dispatch_shortcut("k".into(), true, false, false, false),
+        "shortcuts pause while the center is open"
+    );
+
+    // At the smallest window and 200% text, with a long notice and its
+    // manual Check and open, and a pending bulk confirmation, every action is
+    // reachable: focusing one scrolls the center's body until it is whole
+    // inside the center, and the confirmation's buttons bring its text.
+    ui.window().set_size(slint::PhysicalSize::new(940, 620));
+    ui.set_font_scale_percent(200);
+    global.set_items(ModelRc::new(VecModel::from(vec![
+        row("!a:example.org", "Alpha"),
+        row("!b:example.org", "Beta"),
+    ])));
+    global.set_matching(2);
+    global.set_total(2);
+    global.set_read(2);
+    global.set_bulk_count(2);
+    let notice = concat!(
+        "Alpha: Joined, but sync has not brought the room here yet. ",
+        "Choose Check and open again later."
+    );
+    global.set_notice(notice.into());
+    global.set_notice_room_id("!a:example.org".into());
+    global.set_notice_room_ready(false);
+    settle(ui).await;
+    let label = format!("Invitations for {}", ui.get_active_account_handle());
+    let center = item_bounds(&control_with_label(ui, &label));
+    assert!(
+        inside_window(ui, center),
+        "the center fits the window: {center:?}"
+    );
+    let whole = |bounds: Bounds| {
+        bounds.top >= center.top
+            && bounds.bottom <= center.bottom
+            && bounds.left >= center.left
+            && bounds.right <= center.right
+    };
+    let disclosure = concat!(
+        "Decline these 2 invitations? Each one is declined on its own and ",
+        "cannot be taken back here."
+    );
+    for action in [
+        "Open the joined room if sync has brought it here",
+        "Accept invitation to Alpha",
+        "Confirm: decline 2 invitations",
+        "Keep these invitations",
+        "Read this account's invitations again",
+    ] {
+        request_bridge_focus(ui, action);
+        settle(ui).await;
+        let bounds = item_bounds(&control_with_label(ui, action));
+        assert!(
+            whole(bounds),
+            "{action} is whole inside the center once focused: {bounds:?} in {center:?}"
+        );
+        if action == "Confirm: decline 2 invitations" {
+            let text = labelled_bounds(ui, disclosure, None);
+            assert!(
+                !text.is_empty() && text.iter().all(|bounds| whole(*bounds)),
+                "the confirmation's text shows with its buttons: {text:?}"
+            );
+        }
+    }
+    request_bridge_focus(ui, "Close invitations");
+    let mut reached = false;
+    for _ in 0..16 {
+        key(ui, Key::Tab);
+        settle(ui).await;
+        if focused_control_has_label(ui, "Confirm: decline 2 invitations") {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "Tab reaches the confirmation");
+    global.set_notice("".into());
+    global.set_notice_room_id("".into());
+    global.set_bulk_count(0);
+    global.set_items(ModelRc::new(VecModel::<InvitationItem>::default()));
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    settle(ui).await;
+    // The confirmation's buttons are gone; Escape from the center's own
+    // close action still closes it.
+    request_bridge_focus(ui, "Close invitations");
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!global.get_open());
+
+    // Another account on screen than the one listed, or no live session,
+    // closes it too.
+    ui.set_page(0);
+    global.set_open(true);
+    global.set_account_id("work".into());
+    settle(ui).await;
+    assert!(global.get_open());
+    ui.set_active_account_local_id("home".into());
+    settle(ui).await;
+    assert!(!global.get_open(), "another account closed the center");
+    ui.set_active_account_local_id("work".into());
+    global.set_account_id("".into());
+    global.set_open(true);
+    settle(ui).await;
+    ui.set_live_session(false);
+    settle(ui).await;
+    assert!(!global.get_open(), "a detached session closed the center");
+
+    let (page, live, account) = before;
+    ui.set_invitations(ModelRc::new(VecModel::<RoomItem>::default()));
+    ui.set_home_invitations(ModelRc::new(VecModel::<RoomItem>::default()));
+    ui.set_page(page);
+    ui.set_live_session(live);
+    ui.set_active_account_local_id(account);
+    settle(ui).await;
+}
+
+/// The invitations center and a Matrix link exclude each other, through
+/// their real entries, once the link controller is registered: the center's
+/// Home entry and its Settings-search route each end a joined link's message
+/// still to come synchronously, before the center opens, and closing the
+/// center never revives it; while the center is open a link click shows
+/// nothing and a link follow-up admitted under it ends for good.
+async fn assert_invitations_and_links_exclude_each_other(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+) {
+    use crate::InvitationsState;
+
+    let global = ui.global::<InvitationsState>();
+    let before = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_active_account_local_id(),
+    );
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("work".into());
+    settle(ui).await;
+    assert!(!ui.get_matrix_link_protected());
+
+    // The Home entry ends the held follow-up at the call, before the
+    // center's flag changes anything.
+    let held = crate::matrix_links::tests::hold_follow_up();
+    assert!(held.admits(ui));
+    ui.invoke_open_invitations();
+    assert!(held.withdrawn(), "ended at the entry");
+    settle(ui).await;
+    assert!(global.get_open());
+    assert!(focused_control_has_label(ui, "Search invitations"));
+    // While it is open, links are protected: a click shows nothing, and a
+    // follow-up admitted under it ends for good.
+    assert!(ui.get_matrix_link_protected());
+    let link = "https://matrix.to/#/@alice:example.org";
+    assert!(crate::matrix_links::open(ui, live, runtime, link));
+    settle(ui).await;
+    assert!(!crate::matrix_links::is_open(ui));
+    let missed = crate::matrix_links::tests::hold_follow_up();
+    assert!(!missed.admits(ui), "admitted under the center: ended");
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!global.get_open());
+    assert!(!held.admits(ui), "closing the center never revives it");
+    assert!(!missed.admits(ui), "and it stays ended");
+
+    // The Settings-search route ends a held follow-up first too.
+    let routed = crate::matrix_links::tests::hold_follow_up();
+    assert!(routed.admits(ui));
+    assert!(crate::settings_search::reveal(ui, "rooms.invitations"));
+    assert!(routed.withdrawn(), "ended at the route");
+    settle(ui).await;
+    assert!(global.get_open());
+    assert!(focused_control_has_label(ui, "Search invitations"));
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!global.get_open());
+    assert!(!routed.admits(ui));
+
+    // INV-OPEN-01: an automatic open a click still owns (an accepted
+    // invitation's) ends at every protected surface's own entry,
+    // synchronously, before its flag changes, and stays ended once that
+    // surface closes, even closed before any deferred handler ran; a newer
+    // owned open replaces and ends the older.
+    let menu = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(menu.clone());
+    ui.invoke_open_account_menu();
+    ui.set_account_menu_open(false);
+    assert!(menu.withdrawn(), "ended at the account menu's entry");
+    settle(ui).await;
+    assert!(menu.withdrawn(), "closing it never revives it");
+    // The account control's own activation opens the menu through that entry.
+    let trigger = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(trigger.clone());
+    let label = format!(
+        "Account menu for {}, {}",
+        ui.get_active_account_name(),
+        ui.get_active_account_handle()
+    );
+    request_bridge_focus(ui, &label);
+    key(ui, Key::Return);
+    assert!(ui.get_account_menu_open());
+    ui.set_account_menu_open(false);
+    assert!(
+        trigger.withdrawn(),
+        "ended at the account control's activation"
+    );
+    settle(ui).await;
+    assert!(trigger.withdrawn());
+    let entry = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(entry.clone());
+    ui.invoke_open_invitations();
+    assert!(entry.withdrawn(), "ended at the center's Home entry");
+    settle(ui).await;
+    assert!(global.get_open());
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!global.get_open());
+    assert!(entry.withdrawn());
+    let older = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(older.clone());
+    let newer = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(newer.clone());
+    assert!(
+        older.withdrawn() && !newer.withdrawn(),
+        "only the last click opens"
+    );
+    crate::matrix_links::clear(ui);
+    assert!(newer.withdrawn());
+
+    // Under anything that withdraws a link (a verification still pending on
+    // Home here) both entries are refused, not deferred: no flag is left
+    // behind to block links, shortcuts or mentions, or to open the center
+    // by itself once it ends.
+    ui.set_sas_stage(1);
+    settle(ui).await;
+    assert!(ui.get_matrix_link_blocked());
+    ui.invoke_open_invitations();
+    settle(ui).await;
+    assert!(!global.get_open(), "refused at the Home entry");
+    assert!(crate::settings_search::reveal(ui, "rooms.invitations"));
+    settle(ui).await;
+    assert!(!global.get_open(), "refused at the route");
+    ui.set_sas_stage(0);
+    settle(ui).await;
+    assert!(!global.get_open(), "never opens by itself later");
+    assert!(ui.get_mention_ui_allowed());
+
+    // The thread browser, Leave and the center exclude each other: an open
+    // Leave dialog or browser refuses both of the center's entries before
+    // anything is withdrawn (an automatic open a click owns still stands),
+    // and an open center holds Leave's and the browser's own admission.
+    // Each surface is set and reset with no settle between, so no change
+    // handler runs.
+    let leave = ui.global::<crate::RoomLeave>();
+    let browser = ui.global::<crate::ThreadBrowser>();
+    let kept = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(kept.clone());
+    leave.set_view(crate::RoomLeaveView {
+        open: true,
+        ..Default::default()
+    });
+    ui.invoke_open_invitations();
+    assert!(!crate::settings_search::reveal(ui, "rooms.invitations"));
+    assert!(!global.get_open(), "refused over Leave");
+    assert!(leave.get_view().open, "Leave stays");
+    assert!(!kept.withdrawn(), "refused before any withdrawal");
+    leave.set_view(crate::RoomLeaveView::default());
+    browser.set_open(true);
+    ui.invoke_open_invitations();
+    assert!(!global.get_open(), "refused over the thread browser");
+    assert!(browser.get_open(), "the browser stays");
+    assert!(!kept.withdrawn(), "refused before any withdrawal");
+    browser.set_open(false);
+    settle(ui).await;
+    ui.invoke_open_invitations();
+    assert!(kept.withdrawn(), "an admitted entry ends it");
+    settle(ui).await;
+    assert!(global.get_open());
+    assert!(ui.get_room_leave_blocked(), "the center holds Leave");
+    assert!(!ui.get_thread_browser_allowed(), "and the browser");
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!global.get_open());
+    assert!(!ui.get_room_leave_blocked() && ui.get_thread_browser_allowed());
+
+    // The Settings-search route from the actual Settings page, where the
+    // page itself never refuses it: refused under a surface up there (a
+    // verification here), it withdraws nothing and Settings stays; admitted,
+    // it ends an automatic open a click owns before the center's flag. The
+    // open center then holds a jump too.
+    ui.set_page(1);
+    settle(ui).await;
+    let routed_open = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(routed_open.clone());
+    ui.set_sas_stage(1);
+    assert!(crate::settings_search::reveal(ui, "rooms.invitations"));
+    assert!(!routed_open.withdrawn(), "refused before any withdrawal");
+    assert_eq!(ui.get_page(), 1, "and Settings stays");
+    assert!(!global.get_open());
+    ui.set_sas_stage(0);
+    settle(ui).await;
+    assert!(crate::settings_search::reveal(ui, "rooms.invitations"));
+    assert!(routed_open.withdrawn(), "the route ended it first");
+    assert_eq!(ui.get_page(), 0);
+    settle(ui).await;
+    assert!(global.get_open());
+    assert!(!ui.get_unread_jump_allowed(), "the center holds a jump");
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!global.get_open());
+
+    let (page, live_session, account) = before;
+    ui.set_settings_reveal_id("".into());
+    ui.set_settings_revealed_id("".into());
+    ui.set_page(page);
+    ui.set_live_session(live_session);
+    ui.set_active_account_local_id(account);
+    settle(ui).await;
+}
+
 const HEADER_MORE: &str = "More room actions";
 const HEADER_MENU: &str = "Room actions that do not fit";
 const HEADER_ROOM: &str = "A long synthetic room name that the responsive header keeps readable";
 const HEADER_TOPIC: &str = "A synthetic topic that gives way before the room name";
 const HEADER_LEAVE: &str = "Leave this room…";
+const HEADER_JUMP: &str = "Jump to first unread message";
 
 /// The eight header actions that may fold, in header order, with the labels
 /// the header gives them now.
@@ -8883,6 +9440,8 @@ fn assert_header_row(ui: &AppWindow, case: &str) -> Vec<String> {
     // Leave sits between room settings and Search while it is shown.
     row.push(HEADER_LEAVE.to_owned());
     row.push("Search messages".to_owned());
+    // Jump to first unread sits between Search and pins while it is shown.
+    row.push(HEADER_JUMP.to_owned());
     row.extend(labels[2..].iter().cloned());
     row.push(HEADER_MORE.to_owned());
     let mut previous = name;
@@ -8979,6 +9538,7 @@ async fn assert_responsive_header(ui: &AppWindow) {
     assert_eq!(assert_header_row(ui, "comfortable").len(), 8);
     assert!(header_buttons(ui, HEADER_MORE).is_empty());
     assert_eq!(on_header_row(ui, control_bounds(ui, HEADER_TOPIC)).len(), 1);
+    assert_eq!(header_buttons(ui, HEADER_JUMP).len(), 1, "Jump is drawn");
     let pins = header_buttons(ui, "Show pinned messages");
     click_bounds(ui, pins[0]);
     settle(ui).await;
@@ -9032,6 +9592,12 @@ async fn assert_responsive_header(ui: &AppWindow) {
             1,
             "{case}: Leave is drawn once"
         );
+        assert!(ui.get_header_jump_shown(), "{case}: Jump keeps its place");
+        assert_eq!(
+            header_buttons(ui, HEADER_JUMP).len(),
+            1,
+            "{case}: Jump is drawn once"
+        );
 
         open_header_more(ui).await;
         let menu = control_bounds(ui, HEADER_MENU);
@@ -9056,6 +9622,10 @@ async fn assert_responsive_header(ui: &AppWindow) {
         assert!(
             header_menu_buttons(ui, HEADER_LEAVE).is_empty(),
             "{case}: Leave not listed"
+        );
+        assert!(
+            header_menu_buttons(ui, HEADER_JUMP).is_empty(),
+            "{case}: Jump not listed"
         );
         // Keyboard: the first listed action has focus; Down, End, Tab (which
         // wraps inside the menu) and Backtab move through the listed ones.
@@ -9303,6 +9873,18 @@ async fn assert_responsive_header(ui: &AppWindow) {
     );
     crate::identity_warnings::withdraw(ui);
     settle(ui).await;
+    // An open invitations center is a visible peer too: More refuses before
+    // any withdrawal, and an automatic open a click owns still stands.
+    let center = ui.global::<crate::InvitationsState>();
+    let owned = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(owned.clone());
+    center.set_open(true);
+    let before_center = resets.get();
+    activate_more(ui);
+    assert!(!ui.get_header_more_open() && center.get_open());
+    assert!(!owned.withdrawn(), "the open center refuses More first");
+    assert_eq!(resets.get(), before_center);
+    center.set_open(false);
     // Admitted, it withdraws first: a joined link's message still to come
     // and a Leave owner whose view already hid. While it is open links and
     // the browser are held (a late admission ends for good) and Leave stays
@@ -9311,6 +9893,7 @@ async fn assert_responsive_header(ui: &AppWindow) {
     let before = resets.get();
     activate_more(ui);
     assert!(ui.get_header_more_open());
+    assert!(owned.withdrawn(), "More's entry ended the owned open");
     assert!(
         !ui.get_identity_warnings_allowed(),
         "More owns identity admission"
@@ -9494,6 +10077,189 @@ async fn assert_responsive_header(ui: &AppWindow) {
     ui.window().set_size(slint::PhysicalSize::new(640, 620));
     ui.set_show_side_panel(false);
     settle(ui).await;
+    leave.on_start(|| {});
+    leave.on_close(|| {});
+    leave.on_reset(|| {});
+    leave.set_view(crate::RoomLeaveView::default());
+    tokens.set_icon_size(18.0);
+    settle(ui).await;
+    settle(ui).await;
+
+    // Jump to first unread is the twelfth action. Drawn (comfortable, all
+    // twelve inside the window and Tab in header order), as the drawn icon's
+    // accessibility action and in overflow (a More item, by keyboard and by
+    // its accessibility action), it runs the window's actual jump callback;
+    // a running jump relabels and disables it. An account-menu entry that
+    // opens and closes at once, and an admitted Thread or Leave entry, each
+    // withdraw a held jump; a refused Thread entry leaves every peer alone.
+    let unread = ui.global::<crate::UnreadNavigation>();
+    let jumps = Rc::new(Cell::new(0));
+    let counted = jumps.clone();
+    unread.on_jump(move || counted.set(counted.get() + 1));
+    let withdrawn = Rc::new(Cell::new(0));
+    let counted = withdrawn.clone();
+    let weak = ui.as_weak();
+    unread.on_withdraw_jump(move || {
+        counted.set(counted.get() + 1);
+        // As unread_navigation's own withdraw_jump: the held jump ends.
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<crate::UnreadNavigation>().set_jumping(false);
+        }
+    });
+    let latent = Rc::new(Cell::new(0));
+    let counted = latent.clone();
+    leave.on_reset(move || counted.set(counted.get() + 1));
+    let weak = ui.as_weak();
+    leave.on_start(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<crate::RoomLeave>()
+                .set_view(crate::RoomLeaveView {
+                    open: true,
+                    stage: 1,
+                    title: "Leave this room?".into(),
+                    name: HEADER_ROOM.into(),
+                    room_id: "!header:example.org".into(),
+                    ..Default::default()
+                });
+        }
+    });
+    let weak = ui.as_weak();
+    leave.on_close(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.global::<crate::RoomLeave>()
+                .set_view(crate::RoomLeaveView::default());
+        }
+    });
+    unread.set_can_jump(true);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_font_scale_percent(100);
+    settle(ui).await;
+    settle(ui).await;
+    assert!(ui.get_header_full() && ui.get_header_jump_shown());
+    assert_eq!(assert_header_row(ui, "twelve actions").len(), 8);
+    let labels = header_foldable_labels(ui);
+    request_bridge_focus(ui, &labels[0]);
+    let order = [
+        labels[1].as_str(),
+        HEADER_LEAVE,
+        "Search messages",
+        HEADER_JUMP,
+        labels[2].as_str(),
+        labels[3].as_str(),
+        labels[4].as_str(),
+        labels[5].as_str(),
+        labels[6].as_str(),
+        labels[7].as_str(),
+    ];
+    for label in order {
+        key(ui, Key::Tab);
+        settle(ui).await;
+        assert!(focused_control_has_label(ui, label), "Tab reaches {label}");
+    }
+    key(ui, Key::Backtab);
+    settle(ui).await;
+    assert!(
+        focused_control_has_label(ui, &labels[6]),
+        "Backtab goes back"
+    );
+    let icon = header_buttons(ui, HEADER_JUMP);
+    click_bounds(ui, icon[0]);
+    settle(ui).await;
+    assert_eq!(jumps.get(), 1, "the drawn Jump runs the jump");
+    control_with_label(ui, HEADER_JUMP).accessible_action(&AccessibilityAction::Default);
+    settle(ui).await;
+    assert_eq!(jumps.get(), 2, "and so does its accessibility action");
+    unread.set_jumping(true);
+    settle(ui).await;
+    let loading = "Loading earlier messages to your read position";
+    assert!(header_buttons(ui, HEADER_JUMP).is_empty());
+    let running = header_buttons(ui, loading);
+    assert_eq!(running.len(), 1, "a running jump relabels Jump");
+    click_bounds(ui, running[0]);
+    settle(ui).await;
+    assert_eq!(jumps.get(), 2, "and a running jump disables it");
+
+    // The account menu's guarded entry, opened and closed at once: the held
+    // jump, a joined link's follow-up and a latent Leave owner end with it.
+    let follow_up = crate::matrix_links::tests::install_follow_up();
+    let (before, owners) = (withdrawn.get(), latent.get());
+    ui.invoke_open_account_menu();
+    ui.set_account_menu_open(false);
+    assert!(withdrawn.get() > before && !unread.get_jumping());
+    assert!(follow_up.withdrawn() && latent.get() == owners + 1);
+    settle(ui).await;
+    assert!(
+        !follow_up.admits(ui) && !unread.get_jumping(),
+        "nothing revives"
+    );
+    // An admitted Thread entry withdraws a held jump before its own flags.
+    unread.set_jumping(true);
+    let before = withdrawn.get();
+    threads.invoke_show();
+    assert!(
+        withdrawn.get() > before && !unread.get_jumping(),
+        "Thread entry"
+    );
+    crate::thread_browser::clear(ui);
+    settle(ui).await;
+    // So does an admitted Leave entry, from its drawn icon.
+    unread.set_jumping(true);
+    let before = withdrawn.get();
+    let icon = header_buttons(ui, HEADER_LEAVE);
+    click_bounds(ui, icon[0]);
+    settle(ui).await;
+    assert!(leave.get_view().open, "Leave opens");
+    assert!(
+        withdrawn.get() > before && !unread.get_jumping(),
+        "Leave entry"
+    );
+    // Over that visible Leave a Thread entry is refused before it touches a
+    // held jump, a link's follow-up or a latent Leave owner.
+    unread.set_jumping(true);
+    let follow_up = crate::matrix_links::tests::install_follow_up();
+    let (before, owners) = (withdrawn.get(), latent.get());
+    threads.invoke_show();
+    assert_eq!(withdrawn.get(), before, "a refused entry withdraws no jump");
+    assert!(unread.get_jumping() && !follow_up.withdrawn());
+    assert!(leave.get_view().open && latent.get() == owners && !threads.get_open());
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(!leave.get_view().open);
+    crate::matrix_links::clear(ui);
+    unread.set_jumping(false);
+    settle(ui).await;
+
+    // In overflow (far larger icons fold Leave and Jump at the minimum
+    // window and 200 %): Jump is listed after Leave, reached by Down and run
+    // by Return or by its accessibility action, each after the menu closed.
+    ui.window().set_size(slint::PhysicalSize::new(640, 620));
+    ui.set_font_scale_percent(200);
+    tokens.set_icon_size(60.0);
+    settle(ui).await;
+    settle(ui).await;
+    assert!(!ui.get_header_jump_shown() && header_buttons(ui, HEADER_JUMP).is_empty());
+    let _ = assert_header_row(ui, "Jump folded");
+    open_header_more(ui).await;
+    assert_eq!(header_menu_buttons(ui, HEADER_JUMP).len(), 1, "Jump listed");
+    assert!(focused_control_has_label(ui, &labels[0]), "first item");
+    for label in [labels[1].as_str(), HEADER_LEAVE, HEADER_JUMP] {
+        key(ui, Key::DownArrow);
+        settle(ui).await;
+        assert!(focused_control_has_label(ui, label), "Down reaches {label}");
+    }
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(jumps.get(), 3, "the Jump item runs the jump");
+    assert!(!ui.get_header_more_open() && focused_control_has_label(ui, HEADER_MORE));
+    open_header_more(ui).await;
+    control_with_label(ui, HEADER_JUMP).accessible_action(&AccessibilityAction::Default);
+    settle(ui).await;
+    assert_eq!(jumps.get(), 4, "and so does its accessibility action");
+    assert!(!ui.get_header_more_open());
+    unread.on_jump(|| {});
+    unread.on_withdraw_jump(|| {});
+    unread.set_can_jump(false);
+    unread.set_jumping(false);
     leave.on_start(|| {});
     leave.on_close(|| {});
     leave.on_reset(|| {});
@@ -10163,7 +10929,26 @@ async fn assert_identity_warnings_presentation(
         "Leave holds identity details admission"
     );
     leave.set_view(crate::RoomLeaveView::default());
+    // The invitations center too, both ways: an open center holds identity
+    // details' and the member inspector's admission (the inspector's own
+    // guarded entry refuses at once), and open details refuse the center's
+    // Home entry before anything is withdrawn.
+    let center = ui.global::<crate::InvitationsState>();
+    center.set_open(true);
+    assert!(
+        !ui.get_identity_warnings_allowed(),
+        "the center holds identity details admission"
+    );
+    assert!(!ui.get_member_inspector_allowed(), "and the inspector's");
+    assert!(
+        !crate::member_privacy::inspect_admitted(ui, &live.security_gate, "@pat:example.org"),
+        "the inspector's own admission refuses"
+    );
+    center.set_open(false);
     warnings.set_open(true);
+    ui.invoke_open_invitations();
+    assert!(!center.get_open(), "open details refuse the center");
+    assert!(warnings.get_open(), "and stay");
     let addresses = ui.global::<crate::RoomAddresses>();
     addresses.set_open(true);
     let allowed = ui.get_identity_warnings_allowed();

@@ -2285,6 +2285,48 @@ impl Room {
             .await
     }
 
+    /// Morpheus opt-in (see `MORPHEUS_PATCH.md`): send one receipt as
+    /// [`Self::send_single_receipt`] does, but never change the room's
+    /// `m.marked_unread` flag, and send the request with `request_config`
+    /// (the client's default when `None`).
+    ///
+    /// Identical requests are deduplicated only among callers of this method
+    /// (a separate key namespace), so one never joins a
+    /// [`Self::send_single_receipt`] call, whose shared future also unsets
+    /// the flag, and that method's behaviour is unchanged.
+    #[instrument(skip_all)]
+    pub async fn send_single_receipt_without_unread_flag(
+        &self,
+        receipt_type: create_receipt::v3::ReceiptType,
+        thread: ReceiptThread,
+        event_id: OwnedEventId,
+        request_config: Option<RequestConfig>,
+    ) -> Result<()> {
+        let request_key = format!(
+            "morpheus-no-unread-flag|{}|{}",
+            receipt_type,
+            thread.as_str().unwrap_or("<unthreaded>")
+        );
+
+        self.client
+            .inner
+            .locks
+            .read_receipt_deduplicated_handler
+            .run((request_key, event_id.clone()), async {
+                let mut request = create_receipt::v3::Request::new(
+                    self.room_id().to_owned(),
+                    receipt_type,
+                    event_id,
+                );
+                request.thread = thread;
+
+                self.client.send(request).with_request_config(request_config).await?;
+
+                Ok(())
+            })
+            .await
+    }
+
     /// Send a request to set multiple receipts at once.
     ///
     /// This will also unset the unread flag of the room if necessary.

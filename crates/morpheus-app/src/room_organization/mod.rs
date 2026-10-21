@@ -1044,6 +1044,7 @@ mod tests {
             unread_messages: 0,
             unread_notifications: 0,
             unread_mentions: 0,
+            marked_unread: false,
         }
     }
 

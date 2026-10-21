@@ -3056,6 +3056,94 @@ the room lives, and no strong client or SQLite handle leak has been shown from
 this path, so Windows file cleanup after these observers end is simply
 untested here.
 
+## 2026-10-20 room creation and owned navigation (source only, unverified)
+
+The Rooms and Spaces dialog's Create room and Create Space modes now plan the
+room from what the account and homeserver allow, preview exactly what is sent,
+and send one create request (no HTTP retries and no token-refresh replay). A
+reply that never arrives is reported as an unknown outcome that blocks another
+attempt for that account until the person says they checked, however the
+dialog was closed, switched or reopened meanwhile; a confirmed room is never
+reported as unknown. Placing it in a Space, waiting for sync and opening it
+are separate, bounded steps that cannot turn a confirmed room into an unknown
+one. Waiting for the request's turn behind an account change has its own
+bound and sends nothing. The create request and each Space link are handed
+off only while no security or account step began since their click (one
+running at the click refuses Create at once); refused there, nothing is sent
+and a link may be added again. While an invitation reply or a join holds the
+dialog's actions, Create sends nothing, from the button or the name field.
+The keyboard stays in the dialog: Close (or the dialog itself while Close is
+disabled) until the name field is enabled, the clicked mode after a mode
+switch, Done when Add to Space again or Open succeeds, the name field after
+the acknowledgement (offered only once the account's settings are read), and
+the opener once a finished creation closes the dialog. The dialog is still
+the header's + entry; no header action, menu item or second dialog is added.
+
+A created room opens only for the click that asked for it: the navigation and
+security generations are captured on the UI thread at Create (or Open), and the
+open takes a navigation of its own only while nothing navigated since, the
+exact account selection is current and no security step began since. It
+counts as open only when its own snapshot was admitted on the UI thread. The
+navigation authority now records that admission under the same lock as its
+withdrawal, so a bound that withdraws the open never reads a claimed snapshot
+as refused, and every wait before the commit or the admission gives way to a
+withdrawal. Search results, created rooms and an accepted invitation's room
+or Space run their follow-ups (members, feed, draft recovery) after releasing
+the transition lock and the snapshot barrier; each follow-up rechecks its own
+selection, navigation and room where it writes the feed key, the feed, the
+draft error or recovery. Otherwise the dialog stays open and says the room was
+created but is not open, and Open retries for that exact room.
+
+With the thread browser, Leave, identity details and the invitations center,
+these entries refuse over a visible surface before they retire anything:
+Rooms and Spaces is not opened while Leave is shown, and Leave, the thread
+browser's Show and the invitations center are refused while Rooms and Spaces
+is open, before any of them touches a latent Leave or a held link. A created
+room's open is latent navigation from its click until that attempt finishes,
+held as the window's owned automatic open, as an accepted invitation's open
+is. Every protected surface's entry runs the shared link withdrawal first
+(MatrixLink.withdraw() in Slint, matrix_links::clear in Rust), which ends it
+synchronously before that surface's flag changes; its authority also refuses,
+for good, an admission while a newer protected surface is up (everything
+Leave counts except the page and the dialog the creation runs in, plus Leave,
+a link card and the header's More menu). So a creation never navigates under
+such a surface and does not come back when it closes; the room then reads as
+created but not opened. A finished attempt is released from that slot, never
+withdrawn, so a later entry does not take back the room it showed.
+
+The unknown-outcome record is a bounded journal: at most one entry per local
+account and 32 in all. A create reserves its account's entry before anything
+can be sent, and is refused with nothing sent while that account's earlier
+request is still on its way, while its unknown outcome is unacknowledged, or
+while the journal is full; no entry is ever evicted. An entry is released when
+its request settles definitely, when its unknown outcome is acknowledged on
+that account, or when the account is removed completely or logged out; a
+switch, lock or partial removal keeps it, and a request that settles after its
+account was forgotten leaves nothing behind. The journal lives in process
+memory, so a restart forgets it. A revealed room's member load now claims the
+member list only while the snapshot that showed it is still the current
+navigation and selection, checked after its waits, so an older reveal can no
+longer suppress a newer room's members or leave them loading. Each member
+load's loading flag, members and error are also applied only while that load
+is still the latest for the account and room shown and its owner still holds,
+checked on the UI thread as each applies: a load that claimed and then waited
+can no longer restart the spinner after a newer load of the same room
+finished. The 30-second reuse of a member load relies only on a request whose
+owner is still current. A Space with no
+usable name is shown by its room ID through the same bounded plain-text
+policy as names, never raw: an accepted room ID may hold control and bidi
+characters and be of any length. Every request and action keeps the exact
+ID.
+
+None of this has been compiled, formatted by tool or run. The focused
+regressions in `room_creation` (app and core) and `live` are source only; the
+fixture-backed ones need the disposable Matrix fixture, and no generated
+window drives the creation form or a live Slint event loop. UI suite phase 91
+covers only the protected-entry seams above, with view-only stand-ins: no
+Leave controller, create request or created-room reveal runs in it. The
+generated-window member publication check is the separate opt-in
+`member_publication` stage of the live timeline controller test.
+
 ## Native outgoing video GUI acceptance (partial)
 
 An ad hoc signed macOS Apple Silicon QA app used a temporary, debug-only

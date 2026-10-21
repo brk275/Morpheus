@@ -345,8 +345,13 @@ fn local_room(client: &Client, room_id: &RoomId) -> (LinkRoom, Option<String>) {
 
 /// The event's thread root from the room's local event cache: memory, then
 /// this device's storage, never a request. `None` when the cache does not
-/// have the event, or it is not in a thread.
-async fn local_thread_root(client: &Client, room_id: &RoomId, event: &EventId) -> Option<String> {
+/// have the event, or it is not in a thread. Also places a fully-read marker
+/// that names a reply in a thread (`unread_navigation`).
+pub(crate) async fn local_thread_root(
+    client: &Client,
+    room_id: &RoomId,
+    event: &EventId,
+) -> Option<String> {
     let room = client.get_room(room_id)?;
     let (cache, _handles) = room.event_cache().await.ok()?;
     let found = cache.find_event(event).await.ok()??;
@@ -355,7 +360,7 @@ async fn local_thread_root(client: &Client, room_id: &RoomId, event: &EventId) -
 
 /// The thread root an event's `m.relates_to` names (cleartext also on an
 /// encrypted event), when its relation is a thread.
-fn thread_of(event_json: &str) -> Option<String> {
+pub(crate) fn thread_of(event_json: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Event {
         content: Content,

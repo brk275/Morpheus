@@ -896,11 +896,40 @@ pub(crate) async fn assert_thread_browser_panel(
     leave.on_reset(|| {});
     settle(ui).await;
 
+    // The same mutual refusal with the invitations center: the center's
+    // Home entry refuses over the browser and never withdraws it, and the
+    // browser's actual Show refuses over an open center before it clears
+    // anything: the center stays, and so does an automatic open a click
+    // owns.
+    open("", false, true);
+    settle(ui).await;
+    let center = ui.global::<crate::InvitationsState>();
+    ui.invoke_open_invitations();
+    assert!(!center.get_open(), "the center refuses over the browser");
+    assert!(state.get_open(), "and never withdraws it");
+    clear(ui);
+    center.set_open(true);
+    let owned = crate::live::NavigationAuthority::default();
+    crate::matrix_links::own_automatic_open(owned.clone());
+    assert!(held(ui), "the center holds browser admission synchronously");
+    state.invoke_show();
+    assert!(center.get_open(), "refused Show never closes the center");
+    assert!(!owned.withdrawn(), "nor ends its owned automatic open");
+    assert!(!state.get_open(), "Show cannot open over the center");
+    center.set_open(false);
+    crate::matrix_links::clear(ui);
+    assert!(owned.withdrawn());
+    settle(ui).await;
+    assert!(
+        !held(ui) && !state.get_open(),
+        "closing the center never reopens the browser"
+    );
+
     // Rust's guard and the Slint gate are the same set, state by state. Each
     // state is set and reset with no settle between, so no change handler
     // or overlay runs and later phases see nothing.
     assert!(!held(ui) && ui.get_thread_browser_allowed());
-    let every: [(&str, fn(&AppWindow, bool)); 32] = [
+    let every: [(&str, fn(&AppWindow, bool)); 33] = [
         ("identity details", |ui, on| {
             ui.global::<crate::IdentityWarnings>().set_open(on)
         }),
@@ -972,6 +1001,9 @@ pub(crate) async fn assert_thread_browser_panel(
         }),
         ("a Matrix link card", |ui, on| {
             ui.global::<crate::MatrixLink>().set_open(on)
+        }),
+        ("the invitations center", |ui, on| {
+            ui.global::<crate::InvitationsState>().set_open(on)
         }),
         ("Leave", |ui, on| {
             ui.global::<crate::RoomLeave>()

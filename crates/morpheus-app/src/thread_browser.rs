@@ -639,7 +639,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
 ///   the quick switcher, room actions, room administration (details,
 ///   permissions, redaction), a member action's confirmation, the capture
 ///   picker, leaving a call, the image preview, a poll, a shortcut
-///   recording, a Matrix link card.
+///   recording, a Matrix link card, the invitations center.
 /// The browser's own panel is not among them. The panel is not drawn and
 /// its rows are cleared as soon as any of them begins, and each of their
 /// entries also withdraws the browser first (`withdraw`, `clear`).
@@ -687,14 +687,21 @@ fn live_session(ui: &AppWindow) -> Option<AccountSelection> {
 }
 
 fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
-    // Mutual entry policy: open Leave or identity details own the window. Refuse
-    // before clearing any surface or withdrawing a held link.
-    if crate::room_leave::is_open(ui) || crate::identity_warnings::is_open(ui) {
+    // Mutual entry policy: open Leave or identity details, or any other
+    // visible surface that owns the window (all but a link card, which this
+    // entry replaces), refuse before clearing any surface or withdrawing a
+    // held link, call bar click or unread jump.
+    if crate::room_leave::is_open(ui)
+        || crate::identity_warnings::is_open(ui)
+        || !ui.get_thread_browser_entry_allowed()
+    {
         return;
     }
     crate::identity_warnings::withdraw(ui);
     // An admitted browser also cancels a latent Leave owner before it opens.
     crate::room_leave::clear_presentation(ui);
+    // A held unread jump ends for good before the browser's flag changes.
+    crate::unread_navigation::withdraw_jump(ui);
     // The browser's own entry: a Matrix link card, and a joined link's
     // message still to come (its follow-up), end first, synchronously. A
     // call bar click still waiting for the call controller is refused for

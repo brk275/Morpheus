@@ -18,11 +18,12 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use morpheus_matrix::{
-    AccountInfo, AccountManager, AccountSelection, ComposeSendTarget, ComposeText,
-    DownloadedAttachment, EditBaseline, Generation, JoinCancellation, JoinError, MatrixCoreError,
-    MatrixLinkTarget, MessageInfo, MessageSendState, PublicMediaConsent, QueuedAttachment,
-    QueuedMessage, QueuedSendUpdate, RecoveredDraft, RoomInfo, RoomMemberInfo, RoomMembership,
-    StickerCatalog, SyncBackend, SyncStatus, TextFormat,
+    AccountInfo, AccountManager, AccountSelection, AnswerFence, ComposeSendTarget, ComposeText,
+    CreatedRoom, CreationError, CreationKind, CreationPlan, DownloadedAttachment, EditBaseline,
+    Generation, InvitationAnswer, InvitationOutcome, JoinCancellation, JoinError, MatrixCoreError,
+    MatrixLinkTarget, MessageInfo, MessageSendState, Placement, PublicMediaConsent,
+    QueuedAttachment, QueuedMessage, QueuedSendUpdate, RecoveredDraft, RoomInfo, RoomMemberInfo,
+    RoomMembership, StickerCatalog, SyncBackend, SyncStatus, TextFormat,
 };
 use slint::{Color, Model, ModelRc, StyledText, VecModel, Weak};
 use tokio::{
@@ -46,18 +47,16 @@ use crate::{
 
 /// Events loaded around a message opened in a focused conversation view.
 const FOCUS_CONTEXT_EVENTS: u16 = 24;
+/// Longest wait for the account transition before an invitation answer is
+/// sent, and again before its result is recorded and opened: past it,
+/// nothing is sent, or nothing opens.
+const INVITE_TRANSITION_WAIT: Duration = Duration::from_secs(10);
 
 pub enum MessageTarget {
     Room,
     Reply(String),
     Edit(String),
     Thread(String),
-}
-
-#[derive(Clone, Copy)]
-pub enum RoomAction {
-    CreatePrivate,
-    CreateSpace,
 }
 
 /// How a joined room opens, once sync shows it joined.
@@ -92,6 +91,23 @@ pub(crate) struct JoinAsked {
     authority: NavigationAuthority,
     /// The join's own open, once its snapshot was shown (`owned_open`).
     opened: Arc<std::sync::Mutex<Option<JoinOpened>>>,
+}
+
+/// What a creation captures at its click (Create, Add to Space again, or
+/// Open on a created room that is not open), on the UI thread: the
+/// navigation and the security gate's generation then
+/// (LiveUi::creation_asked). Its writes are handed off only while no
+/// security or account step began since (creation_allowed,
+/// creation_admits). The open later navigates only while nothing navigated
+/// since that click and no security step began since (a step running at
+/// the click never admits either), under the exact selection the room was
+/// created for (open_created_room). Taken later, in the worker, either
+/// would let a creation's completion move a person who has navigated,
+/// switched or locked since.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CreationAsked {
+    navigation: u64,
+    security: u64,
 }
 
 /// What a join's own open showed: the navigation it took under the join's
@@ -350,11 +366,124 @@ struct KnownSpace {
     recorded_at: Instant,
 }
 
+/// Whom a member load belongs to: the exact selection and navigation of
+/// the snapshot that showed its room (after_snapshot: an owned reveal's, or
+/// a plain refresh's when its account has a selection), or, for a forced
+/// refresh (refresh_members_for), its account's selection and the navigation
+/// captured at its call, before any await. Every production load has one;
+/// a load that cannot capture one does nothing. The load claims the
+/// member epoch only while both are still current, checked at the claim
+/// itself, after every await, so a stale snapshot never installs an epoch
+/// over a newer navigation's load or leaves that load waiting for nothing.
+/// The same owner then fences every publication of the load
+/// (MemberPublication).
+#[derive(Clone)]
+struct MemberOwner {
+    selection: AccountSelection,
+    navigation_epoch: u64,
+}
+
 struct MemberRequest {
     account_id: String,
     room_id: String,
     started: Instant,
     epoch: u64,
+    /// The claiming load's owner. Production always sets it
+    /// (refresh_members_owned); None only in owner-free unit fixtures.
+    owner: Option<MemberOwner>,
+}
+
+impl MemberRequest {
+    /// Whether a load for `account_id`'s `room_id` that is not forced may
+    /// rely on this earlier one instead of fetching again (the 30 s
+    /// coalescing): same account and room, its epoch still the latest (every
+    /// navigation and every newer load advances it), under 30 s old, and its
+    /// own publications still admitted, that is, its owner (if any) still
+    /// current under `navigation_epoch`. A request whose owner is no longer
+    /// current is never relied on, so it cannot suppress a current one.
+    fn serves(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        member_epoch: u64,
+        navigation_epoch: u64,
+    ) -> bool {
+        self.account_id == account_id
+            && self.room_id == room_id
+            && self.epoch == member_epoch
+            && self.started.elapsed() < Duration::from_secs(30)
+            && self.owner.as_ref().is_none_or(|owner| {
+                owner.selection.is_current() && owner.navigation_epoch == navigation_epoch
+            })
+    }
+}
+
+/// What a member load may still publish, captured at its claim: the epoch
+/// it claimed, its owner (exact selection and navigation) when it has one,
+/// and the account and room it is for, with the live state it is read
+/// against. Every application of its loading flag, members or error goes
+/// through `publish`, on the UI thread, at the moment it applies: a load
+/// that is no longer the latest, whose owner no longer owns the screen, or
+/// whose account and room are not the ones shown changes nothing, so a
+/// newer load's members, loading flag and error stay as they are. Nothing
+/// newer is ever recaptured to adopt stale work.
+#[derive(Clone)]
+struct MemberPublication {
+    epoch: u64,
+    account_id: String,
+    room_id: String,
+    owner: Option<MemberOwner>,
+    is_live: Arc<AtomicBool>,
+    member_epoch: Arc<AtomicU64>,
+    navigation_epoch: Arc<AtomicU64>,
+}
+
+/// What a member load shows.
+enum MemberUpdate {
+    Loading,
+    Members(Vec<MemberItem>),
+    Error(String),
+}
+
+impl MemberPublication {
+    /// Whether this load may still change what is shown for
+    /// `visible_account` and `visible_room` (the window's own, in publish).
+    fn admits(&self, visible_account: &str, visible_room: &str) -> bool {
+        self.is_live.load(Ordering::Acquire)
+            && self.member_epoch.load(Ordering::Acquire) == self.epoch
+            && self.owner.as_ref().is_none_or(|owner| {
+                owner.selection.is_current()
+                    && self.navigation_epoch.load(Ordering::Acquire) == owner.navigation_epoch
+            })
+            && visible_account == self.account_id
+            && visible_room == self.room_id
+    }
+
+    /// Apply `update` to `window` only while this load is admitted for what
+    /// the window shows; whether it applied. UI thread only.
+    fn publish(&self, window: &AppWindow, update: MemberUpdate) -> bool {
+        let account = window.get_active_account_local_id();
+        let room = window.get_active_room_id();
+        if !self.admits(account.as_str(), room.as_str()) {
+            return false;
+        }
+        match update {
+            MemberUpdate::Loading => {
+                window.set_member_loading(true);
+                window.set_member_error("".into());
+            }
+            MemberUpdate::Members(items) => {
+                window.set_member_loading(false);
+                window.set_members(ModelRc::new(VecModel::from(items)));
+                window.set_member_error("".into());
+            }
+            MemberUpdate::Error(error) => {
+                window.set_member_loading(false);
+                window.set_member_error(error.into());
+            }
+        }
+        true
+    }
 }
 
 /// Authority of one navigation its requester may withdraw, such as opening
@@ -373,24 +502,52 @@ struct MemberRequest {
 /// change and no watcher needed.
 ///
 /// It may also name the surfaces that end it (`blocked_by`, asked on the
-/// UI thread by `admits`): a step admitted while one of them is up
-/// withdraws the authority for good, so that surface closing again never
-/// revives it.
+/// UI thread by `admits`, an owned snapshot's admission included): a step
+/// admitted while one of them is up withdraws the authority for good, so
+/// that surface closing again never revives it.
+///
+/// Whether an owned snapshot was admitted and whether the authority was
+/// withdrawn are one linearized decision, under the same lock, from any
+/// thread: the UI thread claims the admission (`claim`, from
+/// SnapshotGate::admits) just before it applies the snapshot, outside the
+/// lock, and `withdraw` reports whether it came after such a claim. So a
+/// requester that withdraws on its own bound never reads a claimed (shown or
+/// being applied) snapshot as refused, and once withdrawn nothing more is
+/// claimed or committed. No lock is held across the apply, which runs Slint
+/// code that may withdraw this same authority. A withdrawal also wakes
+/// every wait before a commit or an admission (`until_withdrawn`), so a
+/// withdrawn reveal gives up its locks at once.
 #[derive(Clone, Default)]
 pub(crate) struct NavigationAuthority {
-    withdrawn: Arc<std::sync::Mutex<bool>>,
+    shared: Arc<AuthorityState>,
     /// The requester's conditions besides its withdrawal; `None`: none.
     holds: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Whether another surface is up, asked on the UI thread; `None`: none.
     blocked_by: Option<fn(&AppWindow) -> bool>,
 }
 
+#[derive(Default)]
+struct AuthorityState {
+    decision: std::sync::Mutex<AuthorityDecision>,
+    /// Woken by every withdrawal (until_withdrawn).
+    wake: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct AuthorityDecision {
+    withdrawn: bool,
+    /// The UI thread claimed the admission of a snapshot under it (`claim`).
+    admitted: bool,
+}
+
 impl NavigationAuthority {
     /// An authority that also needs `holds` at every commit and admission.
-    /// Callers: JoinAsked::follow_up_authority (a joined link's message).
+    /// Callers: JoinAsked::follow_up_authority (a joined link's message),
+    /// OpenRequest::owned (an accepted invitation's own open, at its click)
+    /// and LiveUi::creation_authority (a created room's open).
     pub(crate) fn holding(holds: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         Self {
-            withdrawn: Arc::default(),
+            shared: Arc::default(),
             holds: Some(holds),
             blocked_by: None,
         }
@@ -399,7 +556,9 @@ impl NavigationAuthority {
     /// The same authority, also ended for good by its first UI-thread
     /// admission while `blocked` says another surface is up. Set before it
     /// is cloned. Callers: matrix_links' finish_join (a joined link's
-    /// message, blocked by matrix_links::surface_blocked).
+    /// message, blocked by matrix_links::surface_blocked) and
+    /// LiveUi::creation_authority (a created room's open, blocked by
+    /// room_creation::surface_blocked).
     pub(crate) fn blocked_by(mut self, blocked: fn(&AppWindow) -> bool) -> Self {
         self.blocked_by = Some(blocked);
         self
@@ -418,22 +577,74 @@ impl NavigationAuthority {
         true
     }
 
-    pub(crate) fn withdraw(&self) {
-        *self.state() = true;
+    /// Withdraw it, from any thread. Returns whether a snapshot under it was
+    /// already claimed by the UI: that snapshot is then shown (or being
+    /// applied right now), and only later commits and admissions are
+    /// refused. Callers that do not need the answer ignore it.
+    pub(crate) fn withdraw(&self) -> bool {
+        let admitted = {
+            let mut state = self.state();
+            state.withdrawn = true;
+            state.admitted
+        };
+        self.shared.wake.notify_waiters();
+        admitted
     }
 
     /// Withdrawn, or its own conditions no longer hold.
     pub(crate) fn withdrawn(&self) -> bool {
-        *self.state() || !self.holds()
+        self.state().withdrawn || !self.holds()
+    }
+
+    /// Whether the UI claimed the admission of a snapshot under it.
+    pub(crate) fn admitted(&self) -> bool {
+        self.state().admitted
+    }
+
+    /// Claim the admission of a snapshot, on the UI thread just before it is
+    /// applied: refused once withdrawn or once its own conditions fail, both
+    /// read under the withdrawal lock.
+    pub(crate) fn claim(&self) -> bool {
+        let mut state = self.state();
+        if state.withdrawn || !self.holds() {
+            return false;
+        }
+        state.admitted = true;
+        true
+    }
+
+    /// Resolves once withdrawn. A `holding` authority whose conditions
+    /// already fail resolves at once; one whose conditions fail later wakes
+    /// at its requester's withdrawal (every requester bounds its wait).
+    pub(crate) async fn until_withdrawn(&self) {
+        loop {
+            let notified = self.shared.wake.notified();
+            tokio::pin!(notified);
+            // Register before checking: notify_waiters keeps no permit for a
+            // later waiter.
+            notified.as_mut().enable();
+            if self.withdrawn() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Whether `other` is this very authority (a clone of it, sharing its
+    /// one decision), not merely an equal one. Callers:
+    /// matrix_links::release_automatic_open.
+    pub(crate) fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
     }
 
     fn holds(&self) -> bool {
         self.holds.as_ref().is_none_or(|holds| holds())
     }
 
-    /// True once withdrawn.
-    fn state(&self) -> std::sync::MutexGuard<'_, bool> {
-        self.withdrawn
+    /// Held only around synchronous commits and decisions.
+    fn state(&self) -> std::sync::MutexGuard<'_, AuthorityDecision> {
+        self.shared
+            .decision
             .lock()
             .unwrap_or_else(|error| error.into_inner())
     }
@@ -441,16 +652,104 @@ impl NavigationAuthority {
     /// The withdrawal lock, held around one synchronous commit, only while
     /// the navigation may still commit: not withdrawn, and its own
     /// conditions holding when the commit takes it.
-    fn commit_guard(&self) -> Option<std::sync::MutexGuard<'_, bool>> {
+    fn commit_guard(&self) -> Option<std::sync::MutexGuard<'_, AuthorityDecision>> {
         let state = self.state();
-        (!*state && self.holds()).then_some(state)
+        (!state.withdrawn && self.holds()).then_some(state)
+    }
+}
+
+/// `work`, unless `authority` is withdrawn first (checked first on every
+/// poll): `None` then, and `work` is dropped where it waited. Only for work
+/// before a commit, or before an owned snapshot is decided, so that dropping
+/// it leaves nothing shown and nothing but the commit to give back.
+pub(crate) async fn unless_withdrawn<F: std::future::Future>(
+    authority: &NavigationAuthority,
+    work: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        () = authority.until_withdrawn() => None,
+        output = work => Some(output),
+    }
+}
+
+/// `work` for a refresh, or for an owned reveal unless its authority is
+/// withdrawn first (`None` then). Every wait before a reveal's snapshot is
+/// admitted goes through it, so a withdrawn reveal never keeps its barrier
+/// or the transition lock for a wait.
+async fn within<F: std::future::Future>(
+    stop: Option<&NavigationAuthority>,
+    work: F,
+) -> Option<F::Output> {
+    match stop {
+        Some(authority) => unless_withdrawn(authority, work).await,
+        None => Some(work.await),
+    }
+}
+
+/// What a shown snapshot leaves to do, scoped to exactly it: its account
+/// and room, the selection its feed opens under (a reveal's own, never one
+/// looked up again), the navigation epoch it was built under, and for an
+/// owned reveal the left room's thread generation and its draft error.
+struct AfterSnapshot {
+    account_id: String,
+    room_id: Option<String>,
+    selection: Option<AccountSelection>,
+    navigation_epoch: u64,
+    marker_rooms: Vec<String>,
+    owned: Option<(u64, Option<String>)>,
+    /// An owned joined Space shown with no room: the left room's feed is
+    /// retired with it, while that snapshot is still the current one.
+    retire_feed: bool,
+    /// Recover the room's drafts (a room reveal), while it is still shown.
+    recover: bool,
+}
+
+/// What an automatic open was chosen under, captured on the UI thread at
+/// its click (`LiveUi::open_request`): the navigation then, and its own
+/// conditions, which the open's authority asks at its commit and at its
+/// snapshot's admission (`NavigationAuthority::holding`).
+#[derive(Clone)]
+pub(crate) struct OpenRequest {
+    navigation: u64,
+    holds: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl OpenRequest {
+    /// The open owned from its click by `selection`, the click's exact
+    /// account: the navigation then and the open's one authority, made now
+    /// from the click's conditions and that selection. Its holder hands that
+    /// authority to matrix_links::own_automatic_open at the click, so every
+    /// protected surface's entry withdraws it for good; its commit and its
+    /// snapshot's admission ask it (open_answered).
+    pub(crate) fn owned(self, selection: &AccountSelection) -> OwnedOpen {
+        let (account, holds) = (selection.clone(), self.holds);
+        let owned = move || account.is_current() && holds();
+        OwnedOpen {
+            navigation: self.navigation,
+            authority: NavigationAuthority::holding(Arc::new(owned)),
+        }
+    }
+}
+
+/// An automatic open owned from its click (`OpenRequest::owned`).
+#[derive(Clone)]
+pub(crate) struct OwnedOpen {
+    navigation: u64,
+    authority: NavigationAuthority,
+}
+
+impl OwnedOpen {
+    /// The open's one authority, from its click to its commit.
+    pub(crate) fn authority(&self) -> &NavigationAuthority {
+        &self.authority
     }
 }
 
 /// What a reveal's snapshot must still hold when it is applied: the
 /// navigation's withdrawable authority, the account selection and the
-/// navigation epoch that started it. Checked on the UI thread, where the
-/// requester also withdraws.
+/// navigation epoch that started it. Decided on the UI thread, where the
+/// admission is claimed on the authority (see NavigationAuthority).
 #[derive(Clone)]
 struct SnapshotGate {
     authority: NavigationAuthority,
@@ -459,10 +758,24 @@ struct SnapshotGate {
 }
 
 impl SnapshotGate {
+    /// Decide the snapshot on the UI thread, just before it is applied: the
+    /// selection and epoch still current, then the admission claimed on the
+    /// authority, last, so a claim is recorded only for a snapshot that is
+    /// then applied. A withdrawn authority (or one whose own conditions
+    /// fail) never admits, as before.
     fn admits(&self, navigation: &AtomicU64) -> bool {
-        !self.authority.withdrawn()
-            && self.selection.is_current()
+        self.selection.is_current()
             && navigation.load(Ordering::Acquire) == self.navigation
+            && self.authority.claim()
+    }
+
+    /// `admits`, first asking the authority on the window: a surface it
+    /// names that is up now withdraws it for good (NavigationAuthority::
+    /// admits), so the snapshot is refused and the commit is given back.
+    /// Only an authority with `blocked_by` can be refused here; for every
+    /// other one this is exactly `admits`.
+    fn admits_on(&self, ui: &AppWindow, navigation: &AtomicU64) -> bool {
+        self.authority.admits(ui) && self.admits(navigation)
     }
 }
 
@@ -479,6 +792,10 @@ struct RevealOwner<'a> {
     space_id: Option<String>,
     /// Held for its guard; released once the snapshot was shown.
     _barrier: Option<tokio::sync::RwLockWriteGuard<'a, ()>>,
+    /// Told the moment the snapshot is admitted, before any follow-up
+    /// (members, the feed, recovery). Dropped unsent when it never is.
+    /// Only a created room's open asks for it (open_created_room).
+    admitted: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 pub struct LiveUi {
@@ -785,6 +1102,38 @@ impl LiveUi {
     /// click is refused too.
     pub(crate) fn join_asked(&self) -> JoinAsked {
         JoinAsked::at(&self.security_gate, self.current_navigation_epoch())
+    }
+
+    /// Capture an automatic open at the click, on the UI thread: the
+    /// navigation now, and its own conditions, the session live and the
+    /// security gate still at `security` (the generation the answer was
+    /// chosen under: no step in progress or begun since). Callers: the
+    /// invitations Home card's accept (InvitationsCenter::answer).
+    pub(crate) fn open_request(&self, security: u64) -> OpenRequest {
+        let (gate, is_live) = (self.security_gate.clone(), self.is_live.clone());
+        OpenRequest {
+            navigation: self.current_navigation_epoch(),
+            holds: Arc::new(move || {
+                is_live.load(Ordering::Acquire) && gate.ringing_allowed(security)
+            }),
+        }
+    }
+
+    /// Take a new navigation for an automatic open, only while `epoch` (the
+    /// one it was chosen in) is still the current one, in one step: a newer
+    /// navigation is never invalidated, and nothing changes when it fails.
+    /// Callers: open_answered.
+    pub(crate) fn claim_navigation_from(&self, epoch: u64) -> Option<u64> {
+        if !self.is_live.load(Ordering::Acquire) {
+            return None;
+        }
+        let next = epoch.checked_add(1)?;
+        self.navigation_epoch
+            .compare_exchange(epoch, next, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        self.render_epoch.fetch_add(1, Ordering::AcqRel);
+        self.member_epoch.fetch_add(1, Ordering::AcqRel);
+        Some(next)
     }
 
     pub fn composed_draft(&self, account: &str, room: &str, thread: Option<&str>) -> ComposeText {
@@ -1991,35 +2340,264 @@ impl LiveUi {
         Ok(true)
     }
 
-    /// Keep an action tied to the account visible when it was submitted. The
-    /// same guard covers account switches, login, and logout in the app.
-    pub async fn run_room_action(
-        self: &Arc<Self>,
-        account_id: &str,
-        action: RoomAction,
-        input: &str,
-        ui: Weak<AppWindow>,
-    ) -> Result<(), MatrixCoreError> {
+    /// Whether a creation asked at `asked` may go on to its create request:
+    /// with account_transition held (its caller bounds this wait on its own,
+    /// so passing it sends nothing), the exact selection is the active,
+    /// current account, and no security or account step began since the
+    /// click or runs now. Nothing is sent here.
+    pub(crate) async fn creation_allowed(
+        &self,
+        selection: &AccountSelection,
+        asked: CreationAsked,
+    ) -> Result<(), CreationError> {
         let _transition = self.account_transition.lock().await;
-        self.require_active_account(account_id).await?;
-        let input = input.trim();
-        if input.is_empty() {
-            return Err(MatrixCoreError::InvalidRegistry(
-                "Enter a room or Space name".into(),
-            ));
+        let active = self.require_active_account(selection.account_id()).await;
+        if !selection.is_current() || active.is_err() {
+            return Err(CreationError::AccountChanged);
         }
-        let room_id = match action {
-            RoomAction::CreatePrivate => self.manager.create_private_room(input).await?,
-            RoomAction::CreateSpace => self.manager.create_space(input).await?,
+        if !self.security_gate.ringing_allowed(asked.security) {
+            return Err(CreationError::SecurityBusy);
+        }
+        Ok(())
+    }
+
+    /// The admission of a creation's writes (its create request and every
+    /// Space link of it), asked by the core with the exact selection right
+    /// before each hand-off: the session is live and no security or account
+    /// step began since the click (`asked`), the gate as it was then, as
+    /// join_target_for's `admit` is.
+    pub(crate) fn creation_admits(
+        &self,
+        asked: CreationAsked,
+    ) -> impl Fn() -> bool + Send + Sync + 'static {
+        let (gate, is_live) = (self.security_gate.clone(), self.is_live.clone());
+        move || is_live.load(Ordering::Acquire) && gate.ringing_allowed(asked.security)
+    }
+
+    /// Create what the room-actions dialog planned, under the exact
+    /// selection it was opened with, once creation_allowed said it may go:
+    /// the create request (AccountManager::create_room_for), handed off only
+    /// under `asked`'s admission, and nothing else. Not under
+    /// account_transition: a slow homeserver must not hold up an account
+    /// switch, and the exact selection fences every step. Placing, syncing
+    /// and opening the room are later steps that cannot change this result.
+    pub(crate) async fn create_room_for(
+        &self,
+        selection: &AccountSelection,
+        plan: &CreationPlan,
+        asked: CreationAsked,
+    ) -> Result<CreatedRoom, CreationError> {
+        let admit = self.creation_admits(asked);
+        self.manager.create_room_for(selection, plan, admit).await
+    }
+
+    /// The navigation and security generations at a creation's click
+    /// (Create, Add to Space again, or Open on a created room that is not
+    /// open), read on the UI thread (see CreationAsked). The gate's generation is read first, as
+    /// JoinAsked::at does.
+    pub(crate) fn creation_asked(&self) -> CreationAsked {
+        let generation = self.security_gate.ringing_generation();
+        let security = if self.security_gate.blocked() {
+            u64::MAX
+        } else {
+            generation
         };
-        self.complete_room_action(
-            account_id,
-            room_id,
-            Some(matches!(action, RoomAction::CreateSpace)),
-            input,
-            ui,
-        )
-        .await
+        CreationAsked {
+            navigation: self.current_navigation_epoch(),
+            security,
+        }
+    }
+
+    /// The authority a created room's open runs under: it holds only while
+    /// the session is live, the creation's exact `selection` is current and
+    /// no security step began since the click (`asked`), asked at every
+    /// commit and admission (NavigationAuthority::holding, the shape of
+    /// JoinAsked::follow_up_authority). It is also ended for good by its
+    /// first UI-thread admission while a newer protected surface is up
+    /// (blocked_by room_creation::surface_blocked: everything Leave counts
+    /// but the page and the room-actions dialog it runs in, plus Leave, a
+    /// link card and the header's More menu), so that surface closing never
+    /// revives it. Built at the click on the UI thread and held there as the
+    /// window's owned automatic open (room_creation's install_open), which
+    /// every protected entry withdraws first (matrix_links::clear), and
+    /// withdrawn by its bound (room_creation::bounded_reveal). It never
+    /// takes, advances or blesses a navigation by itself.
+    pub(crate) fn creation_authority(
+        &self,
+        asked: CreationAsked,
+        selection: &AccountSelection,
+    ) -> NavigationAuthority {
+        let (is_live, gate) = (self.is_live.clone(), self.security_gate.clone());
+        let (selection, security) = (selection.clone(), asked.security);
+        NavigationAuthority::holding(Arc::new(move || {
+            is_live.load(Ordering::Acquire)
+                && selection.is_current()
+                && gate.ringing_allowed(security)
+        }))
+        .blocked_by(crate::room_creation::surface_blocked)
+    }
+
+    /// Open a confirmed created room or Space as an owned reveal, the way a
+    /// search result or a joined room opens (reveal_room_locked;
+    /// reveal_joined_space_locked for a Space), which keeps every room's
+    /// draft. A room opens inside the Space that lists it (`placement`),
+    /// else in Home.
+    ///
+    /// It navigates only for its own click (`asked`): with the transition
+    /// lock held and under `authority`'s withdrawal lock, it takes a new
+    /// navigation epoch only while nothing navigated since that click, the
+    /// exact `selection` is current and the authority holds
+    /// (created_navigation). Otherwise nothing changes and the room is
+    /// reported as not opened. From there:
+    /// - before the commit, nothing changes;
+    /// - the commit sets the exact target, and the feed is left running;
+    /// - the snapshot that shows it is admitted only on the UI thread, which
+    ///   claims the admission on `authority` while the epoch and selection
+    ///   are still current, and that decision is awaited;
+    /// - not admitted (withdrawn before a claim, replaced by a newer
+    ///   navigation, another account, a security step since the click, not
+    ///   visible there, its refresh failed, or no window): the committed
+    ///   Space and room are given back before any other refresh samples
+    ///   them, and reopen_unrevealed reopens the shown room's feed under the
+    ///   epoch this open took, while it is still current.
+    ///
+    /// `admitted` is told the moment that snapshot is admitted showing
+    /// exactly the created room, or the created Space as the selected one,
+    /// before the follow-ups after it; it is dropped unsent otherwise, before
+    /// any reopen. The result also says it (Ok(true)), but only after those
+    /// follow-ups. Every wait before the admission gives way to a withdrawal
+    /// (the transition lock, the barrier, every read and lock of the
+    /// snapshot, the UI decision unless the UI already claimed it). The
+    /// guarded part (navigation, commit, admission, give-back) holds the
+    /// transition lock; the follow-ups (after_snapshot, each scoped to this
+    /// snapshot) and the reopen of an unshown open run after releasing it.
+    /// It never creates or links anything: the room exists whatever it
+    /// returns.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_created_room(
+        self: Arc<Self>,
+        selection: AccountSelection,
+        created: CreatedRoom,
+        placement: Placement,
+        asked: CreationAsked,
+        authority: NavigationAuthority,
+        admitted: tokio::sync::oneshot::Sender<()>,
+        ui: Weak<AppWindow>,
+    ) -> Result<bool, MatrixCoreError> {
+        let mut admitted = Some(admitted);
+        // The transition guard lives only in this block: whatever branch is
+        // taken, no residual guard reaches the follow-ups or the reopen.
+        let (epoch, revealed) = {
+            let transition = unless_withdrawn(&authority, self.account_transition.lock()).await;
+            #[cfg(test)]
+            self.pauses.reach("creation.after_transition").await;
+            match transition {
+                Some(_transition) => {
+                    match self.created_navigation(&selection, asked, &authority) {
+                        Some(epoch) => {
+                            let told = admitted.take();
+                            let shown = self
+                                .reveal_created_locked(
+                                    &selection, &created, &placement, epoch, &authority, told, &ui,
+                                )
+                                .await;
+                            (Some(epoch), shown)
+                        }
+                        // Navigated since the click, another account,
+                        // withdrawn or a security step since: nothing
+                        // navigates.
+                        None => (None, Ok(None)),
+                    }
+                }
+                // Withdrawn while it waited for the transition lock.
+                None => (None, Ok(None)),
+            }
+        };
+        // Never admitted on these paths: the bound learns it now.
+        drop(admitted);
+        // The transition lock is released: the follow-ups (members, the feed,
+        // recovery) and the reopen of an unshown open never hold up
+        // navigation.
+        let opened = match (revealed, epoch) {
+            (Ok(Some(after)), _) => {
+                self.after_snapshot(after, ui.clone()).await;
+                Ok(true)
+            }
+            // Not admitted after this open took its epoch: that epoch retired
+            // the shown room's feed, which is reopened under it while it is
+            // still current (see reopen_unrevealed).
+            (other, Some(epoch)) => {
+                self.reopen_unrevealed(&selection, epoch, ui.clone()).await;
+                other.map(|_| false)
+            }
+            (other, None) => other.map(|_| false),
+        };
+        // The Space graph is read again with the created room in it.
+        tokio::spawn(self.clone().scan_spaces(ui));
+        opened
+    }
+
+    /// The navigation of a created room's open, taken with the transition
+    /// lock held and under `authority`'s withdrawal lock (`commit_guard`),
+    /// only while it holds (not withdrawn; live, the exact selection current
+    /// and no security step since the click), the selection is current and
+    /// nothing navigated since the click (`asked`). `None` otherwise, and
+    /// nothing navigates. The shape of open_joined's own navigation.
+    fn created_navigation(
+        &self,
+        selection: &AccountSelection,
+        asked: CreationAsked,
+        authority: &NavigationAuthority,
+    ) -> Option<u64> {
+        let _admitted = authority.commit_guard()?;
+        if !selection.is_current() || !self.navigation_is_current(asked.navigation) {
+            return None;
+        }
+        Some(self.invalidate_navigation())
+    }
+
+    /// The guarded part of a created room's open, under the transition lock:
+    /// a Space through reveal_joined_space_locked, a room through
+    /// reveal_room_locked, after recording a confirmed Space link in the
+    /// cached graph (a scan under way could install an older graph: it is
+    /// invalidated first).
+    #[allow(clippy::too_many_arguments)]
+    async fn reveal_created_locked(
+        self: &Arc<Self>,
+        selection: &AccountSelection,
+        created: &CreatedRoom,
+        placement: &Placement,
+        epoch: u64,
+        authority: &NavigationAuthority,
+        admitted: Option<tokio::sync::oneshot::Sender<()>>,
+        ui: &Weak<AppWindow>,
+    ) -> Result<Option<AfterSnapshot>, MatrixCoreError> {
+        match created.kind {
+            CreationKind::Space => {
+                let space = created.room_id.clone();
+                self.reveal_joined_space_locked(selection, space, epoch, authority, admitted, ui)
+                    .await
+            }
+            CreationKind::Room => {
+                let linked = async {
+                    if let Placement::Linked { space_id } = placement {
+                        self.invalidate_space_scan().await;
+                        self.space_children
+                            .lock()
+                            .await
+                            .entry(space_id.clone())
+                            .or_default()
+                            .insert(created.room_id.clone());
+                    }
+                };
+                if unless_withdrawn(authority, linked).await.is_none() {
+                    return Ok(None);
+                }
+                let room = created.room_id.clone();
+                self.reveal_room_locked(selection, room, epoch, authority, admitted, ui)
+                    .await
+            }
+        }
     }
 
     /// Join a parsed room ID, alias, or Matrix link (the directory, Join a
@@ -2126,8 +2704,8 @@ impl LiveUi {
         // Do not invalidate the current feed while waiting for a held
         // transition: Close or a newer navigation may already have won.
         let epoch = {
-            let withdrawn = asked.authority.state();
-            if *withdrawn
+            let state = asked.authority.state();
+            if state.withdrawn
                 || asked.cancellation.is_cancelled()
                 || !selection.is_current()
                 || !self.navigation_is_current(asked.navigation)
@@ -2137,105 +2715,114 @@ impl LiveUi {
             self.invalidate_navigation()
         };
         let shown_room = room_id.clone();
+        let authority = &asked.authority;
         let opened = match open {
             JoinedNavigation::Room => {
-                self.reveal_room_locked(&selection, room_id, epoch, &asked.authority, &ui)
+                self.reveal_room_locked(&selection, room_id, epoch, authority, None, &ui)
                     .await
             }
             JoinedNavigation::Space => {
-                self.reveal_joined_space_locked(&selection, room_id, epoch, &asked.authority, &ui)
+                self.reveal_joined_space_locked(&selection, room_id, epoch, authority, None, &ui)
                     .await
             }
         };
-        if matches!(opened, Ok(true)) {
-            // Its receipt: the navigation this open took and the exact room.
-            asked.record_opened(epoch, shown_room);
-        } else {
-            self.reopen_unrevealed(&selection, epoch, ui).await;
+        match opened {
+            // Its follow-ups still run under this open's transition lock, as
+            // before; each is scoped to its own snapshot (after_snapshot).
+            Ok(Some(after)) => {
+                self.after_snapshot(after, ui).await;
+                // Its receipt: the navigation this open took and the exact
+                // room.
+                asked.record_opened(epoch, shown_room);
+                Ok(true)
+            }
+            other => {
+                self.reopen_unrevealed(&selection, epoch, ui).await;
+                other.map(|_| false)
+            }
         }
-        opened
     }
 
-    async fn complete_room_action(
-        self: &Arc<Self>,
-        account_id: &str,
-        room_id: String,
-        space_hint: Option<bool>,
-        display_name: &str,
-        ui: Weak<AppWindow>,
-    ) -> Result<(), MatrixCoreError> {
-        self.require_active_account(account_id).await?;
-        let is_space = match space_hint {
-            Some(true) => true,
-            Some(false) | None => self
-                .manager
-                .rooms_snapshot()
-                .await?
-                .iter()
-                .any(|room| room.room_id == room_id && room.is_space),
-        };
-        if is_space {
-            self.known_spaces
-                .lock()
-                .await
-                .entry(account_id.to_owned())
-                .or_default()
-                .insert(
-                    room_id.clone(),
-                    KnownSpace {
-                        name: if display_name.is_empty() {
-                            room_id.clone()
-                        } else {
-                            display_name.to_owned()
-                        },
-                        recorded_at: Instant::now(),
-                    },
-                );
-        }
-        self.clear_feed().await;
-        if is_space {
-            *self.selected_space.lock().await = Some(room_id);
-            *self.selected_room.lock().await = None;
-        } else {
-            *self.selected_space.lock().await = None;
-            *self.selected_room.lock().await = Some(room_id);
-        }
-        self.invalidate_space_scan().await;
-        self.invalidate_navigation();
-        self.refresh(ui.clone()).await?;
-        tokio::spawn(self.clone().scan_spaces(ui));
-        Ok(())
-    }
-
+    /// Answer one invitation for exactly `selection`, the account shown when
+    /// it was chosen: accept joins it, decline leaves it. The answer is the
+    /// core's single fenced request for that room alone; it is not sent when
+    /// the room is no longer an invitation, or when the selection or `fence`
+    /// (the view it was chosen in, a security step, the app still running)
+    /// ended first. `Err` means nothing was applied; once the request was
+    /// sent, the core's answer is returned whatever follows (see
+    /// `AccountManager::respond_invitation_selected`).
+    ///
+    /// The account transition is waited for at most
+    /// `INVITE_TRANSITION_WAIT`, past which nothing is sent
+    /// (`AccountAccessBusy`), and is held while the answer is checked, not
+    /// across its network waits; it is taken again, as bounded, to record
+    /// the result and read the lists again. That bookkeeping never takes or
+    /// invalidates a navigation, so a room chosen meanwhile keeps its own.
+    /// An accepted room or Space is opened only through `open_answered`:
+    /// sync already brought the join here, the navigation `opens` captured at
+    /// the click is still the current one, and its owned authority (session,
+    /// exact selection, security gate, no protected surface entered since)
+    /// still holds at the commit and at the snapshot's admission (a switch
+    /// from A to B and back to A included). A withdrawn open changes only
+    /// what is shown: the answer, its guard and its outcome stand. A failed
+    /// refresh only leaves the lists as they were until the next sync. An
+    /// answer already sent is not recalled.
     pub async fn respond_to_invite(
         self: &Arc<Self>,
-        account_id: &str,
+        selection: &AccountSelection,
         room_id: &str,
         accept: bool,
+        fence: &impl AnswerFence,
+        opens: Option<OwnedOpen>,
         ui: Weak<AppWindow>,
-    ) -> Result<(), MatrixCoreError> {
-        let _transition = self.account_transition.lock().await;
-        self.require_active_account(account_id).await?;
-        if accept {
-            // Invited Spaces carry the room type in their stripped state.
-            // Check before joining: a newly joined room may not yet have its
-            // full create event in the local room snapshot.
-            let invite = self
-                .manager
-                .invites_snapshot()
-                .await?
-                .into_iter()
-                .find(|room| room.room_id == room_id);
-            let was_space = invite.as_ref().is_some_and(|room| room.is_space);
-            self.manager.accept_invite(room_id).await?;
-            let is_space = was_space
-                || self
-                    .manager
-                    .rooms_snapshot()
-                    .await?
-                    .iter()
-                    .any(|room| room.room_id == room_id && room.is_space);
-            if is_space {
+    ) -> Result<InvitationAnswer, MatrixCoreError> {
+        let Some(transition) = self.bounded_transition(INVITE_TRANSITION_WAIT).await else {
+            return Err(MatrixCoreError::AccountAccessBusy);
+        };
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let account_id = selection.account_id();
+        // The invitation's name, read before joining, for an accepted Space
+        // that sync has not brought into the local room list yet; past the
+        // bound its room ID stands in.
+        let invite = if accept {
+            let invites = self.manager.invites_snapshot();
+            let invite = match tokio::time::timeout(INVITE_TRANSITION_WAIT, invites).await {
+                Ok(invites) => invites?.into_iter().find(|room| room.room_id == room_id),
+                Err(_) => None,
+            };
+            if !selection.is_current() {
+                return Err(MatrixCoreError::SelectedAccountChanged);
+            }
+            invite
+        } else {
+            None
+        };
+        // Not held across the answer's network waits: the core fences the
+        // hand-off to this exact selection and `fence` itself.
+        drop(transition);
+        let answer = self
+            .manager
+            .respond_invitation_selected(selection, room_id, accept, fence)
+            .await?;
+        if !selection.is_current() {
+            return Ok(answer);
+        }
+        let joined = accept && answer.outcome != InvitationOutcome::Unconfirmed;
+        // Bookkeeping only, under the transition: an accepted Space's name,
+        // and the lists read again. No navigation is taken or invalidated
+        // here, so a room chosen since the answer keeps its own.
+        {
+            let Some(_transition) = self.bounded_transition(INVITE_TRANSITION_WAIT).await else {
+                return Ok(answer);
+            };
+            if !selection.is_current() {
+                return Ok(answer);
+            }
+            // The kind the core read from the invite state when it admitted
+            // the answer: the joined room may not show it here yet.
+            if joined && answer.is_space {
                 self.known_spaces
                     .lock()
                     .await
@@ -2251,23 +2838,74 @@ impl LiveUi {
                         },
                     );
             }
-            self.clear_feed().await;
-            if is_space {
-                *self.selected_space.lock().await = Some(room_id.to_owned());
-                *self.selected_room.lock().await = None;
-            } else {
-                *self.selected_space.lock().await = None;
-                *self.selected_room.lock().await = Some(room_id.to_owned());
+            self.invalidate_space_scan().await;
+            if selection.is_current() && self.refresh(ui.clone()).await.is_ok() {
+                tokio::spawn(self.clone().scan_spaces(ui.clone()));
             }
-        } else {
-            self.manager.reject_invite(room_id).await?;
         }
-        self.require_active_account(account_id).await?;
-        self.invalidate_space_scan().await;
-        self.invalidate_navigation();
-        self.refresh(ui.clone()).await?;
-        tokio::spawn(self.clone().scan_spaces(ui));
-        Ok(())
+        // A room still reading as an invitation locally is not opened.
+        if joined && answer.outcome == InvitationOutcome::Settled {
+            self.open_answered(selection, room_id, answer.is_space, opens, ui)
+                .await;
+        }
+        Ok(answer)
+    }
+
+    /// The account transition, waited for at most `bound`.
+    async fn bounded_transition(&self, bound: Duration) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        tokio::time::timeout(bound, self.account_transition.lock())
+            .await
+            .ok()
+    }
+
+    /// Open an accepted invitation that sync already brought here, as a Home
+    /// card's accept or the center's Open asks (`open`, owned from its click
+    /// by `selection`): only while the open's own authority holds (the
+    /// session live, that selection current, the security gate where it was
+    /// and no protected surface entered since: each entry withdrew it for
+    /// good) and the navigation it was chosen in is still the current one,
+    /// taken in one step under that authority's lock (`claim_navigation_from`),
+    /// and only through the owned reveal of a room (reveal_room_for: the
+    /// current Space when it lists the room, else the Space that does, else
+    /// Home) or of a Space (reveal_space_for). That same authority is asked
+    /// again at the synchronous commit and the final snapshot admission: a
+    /// security step begun since, even one already ended, or a protected
+    /// surface entered since stops it there, and an unshown commit is given
+    /// back. A newer navigation is never taken or undone. Callers:
+    /// respond_to_invite and InvitationsCenter's Open.
+    pub(crate) async fn open_answered(
+        self: &Arc<Self>,
+        selection: &AccountSelection,
+        room_id: &str,
+        is_space: bool,
+        open: Option<OwnedOpen>,
+        ui: Weak<AppWindow>,
+    ) {
+        let Some(open) = open else {
+            return;
+        };
+        if !selection.is_current() {
+            return;
+        }
+        // A withdrawal takes the same lock: once it returns, nothing claims.
+        let epoch = {
+            let Some(_admitted) = open.authority.commit_guard() else {
+                return;
+            };
+            self.claim_navigation_from(open.navigation)
+        };
+        let Some(epoch) = epoch else {
+            return;
+        };
+        let (selection, room_id) = (selection.clone(), room_id.to_owned());
+        let authority = open.authority;
+        let _ = if is_space {
+            self.reveal_space_for(selection, room_id, epoch, authority, ui)
+                .await
+        } else {
+            self.reveal_room_for(selection, room_id, epoch, authority, ui)
+                .await
+        };
     }
 
     async fn require_active_account(&self, account_id: &str) -> Result<(), MatrixCoreError> {
@@ -2327,6 +2965,11 @@ impl LiveUi {
     /// only while all three still hold (checked on the UI thread, where
     /// withdrawal happens), and an unshown commit gives back the previous
     /// room and Space. A newer navigation keeps its own epoch and state.
+    /// Every wait before the admission gives way to a withdrawal of
+    /// `authority`. The transition lock is released before the follow-ups
+    /// (members, the feed, recovery: after_snapshot, each scoped to this
+    /// snapshot) and before the reopen of an unshown reveal, so neither holds
+    /// up navigation; the result still comes after them.
     pub(crate) async fn reveal_room_for(
         self: &Arc<Self>,
         selection: AccountSelection,
@@ -2335,39 +2978,64 @@ impl LiveUi {
         authority: NavigationAuthority,
         ui: Weak<AppWindow>,
     ) -> Result<bool, MatrixCoreError> {
-        let _transition = self.account_transition.lock().await;
-        let revealed = self
-            .reveal_room_locked(&selection, room_id, navigation_epoch, &authority, &ui)
-            .await;
-        if !matches!(revealed, Ok(true)) {
-            self.reopen_unrevealed(&selection, navigation_epoch, ui)
-                .await;
+        let revealed = match unless_withdrawn(&authority, self.account_transition.lock()).await {
+            Some(_transition) => {
+                let epoch = navigation_epoch;
+                self.reveal_room_locked(&selection, room_id, epoch, &authority, None, &ui)
+                    .await
+            }
+            None => Ok(None),
+        };
+        match revealed {
+            Ok(Some(after)) => {
+                self.after_snapshot(after, ui).await;
+                Ok(true)
+            }
+            other => {
+                self.reopen_unrevealed(&selection, navigation_epoch, ui)
+                    .await;
+                other.map(|_| false)
+            }
         }
-        revealed
     }
 
-    /// reveal_room_for under the transition lock.
+    /// reveal_room_for under the transition lock: the guarded part only
+    /// (commit, admission, give-back). `Some` with the follow-ups once its
+    /// snapshot was admitted, for the caller to run (after_snapshot).
+    /// `admitted`, when given, is told the moment the snapshot is admitted
+    /// (see RevealOwner). Every wait before that gives way to a withdrawal of
+    /// `authority`.
     async fn reveal_room_locked(
         self: &Arc<Self>,
         selection: &AccountSelection,
         room_id: String,
         navigation_epoch: u64,
         authority: &NavigationAuthority,
+        admitted: Option<tokio::sync::oneshot::Sender<()>>,
         ui: &Weak<AppWindow>,
-    ) -> Result<bool, MatrixCoreError> {
+    ) -> Result<Option<AfterSnapshot>, MatrixCoreError> {
         let account_id = selection.account_id().to_owned();
         if authority.withdrawn()
             || !selection.is_current()
             || !self.navigation_is_current(navigation_epoch)
-            || self.require_active_account(&account_id).await.is_err()
+            || !matches!(
+                unless_withdrawn(authority, self.require_active_account(&account_id)).await,
+                Some(Ok(()))
+            )
         {
-            return Ok(false);
+            return Ok(None);
         }
         // From before the rooms and the Space graph are read until the
         // snapshot is decided, no other refresh samples the selection, so
-        // none can show the room unguarded.
-        let barrier = self.snapshot_barrier.write().await;
-        let rooms = self.manager.rooms_snapshot().await?;
+        // none can show the room unguarded. Every wait is before the commit:
+        // a withdrawal stops it at once.
+        let Some(barrier) = unless_withdrawn(authority, self.snapshot_barrier.write()).await else {
+            return Ok(None);
+        };
+        let Some(rooms) = unless_withdrawn(authority, self.manager.rooms_snapshot()).await else {
+            return Ok(None);
+        };
+        let rooms = rooms?;
         let Some(room) = rooms.iter().find(|room| room.room_id == room_id) else {
             return Err(MatrixCoreError::RoomNotFound(room_id));
         };
@@ -2377,14 +3045,20 @@ impl LiveUi {
         // The same visibility rules as refresh: a Space is shown only while it
         // is joined or was just created (known for 60 s), and Home lists
         // direct rooms and rooms outside every scanned Space.
-        let mut known = HashSet::new();
-        if let Some(created) = self.known_spaces.lock().await.get(&account_id) {
-            for (space, value) in created {
-                if value.recorded_at.elapsed() < Duration::from_secs(60) {
-                    known.insert(space.clone());
+        let known = async {
+            let mut known = HashSet::new();
+            if let Some(created) = self.known_spaces.lock().await.get(&account_id) {
+                for (space, value) in created {
+                    if value.recorded_at.elapsed() < Duration::from_secs(60) {
+                        known.insert(space.clone());
+                    }
                 }
             }
-        }
+            known
+        };
+        let Some(known) = unless_withdrawn(authority, known).await else {
+            return Ok(None);
+        };
         let shown = |space: &str| {
             known.contains(space)
                 || rooms.iter().any(|room| {
@@ -2393,7 +3067,10 @@ impl LiveUi {
                         && room.membership == RoomMembership::Joined
                 })
         };
-        let space_children = self.space_children.lock().await.clone();
+        let children = async { self.space_children.lock().await.clone() };
+        let Some(space_children) = unless_withdrawn(authority, children).await else {
+            return Ok(None);
+        };
         let spaces = space_children
             .iter()
             .filter(|(space, children)| children.contains(&room_id) && shown(space.as_str()))
@@ -2408,14 +3085,16 @@ impl LiveUi {
             return Err(MatrixCoreError::RoomNotFound(room_id));
         }
         if !selection.is_current() {
-            return Ok(false);
+            return Ok(None);
         }
+        // Its only waits are its locks, before the synchronous commit itself.
         let commit = self.commit_reveal(&room_id, &spaces, in_home, navigation_epoch, authority);
-        let Some(previous) = commit.await else {
-            return Ok(false);
+        let Some(Some(previous)) = unless_withdrawn(authority, commit).await else {
+            return Ok(None);
         };
-        // The feed is not cleared here: the owned refresh retires it once the
-        // room is shown; an unshown reveal hands it to reopen_unrevealed.
+        // The feed is not cleared here: the owned snapshot's follow-ups retire
+        // it once the room is shown; an unshown reveal hands it to
+        // reopen_unrevealed.
         let gate = SnapshotGate {
             authority: authority.clone(),
             selection: selection.clone(),
@@ -2426,19 +3105,22 @@ impl LiveUi {
             room_id: room_id.clone(),
             space_id: None,
             _barrier: Some(barrier),
+            admitted,
         };
-        let refreshed = self.refresh_owned(ui.clone(), Some(&mut owner)).await;
-        if !matches!(refreshed, Ok(true)) {
-            self.settle_unshown_reveal(&room_id, previous, owner._barrier.take())
-                .await;
-            return refreshed.map(|_| false);
+        let shown = self.snapshot_owned(ui.clone(), Some(&mut owner)).await;
+        match shown {
+            // The room's drafts are recovered once it is shown, while it is
+            // still the room shown under this snapshot (after_snapshot).
+            Ok(Some(mut after)) => {
+                after.recover = true;
+                Ok(Some(after))
+            }
+            other => {
+                self.settle_unshown_reveal(&room_id, previous, owner._barrier.take())
+                    .await;
+                other
+            }
         }
-        let room_id = self.selected_room.lock().await.clone();
-        if let Some(room_id) = room_id {
-            self.complete_room_recovery(selection.clone(), room_id, ui.clone())
-                .await;
-        }
-        Ok(true)
     }
 
     /// A committed reveal whose snapshot was not applied (withdrawn,
@@ -2459,39 +3141,90 @@ impl LiveUi {
         drop(barrier);
     }
 
-    /// The joined-Space counterpart of reveal_room_locked. Keep the same
+    /// Select the joined Space `space_id` as an owned reveal, the way
+    /// reveal_room_for opens a room: committed exactly under `authority`
+    /// (its withdrawal and its own conditions) and the navigation epoch,
+    /// shown only through its own admitted snapshot, given back otherwise
+    /// (reveal_joined_space_locked, the joined-Space RevealOwner barrier).
+    /// Callers: open_answered (an accepted Space invitation's own open).
+    /// As in reveal_room_for, every wait before the admission gives way to a
+    /// withdrawal of `authority`, and the transition lock is released before
+    /// the follow-ups (after_snapshot) and the reopen of an unshown reveal.
+    pub(crate) async fn reveal_space_for(
+        self: &Arc<Self>,
+        selection: AccountSelection,
+        space_id: String,
+        navigation_epoch: u64,
+        authority: NavigationAuthority,
+        ui: Weak<AppWindow>,
+    ) -> Result<bool, MatrixCoreError> {
+        let revealed = match unless_withdrawn(&authority, self.account_transition.lock()).await {
+            Some(_transition) => {
+                let (epoch, space) = (navigation_epoch, space_id);
+                self.reveal_joined_space_locked(&selection, space, epoch, &authority, None, &ui)
+                    .await
+            }
+            None => Ok(None),
+        };
+        match revealed {
+            Ok(Some(after)) => {
+                self.after_snapshot(after, ui).await;
+                Ok(true)
+            }
+            other => {
+                self.reopen_unrevealed(&selection, navigation_epoch, ui)
+                    .await;
+                other.map(|_| false)
+            }
+        }
+    }
+
+    /// The joined-Space counterpart of reveal_room_locked (a joined link's
+    /// Space, a created Space, an accepted Space invitation). Keep the same
     /// snapshot barrier until this exact selection/authority has shown its
     /// Space, or restore only this unshown commit before releasing it.
+    /// `Some` with the follow-ups once its snapshot was admitted; `admitted`,
+    /// when given, is told at that moment. Every wait before the commit or
+    /// the admission gives way to a withdrawal of `authority`.
     async fn reveal_joined_space_locked(
         self: &Arc<Self>,
         selection: &AccountSelection,
         space_id: String,
         navigation: u64,
         authority: &NavigationAuthority,
+        admitted: Option<tokio::sync::oneshot::Sender<()>>,
         ui: &Weak<AppWindow>,
-    ) -> Result<bool, MatrixCoreError> {
+    ) -> Result<Option<AfterSnapshot>, MatrixCoreError> {
         if authority.withdrawn()
             || !selection.is_current()
             || !self.navigation_is_current(navigation)
-            || self
-                .require_active_account(selection.account_id())
-                .await
-                .is_err()
+            || !matches!(
+                unless_withdrawn(
+                    authority,
+                    self.require_active_account(selection.account_id())
+                )
+                .await,
+                Some(Ok(()))
+            )
         {
-            return Ok(false);
+            return Ok(None);
         }
-        let barrier = self.snapshot_barrier.write().await;
-        let rooms = self.manager.rooms_snapshot().await?;
+        let Some(barrier) = unless_withdrawn(authority, self.snapshot_barrier.write()).await else {
+            return Ok(None);
+        };
+        let Some(rooms) = unless_withdrawn(authority, self.manager.rooms_snapshot()).await else {
+            return Ok(None);
+        };
+        let rooms = rooms?;
         if !rooms.iter().any(|room| {
             room.room_id == space_id && room.is_space && room.membership == RoomMembership::Joined
         }) {
             return Err(MatrixCoreError::RoomNotFound(space_id));
         }
-        let Some(previous) = self
-            .commit_joined_space(selection, &space_id, navigation, authority)
-            .await
-        else {
-            return Ok(false);
+        // Its only waits are its locks, before the synchronous commit itself.
+        let commit = self.commit_joined_space(selection, &space_id, navigation, authority);
+        let Some(Some(previous)) = unless_withdrawn(authority, commit).await else {
+            return Ok(None);
         };
         let mut owner = RevealOwner {
             gate: SnapshotGate {
@@ -2502,9 +3235,10 @@ impl LiveUi {
             room_id: String::new(),
             space_id: Some(space_id.clone()),
             _barrier: Some(barrier),
+            admitted,
         };
-        let shown = self.refresh_owned(ui.clone(), Some(&mut owner)).await;
-        if !matches!(shown, Ok(true)) {
+        let shown = self.snapshot_owned(ui.clone(), Some(&mut owner)).await;
+        if !matches!(shown, Ok(Some(_))) {
             // The transition and barrier still exclude another navigation's
             // commit. Check the installed Space under both selection locks;
             // never replace any selection that is no longer this commit's.
@@ -2556,7 +3290,22 @@ impl LiveUi {
         if !selection.is_current() || !self.navigation_is_current(navigation_epoch) {
             return;
         }
-        *self.feed_key.lock().await = None;
+        let expected_room = { self.selected_room.lock().await.clone() };
+        {
+            // The same order as the feed installs: key, then selected room.
+            let mut key = self.feed_key.lock().await;
+            let selected = self.selected_room.lock().await;
+            // Either wait may outlive a newer room or account choice: recheck
+            // at the mutation, with no suspension after this check.
+            if !self.is_live.load(Ordering::Acquire)
+                || !selection.is_current()
+                || !self.navigation_is_current(navigation_epoch)
+                || *selected != expected_room
+            {
+                return;
+            }
+            *key = None;
+        }
         let _ = self.refresh(ui).await;
     }
 
@@ -2674,52 +3423,79 @@ impl LiveUi {
     }
 
     pub async fn refresh(self: &Arc<Self>, ui: Weak<AppWindow>) -> Result<(), MatrixCoreError> {
-        self.refresh_owned(ui, None).await.map(|_| ())
+        self.refresh_owned(ui).await.map(|_| ())
     }
 
-    /// `owner`: the reveal this refresh publishes for, holding the snapshot
+    /// One refresh: its snapshot, then its follow-ups in place, as before.
+    /// Whether a snapshot was queued. Owned reveals use snapshot_owned and
+    /// run the follow-ups themselves (after_snapshot).
+    async fn refresh_owned(self: &Arc<Self>, ui: Weak<AppWindow>) -> Result<bool, MatrixCoreError> {
+        match self.snapshot_owned(ui.clone(), None).await? {
+            Some(after) => {
+                self.after_snapshot(after, ui).await;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Build and queue one snapshot of the active account; `Some` with what
+    /// it leaves to do once it was queued (with `owner`, once applied).
+    ///
+    /// `owner`: the reveal this snapshot publishes for, holding the snapshot
     /// barrier. Its snapshot is applied only while the reveal's gate admits
-    /// it on the UI thread; only then is the barrier released and are the
-    /// room's members and feed loaded. Every other refresh waits at the
-    /// barrier before it samples anything. Returns whether the owner's
-    /// snapshot was applied (without an owner, whether one was queued).
-    async fn refresh_owned(
+    /// it on the UI thread, which claims the admission on its authority;
+    /// only then is the barrier released. Every wait before that decision
+    /// gives way to a withdrawal of that authority (`within`), so a
+    /// withdrawn reveal never holds its barrier or the transition lock for
+    /// it, and nothing it read is shown. Withdrawn while the snapshot waits
+    /// on the UI thread, it stops waiting unless the UI already claimed it.
+    /// Every other refresh waits at the barrier before it samples anything.
+    async fn snapshot_owned(
         self: &Arc<Self>,
         ui: Weak<AppWindow>,
         mut owner: Option<&mut RevealOwner<'_>>,
-    ) -> Result<bool, MatrixCoreError> {
+    ) -> Result<Option<AfterSnapshot>, MatrixCoreError> {
         let barrier = if owner.is_some() {
             None
         } else {
             Some(self.snapshot_barrier.read().await)
         };
+        let stop = owner.as_ref().map(|owner| owner.gate.authority.clone());
+        let stop = stop.as_ref();
         #[cfg(test)]
         self.pauses.reach("refresh.after_barrier").await;
         if !self.is_live.load(Ordering::Acquire) {
-            return Ok(false);
+            return Ok(None);
         }
         let render_epoch = self.render_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let navigation_epoch = self.navigation_epoch.load(Ordering::Acquire);
-        let accounts = self.manager.accounts().await;
-        let active = self
-            .manager
-            .active_account()
-            .await
-            .ok_or(MatrixCoreError::NoActiveAccount)?;
-        let rooms = self.manager.rooms_snapshot().await?;
-        if self
-            .manager
-            .active_account()
-            .await
-            .as_ref()
-            .map(|account| &account.id)
-            != Some(&active.id)
+        let Some(accounts) = within(stop, self.manager.accounts()).await else {
+            return Ok(None);
+        };
+        let Some(active) = within(stop, self.manager.active_account()).await else {
+            return Ok(None);
+        };
+        let active = active.ok_or(MatrixCoreError::NoActiveAccount)?;
+        // A reveal's commit is held until its snapshot is decided: a
+        // withdrawal stops this read at once, before anything is queued, and
+        // the reveal gives its commit back.
+        let Some(rooms) = within(stop, self.manager.rooms_snapshot()).await else {
+            return Ok(None);
+        };
+        let rooms = rooms?;
+        let Some(still) = within(stop, self.manager.active_account()).await else {
+            return Ok(None);
+        };
+        if still.as_ref().map(|account| &account.id) != Some(&active.id)
             || self.render_epoch.load(Ordering::Acquire) != render_epoch
         {
-            return Ok(false);
+            return Ok(None);
         }
         let known_spaces = {
-            let mut by_account = self.known_spaces.lock().await;
+            let Some(mut by_account) = within(stop, self.known_spaces.lock()).await else {
+                return Ok(None);
+            };
             let known = by_account.entry(active.id.clone()).or_default();
             known.retain(
                 |id, value| match rooms.iter().find(|room| room.room_id == *id) {
@@ -2734,7 +3510,13 @@ impl LiveUi {
                 .map(|(id, value)| (id.clone(), value.name.clone()))
                 .collect::<HashMap<_, _>>()
         };
-        let selected_space = self.selected_space.lock().await.clone().filter(|space_id| {
+        // Each guard is dropped as soon as its value is read.
+        let Some(selected_space) =
+            within(stop, async { self.selected_space.lock().await.clone() }).await
+        else {
+            return Ok(None);
+        };
+        let selected_space = selected_space.filter(|space_id| {
             known_spaces.contains_key(space_id)
                 || rooms.iter().any(|room| {
                     room.is_space
@@ -2743,13 +3525,17 @@ impl LiveUi {
                 })
         });
         if self.render_epoch.load(Ordering::Acquire) != render_epoch {
-            return Ok(false);
+            return Ok(None);
         }
         // A reveal writes its Space only once its room is confirmed below.
         if owner.is_none() {
             *self.selected_space.lock().await = selected_space.clone();
         }
-        let space_children = self.space_children.lock().await.clone();
+        let Some(space_children) =
+            within(stop, async { self.space_children.lock().await.clone() }).await
+        else {
+            return Ok(None);
+        };
         let all_space_children = space_children
             .values()
             .flatten()
@@ -2770,7 +3556,10 @@ impl LiveUi {
                 room.is_direct || !all_space_children.contains(&room.room_id)
             }
         };
-        let current = self.selected_room.lock().await.clone();
+        let Some(current) = within(stop, async { self.selected_room.lock().await.clone() }).await
+        else {
+            return Ok(None);
+        };
         let selected = current
             .filter(|room_id| {
                 rooms
@@ -2784,7 +3573,7 @@ impl LiveUi {
                     .map(|room| room.room_id.clone())
             });
         if self.render_epoch.load(Ordering::Acquire) != render_epoch {
-            return Ok(false);
+            return Ok(None);
         }
         // A reveal shows exactly its room. When the room is not visible under
         // the committed Space any more (the Space graph or membership changed
@@ -2798,17 +3587,34 @@ impl LiveUi {
             } else if selected.as_deref() != Some(owner.room_id.as_str()) {
                 return Err(MatrixCoreError::RoomNotFound(owner.room_id.clone()));
             }
-            *self.selected_space.lock().await = selected_space.clone();
+            let Some(mut space) = within(stop, self.selected_space.lock()).await else {
+                return Ok(None);
+            };
+            *space = selected_space.clone();
         }
-        *self.selected_room.lock().await = selected.clone();
-        // A reveal's draft error is shown only with its snapshot.
+        let Some(mut room) = within(stop, self.selected_room.lock()).await else {
+            return Ok(None);
+        };
+        *room = selected.clone();
+        drop(room);
+        // A reveal's draft error is shown only with its snapshot, in its own
+        // navigation (after_snapshot).
         let mut draft_error = None;
         if let Some(room_id) = selected.as_deref() {
-            if let Err(error) = self
-                .drafts
-                .load_if_missing(&self.manager, &active.id, room_id)
-                .await
-            {
+            let loading = async {
+                // Owned reveals only: an ordinary refresh never takes it.
+                #[cfg(test)]
+                if stop.is_some() {
+                    self.pauses.reach("snapshot.draft").await;
+                }
+                self.drafts
+                    .load_if_missing(&self.manager, &active.id, room_id)
+                    .await
+            };
+            let Some(loaded) = within(stop, loading).await else {
+                return Ok(None);
+            };
+            if let Err(error) = loaded {
                 let message = format!("Could not restore draft on this device: {error}");
                 if owner.is_some() {
                     draft_error = Some(message);
@@ -2818,7 +3624,7 @@ impl LiveUi {
             }
         }
         if self.render_epoch.load(Ordering::Acquire) != render_epoch {
-            return Ok(false);
+            return Ok(None);
         }
         let member_account_id = active.id.clone();
         let marker_rooms = rooms
@@ -2826,6 +3632,11 @@ impl LiveUi {
             .filter(|room| room.membership == RoomMembership::Joined && !room.is_space)
             .map(|room| room.room_id.clone())
             .collect::<Vec<_>>();
+        let local_voice_rooms = self.voice_spaces.local_rooms(&member_account_id);
+        let shared = self.voice_spaces.shared_rooms(&member_account_id);
+        let Some(shared_voice_rooms) = within(stop, shared).await else {
+            return Ok(None);
+        };
         let view = Snapshot {
             accounts,
             active,
@@ -2835,8 +3646,8 @@ impl LiveUi {
             known_spaces,
             space_children,
             all_space_children,
-            local_voice_rooms: self.voice_spaces.local_rooms(&member_account_id),
-            shared_voice_rooms: self.voice_spaces.shared_rooms(&member_account_id).await,
+            local_voice_rooms,
+            shared_voice_rooms,
         };
         let current_epoch = self.render_epoch.clone();
         let is_live = self.is_live.clone();
@@ -2846,12 +3657,14 @@ impl LiveUi {
         let gate = owner.as_ref().map(|owner| owner.gate.clone());
         let navigation_now = self.navigation_epoch.clone();
         let thread_now = self.thread_generation.clone();
-        let (decide, decision) = tokio::sync::oneshot::channel();
+        let (decide, mut decision) = tokio::sync::oneshot::channel();
         let _ = ui.upgrade_in_event_loop(move |ui| {
             let owned = gate.is_some();
+            // The gate claims an owned snapshot's admission last; the apply
+            // below runs outside every lock.
             let shown = is_live.load(Ordering::Acquire)
                 && current_epoch.load(Ordering::Acquire) == render_epoch
-                && gate.is_none_or(|gate| gate.admits(&navigation_now));
+                && gate.is_none_or(|gate| gate.admits_on(&ui, &navigation_now));
             // A shown reveal ends the left room's thread requests here, with
             // its snapshot; one opened in the shown room from now on is newer.
             let thread = (owned && shown).then(|| thread_now.fetch_add(1, Ordering::AcqRel) + 1);
@@ -2861,49 +3674,145 @@ impl LiveUi {
             let _ = decide.send(thread);
         });
         drop(barrier);
-        if let Some(owner) = owner.as_mut() {
-            // Not applied, or dropped unsent with a closed window: nothing of
-            // the room is loaded, and the reveal still holds the barrier.
-            let Ok(Some(thread)) = decision.await else {
-                return Ok(false);
-            };
-            owner._barrier = None;
+        let mut after = AfterSnapshot {
+            account_id: member_account_id,
+            room_id: selected,
+            selection: None,
+            navigation_epoch,
+            marker_rooms,
+            owned: None,
+            retire_feed: false,
+            recover: false,
+        };
+        let Some(owner) = owner.as_mut() else {
+            after.selection = self.manager.account_selection(&after.account_id);
+            return Ok(Some(after));
+        };
+        // Not applied, or dropped unsent with a closed window: nothing of the
+        // room is loaded, and the reveal still holds the barrier. Withdrawn
+        // (or its own conditions failed) before the UI decided: that is made
+        // final under the authority's lock (withdraw), linearized with the
+        // UI's claim. A claim that came first is shown or being applied, and
+        // its decision follows; otherwise nothing is ever shown.
+        let authority = owner.gate.authority.clone();
+        let decided = match unless_withdrawn(&authority, &mut decision).await {
+            Some(decided) => decided,
+            None if authority.withdraw() => decision.await,
+            None => return Ok(None),
+        };
+        let Ok(Some(thread)) = decided else {
+            return Ok(None);
+        };
+        // The admission milestone: shown now, whatever the follow-ups come
+        // to. The barrier goes with it; the caller runs the follow-ups.
+        if let Some(admitted) = owner.admitted.take() {
+            let _ = admitted.send(());
+        }
+        owner._barrier = None;
+        // A reveal's room opens under the selection its snapshot was shown
+        // for, never one looked up again.
+        after.selection = Some(owner.gate.selection.clone());
+        after.owned = Some((thread, draft_error));
+        after.retire_feed = owner.space_id.is_some();
+        Ok(Some(after))
+    }
+
+    /// What a snapshot leaves to do once shown (an owned reveal: admitted),
+    /// each step scoped to exactly that snapshot (see AfterSnapshot): for an
+    /// owned reveal the left room's thread, the feed slot and the draft
+    /// error; then the room's members and live feed, recovery, and the
+    /// voice markers. Every step rechecks that its snapshot is still the
+    /// current one where it writes, so a later navigation, account switch or
+    /// lock keeps its own feed, key, draft, presentation and selection. A
+    /// search result's or a created room's reveal runs this with no
+    /// transition lock and no barrier held, so none of these waits holds up
+    /// navigation; a join's open runs it under its own transition lock, as
+    /// before.
+    async fn after_snapshot(self: &Arc<Self>, after: AfterSnapshot, ui: Weak<AppWindow>) {
+        let AfterSnapshot {
+            account_id,
+            room_id,
+            selection,
+            navigation_epoch,
+            marker_rooms,
+            owned,
+            retire_feed,
+            recover,
+        } = after;
+        let current = |live: &Self| {
+            live.navigation_is_current(navigation_epoch)
+                && selection.as_ref().is_some_and(AccountSelection::is_current)
+        };
+        if let Some((thread, draft_error)) = owned {
             // The left room's thread ends, unless one was opened since.
             self.clear_thread_if_current(thread).await;
             // Any feed in the slot was opened under an epoch navigate() has
             // replaced and can no longer publish: open_room opens the room's
-            // feed under this reveal's epoch.
-            *self.feed_key.lock().await = None;
-            if let Some(message) = draft_error.take() {
-                show_error(&ui, message);
-            }
-            // A joined Space may have no visible room. Its admitted empty
-            // snapshot must retire the old room's feed, too, after the UI
-            // has captured its draft and accepted this owned selection.
-            if owner.space_id.is_some() && selected.is_none() {
-                self.clear_feed().await;
+            // feed under this reveal's epoch. A newer navigation keeps its own
+            // key and feed.
+            let reset = {
+                #[cfg(test)]
+                self.pauses.reach("snapshot.before_feed_key").await;
+                // The order of the feed installs: key, feed, selected room.
+                let mut key = self.feed_key.lock().await;
+                let mut feed = self.feed.lock().await;
+                let selected = self.selected_room.lock().await;
+                if self.is_live.load(Ordering::Acquire) && current(self) && *selected == room_id {
+                    *key = None;
+                    // A joined Space may show no room: its admitted empty
+                    // snapshot retires the left room's feed too, after the UI
+                    // has captured its draft and accepted this selection.
+                    if retire_feed && room_id.is_none() {
+                        self.generation.fetch_add(1, Ordering::AcqRel);
+                        self.drop_stale_focus();
+                        if let Some(task) = feed.take() {
+                            task.abort();
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if reset && let (Some(message), Some(selection)) = (draft_error, selection.clone()) {
+                self.show_navigation_error(
+                    &ui,
+                    selection,
+                    navigation_epoch,
+                    room_id.clone(),
+                    message,
+                );
             }
         }
-        if let Some(room_id) = selected {
-            self.refresh_members_for(
-                member_account_id.clone(),
-                room_id.clone(),
-                ui.clone(),
-                false,
-            )
-            .await;
-            // A reveal's room opens under the selection its snapshot was
-            // shown for, never one looked up again.
-            let selection = match &owner {
-                Some(owner) => Some(owner.gate.selection.clone()),
-                None => self.manager.account_selection(&member_account_id),
-            };
-            if let Some(selection) = selection {
+        if let Some(room_id) = room_id.clone() {
+            // The snapshot's member load carries its selection and navigation
+            // to the load's own claim (MemberOwner). Without a selection (the
+            // account is restoring, switching or logging out) there is no
+            // owner and no member load: the next admitted snapshot loads.
+            if let Some(selection) = selection.clone() {
+                let owner = MemberOwner {
+                    selection,
+                    navigation_epoch,
+                };
+                let (account, room) = (account_id.clone(), room_id.clone());
+                self.refresh_members_owned(account, room, ui.clone(), false, owner)
+                    .await;
+            }
+            if let Some(selection) = selection.clone() {
                 self.open_room(selection, room_id, navigation_epoch, ui.clone())
                     .await;
             }
         }
-        let marker_account = member_account_id;
+        // A revealed room's drafts are recovered for it while it is still the
+        // room shown under that snapshot's selection and navigation.
+        if recover && let (Some(selection), Some(room_id)) = (selection.clone(), room_id) {
+            let still_shown = self.selected_room.lock().await.as_deref() == Some(room_id.as_str());
+            if still_shown && current(self) {
+                self.complete_room_recovery(selection, room_id, ui.clone())
+                    .await;
+            }
+        }
+        let marker_account = account_id;
         let voice_spaces = self.voice_spaces.clone();
         let live = self.clone();
         tokio::spawn(async move {
@@ -2919,12 +3828,51 @@ impl LiveUi {
                 });
             }
         });
-        Ok(true)
+    }
+
+    /// Publish an error only in the exact navigation it belongs to. The
+    /// event-loop queue is another asynchronous boundary, so the worker's
+    /// earlier checks cannot authorize publication in a newer room or
+    /// account: they are checked again in the UI callback.
+    fn show_navigation_error(
+        &self,
+        ui: &Weak<AppWindow>,
+        selection: AccountSelection,
+        navigation_epoch: u64,
+        room_id: Option<String>,
+        error: String,
+    ) {
+        let navigation = self.navigation_epoch.clone();
+        let is_live = self.is_live.clone();
+        let _ = ui.upgrade_in_event_loop(move |window| {
+            if is_live.load(Ordering::Acquire)
+                && selection.is_current()
+                && navigation.load(Ordering::Acquire) == navigation_epoch
+                && visible_feed_target(
+                    window.get_active_account_local_id().as_str(),
+                    window.get_active_room_id().as_str(),
+                    selection.account_id(),
+                    room_id.as_deref().unwrap_or(""),
+                )
+            {
+                window.set_session_error(error.into());
+            }
+        });
     }
 
     /// Fetch members for the visible account and room. Sync can trigger many
     /// presentation refreshes, so refresh at most once per short interval
-    /// unless the user explicitly requests it.
+    /// unless the user explicitly requests it. Callers: the member list's
+    /// Refresh and moderation's settled action (both forced, for the room on
+    /// screen); after_snapshot uses refresh_members_owned.
+    ///
+    /// The load's owner is captured here, synchronously, before the first
+    /// await: `account_id`'s exact current selection (none when another
+    /// account is active, or while one is restoring, switching or logging
+    /// out) and the navigation now. A load with no owner does nothing, so a
+    /// forced Refresh or moderation refresh for account A can never claim the
+    /// member epoch, or publish, after B became active, even in a room with
+    /// the same ID.
     pub async fn refresh_members_for(
         self: &Arc<Self>,
         account_id: String,
@@ -2932,7 +3880,43 @@ impl LiveUi {
         ui: Weak<AppWindow>,
         force: bool,
     ) {
-        if !self.is_live.load(Ordering::Acquire)
+        let navigation_epoch = self.navigation_epoch.load(Ordering::Acquire);
+        let Some(selection) = self.manager.account_selection(&account_id) else {
+            return;
+        };
+        let owner = MemberOwner {
+            selection,
+            navigation_epoch,
+        };
+        self.refresh_members_owned(account_id, room_id, ui, force, owner)
+            .await;
+    }
+
+    /// refresh_members_for, for `owner`, captured before any await (every
+    /// forced and automatic load has one; there is no owner-free load). The
+    /// member epoch is claimed under member_request only while the room is
+    /// still the one selected and the owner's exact selection (of
+    /// `account_id`) and navigation are still current: checked before the
+    /// first await and again after every await, where the claim happens. A
+    /// load that fails them installs no epoch or request and touches no
+    /// loading state, members or error, so a newer navigation's or another
+    /// account's load keeps its own. Lock order at the claim: member_request,
+    /// then selected_room; no manager or network wait is held under either.
+    async fn refresh_members_owned(
+        self: &Arc<Self>,
+        account_id: String,
+        room_id: String,
+        ui: Weak<AppWindow>,
+        force: bool,
+        owner: MemberOwner,
+    ) {
+        let owned = |owner: &MemberOwner| {
+            owner.selection.is_current()
+                && owner.selection.account_id() == account_id
+                && self.navigation_is_current(owner.navigation_epoch)
+        };
+        if !owned(&owner)
+            || !self.is_live.load(Ordering::Acquire)
             || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
             || self
                 .manager
@@ -2942,14 +3926,26 @@ impl LiveUi {
         {
             return;
         }
+        #[cfg(test)]
+        self.pauses.reach("members.before_claim").await;
         let epoch = {
             let mut request = self.member_request.lock().await;
+            // The claim, after the awaits above: the earlier room check may
+            // be stale by now.
+            let selected = self.selected_room.lock().await.as_deref() == Some(room_id.as_str());
+            // The original owner, never one looked up again: a load whose
+            // account is no longer the selected one claims nothing, even
+            // where another account now shows a room with the same ID.
+            if !self.is_live.load(Ordering::Acquire) || !selected || !owned(&owner) {
+                return;
+            }
+            let (member_epoch, navigation_epoch) = (
+                self.member_epoch.load(Ordering::Acquire),
+                self.navigation_epoch.load(Ordering::Acquire),
+            );
             if !force
                 && request.as_ref().is_some_and(|previous| {
-                    previous.account_id == account_id
-                        && previous.room_id == room_id
-                        && previous.epoch == self.member_epoch.load(Ordering::Acquire)
-                        && previous.started.elapsed() < Duration::from_secs(30)
+                    previous.serves(&account_id, &room_id, member_epoch, navigation_epoch)
                 })
             {
                 return;
@@ -2960,18 +3956,27 @@ impl LiveUi {
                 room_id: room_id.clone(),
                 started: Instant::now(),
                 epoch,
+                owner: Some(owner.clone()),
             });
             epoch
         };
-        let loading_account = account_id.clone();
-        let loading_room = room_id.clone();
+        // Every publication of this load carries what it claimed under.
+        let publication = MemberPublication {
+            epoch,
+            account_id: account_id.clone(),
+            room_id: room_id.clone(),
+            owner: Some(owner),
+            is_live: self.is_live.clone(),
+            member_epoch: self.member_epoch.clone(),
+            navigation_epoch: self.navigation_epoch.clone(),
+        };
+        // Claimed, its loading flag not yet queued: a newer load may run
+        // and finish here.
+        #[cfg(test)]
+        self.pauses.reach("members.before_loading").await;
+        let loading = publication.clone();
         let _ = ui.upgrade_in_event_loop(move |window| {
-            if window.get_active_account_local_id().as_str() == loading_account
-                && window.get_active_room_id().as_str() == loading_room
-            {
-                window.set_member_loading(true);
-                window.set_member_error("".into());
-            }
+            loading.publish(&window, MemberUpdate::Loading);
         });
         let live = self.clone();
         tokio::spawn(async move {
@@ -2991,37 +3996,20 @@ impl LiveUi {
             {
                 return;
             }
-            let (items, error) = match result {
-                Ok(Ok(members)) => (
-                    Some(members.iter().map(member_item).collect::<Vec<_>>()),
-                    None,
-                ),
-                Ok(Err(error)) => (
-                    None,
-                    Some(crate::directory_plain_text(
-                        &format!("Could not load members: {error}"),
-                        240,
-                    )),
-                ),
-                Err(_) => (
-                    None,
-                    Some("Loading members timed out. Retry to refresh.".to_owned()),
-                ),
+            let update = match result {
+                Ok(Ok(members)) => {
+                    MemberUpdate::Members(members.iter().map(member_item).collect::<Vec<_>>())
+                }
+                Ok(Err(error)) => MemberUpdate::Error(crate::directory_plain_text(
+                    &format!("Could not load members: {error}"),
+                    240,
+                )),
+                Err(_) => {
+                    MemberUpdate::Error("Loading members timed out. Retry to refresh.".to_owned())
+                }
             };
             let _ = ui.upgrade_in_event_loop(move |window| {
-                if live.member_epoch.load(Ordering::Acquire) != epoch
-                    || window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                {
-                    return;
-                }
-                window.set_member_loading(false);
-                if let Some(items) = items {
-                    window.set_members(ModelRc::new(VecModel::from(items)));
-                    window.set_member_error("".into());
-                } else if let Some(error) = error {
-                    window.set_member_error(error.into());
-                }
+                publication.publish(&window, update);
             });
         });
     }
@@ -3188,18 +4176,34 @@ impl LiveUi {
             return;
         }
         let requested_key = (account_id.clone(), room_id.clone());
-        {
+        #[cfg(test)]
+        self.pauses.reach("feed.before_claim").await;
+        let generation = {
+            // The same order as focused installs: key, feed, selected room.
             let key = self.feed_key.lock().await;
             let feed = self.feed.lock().await;
+            let selected = self.selected_room.lock().await;
+            // These waits may outlive a newer navigation: a stale open must
+            // not even advance the feed generation, which would end the
+            // newer navigation's running feed.
+            if !self.is_live.load(Ordering::Acquire)
+                || !selection.is_current()
+                || !self.navigation_is_current(navigation_epoch)
+                || selected.as_deref() != Some(room_id.as_str())
+            {
+                return;
+            }
             if key.as_ref() == Some(&requested_key)
                 && feed.as_ref().is_some_and(|task| !task.is_finished())
             {
                 return;
             }
-        }
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        // A live feed ends the focused view it replaces; a newer one stays.
-        self.drop_stale_focus();
+            let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            // A live feed ends the focused view it replaces; a newer one
+            // stays. No suspension through the claim and this cleanup.
+            self.drop_stale_focus();
+            generation
+        };
         let feed = match self
             .manager
             .message_feed_selected(&selection, &room_id)
@@ -3211,7 +4215,14 @@ impl LiveUi {
                     && self.navigation_is_current(navigation_epoch)
                     && self.require_active_account(&account_id).await.is_ok()
                 {
-                    show_error(&ui, error.to_string());
+                    // Shown only in this exact navigation and room.
+                    self.show_navigation_error(
+                        &ui,
+                        selection.clone(),
+                        navigation_epoch,
+                        Some(room_id.clone()),
+                        error.to_string(),
+                    );
                 }
                 return;
             }
@@ -3224,10 +4235,26 @@ impl LiveUi {
         {
             return;
         }
-        if let Some(previous) = self.feed.lock().await.take() {
+        #[cfg(test)]
+        self.pauses.reach("feed.before_commit").await;
+        // Loading stayed outside these locks and outside account_transition.
+        // Every local wait is before the final exact ownership check; from
+        // that check through publishing the task and key, nothing suspends.
+        let mut key_slot = self.feed_key.lock().await;
+        let mut feed_slot = self.feed.lock().await;
+        let selected = self.selected_room.lock().await;
+        if !self.is_live.load(Ordering::Acquire)
+            || !selection.is_current()
+            || self.generation.load(Ordering::Acquire) != generation
+            || !self.navigation_is_current(navigation_epoch)
+            || selected.as_deref() != Some(room_id.as_str())
+        {
+            return;
+        }
+        if let Some(previous) = feed_slot.take() {
             previous.abort();
         }
-        *self.feed_key.lock().await = Some(requested_key);
+        *key_slot = Some(requested_key);
         let mut updates = feed.subscribe();
         let feed_generation = self.generation.clone();
         let feed_navigation_epoch = self.navigation_epoch.clone();
@@ -3267,16 +4294,7 @@ impl LiveUi {
                                     &room_id,
                                 )
                             {
-                                ui.set_messages(crate::timeline_model::update_shared(
-                                    ui.get_messages(),
-                                    messages.as_ref().clone(),
-                                ));
-                                // Live rows replace any focused view, and with
-                                // it that view's history paging state.
-                                if ui.get_conversation_focused() {
-                                    ui.set_conversation_focused(false);
-                                    message_search::reset_history(&ui);
-                                }
+                                publish_live_messages(&ui, messages.as_ref().clone());
                             }
                         })
                         .is_err()
@@ -3299,7 +4317,9 @@ impl LiveUi {
                 }
             }
         });
-        *self.feed.lock().await = Some(handle);
+        // Through the held guard: no second wait after the ownership check.
+        *feed_slot = Some(handle);
+        drop(selected);
     }
 
     pub async fn clear_feed(&self) {
@@ -4139,6 +5159,8 @@ fn apply_snapshot(
         crate::thread_browser::clear(ui);
         // So do the media browser's rows, search and load.
         crate::room_media_browser::reset_window(ui);
+        // So do the unread divider, jump and mark state.
+        crate::unread_navigation::reset_window(ui);
         // So do typing names, Seen-by rows and read receipt state.
         crate::room_activity::clear(ui);
         // So do its members' identity-change warnings and their details.
@@ -4242,13 +5264,21 @@ fn apply_snapshot(
             room.is_direct || !view.all_space_children.contains(&room.room_id)
         }
     };
-    ui.set_invitations(ModelRc::new(VecModel::from(
-        view.rooms
+    let invitations = view
+        .rooms
+        .iter()
+        .filter(|room| room.membership == RoomMembership::Invited)
+        .map(|room| room_item(room, false, false))
+        .collect::<Vec<_>>();
+    // Home shows the first few as cards; the invitations center lists all.
+    ui.set_home_invitations(ModelRc::new(VecModel::from(
+        invitations
             .iter()
-            .filter(|room| room.membership == RoomMembership::Invited)
-            .map(|room| room_item(room, false, false))
+            .take(crate::invitations::HOME_CARDS)
+            .cloned()
             .collect::<Vec<_>>(),
     )));
+    ui.set_invitations(ModelRc::new(VecModel::from(invitations)));
     ui.set_unsorted_channels(ModelRc::new(VecModel::from(
         view.rooms
             .iter()
@@ -4359,6 +5389,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     crate::thread_browser::clear(ui);
     // So are the media browser's rows.
     crate::room_media_browser::reset_window(ui);
+    // So is the unread divider, jump and mark state.
+    crate::unread_navigation::reset_window(ui);
     // So are the room's roles and staged permission changes.
     crate::room_permissions::reset_window(ui);
     // So is who is in this account's voice rooms.
@@ -4369,6 +5401,9 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     // So are identity-change warnings and the members they name.
     crate::identity_warnings::reset(ui);
     ui.set_room_actions_open(false);
+    // Typed names, the read context and any outcome of a creation end with
+    // the account; a late result of its attempt is dropped (room_creation).
+    crate::room_creation::clear(ui);
     ui.set_room_action_busy(false);
     ui.set_room_action_error("".into());
     ui.set_invite_error("".into());
@@ -4396,6 +5431,7 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     // The Leave dialog and its captured account are private to this context.
     crate::room_leave::clear_presentation(ui);
     ui.set_invitations(ModelRc::new(VecModel::<RoomItem>::default()));
+    ui.set_home_invitations(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_results(ModelRc::new(VecModel::<RoomItem>::default()));
     ui.set_quick_switcher_open(false);
     ui.set_quick_switcher_index(-1);
@@ -4528,6 +5564,7 @@ fn room_item(room: &RoomInfo, voice_local: bool, voice_shared: bool) -> RoomItem
         voice_shared,
         favourite: room.favourite,
         low_priority: room.low_priority,
+        marked_unread: room.marked_unread,
     }
 }
 
@@ -4699,6 +5736,25 @@ fn visible_feed_target(
     visible_account == expected_account && visible_room == expected_room
 }
 
+/// Publish the final coalesced live snapshot only after the caller's exact
+/// selection, feed, navigation and visible-room checks. This notification is
+/// not an authority token: even a same-length replacement with the same newest
+/// event must place the unread marker again. Focused feeds and divider writes
+/// do not call it.
+pub(crate) fn publish_live_messages(ui: &AppWindow, messages: Vec<Arc<MessageInfo>>) {
+    ui.set_messages(crate::timeline_model::update_shared(
+        ui.get_messages(),
+        messages,
+    ));
+    // Live rows replace any focused view, and with it that view's history
+    // paging state. Notify only after both the model and that state are final.
+    if ui.get_conversation_focused() {
+        ui.set_conversation_focused(false);
+        message_search::reset_history(ui);
+    }
+    ui.set_unread_message_publication(ui.get_unread_message_publication().wrapping_add(1));
+}
+
 fn snapshot_closes_sign_in(was_live: bool, account_changed: bool) -> bool {
     !was_live || account_changed
 }
@@ -4706,6 +5762,56 @@ fn snapshot_closes_sign_in(was_live: bool, account_changed: bool) -> bool {
 #[cfg(test)]
 mod member_tests {
     use super::*;
+
+    /// A member load's loading flag, members and error apply only while it
+    /// is still the latest load for the account and room shown: a newer
+    /// same-account, same-room load (a forced refresh, A -> B -> A) leaves
+    /// the older one nothing to change. The 30 s coalescing relies only on a
+    /// request that is still the latest, for the same account and room.
+    /// Owner-free here; owners need a real selection (stale_observer_tests).
+    #[test]
+    fn a_member_load_publishes_only_while_it_is_the_latest_for_what_is_shown() {
+        let is_live = Arc::new(AtomicBool::new(true));
+        let member_epoch = Arc::new(AtomicU64::new(7));
+        let navigation = Arc::new(AtomicU64::new(3));
+        let load = |epoch| MemberPublication {
+            epoch,
+            account_id: "account".into(),
+            room_id: "!room:example.org".into(),
+            owner: None,
+            is_live: is_live.clone(),
+            member_epoch: member_epoch.clone(),
+            navigation_epoch: navigation.clone(),
+        };
+        let older = load(7);
+        assert!(older.admits("account", "!room:example.org"));
+        // A newer load of the same account and room claims.
+        let newer = load(member_epoch.fetch_add(1, Ordering::AcqRel) + 1);
+        assert!(!older.admits("account", "!room:example.org"));
+        assert!(newer.admits("account", "!room:example.org"));
+        assert!(!newer.admits("other", "!room:example.org"));
+        assert!(!newer.admits("account", "!other:example.org"));
+        is_live.store(false, Ordering::Release);
+        assert!(!newer.admits("account", "!room:example.org"));
+        is_live.store(true, Ordering::Release);
+
+        let request = |started, epoch| MemberRequest {
+            account_id: "account".into(),
+            room_id: "!room:example.org".into(),
+            started,
+            epoch,
+            owner: None,
+        };
+        let now = Instant::now();
+        assert!(request(now, 8).serves("account", "!room:example.org", 8, 3));
+        // A navigation or a newer load since advanced the epoch.
+        assert!(!request(now, 8).serves("account", "!room:example.org", 9, 4));
+        assert!(!request(now, 8).serves("account", "!other:example.org", 8, 3));
+        assert!(!request(now, 8).serves("other", "!room:example.org", 8, 3));
+        if let Some(earlier) = now.checked_sub(Duration::from_secs(31)) {
+            assert!(!request(earlier, 8).serves("account", "!room:example.org", 8, 3));
+        }
+    }
 
     #[test]
     fn member_rows_sanitize_untrusted_identity_and_do_not_claim_presence() {
@@ -4971,6 +6077,112 @@ mod account_presentation_tests {
         close_profile(directory, live).await;
     }
 
+    /// An accepted invitation's late result never takes or undoes a newer
+    /// navigation: its open claims the navigation it was chosen in only while
+    /// that is still current, in one step, and commits only under that claim
+    /// and its own authority, which a closed fence withdraws.
+    #[tokio::test]
+    async fn a_late_invitation_answer_never_takes_or_undoes_a_newer_navigation() {
+        let (directory, live) = empty_profile();
+        live.is_live.store(true, Ordering::Release);
+        let (old_room, invited) = ("!old-room:example.org", "!invited:example.org");
+        *live.selected_room.lock().await = Some(old_room.into());
+        // Already stale before the answer's result is recorded: chosen on a
+        // card, then another room chosen. The claim fails and changes no
+        // epoch.
+        let chosen = live.current_navigation_epoch();
+        let newer = live.invalidate_navigation();
+        let render = live.render_epoch.load(Ordering::Acquire);
+        let members = live.member_epoch.load(Ordering::Acquire);
+        assert_eq!(live.claim_navigation_from(chosen), None);
+        assert!(live.navigation_is_current(newer));
+        assert_eq!(live.render_epoch.load(Ordering::Acquire), render);
+        assert_eq!(live.member_epoch.load(Ordering::Acquire), members);
+        // The bookkeeping refresh after an answer takes no navigation.
+        let _ = live.refresh(Weak::default()).await;
+        assert!(live.navigation_is_current(newer));
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(old_room));
+
+        // Still current: the claim takes the next navigation. A room chosen
+        // while its reveal is held at the selected-state commit wins.
+        let claimed = live.claim_navigation_from(newer).expect("still current");
+        assert!(live.navigation_is_current(claimed));
+        let authority = NavigationAuthority::default();
+        let held = live.selected_room.lock().await;
+        let commit = {
+            let (live, authority) = (live.clone(), authority.clone());
+            tokio::spawn(async move {
+                live.commit_reveal(invited, &[], true, claimed, &authority)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let chosen_since = live.invalidate_navigation();
+        drop(held);
+        assert_eq!(commit.await.unwrap(), None);
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(old_room));
+        assert!(live.navigation_is_current(chosen_since));
+
+        // A real security step begins and ends while the reveal is held at
+        // its selected-state commit: the open's own conditions, captured at
+        // its click, no longer hold, so the commit itself refuses, though no
+        // navigation came since. No watcher and no withdrawal is involved.
+        assert!(live.navigation_is_current(chosen_since));
+        let request = live.open_request(live.security_gate.ringing_generation());
+        let claimed = live
+            .claim_navigation_from(request.navigation)
+            .expect("still current");
+        let authority = NavigationAuthority::holding(request.holds.clone());
+        assert!(!authority.withdrawn());
+        let held = live.selected_room.lock().await;
+        let commit = {
+            let (live, authority) = (live.clone(), authority.clone());
+            tokio::spawn(async move {
+                live.commit_reveal(invited, &[], true, claimed, &authority)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(live.security_gate.try_account_access());
+        drop(held);
+        assert_eq!(commit.await.unwrap(), None);
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(old_room));
+        assert!(live.navigation_is_current(claimed));
+        // Every later check of that authority, the final snapshot's
+        // admission included (SnapshotGate asks `withdrawn`), refuses too.
+        assert!(authority.withdrawn());
+
+        // The joined-Space commit (commit_joined_space) asks the same
+        // conditions under its selected-state locks; it needs a real
+        // selection, so that case runs in
+        // a_departed_selection_neither_reveals_nor_focuses_after_a_switch_back.
+        // The session ending is one of those conditions too.
+        let request = live.open_request(live.security_gate.ringing_generation());
+        let authority = NavigationAuthority::holding(request.holds.clone());
+        assert!(!authority.withdrawn());
+        live.is_live.store(false, Ordering::Release);
+        assert!(authority.withdrawn());
+        close_profile(directory, live).await;
+    }
+
+    /// The invitation path's account transition wait is bounded, and gives
+    /// the transition as soon as it is free.
+    #[tokio::test]
+    async fn the_invitation_transition_wait_is_bounded() {
+        let (directory, live) = empty_profile();
+        let held = live.account_transition.lock().await;
+        let started = Instant::now();
+        let waited = live.bounded_transition(Duration::from_millis(100)).await;
+        assert!(waited.is_none());
+        drop(waited);
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        drop(held);
+        let taken = live.bounded_transition(Duration::from_millis(100)).await;
+        assert!(taken.is_some());
+        drop(taken);
+        close_profile(directory, live).await;
+    }
+
     #[tokio::test]
     async fn a_withdrawn_search_navigation_held_at_its_commit_changes_nothing() {
         let (directory, live) = empty_profile();
@@ -5102,6 +6314,102 @@ mod account_presentation_tests {
         assert_eq!(slot.view(live), None);
         slot.drop_stale(live);
         assert!(slot.shown.is_none());
+    }
+
+    /// A withdrawal wakes a reveal where it waits before its commit or
+    /// before its snapshot is decided (an unbounded read of the rooms, the
+    /// barrier, the transition lock), so a timed-out reveal gives those up
+    /// at once instead of holding navigation.
+    #[tokio::test]
+    async fn a_withdrawal_stops_a_reveal_waiting_on_a_read_at_once() {
+        let authority = NavigationAuthority::default();
+        let waiting = {
+            let authority = authority.clone();
+            tokio::spawn(
+                async move { unless_withdrawn(&authority, std::future::pending::<()>()).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        authority.withdraw();
+        let woke = tokio::time::timeout(Duration::from_secs(5), waiting).await;
+        assert_eq!(woke.expect("woken by the withdrawal").unwrap(), None);
+        // Already withdrawn: no wait at all, even for work that is ready.
+        assert_eq!(unless_withdrawn(&authority, async { 7 }).await, None);
+        let current = NavigationAuthority::default();
+        assert_eq!(unless_withdrawn(&current, async { 7 }).await, Some(7));
+        // The barrier held by a stalled reveal is released with it.
+        let (directory, live) = empty_profile();
+        let held = live.snapshot_barrier.write().await;
+        let blocked = NavigationAuthority::default();
+        let barrier = {
+            let (live, blocked) = (live.clone(), blocked.clone());
+            tokio::spawn(async move {
+                unless_withdrawn(&blocked, live.snapshot_barrier.write())
+                    .await
+                    .is_some()
+            })
+        };
+        tokio::task::yield_now().await;
+        blocked.withdraw();
+        let gave_up = tokio::time::timeout(Duration::from_secs(5), barrier).await;
+        assert!(!gave_up.expect("woken by the withdrawal").unwrap());
+        drop(held);
+        close_profile(directory, live).await;
+    }
+
+    /// Whichever thread gets there first, the UI's claim of an owned
+    /// snapshot (SnapshotGate::admits) and a withdrawal are one decision on
+    /// the authority's one lock: the withdrawal reports a claim exactly when
+    /// the claim succeeded, and after a withdrawal nothing is claimed, so a
+    /// requester never reads a claimed snapshot as refused. No lock is held
+    /// after either returns (the apply runs outside it). Commits keep their
+    /// rule, and an authority whose own conditions failed (`holding`) claims
+    /// nothing and wakes every wait at once.
+    #[test]
+    fn a_claim_and_a_withdrawal_are_one_decision_on_any_thread() {
+        for _ in 0..500 {
+            let authority = NavigationAuthority::default();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let claiming = {
+                let (authority, start) = (authority.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    authority.claim()
+                })
+            };
+            start.wait();
+            let saw_claim = authority.withdraw();
+            let claimed = claiming.join().unwrap();
+            assert_eq!(claimed, saw_claim, "a claim and a withdrawal disagreed");
+            assert_eq!(authority.admitted(), claimed);
+            assert!(authority.withdrawn());
+            assert!(!authority.claim(), "claimed after the withdrawal");
+        }
+        // Commits keep their rule: refused once withdrawn, claimed or not.
+        let generation = AtomicU64::new(0);
+        let mut slot = FocusSlot::default();
+        let authority = NavigationAuthority::default();
+        assert!(authority.claim());
+        assert!(slot.commit(&generation, &authority, "A").is_some());
+        assert!(authority.withdraw());
+        assert_eq!(slot.commit(&generation, &authority, "B"), None);
+        // Its own conditions failing ends it the same way, with no withdraw
+        // call: nothing is claimed, and a wait before a commit returns at once.
+        let holds = Arc::new(AtomicBool::new(true));
+        let held = {
+            let holds = holds.clone();
+            NavigationAuthority::holding(Arc::new(move || holds.load(Ordering::Acquire)))
+        };
+        holds.store(false, Ordering::Release);
+        assert!(!held.claim() && !held.admitted());
+        assert!(held.withdrawn());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let ready = runtime.block_on(unless_withdrawn(&held, std::future::pending::<()>()));
+        assert_eq!(ready, None, "a failed condition never keeps a wait");
+        assert!(!held.withdraw(), "nothing was claimed");
     }
 
     /// An authority carrying its requester's click-time security generation
@@ -5717,7 +7025,109 @@ mod stale_observer_tests {
         };
         assert!(gate.admits(&live.navigation_epoch));
         authority.withdraw();
+        // The admission it claimed is reported to the withdrawal (never read
+        // as refused; a repeated withdrawal reports the same one decision),
+        // which then ends every later admission.
+        assert!(authority.withdraw(), "a claimed admission reads as claimed");
         assert!(!gate.admits(&live.navigation_epoch));
+        // An accepted invitation's own open: a real security step begun and
+        // ended since its click, and its snapshot is not admitted, though
+        // nothing navigated.
+        let request = live.open_request(live.security_gate.ringing_generation());
+        let fenced = SnapshotGate {
+            authority: NavigationAuthority::holding(request.holds.clone()),
+            selection: selection.clone(),
+            navigation: live.current_navigation_epoch(),
+        };
+        assert!(fenced.admits(&live.navigation_epoch));
+        drop(live.security_gate.try_account_access());
+        assert!(!fenced.admits(&live.navigation_epoch));
+        // An accepted Space invitation's own open asks the same conditions
+        // under the joined-Space commit's selected-state locks: a real
+        // security step begun and ended while it is held there refuses it,
+        // though no navigation came since.
+        let space = "!invited-space:example.org";
+        let request = live.open_request(live.security_gate.ringing_generation());
+        let claimed = live
+            .claim_navigation_from(request.navigation)
+            .expect("still current");
+        let authority = NavigationAuthority::holding(request.holds.clone());
+        let held = live.selected_space.lock().await;
+        let commit = {
+            let (live, selection, authority) = (live.clone(), selection.clone(), authority.clone());
+            tokio::spawn(async move {
+                live.commit_joined_space(&selection, space, claimed, &authority)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(live.security_gate.try_account_access());
+        drop(held);
+        assert!(commit.await.unwrap().is_none());
+        assert!(live.selected_space.lock().await.is_none());
+        assert_eq!(
+            live.selected_room.lock().await.as_deref(),
+            Some(a_room.as_str())
+        );
+        assert!(live.navigation_is_current(claimed));
+        assert!(authority.withdrawn());
+        // Unchanged conditions: it selects the Space with no room in one
+        // step. The production give-back is reveal_joined_space_locked's;
+        // the previous selection is put back here for the checks below.
+        let request = live.open_request(live.security_gate.ringing_generation());
+        let claimed = live
+            .claim_navigation_from(request.navigation)
+            .expect("still current");
+        let authority = NavigationAuthority::holding(request.holds.clone());
+        let previous = live
+            .commit_joined_space(&selection, space, claimed, &authority)
+            .await
+            .expect("an unchanged owner commits");
+        assert_eq!(live.selected_space.lock().await.as_deref(), Some(space));
+        assert!(live.selected_room.lock().await.is_none());
+        *live.selected_space.lock().await = previous.0;
+        *live.selected_room.lock().await = previous.1;
+        // INV-OPEN-01/02: an accepted invitation's open owned from its click
+        // by this selection. A security step begun and ended since the click
+        // leaves its one authority withdrawn: open_answered claims no
+        // navigation and shows nothing.
+        let navigation = live.current_navigation_epoch();
+        let request = live.open_request(live.security_gate.ringing_generation());
+        let owned = request.owned(&selection);
+        drop(live.security_gate.try_account_access());
+        assert!(owned.authority().withdrawn());
+        live.open_answered(&selection, &a_room, false, Some(owned), Weak::default())
+            .await;
+        assert_eq!(
+            live.current_navigation_epoch(),
+            navigation,
+            "nothing claimed"
+        );
+        assert_eq!(
+            live.selected_room.lock().await.as_deref(),
+            Some(a_room.as_str())
+        );
+        // A fresh one commits under its own authority the way the owned
+        // reveal does (commit_reveal): the joined room in Home (it is in no
+        // Space), although another Space was selected, so that Space's filter
+        // never makes the refresh pick another room.
+        *live.selected_space.lock().await = Some("!another-space:example.org".into());
+        let request = live.open_request(live.security_gate.ringing_generation());
+        let owned = request.owned(&selection);
+        let claimed = live
+            .claim_navigation_from(owned.navigation)
+            .expect("still current");
+        let previous = live
+            .commit_reveal(&a_room, &[], true, claimed, owned.authority())
+            .await
+            .expect("an unchanged owner commits");
+        assert!(live.selected_space.lock().await.is_none());
+        assert_eq!(
+            live.selected_room.lock().await.as_deref(),
+            Some(a_room.as_str())
+        );
+        live.restore_reveal(&a_room, previous).await;
+        *live.selected_space.lock().await = None;
 
         // A -> B -> A: the first selection is revoked, switching back issues
         // a new one, and the old one never admits a snapshot again.
@@ -5785,6 +7195,679 @@ mod stale_observer_tests {
             .logout_account(&b_account.id)
             .await
             .expect("Cannot remove second account");
+        manager.stop().await;
+        drop(manager);
+        close_profile(directory, live).await;
+    }
+
+    /// A created room opens only through its own owned reveal, and only for
+    /// the click that asked for it (open_created_room):
+    /// - withdrawn before it starts (its bound passed), it takes no
+    ///   navigation and commits nothing;
+    /// - after a newer navigation since its click, or a security step begun
+    ///   and ended since, it takes no navigation and commits nothing: the
+    ///   newer navigation keeps its epoch and room;
+    /// - current, it takes its own navigation and commits the exact room, but
+    ///   its snapshot is never admitted without a UI decision (no window
+    ///   here): it is not opened, and the commit is given back before any
+    ///   other refresh may sample it;
+    /// - nothing is created: the room ID given is the room revealed.
+    #[tokio::test]
+    async fn a_created_room_opens_only_for_its_own_click_and_admitted_snapshot() {
+        let Some((alice, _, a_room)) = fixture() else {
+            eprintln!(
+                "Skipped creation open regression; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in."
+            );
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(directory.path().join("profile")).unwrap());
+        let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
+            directory.path().join("config.toml"),
+        )));
+        let live = LiveUi::new(manager.clone(), Handle::current(), Weak::default(), voices);
+        let account = manager
+            .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
+            .await
+            .expect("Login failed");
+        wait_for_room(&manager, &a_room).await;
+        live.is_live.store(true, Ordering::Release);
+        let selection = manager
+            .account_selection(&account.id)
+            .expect("Selection missing");
+        let created = CreatedRoom {
+            room_id: a_room.clone(),
+            kind: CreationKind::Room,
+            name: "Created".into(),
+            parent: None,
+            suggested: false,
+        };
+        let previous = "!previous:fixture.invalid";
+        *live.selected_room.lock().await = Some(previous.into());
+        let open = |asked: CreationAsked, authority: NavigationAuthority| {
+            let (admitted, admission) = tokio::sync::oneshot::channel();
+            let opening = live.clone().open_created_room(
+                selection.clone(),
+                created.clone(),
+                Placement::Home,
+                asked,
+                authority,
+                admitted,
+                Weak::default(),
+            );
+            (opening, admission)
+        };
+
+        // Withdrawn first: no navigation of its own, nothing committed.
+        let asked = live.creation_asked();
+        let withdrawn = live.creation_authority(asked, &selection);
+        assert!(!withdrawn.withdraw(), "nothing was claimed");
+        let (opening, admission) = open(asked, withdrawn);
+        assert!(matches!(opening.await, Ok(false)));
+        assert!(admission.await.is_err(), "admitted while withdrawn");
+        assert!(
+            live.navigation_is_current(asked.navigation),
+            "no navigation taken"
+        );
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(previous));
+
+        // A newer navigation since the click keeps its epoch and room.
+        let asked = live.creation_asked();
+        let newer = live.invalidate_navigation();
+        let authority = live.creation_authority(asked, &selection);
+        let (opening, admission) = open(asked, authority.clone());
+        assert!(matches!(opening.await, Ok(false)));
+        assert!(admission.await.is_err());
+        assert!(
+            live.navigation_is_current(newer),
+            "the newer navigation stays current"
+        );
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(previous));
+        assert!(!authority.withdraw(), "nothing was claimed");
+
+        // A security step begun and ended since the click: the same.
+        let asked = live.creation_asked();
+        drop(live.security_gate.try_account_access());
+        let authority = live.creation_authority(asked, &selection);
+        assert!(authority.withdrawn(), "its own conditions failed");
+        let (opening, admission) = open(asked, authority);
+        assert!(matches!(opening.await, Ok(false)));
+        assert!(admission.await.is_err());
+        assert!(live.navigation_is_current(asked.navigation));
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(previous));
+
+        // Current: its own navigation and the exact commit, never admitted
+        // without a window, given back while the reveal holds the barrier.
+        let release = live.pauses.install("reveal.before_release");
+        let asked = live.creation_asked();
+        let authority = live.creation_authority(asked, &selection);
+        let (opening, admission) = open(asked, authority);
+        let opening = tokio::spawn(opening);
+        release.entered().await;
+        assert!(
+            !live.navigation_is_current(asked.navigation),
+            "it took its own"
+        );
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(previous));
+        assert!(live.snapshot_barrier.try_read().is_err());
+        release.proceed();
+        let opened = opening.await.expect("the open task ends");
+        assert!(
+            !matches!(opened, Ok(true)),
+            "opened without an admitted snapshot"
+        );
+        // The milestone agrees: no admission was ever told.
+        assert!(admission.await.is_err());
+
+        manager
+            .logout_account(&account.id)
+            .await
+            .expect("Cannot remove the account");
+        manager.stop().await;
+        drop(manager);
+        close_profile(directory, live).await;
+    }
+
+    /// An admitted snapshot's member load claims the member epoch only while
+    /// that snapshot's selection and navigation are still current, checked
+    /// at the claim, after its awaits. A stale load held there while a
+    /// newer navigation's load claims installs nothing: the newer epoch and
+    /// request stay, so the newer load is neither suppressed nor left
+    /// loading. A forced refresh held there while its room stopped being
+    /// the selected one claims nothing either.
+    #[tokio::test]
+    async fn a_stale_snapshots_member_load_never_claims_over_a_newer_one() {
+        let Some((alice, _, a_room)) = fixture() else {
+            eprintln!(
+                "Skipped member claim regression; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in."
+            );
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(directory.path().join("profile")).unwrap());
+        let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
+            directory.path().join("config.toml"),
+        )));
+        let live = LiveUi::new(manager.clone(), Handle::current(), Weak::default(), voices);
+        let account = manager
+            .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
+            .await
+            .expect("Login failed");
+        wait_for_room(&manager, &a_room).await;
+        live.is_live.store(true, Ordering::Release);
+        let selection = manager
+            .account_selection(&account.id)
+            .expect("Selection missing");
+        let newer_room = "!newer:fixture.invalid";
+        let request = |live: Arc<LiveUi>| async move {
+            let request = live.member_request.lock().await;
+            request
+                .as_ref()
+                .map(|request| (request.room_id.clone(), request.epoch))
+        };
+
+        // A: the admitted snapshot's load passes its early checks and waits
+        // at the claim.
+        *live.selected_room.lock().await = Some(a_room.clone());
+        let stale = live.invalidate_navigation();
+        let held = live.pauses.install("members.before_claim");
+        let loading = tokio::spawn({
+            let (live, account, room) = (live.clone(), account.id.clone(), a_room.clone());
+            let owner = MemberOwner {
+                selection: selection.clone(),
+                navigation_epoch: stale,
+            };
+            async move {
+                live.refresh_members_owned(account, room, Weak::default(), false, owner)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), held.entered())
+            .await
+            .unwrap();
+        // B: a newer navigation selects another room and claims its load.
+        live.invalidate_navigation();
+        *live.selected_room.lock().await = Some(newer_room.into());
+        live.refresh_members_for(account.id.clone(), newer_room.into(), Weak::default(), true)
+            .await;
+        let newer = live.member_epoch.load(Ordering::Acquire);
+        assert_eq!(
+            request(live.clone()).await,
+            Some((newer_room.to_owned(), newer))
+        );
+        held.proceed();
+        tokio::time::timeout(Duration::from_secs(30), loading)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.member_epoch.load(Ordering::Acquire),
+            newer,
+            "the stale load installed no epoch"
+        );
+        assert_eq!(
+            request(live.clone()).await,
+            Some((newer_room.to_owned(), newer)),
+            "and left the newer load its request"
+        );
+
+        // A forced refresh whose room is no longer selected at its claim.
+        *live.selected_room.lock().await = Some(a_room.clone());
+        let held = live.pauses.install("members.before_claim");
+        let refreshing = tokio::spawn({
+            let (live, account, room) = (live.clone(), account.id.clone(), a_room.clone());
+            async move {
+                live.refresh_members_for(account, room, Weak::default(), true)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), held.entered())
+            .await
+            .unwrap();
+        *live.selected_room.lock().await = Some(newer_room.into());
+        held.proceed();
+        tokio::time::timeout(Duration::from_secs(30), refreshing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.member_epoch.load(Ordering::Acquire), newer);
+        assert_eq!(
+            request(live.clone()).await,
+            Some((newer_room.to_owned(), newer))
+        );
+
+        // Every publication of a claimed load is fenced by the same owner,
+        // when it would apply. A same-room navigation ends the older view's
+        // publications; the new view's own load still publishes.
+        let publication = |epoch, owner| MemberPublication {
+            epoch,
+            account_id: account.id.clone(),
+            room_id: newer_room.into(),
+            owner,
+            is_live: live.is_live.clone(),
+            member_epoch: live.member_epoch.clone(),
+            navigation_epoch: live.navigation_epoch.clone(),
+        };
+        let older = MemberOwner {
+            selection: selection.clone(),
+            navigation_epoch: live.current_navigation_epoch(),
+        };
+        let shown = publication(newer, Some(older.clone()));
+        assert!(shown.admits(&account.id, newer_room));
+        live.invalidate_navigation();
+        assert!(
+            !shown.admits(&account.id, newer_room),
+            "the older view's load"
+        );
+        let current = MemberOwner {
+            selection: selection.clone(),
+            navigation_epoch: live.current_navigation_epoch(),
+        };
+        let epoch = live.member_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        assert!(
+            publication(epoch, Some(current.clone())).admits(&account.id, newer_room),
+            "the new view's own load"
+        );
+        // Coalescing relies on an earlier request only while its owner is
+        // the current one: a matching owner's serves the view, an older
+        // owner's never suppresses it, even under the same epoch.
+        let navigation = live.current_navigation_epoch();
+        let earlier = |owner| MemberRequest {
+            account_id: account.id.clone(),
+            room_id: newer_room.into(),
+            started: Instant::now(),
+            epoch,
+            owner,
+        };
+        assert!(earlier(Some(current)).serves(&account.id, newer_room, epoch, navigation));
+        assert!(!earlier(Some(older)).serves(&account.id, newer_room, epoch, navigation));
+
+        manager.stop().await;
+        drop(manager);
+        close_profile(directory, live).await;
+    }
+
+    /// Follow-ups that waited for a real production key or commit lock
+    /// cannot retire the feed of a newer room. Exercise the actual
+    /// after_snapshot, refusal reopen and open_room paths; the last loads its
+    /// real SDK feed before the forced commit interleaving. A created room's
+    /// open withdrawn after it took the transition lock, before its own
+    /// navigation, drops that guard at once and takes no navigation.
+    #[tokio::test]
+    async fn stale_creation_follow_ups_keep_a_newer_rooms_feed_and_transition() {
+        let Some((alice, _, a_room)) = fixture() else {
+            eprintln!(
+                "Skipped creation follow-up regression; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in."
+            );
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(directory.path().join("profile")).unwrap());
+        let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
+            directory.path().join("config.toml"),
+        )));
+        let live = LiveUi::new(manager.clone(), Handle::current(), Weak::default(), voices);
+        let account = manager
+            .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
+            .await
+            .expect("Login failed");
+        wait_for_room(&manager, &a_room).await;
+        live.is_live.store(true, Ordering::Release);
+        let selection = manager
+            .account_selection(&account.id)
+            .expect("Selection missing");
+        let newer_room = "!newer:fixture.invalid";
+        let newer_key = (account.id.clone(), newer_room.to_owned());
+        // A running sentinel feed stands for the newer navigation's task.
+        let (started, running) = tokio::sync::oneshot::channel();
+        let sentinel = tokio::spawn(async move {
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        running.await.unwrap();
+        *live.feed.lock().await = Some(sentinel);
+
+        // Admitted reveal: block the real key wait, then install a newer
+        // navigation's key and room while that lock is still ours.
+        *live.selected_room.lock().await = Some(a_room.clone());
+        let epoch = live.invalidate_navigation();
+        let mut key = live.feed_key.lock().await;
+        let held = live.pauses.install("snapshot.before_feed_key");
+        let mut after = tokio::spawn({
+            let live = live.clone();
+            let after = AfterSnapshot {
+                account_id: account.id.clone(),
+                room_id: Some(a_room.clone()),
+                selection: Some(selection.clone()),
+                navigation_epoch: epoch,
+                marker_rooms: Vec::new(),
+                owned: Some((
+                    live.begin_thread_request(),
+                    Some("Old room draft error".into()),
+                )),
+                retire_feed: false,
+                recover: true,
+            };
+            async move { live.after_snapshot(after, Weak::default()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), held.entered())
+            .await
+            .unwrap();
+        held.proceed();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut after)
+                .await
+                .is_err()
+        );
+        live.invalidate_navigation();
+        *live.selected_room.lock().await = Some(newer_room.into());
+        *key = Some(newer_key.clone());
+        drop(key);
+        tokio::time::timeout(Duration::from_secs(30), after)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*live.feed_key.lock().await, Some(newer_key.clone()));
+        assert!(
+            live.feed
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|task| !task.is_finished()),
+            "the newer navigation's feed runs on"
+        );
+
+        // Refused reveal: the reopened feed's key mutation has the same
+        // final fence after waiting for the held key.
+        let epoch = live.invalidate_navigation();
+        let mut key = live.feed_key.lock().await;
+        let mut reopen = tokio::spawn({
+            let (live, selection) = (live.clone(), selection.clone());
+            async move {
+                live.reopen_unrevealed(&selection, epoch, Weak::default())
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut reopen)
+                .await
+                .is_err()
+        );
+        live.invalidate_navigation();
+        *key = Some(newer_key.clone());
+        drop(key);
+        tokio::time::timeout(Duration::from_secs(30), reopen)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*live.feed_key.lock().await, Some(newer_key.clone()));
+
+        // A stale room open must not even advance the feed generation after
+        // its initial key wait: it would invalidate the newer running feed.
+        *live.selected_room.lock().await = Some(a_room.clone());
+        let epoch = live.invalidate_navigation();
+        let held = live.pauses.install("feed.before_claim");
+        let opening = tokio::spawn({
+            let (live, selection, room) = (live.clone(), selection.clone(), a_room.clone());
+            async move {
+                live.open_room(selection, room, epoch, Weak::default())
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), held.entered())
+            .await
+            .unwrap();
+        let mut key = live.feed_key.lock().await;
+        held.proceed();
+        live.invalidate_navigation();
+        *live.selected_room.lock().await = Some(newer_room.into());
+        let generation = live.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *key = Some(newer_key.clone());
+        drop(key);
+        tokio::time::timeout(Duration::from_secs(30), opening)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.generation.load(Ordering::Acquire), generation);
+        assert_eq!(*live.feed_key.lock().await, Some(newer_key.clone()));
+
+        // An actual loaded SDK feed reaches the real final commit. Hold its
+        // first commit lock, let a newer room, epoch and generation win, then
+        // let it resume: the newer task is neither aborted nor replaced.
+        *live.selected_room.lock().await = Some(a_room.clone());
+        let epoch = live.invalidate_navigation();
+        let held = live.pauses.install("feed.before_commit");
+        let mut opening = tokio::spawn({
+            let (live, selection, room) = (live.clone(), selection.clone(), a_room.clone());
+            async move {
+                live.open_room(selection, room, epoch, Weak::default())
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(30), held.entered())
+            .await
+            .unwrap();
+        let mut key = live.feed_key.lock().await;
+        held.proceed();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut opening)
+                .await
+                .is_err()
+        );
+        live.invalidate_navigation();
+        *live.selected_room.lock().await = Some(newer_room.into());
+        let generation = live.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *key = Some(newer_key.clone());
+        drop(key);
+        tokio::time::timeout(Duration::from_secs(30), opening)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(live.generation.load(Ordering::Acquire), generation);
+        assert_eq!(*live.feed_key.lock().await, Some(newer_key.clone()));
+        assert!(
+            live.feed
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        );
+
+        // Withdrawn after taking the transition lock but before its own
+        // navigation: the guard ends with its block, no navigation is taken
+        // and nothing waits on the held key.
+        let asked = live.creation_asked();
+        let authority = live.creation_authority(asked, &selection);
+        let held = live.pauses.install("creation.after_transition");
+        let (admitted, admission) = tokio::sync::oneshot::channel();
+        let key = live.feed_key.lock().await;
+        let opening = tokio::spawn(live.clone().open_created_room(
+            selection.clone(),
+            CreatedRoom {
+                room_id: a_room,
+                kind: CreationKind::Room,
+                name: "Created".into(),
+                parent: None,
+                suggested: false,
+            },
+            Placement::Home,
+            asked,
+            authority.clone(),
+            admitted,
+            Weak::default(),
+        ));
+        tokio::time::timeout(Duration::from_secs(30), held.entered())
+            .await
+            .unwrap();
+        assert!(live.account_transition.try_lock().is_err());
+        assert!(!authority.withdraw(), "nothing was claimed");
+        held.proceed();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(30), opening)
+                .await
+                .unwrap()
+                .unwrap(),
+            Ok(false)
+        ));
+        assert!(admission.await.is_err());
+        assert!(live.account_transition.try_lock().is_ok());
+        // Only an ordinary refresh (the Space rescan) may take it, briefly.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while live.snapshot_barrier.try_write().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("no barrier stays held");
+        assert!(
+            live.navigation_is_current(asked.navigation),
+            "no navigation taken"
+        );
+        assert_eq!(*key, Some(newer_key));
+        drop(key);
+        live.is_live.store(false, Ordering::Release);
+        live.invalidate_navigation();
+        let task = live.feed.lock().await.take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+        manager
+            .logout_account(&account.id)
+            .await
+            .expect("Cannot remove the account");
+        manager.stop().await;
+        drop(manager);
+        close_profile(directory, live).await;
+    }
+
+    /// A created room's open withdrawn while held at a real production wait
+    /// gives everything up at once:
+    /// - before its commit, at the known-Spaces lock of reveal_room_locked,
+    ///   it commits nothing, and the reopen of the shown room's feed under
+    ///   the navigation it took then waits without the transition lock;
+    /// - after its commit, at its snapshot's draft load (snapshot.draft),
+    ///   with the transition lock and the barrier its own, it gives the
+    ///   commit back before releasing the barrier, and no lock stays held.
+    /// The admission is never told for either.
+    #[tokio::test]
+    async fn a_withdrawn_created_room_open_gives_up_held_waits_and_its_locks() {
+        let Some((alice, _, a_room)) = fixture() else {
+            eprintln!(
+                "Skipped creation wait regression; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in."
+            );
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(directory.path().join("profile")).unwrap());
+        let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
+            directory.path().join("config.toml"),
+        )));
+        let live = LiveUi::new(manager.clone(), Handle::current(), Weak::default(), voices);
+        let account = manager
+            .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
+            .await
+            .expect("Login failed");
+        wait_for_room(&manager, &a_room).await;
+        live.is_live.store(true, Ordering::Release);
+        let selection = manager
+            .account_selection(&account.id)
+            .expect("Selection missing");
+        let created = CreatedRoom {
+            room_id: a_room.clone(),
+            kind: CreationKind::Room,
+            name: "Created".into(),
+            parent: None,
+            suggested: false,
+        };
+        let previous = "!previous:fixture.invalid";
+        let until = |held: fn(&LiveUi) -> bool, live: Arc<LiveUi>| async move {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !held(&live) {
+                assert!(Instant::now() < deadline, "timed out waiting for the open");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let transition_free = |live: &LiveUi| live.account_transition.try_lock().is_ok();
+
+        // Held before its commit.
+        *live.selected_room.lock().await = Some(previous.into());
+        let held = live.known_spaces.lock().await;
+        let asked = live.creation_asked();
+        let authority = live.creation_authority(asked, &selection);
+        let (admitted, admission) = tokio::sync::oneshot::channel();
+        let opening = tokio::spawn(live.clone().open_created_room(
+            selection.clone(),
+            created.clone(),
+            Placement::Home,
+            asked,
+            authority.clone(),
+            admitted,
+            Weak::default(),
+        ));
+        // Inside, with the barrier written and the transition lock held.
+        until(
+            |live| live.snapshot_barrier.try_read().is_err(),
+            live.clone(),
+        )
+        .await;
+        assert!(!transition_free(&live));
+        assert!(!authority.withdraw(), "nothing was claimed");
+        // At once: the transition lock is free, while the reopen's refresh
+        // still waits for the held lock.
+        until(transition_free, live.clone()).await;
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(previous));
+        drop(held);
+        let opened = opening.await.expect("the open task ends");
+        assert!(matches!(opened, Ok(false)));
+        assert!(admission.await.is_err(), "admitted while withdrawn");
+
+        // Held after its commit, at the draft load of its snapshot.
+        *live.selected_room.lock().await = Some(previous.into());
+        let draft = live.pauses.install("snapshot.draft");
+        let release = live.pauses.install("reveal.before_release");
+        let asked = live.creation_asked();
+        let authority = live.creation_authority(asked, &selection);
+        let (admitted, admission) = tokio::sync::oneshot::channel();
+        let opening = tokio::spawn(live.clone().open_created_room(
+            selection.clone(),
+            created,
+            Placement::Home,
+            asked,
+            authority.clone(),
+            admitted,
+            Weak::default(),
+        ));
+        draft.entered().await;
+        assert_eq!(
+            live.selected_room.lock().await.as_deref(),
+            Some(a_room.as_str())
+        );
+        assert!(!transition_free(&live));
+        assert!(live.snapshot_barrier.try_read().is_err());
+        assert!(!authority.withdraw(), "nothing was claimed");
+        // Woken at the draft load: given back while the barrier is held.
+        release.entered().await;
+        assert_eq!(live.selected_room.lock().await.as_deref(), Some(previous));
+        release.proceed();
+        let opened = tokio::time::timeout(Duration::from_secs(30), opening)
+            .await
+            .expect("woken by the withdrawal")
+            .expect("the open task ends");
+        assert!(matches!(opened, Ok(false)));
+        assert!(admission.await.is_err(), "admitted while withdrawn");
+        until(transition_free, live.clone()).await;
+        until(
+            |live| live.snapshot_barrier.try_write().is_ok(),
+            live.clone(),
+        )
+        .await;
+
+        manager
+            .logout_account(&account.id)
+            .await
+            .expect("Cannot remove the account");
         manager.stop().await;
         drop(manager);
         close_profile(directory, live).await;

@@ -783,6 +783,7 @@ fn hand_off(ui: &AppWindow, flow: VerificationInfo, name: &str) {
     ui.set_sas_other_user_id(flow.other_user_id.into());
     ui.set_sas_request_initiator(flow.we_started);
     crate::withdraw_call_bar(ui);
+    crate::unread_navigation::withdraw_jump(ui);
     ui.set_sas_stage(SAS_WAITING_FOR_REQUEST);
     ui.set_sas_notice(format!("Accept the request on “{name}”, then compare the values.").into());
 }

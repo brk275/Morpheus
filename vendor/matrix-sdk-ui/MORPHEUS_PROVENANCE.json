@@ -761,7 +761,9 @@
     "src/timeline/tests/read_receipts.rs",
     "src/timeline/tests/shields.rs",
     "src/timeline/traits.rs",
+    "src/timeline/mod.rs",
     "tests/integration/timeline/decryption.rs",
+    "tests/integration/timeline/read_receipts.rs",
     "tests/integration/timeline/replies.rs"
   ],
   "additional_files": [

@@ -354,9 +354,17 @@ impl MemberPrivacyUi {
     }
 
     fn inspect(self: &Arc<Self>, ui: &AppWindow, user: &str) {
-        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
+        // An open invitations center owns the window as Leave does: refused
+        // before any peer is withdrawn.
+        if crate::room_addresses::is_open(ui)
+            || crate::room_leave::is_open(ui)
+            || ui.global::<crate::InvitationsState>().get_open()
+        {
             return;
         }
+        // Admitted: a held unread jump ends for good before the inspector's
+        // flags (matrix_links::clear below ends it too).
+        crate::unread_navigation::withdraw_jump(ui);
         crate::matrix_links::clear(ui);
         crate::thread_browser::withdraw(ui);
         crate::withdraw_call_bar(ui);
@@ -802,7 +810,7 @@ impl MemberPrivacyUi {
     }
 
     fn review_unignore(&self, ui: &AppWindow, key: &str) {
-        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
+        if !ignored_action_admitted(ui) {
             return;
         }
         let mut reviewing = false;
@@ -835,6 +843,7 @@ impl MemberPrivacyUi {
         // before the painted stage changes.
         if reviewing {
             crate::withdraw_call_bar(ui);
+            crate::unread_navigation::withdraw_jump(ui);
         }
         self.paint_panel(ui);
     }
@@ -849,7 +858,7 @@ impl MemberPrivacyUi {
     }
 
     fn confirm_unignore(self: &Arc<Self>, ui: &AppWindow) {
-        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
+        if !ignored_action_admitted(ui) {
             return;
         }
         // The admission fence the core rechecks right before the write.
@@ -890,6 +899,7 @@ impl MemberPrivacyUi {
         // withdrawn again, synchronously, before the painted state changes.
         if started.is_some() {
             crate::withdraw_call_bar(ui);
+            crate::unread_navigation::withdraw_jump(ui);
         }
         self.paint_panel(ui);
         let Some((ids, user, baseline, selection, cancellation)) = started else {
@@ -1018,6 +1028,15 @@ impl MemberPrivacyUi {
         });
         privacy.set_ignored_rows(ModelRc::new(VecModel::from(rows)));
     }
+}
+
+/// Inline Settings review and confirmation must not replace a newer dialog
+/// or send its obscured action. Both actual entry points check this before
+/// changing the review or reserving a write. Idle Settings remains usable.
+pub(crate) fn ignored_action_admitted(ui: &AppWindow) -> bool {
+    !ui.get_room_actions_open()
+        && !crate::room_addresses::is_open(ui)
+        && !crate::room_leave::is_open(ui)
 }
 
 fn paint_unavailable(ui: &AppWindow) {

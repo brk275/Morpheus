@@ -245,6 +245,7 @@ elsewhere.
 | Show members (`show_members_panel`) | `Mod+Shift+P` |
 | Show the open thread (`show_thread_panel`) | `Mod+Shift+T` |
 | Open the account menu (`open_account_menu`) | `Mod+Shift+U` |
+| Jump to the first unread message (`jump_to_first_unread`) | `Mod+Shift+N` |
 
 ```toml
 # An excerpt: a [shortcuts] table lists every action you keep.
@@ -298,13 +299,14 @@ the details panel and the other panes. When not every action fits (a small
 window, large text, a large `icon_size` or an open details panel), the room
 name keeps a readable width, the topic gives way first, and the lower-priority
 actions move into one **More room actions** menu at the end of the header, in
-their header order. Room organization and Search always stay in the header,
-and **Leave this room…** stays while the room name keeps its shortest readable
-width beside it. Each menu item is the same action, with the same label, state
-and availability; an unavailable one is listed greyed out. The menu closes
-before an action runs. Up, Down, Home and End move through the available
-items, Tab stays in the menu, and Escape closes it and returns focus to More.
-More does not open while another panel or dialog owns the window.
+their header order. Room organization and Search always stay in the header;
+**Leave this room…**, then **Jump to first unread message**, stay while the
+room name keeps its shortest readable width beside them. Each menu item is the
+same action, with the same label, state and availability; an unavailable one
+is listed greyed out. The menu closes before an action runs. Up, Down, Home
+and End move through the available items, Tab stays in the menu, and Escape
+closes it and returns focus to More. More does not open while another panel
+or dialog owns the window.
 
 All modes retain the active room name, room settings/search/call/details
 controls, call notices, voice-room controls, status and error messages. The

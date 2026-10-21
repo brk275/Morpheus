@@ -90,7 +90,8 @@ card, the Space explorer and Space rooms, room addresses, room
 notifications, Seen by, the Quick Switcher, room actions, room
 administration (including roles and permissions), a member confirmation,
 the capture source picker, the leave dialog, an image preview, the poll
-dialog and the thread browser, and in Settings the ignored-users review and
+dialog, the thread browser and the invitations center, and in Settings the
+ignored-users review and
 shortcut recording. It stays available everywhere else, including while you move between
 rooms and pages. If a call is active or the camera or screen share runs
 then, only a small badge says so: "Call active · Mic on · Camera on", for

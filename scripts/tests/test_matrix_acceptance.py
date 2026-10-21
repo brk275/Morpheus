@@ -84,6 +84,34 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertIn("not full acceptance", summary.read_text())
             self.assertNotIn("Full suite:", summary.read_text())
 
+    def test_app_timeline_completion_and_summary_cannot_claim_other_checks(self):
+        self.assertEqual(acceptance_module.SUITES["app-timeline"], ("app-live-timeline",))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="app-timeline")
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+            runner.results = [{"check": "app-live-timeline", "passed": 1, "seconds": 1}]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "app-timeline")
+            self.assertEqual(report["not_run"], {})
+            text = summary.read_text()
+            self.assertIn("Only app-live-timeline ran", text)
+            self.assertIn("member publication and cleanup", text)
+            self.assertIn("No draft recovery, moderation, OAuth or RTC checks", text)
+            self.assertIn("not full acceptance", text)
+            self.assertNotIn("Full suite:", text)
+            self.assertNotIn("Focused draft-recovery rerun:", text)
+            self.assertNotIn("formatting prerequisite", text)
+
     def test_completion_requires_every_selected_check_and_default_still_requires_full(self):
         with tempfile.TemporaryDirectory() as folder:
             focused = Acceptance(Path(folder), "scanner", suite="draft-recovery")
@@ -336,6 +364,7 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             "CHECK link_follow_up_owned_retry=true",
             "CHECK link_follow_up_held_focus_rejected=true",
             "CHECK link_follow_up_owned_focus=true",
+            "STAGE member_publication", "CHECK member_publication=true",
             "STAGE cleanup", "CHECK cleanup_complete=true", "STAGE complete",
         )
         lines = ["running 1 test"]
@@ -343,9 +372,9 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         lines.append("test result: ok. 1 passed; 0 failed; 0 ignored;")
         return "\n".join(lines) + "\n"
 
-    def test_one_harness_requires_all_nineteen_observable_facts_and_cleanup(self):
+    def test_one_harness_requires_all_twenty_observable_facts_and_cleanup(self):
         checks = acceptance_module.app_timeline_evidence(self.output())
-        self.assertEqual(len(checks), 19)
+        self.assertEqual(len(checks), 20)
         self.assertEqual(set(checks), acceptance_module.APP_TIMELINE_CHECKS)
         self.assertTrue(all(checks.values()))
         self.assertIn("queued_callbacks_observed", checks)
@@ -353,6 +382,8 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         self.assertIn("queued_thread_rejected", checks)
         self.assertIn("link_follow_up_stale_retry_rejected", checks)
         self.assertIn("link_follow_up_held_focus_rejected", checks)
+        self.assertIn("member_publication", checks)
+        self.assertIn("member_publication", acceptance_module.APP_TIMELINE_STAGES)
         self.assertIn("cleanup_complete", checks)
 
     def test_every_missing_fact_is_fatal_even_after_a_green_test_summary(self):
@@ -372,6 +403,14 @@ class AppTimelineEvidenceTests(unittest.TestCase):
                 acceptance_module.app_timeline_evidence(self.output().replace(line, replacement))
             self.assertNotIn("private", str(caught.exception))
             self.assertNotIn("secret", str(caught.exception))
+
+    def test_member_publication_fact_cannot_be_false_duplicated_or_malformed(self):
+        line = "MORPHEUS_LIVE_TIMELINE_CHECK member_publication=true"
+        for replacement in (line.replace("true", "false"), line + "\n" + line,
+                            "MORPHEUS_LIVE_TIMELINE_CHECK member_publication=1",
+                            "MORPHEUS_LIVE_TIMELINE_CHECK member_publication_unknown=true"):
+            with self.subTest(record=replacement), self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(self.output().replace(line, replacement))
 
     def test_missing_or_repeated_lifecycle_markers_cannot_stand_in_for_completion(self):
         setup = "MORPHEUS_LIVE_TIMELINE_STAGE setup\n"
@@ -418,7 +457,7 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             arguments = {"ring_case": None, "oauth_checks": None, "element_checks": None}
             record = runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=True, **arguments)
             self.assertEqual(record["passed"], 1)
-            self.assertEqual(len(record["app_timeline_checks"]), 19)
+            self.assertEqual(len(record["app_timeline_checks"]), 20)
             self.assertTrue(all(record["app_timeline_checks"].values()))
             with self.assertRaises(RuntimeError):
                 runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=False, **arguments)
@@ -593,6 +632,33 @@ class FinalizationTests(unittest.TestCase):
         runner.outgoing_ring_cases.assert_not_called()
         runner.element_case.assert_not_called()
         self.assert_both_cleanups(runner)
+
+    def test_app_timeline_selection_keeps_cleanup_after_success_or_incomplete_results(self):
+        for failure_at in (None, "app_timeline", "finish_checks"):
+            with self.subTest(failure_at=failure_at), self.mocked_main() as (runner, _):
+                failure = RuntimeError("fixed incomplete live UI result")
+                if failure_at:
+                    getattr(runner, failure_at).side_effect = failure
+                with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                               "--suite", "app-timeline"]):
+                    if failure_at:
+                        with self.assertRaises(RuntimeError) as caught:
+                            acceptance_module.main()
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        self.assertIsNone(acceptance_module.main())
+                runner.app_timeline.assert_called_once()
+                runner.test.assert_not_called()
+                runner.timeline_read_cases.assert_not_called()
+                runner.draft_recovery_cases.assert_not_called()
+                runner.app_recovery.assert_not_called()
+                runner.oauth_cases.assert_not_called()
+                runner.rtc_cases.assert_not_called()
+                runner.outgoing_ring_cases.assert_not_called()
+                runner.element_case.assert_not_called()
+                self.assertNotIn(("local_matrix_rtc", "up"),
+                                 [call.args for call in runner.script.call_args_list])
+                self.assert_both_cleanups(runner)
 
     def test_media_only_main_runs_only_media_and_preserves_cleanup(self):
         with self.mocked_main() as (runner, _):

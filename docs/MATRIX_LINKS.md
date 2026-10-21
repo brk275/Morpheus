@@ -118,7 +118,8 @@ available where the join itself may still find the room.
     room addresses, room notifications or Seen by;
   - the quick switcher, room actions, room administration (details,
     permissions, redaction), a member action's confirmation, the capture
-    picker, leaving a call, the image preview or a poll.
+    picker, leaving a call, the image preview, a poll or the invitations
+    center.
 - Nothing a link started navigates after it was withdrawn, or after you went
   elsewhere. If the card is up and something else navigated meanwhile, the
   card asks before opening (**Open**).

@@ -21,11 +21,23 @@
 //! that ends before the write leaves nothing written, and one that ends
 //! while the write may have left reports `Unknown`, never retried.
 //!
+//! One listing at a time in this process (`direct_turn`): every caller of
+//! `list_direct_room` (People's new conversation, an accepted direct-message
+//! invitation, the unbound accept) waits its turn before its first read and
+//! keeps it until its write is answered, so no two in-process writers can
+//! both read the same baseline and then each write over the other's room.
+//! The wait is raced against the caller's guard and bounded
+//! (`DIRECT_TURN_WAIT`); a caller that stops or runs out of time while
+//! waiting has sent nothing. A write whose answer is unknown ends its turn
+//! like any other, and may still land after the next listing read its
+//! baseline. None of this is a conditional write against other clients or
+//! devices: Matrix account data has none.
+//!
 //! The module is shared: people_directory uses it after creating a direct
 //! conversation, and the invitations line's direct-message listing on join
 //! can share `list_direct_room` without changing the creation result.
 
-use std::{collections::BTreeMap, future::Future, time::Duration};
+use std::{collections::BTreeMap, future::Future, sync::OnceLock, time::Duration};
 
 use matrix_sdk::{
     Client, HttpError,
@@ -47,6 +59,9 @@ use serde_json::value::RawValue;
 pub const MAX_DIRECT_CONTENT_BYTES: u64 = 1024 * 1024;
 const MAX_WRITE_RESPONSE_BYTES: u64 = 16 * 1024;
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest wait for this process's `m.direct` turn: a listing holds it for
+/// at most two reads and a write.
+const DIRECT_TURN_WAIT: Duration = Duration::from_secs(60);
 
 /// Ends a listing step: the account selection and the caller's cancellation.
 pub trait DirectWriteGuard {
@@ -230,9 +245,16 @@ async fn read_direct(
     }
 }
 
+/// This process's one `m.direct` turn (see the module notes).
+fn direct_turn() -> &'static tokio::sync::Mutex<()> {
+    static TURN: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    TURN.get_or_init(Default::default)
+}
+
 /// List `room_id` under `target` in the `m.direct` data of the account
-/// `own`, which must be the client's own user. A fresh read, a re-read
-/// immediately before the single write, and the write; see the module notes.
+/// `own`, which must be the client's own user. Its turn, a fresh read, a
+/// re-read immediately before the single write, and the write; see the
+/// module notes.
 pub async fn list_direct_room(
     client: &Client,
     own: &UserId,
@@ -244,6 +266,28 @@ pub async fn list_direct_room(
     if client.user_id() != Some(own) {
         return Err(DirectWriteError::NotSent);
     }
+    if guard.stopped() {
+        return Err(DirectWriteError::NotSent);
+    }
+    // Waiting for the turn sends nothing; it is kept until this listing's
+    // write is answered or ends.
+    let _turn = tokio::select! {
+        biased;
+        _ = guard.wait_stopped() => return Err(DirectWriteError::NotSent),
+        _ = tokio::time::sleep(DIRECT_TURN_WAIT) => return Err(DirectWriteError::NotSent),
+        turn = direct_turn().lock() => turn,
+    };
+    list_in_turn(client, own, target, room_id, guard).await
+}
+
+/// `list_direct_room` once it is the caller's turn.
+async fn list_in_turn(
+    client: &Client,
+    own: &UserId,
+    target: &UserId,
+    room_id: &RoomId,
+    guard: &impl DirectWriteGuard,
+) -> Result<DirectListing, DirectWriteError> {
     let first = read_direct(client, own, guard).await?;
     let Some(merged) = merged_direct(first.as_deref(), target.as_str(), room_id.as_str())? else {
         return Ok(DirectListing::AlreadyListed);
@@ -279,6 +323,48 @@ pub async fn list_direct_room(
         Err(error) if refused_by_server(&error) => Err(DirectWriteError::Refused),
         Err(_) => Err(DirectWriteError::Unknown),
     }
+}
+
+/// Raw account-data content (raw JSON text, `None` when none is stored) with
+/// one top-level `field` set to the exact JSON text `value`, every other
+/// field copied as its exact raw text; `Ok(None)` when the field already
+/// holds exactly that text. The same lexical rules as `merged_direct`
+/// (content that is not an object or has duplicate fields is refused), but
+/// separate from it and from the m.direct turn: only the room
+/// `m.marked_unread` writer (unread_navigation) calls it.
+pub(crate) fn merged_field(
+    stored: Option<&str>,
+    field: &str,
+    value: &str,
+) -> Result<Option<String>, DirectWriteError> {
+    let unreadable = |_| DirectWriteError::Unreadable;
+    let mut fields = match stored {
+        None => BTreeMap::new(),
+        Some(raw) => {
+            serde_json::from_str::<UniqueFields>(raw)
+                .map_err(unreadable)?
+                .0
+        }
+    };
+    if fields
+        .get(field)
+        .is_some_and(|current| current.get() == value)
+    {
+        return Ok(None);
+    }
+    let value = RawValue::from_string(value.to_owned()).map_err(unreadable)?;
+    fields.insert(field.to_owned(), value);
+    let mut body = String::from("{");
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(&serde_json::to_string(key).map_err(unreadable)?);
+        body.push(':');
+        body.push_str(value.get());
+    }
+    body.push('}');
+    Ok(Some(body))
 }
 
 #[cfg(test)]

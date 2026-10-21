@@ -284,6 +284,8 @@ impl IdentityWarningsUi {
             // Refusal above leaves every peer alone. Once admitted, a held
             // bar action must not survive these details, even after Close.
             crate::withdraw_call_bar(ui);
+            // Nor a held unread jump (matrix_links::clear below ends it too).
+            crate::unread_navigation::withdraw_jump(ui);
             // The details are another modal over the conversation: a shown
             // Matrix link, its read and join end first, synchronously, as at
             // every other modal's entry (matrix-link-blocked lists them).

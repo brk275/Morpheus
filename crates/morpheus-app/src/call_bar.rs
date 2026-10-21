@@ -612,6 +612,13 @@ pub(crate) fn register(
             && !ui.get_call_bar_protected()
             && showing_current_call()
         {
+            // Admitted, Return takes the window to the call page: a held
+            // unread jump, a shown link's read, join and follow-up, and
+            // identity details' focus-return intent end first, synchronously,
+            // as at the rail's call-page entry.
+            crate::unread_navigation::withdraw_jump(&ui);
+            crate::matrix_links::clear(&ui);
+            crate::identity_warnings::withdraw(&ui);
             ui.set_call_stage_focus_pending(true);
             ui.set_page(2);
         }

@@ -32,6 +32,7 @@ Opening a conversation goes through the shared conversation path, so your drafts
     - it makes a fresh read, merges in only the new person-to-room entry (every other field value is kept as raw JSON; object key order and whitespace may change), re-reads immediately before writing, and refuses to write if the list changed in between;
     - the write is sent once, with no retry and no token-refresh replay;
     - Matrix account data has no compare-and-swap, so a change landing between the re-read and the write could still be overwritten. That window is one round trip.
+    - Only one `m.direct` listing runs at a time in the app (an accepted direct-message invitation's included): this one waits its turn before its first read, at most a minute and not once the window closes or the account changes. If it never gets its turn, nothing is written and the window says the listing was not written.
   - The room exists whatever happens to that listing. If the listing was not written, or its outcome is unknown, the window says so instead of opening the room straight away. It never reports the creation as failed and never tries the listing again.
   - The request is raced against closing the window and against the account selection ending, so an old account's creation is never sent after a switch. A close or switch while the request may already be on its way is reported as unknown.
 - marks the room as a direct conversation in your account data, and waits briefly for it to sync before opening it.

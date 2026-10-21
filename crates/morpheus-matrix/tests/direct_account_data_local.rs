@@ -66,18 +66,18 @@ impl DirectWriteGuard for Closed {
     }
 }
 
-/// Stops exactly as the write is admitted: the reads see an open guard; the
-/// write's race sees it ended.
+/// Stops exactly as the write is admitted: the turn's wait and the reads see
+/// an open guard; the write's race sees it ended.
 struct StopsAtWrite(AtomicUsize);
 impl DirectWriteGuard for StopsAtWrite {
     fn stopped(&self) -> bool {
         false
     }
     fn wait_stopped(&self) -> impl Future<Output = ()> + Send {
-        // Two reads, then the write (the third race).
+        // The turn's wait, two reads, then the write (the fourth race).
         let call = self.0.fetch_add(1, Ordering::SeqCst);
         async move {
-            if call < 2 {
+            if call < 3 {
                 std::future::pending::<()>().await;
             }
         }

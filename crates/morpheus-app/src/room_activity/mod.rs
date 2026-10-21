@@ -827,6 +827,11 @@ impl RoomActivityUi {
     /// leaving the room does not, since the user asked for that room. Unread
     /// counts change only when sync brings the server's result.
     fn mark_read(self: &Arc<Self>, ui: &AppWindow, room: &str) {
+        // The click's own fence for the unread-flag clear that follows:
+        // taken here, before anything is spawned, and never re-captured.
+        let gate = self.live.security_gate.clone();
+        let security = gate.ringing_generation();
+        let navigation = self.live.current_navigation_epoch();
         let live = ui.get_live_session() && self.live.is_live.load(Ordering::Acquire);
         if !live || room.is_empty() || self.live.security_gate.blocked() {
             return;
@@ -849,14 +854,37 @@ impl RoomActivityUi {
         ui.global::<RoomActivity>().set_marking(true);
         let this = self.clone();
         let room = room.to_owned();
+        let fence_live = self.live.clone();
+        let fence_selection = selection.clone();
+        let admitted = move || {
+            fence_selection.is_current()
+                && gate.ringing_allowed(security)
+                && fence_live.navigation_is_current(navigation)
+        };
         self.runtime.spawn(async move {
             let manager = this.live.manager.clone();
             let marked = manager
                 .explicit_mark_read_selected(&selection, &room, public, &cancellation)
                 .await;
+            // Unread navigation: an explicit Mark as read also clears this
+            // account's m.marked_unread flag for the room, as part of the
+            // same choice. Nothing else ever clears it.
+            let flag = match marked {
+                Ok(ReceiptOutcome::Sent | ReceiptOutcome::NotNeeded) => {
+                    crate::unread_navigation::clear_mark_for_read(
+                        &manager,
+                        &selection,
+                        &room,
+                        &cancellation,
+                        &admitted,
+                    )
+                    .await
+                }
+                _ => None,
+            };
             let weak = this.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                this.finish_mark(&ui, &selection, op, marked);
+                this.finish_mark(&ui, &selection, op, marked, flag);
             });
         });
     }
@@ -867,6 +895,7 @@ impl RoomActivityUi {
         selection: &AccountSelection,
         op: u64,
         marked: Result<ReceiptOutcome, MatrixCoreError>,
+        flag: Option<&'static str>,
     ) {
         {
             let mut state = self.lock();
@@ -893,7 +922,10 @@ impl RoomActivityUi {
             Err(MatrixCoreError::SelectedAccountChanged) => return,
             Err(_) => "Could not mark as read. Try again.",
         };
-        self.show_notice(ui, notice);
+        match flag {
+            Some(flag) => self.show_notice(ui, &format!("{notice}{flag}")),
+            None => self.show_notice(ui, notice),
+        }
     }
 
     fn show_notice(self: &Arc<Self>, ui: &AppWindow, notice: &str) {

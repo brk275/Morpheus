@@ -27,6 +27,7 @@ mod identity_warnings;
 mod image_previews;
 #[cfg(feature = "native-calls")]
 mod incoming_ring;
+mod invitations;
 mod kept_replies;
 mod live;
 #[cfg(feature = "native-calls")]
@@ -50,6 +51,7 @@ mod polls;
 mod preview_capture;
 mod room_activity;
 mod room_addresses;
+mod room_creation;
 mod room_leave;
 mod room_media_browser;
 mod room_organization;
@@ -74,6 +76,7 @@ mod thread_history;
 mod timeline_acceptance;
 mod timeline_delivery;
 mod timeline_model;
+mod unread_navigation;
 mod update_controller;
 mod updater;
 mod verification;
@@ -110,7 +113,7 @@ use crate::calls::{
     AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStartIntent, CallStatus,
     route_degraded, route_notice, route_reply_notice, route_reply_scope, route_summary,
 };
-use crate::live::{LiveUi, RoomAction, show_error};
+use crate::live::{LiveUi, show_error};
 #[cfg(feature = "native-calls")]
 use crate::local_video::{CaptureKind, CapturePhase, CaptureSource, LocalVideoStatus};
 use crate::notifications::DesktopNotifications;
@@ -176,6 +179,7 @@ fn room(
             voice_shared: false,
             favourite: false,
             low_priority: false,
+            marked_unread: false,
         },
         topic: topic.into(),
         messages,
@@ -664,6 +668,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_thread_composer_text("".into());
         ui.set_thread_send_pending(false);
         ui.set_room_actions_open(false);
+        room_creation::clear(ui);
         ui.set_room_action_busy(false);
         ui.set_room_action_error("".into());
         ui.set_invite_error("".into());
@@ -720,6 +725,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
             .collect::<Vec<_>>(),
     )));
     ui.set_invitations(ModelRc::new(VecModel::from(Vec::<RoomItem>::new())));
+    ui.set_home_invitations(ModelRc::new(VecModel::from(Vec::<RoomItem>::new())));
     apply_room_sort(ui);
     ui.set_members(ModelRc::new(VecModel::from(account.members.clone())));
     ui.set_member_loading(false);
@@ -1701,6 +1707,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let room_activity =
         room_activity::RoomActivityUi::register(&ui, live.clone(), store.clone(), runtime.handle());
+    let unread_navigation_ui =
+        unread_navigation::UnreadNavigationUi::register(&ui, live.clone(), runtime.handle());
     let device_sessions =
         device_sessions::DeviceSessionsUi::register(&ui, live.clone(), runtime.handle());
     let member_privacy =
@@ -2109,6 +2117,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         notifications.clone(),
         store.clone(),
         runtime.handle(),
+    );
+    // Home invitation cards and the invitations center answer through it.
+    let _invitations = invitations::register(
+        &ui,
+        live.clone(),
+        notifications.clone(),
+        runtime.handle().clone(),
     );
 
     let watch = store.watch_with_theme(Duration::from_millis(700));
@@ -3042,6 +3057,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     message_search::register(&ui, live.clone(), runtime.handle().clone());
     space_explorer::register(&ui, live.clone(), runtime.handle().clone());
+    room_creation::register(&ui, live.clone(), runtime.handle().clone());
     matrix_links::register(&ui, live.clone(), runtime.handle().clone());
     space_management::register(&ui, live.clone(), runtime.handle().clone());
     room_addresses::register(&ui, live.clone(), runtime.handle().clone());
@@ -3259,6 +3275,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(window) = weak.upgrade() else {
             return;
         };
+        // Create room and Create Space use the planned, single-send creation
+        // and its owned open (room_creation.rs); only Join stays here.
+        if mode == 0 || mode == 2 {
+            room_creation::submit(&window, &action_live, &action_handle);
+            return;
+        }
+        if mode != 1 {
+            return;
+        }
         if !action_live.is_live.load(Ordering::Acquire) {
             window.set_room_action_error("Sign in to a Matrix account first".into());
             return;
@@ -3266,25 +3291,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if window.get_room_action_busy() {
             return;
         }
-        let action = match mode {
-            0 => Some(RoomAction::CreatePrivate),
-            1 => None,
-            2 => Some(RoomAction::CreateSpace),
-            _ => return,
-        };
-        if action.is_none()
-            && (!window.get_discovery_context_allowed()
-                || !window.get_room_actions_open()
-                || space_explorer::is_open(&window)
-                || action_live.security_gate.blocked())
+        if !window.get_discovery_context_allowed()
+            || !window.get_room_actions_open()
+            || space_explorer::is_open(&window)
+            || action_live.security_gate.blocked()
         {
             return;
         }
         // Joining by a user's Matrix ID means talking to them: open Start a
         // conversation for that exact person instead of failing.
-        if action.is_none()
-            && let Some(user) = morpheus_matrix::exact_user_id(&input)
-        {
+        if let Some(user) = morpheus_matrix::exact_user_id(&input) {
             window.set_room_actions_open(false);
             window.invoke_open_people(user.into());
             return;
@@ -3307,27 +3323,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .manager
             .account_selection(&account_id)
             .filter(morpheus_matrix::AccountSelection::is_current);
-        let asked = action.is_none().then(|| action_live.join_asked());
-        if let Some(asked) = &asked {
-            *join_slot.lock().unwrap_or_else(|error| error.into_inner()) =
-                Some((operation, asked.clone()));
-        }
+        let asked = action_live.join_asked();
+        *join_slot.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some((operation, asked.clone()));
         let join_slot = join_slot.clone();
         action_handle.spawn(async move {
-            let result = match (action, asked) {
-                (Some(action), _) => live
-                    .run_room_action(&account_id, action, &submitted, weak.clone())
+            let result = match (room_join_target(&submitted, "", ""), selection) {
+                (Ok(target), Some(selection)) => live
+                    .join_target_for(&selection, &target, &asked, weak.clone())
                     .await
+                    .map(|_| ())
                     .map_err(|error| error.to_string()),
-                (None, asked) => match (room_join_target(&submitted, "", ""), selection, asked) {
-                    (Ok(target), Some(selection), Some(asked)) => live
-                        .join_target_for(&selection, &target, &asked, weak.clone())
-                        .await
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
-                    (Ok(_), _, _) => Err(morpheus_matrix::JoinError::AccountChanged.to_string()),
-                    (Err(error), _, _) => Err(error),
-                },
+                (Ok(_), None) => Err(morpheus_matrix::JoinError::AccountChanged.to_string()),
+                (Err(error), _) => Err(error),
             };
             let _ = weak.upgrade_in_event_loop(move |window| {
                 if window.get_active_account_local_id().as_str() != account_id
@@ -3348,48 +3356,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         window.set_page(0);
                     }
                     Err(error) => window.set_room_action_error(error.into()),
-                }
-            });
-        });
-    });
-
-    let weak = ui.as_weak();
-    let invite_live = live.clone();
-    let invite_handle = runtime.handle().clone();
-    ui.on_respond_invite(move |room_id, accept| {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !invite_live.is_live.load(Ordering::Acquire) {
-            window.set_invite_error("Sign in to respond to invitations".into());
-            return;
-        }
-        if window.get_room_action_busy() {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        if account_id.is_empty() {
-            return;
-        }
-        let operation = window.get_room_action_operation().wrapping_add(1);
-        window.set_room_action_operation(operation);
-        window.set_room_action_busy(true);
-        window.set_invite_error("".into());
-        let live = invite_live.clone();
-        let weak = weak.clone();
-        invite_handle.spawn(async move {
-            let result = live
-                .respond_to_invite(&account_id, &room_id, accept, weak.clone())
-                .await;
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
-                    || window.get_room_action_operation() != operation
-                {
-                    return;
-                }
-                window.set_room_action_busy(false);
-                if let Err(error) = result {
-                    window.set_invite_error(error.to_string().into());
                 }
             });
         });
@@ -4306,7 +4272,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     live.voice_spaces.forget_account(&account_id).await;
                     live.forget_account_drafts(&account_id);
                     room_permissions::forget_account(&account_id);
+                    // A successful logout only: invitation answers, listings
+                    // and notices of this account are forgotten too.
+                    invitations::forget_account(&account_id);
+                    unread_navigation::forget_account(&account_id);
                     room_leave::forget_account(&account_id);
+                    room_creation::forget_account(&account_id);
                     room_settings::forget_access_account(&account_id);
                     space_management::forget_account(&account_id);
                     live.forget_removed_account_joins(&account_id);
@@ -4676,6 +4647,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pinned_messages.shutdown(&ui);
     room_media.shutdown(&ui);
     room_activity.shutdown(&ui);
+    // Before any wait below: no unread-mark write that was not handed over
+    // yet can start while main waits on other cleanup.
+    unread_navigation_ui.shutdown(&ui);
     room_permissions.shutdown(&ui);
     room_settings.shutdown(&ui);
     room_leave.shutdown(&ui);

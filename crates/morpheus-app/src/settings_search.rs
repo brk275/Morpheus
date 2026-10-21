@@ -246,6 +246,26 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
         Route::Settings => request_settings_reveal(ui),
         // Presentation only: the panel shows what is already there.
         Route::Transfers => ui.invoke_show_transfer_panel(),
+        // Presentation only: Home with the center open, focused on its
+        // search field; nothing is answered.
+        Route::Invitations => {
+            // Refused, never deferred, before anything is withdrawn or the
+            // page changes, under any surface the center refuses under
+            // (invitations-entry-blocked: the link list without its page
+            // term, as this route runs from the Settings page itself; an
+            // open Leave dialog is refused above).
+            if !ui.get_invitations_entry_blocked() {
+                // A link card, a joined link's message still to come, any
+                // owned automatic open, a held unread jump, identity details,
+                // the thread browser and a waiting call bar click end first,
+                // as at every modal's entry.
+                crate::matrix_links::clear(ui);
+                crate::thread_browser::withdraw(ui);
+                crate::withdraw_call_bar(ui);
+                ui.set_page(0);
+                ui.global::<crate::InvitationsState>().set_open(true);
+            }
+        }
         Route::ManageAccounts(focus) => {
             ui.set_manage_accounts_focus(
                 match focus {

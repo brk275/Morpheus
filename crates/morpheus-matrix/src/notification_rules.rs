@@ -71,7 +71,7 @@ pub const MAX_NOTIFICATION_KEYWORD_CHARS: usize = 64;
 /// that failed on the way. It never claims nothing changed: a multi-rule
 /// change can reach the homeserver in part. The SDK error, which can carry
 /// server text, is never passed on.
-fn refused<E>(what: &'static str) -> impl FnOnce(E) -> MatrixCoreError {
+pub(crate) fn refused<E>(what: &'static str) -> impl FnOnce(E) -> MatrixCoreError {
     move |_| MatrixCoreError::Sdk(what.into())
 }
 
@@ -149,8 +149,9 @@ impl AccountManager {
     }
 
     /// The selected account's client while `selection` still owns it. The
-    /// manager lock is released before any homeserver request.
-    async fn rule_client(&self, selection: &AccountSelection) -> Result<Client> {
+    /// manager lock is released before any homeserver request. Invitations
+    /// use the same fence.
+    pub(crate) async fn rule_client(&self, selection: &AccountSelection) -> Result<Client> {
         if !self.owns_rule_selection(selection) {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
@@ -184,7 +185,7 @@ impl AccountManager {
 
     /// Run one bounded request under `selection`; a revoked selection or a
     /// timeout ends it and its result is never returned.
-    async fn under_rule_selection<T>(
+    pub(crate) async fn under_rule_selection<T>(
         &self,
         selection: &AccountSelection,
         request: impl std::future::Future<Output = Result<T>>,
@@ -454,6 +455,9 @@ impl AccountManager {
     /// private read receipt, which clears unread counts on this and the
     /// account's other devices without showing other members a read marker.
     /// Returns whether a receipt was sent; an already read room sends none.
+    /// The room's `m.marked_unread` flag is never changed here (the SDK's
+    /// opt-in path; only unread navigation's owned writer changes it), and
+    /// the request keeps the client's default configuration as before.
     pub async fn mark_room_read_selected(
         &self,
         selection: &AccountSelection,
@@ -463,7 +467,7 @@ impl AccountManager {
         self.under_rule_selection(selection, async move {
             let timeline = loaded.timeline(room_id).await?;
             timeline
-                .mark_as_read(ReceiptType::ReadPrivate)
+                .mark_as_read_without_unread_flag(ReceiptType::ReadPrivate, None)
                 .await
                 .map_err(refused("the read marker was not confirmed"))
         })
@@ -481,7 +485,7 @@ impl AccountManager {
         self.under_rule_selection(selection, async move {
             let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
             timeline
-                .mark_as_read(ReceiptType::ReadPrivate)
+                .mark_as_read_without_unread_flag(ReceiptType::ReadPrivate, None)
                 .await
                 .map_err(refused("the read marker was not confirmed"))
         })

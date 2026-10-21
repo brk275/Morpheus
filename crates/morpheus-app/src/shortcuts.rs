@@ -19,7 +19,7 @@ use morpheus_config::{
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, platform::Key};
 
-use crate::{AppWindow, RoomItem, ShortcutItem};
+use crate::{AppWindow, RoomItem, ShortcutItem, UnreadNavigation};
 
 // Keep every candidate visible even at 200% text scale in the minimum window.
 const PICKER_LIMIT: usize = 6;
@@ -377,6 +377,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || !ui.get_shortcut_recording().is_empty()
         || ui.get_poll_dialog_open()
         || ui.global::<crate::RoomNotificationState>().get_open()
+        || ui.global::<crate::InvitationsState>().get_open()
         || ui.global::<crate::RoomActivity>().get_seen_open()
         || crate::identity_warnings::is_open(ui)
 }
@@ -516,6 +517,17 @@ fn run(ui: &AppWindow, action: ShortcutAction) -> bool {
         // Opens the menu and focuses its trigger; every entry still needs
         // its own activation and confirmation.
         ShortcutAction::OpenAccountMenu => ui.invoke_open_account_menu(),
+        // The same explicit jump as the room header's button: it only
+        // scrolls and loads history; it never marks anything read.
+        ShortcutAction::JumpToFirstUnread
+            if in_room
+                && ui.get_page() == 0
+                && ui.get_unread_jump_allowed()
+                && ui.global::<UnreadNavigation>().get_can_jump()
+                && !ui.global::<UnreadNavigation>().get_jumping() =>
+        {
+            ui.global::<UnreadNavigation>().invoke_jump()
+        }
         _ => return false,
     }
     true
@@ -607,8 +619,10 @@ pub fn register(ui: &AppWindow, store: ConfigStore) {
         let Some(ui) = weak.upgrade() else { return };
         if let Some(action) = named_action(name.as_str()) {
             // Recording protects the call bar: a bar click still waiting is
-            // refused for good, synchronously, before the flag is set.
+            // refused for good, synchronously, before the flag is set; so is
+            // a held unread jump.
             crate::withdraw_call_bar(&ui);
+            crate::unread_navigation::withdraw_jump(&ui);
             ui.set_shortcut_recording(action.name().into());
             set_message(
                 format!(

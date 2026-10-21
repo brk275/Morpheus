@@ -487,6 +487,38 @@ thread_local! {
     // outlives its card: the next clear (Close, a newer link, an account
     // change, a protected surface) withdraws it at once.
     static FOLLOW_UP: RefCell<Option<NavigationAuthority>> = const { RefCell::new(None) };
+    // The authority of the last automatic open a click still owns (an
+    // accepted invitation's, from a Home card or the invitations center's
+    // Open, or a created room's): the same clear withdraws it at once, so no
+    // protected surface entered after the click is ever navigated behind.
+    static OWNED_OPEN: RefCell<Option<NavigationAuthority>> = const { RefCell::new(None) };
+}
+
+/// Hold `authority`, the one authority of an automatic open owned from its
+/// click (live.rs OpenRequest::owned, or a created room's open:
+/// room_creation's install_open), so that every protected surface's
+/// entry (clear, synchronous, before its flag changes) withdraws it for
+/// good, as it does a joined link's follow-up. A newer one replaces and
+/// withdraws it: only the last click opens. Call on the UI thread, at the
+/// click. Withdrawing changes only what is shown, never an answer.
+pub(crate) fn own_automatic_open(authority: NavigationAuthority) {
+    let older = OWNED_OPEN.with(|owned| owned.borrow_mut().replace(authority));
+    if let Some(older) = older {
+        older.withdraw();
+    }
+}
+
+/// Forget `authority` as the owned automatic open without withdrawing it,
+/// when it is still the one held: its open finished (a created room's
+/// attempt, room_creation's release_open), so no later entry takes back the
+/// room it showed. Another, newer owned open is left as it is. UI thread.
+pub(crate) fn release_automatic_open(authority: &NavigationAuthority) {
+    OWNED_OPEN.with(|owned| {
+        let mut owned = owned.borrow_mut();
+        if owned.as_ref().is_some_and(|held| held.is_same(authority)) {
+            *owned = None;
+        }
+    });
 }
 
 fn next_operation() -> u64 {
@@ -497,13 +529,19 @@ fn next_operation() -> u64 {
     })
 }
 
-/// End the shown link: withdraw its read, its join and the last joined
-/// link's follow-up first, then hide the card and forget everything it
-/// showed.
+/// End the shown link: withdraw its read, its join, the last joined link's
+/// follow-up and the last owned automatic open (own_automatic_open) first,
+/// then hide the card and forget everything it showed.
 pub(crate) fn clear(ui: &AppWindow) {
+    // Every route that takes over the window clears links here first, before
+    // its surface opens; a held unread jump ends at the same moment, for good.
+    crate::unread_navigation::withdraw_jump(ui);
     next_operation();
     if let Some(follow_up) = FOLLOW_UP.with(|follow_up| follow_up.borrow_mut().take()) {
         follow_up.withdraw();
+    }
+    if let Some(owned) = OWNED_OPEN.with(|owned| owned.borrow_mut().take()) {
+        owned.withdraw();
     }
     if let Some(Session {
         shown: Shown::Room(room),
@@ -574,11 +612,12 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
 /// Space explorer and Space rooms, room addresses, room notifications, Seen
 /// by, the quick switcher, room actions, room administration with its
 /// permissions and redaction, member actions, the capture picker, leaving a
-/// call, the image preview, polls, the thread browser). Each of their
-/// entries also withdraws the link synchronously first (clear). The session ending is the link
-/// modal's own exception: its signed-out card may still show, while the
-/// follow-up's authority ends with the session it captured. Integration
-/// seam: root's modal guard registry, once there is one, replaces the list.
+/// call, the image preview, polls, the thread browser, the invitations
+/// center). Each of their entries also withdraws the link synchronously
+/// first (clear). The session ending is the link modal's own exception: its
+/// signed-out card may still show, while the follow-up's authority ends with
+/// the session it captured. Integration seam: root's modal guard registry,
+/// once there is one, replaces the list.
 fn surface_blocked(ui: &AppWindow) -> bool {
     ui.get_matrix_link_blocked()
 }
@@ -1404,6 +1443,15 @@ pub(crate) mod tests {
         ui.set_live_session(live_session);
         ui.set_show_sign_in(sign_in);
         settle(ui).await;
+    }
+
+    /// A joined link's message still to come, held as the link's own
+    /// follow-up (blocked by surface_blocked), for a test of another
+    /// surface's entry. The caller asks whether it still admits.
+    pub(crate) fn hold_follow_up() -> NavigationAuthority {
+        let authority = NavigationAuthority::default().blocked_by(surface_blocked);
+        FOLLOW_UP.with(|slot| *slot.borrow_mut() = Some(authority.clone()));
+        authority
     }
 
     /// A joined link's message still to come, installed the way finish_join

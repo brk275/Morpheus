@@ -409,12 +409,18 @@ Additionally modified vendored files (upstream c6ad52e blob -> current blob):
 | File | Upstream git blob | Current git blob |
 | --- | --- | --- |
 | src/room/identity_status_changes.rs | ab830b7fa437da3ef24e2b56474d81a6c2920744 | 8a32f7931a0e79fd26ebff767155a91c53889799 |
-| src/room/mod.rs | f979dc97d1667d661c91c0fac34a26206fc15572 | cc6d1b828a3db334814f6bc2ea06ced35360af5a |
+| src/room/mod.rs | f979dc97d1667d661c91c0fac34a26206fc15572 | a329dcc0189c9dacd1c7e4d98f1489ab27381229 |
 
 Current blobs are git blob IDs computed from the final file bytes (sha256
 c1d9991c76dd98074cdb94ed3fcdc7bd9ef6ff6b36e37af2dff0b24f52a424a8, 66510
-bytes, and 506306b392b09828d8b22a303424b8d8652b60d218899b0eda0b1dac4d051c6e,
-227283 bytes); the same computation reproduces both recorded upstream blobs.
+bytes, and 208005f7ba208ed3bb981d5262310c28a48f05b38db33afcee01a29d9af02831,
+228838 bytes); the same computation reproduces both recorded upstream blobs.
+`src/room/mod.rs` also carries the opt-in receipt without the unread-flag
+write (its own section below); its current blob and sha256 are those of the
+file with both patches. With this stream patch alone it was blob
+cc6d1b828a3db334814f6bc2ea06ced35360af5a (sha256
+506306b392b09828d8b22a303424b8d8652b60d218899b0eda0b1dac4d051c6e, 227283
+bytes).
 The upstream blobs are the `git_blob` values in `MORPHEUS_PROVENANCE.json`;
 those records are unchanged. `LICENSE` and the upstream headers are kept.
 `crates/morpheus-app/build.rs` hashes `vendor/`, so the persistence cohort
@@ -503,3 +509,36 @@ The upstream blobs are the `git_blob` values in `MORPHEUS_PROVENANCE.json`;
 those records are unchanged. `LICENSE` and the upstream headers are kept.
 `crates/morpheus-app/build.rs` hashes `vendor/`, so the persistence cohort
 changes with this patch.
+
+## Opt-in receipt without the unread-flag side effect (unread navigation)
+
+`Room::send_single_receipt` unsets the room's `m.marked_unread` flag after an
+unthreaded receipt with an ordinary typed write (`Room::set_unread_flag`, no
+read of the stored content, the client's default retry and token refresh).
+Morpheus owns that flag through one lossless, bounded writer with its own
+receipts (`crates/morpheus-matrix/src/unread_navigation.rs`), so its explicit
+Mark as read must not trigger the SDK's write.
+
+`src/room/mod.rs` adds `Room::send_single_receipt_without_unread_flag`. It
+sends the same `create_receipt` request (same receipt type, thread and event)
+with an optional `RequestConfig` (the client's default when `None`), and never
+calls `set_unread_flag`. Identical requests are deduplicated only among its
+own callers (key prefix `morpheus-no-unread-flag|`), so one never joins a
+`send_single_receipt` future that would unset the flag. `send_single_receipt`,
+`send_multiple_receipts`, `set_unread_flag` and every other caller are
+unchanged. The only caller is the opt-in `Timeline` method in the vendored
+`matrix-sdk-ui` (see its `MORPHEUS_PATCH.md`), which carries the regression.
+
+| File | Upstream git blob | Current git blob |
+| --- | --- | --- |
+| src/room/mod.rs | f979dc97d1667d661c91c0fac34a26206fc15572 | a329dcc0189c9dacd1c7e4d98f1489ab27381229 |
+
+Upstream sha256 88b4286a705e08155efff98b348f23f9172ec92c85dccef4e635e40850560db6;
+current sha256 208005f7ba208ed3bb981d5262310c28a48f05b38db33afcee01a29d9af02831
+(228838 bytes), the file with this patch and the stored-members identity
+stream patch above; with this patch alone it was blob
+f877eb2205818b3ee896d1b95626169f0050b2e3 (sha256
+0b6db0258636e29e3f56500bb3b69f2998cc7399fd721cb3643dc0ef9bc38d5a).
+The upstream record in `MORPHEUS_PROVENANCE.json` is unchanged. No dependency,
+feature, lockfile, workflow or scanner setting changes. The persistence cohort
+changes with this patch because `vendor/` is hashed.

@@ -30,6 +30,7 @@ use std::{
 
 use matrix_sdk::{
     Room,
+    config::RequestConfig,
     event_handler::EventHandlerDropGuard,
     ruma::{
         OwnedUserId, UserId,
@@ -56,6 +57,18 @@ const MAX_TYPING_NAMED: usize = 4;
 const MAX_NAME_CHARS: usize = 256;
 const NAME_LIMIT: Duration = Duration::from_millis(400);
 const WRITE_LIMIT: Duration = Duration::from_secs(15);
+/// Largest answer read for one explicit Mark as read receipt request.
+const RECEIPT_RESPONSE_BYTES: u64 = 16 * 1024;
+
+/// The explicit Mark as read receipts: one bounded attempt, no SDK retry and
+/// no authentication refresh or replay, a capped answer.
+fn receipt_config() -> RequestConfig {
+    RequestConfig::new()
+        .retry_limit(0)
+        .timeout(WRITE_LIMIT)
+        .max_response_bytes(RECEIPT_RESPONSE_BYTES)
+        .disable_auth_refresh()
+}
 
 /// Which receipts may say that an event was seen.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -325,6 +338,9 @@ impl AccountManager {
     /// fully-read marker (unthreaded) and a read receipt on the live
     /// timeline's latest event, public only when `public`. Nothing calls it
     /// automatically. The SDK skips a receipt that would not move forwards.
+    /// It uses the SDK's opt-in mark-as-read that never touches the room's
+    /// `m.marked_unread` flag (the app's owned, lossless writer clears it),
+    /// with bounded, single-attempt requests that never refresh or replay.
     /// Unread counts change only when sync reports the server's result.
     /// `cancellation` withdraws it up to the moment it is handed to the SDK.
     pub async fn explicit_mark_read_selected(
@@ -338,10 +354,17 @@ impl AccountManager {
         let lookup = Box::pin(self.activity_timeline(selection, room_id, None));
         let marked = send_unless_cancelled(cancellation, lookup, |timeline| async move {
             ensure_current(selection)?;
-            let marker = timeline.mark_as_read(SendReceiptType::FullyRead).await;
+            let marker = timeline
+                .mark_as_read_without_unread_flag(
+                    SendReceiptType::FullyRead,
+                    Some(receipt_config()),
+                )
+                .await;
             let marker = marker.map_err(|_| MatrixCoreError::Sdk("read marker failed".into()))?;
             ensure_current(selection)?;
-            let read = timeline.mark_as_read(receipt).await;
+            let read = timeline
+                .mark_as_read_without_unread_flag(receipt, Some(receipt_config()))
+                .await;
             let read = read.map_err(|_| MatrixCoreError::Sdk("read receipt failed".into()))?;
             Ok::<bool, MatrixCoreError>(marker || read)
         });
@@ -534,6 +557,28 @@ mod tests {
         sync::atomic::AtomicUsize,
         task::{Context, Poll},
     };
+
+    /// Mark as read never asks the SDK to change the unread flag: no default
+    /// mark-as-read or receipt-set call that unsets it, only the opt-in one
+    /// with a bounded config that neither retries nor refreshes or replays.
+    #[test]
+    fn mark_as_read_leaves_the_unread_flag_to_its_owned_writer() {
+        let source = include_str!("room_activity.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(!production.contains(".mark_as_read("));
+        assert!(!production.contains("send_multiple_receipts"));
+        assert!(!production.contains("set_unread_flag"));
+        assert_eq!(
+            production
+                .matches(".mark_as_read_without_unread_flag(")
+                .count(),
+            2
+        );
+        let config = format!("{:?}", receipt_config());
+        assert!(config.contains("retry_limit: Some(0)") || config.contains("retry_limit: 0"));
+        assert!(config.contains("disable_auth_refresh: true"), "{config}");
+        assert!(config.contains("max_response_bytes"), "{config}");
+    }
 
     #[test]
     fn a_receipt_waiting_for_its_timeline_is_withdrawn_before_it_is_sent() {

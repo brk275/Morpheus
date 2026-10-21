@@ -1811,6 +1811,9 @@ pub enum Route {
     /// Show the transfer center of the account on screen and focus its
     /// heading. Nothing is started, cancelled or retried.
     Transfers,
+    /// Open the invitations center of the account on screen on Home and
+    /// focus its search field. Nothing is accepted or declined.
+    Invitations,
 }
 
 pub struct SettingTarget {
@@ -1857,6 +1860,11 @@ const fn accounts(mut setting: SettingTarget, focus: AccountsFocus) -> SettingTa
 
 const fn transfers(mut setting: SettingTarget) -> SettingTarget {
     setting.route = Route::Transfers;
+    setting
+}
+
+const fn invitations(mut setting: SettingTarget) -> SettingTarget {
+    setting.route = Route::Invitations;
     setting
 }
 
@@ -2521,6 +2529,22 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             "cancel upload",
         ],
     ))),
+    live(invitations(target(
+        "rooms.invitations",
+        "Rooms",
+        "Home › Invitations",
+        "Invitations",
+        "Search this account's room and Space invitations and accept or decline each one.",
+        &[
+            "invitation",
+            "invitations",
+            "invite",
+            "invited",
+            "decline",
+            "join room",
+            "spam invites",
+        ],
+    ))),
     target(
         "shortcuts",
         "Shortcuts",
@@ -2888,6 +2912,20 @@ mod tests {
                 .iter()
                 .all(|target| target.requires == Requirement::Always)
         );
+    }
+
+    #[test]
+    fn the_invitations_center_is_a_live_search_destination_that_answers_nothing() {
+        let all = |_| true;
+        let first = |query: &str| search_settings(query, all).first().map(|target| target.id);
+        for query in ["invitations", "invited", "spam invites"] {
+            assert_eq!(first(query), Some("rooms.invitations"), "{query}");
+        }
+        let target = setting_target("rooms.invitations").unwrap();
+        assert_eq!(target.route, Route::Invitations);
+        assert_eq!(target.requires, Requirement::LiveSession);
+        let offline = |requirement| requirement == Requirement::Always;
+        assert!(search_settings("invitations", offline).is_empty());
     }
 
     #[test]

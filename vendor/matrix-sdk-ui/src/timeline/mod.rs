@@ -28,6 +28,7 @@ use imbl::Vector;
 use matrix_sdk::{
     Result,
     attachment::{AttachmentInfo, Thumbnail},
+    config::RequestConfig,
     deserialized_responses::TimelineEvent,
     event_cache::{EventCacheDropHandles, EventFocusThreadMode},
     room::{
@@ -1049,6 +1050,45 @@ impl Timeline {
             }
 
             Ok(false)
+        }
+    }
+
+    /// Morpheus opt-in (see `MORPHEUS_PATCH.md`): [`Self::mark_as_read`]
+    /// with the same latest event, receipt thread and receipt decision
+    /// (backwards, own-event and explicit-mark rules), but it never changes
+    /// the room's `m.marked_unread` flag in any branch: not when no receipt
+    /// would move forwards, not when a live timeline has no latest event,
+    /// and not after the receipt was sent. The receipt request uses
+    /// `request_config` (the client's default when `None`). The caller owns
+    /// any unread-flag change. [`Self::mark_as_read`] is unchanged.
+    #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
+    pub async fn mark_as_read_without_unread_flag(
+        &self,
+        receipt_type: ReceiptType,
+        request_config: Option<RequestConfig>,
+    ) -> Result<bool> {
+        let Some(event_id) = self.controller.latest_event_id().await else {
+            trace!("can't mark room as read because there's no latest event id");
+            return Ok(false);
+        };
+        let thread = self.controller.infer_thread_for_read_receipt(&receipt_type);
+        match self.controller.should_send_receipt(&receipt_type, &thread, &event_id, true).await {
+            SendReceiptDecision::SendTo(event_id) => {
+                trace!("sending receipt without touching the unread flag");
+                self.room()
+                    .send_single_receipt_without_unread_flag(
+                        receipt_type,
+                        thread,
+                        event_id,
+                        request_config,
+                    )
+                    .await?;
+                Ok(true)
+            }
+            SendReceiptDecision::DoNotSend => {
+                trace!("not sending receipt, because it wouldn't move the real receipt forwards");
+                Ok(false)
+            }
         }
     }
 

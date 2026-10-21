@@ -1807,10 +1807,11 @@ pub enum ShortcutAction {
     ShowMembersPanel,
     ShowThreadPanel,
     OpenAccountMenu,
+    JumpToFirstUnread,
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::QuickSwitcher,
         Self::Search,
         Self::NextUnread,
@@ -1826,6 +1827,7 @@ impl ShortcutAction {
         Self::ShowMembersPanel,
         Self::ShowThreadPanel,
         Self::OpenAccountMenu,
+        Self::JumpToFirstUnread,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1845,6 +1847,7 @@ impl ShortcutAction {
             Self::ShowMembersPanel => "show_members_panel",
             Self::ShowThreadPanel => "show_thread_panel",
             Self::OpenAccountMenu => "open_account_menu",
+            Self::JumpToFirstUnread => "jump_to_first_unread",
         }
     }
 
@@ -1865,6 +1868,7 @@ impl ShortcutAction {
             Self::ShowMembersPanel => "Show members",
             Self::ShowThreadPanel => "Show the open thread",
             Self::OpenAccountMenu => "Open the account menu",
+            Self::JumpToFirstUnread => "Jump to the first unread message",
         }
     }
 
@@ -1876,7 +1880,8 @@ impl ShortcutAction {
             | Self::NextRoom
             | Self::PreviousRoom
             | Self::GoHome
-            | Self::OpenSettings => ShortcutGroup::Navigation,
+            | Self::OpenSettings
+            | Self::JumpToFirstUnread => ShortcutGroup::Navigation,
             Self::FocusComposer | Self::OpenEmojiPicker => ShortcutGroup::Composer,
             Self::Search | Self::SearchSettings => ShortcutGroup::Search,
             Self::ToggleDetailsPanel | Self::ShowMembersPanel | Self::ShowThreadPanel => {
@@ -1905,6 +1910,7 @@ impl ShortcutAction {
             Self::ShowMembersPanel => "Mod+Shift+P",
             Self::ShowThreadPanel => "Mod+Shift+T",
             Self::OpenAccountMenu => "Mod+Shift+U",
+            Self::JumpToFirstUnread => "Mod+Shift+N",
         })
     }
 

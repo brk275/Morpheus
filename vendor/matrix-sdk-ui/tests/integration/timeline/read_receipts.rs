@@ -2177,3 +2177,77 @@ async fn test_no_duplicate_receipt_after_backpagination_with_message_like_events
     // nowhere else.
     assert_eq!(seen_users.get(*CAROL).map(|id| id.as_ref()), Some(eid3));
 }
+
+/// Morpheus opt-in (see `MORPHEUS_PATCH.md`): `mark_as_read_without_unread_flag`
+/// keeps the receipt decisions of `mark_as_read` but never writes
+/// `m.marked_unread`: not for a live timeline without a latest event, not
+/// after an unthreaded receipt was sent, and not when no receipt would move
+/// forwards. `mark_as_read` would unset the flag in each of these branches.
+#[async_test]
+async fn test_mark_as_read_without_unread_flag_never_writes_the_flag() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    // A room marked unread whose live timeline has no event yet.
+    let f = EventFactory::new();
+    let room = server
+        .sync_room(&client, JoinedRoomBuilder::default().add_account_data(f.marked_unread(true)))
+        .await;
+    assert!(room.is_marked_unread());
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room.timeline().await.unwrap();
+
+    // No flag write may happen in any branch below.
+    let _no_flag_write = server
+        .mock_set_room_account_data(RoomAccountDataEventType::MarkedUnread)
+        .ok()
+        .expect(0)
+        .mount_as_scoped()
+        .await;
+
+    // No latest event: nothing is sent.
+    let sent = timeline.mark_as_read_without_unread_flag(CreateReceiptType::Read, None).await;
+    assert!(!sent.unwrap());
+
+    // A message from someone else: the unthreaded receipt is sent once.
+    let latest = event_id!("$latest_event_id");
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::default().add_timeline_event(
+                f.text_msg("Hello").sender(user_id!("@alice:example.org")).event_id(latest),
+            ),
+        )
+        .await;
+    {
+        let _send_receipt_guard = server
+            .mock_send_receipt(CreateReceiptType::Read)
+            .ok()
+            .expect(1)
+            .mount_as_scoped()
+            .await;
+        let sent = timeline.mark_as_read_without_unread_flag(CreateReceiptType::Read, None).await;
+        assert!(sent.unwrap());
+    }
+
+    // The receipt is already on the latest event: nothing would move
+    // forwards, and nothing is sent.
+    let own_user_id = client.user_id().unwrap();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::default().add_receipt(
+                f.read_receipts()
+                    .add(latest, own_user_id, EventReceiptType::Read, ReceiptThread::Unthreaded)
+                    .into_event(),
+            ),
+        )
+        .await;
+    let sent = timeline.mark_as_read_without_unread_flag(CreateReceiptType::Read, None).await;
+    assert!(!sent.unwrap());
+
+    // The flag is left to its owner.
+    assert!(room.is_marked_unread());
+}

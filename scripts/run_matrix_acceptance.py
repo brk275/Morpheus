@@ -110,12 +110,12 @@ APP_TIMELINE_CHECKS = frozenset((
     "renewed_room_delivery", "queued_callbacks_observed", "queued_room_rejected",
     "queued_thread_rejected", "link_follow_up_stale_retry_rejected",
     "link_follow_up_owned_retry", "link_follow_up_held_focus_rejected",
-    "link_follow_up_owned_focus", "cleanup_complete",
+    "link_follow_up_owned_focus", "member_publication", "cleanup_complete",
 ))
 APP_TIMELINE_STAGES = frozenset((
     "setup", "activation", "room_open", "room_delivery", "thread_delivery",
     "revocation", "renewal", "reopen", "queued_revocation", "queued_drain",
-    "queued_reopen", "link_continuation", "cleanup", "complete",
+    "queued_reopen", "link_continuation", "member_publication", "cleanup", "complete",
 ))
 APP_TIMELINE_STAGE = re.compile(r"^MORPHEUS_LIVE_TIMELINE_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_TIMELINE_CHECK = re.compile(r"MORPHEUS_LIVE_TIMELINE_CHECK ([a-z_]{1,48})=(true|false)")
@@ -360,10 +360,13 @@ TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_
 # Retry the two failed binaries and formatting's dependent moderation check.
 # Passing room/thread UI, media and search cases retain their own evidence.
 TIMELINE_FAILURE_CHECKS = ("formatted_local", "moderation_local", "recovery_local")
+# App-only live controller coverage keeps its existing fixture and cleanup.
+APP_TIMELINE_ONLY_CHECKS = (APP_TIMELINE_LABEL,)
 MEDIA_ONLY_CHECKS = ("media_local",)
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
-          "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS}
+          "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
+          "app-timeline": APP_TIMELINE_ONLY_CHECKS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1265,6 +1268,10 @@ class Acceptance:
                     output.write("Focused drafts-only rerun: real Synapse and an ephemeral OS Secret Service. "
                                  "Only the draft persistence/recovery cases ran. "
                                  "No app recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
+                elif self.suite == "app-timeline":
+                    output.write("Focused generated-window timeline checks: real Synapse and an ephemeral OS Secret Service. "
+                                 "Only app-live-timeline ran, covering model delivery, stale callback rejection, member publication and cleanup. "
+                                 "No draft recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
                 elif self.suite == "media-only":
                     output.write("Focused encrypted media checks: real Synapse and an ephemeral OS Secret Service. "
                                  "Only media_local ran; this is not full acceptance. "
@@ -1344,6 +1351,10 @@ def main():
         acceptance.require_containment()
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "app-timeline":
+            acceptance.group(APP_TIMELINE_ONLY_CHECKS, lambda: acceptance.app_timeline(fixture))
+            acceptance.finish_checks()
+            return
         if args.suite == "media-only":
             acceptance.group(MEDIA_ONLY_CHECKS, lambda: acceptance.test("media_local", fixture))
             acceptance.finish_checks()

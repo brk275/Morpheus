@@ -1309,6 +1309,14 @@ pub(crate) async fn state_content_raw(
     }
 }
 
+/// Whether new rooms of the homeserver's default `version` may admit the
+/// members of another room (a Space) without an invitation.
+pub(crate) fn supports_restricted(version: &RoomVersionId) -> bool {
+    version
+        .rules()
+        .is_some_and(|rules| rules.authorization.restricted_join_rule)
+}
+
 fn rule_options(version: &RoomVersionId) -> Vec<JoinRuleKind> {
     let Some(rules) = version.rules() else {
         return Vec::new();

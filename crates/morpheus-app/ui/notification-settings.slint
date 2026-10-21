@@ -85,7 +85,7 @@ export struct NotificationPalette {
 
 // A focusable action with the window's keyboard path: Tab reaches it,
 // Return or Space activates it, a click focuses it first.
-component RuleAction inherits Rectangle {
+export component RuleAction inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <bool> checkable: false;
@@ -158,7 +158,7 @@ component RuleAction inherits Rectangle {
 }
 
 // One choice of a segmented level control.
-component RuleOption inherits RuleAction {
+export component RuleOption inherits RuleAction {
     in property <string> text;
     in property <bool> selected;
     in property <NotificationPalette> palette;

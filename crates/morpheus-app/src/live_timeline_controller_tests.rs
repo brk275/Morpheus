@@ -415,6 +415,12 @@ impl Scenario {
             "open_room must own the feed"
         );
 
+        // Members: an actual load held after its claim, before its loading
+        // flag is queued, while a newer same-account, same-room load finishes.
+        stage!(member_publication);
+        self.stale_member_loading_publishes_nothing().await;
+        check!(member_publication);
+
         stage!(room_delivery);
         let root_text = marker("live-timeline-root");
         self.send_room(&root_text).await;
@@ -454,8 +460,10 @@ impl Scenario {
 
         // Idle case, A -> B without the controller: another account signs in
         // on this profile and becomes active. Both waiting feeds must end.
+        // Meanwhile A's forced member load, held before its claim, claims
+        // nothing over B's own load of the same room ID.
         stage!(revocation);
-        let other_id = self.switch_away(other).await;
+        let other_id = self.member_claim_across_switch(other).await;
         assert!(
             !lease.is_current(),
             "Signing in another account must end the lease"
@@ -918,6 +926,138 @@ impl Scenario {
             "The continuation must load the focused view"
         );
         held
+    }
+
+    /// The production member load (refresh_members_for, forced, as the
+    /// member list's Refresh is) of the selected room, held at its test-build
+    /// pause after it claimed the member epoch and before it queued its
+    /// loading flag. A newer forced load of the same account and room then
+    /// runs to completion and publishes. Released, the older load queues its
+    /// loading flag, which the window must refuse: the spinner stays off, and
+    /// the newer members model and error stay. (The newer load succeeded, so
+    /// its error is empty, as a stale loading flag would also make it: the
+    /// error check here is a non-regression only. The spinner and the members
+    /// model are the observable ones.)
+    async fn stale_member_loading_publishes_nothing(&self) {
+        let loaded = |ui: &AppWindow| !ui.get_member_loading() && ui.get_members().row_count() > 0;
+        wait_for_ui(&self.ui, "The room's members did not load", loaded).await;
+        let load = || {
+            let (live, weak) = (self.live.clone(), self.ui.as_weak());
+            let (account, room) = (self.account.clone(), self.room.clone());
+            async move { live.refresh_members_for(account, room, weak, true).await }
+        };
+        let held = self.live.pauses.install("members.before_loading");
+        let mut stale = OwnedTask::spawn(&self.runtime, load());
+        tokio::time::timeout(Duration::from_secs(60), held.entered())
+            .await
+            .expect("The older load must reach its loading post");
+        let before = self.ui.get_members();
+        on_runtime(&self.runtime, load()).await;
+        let newer = |ui: &AppWindow| !ui.get_member_loading() && ui.get_members() != before;
+        wait_for_ui(&self.ui, "The newer load did not publish", newer).await;
+        let (members, error) = (self.ui.get_members(), self.ui.get_member_error());
+        held.proceed();
+        // Its loading flag is queued before it returns; the barrier runs it.
+        stale.join().await;
+        settle(&self.ui).await;
+        assert!(
+            !self.ui.get_member_loading(),
+            "A stale load must not restart the spinner"
+        );
+        assert!(
+            self.ui.get_members() == members,
+            "A stale load must not replace the newer members"
+        );
+        assert_eq!(
+            self.ui.get_member_error(),
+            error,
+            "A stale load must not change the newer error"
+        );
+    }
+
+    /// The production member load (refresh_members_for, forced, as the
+    /// member list's Refresh and moderation's refresh are) of this account's
+    /// selected room, held at its test-build pause after its early account
+    /// and room checks, before its claim. Another account then signs in and
+    /// becomes active (switch_away: the core only; the window is not told and
+    /// still shows this account's room), the same room ID stays selected, and
+    /// that account's own forced load of it claims. Released and joined, the
+    /// old load claims nothing: no member epoch, no request, and no loading
+    /// flag, members or error in the window. The other account's claimed
+    /// epoch and request stay the current ones, so its own worker and
+    /// publications are still admitted by epoch. (Its publications are not
+    /// observed: the window shows this account, so they are refused there by
+    /// account, as A's would be in B's window.) Returns the other account.
+    async fn member_claim_across_switch(&self, other: FixtureAccount) -> String {
+        let load = |account: String| {
+            let (live, weak) = (self.live.clone(), self.ui.as_weak());
+            let room = self.room.clone();
+            async move { live.refresh_members_for(account, room, weak, true).await }
+        };
+        settle(&self.ui).await;
+        assert!(
+            !self.ui.get_member_loading(),
+            "No member load is running before the switch"
+        );
+        let (members, error) = (self.ui.get_members(), self.ui.get_member_error());
+        let held = self.live.pauses.install("members.before_claim");
+        let mut stale = OwnedTask::spawn(&self.runtime, load(self.account.clone()));
+        tokio::time::timeout(Duration::from_secs(60), held.entered())
+            .await
+            .expect("The old account's load must reach its claim");
+        let other_id = self.switch_away(other).await;
+        assert_eq!(
+            self.live.selected_room.lock().await.as_deref(),
+            Some(self.room.as_str()),
+            "The same room ID is still the selected one"
+        );
+        on_runtime(&self.runtime, load(other_id.clone())).await;
+        let claimed = self.live.member_epoch.load(Ordering::Acquire);
+        let current = Some((other_id.clone(), self.room.clone(), claimed));
+        assert_eq!(
+            self.member_request().await,
+            current,
+            "The other account's own load must claim"
+        );
+        held.proceed();
+        stale.join().await;
+        settle(&self.ui).await;
+        assert_eq!(
+            self.live.member_epoch.load(Ordering::Acquire),
+            claimed,
+            "The old account's load installed no member epoch"
+        );
+        assert_eq!(
+            self.member_request().await,
+            current,
+            "and left the other account its request"
+        );
+        assert!(
+            !self.ui.get_member_loading(),
+            "The old account's load must not show loading"
+        );
+        assert!(
+            self.ui.get_members() == members,
+            "The old account's load must not replace the members"
+        );
+        assert_eq!(
+            self.ui.get_member_error(),
+            error,
+            "The old account's load must not change the error"
+        );
+        other_id
+    }
+
+    /// The account, room and epoch of the current member request.
+    async fn member_request(&self) -> Option<(String, String, u64)> {
+        let request = self.live.member_request.lock().await;
+        request.as_ref().map(|request| {
+            (
+                request.account_id.clone(),
+                request.room_id.clone(),
+                request.epoch,
+            )
+        })
     }
 
     fn shows_scope(&self, ui: &AppWindow) -> bool {

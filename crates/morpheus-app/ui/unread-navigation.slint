@@ -1,0 +1,71 @@
+// Unread navigation of the open room: the "New messages" divider after this
+// account's exact fully-read marker, an explicit jump back to it, and the
+// room's marked-unread flag. Rust owns every value and request
+// (src/unread_navigation.rs); this file only shows them and reports
+// explicit choices. Nothing here marks anything read or sends a receipt.
+
+import { StyleTokens } from "style-tokens.slint";
+
+export global UnreadNavigation {
+    // The first shown message after the open room's fully-read marker that
+    // somebody else sent, while that room and account are shown: the divider
+    // shows above that exact row in the live list. Rust places it from the
+    // exact order of the room's own timeline and local event cache, never
+    // from times or counts. Empty when every later shown message is this
+    // account's own, or the marker's place is not known.
+    in-out property <string> first-unread-event-id;
+    // The open room has a fully-read marker to jump to.
+    in-out property <bool> can-jump: false;
+    // A jump is loading older history.
+    in-out property <bool> jumping: false;
+    // A marked-unread write is running.
+    in-out property <bool> marking: false;
+    // A short, fixed result of a jump or a mark, or empty.
+    in-out property <string> notice;
+    // The open room or account changed, or the live list changed: read and
+    // place the marker again (local, nothing is sent).
+    callback context-changed();
+    // An account change, lock or detach cleared everything above.
+    callback reset();
+    // A modal, Settings, the call page or an account step appeared: the jump
+    // in progress and its scroll retries end for good (never resumed).
+    callback withdraw-jump();
+    // Explicit choices.
+    callback jump();
+    callback mark-unread(string);
+}
+
+// The divider drawn above the first shown message after the fully-read marker
+// that somebody else sent. It takes its own height (the row grows by it), so
+// it never covers a message.
+export component NewMessagesDivider inherits Rectangle {
+    in property <color> line;
+    in property <color> ink;
+    in property <color> surface;
+    in property <float> text-scale: 1;
+    in property <length> inset;
+    accessible-role: text;
+    accessible-label: "New messages below your read position";
+    Rectangle {
+        x: root.inset;
+        y: (parent.height - self.height) / 2;
+        width: parent.width - 2 * root.inset;
+        height: max(1px, StyleTokens.line-width);
+        background: root.line;
+    }
+    Rectangle {
+        x: parent.width - self.width - root.inset - 8px;
+        y: (parent.height - self.height) / 2;
+        width: label.preferred-width + 12px;
+        height: label.preferred-height + 2px;
+        background: root.surface;
+        label := Text {
+            text: "New messages";
+            color: root.ink;
+            font-size: 10px * root.text-scale;
+            font-weight: 700;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+}

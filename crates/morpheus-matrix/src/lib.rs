@@ -15,6 +15,11 @@ pub use media::{
     ImagePreviewDownload, MAX_ATTACHMENT_BYTES, MAX_IMAGE_PREVIEW_BYTES, QueuedAttachment,
 };
 mod room_activity;
+mod unread_navigation;
+pub use unread_navigation::{
+    MAX_JUMP_PAGES, MarkedUnreadError, MarkedUnreadOutcome, UnreadJump, UnreadJumpError,
+    UnreadPosition, UnreadState, UnreadWriteGuard,
+};
 mod room_leave;
 pub use room_activity::{
     ActivityCancellation, ActivityMember, MAX_RECEIPT_EVENTS, Reader, ReceiptOutcome, ReceiptScope,
@@ -43,6 +48,12 @@ mod matrix_links;
 pub use matrix_links::{
     LinkError, LinkPreview, LinkRoom, MAX_LINK_ID_BYTES, MAX_LINK_NAME_CHARS,
     MAX_MESSAGE_LINK_BYTES, MessageLink, message_link,
+};
+mod room_creation;
+pub use room_creation::{
+    CreatedRoom, CreationAccess, CreationChoices, CreationContext, CreationError, CreationKind,
+    CreationPlan, LinkFailure, MAX_ALIAS_LOCALPART_BYTES, MAX_CREATION_NAME_BYTES,
+    MAX_CREATION_TOPIC_BYTES, ParentContext, Placement, PreviewLine,
 };
 mod space_management;
 pub use space_management::{
@@ -121,11 +132,16 @@ pub use room_media_browser::{
     MEDIA_PAGE_EVENTS, RoomMediaCancellation, RoomMediaError, RoomMediaItem, RoomMediaKind,
     RoomMediaPage,
 };
+mod invitations;
 mod notification_rules;
 mod rich_text;
 mod room_tags;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
+pub use invitations::{
+    AnswerFence, DirectMark, InvitationAnswer, InvitationOutcome, InvitationSummary, Invitations,
+    MAX_INVITATION_TEXT_CHARS, MAX_INVITATIONS,
+};
 pub use notification_rules::{
     MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_KEYWORDS, MAX_NOTIFICATION_ROOMS,
     NotificationDefaults, NotificationMode, PUSH_RULE_SYNC_WAIT, PushRuleSyncWatch,
@@ -393,6 +409,10 @@ pub struct RoomInfo {
     /// snapshots without the field read as zero.
     #[serde(default)]
     pub unread_mentions: u64,
+    /// The room's `m.marked_unread` flag as synced (set by this account on
+    /// any of its devices). Older snapshots without it read as unmarked.
+    #[serde(default)]
+    pub marked_unread: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2576,6 +2596,9 @@ impl AccountManager {
             .collect())
     }
 
+    /// A fixture helper for the local integration tests. The app creates
+    /// rooms through `create_room_for`, which sends the request once; this
+    /// uses the SDK's default retries.
     pub async fn create_private_room(&self, name: &str) -> Result<String> {
         let state = self.state.lock().await;
         let loaded = selected_loaded(&state)?;
@@ -2599,6 +2622,8 @@ impl AccountManager {
         Ok(room.room_id().to_string())
     }
 
+    /// A fixture helper like `create_private_room`; the app uses
+    /// `create_room_for`.
     pub async fn create_space(&self, name: &str) -> Result<String> {
         let state = self.state.lock().await;
         let loaded = selected_loaded(&state)?;
@@ -2806,19 +2831,24 @@ impl AccountManager {
             .map_err(|error| MatrixCoreError::Sdk(room_leave::leave_error(&error).to_string()))
     }
 
+    /// Prefer `respond_invitation_selected`, which is bound to a selection.
+    /// Joins exactly this room through the same bounded request.
     pub async fn accept_invite(&self, room_id: &str) -> Result<()> {
-        let state = self.state.lock().await;
-        let room = selected_room(&state, room_id)?;
+        let room = {
+            let state = self.state.lock().await;
+            selected_room(&state, room_id)?
+        };
         if room.state() != RoomState::Invited {
             return Err(MatrixCoreError::InvalidRegistry(
                 "room is not an invitation".into(),
             ));
         }
-        room.join()
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+        invitations::join_room_exactly(&room.client(), &room).await
     }
 
+    /// Prefer `respond_invitation_selected`, which is bound to a selection.
+    /// Leaves exactly this room through the same bounded request, never its
+    /// predecessors.
     pub async fn reject_invite(&self, room_id: &str) -> Result<()> {
         let room = {
             let state = self.state.lock().await;
@@ -2830,11 +2860,7 @@ impl AccountManager {
             }
             room
         };
-        // Until the full invitations feature lands, this legacy path also
-        // leaves only the invitation, never its attacker-named predecessors.
-        room_leave::leave_request(&room.client(), room.room_id())
-            .await
-            .map_err(|error| MatrixCoreError::Sdk(room_leave::leave_error(&error).to_string()))
+        invitations::leave_room_exactly(&room.client(), room.room_id()).await
     }
 
     /// Invite through the selected account's bounded invite (`moderation`):
@@ -4164,6 +4190,7 @@ async fn room_info(room: &Room) -> RoomInfo {
         unread_messages: room.num_unread_messages(),
         unread_notifications: room.num_unread_notifications(),
         unread_mentions: room.num_unread_mentions(),
+        marked_unread: room.is_marked_unread(),
     }
 }
 

@@ -446,7 +446,9 @@ impl RoomLeaveUi {
         if room.is_empty() {
             return;
         }
-        // Withdraw the link's held navigation before Leave owns the window.
+        // Withdraw a held unread jump, for good, and the link's held
+        // navigation before Leave owns the window.
+        crate::unread_navigation::withdraw_jump(ui);
         crate::matrix_links::clear(ui);
         // Admission refuses an open browser. Retire any stale page/task as
         // well, before this dialog is shown; ordinary clear never calls back.

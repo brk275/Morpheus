@@ -472,6 +472,7 @@ pub(crate) fn hide_sensitive(ui: &AppWindow) {
     ui.set_sas_busy(false);
     ui.set_sas_incoming_loading(false);
     if ui.get_sas_stage() == COMPARING {
+        crate::unread_navigation::withdraw_jump(ui);
         ui.set_sas_stage(WAITING_FOR_VALUES);
     }
     if was_busy {
@@ -566,6 +567,7 @@ fn adopt(ui: &AppWindow, info: &OwnVerification) {
     ui.set_sas_request_initiator(info.we_started);
     ui.set_sas_compared(false);
     crate::withdraw_call_bar(ui);
+    crate::unread_navigation::withdraw_jump(ui);
     ui.set_sas_stage(match info.phase {
         OwnVerificationPhase::Comparing => WAITING_FOR_VALUES,
         _ => WAITING_FOR_REQUEST,
@@ -850,6 +852,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 }
                 match info {
                     Ok(info) if unsupported_method(&info) => {
+                        crate::unread_navigation::withdraw_jump(&window);
                         window.set_sas_stage(UNSUPPORTED);
                         window.set_sas_notice("".into());
                         window.set_sas_error(OwnVerificationError::Unsupported.to_string().into());
@@ -878,6 +881,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                         OwnVerificationPhase::Ready
                             if stage == WAITING_FOR_REQUEST && info.we_started =>
                         {
+                            crate::unread_navigation::withdraw_jump(&window);
                             window.set_sas_stage(READY_TO_START);
                             window.set_sas_notice(
                                 "The other device accepted. Start comparison.".into(),
@@ -887,6 +891,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                         _ if stage == WAITING_FOR_REQUEST && !info.we_started => match incoming_sas
                         {
                             Some(Ok(true)) => {
+                                crate::unread_navigation::withdraw_jump(&window);
                                 window.set_sas_stage(WAITING_FOR_VALUES);
                                 window.set_sas_notice(
                                     "Comparison started. Waiting for values on both devices."
@@ -912,6 +917,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                                     window.set_sas_emoji(emoji.into());
                                     window.set_sas_decimals(decimals.into());
                                     window.set_sas_compared(false);
+                                    crate::unread_navigation::withdraw_jump(&window);
                                     window.set_sas_stage(COMPARING);
                                     window.set_sas_notice("".into());
                                     window.set_sas_error("".into());
@@ -987,6 +993,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 window.set_sas_busy(false);
                 match result {
                     Ok(()) => {
+                        crate::unread_navigation::withdraw_jump(&window);
                         window.set_sas_stage(WAITING_FOR_VALUES);
                         window.set_sas_notice(
                             "Waiting for the other device to show comparison values.".into(),
@@ -1047,6 +1054,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 window.set_sas_decimals("".into());
                 match result {
                     Ok(()) => {
+                        crate::unread_navigation::withdraw_jump(&window);
                         window.set_sas_stage(WAITING_FOR_COMPLETION);
                         window.set_sas_notice(
                             "Comparison confirmed here. Waiting for the other device to finish."
@@ -1056,10 +1064,12 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                     Err(OwnVerificationError::Unknown) => {
                         // It may have been confirmed: wait for the outcome,
                         // never confirm again.
+                        crate::unread_navigation::withdraw_jump(&window);
                         window.set_sas_stage(WAITING_FOR_COMPLETION);
                         window.set_sas_error(OwnVerificationError::Unknown.to_string().into());
                     }
                     Err(error) => {
+                        crate::unread_navigation::withdraw_jump(&window);
                         window.set_sas_stage(WAITING_FOR_VALUES);
                         if let Some(text) = step_error(error) {
                             window.set_sas_error(text.into());
