@@ -5807,6 +5807,10 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     ui.set_image_preview_has_next(false);
     ui.set_image_preview_event_id("".into());
     ui.set_image_preview_image(slint::Image::default());
+    // Finish this viewer's close before the next scenario installs its spies
+    // and opens a new one. Otherwise Slint can retain the conditional component.
+    settle(&ui).await;
+    assert!(control_bounds(&ui, "Close image preview").is_empty());
     assert_media_viewer_keyboard(&ui).await;
     assert_animation_autoplay_setting(&ui).await;
 
