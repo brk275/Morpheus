@@ -8937,7 +8937,7 @@ async fn assert_responsive_header(ui: &AppWindow) {
 
     let tokens = ui.global::<crate::StyleTokens>();
     let threads = ui.global::<crate::ThreadBrowser>();
-    let before = (
+    let saved_header_state = (
         ui.get_page(),
         ui.get_live_session(),
         ui.get_show_sign_in(),
@@ -9581,7 +9581,7 @@ async fn assert_responsive_header(ui: &AppWindow) {
     }
 
     let (page, live, sign_in, account, room, name, topic, side, tab, reveal, scale, size, icon) =
-        before;
+        saved_header_state;
     tokens.set_icon_size(icon);
     ui.set_font_scale_percent(scale);
     ui.window().set_size(size);
