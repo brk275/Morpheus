@@ -26,6 +26,14 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "evidence"):
                 target.evidence(value, complete=True)
         self.assertEqual(target.evidence("MORPHEUS_ELEMENT_CHECK secret_value=true"), {})
+        # Historical eleven-fact evidence cannot establish reverse audio. A
+        # later true must never erase a false reverse-audio observation.
+        self.assertIn("browser_audio", target.CHECKS)
+        for value in (complete.replace("MORPHEUS_ELEMENT_CHECK browser_audio=true", ""),
+                      "MORPHEUS_ELEMENT_CHECK browser_audio=false\n" + complete,
+                      complete + "\nMORPHEUS_ELEMENT_CHECK browser_audio=false"):
+            with self.subTest(reverse_audio=value), self.assertRaisesRegex(RuntimeError, "evidence"):
+                target.evidence(value, complete=True)
 
     def test_exact_named_nonempty_test_result_is_required(self):
         result = f"test {target.TEST_NAME} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"

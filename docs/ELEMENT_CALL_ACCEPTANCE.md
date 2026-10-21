@@ -2,8 +2,9 @@
 
 The Linux Matrix acceptance harness includes an opt-in Rust peer test paired
 with the **unmodified official Element Call v0.28.0-rc.1 image**. This is a
-release candidate, not the latest stable release. Its first hosted result is
-pending; adding the harness is not interoperability evidence.
+release candidate, not the latest stable release. The reverse-audio extension
+below has not been executed. Earlier eleven-fact results do not establish its
+new twelve-fact acceptance requirement.
 
 ## Why this peer
 
@@ -72,6 +73,15 @@ A pass requires all of the following:
 - Element Call decodes Morpheus's distinct white/black video pattern. Three
   consecutive pixel samples must match; its local red/green preview cannot
   satisfy this assertion.
+- Element Call decodes Morpheus's 997 Hz microphone tone, distinct from the
+  browser's 440 Hz file-backed microphone. The browser reads the pinned RC's
+  existing React `AudioTrack` binding without changing it. The Matrix user,
+  device, join and backend identity must match the native publication's private
+  lease marker. The participant must be remote; its microphone publication map,
+  SID, attached audio element and decoded `MediaStreamTrack` must agree. Only a
+  clone of that exact remote track feeds the analyser. Three consecutive
+  samples require nonzero RMS, a 997 Hz spectral peak and dominant native-tone
+  energy; the browser's own capture cannot satisfy `browser_audio`.
 - The browser leaves through the normal UI and Morpheus observes departure.
 - Both child processes succeed, the exact named native test runs once, and all
   fixed evidence markers exist. Zero, skipped, ignored or other tests cannot
@@ -82,9 +92,13 @@ Chromium uses file-backed synthetic capture devices. There is no
 injection or SDK patch. Any inherited `MORPHEUS_ELEMENT_DIAG_REFRESH` value is
 rejected before services or children start.
 
-The native-to-browser **audio** path is not asserted. Reconnect, rotation,
-screen sharing, larger groups, late-join behavior, physical devices and
-macOS/Windows runtime interoperability remain separate acceptance gates.
+The new native-to-browser **audio** assertion is required but unexecuted. The
+observer fails closed if the pinned RC's binding cannot be resolved or changes
+during sampling; it never falls back to an arbitrary audio element or local
+microphone. This extends synthetic transport acceptance, not physical speaker
+output. Reconnect, rotation, screen sharing, larger groups, late-join behavior,
+physical devices and macOS/Windows runtime interoperability remain separate
+acceptance gates.
 
 ### Protocol distinction
 
@@ -121,7 +135,18 @@ or unowned containers.
 Credentials, SDK stores, raw logs and synthetic capture files stay outside the
 checkout under directories mode 0700 and files mode 0600. Raw logs are scanned
 before only fixed stage/failure names and allowlisted booleans are emitted.
-There are no screenshot, browser trace, media or raw-log uploads. Subprocesses
+There are no screenshot, browser trace, media or raw-log uploads. The new audio
+observer retains the existing outer deadlines. Binding, context start and
+sampling share a 45-second deadline. Context closing can extend beyond it and
+remains governed by the outer process deadline. The observer inspects at most
+32 audio elements and 32 React ancestors per element. Its source/analyser
+nodes disconnect, its clone stops and its context
+closes before the reverse-audio fact is emitted. The stock receive track is
+never stopped or redirected. The bounded native PCM task is stopped, awaited
+and unpublished on success. Failure or cancellation requests abort of its owned
+task; dropping an active publication mutes it. Runtime and owned-process
+teardown remain the final failure boundary. No PCM is written or emitted by
+the new path. Subprocesses
 have deadlines; their group leaders remain unreaped until the owned group is
 killed. A QA-only Linux PID namespace also contains detached browser/native
 sessions. Trusted absolute `sudo`, `unshare` and `setpriv` binaries create it;
