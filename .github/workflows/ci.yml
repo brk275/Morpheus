@@ -1,8 +1,8 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, personal-account, physical-device or artifact jobs.
 # Linux runs disposable checks after offline checks; call-native owns timeline and four ring cases in one fixture lifecycle.
-name: Reviewed beta four-platform native checks
-run-name: Reviewed beta catch-up - 15c1a31 - ${{ inputs.platform }}
+name: Owner exact15c native-call fixture diagnostic
+run-name: Exact15c native-call fixture diagnostic
 on:
   workflow_dispatch:
     inputs:
@@ -10,23 +10,23 @@ on:
         description: Select only affected native platforms
         type: choice
         required: true
-        default: all
-        options: [all, macos-arm64, macos-intel, windows, linux, remaining-native]
+        default: linux
+        options: [linux]
       checks:
-        description: Full native checks with Linux disposable timeline, or an affected focused retry
+        description: Only the existing native-call fixture after its compile prerequisite
         type: choice
         required: true
-        default: full
-        options: [full, failed-linux, account-ui, product-linux, app-linux, product-sdk-linux, helper-linux, app-timeline-linux, app-tests, media-native, call-native]
+        default: call-fixture-linux
+        options: [call-fixture-linux]
 permissions:
   contents: read
 concurrency:
-  group: beta-native-15c1a31-${{ github.ref }}
+  group: beta-native-call-fixture-15c1a31-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
     name: Reviewed candidate history
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -67,10 +67,10 @@ jobs:
   native:
     needs: security
     name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["all","macos-arm64","macos-intel","windows","linux","remaining-native"]'), inputs.platform)
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && inputs.platform == 'linux' && inputs.checks == 'call-fixture-linux'
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || inputs.platform == 'remaining-native' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
+      matrix: {include: [{name: 'Linux x64', runner: ubuntu-24.04, os: Linux, arch: X64}]}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -1088,8 +1088,15 @@ jobs:
           # successful production/RTC/config/SDK evidence on Linux, and reruns only
           # the two failed suites plus formatting. Other native platforms stay full.
           scope=os.environ.get('MORPHEUS_CHECK_SCOPE','full')
-          if scope not in ('full','failed-linux','account-ui','product-linux','app-linux','product-sdk-linux','helper-linux','app-timeline-linux','app-tests','media-native','call-native'):
+          if scope not in ('full','failed-linux','account-ui','product-linux','app-linux','product-sdk-linux','helper-linux','app-timeline-linux','app-tests','media-native','call-native','call-fixture-linux'):
               raise SystemExit('unknown_check_scope')
+          if scope=='call-fixture-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('call_fixture_linux_requires_linux')
+              # Rebuild only this required test target on a fresh runner; no offline suites.
+              checks=[('native_call_fixture_compile',
+                  ['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                      '--bin','morpheus-app','--no-run'],40*60,None,set())]
           if scope=='helper-linux':
               if os.environ.get('RUNNER_OS')!='Linux':
                   raise SystemExit('helper_linux_requires_linux')
@@ -1171,7 +1178,7 @@ jobs:
               checks.append(('app_timeline_compile',
                   ['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                       '--bin','morpheus-app','--no-run'],40*60,None,set()))
-          if os.environ.get('RUNNER_OS')=='Linux' and scope in ('full','app-timeline-linux','app-tests','media-native','call-native'):
+          if os.environ.get('RUNNER_OS')=='Linux' and scope in ('full','app-timeline-linux','app-tests','media-native','call-native','call-fixture-linux'):
               # Isolated Python excludes script siblings. Add only this exact
               # reviewed checkout's helper directory after importing stdlib.
               fixture_program = """import pathlib, runpy, sys
@@ -1180,8 +1187,8 @@ jobs:
           sys.argv = [str(script), *sys.argv[1:]]
           runpy.run_path(str(script), run_name='__main__')
           """
-              if scope=='call-native':
-                  # One fixture owner; App unit already compiled the same test target.
+              if scope in ('call-native','call-fixture-linux'):
+                  # One fixture owner; its required test target is already compiled.
                   checks.append(('native_call_disposable',
                       ['dbus-run-session','--',sys.executable,'-I','-B','-c',fixture_program,
                           '--suite','native-call','--gitleaks',str(scanner)],56*60,None,set()))
@@ -1297,6 +1304,118 @@ jobs:
                   'cases':[found[label] for label in sorted(found)],
                   # These existing cases do not exercise cross-device Decline delivery.
                   'cross_device_decline_exercised':False}
+          def native_call_failure_evidence(output):
+              # Called only AFTER independent default scan. All strings below are fixed
+              # reviewed labels/categories; no exception body, path, ID or raw line escapes.
+              import math
+              labels={
+                  'unlock-disposable-keyring','vault-store','vault-read','vault-clear',
+                  'acceptance-process-containment','local_matrix_env-up','local_matrix_env-down',
+                  'local_matrix_rtc-up','local_matrix_rtc-probe','local_matrix_rtc-rtc-fixture',
+                  'local_matrix_rtc-down','verify-fixture-container-cleanup',
+                  'verify-fixture-network-cleanup','app-live-timeline',
+                  'outgoing-ring-current-dm','outgoing-ring-current-room',
+                  'outgoing-ring-sticky-2025-dm','outgoing-ring-sticky-2025-room'}
+              stages={
+                  'disk_check','network','credentials','registration','seed_rooms','verify',
+                  'recovery','rtc_gate','status','cleanup','rtc_disk_check','rtc_network',
+                  'rtc_stop_native','rtc_configs','rtc_federation','rtc_sfu','rtc_auth_bridge',
+                  'rtc_auth_service','rtc_auth_ready','rtc_synapse_configure','rtc_synapse_restart',
+                  'rtc_synapse_ready','rtc_versions','rtc_login','rtc_transports',
+                  'rtc_probe_login','rtc_openid','rtc_token_exchange','rtc_sfu_ready',
+                  *('{}_{}'.format(operation,server) for operation in
+                      ('volume','generate','configure','start','ready') for server in ('a','b'))}
+              fixture_failures={'docker','docker_disk','docker_permission','docker_registry',
+                  'docker_network','http','network','os','invalid_data','fixture_operation','deadline'}
+              timeline_stages={'setup','activation','room_open','room_delivery','thread_delivery',
+                  'revocation','renewal','reopen','queued_revocation','queued_drain',
+                  'queued_reopen','link_continuation','member_publication','cleanup','complete'}
+              fatal_messages={
+                  'This harness is restricted to ephemeral Linux GitHub runners':'runner_guard',
+                  'Run the harness inside dbus-run-session':'dbus_missing',
+                  'Could not verify absence of a pre-existing Matrix fixture':'fixture_absence_unproved',
+                  'Pre-existing Matrix fixture found; refusing to modify it':'fixture_preexisting',
+                  'Disposable OS credential vault failed its round trip':'vault_round_trip',
+                  'Acceptance process containment failed':'process_containment',
+                  'Acceptance process containment has not been verified':'containment_unverified',
+                  'Acceptance owned process cleanup failed':'owned_cleanup',
+                  'Acceptance command could not be started':'command_start',
+                  'Acceptance log credential scanner failed; raw log withheld':'inner_log_scan',
+                  'Outgoing invitation acceptance cleanup failed':'ring_cleanup',
+                  'Disposable Matrix fixture absence could not be verified':'cleanup_absence_unproved',
+                  'Disposable Matrix fixture resources remain after cleanup':'cleanup_resources_remain',
+                  'Disposable Matrix service cleanup did not complete':'service_cleanup',
+                  'Matrix acceptance summary could not be written':'summary_failed',
+                  'Matrix acceptance has failed or unexecuted required checks':'required_checks_incomplete',
+                  'Acceptance cleanup deadline exhausted':'cleanup_deadline'}
+              exception_kinds={'RuntimeError','OSError','FileNotFoundError','PermissionError',
+                  'ValueError','TypeError','KeyError','ImportError','ModuleNotFoundError',
+                  'TimeoutExpired','CalledProcessError','JSONDecodeError','UnicodeDecodeError'}
+              records=[]; started=[]; fatal=set(); kinds=set(); invalid=False; unknown=False
+              if len(output)>4*1024*1024:
+                  return {'complete':False,'input_limit_exceeded':True}
+              for line in io.StringIO(output):
+                  line=line.rstrip('\r\n')
+                  if len(line)>16384:
+                      invalid=True; continue
+                  if line.startswith('Starting '):
+                      label=line[len('Starting '):]
+                      if label in labels and len(started)<64: started.append(label)
+                      else: invalid=True
+                  if line.startswith('Matrix acceptance failed: '):
+                      body=line[len('Matrix acceptance failed: '):]
+                      if body in fatal_messages: fatal.add(fatal_messages[body])
+                      elif body.startswith('Required command unavailable: '): fatal.add('required_command_missing')
+                      else:
+                          match=re.fullmatch(r'([a-zA-Z0-9_-]{1,80}) failed with exit status (-?[0-9]{1,3})',body)
+                          if match and match[1] in labels and -64<=int(match[2])<=255:
+                              fatal.add('command_exit')
+                              if len(records)<64:
+                                  records.append({'check':match[1],'status':'failed','exit_code':int(match[2])})
+                              else: invalid=True
+                          else: unknown=True
+                  match=re.match(r'^(?:[a-z_]+\.)?([A-Za-z][A-Za-z0-9]{0,63}):',line)
+                  if match and match[1] in exception_kinds: kinds.add(match[1])
+                  if line in ('Cleanup incomplete: local_matrix_rtc',
+                              'Cleanup incomplete: local_matrix_env','Cleanup incomplete: fixture_absence'):
+                      fatal.add('cleanup_incomplete')
+                  if not line.startswith('{'): continue
+                  try: row=json.loads(line)
+                  except (ValueError,TypeError,RecursionError):
+                      invalid=True; continue
+                  if (type(row) is not dict or type(row.get('check')) is not str
+                          or row['check'] not in labels): continue
+                  record={'check':row['check'],'status':'diagnostic'}
+                  status=row.get('status')
+                  if status in ('passed','failed','not_run'): record['status']=status
+                  if row.get('reason') in ('test_failed','deadline','evidence_incomplete',
+                          'dependency_failed','budget_spent','prerequisite_failed'):
+                      record['reason']=row['reason']
+                  count=row.get('passed'); seconds=row.get('seconds')
+                  if type(count) is int and 0<=count<=10000: record['tests_passed']=count
+                  if type(seconds) in (int,float) and 0<=seconds<=54*60 and math.isfinite(seconds):
+                      record['elapsed_ms']=int(seconds*1000)
+                  fixed=row.get('matrix_fixture_diagnostics')
+                  if type(fixed) is dict:
+                      if type(fixed.get('stage')) is str and fixed['stage'] in stages:
+                          record['fixture_stage']=fixed['stage']
+                      if type(fixed.get('failure')) is str and fixed['failure'] in fixture_failures:
+                          record['fixture_failure']=fixed['failure']
+                      for key in ('docker_exit','http_status','os_errno'):
+                          value=fixed.get(key)
+                          if type(value) is int and (100<=value<=599 if key=='http_status' else 0<=value<=255):
+                              record[key]=value
+                  fixed=row.get('app_timeline_diagnostics')
+                  if (type(fixed) is dict and type(fixed.get('stage')) is str
+                          and fixed['stage'] in timeline_stages):
+                      record['timeline_stage']=fixed['stage']
+                  if len(records)<64: records.append(record)
+                  else: invalid=True
+              return {'complete':not invalid,'input_limit_exceeded':False,
+                  'started_checks':started,'last_started':started[-1] if started else 'none',
+                  'records':records,'fatal_categories':sorted(fatal),
+                  'unclassified_fatal':unknown,'exception_kinds':sorted(kinds),
+                  'traceback_present':'Traceback (most recent call last):' in output}
           # All four platform scopes use this exact stable reviewed candidate.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
@@ -1349,6 +1468,8 @@ jobs:
                   evidence=native_call_evidence(output,passed)
                   passed=passed and evidence['complete']
                   record['native_call_evidence']=evidence
+                  if not passed:
+                      record['native_call_failure_evidence']=native_call_failure_evidence(output)
               if name!='native_call_disposable':
                   record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
               if not passed and name!='native_call_disposable':
