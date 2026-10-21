@@ -31,6 +31,7 @@ use tokio::{runtime::Handle, task::JoinHandle};
 use crate::{
     AppWindow, MessageItem, MessageSearchItem,
     live::{LiveUi, NavigationAuthority},
+    timeline_viewport::{self, Ended, Owner as SeekOwner, Pane, Reveal},
 };
 
 /// Hits requested per page.
@@ -77,6 +78,9 @@ const CONTEXT_FAILED: &str = "Nearby messages could not be loaded.";
 const CONTEXT_SLOW: &str = "Nearby messages took too long to load.";
 const CONTEXT_MISSING: &str = "The matched message is no longer available in this conversation.";
 const NOT_SHOWN: &str = "This message could not be shown in the conversation; it is shown here.";
+const THREAD_NOT_SHOWN: &str = "This reply could not be shown in its thread; it is shown here.";
+// An activation's loaded target that its seek could not bring into view.
+const NOT_IN_VIEW: &str = "The message was opened but could not be brought into view.";
 const THREAD_OLDER: &str =
     "This reply is older than the loaded thread. Use Load earlier replies to reach it.";
 const FINDING: &str = "Loading earlier replies to reach this one…";
@@ -196,13 +200,15 @@ enum Owner {
 /// target, the authority of the navigation it started, which a newer open
 /// withdraws (and, for search, a newer query, scope or reset), and the
 /// navigation epoch it opened under. Backend steps take the owner's own
-/// selection and this epoch, never ones looked up again later.
+/// selection and this epoch, never ones looked up again later. Its viewport
+/// seeks also keep the security generation taken when it opened.
 #[derive(Clone)]
 struct Opening {
     owner: Owner,
     hit: Hit,
     authority: NavigationAuthority,
     navigation: u64,
+    security: u64,
 }
 
 impl Opening {
@@ -264,6 +270,34 @@ impl Opening {
     fn notice(&self, window: &AppWindow, text: &str) {
         if self.searching() {
             window.set_room_search_context_notice(text.into());
+        }
+    }
+
+    /// A loaded target could not be brought into view (its seek ran out or
+    /// its row went): say so in the search panel, or as an activation's
+    /// session error.
+    fn not_in_view(&self, window: &AppWindow, notice: &'static str) {
+        if self.searching() {
+            window.set_room_search_context_notice(notice.into());
+        } else {
+            window.set_session_error(NOT_IN_VIEW.into());
+        }
+    }
+
+    /// This opening as the owner of a seek: its own admission before every
+    /// move, and `notice` (or the activation's error) if the target could
+    /// not be brought into view. A scrolled or placed seek says nothing.
+    fn seek_owner(&self, notice: &'static str) -> SeekOwner {
+        let (admitting, telling) = (self.clone(), self.clone());
+        SeekOwner {
+            admits: Box::new(move |window: &AppWindow, live: &LiveUi| {
+                admitting.admitted(window, live)
+            }),
+            ended: Box::new(move |window: &AppWindow, ended: Ended| {
+                if ended == Ended::Unavailable {
+                    telling.not_in_view(window, notice);
+                }
+            }),
         }
     }
 
@@ -379,6 +413,7 @@ fn owns(ticket: &Ticket) -> bool {
 /// included: they can name a person or a time and belong to the account.
 /// Used for account changes and removal, sign-out and revocation.
 pub(crate) fn reset(ui: &AppWindow) {
+    timeline_viewport::reset(ui);
     clear_results(ui);
     ui.set_room_search_filter_sender("".into());
     ui.set_room_search_filter_since("".into());
@@ -415,8 +450,10 @@ fn clear_results(ui: &AppWindow) {
 
 /// A different room became visible. All-room results stay with their
 /// account; open-room results belong to the room that was left. Filters
-/// stay until the account changes.
+/// stay until the account changes. Seeks and anchors belong to the room
+/// that was left.
 pub(crate) fn room_changed(ui: &AppWindow, account_changed: bool) {
+    timeline_viewport::reset(ui);
     if account_changed {
         reset(ui);
     } else if ui.get_room_search_scope() != 1 {
@@ -434,6 +471,8 @@ fn clear_selection(ui: &AppWindow) {
 }
 
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) {
+    // The window's seeks (opened hits, activations, unread jumps, anchors).
+    timeline_viewport::register(ui, live.clone());
     let weak = ui.as_weak();
     let edit_live = live.clone();
     let edit_runtime = runtime.clone();
@@ -986,6 +1025,9 @@ fn listed(window: &AppWindow, room_id: &str, event_id: &str) -> Option<MessageSe
 /// Open one listed hit: its room (revealing its Space when needed), then the
 /// exact event in the conversation or its thread, and the nearby messages.
 fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str, event_id: &str) {
+    // Taken first: a security step begun while this click is admitted never
+    // gives its seeks a newer generation.
+    let security = timeline_viewport::security_generation(&live.security_gate);
     if !live.is_live.load(Ordering::Acquire) || room_id.is_empty() || event_id.is_empty() {
         return;
     }
@@ -1030,6 +1072,7 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
         hit,
         authority,
         navigation: live.current_navigation_epoch(),
+        security,
     };
     navigate(window, live, runtime, opening);
 }
@@ -1114,6 +1157,9 @@ pub(crate) fn continue_conversation(
     navigation: u64,
     authority: NavigationAuthority,
 ) {
+    // The join's click-time security stays in `authority`, which every seek
+    // move asks too; the seeks also keep this continuation's, taken first.
+    let security = timeline_viewport::security_generation(&live.security_gate);
     let owned = live.navigation_is_current(navigation)
         && authority.admits(window)
         && selection.is_current()
@@ -1145,6 +1191,7 @@ pub(crate) fn continue_conversation(
         hit,
         authority,
         navigation,
+        security,
     };
     // The room was just opened: its latest messages may still be arriving.
     arrived(window, live, runtime, &opening, true);
@@ -1198,6 +1245,9 @@ fn activate(
     generation: u64,
     selection: AccountSelection,
 ) {
+    // Taken first, when the target opens in its now visible account (after
+    // a protected switch, once that switch's own step is over).
+    let security = timeline_viewport::security_generation(&live.security_gate);
     if !selection.is_current() || selection.account_id() != target.account_id {
         return;
     }
@@ -1223,6 +1273,7 @@ fn activate(
         hit,
         authority,
         navigation: live.current_navigation_epoch(),
+        security,
     };
     navigate(window, live, runtime, opening);
 }
@@ -1294,13 +1345,14 @@ fn arrived(
 ) {
     let hit = &opening.hit;
     if !hit.thread_root.is_empty() {
-        // The thread panel reveals this reply once it is laid out.
+        // The reply is highlighted, and brought into the thread's view once
+        // its reveal finds it loaded (revealed).
         window.set_timeline_jump_event_id(hit.event_id.as_str().into());
         open_thread(window, &hit.room_id, &hit.thread_root);
         if !hit.event_id.is_empty() {
             reveal(window, live, runtime, opening);
         }
-    } else if !hit.event_id.is_empty() && !jump_timeline(window, &hit.event_id) {
+    } else if !hit.event_id.is_empty() && !jump_timeline(window, live, opening) {
         let attempts = if moved { ARRIVAL_ATTEMPTS } else { 0 };
         jump_or_focus(window.as_weak(), live, runtime, opening, attempts);
     }
@@ -1340,7 +1392,7 @@ fn jump_or_focus(
     if !opening.admitted(&window, live) {
         return;
     }
-    if jump_timeline(&window, &opening.hit.event_id) {
+    if jump_timeline(&window, live, opening) {
         return;
     }
     if attempts == 0 {
@@ -1435,7 +1487,12 @@ async fn reveal_hit(manager: &AccountManager, opening: &Opening) -> Option<Histo
     outcome.ok().and_then(Result::ok)
 }
 
-fn revealed(window: &AppWindow, live: &LiveUi, opening: &Opening, outcome: Option<HistoryReveal>) {
+fn revealed(
+    window: &AppWindow,
+    live: &Arc<LiveUi>,
+    opening: &Opening,
+    outcome: Option<HistoryReveal>,
+) {
     if !opening.current(window) || !opening.here(window) {
         return;
     }
@@ -1456,6 +1513,19 @@ fn revealed(window: &AppWindow, live: &LiveUi, opening: &Opening, outcome: Optio
         None => REVEAL_FAILED,
     };
     opening.notice(window, notice);
+    // The loaded reply (never the root, which heads the panel) is brought
+    // into the thread's view once its row is laid out, under this opening.
+    if thread_open && outcome.is_some_and(|reveal| reveal.found) {
+        let reveal = Reveal {
+            pane: Pane::Thread,
+            selection: opening.selection().clone(),
+            navigation: opening.navigation,
+            security: opening.security,
+            event_id: opening.hit.event_id.clone(),
+            owner: opening.seek_owner(THREAD_NOT_SHOWN),
+        };
+        timeline_viewport::reveal(window, live, reveal);
+    }
 }
 
 /// Jump once the hit's row reaches the conversation model, under the
@@ -1468,7 +1538,7 @@ fn jump_when_loaded(weak: Weak<AppWindow>, live: Arc<LiveUi>, opening: Opening, 
         if !opening.admitted(&window, &live) {
             return;
         }
-        if jump_timeline(&window, &opening.hit.event_id) {
+        if jump_timeline(&window, &live, &opening) {
             return;
         }
         if attempts > 1 {
@@ -1556,9 +1626,35 @@ fn load_newer(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     });
 }
 
+/// SURFACE ENTRY: called by matrix_links::clear, which every admitted route
+/// that takes over the window calls first, before its surface's own flag
+/// changes (a refused entry returns before it), and by an admitted link
+/// click (matrix_links::open). A link's own ends and an older link's stale
+/// cleanup never call it (matrix_links::end_link). The held open's original
+/// authority is withdrawn for good. No later step of it acts: a scroll
+/// retry, the focused view's commit or first rows, or a reveal. The
+/// timeline's seeks and thread keeper end too (timeline_viewport::withdraw).
+/// Nothing is recaptured; a later open takes its own new authority.
+pub(crate) fn surface_entered(window: &AppWindow) {
+    with(|controller| {
+        if let Some((navigation, _)) = controller.navigation.take() {
+            navigation.withdraw();
+        }
+    });
+    timeline_viewport::withdraw(window);
+}
+
+/// Test builds only: hold `authority` as the latest open's, as
+/// `claim_navigation` does for a search hit or activation.
+#[cfg(test)]
+pub(crate) fn hold_navigation_for_test(authority: NavigationAuthority) {
+    with(|controller| controller.claim_navigation(authority, false));
+}
+
 /// Load earlier messages pages whichever view is shown, live or focused; a
-/// result for the other view no longer applies.
+/// result for the other view no longer applies, nor does a seek in it.
 pub(crate) fn reset_history(window: &AppWindow) {
+    timeline_viewport::retire_room(window);
     with(|controller| controller.newer_request = controller.newer_request.wrapping_add(1));
     window.set_history_operation(window.get_history_operation().wrapping_add(1));
     window.set_history_loading(false);
@@ -1635,17 +1731,21 @@ fn trim_context(mut messages: Vec<MessageInfo>, event_id: &str) -> Vec<MessageIn
     messages
 }
 
-/// Scroll the shown conversation to a loaded event; no row is rebuilt. A
-/// search hit's row is also highlighted, by the selected event ID.
-fn jump_timeline(window: &AppWindow, event_id: &str) -> bool {
-    let messages = window.get_messages();
-    let Some(index) = crate::timeline_model::index_of_event(&messages, event_id) else {
-        return false;
+/// Bring the opening's loaded event into the shown conversation's view,
+/// highlighted, measured and bounded (timeline_viewport); no row is rebuilt.
+/// Every move asks the opening's own admission, and a row that cannot be
+/// placed says so (NOT_SHOWN) rather than counting as shown. False when the
+/// event is not a loaded row.
+fn jump_timeline(window: &AppWindow, live: &Arc<LiveUi>, opening: &Opening) -> bool {
+    let reveal = Reveal {
+        pane: Pane::Room,
+        selection: opening.selection().clone(),
+        navigation: opening.navigation,
+        security: opening.security,
+        event_id: opening.hit.event_id.clone(),
+        owner: opening.seek_owner(NOT_SHOWN),
     };
-    window.set_timeline_jump_event_id(event_id.into());
-    window.set_timeline_jump_index(i32::try_from(index).unwrap_or(i32::MAX));
-    window.set_timeline_jump_request(window.get_timeline_jump_request().wrapping_add(1));
-    true
+    timeline_viewport::reveal(window, live, reveal)
 }
 
 /// Open a thread the way the timeline's thread action does. A root that is

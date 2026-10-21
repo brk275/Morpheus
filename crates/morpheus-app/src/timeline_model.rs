@@ -158,6 +158,22 @@ pub(crate) fn index_of_event(model: &ModelRc<MessageItem>, event_id: &str) -> Op
         .position(|row| row.event_id.as_str() == event_id)
 }
 
+/// Whether the row at `index` shows `event_id`: a timeline model reads its
+/// stored row without projecting it, any other model projects that row only.
+/// A seek checks its row this way before it searches the whole history.
+pub(crate) fn has_event_at(model: &ModelRc<MessageItem>, index: usize, event_id: &str) -> bool {
+    if let Some(model) = model.as_any().downcast_ref::<TimelineModel>() {
+        return model
+            .rows
+            .borrow()
+            .get(index)
+            .is_some_and(|row| row.event_id.as_deref() == Some(event_id));
+    }
+    model
+        .row_data(index)
+        .is_some_and(|row| row.event_id.as_str() == event_id)
+}
+
 /// The row showing `event_id`, projecting only that row.
 pub(crate) fn item_of_event(model: &ModelRc<MessageItem>, event_id: &str) -> Option<MessageItem> {
     model.row_data(index_of_event(model, event_id)?)
@@ -378,6 +394,21 @@ pub(crate) mod tests {
         let same = update(model.clone(), rows);
         assert_eq!(same, model);
         assert_eq!(projection_count(&same), 1);
+    }
+
+    /// A seek's row check reads stored rows only: no row of a 10,000-row
+    /// mixed history is formatted, and another row, an index past the end or
+    /// a row without an event (a local echo) matches nothing.
+    #[test]
+    fn a_row_check_reads_stored_rows_without_projecting_them() {
+        let mut rows: Vec<_> = (0..10_000).map(rich_fixture).collect();
+        rows[9_999].event_id = None;
+        let model = update(ModelRc::default(), rows);
+        assert!(has_event_at(&model, 7_654, "$fixture-7654:example.org"));
+        assert!(!has_event_at(&model, 7_655, "$fixture-7654:example.org"));
+        assert!(!has_event_at(&model, 10_000, "$fixture-7654:example.org"));
+        assert!(!has_event_at(&model, 9_999, "$fixture-9999:example.org"));
+        assert_eq!(projection_count(&model), 0);
     }
 
     #[test]

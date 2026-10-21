@@ -4259,6 +4259,8 @@ impl LiveUi {
         let feed_generation = self.generation.clone();
         let feed_navigation_epoch = self.navigation_epoch.clone();
         let is_live = self.is_live.clone();
+        // VIEWPORT LIFECYCLE: read-only, for the publication's security generation.
+        let viewport_gate = self.security_gate.clone();
         let feed_account_id = account_id;
         let feed_room_id = room_id;
         let handle = tokio::spawn(async move {
@@ -4273,6 +4275,7 @@ impl LiveUi {
                     let current_generation = feed_generation.clone();
                     let current_navigation_epoch = feed_navigation_epoch.clone();
                     let live_flag = is_live.clone();
+                    let gate = viewport_gate.clone();
                     let account_id = feed_account_id.clone();
                     let room_id = feed_room_id.clone();
                     let pending = delivery.clone();
@@ -4295,6 +4298,14 @@ impl LiveUi {
                                 )
                             {
                                 publish_live_messages(&ui, messages.as_ref().clone());
+                                // VIEWPORT LIFECYCLE: under the checks above.
+                                crate::timeline_viewport::rows_published(
+                                    &ui,
+                                    &selected_account,
+                                    navigation_epoch,
+                                    generation,
+                                    &gate,
+                                );
                             }
                         })
                         .is_err()
@@ -4428,6 +4439,8 @@ impl LiveUi {
         let current_generation = self.generation.clone();
         let navigation_now = self.navigation_epoch.clone();
         let is_live = self.is_live.clone();
+        // VIEWPORT LIFECYCLE: read-only, for the publication's security generation.
+        let viewport_gate = self.security_gate.clone();
         let feed_account_id = account_id;
         // Withdrawal still counts until the view's first rows are shown,
         // checked on the UI thread where withdraw() happens.
@@ -4453,6 +4466,7 @@ impl LiveUi {
                     let room_id = room_id.clone();
                     let (unshown, authority) = (unshown.clone(), authority.clone());
                     let back = unshown_view.clone();
+                    let gate = viewport_gate.clone();
                     let queued = ui.upgrade_in_event_loop(move |ui| {
                         let Some(messages) = pending.take() else {
                             return;
@@ -4481,6 +4495,14 @@ impl LiveUi {
                                 messages.as_ref().clone(),
                             ));
                             ui.set_conversation_focused(true);
+                            // VIEWPORT LIFECYCLE: under the checks above.
+                            crate::timeline_viewport::rows_published(
+                                &ui,
+                                &selected_account,
+                                navigation_epoch,
+                                generation,
+                                &gate,
+                            );
                         }
                     });
                     if queued.is_err() {
@@ -4622,6 +4644,8 @@ impl LiveUi {
         let mut updates = feed.subscribe();
         let current_generation = self.thread_generation.clone();
         let is_live = self.is_live.clone();
+        // VIEWPORT LIFECYCLE: read-only, for the publication's security generation.
+        let viewport_gate = self.security_gate.clone();
         let handle = tokio::spawn(async move {
             let _feed = feed;
             let delivery = Arc::new(crate::timeline_delivery::Latest::new());
@@ -4633,6 +4657,7 @@ impl LiveUi {
                     let ui_for_update = ui.clone();
                     let current_generation = current_generation.clone();
                     let is_live = is_live.clone();
+                    let gate = viewport_gate.clone();
                     let account_id = account_id.clone();
                     let room_id = room_id.clone();
                     let root_event_id = root_event_id.clone();
@@ -4662,6 +4687,13 @@ impl LiveUi {
                                     ui.get_thread_messages(),
                                     replies,
                                 ));
+                                // VIEWPORT LIFECYCLE: under the checks above.
+                                crate::timeline_viewport::replies_published(
+                                    &ui,
+                                    &selected_account,
+                                    generation,
+                                    &gate,
+                                );
                             }
                         })
                         .is_err()
@@ -4699,6 +4731,19 @@ impl LiveUi {
 
     pub fn thread_request_is_current(&self, generation: u64) -> bool {
         self.thread_generation.load(Ordering::Acquire) == generation
+    }
+
+    /// VIEWPORT LIFECYCLE (timeline_viewport): the thread request generation
+    /// a reply's seek is bound to. Read only; never advanced from there.
+    pub(crate) fn thread_request_generation(&self) -> u64 {
+        self.thread_generation.load(Ordering::Acquire)
+    }
+
+    /// VIEWPORT LIFECYCLE (timeline_viewport): the feed generation a
+    /// conversation seek is bound to (a new live feed, focused view or Return
+    /// to live advances it). Read only; never advanced from there.
+    pub(crate) fn feed_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub async fn clear_thread(&self) {

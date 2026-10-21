@@ -529,13 +529,33 @@ fn next_operation() -> u64 {
     })
 }
 
-/// End the shown link: withdraw its read, its join, the last joined link's
-/// follow-up and the last owned automatic open (own_automatic_open) first,
-/// then hide the card and forget everything it showed.
+/// An admitted entry's clear: end the shown link (end_link) and, with it,
+/// what owns the timeline now. Only a route that takes over the window or
+/// resets it calls this; a link's own ends and its stale cleanup call
+/// end_link, which leaves a newer open alone.
 pub(crate) fn clear(ui: &AppWindow) {
     // Every route that takes over the window clears links here first, before
     // its surface opens; a held unread jump ends at the same moment, for good.
     crate::unread_navigation::withdraw_jump(ui);
+    // So do the held open's authority, the timeline's seeks and the thread
+    // keeper, synchronously (message_search::surface_entered).
+    crate::message_search::surface_entered(ui);
+    withdraw_link(ui);
+}
+
+/// End the shown link and its existing related operations: Close, its own
+/// Open, Join or browser hand-off, and stale cleanup. Keep the legacy
+/// unread/follow-up/owned-open withdrawal; leave the latest search or
+/// activation's held navigation, timeline seek and keeper alone.
+fn end_link(ui: &AppWindow) {
+    crate::unread_navigation::withdraw_jump(ui);
+    withdraw_link(ui);
+}
+
+/// Withdraw the shown link's read, its join, the last joined link's
+/// follow-up and the last owned automatic open (own_automatic_open) first,
+/// then hide the card and forget everything it showed.
+fn withdraw_link(ui: &AppWindow) {
     next_operation();
     if let Some(follow_up) = FOLLOW_UP.with(|follow_up| follow_up.borrow_mut().take()) {
         follow_up.withdraw();
@@ -586,7 +606,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     state.on_close(move || {
         if let Some(ui) = weak.upgrade() {
             let shown = is_open(&ui);
-            clear(&ui);
+            end_link(&ui);
             if shown && !surface_blocked(&ui) && !ui.get_active_room_id().is_empty() {
                 ui.invoke_focus_composer(false);
             }
@@ -647,7 +667,7 @@ fn on_screen(ui: &AppWindow, live: &LiveUi, selection: &AccountSelection) -> boo
 /// Show `card` for the current session, and open the card.
 fn show(ui: &AppWindow, card: &Card) {
     if surface_blocked(ui) {
-        clear(ui);
+        end_link(ui);
         return;
     }
     SESSION.with(|session| {
@@ -684,10 +704,14 @@ pub(crate) fn open(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, href: &s
         return false;
     };
     // One link at a time: the shown one is withdrawn first.
-    clear(ui);
+    end_link(ui);
     if surface_blocked(ui) {
         return true;
     }
+    // Admitted, the click takes the conversation over: the held open, the
+    // timeline's seeks and the thread keeper end now, synchronously, as at
+    // every protected entry. A refused click above leaves them alone.
+    crate::message_search::surface_entered(ui);
     // A card opens now: the thread browser (a modal that blocks links while
     // it is open) ends first, with any page or retry it still holds.
     crate::thread_browser::withdraw(ui);
@@ -812,9 +836,15 @@ fn reveal_reading(
         live.navigation_is_current(navigation),
         surface_blocked(ui),
     );
+    first_shown(ui, decided, card);
+}
+
+/// Carry out a first show's decision. A withdrawn link is stale: it ends
+/// only itself (end_link), never a newer navigation, seek or keeper.
+fn first_shown(ui: &AppWindow, decided: FirstShow, card: &Card) {
     match decided {
         FirstShow::NotOurs => {}
-        FirstShow::Withdraw => clear(ui),
+        FirstShow::Withdraw => end_link(ui),
         FirstShow::Show => show(ui, card),
     }
 }
@@ -850,20 +880,14 @@ fn finish_read(
     let moved_on = !live.navigation_is_current(navigation);
     // Gone from screen, covered, or the person moved on before anything of
     // this link was shown: nothing more happens.
-    if read_ends(
-        on_screen(ui, live, &selection),
-        surface_blocked(ui),
-        moved_on,
-        presented,
-    ) {
-        clear(ui);
+    if read_ended(ui, on_screen(ui, live, &selection), moved_on, presented) {
         return;
     }
     let preview = match result {
         Ok(preview) => preview,
         Err(LinkError::Cancelled) => return,
         Err(LinkError::AccountChanged) => {
-            clear(ui);
+            end_link(ui);
             return;
         }
         Err(error) => {
@@ -904,10 +928,23 @@ fn finish_read(
     show(ui, &moved_on_card(&target, space));
 }
 
+/// End a finished read's link when read_ends says nothing more happens.
+/// That link is stale: it ends only itself (end_link), never a newer
+/// navigation, seek or keeper. True when it ended.
+fn read_ended(ui: &AppWindow, on_screen: bool, moved_on: bool, presented: bool) -> bool {
+    let ended = read_ends(on_screen, surface_blocked(ui), moved_on, presented);
+    if ended {
+        end_link(ui);
+    }
+    ended
+}
+
 /// Close the card, then open a joined room or Space for the account on
-/// screen, in the same UI turn.
+/// screen, in the same UI turn. A room's open (open_conversation) takes its
+/// own authority, which withdraws any older one; a Space is selected like a
+/// sidebar click.
 fn go(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, next: Next) {
-    clear(ui);
+    end_link(ui);
     match next {
         Next::Room(conversation) => {
             message_search::open_conversation(ui, live, handle, conversation)
@@ -955,7 +992,7 @@ fn open_chosen(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
         return;
     };
     if !on_screen(ui, live, &selection) {
-        clear(ui);
+        end_link(ui);
         return;
     }
     go(ui, live, handle, next);
@@ -970,7 +1007,7 @@ fn browse(ui: &AppWindow) {
         }) => Some(href.clone()),
         _ => None,
     });
-    clear(ui);
+    end_link(ui);
     if let Some(href) = href {
         crate::confirm_external_link(&href);
     }
@@ -996,7 +1033,7 @@ fn join(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
         return;
     };
     if !on_screen(ui, live, &selection) {
-        clear(ui);
+        end_link(ui);
         return;
     }
     // The navigation and security generations at this click.
@@ -1065,7 +1102,7 @@ fn finish_join(
         return;
     };
     if !on_screen(ui, live, &selection) {
-        clear(ui);
+        end_link(ui);
         return;
     }
     if let Some(card) = joined_card(&target, &result) {
@@ -1078,7 +1115,9 @@ fn finish_join(
     // since, and whatever happens, the join stays joined.
     let account_id = selection.account_id().to_owned();
     let follow_up = event_follow_up(&account_id, &target, asked.owned_open(live));
-    clear(ui);
+    // The join's own end: a navigation taken since is left alone, and the
+    // follow-up below claims its own authority (continue_conversation).
+    end_link(ui);
     let Some((conversation, navigation)) = follow_up else {
         return;
     };
@@ -1462,6 +1501,49 @@ pub(crate) mod tests {
         let authority = NavigationAuthority::default().blocked_by(surface_blocked);
         FOLLOW_UP.with(|slot| *slot.borrow_mut() = Some(authority.clone()));
         authority
+    }
+
+    /// A hidden room link A's two stale ends (UI suite phase 94), once a
+    /// newer open moved the navigation A took at its click (`navigation`)
+    /// before A's card was ever shown. First A's REVEAL_DELAY timer, as
+    /// reveal_reading decides and runs it (first_show, first_shown); then
+    /// A's read's completion, as finish_read runs it (read_ended). The suite
+    /// has no account, so no room link's session (its AccountSelection) can
+    /// exist here. Each A is a session of its own operation instead, its
+    /// card filled in but never shown, and its account is taken as still on
+    /// screen. Each end must still end A; the caller checks what it left.
+    pub(crate) fn end_stale_reads(ui: &AppWindow, live: &LiveUi, navigation: u64) {
+        let target = room("!a:example.org", Some("$a:example.org"), &[]);
+        let card = reading_card(&target);
+        let hidden = || {
+            let operation = next_operation();
+            SESSION.with(|session| {
+                *session.borrow_mut() = Some(Session {
+                    operation,
+                    action: Action::None,
+                    shown: Shown::Static,
+                });
+            });
+            publish(ui, &card);
+            assert!(!is_open(ui), "A's card is filled in, never shown");
+        };
+        let ended = || {
+            let gone = SESSION.with(|session| session.borrow().is_none());
+            assert!(gone, "A itself ended");
+            assert!(ui.global::<MatrixLink>().get_title().is_empty());
+        };
+        let current = live.navigation_is_current(navigation);
+        assert!(!current, "a newer open moved A's navigation");
+        // A's timer.
+        hidden();
+        let decided = first_show(true, true, current, surface_blocked(ui));
+        assert_eq!(decided, FirstShow::Withdraw);
+        first_shown(ui, decided, &card);
+        ended();
+        // A's read completes.
+        hidden();
+        assert!(read_ended(ui, true, !current, false), "nothing more");
+        ended();
     }
 
     /// A message link's confirmed join completing as the join's queued

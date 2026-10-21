@@ -44,7 +44,11 @@ use morpheus_matrix::{
 use slint::{ComponentHandle, Timer};
 use tokio::runtime::Handle;
 
-use crate::{AppWindow, UnreadNavigation, live::LiveUi};
+use crate::{
+    AppWindow, UnreadNavigation,
+    live::LiveUi,
+    timeline_viewport::{self, Ended, Owner, Pane, Reveal},
+};
 
 const FOCUSED: &str = "Return to the latest messages first, then jump to the first unread one.";
 const NO_MARKER: &str = "This room has no read position for your account yet.";
@@ -805,8 +809,12 @@ impl UnreadNavigationUi {
 
     /// Scroll to the first shown later message that somebody else sent (the
     /// row the divider is above) once it is in the list, through the
-    /// conversation's own jump (no row is rebuilt and no receipt is sent).
-    /// Retries a few short times, then says so.
+    /// conversation's own measured reveal (timeline_viewport: no row is
+    /// rebuilt and no receipt or request is sent). Every move and the reveal's
+    /// end ask this jump's click-time admission again (its op and
+    /// `still_shown` under the click's own selection, epoch and security
+    /// generation), never a newly taken one. Retries a few short times, then
+    /// says so, as does a reveal that cannot place the row.
     fn scroll_after(self: &Arc<Self>, ui: &AppWindow, target: Target, attempts: u8) {
         if self.lock().op != target.op
             || !self.still_shown(
@@ -822,7 +830,7 @@ impl UnreadNavigationUi {
         }
         let global = ui.global::<UnreadNavigation>();
         let messages = ui.get_messages();
-        let Some(index) = crate::timeline_model::index_of_event(&messages, &target.first) else {
+        let Some(_) = crate::timeline_model::index_of_event(&messages, &target.first) else {
             if attempts > 1 {
                 let this = self.clone();
                 let weak = ui.as_weak();
@@ -837,9 +845,45 @@ impl UnreadNavigationUi {
             }
             return;
         };
-        ui.set_timeline_jump_event_id(target.first.as_str().into());
-        ui.set_timeline_jump_index(i32::try_from(index).unwrap_or(i32::MAX));
-        ui.set_timeline_jump_request(ui.get_timeline_jump_request().wrapping_add(1));
+        let Target {
+            op,
+            selection,
+            account,
+            room,
+            navigation,
+            security,
+            first,
+        } = target;
+        let (this, fence) = (self.clone(), selection.clone());
+        let admitted = move |ui: &AppWindow, _: &LiveUi| {
+            this.lock().op == op
+                && this.still_shown(ui, &fence, &account, &room, navigation, security)
+        };
+        let reveal = Reveal {
+            pane: Pane::Room,
+            selection,
+            navigation,
+            security,
+            event_id: first,
+            owner: Self::jump_owner(admitted),
+        };
+        timeline_viewport::reveal(ui, &self.live, reveal);
+    }
+
+    /// A jump as a seek's owner: `admitted`, the jump's own admission, is
+    /// asked before every move and before the seek's end is told; only an end
+    /// that could not show the row (to a still-admitted jump) says NOT_SHOWN.
+    /// A placed or scrolled seek, or a stale one, says nothing.
+    pub(crate) fn jump_owner(admitted: impl Fn(&AppWindow, &LiveUi) -> bool + 'static) -> Owner {
+        Owner {
+            admits: Box::new(admitted),
+            ended: Box::new(|ui: &AppWindow, ended: Ended| {
+                if ended == Ended::Unavailable {
+                    let global = ui.global::<UnreadNavigation>();
+                    global.set_notice(NOT_SHOWN.into());
+                }
+            }),
+        }
     }
 
     fn mark_unread(self: &Arc<Self>, ui: &AppWindow, room: &str) {

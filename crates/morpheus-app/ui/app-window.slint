@@ -4211,13 +4211,94 @@ export component AppWindow inherits Window {
     in-out property <int> room-search-filter-attachment: 0;
     in-out property <bool> room-search-filters-open: false;
     in-out property <string> room-search-filter-error;
-    // Scroll the conversation to a loaded row by its index; the row with
-    // the jump event finishes the reveal. Nothing is rebuilt.
-    in-out property <int> timeline-jump-index: -1;
-    // The event a jump or thread open is revealing; rows compare against it.
+    // The loaded event a jump revealed in the conversation or its thread,
+    // highlighted until another jump or a room change; each started
+    // conversation reveal counts once.
     in-out property <string> timeline-jump-event-id;
     in-out property <int> timeline-jump-request: 0;
-    property <int> timeline-jump-passes: 0;
+    // A seek (timeline_viewport.rs) brings one loaded row into the
+    // conversation's viewport without rebuilding any row: Rust starts it
+    // with its own id, the row's event and index, and either a reveal (the
+    // row a third of the way down) or an anchor (the row's top kept at
+    // `offset` from the viewport's top). The list approaches an undrawn row
+    // and the drawn row places itself from its own measured geometry; Rust
+    // admits every move and ends the seek (id 0).
+    in-out property <int> timeline-seek-id: 0;
+    in-out property <string> timeline-seek-event;
+    in-out property <int> timeline-seek-index: -1;
+    in-out property <bool> timeline-seek-reveal: true;
+    in-out property <length> timeline-seek-offset: 0px;
+    // List passes, the pass and seek in which the row was last drawn, the
+    // last approach, and the last placement with its waits for a layout.
+    property <int> timeline-seek-pass: 0;
+    property <int> timeline-seek-heard: 0;
+    property <int> timeline-seek-heard-id: 0;
+    property <int> timeline-seek-approached: 0;
+    property <int> timeline-seek-approached-id: 0;
+    property <int> timeline-seek-moved-id: 0;
+    property <length> timeline-seek-moved-top: 0px;
+    property <length> timeline-seek-moved-y: 0px;
+    property <int> timeline-seek-waits: 0;
+    // The reader's top row as the running seek last accepted it: at its
+    // start, then only after its own move or jump, or when Rust says its
+    // rows changed (timeline-seek-rows). Any other change of that row, or of
+    // how far above the top it is drawn, is the person's scrolling, such as
+    // a scrollbar's wheel or arrow buttons, which never report as scrolled.
+    property <int> timeline-seek-seen-id: 0;
+    property <int> timeline-seek-seen-index: -1;
+    property <length> timeline-seek-seen-offset: 0px;
+    property <bool> timeline-seek-expect: false;
+    // A list created while its seek already ran (page 0 shown again after the
+    // seek started): until the seek's own first move, or the list's first
+    // report of its top row, the baseline is the list's content-y as created.
+    // The window's anchor then belongs to an older list or is unknown, which
+    // proves nothing about scrolling.
+    property <int> timeline-seek-created-id: 0;
+    property <length> timeline-seek-created-y: 0px;
+    in-out property <int> timeline-seek-rows: 0;
+    // The reader's top row (the row drawn across the viewport's top), which
+    // a later change above it keeps in place; index -1 while unknown.
+    in-out property <string> timeline-anchor-event;
+    in-out property <int> timeline-anchor-index: -1;
+    in-out property <length> timeline-anchor-offset: 0px;
+    // The same for the open thread's replies (all laid out, never
+    // approached); a thread hit's reply is the jump event above.
+    in-out property <int> thread-seek-id: 0;
+    in-out property <string> thread-seek-event;
+    in-out property <bool> thread-seek-reveal: true;
+    in-out property <length> thread-seek-offset: 0px;
+    property <int> thread-seek-moved-id: 0;
+    property <length> thread-seek-moved-top: 0px;
+    property <length> thread-seek-moved-y: 0px;
+    property <int> thread-seek-waits: 0;
+    // The thread's content-y as its running seek last saw or set it; only
+    // the person's scrolling (its scrollbar's wheel or arrows included)
+    // changes it otherwise.
+    property <int> thread-seek-seen-id: 0;
+    property <length> thread-seek-seen-y: 0px;
+    in-out property <string> thread-anchor-event;
+    in-out property <int> thread-anchor-index: -1;
+    in-out property <length> thread-anchor-offset: 0px;
+    // The thread's content-y when its anchor was last taken: only scrolling
+    // takes it again, never a layout change above the reader.
+    property <length> thread-anchor-scroll: 0px;
+    // Rust's fence for one move of a seek (false ends it), and its end:
+    // 1 placed, 0 the person scrolled.
+    callback viewport-seek-admit(int) -> bool;
+    callback viewport-seek-ended(int, int);
+    // Rust's fence for the thread keeper's one move (below).
+    callback viewport-anchor-admit() -> bool;
+    // A seek or the keeper moves a pane only in the live session while no
+    // protected surface is up: the complete inventory links and the unread
+    // jump use (matrix-link-blocked: Leave's list, the Leave dialog and the
+    // header's More menu) and an open link card. Rust reads this before every
+    // start, move and end; its fall also retires every seek for good.
+    out property <bool> viewport-seek-allowed: root.live-session && !root.matrix-link-blocked
+        && !MatrixLink.open;
+    changed viewport-seek-allowed => {
+        if !root.viewport-seek-allowed { root.viewport-seek-withdrawn(); }
+    }
+    callback viewport-seek-withdrawn();
     // The conversation shows the messages around an opened search hit
     // instead of the latest ones, until Return to live or a room change.
     in-out property <bool> conversation-focused: false;
@@ -7081,20 +7162,191 @@ export component AppWindow inherits Window {
                         property <bool> at-bottom: self.content-height <= self.visible-height + 1px || -self.content-y >= self.content-height - self.visible-height - 24px;
                         property <string> read-key: root.live-session && root.page == 0 && !root.conversation-focused && self.at-bottom && root.messages.length > 0 ? root.messages[root.messages.length - 1].event-id : "";
                         changed read-key => { RoomActivity.read-view(false, self.read-key); }
-                        init => { RoomActivity.read-view(false, self.read-key); }
-                        // A search jump first approaches the row from the average
-                        // row height, refines it as nearby rows load, and the row
-                        // itself finishes the reveal once it exists.
-                        property <int> jump-request: root.timeline-jump-request;
-                        changed jump-request => {
-                            root.timeline-jump-passes = 3;
-                            self.approach-jump();
+                        // A list created while a seek already runs takes its starting point
+                        // here: `changed seek-id` below never fires for the first id it sees.
+                        init => {
+                            RoomActivity.read-view(false, self.read-key);
+                            self.watch-created();
                         }
-                        function approach-jump() {
-                            if root.timeline-jump-index >= 0 && root.messages.length > 0 {
-                                self.content-y = -max(0px, min(self.content-height - self.visible-height,
-                                    root.timeline-jump-index * self.content-height / root.messages.length - self.visible-height / 3));
+                        // The person's wheel, drag or scrollbar wins over a seek; content-y set
+                        // here never reports as scrolled.
+                        scrolled => {
+                            if root.timeline-seek-id != 0 {
+                                root.viewport-seek-ended(root.timeline-seek-id, 0);
                             }
+                        }
+                        // A new seek to a far row jumps at once, before the next frame is
+                        // drawn; a near row may be drawn already and places itself.
+                        property <int> seek-id: root.timeline-seek-id;
+                        changed seek-id => {
+                            self.watch-start();
+                            self.approach-seek(true);
+                        }
+                        // Rows changed under the running seek (Rust resolved its row
+                        // again): the top row the list then draws is its new baseline.
+                        property <int> seek-rows: root.timeline-seek-rows;
+                        changed seek-rows => { root.timeline-seek-expect = true; }
+                        // The running seek's baseline: the reader's top row when it starts.
+                        function watch-start() {
+                            let id = root.timeline-seek-id;
+                            if id != 0 && root.timeline-seek-seen-id != id {
+                                root.timeline-seek-seen-id = id;
+                                root.timeline-seek-seen-index = root.timeline-anchor-index;
+                                root.timeline-seek-seen-offset = root.timeline-anchor-offset;
+                                root.timeline-seek-expect = root.timeline-anchor-index < 0;
+                            }
+                        }
+                        // The baseline of a seek that ran before this list existed: its
+                        // content-y as created. No row of this list has reported the top
+                        // yet, so its first report becomes the baseline only while the
+                        // list is still where it was created.
+                        function watch-created() {
+                            let id = root.timeline-seek-id;
+                            if id != 0 {
+                                root.timeline-seek-seen-id = id;
+                                root.timeline-seek-seen-index = -1;
+                                root.timeline-seek-expect = false;
+                                root.timeline-seek-created-id = id;
+                                root.timeline-seek-created-y = self.content-y;
+                            }
+                        }
+                        // The list moved since it was created under seek `id`, before
+                        // that seek moved it: the person scrolled.
+                        pure function moved-since-created(id: int) -> bool {
+                            root.timeline-seek-created-id == id
+                                && abs(self.content-y - root.timeline-seek-created-y) > 0.01px
+                        }
+                        // The top row reported again (after a layout). A change the seek
+                        // expects (its own move or jump, or changed rows) becomes its
+                        // baseline; any other change is the person's scrolling, which ends
+                        // it. The list's own re-anchoring keeps the top row where it is.
+                        function watch-seek() {
+                            let id = root.timeline-seek-id;
+                            if id == 0 || root.timeline-seek-seen-id != id {
+                                return;
+                            }
+                            // Created under this seek: its first report counts only if the
+                            // list is still where it was created.
+                            if root.timeline-seek-created-id == id {
+                                if self.moved-since-created(id) {
+                                    root.viewport-seek-ended(id, 0);
+                                    return;
+                                }
+                                root.timeline-seek-created-id = 0;
+                            }
+                            let moved = root.timeline-anchor-index != root.timeline-seek-seen-index
+                                || abs(root.timeline-anchor-offset - root.timeline-seek-seen-offset) > 0.5px;
+                            if root.timeline-seek-expect || root.timeline-seek-seen-index < 0 {
+                                if moved || root.timeline-seek-seen-index < 0 {
+                                    root.timeline-seek-seen-index = root.timeline-anchor-index;
+                                    root.timeline-seek-seen-offset = root.timeline-anchor-offset;
+                                    root.timeline-seek-expect = false;
+                                }
+                            } else if moved {
+                                root.viewport-seek-ended(id, 0);
+                            }
+                        }
+                        // While the seek's row is not drawn (no row placed itself in the
+                        // last 3 passes), move towards it: a far row straight to its
+                        // estimated position (a jump the list lays out from that row), a
+                        // near one by most of a screen, in the direction of the measured top
+                        // row, never in the seek's first 2 passes. Every move is admitted by
+                        // Rust (which also resolves the row's index again if rows changed);
+                        // one move per 2 passes.
+                        function approach-seek(first: bool) {
+                            let id = root.timeline-seek-id;
+                            let h = self.visible-height;
+                            let rows = root.messages.length;
+                            if id == 0 || h <= 0px || rows == 0 {
+                                return;
+                            }
+                            if root.timeline-seek-heard-id == id && root.timeline-seek-pass - root.timeline-seek-heard < 3 {
+                                return;
+                            }
+                            if root.timeline-seek-approached-id == id && root.timeline-seek-pass - root.timeline-seek-approached < 2 {
+                                return;
+                            }
+                            let top = root.timeline-anchor-index;
+                            let average = self.content-height / rows;
+                            let far = top < 0 || abs(root.timeline-seek-index - top) * average > 2 * h;
+                            root.timeline-seek-approached-id = id;
+                            root.timeline-seek-approached = root.timeline-seek-pass;
+                            if first && !far {
+                                return;
+                            }
+                            // Not where it was created: the person scrolled first.
+                            if self.moved-since-created(id) {
+                                root.viewport-seek-ended(id, 0);
+                                return;
+                            }
+                            if !root.viewport-seek-admit(id) || root.timeline-seek-id != id {
+                                return;
+                            }
+                            let k = root.timeline-seek-index;
+                            if k < 0 || k >= rows {
+                                return;
+                            }
+                            let limit = max(0px, self.content-height - h);
+                            // This move's new top row becomes the baseline.
+                            self.watch-start();
+                            root.timeline-seek-expect = true;
+                            root.timeline-seek-created-id = 0;
+                            if far {
+                                // The rows drawn there are new; the top row reports again.
+                                root.timeline-anchor-index = -1;
+                                self.content-y = -min(limit, (k + 0.5) * average);
+                            } else if k > top {
+                                self.content-y = -min(limit, 0.8 * h - self.content-y);
+                            } else {
+                                self.content-y = -max(0px, -self.content-y - 0.8 * h);
+                            }
+                        }
+                        // The drawn seek row at content position `row-y` with height `tall`:
+                        // in place (or as close as the ends allow) ends the seek; otherwise
+                        // move it there once Rust admits it. After its move, the row is not
+                        // moved again until the list was laid out (at most 3 waits); found
+                        // anywhere but where that move put it, someone else moved it (the
+                        // person, such as with a scrollbar's wheel or arrows, which never
+                        // report as scrolled, or a layout above it), and the seek ends
+                        // there rather than move it back.
+                        function place-seek(row-y: length, tall: length) {
+                            let id = root.timeline-seek-id;
+                            let h = self.visible-height;
+                            if id == 0 || h <= 0px {
+                                return;
+                            }
+                            root.timeline-seek-heard-id = id;
+                            root.timeline-seek-heard = root.timeline-seek-pass;
+                            let top = row-y + self.content-y;
+                            if root.timeline-seek-moved-id == id && root.timeline-seek-waits < 3
+                                && abs(top - root.timeline-seek-moved-top) < 0.01px
+                                && abs(self.content-y - root.timeline-seek-moved-y) < 0.01px {
+                                root.timeline-seek-waits += 1;
+                                return;
+                            }
+                            let want = root.timeline-seek-reveal ? max(min(8px, h / 4), min(h / 3, h - tall - 8px)) : root.timeline-seek-offset;
+                            let goal = -max(0px, min(max(0px, self.content-height - h), row-y - want));
+                            if abs(top - want) <= 1px || abs(self.content-y - goal) <= 0.5px {
+                                if top < h && top + tall > 0px {
+                                    root.viewport-seek-ended(id, 1);
+                                }
+                                return;
+                            }
+                            if root.timeline-seek-moved-id == id || self.moved-since-created(id) {
+                                root.viewport-seek-ended(id, 0);
+                                return;
+                            }
+                            if !root.viewport-seek-admit(id) || root.timeline-seek-id != id {
+                                return;
+                            }
+                            self.watch-start();
+                            root.timeline-seek-expect = true;
+                            root.timeline-seek-created-id = 0;
+                            root.timeline-seek-moved-id = id;
+                            root.timeline-seek-moved-top = top;
+                            root.timeline-seek-moved-y = goal;
+                            root.timeline-seek-waits = 0;
+                            self.content-y = goal;
                         }
                         for message[index] in root.messages : message-row := Rectangle {
                             width: timeline-list.visible-width;
@@ -7106,7 +7358,28 @@ export component AppWindow inherits Window {
                             // choosing columns; keep the existing message/action space intact.
                             property <bool> columns: root.message-layout == 2 && self.width >= max(640px, 640px * root.text-scale)
                                 + (self.show-time ? max(0px, (root.timestamp-width-px - 72) * 1px * root.text-scale) : 0px);
-                            property <bool> selected-message: root.room-search-selected-event-id != "" && message.event-id == root.room-search-selected-event-id;
+                            // A selected search hit or the event a jump revealed.
+                            property <bool> selected-message: message.event-id != ""
+                                && (message.event-id == root.room-search-selected-event-id || message.event-id == root.timeline-jump-event-id);
+                            // Where the row is drawn, relative to the viewport's top. The row
+                            // across that top reports itself as the reader's anchor whenever
+                            // that changes (rows drawn: a few dozen, never the whole history).
+                            property <length> shown-top: self.y + timeline-list.content-y;
+                            property <bool> at-top: self.shown-top <= 0px && self.shown-top + self.height > 0px;
+                            property <int> top-index: self.at-top ? index : -1;
+                            property <string> top-event: self.at-top ? message.event-id : "";
+                            property <length> top-offset: self.at-top ? self.shown-top : 1px;
+                            changed top-index => { self.report-top(); }
+                            changed top-event => { self.report-top(); }
+                            changed top-offset => { self.report-top(); }
+                            function report-top() {
+                                if self.at-top {
+                                    root.timeline-anchor-index = index;
+                                    root.timeline-anchor-event = message.event-id;
+                                    root.timeline-anchor-offset = self.shown-top;
+                                    timeline-list.watch-seek();
+                                }
+                            }
                             // Unread navigation: the exact row Rust placed after the
                             // fully-read marker (the first shown later message somebody
                             // else sent), in the live list only. The row grows by the
@@ -7133,20 +7406,39 @@ export component AppWindow inherits Window {
                             min-height: max(28px + 2 * root.message-row-gap, root.show-message-avatars ? self.avatar-size + 2 * root.message-row-gap : 0px);
                             background: root.row-surface(message-row.selected-message, message-hover.has-hover, message.is-own, transparent);
                             message-hover := TouchArea { mouse-cursor: default; }
-                            // Finish a search jump once this row exists: place it a
-                            // third of the way down the visible conversation. A Timer
-                            // cannot itself be conditional, so a zero-size holder is.
-                            if root.timeline-jump-passes > 0 && message.event-id != "" && message.event-id == root.timeline-jump-event-id : Rectangle {
+                            // The seek's row, once drawn, places itself from its own geometry
+                            // each time the list lays it out (before that frame is drawn), and
+                            // at least every 16 ms. A Timer cannot itself be conditional, so a
+                            // zero-size holder is.
+                            if root.timeline-seek-id != 0 && message.event-id != "" && message.event-id == root.timeline-seek-event : Rectangle {
+                                width: 0px; height: 0px;
+                                // Where the row is drawn and its height change when the list
+                                // lays it out; its content position also changes when a row
+                                // created by a jump is first laid out, at the viewport's top.
+                                property <length> top: message-row.shown-top;
+                                property <length> tall: message-row.height;
+                                property <length> row-y: message-row.y;
+                                init => {
+                                    root.timeline-seek-heard-id = root.timeline-seek-id;
+                                    root.timeline-seek-heard = root.timeline-seek-pass;
+                                }
+                                changed top => { timeline-list.place-seek(message-row.y, message-row.height); }
+                                changed tall => { timeline-list.place-seek(message-row.y, message-row.height); }
+                                changed row-y => { timeline-list.place-seek(message-row.y, message-row.height); }
+                                Timer {
+                                    interval: 16ms;
+                                    running: root.timeline-seek-id != 0;
+                                    triggered => { timeline-list.place-seek(message-row.y, message-row.height); }
+                                }
+                            }
+                            // An unknown anchor (a new feed or view, or a jump that drew new
+                            // rows) is reported again by the row across the top once laid out.
+                            if root.timeline-anchor-index < 0 && message-row.at-top : Rectangle {
                                 width: 0px; height: 0px;
                                 Timer {
-                                    interval: 1ms;
+                                    interval: 16ms;
                                     running: true;
-                                    triggered => {
-                                        self.running = false;
-                                        timeline-list.content-y = -max(0px, min(timeline-list.content-height - timeline-list.visible-height,
-                                            message-row.y - timeline-list.visible-height / 3));
-                                        root.timeline-jump-passes = 0;
-                                    }
+                                    triggered => { message-row.report-top(); }
                                 }
                             }
                             if message-row.divider-above : NewMessagesDivider {
@@ -7415,13 +7707,14 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    // Bounded follow-up passes of a search jump (see timeline-list).
+                    // The passes of a seek (see timeline-list), only while one runs;
+                    // Rust bounds each seek's passes and time.
                     Timer {
-                        interval: 50ms;
-                        running: root.timeline-jump-passes > 0;
+                        interval: 16ms;
+                        running: root.timeline-seek-id != 0;
                         triggered => {
-                            root.timeline-jump-passes -= 1;
-                            timeline-list.approach-jump();
+                            root.timeline-seek-pass += 1;
+                            timeline-list.approach-seek(false);
                         }
                     }
                     // Who is typing in this room, or a Mark as read result.
@@ -11383,7 +11676,85 @@ export component AppWindow inherits Window {
                         property <bool> at-bottom: self.content-height <= self.visible-height + 1px || -self.content-y >= self.content-height - self.visible-height - 24px;
                         property <string> read-key: root.live-session && root.page == 0 && root.show-side-panel && root.side-panel-tab == 1 && self.at-bottom && root.thread-messages.length > 0 ? root.thread-messages[root.thread-messages.length - 1].event-id : "";
                         changed read-key => { RoomActivity.read-view(true, self.read-key); }
-                        init => { RoomActivity.read-view(true, self.read-key); }
+                        // A pane created while a seek already runs takes its starting point
+                        // here: `changed seek-id` below never fires for the first id it sees.
+                        init => {
+                            RoomActivity.read-view(true, self.read-key);
+                            self.watch-start();
+                        }
+                        // As in the conversation: the person's scrolling wins over a seek.
+                        scrolled => {
+                            if root.thread-seek-id != 0 {
+                                root.viewport-seek-ended(root.thread-seek-id, 0);
+                            }
+                        }
+                        // Only a seek's moves and the person's scrolling change content-y
+                        // here (no list re-anchors it). A running seek takes it when it
+                        // starts and after each of its moves; any other change is the
+                        // person's, a scrollbar's wheel or arrows included, which never
+                        // report as scrolled, and ends the seek.
+                        property <int> seek-id: root.thread-seek-id;
+                        changed seek-id => { self.watch-start(); }
+                        function watch-start() {
+                            let id = root.thread-seek-id;
+                            if id != 0 && root.thread-seek-seen-id != id {
+                                root.thread-seek-seen-id = id;
+                                root.thread-seek-seen-y = self.content-y;
+                            }
+                        }
+                        // Place the seek's reply (laid out at `row-y` with height `tall`),
+                        // like timeline-list's place-seek; every reply is laid out here.
+                        function place-seek(row-y: length, tall: length) {
+                            let id = root.thread-seek-id;
+                            let h = self.visible-height;
+                            if id == 0 || h <= 0px {
+                                return;
+                            }
+                            self.watch-start();
+                            if abs(self.content-y - root.thread-seek-seen-y) > 0.01px {
+                                root.viewport-seek-ended(id, 0);
+                                return;
+                            }
+                            let top = row-y + self.content-y;
+                            if root.thread-seek-moved-id == id && root.thread-seek-waits < 3
+                                && abs(top - root.thread-seek-moved-top) < 0.01px
+                                && abs(self.content-y - root.thread-seek-moved-y) < 0.01px {
+                                root.thread-seek-waits += 1;
+                                return;
+                            }
+                            let want = root.thread-seek-reveal ? max(min(8px, h / 4), min(h / 3, h - tall - 8px)) : root.thread-seek-offset;
+                            let goal = -max(0px, min(max(0px, self.content-height - h), row-y - want));
+                            if abs(top - want) <= 1px || abs(self.content-y - goal) <= 0.5px {
+                                if top < h && top + tall > 0px {
+                                    root.viewport-seek-ended(id, 1);
+                                }
+                                return;
+                            }
+                            if !root.viewport-seek-admit(id) || root.thread-seek-id != id {
+                                return;
+                            }
+                            root.thread-seek-moved-id = id;
+                            root.thread-seek-moved-top = top;
+                            root.thread-seek-moved-y = goal;
+                            root.thread-seek-waits = 0;
+                            root.thread-seek-seen-y = goal;
+                            self.content-y = goal;
+                        }
+                        // The keeper's one move: put the anchor reply, now laid out at
+                        // `row-y`, back at its measured offset (clamped at the ends) once
+                        // Rust admits it. Refused, the reader's place moves with the layout
+                        // and the reply across the top reports the anchor again.
+                        function keep-anchor(row-y: length) {
+                            let goal = -max(0px, min(max(0px, self.content-height - self.visible-height), row-y - root.thread-anchor-offset));
+                            if abs(self.content-y - goal) <= 0.5px {
+                                return;
+                            }
+                            if root.viewport-anchor-admit() {
+                                self.content-y = goal;
+                            } else {
+                                root.thread-anchor-index = -1;
+                            }
+                        }
                         VerticalLayout {
                             width: parent.width;
                             padding: 12px;
@@ -11430,26 +11801,79 @@ export component AppWindow inherits Window {
                                 accessible-live-region: polite;
                             }
                             Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
-                            for reply in root.thread-messages : thread-reply := Rectangle {
+                            for reply[index] in root.thread-messages : thread-reply := Rectangle {
                                 property <string> time-label: root.message-time-label(reply);
-                                // The reply a search hit opened, highlighted like a
+                                // The reply a search hit or a jump opened, highlighted like a
                                 // selected conversation row.
-                                property <bool> search-hit: root.room-search-selected-event-id != "" && reply.event-id == root.room-search-selected-event-id;
+                                property <bool> search-hit: reply.event-id != ""
+                                    && (reply.event-id == root.room-search-selected-event-id || reply.event-id == root.timeline-jump-event-id);
                                 min-height: 43px;
                                 vertical-stretch: 0;
                                 background: root.row-surface(thread-reply.search-hit, false, reply.is-own, root.elevated);
                                 border-radius: StyleTokens.radius * 0.8;
-                                // Reveal that reply once it is laid out (a zero-size
-                                // holder carries the condition; a Timer cannot).
-                                if reply.event-id != "" && reply.event-id == root.timeline-jump-event-id : Rectangle {
+                                // The reply across the viewport's top (with the spacing below it)
+                                // is the reader's anchor; above the first reply there is none.
+                                property <length> shown-top: self.y + thread-scroll.content-y;
+                                property <bool> at-top: self.shown-top <= 0px && self.shown-top + self.height + 10px > 0px;
+                                property <bool> above: index == 0 && self.shown-top > 0px;
+                                property <int> top-index: self.at-top ? index : -1;
+                                property <string> top-event: self.at-top ? reply.event-id : "";
+                                property <length> top-offset: self.at-top ? self.shown-top : 1px;
+                                changed top-index => { self.report-top(); }
+                                changed top-event => { self.report-top(); }
+                                changed top-offset => { self.report-top(); }
+                                changed above => { self.report-top(); }
+                                // A known anchor is taken again only by scrolling (the person's or
+                                // a seek's), never by a layout change above the reader: the keeper
+                                // below puts that reply back instead.
+                                function report-top() {
+                                    if root.thread-anchor-index >= 0 && thread-scroll.content-y == root.thread-anchor-scroll {
+                                        return;
+                                    }
+                                    if self.at-top {
+                                        root.thread-anchor-index = index;
+                                        root.thread-anchor-event = reply.event-id;
+                                        root.thread-anchor-offset = self.shown-top;
+                                        root.thread-anchor-scroll = thread-scroll.content-y;
+                                    } else if self.above {
+                                        root.thread-anchor-index = -1;
+                                        root.thread-anchor-event = "";
+                                        root.thread-anchor-scroll = thread-scroll.content-y;
+                                    }
+                                }
+                                // The reader's anchor reply keeps its measured place when the
+                                // layout above it changes (the root or earlier replies reflow, a
+                                // font or width change), as the conversation's list keeps its first
+                                // drawn row. Only a layout moves `laid-y`; scrolling does not.
+                                if root.thread-seek-id == 0 && root.thread-anchor-index >= 0 && reply.event-id != "" && reply.event-id == root.thread-anchor-event : Rectangle {
+                                    width: 0px; height: 0px;
+                                    property <length> laid-y: thread-reply.y;
+                                    changed laid-y => { thread-scroll.keep-anchor(thread-reply.y); }
+                                }
+                                // The seek's reply places itself as soon as it exists, whenever it
+                                // is laid out, and at least every 16 ms (a zero-size holder carries
+                                // the condition; a Timer cannot).
+                                if root.thread-seek-id != 0 && reply.event-id != "" && reply.event-id == root.thread-seek-event : Rectangle {
+                                    width: 0px; height: 0px;
+                                    property <length> top: thread-reply.shown-top;
+                                    property <length> tall: thread-reply.height;
+                                    init => { thread-scroll.place-seek(thread-reply.y, thread-reply.height); }
+                                    changed top => { thread-scroll.place-seek(thread-reply.y, thread-reply.height); }
+                                    changed tall => { thread-scroll.place-seek(thread-reply.y, thread-reply.height); }
+                                    Timer {
+                                        interval: 16ms;
+                                        running: root.thread-seek-id != 0;
+                                        triggered => { thread-scroll.place-seek(thread-reply.y, thread-reply.height); }
+                                    }
+                                }
+                                // An unknown anchor (another thread or feed) is reported again by
+                                // the reply across the top.
+                                if root.thread-anchor-index < 0 && thread-reply.at-top : Rectangle {
                                     width: 0px; height: 0px;
                                     Timer {
-                                        interval: 1ms;
+                                        interval: 16ms;
                                         running: true;
-                                        triggered => {
-                                            self.running = false;
-                                            thread-scroll.content-y = -max(0px, min(thread-scroll.content-height - thread-scroll.visible-height, thread-reply.y - 12px));
-                                        }
+                                        triggered => { thread-reply.report-top(); }
                                     }
                                 }
                                 VerticalLayout {

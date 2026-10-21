@@ -951,6 +951,7 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
         "a bounded wheel burst must not format all 10,000 messages"
     );
     assert_eq!(ui.get_messages(), model, "scrolling keeps the shared model");
+    assert_timeline_seeks(ui, &model).await;
     ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
     settle(ui).await;
     assert_eq!(ui.get_messages().row_count(), 0);
@@ -1044,6 +1045,753 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
         .set_first_unread_event_id("".into());
     ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
     settle(ui).await;
+}
+
+/// The conversation's real seek glue (timeline_viewport's protocol, answered
+/// here as it answers it: this fixture has no account whose moves it could
+/// admit) over the 10,001-row mixed-height history the lazy view left: a far
+/// row is approached and placed a third of the way down the list, so is a
+/// row near the start, fifty older rows prepended above that reader keep its
+/// top row exactly where it was drawn, a seek whose moves are refused moves
+/// nothing, and the person's wheel ends it at once, also in a list created
+/// while its seek already ran. The history is never formatted as a whole.
+async fn assert_timeline_seeks(ui: &AppWindow, model: &ModelRc<MessageItem>) {
+    use crate::timeline_model::{projection_count, tests::rich_fixture, update_shared};
+    use slint::private_unstable_api::re_exports::{AccessibleRole, ItemRc, WindowInner};
+    use std::{
+        cell::{Cell, RefCell},
+        ops::ControlFlow,
+        rc::Rc,
+        sync::Arc,
+    };
+
+    let moves = Rc::new(Cell::new(0u32));
+    let refused = Rc::new(Cell::new(0));
+    let ends = Rc::new(RefCell::new(Vec::<(i32, i32)>::new()));
+    let (counted, refusing) = (moves.clone(), refused.clone());
+    ui.on_viewport_seek_admit(move |id| {
+        counted.set(counted.get() + 1);
+        id != refusing.get()
+    });
+    let (heard, weak) = (ends.clone(), ui.as_weak());
+    ui.on_viewport_seek_ended(move |id, outcome| {
+        heard.borrow_mut().push((id, outcome));
+        let ui = weak.upgrade().unwrap();
+        if ui.get_timeline_seek_id() == id {
+            ui.set_timeline_seek_id(0);
+        }
+    });
+    // Start a seek the way timeline_viewport::start does (the id last).
+    let seek = |id: i32, event: &str, index: i32, anchor: Option<f32>| {
+        ui.set_timeline_seek_event(event.into());
+        ui.set_timeline_seek_index(index);
+        ui.set_timeline_seek_reveal(anchor.is_none());
+        ui.set_timeline_seek_offset(anchor.unwrap_or_default());
+        ui.set_timeline_seek_id(id);
+    };
+    // The list that draws a row, in window coordinates.
+    let list_of = |row: Bounds| {
+        let window = WindowInner::from_pub(ui.window());
+        let mut lists = Vec::new();
+        let _ = ItemRc::new_root(window.component()).visit_descendants(|item| {
+            if item.accessible_role() == AccessibleRole::List {
+                lists.push(item_bounds(item));
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        lists
+            .into_iter()
+            .find(|list| list.left <= row.left && row.right <= list.right)
+            .expect("a list draws the row")
+    };
+
+    // A far row, from wherever the wheel left the list: 7,322 is the
+    // longest wrapped shape.
+    let before = projection_count(model);
+    let far = rich_fixture(7_322);
+    seek(41, "$fixture-7322:example.org", 7_322, None);
+    assert_eq!(seek_ended(ui, &ends, 41).await, Some(1), "placed");
+    let body = control_bounds(ui, &far.body);
+    assert_eq!(body.len(), 1, "the far row is drawn once");
+    let list = list_of(body[0]);
+    let height = list.bottom - list.top;
+    let third = list.top + height / 3.0;
+    assert!(
+        body[0].top >= third - 1.0 && body[0].top < list.top + height / 2.0,
+        "a third of the way down: {:?} in {list:?}",
+        body[0]
+    );
+    assert!(body[0].bottom <= list.bottom, "the far row is fully shown");
+    let first = control_bounds(ui, "Updated visible timeline fixture");
+    assert!(first.is_empty(), "row 0 is not drawn");
+    assert!(projection_count(model) - before < 1_000, "bounded");
+    let made = moves.get();
+    assert!((1..=240).contains(&made), "moves: {made}");
+
+    // A row near the start, with the rows above it filling the first third.
+    let near = rich_fixture(30);
+    seek(42, "$fixture-30:example.org", 30, None);
+    assert_eq!(seek_ended(ui, &ends, 42).await, Some(1), "placed");
+    let body = control_bounds(ui, &near.body);
+    assert_eq!(body.len(), 1, "the near row is drawn once");
+    let list = list_of(body[0]);
+    let third = list.top + (list.bottom - list.top) / 3.0;
+    assert!(body[0].top >= third - 1.0, "{:?} in {list:?}", body[0]);
+
+    // Fifty older rows arrive above that reader. As timeline_viewport's
+    // hook does, an anchor seek then keeps its top row where it was drawn.
+    settle(ui).await;
+    let index = ui.get_timeline_anchor_index();
+    let offset = ui.get_timeline_anchor_offset();
+    assert!((1..30).contains(&index), "above row 30: {index}");
+    let anchor = format!("$fixture-{index}:example.org");
+    assert_eq!(ui.get_timeline_anchor_event().as_str(), anchor);
+    let top = rich_fixture(usize::try_from(index).unwrap());
+    let held = control_bounds(ui, &top.body);
+    assert_eq!(held.len(), 1, "the top row is drawn once");
+    let mut first = rich_fixture(0);
+    first.body = "Updated visible timeline fixture".into();
+    first.rich_markdown = Some(first.body.clone());
+    first.rich_accessible = Some(first.body.clone());
+    let rows: Vec<_> = (20_000..20_050)
+        .map(rich_fixture)
+        .chain([first])
+        .chain((1..=10_000).map(rich_fixture))
+        .map(Arc::new)
+        .collect();
+    let grown = update_shared(ui.get_messages(), rows);
+    assert_eq!(&grown, model, "a prepend keeps the shared model");
+    ui.set_messages(grown);
+    seek(43, &anchor, index + 50, Some(offset));
+    assert_eq!(seek_ended(ui, &ends, 43).await, Some(1), "kept");
+    let kept = control_bounds(ui, &top.body);
+    assert_eq!(kept.len(), 1, "the top row is still drawn");
+    assert!(
+        (kept[0].top - held[0].top).abs() <= 1.0,
+        "kept in place: {:?} then {:?}",
+        held[0],
+        kept[0]
+    );
+    assert_eq!(ui.get_messages().row_count(), 10_051);
+
+    // A seek whose moves Rust refuses moves nothing, and the person's wheel
+    // ends it at once.
+    refused.set(44);
+    seek(44, "$fixture-5000:example.org", 5_050, None);
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    assert_eq!(control_bounds(ui, &top.body), kept, "refused: unmoved");
+    assert_eq!(ui.get_timeline_seek_id(), 44, "still running");
+    let list = list_of(kept[0]);
+    let position = slint::LogicalPosition::new(
+        (list.left + list.right) / 2.0,
+        (list.top + list.bottom) / 2.0,
+    );
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y: -120.0,
+    });
+    settle(ui).await;
+    assert_eq!(ends.borrow().last(), Some(&(44, 0)), "the wheel wins");
+    assert_eq!(ui.get_timeline_seek_id(), 0);
+
+    // The scrollbar's own wheel and arrow buttons move the list without
+    // reporting as scrolled (the pinned Fluent bar). A running seek, its
+    // moves refused so that only the person moves the list, still sees that
+    // scrolling and ends.
+    let bar = slint::LogicalPosition::new(list.right - 7.0, (list.top + list.bottom) / 2.0);
+    refused.set(45);
+    seek(45, "$fixture-6000:example.org", 6_050, None);
+    settle(ui).await;
+    assert_eq!(ui.get_timeline_seek_id(), 45, "running");
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position: bar,
+        delta_x: 0.0,
+        delta_y: -120.0,
+    });
+    settle(ui).await;
+    assert_eq!(ends.borrow().last(), Some(&(45, 0)), "the bar's wheel");
+    assert_eq!(ui.get_timeline_seek_id(), 0);
+
+    // The down arrow moves the list by its one 10 px step: a row drawn three
+    // below the top row (fixture index - 50 after the prepend) moves up by
+    // exactly that, and the seek ends.
+    refused.set(46);
+    seek(46, "$fixture-6000:example.org", 6_050, None);
+    settle(ui).await;
+    let below = usize::try_from(ui.get_timeline_anchor_index()).unwrap() + 3;
+    assert!(below > 50, "a row after the prepended ones: {below}");
+    let body = rich_fixture(below - 50).body;
+    let before = control_bounds(ui, &body);
+    let arrow = slint::LogicalPosition::new(list.right - 7.0, list.bottom - 7.0);
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position: arrow });
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position: arrow,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position: arrow,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    settle(ui).await;
+    let after = control_bounds(ui, &body);
+    let step = before[0].top - after[0].top;
+    assert!((step - 10.0).abs() <= 0.5, "one arrow step: {step}");
+    assert_eq!(ends.borrow().last(), Some(&(46, 0)), "the bar's arrow");
+    assert_eq!(ui.get_timeline_seek_id(), 0);
+
+    // The list created with its seek already running, as a queued page
+    // change and cached activation leave it: the directory (page 3) closes
+    // and a far seek starts before the conversation's list exists, so its
+    // first id never reports as changed there. The bar's wheel before the
+    // seek's first approach ends it where the person put the list: no
+    // jump, and nothing pulls the list back.
+    ui.set_page(3);
+    settle(ui).await;
+    assert!(control_bounds(ui, &body).is_empty(), "no conversation list");
+    ui.set_page(0);
+    seek(47, "$fixture-9000:example.org", 9_050, None);
+    assert_eq!(ui.get_timeline_seek_id(), 47, "before the list exists");
+    settle(ui).await;
+    let row = rich_fixture(20_003).body;
+    let created = control_bounds(ui, &row);
+    assert_eq!(created.len(), 1, "the new list starts at its first rows");
+    assert_eq!(ui.get_timeline_seek_id(), 47, "the far seek is pending");
+    let list = list_of(created[0]);
+    let bar = slint::LogicalPosition::new(list.right - 7.0, (list.top + list.bottom) / 2.0);
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position: bar,
+        delta_x: 0.0,
+        delta_y: -120.0,
+    });
+    settle(ui).await;
+    let wheeled = control_bounds(ui, &row);
+    assert_eq!(wheeled.len(), 1, "the row is still drawn");
+    assert!((wheeled[0].top - created[0].top).abs() > 1.0, "moved");
+    assert_eq!(ends.borrow().last(), Some(&(47, 0)), "the bar's wheel");
+    assert_eq!(ui.get_timeline_seek_id(), 0);
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    let after = control_bounds(ui, &row);
+    assert!(
+        (after[0].top - wheeled[0].top).abs() <= 0.5,
+        "no pull-back: {wheeled:?} {after:?}"
+    );
+    let target = rich_fixture(9_000).body;
+    assert!(control_bounds(ui, &target).is_empty(), "never brought in");
+    ui.on_viewport_seek_admit(|_| false);
+    ui.on_viewport_seek_ended(|_, _| {});
+}
+
+/// Let the window lay out and run a started seek until it reports its end,
+/// bounded at 60 passes of 16 ms: its outcome, or `None` if it never ended.
+async fn seek_ended(
+    ui: &AppWindow,
+    ends: &std::cell::RefCell<Vec<(i32, i32)>>,
+    id: i32,
+) -> Option<i32> {
+    for _ in 0..60 {
+        let ended = ends
+            .borrow()
+            .iter()
+            .find(|end| end.0 == id)
+            .map(|end| end.1);
+        if ended.is_some() {
+            return ended;
+        }
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    None
+}
+
+/// The unread jump's root-approved seam into the viewport: the jump's own
+/// owner (UnreadNavigationUi::jump_owner, around the admission scroll_after
+/// builds from the click) on the real seek glue, window and live UI. This
+/// fixture has no account, so the seek's session scope is left out
+/// (timeline_viewport::seek_for_test) and the admission is a switch. It is
+/// asked at the start, every move and the end: a withdrawn jump starts or
+/// moves nothing and says nothing, a placed one says nothing, and a row gone
+/// from the list says NOT_SHOWN only while the jump is still admitted.
+async fn assert_unread_jump_owner(ui: &AppWindow, live: &Arc<LiveUi>) {
+    use crate::timeline_model::{tests::rich_fixture, update_shared};
+    use crate::timeline_viewport::{Pane, seek_for_test};
+    use crate::unread_navigation::UnreadNavigationUi;
+    use std::{cell::Cell, rc::Rc};
+
+    const NOT_SHOWN: &str = "The first unread message was loaded but is not shown in this list.";
+    // Seeks move only in the live session with no protected surface up.
+    let old_live = ui.get_live_session();
+    ui.set_live_session(true);
+    crate::timeline_viewport::register(ui, live.clone());
+    ui.set_page(0);
+    let rows: Vec<_> = (0..400).map(|i| Arc::new(rich_fixture(i))).collect();
+    ui.set_messages(update_shared(ModelRc::default(), rows.clone()));
+    settle(ui).await;
+    assert!(ui.get_viewport_seek_allowed(), "no protected surface is up");
+    let notices = ui.global::<crate::UnreadNavigation>();
+    notices.set_notice("".into());
+    let admitted = Rc::new(Cell::new(true));
+    let asked = Rc::new(Cell::new(0u32));
+    let jump = || {
+        let (admitted, asked) = (admitted.clone(), asked.clone());
+        UnreadNavigationUi::jump_owner(move |_: &AppWindow, _: &LiveUi| {
+            asked.set(asked.get() + 1);
+            admitted.get()
+        })
+    };
+    let reveal = |event: &str| seek_for_test(ui, live, Pane::Room, event, None, Some(jump()));
+    let drawn = |index: usize| control_bounds(ui, &rich_fixture(index).body).len();
+
+    // From the top of the list, the way any placed jump gets there.
+    assert!(reveal("$fixture-0:example.org"));
+    assert!(seek_stopped(ui).await, "placed within its bounds");
+    assert_eq!(drawn(0), 1, "row 0 is drawn");
+    assert_eq!(drawn(321), 0, "row 321 is out of view");
+
+    // Withdrawn before its first move (a newer jump, a modal, a security
+    // step): the far row is never brought in and nothing is said.
+    admitted.set(false);
+    let before = asked.get();
+    assert!(reveal("$fixture-321:example.org"));
+    assert!(seek_stopped(ui).await, "ended at its first admission");
+    assert!(asked.get() > before, "the admission was asked");
+    assert_eq!(drawn(321), 0, "a withdrawn jump moves nothing");
+    assert_eq!(notices.get_notice().as_str(), "");
+
+    // Still admitted: placed, asked at its moves and at its end, silent.
+    admitted.set(true);
+    let before = asked.get();
+    assert!(reveal("$fixture-321:example.org"));
+    assert!(seek_stopped(ui).await, "placed within its bounds");
+    assert_eq!(drawn(321), 1, "the jump's row is drawn");
+    assert!(asked.get() >= before + 2, "asked at a move and at the end");
+    assert_eq!(notices.get_notice().as_str(), "");
+
+    // Its row goes from the list while the jump is still admitted: the
+    // reveal cannot show it, and says so.
+    let mut shown = rows;
+    assert!(reveal("$fixture-77:example.org"));
+    let gone = "$fixture-77:example.org";
+    shown.retain(|row| row.event_id.as_deref() != Some(gone));
+    ui.set_messages(update_shared(ui.get_messages(), shown.clone()));
+    assert!(seek_stopped(ui).await, "ended once its row went");
+    assert_eq!(notices.get_notice().as_str(), NOT_SHOWN);
+
+    // The same once the jump was withdrawn: a stale end says nothing.
+    notices.set_notice("".into());
+    assert!(reveal("$fixture-200:example.org"));
+    admitted.set(false);
+    let gone = "$fixture-200:example.org";
+    shown.retain(|row| row.event_id.as_deref() != Some(gone));
+    ui.set_messages(update_shared(ui.get_messages(), shown));
+    assert!(seek_stopped(ui).await, "ended without a word");
+    assert_eq!(notices.get_notice().as_str(), "", "stale: silent");
+
+    crate::timeline_viewport::reset(ui);
+    ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    ui.set_live_session(old_live);
+    settle(ui).await;
+}
+
+/// Root review findings #2 and #3 on the real window, live UI and security
+/// gate. A seek, an ownerless anchor too, is refused at its start and stops
+/// for good before it moves anything while a protected surface is up (the
+/// Leave dialog, a modal) or once a security step began. In the open thread,
+/// the reader's anchor reply keeps its measured place when a reply above it
+/// grows or the root above them reflows, follows the person's own scroll, and
+/// is not moved behind a protected surface. A protected entry, an admitted
+/// link click included, ends seeks, the held open and the keeper at once;
+/// an older link's stale cleanup leaves a newer open, its seek and the
+/// keeper alone. The fixture has no account, so session scopes are left out
+/// (seek_for_test, keep_thread_for_test).
+async fn assert_seek_policy_and_thread_keeper(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+) {
+    use crate::timeline_model::{tests::rich_fixture, update_shared};
+    use crate::timeline_viewport::{Pane, keep_thread_for_test, seek_for_test};
+    use crate::{RoomLeave, RoomLeaveView, live::message_item};
+    use std::sync::atomic::Ordering;
+
+    let old_live = ui.get_live_session();
+    let old_side = ui.get_show_side_panel();
+    ui.set_live_session(true);
+    crate::timeline_viewport::register(ui, live.clone());
+    ui.set_page(0);
+    let rows: Vec<_> = (0..400).map(|i| Arc::new(rich_fixture(i))).collect();
+    ui.set_messages(update_shared(ModelRc::default(), rows));
+    settle(ui).await;
+    assert!(ui.get_viewport_seek_allowed(), "no protected surface is up");
+    let drawn = |index: usize| control_bounds(ui, &rich_fixture(index).body).len();
+    let room = |event: &str| seek_for_test(ui, live, Pane::Room, event, None, None);
+    let anchor = |event: &str| seek_for_test(ui, live, Pane::Room, event, Some(0.0), None);
+    let far = "$fixture-321:example.org";
+    assert!(room("$fixture-0:example.org"));
+    assert!(seek_stopped(ui).await, "placed at the start");
+    assert_eq!(drawn(321), 0, "row 321 is out of view");
+
+    // Under the Leave dialog: refused at its start, nothing starts.
+    let leave = ui.global::<RoomLeave>();
+    leave.set_view(RoomLeaveView {
+        open: true,
+        ..RoomLeaveView::default()
+    });
+    settle(ui).await;
+    assert!(!ui.get_viewport_seek_allowed(), "Leave is protected");
+    assert!(room(far));
+    assert_eq!(ui.get_timeline_seek_id(), 0, "refused at its start");
+    assert!(anchor(far));
+    assert_eq!(ui.get_timeline_seek_id(), 0, "an anchor is refused too");
+    leave.set_view(RoomLeaveView::default());
+    settle(ui).await;
+
+    // A modal opens before its first move: it stops for good, moves
+    // nothing, and stays stopped once the modal closes.
+    assert!(room(far));
+    assert_ne!(ui.get_timeline_seek_id(), 0, "started");
+    ui.set_member_confirm_open(true);
+    assert!(seek_stopped(ui).await, "ended behind the modal");
+    ui.set_member_confirm_open(false);
+    assert!(seek_stopped(ui).await, "never resumes");
+    assert_eq!(drawn(321), 0, "nothing moved behind the modal");
+
+    // A security step begun after its start ends it before it moves, and
+    // one already running refuses it at its start.
+    assert!(room(far));
+    let step = live.security_gate.try_account_access().expect("idle gate");
+    assert!(seek_stopped(ui).await, "ended by the security step");
+    assert_eq!(drawn(321), 0, "nothing moved during the step");
+    assert!(room(far));
+    assert_eq!(ui.get_timeline_seek_id(), 0, "refused while it runs");
+    drop(step);
+    assert!(seek_stopped(ui).await, "still nothing after the step");
+    assert_eq!(drawn(321), 0, "a withdrawn seek never resumes");
+
+    // With nothing up and the step over, the same row is placed.
+    assert!(room(far));
+    assert!(seek_stopped(ui).await, "placed within its bounds");
+    assert_eq!(drawn(321), 1, "placed once nothing is up");
+
+    // A protected entry that opens and closes before any change handler
+    // runs (the account menu here). Its admitted entry first calls
+    // matrix_links::clear, which ends the running seek and withdraws the
+    // held open's authority at once. So nothing moves after it closes, and
+    // an open still waiting for its row (its reveal asks that authority)
+    // cannot start a seek afterwards.
+    let held = crate::live::NavigationAuthority::default();
+    crate::message_search::hold_navigation_for_test(held.clone());
+    let waiting = held.clone();
+    let opening = move || crate::timeline_viewport::Owner {
+        admits: Box::new(move |ui: &AppWindow, _: &LiveUi| waiting.admits(ui)),
+        ended: Box::new(|_: &AppWindow, _: crate::timeline_viewport::Ended| {}),
+    };
+    assert!(held.admits(ui), "the held open is admitted");
+    assert!(room("$fixture-30:example.org"));
+    assert_ne!(ui.get_timeline_seek_id(), 0, "a seek runs");
+    crate::matrix_links::clear(ui);
+    ui.set_account_menu_open(true);
+    ui.set_account_menu_open(false);
+    assert_eq!(ui.get_timeline_seek_id(), 0, "ended at the entry");
+    assert!(held.withdrawn(), "the held open's authority is withdrawn");
+    let late = seek_for_test(ui, live, Pane::Room, far, None, Some(opening()));
+    assert!(late, "the row is loaded");
+    assert_eq!(ui.get_timeline_seek_id(), 0, "its later reveal is refused");
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    assert_eq!(drawn(30), 0, "nothing moved after the menu closed");
+    assert_eq!(drawn(321), 1, "the reader stays where they were");
+
+    // An older link's stale cleanup is no entry. A hidden room link A took
+    // the navigation at its click. Before its card was shown, a newer open B
+    // (a search hit or an activation) moved the navigation, holds its own
+    // authority and runs its reveal. A's timer and then A's read's
+    // completion end A only. B keeps its authority and its seek, whose row
+    // is then placed.
+    let was_live = live.is_live.swap(true, Ordering::AcqRel);
+    let clicked = live.current_navigation_epoch();
+    assert!(live.navigation_is_current(clicked), "A's click is current");
+    let taken = live.invalidate_navigation();
+    assert!(live.navigation_is_current(taken), "B's is current now");
+    let newer = crate::live::NavigationAuthority::default();
+    crate::message_search::hold_navigation_for_test(newer.clone());
+    let current = newer.clone();
+    let owner = crate::timeline_viewport::Owner {
+        admits: Box::new(move |ui: &AppWindow, _: &LiveUi| current.admits(ui)),
+        ended: Box::new(|_: &AppWindow, _: crate::timeline_viewport::Ended| {}),
+    };
+    let near = "$fixture-30:example.org";
+    assert!(seek_for_test(ui, live, Pane::Room, near, None, Some(owner)));
+    let running = ui.get_timeline_seek_id();
+    assert_ne!(running, 0, "B's seek runs");
+    crate::matrix_links::tests::end_stale_reads(ui, live, clicked);
+    live.is_live.store(was_live, Ordering::Release);
+    assert!(
+        !newer.withdrawn() && newer.admits(ui),
+        "B keeps its authority"
+    );
+    assert_eq!(ui.get_timeline_seek_id(), running, "and its seek");
+    assert!(seek_stopped(ui).await, "placed within its bounds");
+    assert_eq!(drawn(30), 1, "B's row is shown");
+
+    // A link click, once admitted, is an entry: its card opens, and the held
+    // open's authority and the running seek end at the click itself.
+    let opened = crate::live::NavigationAuthority::default();
+    crate::message_search::hold_navigation_for_test(opened.clone());
+    assert!(room(far));
+    assert_ne!(ui.get_timeline_seek_id(), 0, "a seek runs");
+    let user = "matrix:u/alice:example.org";
+    assert!(crate::matrix_links::open(ui, live, runtime, user));
+    assert!(crate::matrix_links::is_open(ui), "the user card opened");
+    assert_eq!(ui.get_timeline_seek_id(), 0, "ended at the click");
+    assert!(opened.withdrawn(), "the held open's authority is withdrawn");
+    crate::matrix_links::clear(ui);
+    for _ in 0..4 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    assert_eq!(drawn(321), 0, "nothing moved after the click");
+    assert_eq!(drawn(30), 1, "the reader stays where they were");
+
+    // The open thread: 60 mixed replies under a short root.
+    ui.invoke_show_thread_panel();
+    let root = message_item(&rich_fixture(30_000));
+    ui.set_thread_root_id("$fixture-30000:example.org".into());
+    ui.set_thread_root_sender(root.sender);
+    ui.set_thread_root_rich_body(root.rich_body);
+    ui.set_thread_root_rich_accessible_body(root.rich_accessible_body);
+    let mut replies: Vec<_> = (30_001..30_061)
+        .map(|i| Arc::new(rich_fixture(i)))
+        .collect();
+    ui.set_thread_messages(update_shared(ModelRc::default(), replies.clone()));
+    keep_thread_for_test(live);
+    settle(ui).await;
+    let thread = |event: &str| seek_for_test(ui, live, Pane::Thread, event, None, None);
+    assert!(thread("$fixture-30030:example.org"));
+    assert!(thread_seek_stopped(ui).await, "the reply is placed");
+    settle(ui).await;
+    // The reader's anchor: a reply above 30,030 across the pane's top.
+    let reader = || {
+        let index = usize::try_from(ui.get_thread_anchor_index()).expect("an anchor");
+        let reply = rich_fixture(30_001 + index);
+        let event = format!("$fixture-{}:example.org", 30_001 + index);
+        assert_eq!(ui.get_thread_anchor_event().as_str(), event);
+        (index, control_bounds(ui, &reply.body))
+    };
+    let (index, held) = reader();
+    assert!((1..29).contains(&index), "below the first reply: {index}");
+    assert_eq!(held.len(), 1, "the anchor reply is laid out once");
+    let at = |index: usize| control_bounds(ui, &rich_fixture(30_001 + index).body);
+    // The first reply (always above the reader) grows by `lines` sentences.
+    let grow = |replies: &mut Vec<Arc<morpheus_matrix::MessageInfo>>, lines: usize| {
+        let more = "It grew much longer. ".repeat(lines);
+        let row = Arc::make_mut(&mut replies[0]);
+        row.body = format!("Edited first reply. {more}");
+        row.rich_markdown = Some(row.body.clone());
+        row.rich_accessible = Some(row.body.clone());
+        ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    };
+
+    // A reply above the reader grows: the anchor reply stays where it was.
+    grow(&mut replies, 30);
+    settle(ui).await;
+    let kept = at(index);
+    assert!(
+        (kept[0].top - held[0].top).abs() <= 1.0,
+        "{held:?} {kept:?}"
+    );
+
+    // The root above every reply reflows: it stays there too.
+    let longer = message_item(&rich_fixture(30_104));
+    ui.set_thread_root_rich_body(longer.rich_body);
+    settle(ui).await;
+    let kept = at(index);
+    assert!(
+        (kept[0].top - held[0].top).abs() <= 1.0,
+        "{held:?} {kept:?}"
+    );
+
+    // The person scrolls: the anchor follows them, and the keeper then
+    // keeps the new place rather than pulling the old one back.
+    let position = slint::LogicalPosition::new(
+        (kept[0].left + kept[0].right) / 2.0,
+        (kept[0].top + kept[0].bottom) / 2.0,
+    );
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y: -120.0,
+    });
+    settle(ui).await;
+    let (moved, scrolled) = reader();
+    let followed = moved != index || (scrolled[0].top - kept[0].top).abs() > 1.0;
+    assert!(followed, "the anchor followed the scroll");
+    grow(&mut replies, 60);
+    settle(ui).await;
+    let kept = at(moved);
+    assert!(
+        (kept[0].top - scrolled[0].top).abs() <= 1.0,
+        "{scrolled:?} {kept:?}"
+    );
+
+    // Behind a protected surface the keeper moves nothing: the reply moves
+    // with the layout, and its place is taken again.
+    ui.set_member_confirm_open(true);
+    settle(ui).await;
+    grow(&mut replies, 90);
+    settle(ui).await;
+    let after = at(moved);
+    assert!(after[0].top > kept[0].top + 1.0, "moved with the layout");
+    ui.set_member_confirm_open(false);
+    settle(ui).await;
+
+    // A brief protected entry (opened and closed before any change handler
+    // runs) also stops the thread keeper, at once, until the thread's next
+    // publication binds it again: the next layout change is not corrected.
+    keep_thread_for_test(live);
+    for _ in 0..2 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    let (index, before) = reader();
+    crate::matrix_links::clear(ui);
+    ui.set_account_menu_open(true);
+    ui.set_account_menu_open(false);
+    grow(&mut replies, 120);
+    settle(ui).await;
+    let after = at(index);
+    assert!(after[0].top > before[0].top + 1.0, "the keeper was stopped");
+
+    // An older link's stale cleanup leaves the keeper bound: after a hidden
+    // link A's timer and read's completion, once a newer open moved A's
+    // navigation, the next layout change is still corrected.
+    keep_thread_for_test(live);
+    for _ in 0..2 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    let (index, before) = reader();
+    let was_live = live.is_live.swap(true, Ordering::AcqRel);
+    let clicked = live.current_navigation_epoch();
+    live.invalidate_navigation();
+    crate::matrix_links::tests::end_stale_reads(ui, live, clicked);
+    live.is_live.store(was_live, Ordering::Release);
+    grow(&mut replies, 150);
+    settle(ui).await;
+    let after = at(index);
+    assert!(
+        (after[0].top - before[0].top).abs() <= 1.0,
+        "{before:?} {after:?}"
+    );
+
+    // The thread's scrollbar wheel moves the replies without reporting as
+    // scrolled. A seek waiting for its reply sees that scrolling and ends
+    // without moving anything once the reply arrives. The bar is the
+    // pane's last 14 px, beyond the 12 px padding of the replies' layout,
+    // whose full width the REPLIES heading takes.
+    let heading = control_bounds(ui, "REPLIES · 60");
+    assert_eq!(heading.len(), 1, "the replies heading");
+    assert!(thread("$fixture-30061:example.org"));
+    settle(ui).await;
+    assert_ne!(ui.get_thread_seek_id(), 0, "waiting for its reply");
+    let before = at(moved);
+    let bar = slint::LogicalPosition::new(
+        heading[0].right + 5.0,
+        (before[0].top + before[0].bottom) / 2.0,
+    );
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position: bar,
+        delta_x: 0.0,
+        delta_y: -120.0,
+    });
+    settle(ui).await;
+    let wheeled = at(moved);
+    assert!((wheeled[0].top - before[0].top).abs() > 1.0, "moved");
+    // Not reported as scrolled: only the seek's own check can end it.
+    assert_ne!(ui.get_thread_seek_id(), 0, "the bar's wheel is silent");
+    replies.push(Arc::new(rich_fixture(30_061)));
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    assert!(thread_seek_stopped(ui).await, "the seek ended");
+    let after = at(moved);
+    assert!((after[0].top - wheeled[0].top).abs() <= 1.0, "kept");
+
+    // The same with a pane created only after its seek began: a reveal set
+    // before the thread's pane exists, which its own init then joins. The
+    // pane goes away, and the panel is shown again with a seek for a missing
+    // reply, both before any settle.
+    ui.set_thread_root_id("".into());
+    settle(ui).await;
+    assert!(control_bounds(ui, "REPLIES · 61").is_empty(), "no pane");
+    ui.invoke_show_thread_panel();
+    ui.set_thread_root_id("$fixture-30000:example.org".into());
+    assert!(thread("$fixture-30062:example.org"));
+    assert_ne!(ui.get_thread_seek_id(), 0, "before the pane exists");
+    settle(ui).await;
+    let heading = control_bounds(ui, "REPLIES · 61");
+    assert_eq!(heading.len(), 1, "the new pane is laid out");
+    let bar = slint::LogicalPosition::new(
+        heading[0].right + 5.0,
+        (heading[0].top + heading[0].bottom) / 2.0,
+    );
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position: bar,
+        delta_x: 0.0,
+        delta_y: -120.0,
+    });
+    settle(ui).await;
+    let wheeled = control_bounds(ui, "REPLIES · 61");
+    assert!((wheeled[0].top - heading[0].top).abs() > 1.0, "moved");
+    assert_ne!(ui.get_thread_seek_id(), 0, "the bar's wheel is silent");
+    replies.push(Arc::new(rich_fixture(30_062)));
+    ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
+    assert!(thread_seek_stopped(ui).await, "the seek ended");
+    let after = control_bounds(ui, "REPLIES · 62");
+    assert!((after[0].top - wheeled[0].top).abs() <= 1.0, "kept");
+
+    ui.set_thread_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    ui.set_thread_root_id("".into());
+    ui.set_thread_root_sender("".into());
+    ui.set_thread_root_rich_body(Default::default());
+    ui.set_thread_root_rich_accessible_body("".into());
+    crate::timeline_viewport::reset(ui);
+    ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    ui.set_show_side_panel(old_side);
+    ui.set_live_session(old_live);
+    settle(ui).await;
+}
+
+/// Run the window until its thread seek ended, bounded at 60 passes of 16 ms.
+async fn thread_seek_stopped(ui: &AppWindow) -> bool {
+    for _ in 0..60 {
+        if ui.get_thread_seek_id() == 0 {
+            return true;
+        }
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    ui.get_thread_seek_id() == 0
+}
+
+/// Run the window until its conversation seek ended, bounded at 60 passes of
+/// 16 ms.
+async fn seek_stopped(ui: &AppWindow) -> bool {
+    for _ in 0..60 {
+        if ui.get_timeline_seek_id() == 0 {
+            return true;
+        }
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    ui.get_timeline_seek_id() == 0
 }
 
 async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
@@ -4423,6 +5171,10 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert_room_addresses_bounded_close_and_context(&ui, live.clone(), &runtime).await;
     phase.set(15);
     assert_pane_navigation_epoch(&ui, &live, directory.path()).await;
+    phase.set(93);
+    assert_unread_jump_owner(&ui, &live).await;
+    phase.set(94);
+    assert_seek_policy_and_thread_keeper(&ui, &live, &runtime).await;
     phase.set(73);
     assert_moderation_stops_with_its_context(&ui, &live, &runtime).await;
     phase.set(74);
@@ -12308,6 +13060,10 @@ async fn assert_member_row_actions_fit(ui: &AppWindow) {
         }
     });
     for held in 0..8 {
+        assert!(
+            ui.get_member_inspector_allowed(),
+            "the ordinary context admits member details"
+        );
         privacy.set_inspector(crate::MemberInspectorView {
             open: true,
             name: "Synthetic member".into(),
@@ -12327,10 +13083,47 @@ async fn assert_member_row_actions_fit(ui: &AppWindow) {
             _ => ui.set_sas_stage(4),
         }
         settle(ui).await;
-        assert!(
-            !privacy.get_inspector().open,
-            "context {held} closes private details"
-        );
+        if held == 6 {
+            // This forced pair bypasses production People admission. Either
+            // generated fallback may close first; neither may leave both open.
+            assert!(
+                !ui.get_people_open() || !privacy.get_inspector().open,
+                "mutually exclusive dialogs never stay open together"
+            );
+            ui.invoke_close_people();
+            privacy.invoke_close_inspector();
+            settle(ui).await;
+            assert!(
+                !privacy.get_inspector().open,
+                "reset closes any previous member details"
+            );
+            assert!(
+                ui.get_member_inspector_allowed(),
+                "closing People restores ordinary member admission"
+            );
+            privacy.set_inspector(crate::MemberInspectorView {
+                open: true,
+                name: "Synthetic member".into(),
+                user_id: "@synthetic-member:example.org".into(),
+                ..Default::default()
+            });
+            settle(ui).await;
+            assert!(
+                privacy.get_inspector().open,
+                "the fresh ordinary inspector opens"
+            );
+            privacy.invoke_close_inspector();
+            settle(ui).await;
+            assert!(
+                !privacy.get_inspector().open,
+                "the registered Close callback clears member details"
+            );
+        } else {
+            assert!(
+                !privacy.get_inspector().open,
+                "context {held} closes private details"
+            );
+        }
         ui.set_access_open(false);
         ui.set_security_busy(false);
         ui.set_sas_busy(false);
