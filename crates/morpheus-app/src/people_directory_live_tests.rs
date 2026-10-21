@@ -241,6 +241,8 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     // Arm the real debounce Timer from the search field, then confirm in
     // the same event-loop turn, before any time passes.
     let point = live.pauses.install(PAUSE);
+    // Programmatic text keeps its caret; append through the real input.
+    key(&ui, Key::End);
     key(&ui, "x");
     let typed = format!("{target}x");
     assert_eq!(ui.get_people_query().as_str(), typed);
