@@ -12231,6 +12231,8 @@ async fn assert_member_row_actions_fit(ui: &AppWindow) {
         ui.get_details_width(),
         ui.get_show_side_panel(),
         ui.get_font_scale_percent(),
+        ui.get_side_panel_tab(),
+        ui.get_details_reveal_open(),
     );
     let privacy_scope = (
         ui.get_active_account_local_id(),
@@ -12257,8 +12259,7 @@ async fn assert_member_row_actions_fit(ui: &AppWindow) {
     // Wide enough that the details pane is shown at its configured width;
     // 620 px is the short height the actions must survive.
     ui.window().set_size(slint::PhysicalSize::new(1280, 620));
-    ui.set_page(0);
-    ui.set_show_side_panel(true);
+    ui.invoke_show_members_panel();
     ui.set_live_session(true);
     ui.set_members(ModelRc::new(VecModel::from(vec![MemberItem {
         user_id: "@synthetic-member:example.org".into(),
@@ -12350,10 +12351,21 @@ async fn assert_member_row_actions_fit(ui: &AppWindow) {
     ui.set_account_profile_open(privacy_scope.7);
     ui.set_people_open(privacy_scope.8);
     ui.set_sas_stage(privacy_scope.9);
+    // Restore the previous details destination through its presentation seam.
+    match saved.5 {
+        0 => ui.invoke_show_members_panel(),
+        1 => ui.invoke_show_thread_panel(),
+        2 => ui.invoke_focus_room_search(),
+        3 => ui.invoke_show_pinned_panel(),
+        4 => ui.invoke_show_transfer_panel(),
+        5 => ui.invoke_show_room_media(),
+        _ => panic!("unexpected details tab"),
+    }
     ui.set_page(saved.0);
     ui.set_live_session(saved.1);
     ui.set_details_width(saved.2);
     ui.set_show_side_panel(saved.3);
+    ui.set_details_reveal_open(saved.6);
     ui.set_font_scale_percent(saved.4);
     ui.window().set_size(size);
     settle(ui).await;
