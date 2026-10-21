@@ -1,4 +1,4 @@
-//! Bounded offer ownership and single-use Answer authorization.
+//! Bounded offer ownership and single-use Answer and Decline authorization.
 //!
 //! No discovery task, UI callback, slot write or media operation lives here.
 //! The bounded worker supplies retained sync event IDs and cached change hints;
@@ -6,29 +6,414 @@
 //! streams invalidate when observed, and Answer/postjoin use full revalidation.
 //! Account switches retain this controller/ledger. Private integration is source
 //! reviewed; real controller, watcher and media acceptance is still pending.
+//! A decline from another trusted device of this user retires only its exact
+//! offer (match_declines, then finish_decline after an owned trust check); it
+//! never answers, joins or sends anything.
 
 use super::{
-    AdmissionFailure, IncomingOffer,
+    AdmissionFailure, DeclineOutcome, IncomingOffer,
     ledger::{OfferKey, OfferLedger},
+    policy,
 };
 use crate::voice_spaces::VoiceSpaces;
 use futures_util::FutureExt;
-use matrix_sdk::ruma::{EventId, RoomId};
+use matrix_sdk::{
+    deserialized_responses::{AlgorithmInfo, EncryptionInfo, VerificationState},
+    ruma::{EventId, RoomId},
+};
 use morpheus_matrix::{AccountManager, AccountSelection};
-use morpheus_rtc::{CallInfo, CallOptions, InteropMode, ParticipantInfo, RtcService};
+use morpheus_rtc::{
+    CallInfo, CallOptions, InteropMode, ParticipantInfo, RtcService, ringing::MAX_RING_LIFETIME_MS,
+};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt,
     future::Future,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::{sync::Notify, time};
 
 const MAX_OFFERS: usize = 4;
+/// Own-device declines retained while their offer may still be admitted.
+pub(crate) const MAX_DECLINE_RECEIPTS: usize = 16;
+/// A retained decline never outlives the longest possible ring.
+const DECLINE_RECEIPT_LIFETIME: Duration = Duration::from_millis(MAX_RING_LIFETIME_MS);
+const MAX_RECEIPT_ID_BYTES: usize = 255;
+
+/// The exact identity of one retained decline: this account, the room, the
+/// declined notification and the declining device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptKey {
+    account: String,
+    room: String,
+    notification: String,
+    device: String,
+}
+
+/// What ReceiptBuffer needs from a retained receipt.
+pub(crate) trait BufferedReceipt {
+    fn key(&self) -> &ReceiptKey;
+    fn expires(&self) -> Instant;
+    /// Still owned by the selection it was received under.
+    fn current(&self) -> bool;
+}
+
+/// Bounded, short-lived, in-memory receipts: no store, channel or task.
+/// Expired or no longer current receipts are dropped first. A duplicate of a
+/// retained key is ignored (the first stays). When full, the newest receipt is
+/// refused, never a retained one displaced: an offer then keeps ringing rather
+/// than being settled on evidence that was not kept. Only receipts that passed
+/// the receipt-time checks (decline_receipt_qualifies) ever reach it.
+pub(crate) struct ReceiptBuffer<T> {
+    entries: VecDeque<T>,
+}
+impl<T> Default for ReceiptBuffer<T> {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+}
+impl<T: BufferedReceipt> ReceiptBuffer<T> {
+    fn prune(&mut self, now: Instant) {
+        self.entries
+            .retain(|entry| now < entry.expires() && entry.current());
+    }
+    pub(crate) fn insert(&mut self, receipt: T, now: Instant) -> bool {
+        self.prune(now);
+        if !(now < receipt.expires() && receipt.current())
+            || self
+                .entries
+                .iter()
+                .any(|entry| entry.key() == receipt.key())
+            || self.entries.len() >= MAX_DECLINE_RECEIPTS
+        {
+            return false;
+        }
+        self.entries.push_back(receipt);
+        true
+    }
+    /// Every live receipt, oldest first, leaving the buffer empty.
+    pub(crate) fn take(&mut self, now: Instant) -> Vec<T> {
+        self.prune(now);
+        self.entries.drain(..).collect()
+    }
+    /// Put back receipts taken earlier that matched no offer yet. They are
+    /// older than anything received meanwhile, so they come first; the bound
+    /// then drops the newest.
+    pub(crate) fn restore(&mut self, earlier: Vec<T>, now: Instant) {
+        let newer = std::mem::take(&mut self.entries);
+        for receipt in earlier.into_iter().chain(newer) {
+            self.insert(receipt, now);
+        }
+    }
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// The scope that may hold retained receipts: the selected account.
+pub(crate) trait ReceiptScope {
+    fn scope_account(&self) -> &str;
+    fn scope_current(&self) -> bool;
+}
+impl ReceiptScope for AccountSelection {
+    fn scope_account(&self) -> &str {
+        self.account_id()
+    }
+    fn scope_current(&self) -> bool {
+        self.is_current()
+    }
+}
+
+/// Retained receipts and the scope allowed to hold them, under ONE lock (the
+/// owner's Mutex), so admission, insertion, restoration and clearing are
+/// serialized. A receipt enters (from a sync callback, or back after a
+/// settlement pass) only while not stopped and only if its own captured
+/// selection belongs to the current scope: the same account, both still
+/// current (a current selection is the account's only current one). reset
+/// and stop clear in the same critical section that changes the scope, so a
+/// callback dispatched before them cannot refill the buffer afterwards. No
+/// fresh authority is ever captured for an old callback.
+pub(crate) struct ScopedReceipts<T, S> {
+    stopped: bool,
+    scope: Option<S>,
+    buffer: ReceiptBuffer<T>,
+}
+impl<T, S> Default for ScopedReceipts<T, S> {
+    fn default() -> Self {
+        Self {
+            stopped: false,
+            scope: None,
+            buffer: ReceiptBuffer::default(),
+        }
+    }
+}
+impl<T: BufferedReceipt, S: ReceiptScope> ScopedReceipts<T, S> {
+    fn admits(&self, receipt: &T) -> bool {
+        !self.stopped
+            && receipt.current()
+            && self.scope.as_ref().is_some_and(|scope| {
+                scope.scope_current() && scope.scope_account() == receipt.key().account
+            })
+    }
+    /// A new scope (or none): everything retained is dropped, unless the new
+    /// scope is the same, still current selection as the old one (the scope
+    /// set before its handlers, then confirmed by selection).
+    pub(crate) fn reset(&mut self, scope: Option<S>) {
+        let same = match (&self.scope, &scope) {
+            (Some(old), Some(new)) => {
+                old.scope_current()
+                    && new.scope_current()
+                    && old.scope_account() == new.scope_account()
+            }
+            _ => false,
+        };
+        if !same || self.stopped {
+            self.buffer.clear();
+        }
+        self.scope = if self.stopped { None } else { scope };
+    }
+    /// For good: nothing is retained or admitted afterwards.
+    pub(crate) fn stop(&mut self) {
+        self.stopped = true;
+        self.scope = None;
+        self.buffer.clear();
+    }
+    pub(crate) fn insert(&mut self, receipt: T, now: Instant) -> bool {
+        self.admits(&receipt) && self.buffer.insert(receipt, now)
+    }
+    /// Every live receipt still admitted by the current scope.
+    pub(crate) fn take(&mut self, now: Instant) -> Vec<T> {
+        let taken = self.buffer.take(now);
+        taken
+            .into_iter()
+            .filter(|receipt| self.admits(receipt))
+            .collect()
+    }
+    /// Receipts taken earlier that matched no offer: back only if the same
+    /// scope still admits them.
+    pub(crate) fn restore(&mut self, earlier: Vec<T>, now: Instant) {
+        let earlier = earlier
+            .into_iter()
+            .filter(|receipt| self.admits(receipt))
+            .collect();
+        self.buffer.restore(earlier, now);
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+/// The identity of one offer that a decline must match exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OfferFacts<'a> {
+    account: &'a str,
+    room: &'a str,
+    notification: &'a str,
+    own_user: &'a str,
+    own_device: &'a str,
+}
+impl<'a> OfferFacts<'a> {
+    fn of(offer: &'a IncomingOffer) -> Self {
+        Self {
+            account: offer.selection.account_id(),
+            room: offer.room.room_id().as_str(),
+            notification: offer.ring.event_id(),
+            own_user: &offer.own_user,
+            own_device: &offer.own_device,
+        }
+    }
+    fn owned(&self) -> OwnedOfferFacts {
+        OwnedOfferFacts {
+            account: self.account.to_owned(),
+            room: self.room.to_owned(),
+            notification: self.notification.to_owned(),
+            own_user: self.own_user.to_owned(),
+            own_device: self.own_device.to_owned(),
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnedOfferFacts {
+    account: String,
+    room: String,
+    notification: String,
+    own_user: String,
+    own_device: String,
+}
+impl OwnedOfferFacts {
+    fn borrowed(&self) -> OfferFacts<'_> {
+        OfferFacts {
+            account: &self.account,
+            room: &self.room,
+            notification: &self.notification,
+            own_user: &self.own_user,
+            own_device: &self.own_device,
+        }
+    }
+}
+
+/// A decline (its key and decrypted sender) matches exactly this offer: the
+/// same account, room and retained notification, sent by the offer's own
+/// user from a device other than the offer's own.
+fn decline_key_matches(key: &ReceiptKey, sender: &str, offer: &OfferFacts<'_>) -> bool {
+    key.account == offer.account
+        && key.room == offer.room
+        && key.notification == offer.notification
+        && sender == offer.own_user
+        && key.device != offer.own_device
+}
+fn decline_matches(receipt: &DeclineReceipt, offer: &OfferFacts<'_>) -> bool {
+    decline_key_matches(&receipt.key, receipt.encryption.sender.as_str(), offer)
+}
+
+/// After a trust check: whether its decline may still retire the offer. Every
+/// original condition is required again at this moment, including the
+/// receipt's own original deadline (independent of the offer's).
+pub(super) fn decline_still_settles(
+    trusted: bool,
+    receipt_current: bool,
+    receipt_expires: Instant,
+    now: Instant,
+    offer_pending: bool,
+    facts_match: bool,
+) -> bool {
+    trusted && receipt_current && now < receipt_expires && offer_pending && facts_match
+}
+
+/// One decline's current-trust check, owning everything it needs (the
+/// original token, the offer's identity facts and client, and the receipt),
+/// so it borrows no controller state while it waits.
+pub(crate) struct DeclineCheck {
+    token: ActionToken,
+    facts: OwnedOfferFacts,
+    receipt: DeclineReceipt,
+    client: matrix_sdk::Client,
+}
+impl fmt::Debug for DeclineCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeclineCheck { .. }")
+    }
+}
+impl DeclineCheck {
+    /// The device's current trust with the keys the decline was decrypted
+    /// with (require_current_sender, bounded by its own timeout).
+    pub(crate) fn trust(self) -> impl Future<Output = (Self, bool)> + Send + 'static {
+        async move {
+            let trusted = policy::require_current_sender(&self.client, &self.receipt.encryption)
+                .await
+                .is_ok();
+            (self, trusted)
+        }
+    }
+}
+
+/// Receipt-time checks for a decline the active account's sync delivered: the
+/// event's own decryption metadata says it was Megolm-encrypted with a known
+/// session, verified at decryption, not decrypted with forwarded (shared on
+/// invite) keys, and sent by this same user from another device. This is
+/// evidence only, never trust to act: finish_decline retires nothing until a
+/// DeclineCheck has confirmed the device's current trust.
+pub(crate) fn decline_receipt_qualifies(
+    own_user: &str,
+    own_device: &str,
+    sender: &str,
+    encryption: Option<&EncryptionInfo>,
+) -> bool {
+    let Some(encryption) = encryption else {
+        return false;
+    };
+    let session = matches!(
+        &encryption.algorithm_info,
+        AlgorithmInfo::MegolmV1AesSha2 { session_id: Some(session), .. } if !session.is_empty()
+    );
+    session
+        && encryption.verification_state == VerificationState::Verified
+        && encryption.forwarder.is_none()
+        && !own_user.is_empty()
+        && !own_device.is_empty()
+        && sender == own_user
+        && encryption.sender.as_str() == own_user
+        && encryption
+            .sender_device
+            .as_deref()
+            .is_some_and(|device| device.as_str() != own_device)
+}
+
+/// A decline of one notification by another device of this account's own
+/// user, as the account's sync delivered it, with its real decryption
+/// metadata. It passed the receipt-time checks only; it is not trusted to act
+/// until a DeclineCheck has checked the device's current trust.
+#[derive(Clone)]
+pub(crate) struct DeclineReceipt {
+    selection: AccountSelection,
+    key: ReceiptKey,
+    encryption: EncryptionInfo,
+    expires: Instant,
+}
+impl fmt::Debug for DeclineReceipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeclineReceipt { .. }")
+    }
+}
+impl BufferedReceipt for DeclineReceipt {
+    fn key(&self) -> &ReceiptKey {
+        &self.key
+    }
+    fn expires(&self) -> Instant {
+        self.expires
+    }
+    fn current(&self) -> bool {
+        self.selection.is_current()
+    }
+}
+impl DeclineReceipt {
+    /// None unless the receipt-time checks pass, the selection it arrived
+    /// under is still current and every identifier is bounded.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_sync(
+        selection: &AccountSelection,
+        own_user: &str,
+        own_device: &str,
+        room_id: &str,
+        sender: &str,
+        notification_id: &str,
+        encryption: Option<&EncryptionInfo>,
+        now: Instant,
+    ) -> Option<Self> {
+        let bounded = |id: &str| !id.is_empty() && id.len() <= MAX_RECEIPT_ID_BYTES;
+        if !selection.is_current()
+            || !bounded(room_id)
+            || !bounded(notification_id)
+            || !decline_receipt_qualifies(own_user, own_device, sender, encryption)
+        {
+            return None;
+        }
+        let encryption = encryption?.clone();
+        let device = encryption.sender_device.as_deref()?.to_string();
+        Some(Self {
+            selection: selection.clone(),
+            key: ReceiptKey {
+                account: selection.account_id().to_owned(),
+                room: room_id.to_owned(),
+                notification: notification_id.to_owned(),
+                device,
+            },
+            encryption,
+            expires: now.checked_add(DECLINE_RECEIPT_LIFETIME)?,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct ActionToken(u64);
@@ -193,20 +578,23 @@ enum Phase {
     Ready,
     Joining,
     Established,
+    /// One explicit Decline owns the offer: no Answer, no ringing, and it
+    /// stays pending only until its scope or deadline ends.
+    Declining,
     Revoked,
 }
 struct LeaseState {
     phase: Phase,
     deadline: Instant,
 }
-struct Lease {
+pub(super) struct Lease {
     epoch: u64,
     audible: Arc<AudibleState>,
     state: Mutex<LeaseState>,
     changed: Notify,
 }
 impl Lease {
-    fn new(epoch: u64, deadline: Instant) -> Self {
+    pub(super) fn new(epoch: u64, deadline: Instant) -> Self {
         Self {
             epoch,
             audible: Arc::new(AudibleState::new(deadline)),
@@ -241,7 +629,7 @@ impl Lease {
             && now < state.deadline
             && matches!(
                 state.phase,
-                Phase::Offered | Phase::Reserved | Phase::Ready | Phase::Joining
+                Phase::Offered | Phase::Reserved | Phase::Ready | Phase::Joining | Phase::Declining
             )
     }
     fn advance(
@@ -292,24 +680,40 @@ impl Lease {
     }
 }
 
-struct Pending<T> {
+pub(super) struct Pending<T> {
     payload: T,
     lease: Arc<Lease>,
+    /// Published at least once (shown, and possibly rung).
+    presented: bool,
+    /// Devices whose decline of this offer already began a trust check,
+    /// whatever its outcome. A replay of the same decline (the SDK does not
+    /// deduplicate re-delivered events across sync responses) never starts
+    /// another check or renews withholding. Bounded, and gone with the offer.
+    checked: Vec<String>,
 }
-struct OfferBook<T> {
+/// Distinct declining devices checked per offer; others are ignored.
+const MAX_CHECKED_DEVICES: usize = 8;
+pub(super) struct OfferBook<T> {
     entries: BTreeMap<ActionToken, Pending<T>>,
     next: u64,
+    /// Decline trust checks in flight per offer (bounded by the receipts).
+    checking: BTreeMap<ActionToken, usize>,
 }
 impl<T> Default for OfferBook<T> {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
             next: 1,
+            checking: BTreeMap::new(),
         }
     }
 }
 impl<T> OfferBook<T> {
-    fn insert(&mut self, payload: T, lease: Arc<Lease>) -> Result<ActionToken, ControllerFailure> {
+    pub(super) fn insert(
+        &mut self,
+        payload: T,
+        lease: Arc<Lease>,
+    ) -> Result<ActionToken, ControllerFailure> {
         if self.entries.len() >= MAX_OFFERS {
             return Err(ControllerFailure::Capacity);
         }
@@ -318,25 +722,98 @@ impl<T> OfferBook<T> {
             .next
             .checked_add(1)
             .ok_or(ControllerFailure::Capacity)?;
-        self.entries.insert(token, Pending { payload, lease });
+        self.entries.insert(
+            token,
+            Pending {
+                payload,
+                lease,
+                presented: false,
+                checked: Vec::new(),
+            },
+        );
         Ok(token)
     }
-    fn take(&mut self, token: ActionToken) -> Result<Pending<T>, ControllerFailure> {
+    pub(super) fn take(&mut self, token: ActionToken) -> Result<Pending<T>, ControllerFailure> {
+        self.checking.remove(&token);
         self.entries.remove(&token).ok_or(ControllerFailure::Stale)
+    }
+    /// Every entry, with no check left behind (scope change, stop).
+    fn drain(&mut self) -> BTreeMap<ActionToken, Pending<T>> {
+        self.checking.clear();
+        std::mem::take(&mut self.entries)
+    }
+    /// Begin a decline trust check for `token` from `device`. False (and
+    /// nothing changes) if the offer is gone, that device's decline of it was
+    /// already checked or is being checked, or it already had its bounded
+    /// number of distinct devices: a replayed or excess decline is consumed
+    /// without a check and cannot extend withholding.
+    pub(super) fn begin_check(&mut self, token: ActionToken, device: &str) -> bool {
+        let Some(pending) = self.entries.get_mut(&token) else {
+            return false;
+        };
+        if pending.checked.iter().any(|checked| checked == device)
+            || pending.checked.len() >= MAX_CHECKED_DEVICES
+        {
+            return false;
+        }
+        pending.checked.push(device.to_owned());
+        *self.checking.entry(token).or_default() += 1;
+        true
+    }
+    pub(super) fn end_check(&mut self, token: ActionToken) {
+        if let Some(count) = self.checking.get_mut(&token) {
+            *count -= 1;
+            if *count == 0 {
+                self.checking.remove(&token);
+            }
+        }
+    }
+    /// Not yet shown and awaiting a decline's trust check: not published
+    /// until the check ends, so an authenticated decline that arrived first
+    /// retires it before it is ever shown or rung. An offer already shown
+    /// keeps ringing until a decline is authenticated.
+    pub(super) fn withheld(&self, token: ActionToken) -> bool {
+        self.checking.contains_key(&token)
+            && self
+                .entries
+                .get(&token)
+                .is_some_and(|pending| !pending.presented)
+    }
+    /// Published (shown, and possibly rung) from now on.
+    pub(super) fn mark_presented(&mut self, token: ActionToken) {
+        if let Some(pending) = self.entries.get_mut(&token) {
+            pending.presented = true;
+        }
     }
 }
 
 pub(crate) struct IncomingController {
-    ledger: OfferLedger,
+    /// The one replay ledger. Shared only with the admission in progress
+    /// (begin_receive / finish_receive), which locks it per call and never
+    /// across an await, so settlement can run while that admission waits.
+    ledger: Arc<Mutex<OfferLedger>>,
     book: OfferBook<IncomingOffer>,
     signal: Arc<Signal>,
     selected: Option<AccountSelection>,
     accepting: Arc<AtomicBool>,
 }
+
+/// What an admission captured at its start: the selection and the
+/// controller epoch it began under. finish_receive uses these, never newer
+/// ones.
+pub(crate) struct ReceiveTicket {
+    selection: AccountSelection,
+    epoch: u64,
+}
+impl fmt::Debug for ReceiveTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReceiveTicket { .. }")
+    }
+}
 impl Default for IncomingController {
     fn default() -> Self {
         Self {
-            ledger: OfferLedger::default(),
+            ledger: Arc::new(Mutex::new(OfferLedger::default())),
             book: OfferBook::default(),
             signal: Arc::new(Signal::default()),
             selected: None,
@@ -360,14 +837,22 @@ impl IncomingController {
     }
     fn retire(&mut self, offer: &IncomingOffer) {
         // Admission already reserved this key, so retiring cannot need capacity.
-        let _ = self.ledger.retire(OfferKey::new(
-            offer.selection.account_id(),
-            offer.room.room_id().as_str(),
-            offer.ring.event_id(),
-        ));
+        let _ = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retire(OfferKey::new(
+                offer.selection.account_id(),
+                offer.room.room_id().as_str(),
+                offer.ring.event_id(),
+            ));
+    }
+    /// The shared replay ledger, for the admission begun by begin_receive.
+    pub(crate) fn ledger(&self) -> Arc<Mutex<OfferLedger>> {
+        Arc::clone(&self.ledger)
     }
     fn clear_offers(&mut self) {
-        let entries = std::mem::take(&mut self.book.entries);
+        let entries = self.book.drain();
         for (_, pending) in entries {
             pending.lease.revoke();
             self.retire(&pending.payload);
@@ -396,13 +881,19 @@ impl IncomingController {
     /// Serialized admission, at most four live observers. The SDK must retain
     /// this event as an unsolicited sync receipt; arbitrary event fetches cannot
     /// create an offer. Intake queues/room discovery belong to the future worker.
-    pub(crate) async fn receive(
+    ///
+    /// It runs in three steps so no controller borrow spans its awaits:
+    /// begin_receive (synchronous: selection, epoch, capacity), then the
+    /// caller's one IncomingOffer::admit future with this controller's shared
+    /// ledger (its one-time observation), then finish_receive (synchronous:
+    /// the original selection and epoch, then the book). Only the incoming
+    /// actor admits, one admission at a time, and only removals (settlement,
+    /// expiry) can happen to the book in between.
+    pub(crate) fn begin_receive(
         &mut self,
-        manager: &AccountManager,
-        preferences: &VoiceSpaces,
         room: &RoomId,
         event: &EventId,
-    ) -> Result<ActionToken, ControllerFailure> {
+    ) -> Result<ReceiveTicket, ControllerFailure> {
         self.reap();
         let selection = self
             .selected
@@ -423,6 +914,8 @@ impl IncomingController {
         };
         if self.accepting.load(Ordering::Acquire) || self.book.entries.len() >= MAX_OFFERS {
             self.ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
                 .retire(OfferKey::new(
                     selection.account_id(),
                     room.as_str(),
@@ -431,9 +924,16 @@ impl IncomingController {
                 .map_err(|_| ControllerFailure::Capacity)?;
             return Err(ControllerFailure::Capacity);
         }
-        let offer = IncomingOffer::admit(manager, preferences, room, event, &mut self.ledger)
-            .await
-            .map_err(ControllerFailure::Admission)?;
+        Ok(ReceiveTicket { selection, epoch })
+    }
+    /// The end of the admission begun by begin_receive, with its result.
+    pub(crate) fn finish_receive(
+        &mut self,
+        ticket: ReceiveTicket,
+        admitted: Result<IncomingOffer, AdmissionFailure>,
+    ) -> Result<ActionToken, ControllerFailure> {
+        let ReceiveTicket { selection, epoch } = ticket;
+        let offer = admitted.map_err(ControllerFailure::Admission)?;
         let lease = Arc::new(Lease::new(epoch, offer.deadline()));
         if offer.selection.account_id() != selection.account_id()
             || !selection.is_current()
@@ -446,9 +946,20 @@ impl IncomingController {
     }
     pub(crate) fn presentations(&mut self) -> Vec<OfferPresentation> {
         self.reap();
+        let shown: Vec<_> = self
+            .book
+            .entries
+            .keys()
+            .copied()
+            .filter(|token| !self.book.withheld(*token))
+            .collect();
+        for token in &shown {
+            self.book.mark_presented(*token);
+        }
         self.book
             .entries
             .iter()
+            .filter(|(token, _)| shown.contains(token))
             .map(|(token, pending)| OfferPresentation {
                 token: *token,
                 account_id: pending.payload.selection.account_id().to_owned(),
@@ -470,6 +981,128 @@ impl IncomingController {
         pending.lease.revoke();
         self.retire(&pending.payload);
         Ok(())
+    }
+    /// Explicit protocol Decline. Consumes the token synchronously, retires
+    /// its ledger key (the offer is never shown or answered again) and stops
+    /// its ringing, keeping the offer under its original lease, epoch and
+    /// selection. Nothing is sent here: DeclineClaim::send makes the one
+    /// bounded attempt, and dropping the claim revokes it.
+    pub(crate) fn decline(
+        &mut self,
+        token: ActionToken,
+    ) -> Result<DeclineClaim, ControllerFailure> {
+        self.reap();
+        let pending = self.book.take(token)?;
+        self.retire(&pending.payload);
+        if let Err(failure) = pending.lease.advance(
+            &self.signal,
+            Instant::now(),
+            pending.payload.selection.is_current(),
+            Phase::Offered,
+            Phase::Declining,
+            pending.payload.deadline(),
+        ) {
+            pending.lease.revoke();
+            return Err(failure);
+        }
+        Ok(DeclineClaim {
+            offer: pending.payload,
+            lease: pending.lease,
+            signal: Arc::clone(&self.signal),
+        })
+    }
+    /// Retire each offer that another trusted device of the same user has
+    /// declined, exactly as dismiss does (lease revoked, so its ringing, row
+    /// and banner end; ledger key retired, so it is never offered again).
+    /// Nothing is sent, joined, left or opened. A receipt settles an offer
+    /// only when it is still current and unexpired and matches an offer in
+    /// the book (so not one already being answered or declined here) with:
+    /// - the same account, under a selection that is still current;
+    /// - exactly the offer's room and retained notification;
+    /// - the offer's own user as sender, from a device other than its own;
+    /// - that device still current and cross-signing trusted now, with the
+    ///   same keys the decline was decrypted with (require_current_sender).
+    ///
+    /// This runs in two synchronous steps around an owned trust check, so the
+    /// actor keeps serving commands while a check waits (no controller borrow
+    /// is held across it):
+    /// - match_declines pairs each live receipt with its exact offer and
+    ///   returns a DeclineCheck that captured the original token and facts;
+    ///   the offer is withheld from presentation meanwhile if it was not yet
+    ///   shown (OfferBook::withheld);
+    /// - finish_decline, after the check, revalidates every original fact
+    ///   (including the receipt's own deadline) and only then dismisses.
+    ///
+    /// A matched receipt is consumed whether or not it settled the offer; a
+    /// failed trust check is never retried. At most `room` checks are begun;
+    /// receipts that match no offer yet (its admission may still be running),
+    /// or exceed `room`, are returned for retention.
+    pub(crate) fn match_declines(
+        &mut self,
+        receipts: Vec<DeclineReceipt>,
+        room: usize,
+    ) -> (Vec<DeclineCheck>, Vec<DeclineReceipt>) {
+        self.reap();
+        let now = Instant::now();
+        let mut checks = Vec::new();
+        let mut unmatched = Vec::new();
+        for receipt in receipts {
+            if !receipt.current() || now >= receipt.expires() {
+                continue;
+            }
+            let found = (checks.len() < room)
+                .then(|| {
+                    self.book.entries.iter().find_map(|(token, pending)| {
+                        let offer = &pending.payload;
+                        let facts = OfferFacts::of(offer);
+                        (offer.selection.is_current() && decline_matches(&receipt, &facts))
+                            .then(|| (*token, facts.owned(), offer.client.clone()))
+                    })
+                })
+                .flatten();
+            let Some((token, facts, client)) = found else {
+                unmatched.push(receipt);
+                continue;
+            };
+            // A replay of a decline already checked (or being checked) for
+            // this offer is consumed here without a second check.
+            if self.book.begin_check(token, &receipt.key.device) {
+                checks.push(DeclineCheck {
+                    token,
+                    facts,
+                    receipt,
+                    client,
+                });
+            }
+        }
+        (checks, unmatched)
+    }
+    /// The end of one decline's trust check. The offer is dismissed only if
+    /// the device was trusted, the receipt is still current and before its
+    /// own original deadline, and the same token is still a pending book
+    /// offer of a current selection with exactly the captured facts.
+    pub(crate) fn finish_decline(&mut self, check: DeclineCheck, trusted: bool) -> bool {
+        self.book.end_check(check.token);
+        let now = Instant::now();
+        let settles = self.book.entries.get(&check.token).is_some_and(|pending| {
+            let offer = &pending.payload;
+            decline_still_settles(
+                trusted,
+                check.receipt.current(),
+                check.receipt.expires(),
+                now,
+                offer.selection.is_current()
+                    && pending
+                        .lease
+                        .pending(&self.signal, now, offer.selection.is_current()),
+                OfferFacts::of(offer) == check.facts.borrowed()
+                    && decline_matches(&check.receipt, &check.facts.borrowed()),
+            )
+        });
+        if settles {
+            let _ = self.dismiss(check.token);
+        }
+        settles
     }
     /// Retained for explicit diagnostics only. The live worker uses cached
     /// hints: cancelling this network pass would revoke an offer being answered.
@@ -560,6 +1193,62 @@ impl Drop for WorkGuard {
         if !self.complete {
             self.lease.revoke();
         }
+    }
+}
+
+/// One explicit Decline's single-use ownership of an offer, out of the book.
+/// It keeps the click's original offer (account, room, notification, receipt
+/// generation, selection) and lease. Dropping it, for example when its UI
+/// task is aborted at shutdown, revokes the lease; nothing is queued or
+/// retried afterwards.
+pub(crate) struct DeclineClaim {
+    offer: IncomingOffer,
+    lease: Arc<Lease>,
+    signal: Arc<Signal>,
+}
+impl fmt::Debug for DeclineClaim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeclineClaim { .. }")
+    }
+}
+impl Drop for DeclineClaim {
+    fn drop(&mut self) {
+        self.lease.revoke();
+    }
+}
+impl DeclineClaim {
+    pub(crate) fn selection(&self) -> &AccountSelection {
+        &self.offer.selection
+    }
+    /// The one bounded attempt. `allowed` is the click's own fence (its
+    /// security generation); with the lease, epoch and original selection it
+    /// is checked before the trust check, the fetch and the send. The scope
+    /// ending (account switch, lock, removal, policy change, worker stop,
+    /// expiry) cancels the attempt: before the send that is NotSent, during
+    /// it Unknown. Never reacquires authority.
+    pub(crate) async fn send(
+        mut self,
+        manager: &AccountManager,
+        preferences: &VoiceSpaces,
+        allowed: impl Fn() -> bool + Send + Sync,
+    ) -> DeclineOutcome {
+        let selection = self.offer.selection.clone();
+        let lease = Arc::clone(&self.lease);
+        let signal = Arc::clone(&self.signal);
+        let sending = AtomicBool::new(false);
+        let current =
+            || allowed() && lease.pending(&signal, Instant::now(), selection.is_current());
+        let outcome = tokio::select! {
+            biased;
+            _ = wait_invalid(&lease, &signal, &selection) => None,
+            outcome = self.offer.decline(manager, preferences, current, &sending) => Some(outcome),
+        };
+        self.lease.revoke();
+        outcome.unwrap_or(if sending.load(Ordering::Acquire) {
+            DeclineOutcome::Unknown
+        } else {
+            DeclineOutcome::NotSent
+        })
     }
 }
 
@@ -1108,6 +1797,389 @@ mod tests {
     ) -> Result<(), ControllerFailure> {
         lease.advance(signal, now, true, from, to, now + Duration::from_secs(60))
     }
+
+    fn own_decline_info() -> EncryptionInfo {
+        use matrix_sdk::ruma::{DeviceKeyAlgorithm, device_id, user_id};
+        EncryptionInfo {
+            sender: user_id!("@me:example.org").to_owned(),
+            sender_device: Some(device_id!("PHONE").to_owned()),
+            forwarder: None,
+            algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key: "phone_curve_key".into(),
+                sender_claimed_keys: [(DeviceKeyAlgorithm::Ed25519, "phone_signing_key".into())]
+                    .into(),
+                session_id: Some("phone_session".into()),
+            },
+            verification_state: VerificationState::Verified,
+        }
+    }
+
+    /// Only a verified, Megolm-encrypted decline with its own session, sent by
+    /// this user from another device and not decrypted with forwarded keys,
+    /// may be retained. Plaintext, unverified, forwarded-key, own-device,
+    /// foreign or mismatched evidence never qualifies.
+    #[test]
+    fn only_verified_own_other_device_declines_qualify_at_receipt() {
+        use matrix_sdk::{
+            deserialized_responses::{ForwarderInfo, VerificationLevel},
+            ruma::{device_id, user_id},
+        };
+        let qualifies = |info: Option<&EncryptionInfo>, sender: &str| {
+            decline_receipt_qualifies("@me:example.org", "LAPTOP", sender, info)
+        };
+        let good = own_decline_info();
+        assert!(qualifies(Some(&good), "@me:example.org"));
+        assert!(!qualifies(None, "@me:example.org"), "plaintext");
+        assert!(
+            !qualifies(Some(&good), "@other:example.org"),
+            "foreign event sender"
+        );
+        assert!(!decline_receipt_qualifies(
+            "@me:example.org",
+            "PHONE",
+            "@me:example.org",
+            Some(&good)
+        ));
+        assert!(!decline_receipt_qualifies("", "LAPTOP", "", Some(&good)));
+
+        let mut info = own_decline_info();
+        info.verification_state = VerificationState::Unverified(VerificationLevel::UnsignedDevice);
+        assert!(!qualifies(Some(&info), "@me:example.org"), "unverified");
+        let mut info = own_decline_info();
+        info.forwarder = Some(ForwarderInfo {
+            user_id: user_id!("@me:example.org").to_owned(),
+            device_id: device_id!("TABLET").to_owned(),
+        });
+        assert!(!qualifies(Some(&info), "@me:example.org"), "forwarded keys");
+        let mut info = own_decline_info();
+        info.sender = user_id!("@other:example.org").to_owned();
+        assert!(
+            !qualifies(Some(&info), "@me:example.org"),
+            "decrypted sender differs"
+        );
+        let mut info = own_decline_info();
+        info.sender_device = None;
+        assert!(!qualifies(Some(&info), "@me:example.org"), "no device");
+        let mut info = own_decline_info();
+        info.algorithm_info = AlgorithmInfo::MegolmV1AesSha2 {
+            curve25519_key: "phone_curve_key".into(),
+            sender_claimed_keys: BTreeMap::new(),
+            session_id: None,
+        };
+        assert!(!qualifies(Some(&info), "@me:example.org"), "no session");
+        let mut info = own_decline_info();
+        info.algorithm_info = AlgorithmInfo::OlmV1Curve25519AesSha2 {
+            curve25519_public_key_base64: "phone_curve_key".into(),
+        };
+        assert!(
+            !qualifies(Some(&info), "@me:example.org"),
+            "not a room event key"
+        );
+    }
+
+    struct Fact {
+        key: ReceiptKey,
+        expires: Instant,
+        current: Arc<AtomicBool>,
+    }
+    impl BufferedReceipt for Fact {
+        fn key(&self) -> &ReceiptKey {
+            &self.key
+        }
+        fn expires(&self) -> Instant {
+            self.expires
+        }
+        fn current(&self) -> bool {
+            self.current.load(Ordering::SeqCst)
+        }
+    }
+    fn fact(notification: &str, device: &str, expires: Instant, current: &Arc<AtomicBool>) -> Fact {
+        Fact {
+            key: ReceiptKey {
+                account: "account".into(),
+                room: "!room:example.org".into(),
+                notification: notification.into(),
+                device: device.into(),
+            },
+            expires,
+            current: current.clone(),
+        }
+    }
+
+    /// Retained declines are bounded and short-lived: a duplicate keeps the
+    /// first, a full buffer refuses the newest, expired or no longer current
+    /// receipts are dropped, and receipts put back after a settlement pass
+    /// stay ahead of newer ones.
+    #[test]
+    fn retained_declines_are_bounded_short_lived_and_scoped() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(60);
+        let current = Arc::new(AtomicBool::new(true));
+        let mut buffer = ReceiptBuffer::default();
+        assert!(buffer.insert(fact("$one", "PHONE", later, &current), now));
+        assert!(
+            !buffer.insert(fact("$one", "PHONE", later, &current), now),
+            "duplicate"
+        );
+        assert!(buffer.insert(fact("$one", "TABLET", later, &current), now));
+        assert!(
+            !buffer.insert(fact("$past", "PHONE", now, &current), now),
+            "expired"
+        );
+        for index in buffer.len()..MAX_DECLINE_RECEIPTS {
+            assert!(buffer.insert(
+                fact(&format!("$fill{index}"), "PHONE", later, &current),
+                now
+            ));
+        }
+        assert!(
+            !buffer.insert(fact("$newest", "PHONE", later, &current), now),
+            "full"
+        );
+        assert_eq!(buffer.len(), MAX_DECLINE_RECEIPTS);
+
+        // Settlement takes everything live; unmatched receipts go back ahead
+        // of a newer one, and the bound then drops the newest.
+        let taken = buffer.take(now);
+        assert_eq!(taken.len(), MAX_DECLINE_RECEIPTS);
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.insert(fact("$arrived", "PHONE", later, &current), now));
+        buffer.restore(taken, now);
+        assert_eq!(buffer.len(), MAX_DECLINE_RECEIPTS);
+        assert!(
+            buffer
+                .take(now)
+                .iter()
+                .all(|entry| entry.key.notification != "$arrived"),
+            "older receipts keep their place"
+        );
+
+        // Expiry and a revoked selection drop receipts; clear empties.
+        assert!(buffer.insert(
+            fact("$short", "PHONE", now + Duration::from_secs(1), &current),
+            now
+        ));
+        assert!(buffer.take(now + Duration::from_secs(1)).is_empty());
+        let revoked = Arc::new(AtomicBool::new(true));
+        assert!(buffer.insert(fact("$scoped", "PHONE", later, &revoked), now));
+        revoked.store(false, Ordering::SeqCst);
+        assert!(
+            buffer.take(now).is_empty(),
+            "a revoked selection's receipt is gone"
+        );
+        assert!(!buffer.insert(fact("$scoped", "PHONE", later, &revoked), now));
+        assert!(buffer.insert(fact("$kept", "PHONE", later, &current), now));
+        buffer.clear();
+        assert_eq!(buffer.len(), 0);
+    }
+
+    struct Scope {
+        account: String,
+        current: Arc<AtomicBool>,
+    }
+    impl ReceiptScope for Scope {
+        fn scope_account(&self) -> &str {
+            &self.account
+        }
+        fn scope_current(&self) -> bool {
+            self.current.load(Ordering::SeqCst)
+        }
+    }
+    fn scope(current: &Arc<AtomicBool>) -> Scope {
+        Scope {
+            account: "account".into(),
+            current: current.clone(),
+        }
+    }
+
+    /// Retention and its cleanup are one serialized protocol: a callback
+    /// dispatched before a stop or a scope change cannot insert afterwards,
+    /// receipts taken for settlement cannot come back after a stop or scope
+    /// change that happened meanwhile, and only the current scope's own
+    /// receipts are ever admitted. Confirming the same current selection
+    /// keeps what it already holds.
+    #[test]
+    fn retained_declines_cannot_outlive_a_stop_or_scope_change() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(60);
+        let selected = Arc::new(AtomicBool::new(true));
+        let mut store: ScopedReceipts<Fact, Scope> = ScopedReceipts::default();
+        // Before any scope: nothing is admitted.
+        assert!(!store.insert(fact("$early", "PHONE", later, &selected), now));
+        store.reset(Some(scope(&selected)));
+        assert!(store.insert(fact("$one", "PHONE", later, &selected), now));
+        // The same selection confirmed again keeps it.
+        store.reset(Some(scope(&selected)));
+        assert_eq!(store.len(), 1);
+        // Another account's receipt never enters this scope.
+        let mut other = fact("$two", "PHONE", later, &selected);
+        other.key.account = "other".into();
+        assert!(!store.insert(other, now));
+
+        // Taken for settlement, then the scope changes before the restore.
+        let taken = store.take(now);
+        assert_eq!(taken.len(), 1);
+        let newer = Arc::new(AtomicBool::new(true));
+        selected.store(false, Ordering::SeqCst);
+        store.reset(Some(scope(&newer)));
+        store.restore(taken, now);
+        assert_eq!(store.len(), 0, "the old scope's receipt is not restored");
+        // A late callback from the old selection is refused too.
+        assert!(!store.insert(fact("$late", "PHONE", later, &selected), now));
+        assert!(store.insert(fact("$new", "PHONE", later, &newer), now));
+
+        // Taken, then stopped before the restore: it stays empty, and a
+        // callback dispatched before the stop cannot insert after it.
+        let taken = store.take(now);
+        store.stop();
+        store.restore(taken, now);
+        assert_eq!(store.len(), 0);
+        assert!(!store.insert(fact("$after", "PHONE", later, &newer), now));
+        // Stopped is for good, whatever scope is offered later.
+        store.reset(Some(scope(&newer)));
+        assert!(!store.insert(fact("$again", "PHONE", later, &newer), now));
+
+        // A scope whose selection was revoked admits nothing.
+        let revoked = Arc::new(AtomicBool::new(true));
+        let mut store: ScopedReceipts<Fact, Scope> = ScopedReceipts::default();
+        store.reset(Some(scope(&revoked)));
+        assert!(store.insert(fact("$one", "PHONE", later, &revoked), now));
+        revoked.store(false, Ordering::SeqCst);
+        assert!(store.take(now).is_empty());
+        assert!(!store.insert(fact("$two", "PHONE", later, &revoked), now));
+    }
+
+    /// While one offer's decline trust check is held, that offer is withheld
+    /// only if it was never shown; another offer stays shown and can still be
+    /// taken (Answer, Decline, Dismiss) at once. Taking or draining (scope
+    /// change, stop) ends the bookkeeping, and a check that ends afterwards
+    /// changes nothing.
+    #[test]
+    fn a_held_decline_check_withholds_only_its_unshown_offer() {
+        let (_, lease, _) = setup();
+        let mut book = OfferBook::default();
+        let held = book.insert(1u8, lease.clone()).unwrap();
+        let other = book.insert(2u8, lease.clone()).unwrap();
+        let shown = book.insert(3u8, lease.clone()).unwrap();
+        book.entries.get_mut(&shown).unwrap().presented = true;
+        assert!(book.begin_check(held, "PHONE"));
+        assert!(book.begin_check(shown, "PHONE"));
+        assert!(
+            book.withheld(held),
+            "never shown: withheld while its check runs"
+        );
+        assert!(!book.withheld(shown), "already shown: keeps ringing");
+        assert!(!book.withheld(other));
+        // A replay of the same decline while its check is in flight starts
+        // nothing.
+        assert!(!book.begin_check(held, "PHONE"), "replay while in flight");
+        // Another call is answered while the check is held.
+        assert_eq!(book.take(other).unwrap().payload, 2);
+        assert!(book.withheld(held));
+        // The check ends untrusted: the offer is shown normally.
+        book.end_check(held);
+        assert!(!book.withheld(held));
+        // A replay after that failed completion neither checks again nor
+        // renews withholding.
+        assert!(
+            !book.begin_check(held, "PHONE"),
+            "replay after a failed check"
+        );
+        assert!(!book.withheld(held));
+        // Two checks for one offer (two devices): withheld until both end.
+        assert!(book.begin_check(held, "TABLET"));
+        assert!(book.begin_check(held, "DESKTOP"));
+        book.end_check(held);
+        assert!(book.withheld(held));
+        book.end_check(held);
+        assert!(!book.withheld(held));
+        // Distinct devices per offer are bounded.
+        for index in book.entries[&held].checked.len()..MAX_CHECKED_DEVICES {
+            assert!(book.begin_check(held, &format!("DEVICE{index}")));
+            book.end_check(held);
+        }
+        assert!(!book.begin_check(held, "ONE_MORE"), "bounded");
+        assert!(!book.withheld(held));
+        // Expiry or another removal takes it, and a stop drains the rest; a
+        // check that ends afterwards, or begins for a gone offer, is inert.
+        let fresh = book.insert(4u8, lease.clone()).unwrap();
+        assert!(book.begin_check(fresh, "PHONE"));
+        book.take(fresh).unwrap();
+        book.end_check(fresh);
+        assert!(!book.begin_check(fresh, "LAPTOP"));
+        assert!(book.begin_check(shown, "TABLET"));
+        assert_eq!(book.drain().len(), 2);
+        assert!(book.checking.is_empty());
+        book.end_check(shown);
+        assert!(!book.begin_check(shown, "DESKTOP"));
+    }
+
+    /// A decline matches only exactly its offer, and after the trust check
+    /// it settles only if every original condition still holds then,
+    /// including the receipt's own deadline: a check that completes after the
+    /// receipt expired settles nothing, even while the offer stays live.
+    #[test]
+    fn a_decline_settles_only_its_exact_offer_before_its_own_deadline() {
+        let offer = OfferFacts {
+            account: "account",
+            room: "!room:example.org",
+            notification: "$ring",
+            own_user: "@me:example.org",
+            own_device: "LAPTOP",
+        };
+        let key = |account: &str, room: &str, notification: &str, device: &str| ReceiptKey {
+            account: account.into(),
+            room: room.into(),
+            notification: notification.into(),
+            device: device.into(),
+        };
+        let exact = key("account", "!room:example.org", "$ring", "PHONE");
+        assert!(decline_key_matches(&exact, "@me:example.org", &offer));
+        for (wrong, sender) in [
+            (
+                key("other", "!room:example.org", "$ring", "PHONE"),
+                "@me:example.org",
+            ),
+            (
+                key("account", "!other:example.org", "$ring", "PHONE"),
+                "@me:example.org",
+            ),
+            (
+                key("account", "!room:example.org", "$older", "PHONE"),
+                "@me:example.org",
+            ),
+            (
+                key("account", "!room:example.org", "$ring", "LAPTOP"),
+                "@me:example.org",
+            ),
+            (exact.clone(), "@caller:example.org"),
+        ] {
+            assert!(
+                !decline_key_matches(&wrong, sender, &offer),
+                "{wrong:?} {sender}"
+            );
+        }
+
+        let now = Instant::now();
+        let expires = now + Duration::from_secs(1);
+        assert!(decline_still_settles(true, true, expires, now, true, true));
+        assert!(
+            !decline_still_settles(true, true, expires, expires, true, true),
+            "trust completed after the receipt's own deadline"
+        );
+        assert!(!decline_still_settles(
+            false, true, expires, now, true, true
+        ));
+        assert!(!decline_still_settles(
+            true, false, expires, now, true, true
+        ));
+        assert!(!decline_still_settles(
+            true, true, expires, now, false, true
+        ));
+        assert!(!decline_still_settles(
+            true, true, expires, now, true, false
+        ));
+    }
     #[test]
     fn pending_cancellation_does_not_borrow_the_send_only_offer() {
         fn require_send<T: Send>() {}
@@ -1121,6 +2193,60 @@ mod tests {
             drop(offer);
             require_owned(waiting);
         };
+    }
+
+    /// A Decline owns its offer exclusively: taking it stops the ringing at
+    /// once, Answer can no longer reserve or join it, and it stays pending
+    /// only while its account, epoch and deadline last. Its cancellation
+    /// fence resolves when the scope ends, so an attempt still before its
+    /// send reports NotSent rather than sending later.
+    #[tokio::test]
+    async fn a_decline_claim_excludes_answer_and_ends_with_its_scope() {
+        fn require_send<T: Send>() {}
+        fn require_send_future<F: Future + Send>(_: &F) {}
+        require_send::<DeclineClaim>();
+        let _check = |claim: DeclineClaim, manager: &AccountManager, preferences: &VoiceSpaces| {
+            let attempt = claim.send(manager, preferences, || true);
+            require_send_future(&attempt);
+        };
+
+        let (signal, lease, now) = setup();
+        advance(&lease, &signal, now, Phase::Offered, Phase::Declining).unwrap();
+        assert!(
+            !lease.audible.current(true, true, now),
+            "declining stops its ringing"
+        );
+        assert!(lease.pending(&signal, now, true));
+        for (from, to) in [
+            (Phase::Offered, Phase::Reserved),
+            (Phase::Reserved, Phase::Ready),
+            (Phase::Ready, Phase::Joining),
+            (Phase::Joining, Phase::Established),
+        ] {
+            assert_eq!(
+                advance(&lease, &signal, now, from, to),
+                Err(ControllerFailure::Stale),
+                "Answer cannot take a declining offer"
+            );
+        }
+        assert!(!lease.established(&signal, true));
+        assert!(wait_scope_invalid(&lease, &signal).now_or_never().is_none());
+        // Account switch, expiry and invalidation each end it.
+        assert!(!lease.pending(&signal, now, false));
+        assert!(!lease.pending(&signal, now + Duration::from_secs(30), true));
+        InvalidationHandle(signal.clone()).invalidate();
+        assert!(!lease.pending(&signal, now, true));
+        assert!(wait_scope_invalid(&lease, &signal).now_or_never().is_some());
+
+        // A dropped or finished claim's lease is revoked for good.
+        let (signal, lease, now) = setup();
+        advance(&lease, &signal, now, Phase::Offered, Phase::Declining).unwrap();
+        lease.revoke();
+        assert!(!lease.pending(&signal, now, true));
+        assert_eq!(
+            advance(&lease, &signal, now, Phase::Offered, Phase::Reserved),
+            Err(ControllerFailure::Stale)
+        );
     }
 
     #[test]

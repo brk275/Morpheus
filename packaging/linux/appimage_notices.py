@@ -38,11 +38,19 @@ BUILD_ID_NOTE = re.compile(
     r"[ \t]+Build ID:[ \t]*([0-9a-f]+)[ \t]*$", re.MULTILINE)
 
 
+# Tool binaries fail root_owned as `tool`. A system library path, a package's
+# copyright file or a referenced common license instead names the property
+# that failed; every check stays as strict as for a tool.
+PATH_FAMILIES = ("library_path", "copyright", "common_license")
+PATH_PROPERTIES = ("missing", "owner", "mode", "type", "access")
+REASONS = frozenset(("input", "tool", "elf", "dependency", "package", "notice", "deployment", "limit",
+                     "elf_build_id", "elf_needed", "elf_soname", "elf_search", "search",
+                     *(family + "_" + kind for family in PATH_FAMILIES for kind in PATH_PROPERTIES)))
+
+
 class InventoryFailure(RuntimeError):
     def __init__(self, reason):
-        allowed = {"input", "tool", "elf", "dependency", "package", "notice", "deployment", "limit",
-                   "elf_build_id", "elf_needed", "elf_soname", "elf_search", "search"}
-        self.reason = reason if reason in allowed else "input"
+        self.reason = reason if reason in REASONS else "input"
         super().__init__("AppImage inventory failed: " + self.reason)
 
 
@@ -57,21 +65,37 @@ def regular(path, bound):
         raise InventoryFailure("input") from None
 
 
-def root_owned(path):
-    """Follow only a root-controlled system path; preserve no ambient overrides."""
+def root_owned(path, family="tool"):
+    """Follow only a root-controlled system path; preserve no ambient overrides.
+
+    Every component of the path and of its resolution must be owned by root
+    and, unless it is a symlink, not group- or world-writable; the target must
+    be a regular file. A failure is `tool`, or for a PATH_FAMILIES caller
+    `<family>_<property>`: missing, owner, mode, type or other access failure.
+    """
+    def failure(kind):
+        return InventoryFailure("tool" if family == "tool" else family + "_" + kind)
+
     try:
         path = Path(path).absolute()
         for candidate in (path, path.resolve(strict=True)):
             for item in (candidate, *candidate.parents):
                 info = item.lstat()
-                if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022):
-                    raise InventoryFailure("tool")
+                if info.st_uid != 0:
+                    raise failure("owner")
+                if not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
+                    raise failure("mode")
         resolved = path.resolve(strict=True)
         if not resolved.is_file():
-            raise InventoryFailure("tool")
+            raise failure("type")
         return resolved
-    except OSError:
-        raise InventoryFailure("tool") from None
+    except InventoryFailure:
+        raise
+    except (FileNotFoundError, NotADirectoryError):
+        raise failure("missing") from None
+    except (OSError, RuntimeError):
+        # Python before 3.13 reports a symlink loop as RuntimeError.
+        raise failure("access") from None
 
 
 def command(runner, label, argv, root, environment, *, limit=1024 * 1024, expected_status=(0,)):
@@ -143,7 +167,7 @@ def resolve_library(name):
     for directory in SYSTEM_DIRS:
         path = directory / name
         if path.exists() or path.is_symlink():
-            found.add(root_owned(path))
+            found.add(root_owned(path, "library_path"))
     if len(found) != 1:
         raise InventoryFailure("dependency")
     return found.pop()
@@ -190,7 +214,7 @@ def package_record(runner, path, root, environment):
                      "--showformat=${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n",
                      "--", owner], root, environment)
     record = parse_package_record(output, owner)
-    notice = root_owned(Path("/usr/share/doc") / owner.split(":")[0] / "copyright")
+    notice = root_owned(Path("/usr/share/doc") / owner.split(":")[0] / "copyright", "copyright")
     data = regular(notice, MAX_NOTICE)
     if not data.strip():
         raise InventoryFailure("notice")
@@ -200,8 +224,20 @@ def package_record(runner, path, root, environment):
         text = name.rstrip(b".").decode("ascii")
         if not text:
             raise InventoryFailure("notice")
-        common[text] = regular(root_owned(Path("/usr/share/common-licenses") / text), MAX_NOTICE)
+        license_path = root_owned(Path("/usr/share/common-licenses") / text, "common_license")
+        common[text] = regular(license_path, MAX_NOTICE)
     return record, data, common
+
+
+def system_dependency(runner, name, root, environment):
+    """One installed library's exact record, owning package and notices.
+
+    Read-only: shared by prepare and the hosted notice preflight so both take
+    the same resolution, readelf, dpkg-query and notice steps in order.
+    """
+    path = resolve_library(name)
+    record = elf_record(runner, path, root, environment, "inventory-elf-dependency")
+    return record, *package_record(runner, path, root, environment)
 
 
 def add_notice(directory, config, notices, name, data):
@@ -250,9 +286,7 @@ def prepare(runner, root, binary, stage, source_metadata, config, environment):
                 raise InventoryFailure("input")
             record.update(kind="pipewire", source_version=source_metadata["source_version"])
         else:
-            path = resolve_library(name)
-            record = elf_record(runner, path, root, environment, "inventory-elf-dependency")
-            package, copyright_text, common = package_record(runner, path, root, environment)
+            record, package, copyright_text, common = system_dependency(runner, name, root, environment)
             key = package["package"].replace(":", "_")
             notice = add_notice(directory, config, notices, key + ".copyright", copyright_text)
             for common_name, content in common.items():

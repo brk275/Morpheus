@@ -1,0 +1,45 @@
+# Morpheus theme pack: Tidepool. Deep teal surfaces with sea-glass accents.
+# Colors only; import it from Settings > Appearance > Theme packs.
+schema_version = 1
+name = "Tidepool"
+
+[colors]
+rail = "#0E181B"
+sidebar = "#122024"
+canvas = "#152529"
+panel = "#1A2C31"
+elevated = "#21363C"
+hover = "#294248"
+ink = "#E3F1F0"
+muted = "#9BB8B6"
+divider = "#2C4449"
+accent = "#4FC1B0"
+accent_ink = "#06221E"
+
+[roles]
+link = "#7FD3E8"
+focus = "#F2C26B"
+selection = "#245B5A"
+selection_ink = "#F1FFFD"
+error = "#F08A8A"
+error_surface = "#3A1F24"
+error_ink = "#FFD9D9"
+success = "#7ED6A0"
+success_surface = "#173426"
+success_ink = "#D8F7E2"
+unread = "#4FC1B0"
+unread_ink = "#06221E"
+destructive = "#E06C75"
+destructive_ink = "#1B0B0D"
+timestamp = "#8FAFAD"
+
+[states]
+icon = "#9BB8B6"
+icon_active = "#4FC1B0"
+icon_navigation = "#B8D4D2"
+icon_header = "#9BB8B6"
+icon_composer = "#86C9C0"
+icon_message = "#8FAFAD"
+
+[senders]
+colors = ["#7FD3E8", "#F2C26B", "#B39DDB", "#8BD9A6", "#F4A7B9", "#E8D58B"]

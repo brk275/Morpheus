@@ -1,0 +1,632 @@
+// Native viewer for one explicitly opened image attachment. Rust fetches and
+// decodes only on request, one at a time, and never prefetches neighbours;
+// this file lays out fit, zoom, pan and quarter turns and reports navigation,
+// cancel, retry, playback, save and close. Zoom, pan and turns change
+// immediately, with no animation; an animated picture plays only when Rust
+// says so. The window passes its resolved semantic colors and appearance
+// preferences in; this file cannot import the window's globals.
+
+export struct ViewerPalette {
+    ink: color,
+    muted: color,
+    accent: color,
+    accent-ink: color,
+    surface: color,
+    backdrop: color,
+    scrim: color,
+    // The control hover state, else the window's hover color.
+    hover: color,
+    // The control pressed state, else the hover color.
+    pressed: color,
+    // Whether a theme or config.toml set the hover or pressed state. A set
+    // state shows on the primary Close action too; otherwise it keeps the
+    // accent.
+    hover-set: bool,
+    pressed-set: bool,
+    // The control disabled state; used only when `disabled-set`, otherwise an
+    // unavailable action keeps its built-in dimming.
+    disabled: color,
+    disabled-set: bool,
+    focus: color,
+    error: color,
+}
+
+// Resolved existing appearance preferences; no settings store of its own.
+// At the default preferences every value equals the viewer's built-in look.
+export struct ViewerStyle {
+    dialog-radius: length,
+    stage-radius: length,
+    control-radius: length,
+    line-width: length,
+    focus-width: length,
+    // Horizontal padding inside an action, each side.
+    action-padding: length,
+    // The configured icon size relative to the built-in one, for glyphs.
+    glyph-scale: float,
+}
+
+// A keyboard and pointer action with a text label.
+component ViewerAction inherits Rectangle {
+    in property <string> text;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    // A one-character symbol (arrows, + and -) that follows the icon size.
+    in property <bool> glyph: false;
+    in property <ViewerPalette> palette;
+    in property <ViewerStyle> style;
+    // The resting surface; hover and pressed states draw over it.
+    in property <color> idle-surface: transparent;
+    in property <float> text-scale: 1;
+    out property <bool> has-focus: keyboard-focus.has-focus;
+    callback activated();
+    width: max(32px, action-text.preferred-width + 2 * root.style.action-padding);
+    // The caption's own line height (any font, text scale and, for glyphs, icon
+    // scale together) plus 6 px above and below; never below the built-in 30 px.
+    height: max(30px, action-text.preferred-height + 12px);
+    border-radius: root.style.control-radius;
+    // A configured state shows over the primary accent too, with plain ink.
+    property <bool> state-shown: root.enabled && ((hit.pressed && root.palette.pressed-set)
+        || (hit.has-hover && root.palette.hover-set));
+    background: root.enabled && hit.pressed && (root.palette.pressed-set || !root.primary) ? root.palette.pressed
+        : root.enabled && hit.has-hover && (root.palette.hover-set || !root.primary) ? root.palette.hover
+        : root.primary && root.enabled ? root.palette.accent : root.idle-surface;
+    opacity: root.enabled || root.palette.disabled-set ? 1 : 0.45;
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if root.enabled { root.activated(); }
+    }
+    action-text := Text {
+        text: root.text;
+        color: !root.enabled && root.palette.disabled-set ? root.palette.disabled
+            : root.primary && root.enabled && !root.state-shown ? root.palette.accent-ink : root.palette.ink;
+        font-size: 12px * root.text-scale * (root.glyph ? root.style.glyph-scale : 1);
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    keyboard-focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled { root.activated(); }
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            keyboard-focus.focus();
+            root.activated();
+        }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: root.style.focus-width;
+        border-color: root.palette.focus;
+        background: transparent;
+    }
+}
+
+// The modal viewer. Escape closes; Tab reaches every available control; Left/Right open the previous/next loaded image, or pan
+// while zoomed; Home/End open the first/last; Up/Down pan; +, - and 0 zoom in, out and back to fit; K plays or pauses an
+// animation and R replays it; ] and [ turn the view clockwise and counterclockwise.
+export component MediaViewer inherits Rectangle {
+    // Changes when another item opens; zoom, pan and turns reset then. Each
+    // animation picture replaces `image` without resetting them.
+    in property <string> item-key;
+    in property <image> image;
+    in property <bool> loaded: false;
+    in property <bool> loading: false;
+    in property <bool> failed: false;
+    in property <string> title;
+    in property <string> status;
+    // "3 of 12" among the room's loaded images, or empty.
+    in property <string> position;
+    in property <bool> has-previous: false;
+    in property <bool> has-next: false;
+    in property <bool> can-save: false;
+    // The picture is an animation Rust plays or holds; `playing` is its state.
+    in property <bool> animated: false;
+    in property <bool> playing: false;
+    // The window's autoplay setting and reduced motion. Rust decides what
+    // they mean for playback; this file only reports that they changed.
+    in property <bool> autoplay: false;
+    in property <bool> reduced-motion: false;
+    in property <ViewerPalette> palette;
+    in property <ViewerStyle> style;
+    in property <float> text-scale: 1;
+    callback close();
+    callback previous();
+    callback next();
+    callback first();
+    callback last();
+    callback cancel-loading();
+    callback retry();
+    callback save();
+    callback toggle-playback();
+    callback replay();
+    // The viewer opened, or autoplay or reduced motion changed.
+    callback motion-changed();
+
+    // Zoom is relative to fitting the whole picture: 1 shows all of it.
+    property <float> zoom: 1;
+    property <length> pan-x: 0px;
+    property <length> pan-y: 0px;
+    property <length> pan-step: 48px;
+    // Clockwise quarter turns of the view only; Save keeps the original file.
+    property <int> turns: 0;
+    property <bool> sideways: mod(root.turns, 2) == 1;
+    property <length> natural-width: root.image.width * 1px;
+    property <length> natural-height: root.image.height * 1px;
+    // The picture's on-screen extent before scaling, after the turns.
+    property <length> turned-width: root.sideways ? root.natural-height : root.natural-width;
+    property <length> turned-height: root.sideways ? root.natural-width : root.natural-height;
+    // Fit never enlarges a small picture past its own pixels.
+    property <float> fit-scale: root.natural-width <= 0px || root.natural-height <= 0px ? 1
+        : min(1, stage.width / root.turned-width, stage.height / root.turned-height);
+    // The unturned element size; the turn happens around its centre.
+    property <length> shown-width: root.natural-width * root.fit-scale * root.zoom;
+    property <length> shown-height: root.natural-height * root.fit-scale * root.zoom;
+    property <length> pan-limit-x: max(0px, (root.turned-width * root.fit-scale * root.zoom - stage.width) / 2);
+    property <length> pan-limit-y: max(0px, (root.turned-height * root.fit-scale * root.zoom - stage.height) / 2);
+
+    changed item-key => {
+        root.turns = 0;
+        root.reset-view();
+    }
+    // An action that becomes unavailable while focused hands focus on, so the
+    // keyboard never lands outside the dialog.
+    changed has-previous => { root.keep-focus(); }
+    changed has-next => { root.keep-focus(); }
+    changed can-save => { root.keep-focus(); }
+    changed loaded => { root.keep-focus(); }
+    changed loading => { root.keep-focus(); }
+    changed failed => { root.keep-focus(); }
+    changed animated => { root.keep-focus(); }
+    // Reported whatever `playing` shows, even while the image still loads:
+    // Rust pauses a playing or starting animation when reduced motion turns
+    // on, and reads both values again when playback would start.
+    init => { root.motion-changed(); }
+    changed autoplay => { root.motion-changed(); }
+    changed reduced-motion => { root.motion-changed(); }
+
+    function reset-view() {
+        root.zoom = 1;
+        root.pan-x = 0px;
+        root.pan-y = 0px;
+        root.keep-focus();
+    }
+
+    function zoom-by(factor: float) {
+        if root.loaded {
+            root.zoom = clamp(root.zoom * factor, 1, 8);
+            root.pan-to(root.pan-x, root.pan-y);
+            root.keep-focus();
+        }
+    }
+
+    // Zoom so the picture point at (x, y), measured from the stage centre,
+    // stays under the pointer.
+    function zoom-at(factor: float, x: length, y: length) {
+        if root.loaded {
+            let before = root.zoom;
+            root.zoom = clamp(root.zoom * factor, 1, 8);
+            let ratio = root.zoom / before;
+            root.pan-to(x - (x - root.pan-x) * ratio, y - (y - root.pan-y) * ratio);
+            root.keep-focus();
+        }
+    }
+
+    function pan-to(x: length, y: length) {
+        root.pan-x = clamp(x, -root.pan-limit-x, root.pan-limit-x);
+        root.pan-y = clamp(y, -root.pan-limit-y, root.pan-limit-y);
+    }
+
+    // A new turn starts again from fit, so the turned picture is whole.
+    function rotate(clockwise: bool) {
+        if root.loaded {
+            root.turns = mod(root.turns + (clockwise ? 1 : 3), 4);
+            root.reset-view();
+        }
+    }
+
+    // Keep a single bounded tab ring in visual order, skipping hidden or
+    // disabled actions: Close (0), Save (1), Previous (2), Next (3),
+    // Play/Pause (4), Replay (5), the loading action (6), Zoom out (7),
+    // Fit (8), Zoom in (9). Rotate (10) is outside the ring; ] and [ turn
+    // the view from anywhere in the dialog, and pointers and assistive
+    // technology activate the button directly.
+    pure function action-enabled(index: int) -> bool {
+        return index == 0 || (index == 1 && root.can-save)
+            || (index == 2 && root.has-previous) || (index == 3 && root.has-next)
+            || ((index == 4 || index == 5) && root.animated && root.loaded)
+            || (index == 6 && (root.loading || root.failed))
+            || ((index == 7 || index == 8) && root.loaded && root.zoom > 1)
+            || (index == 9 && root.loaded && root.zoom < 8)
+            || (index == 10 && root.loaded);
+    }
+
+    pure function focused-action() -> int {
+        return save-action.has-focus ? 1 : previous-action.has-focus ? 2
+            : next-action.has-focus ? 3 : play-action.has-focus ? 4
+            : replay-action.has-focus ? 5 : load-action.has-focus ? 6
+            : zoom-out-action.has-focus ? 7 : fit-action.has-focus ? 8
+            : zoom-in-action.has-focus ? 9 : rotate-action.has-focus ? 10 : 0;
+    }
+
+    function focus-action(index: int) {
+        if index == 1 { save-action.focus(); }
+        else if index == 2 { previous-action.focus(); }
+        else if index == 3 { next-action.focus(); }
+        else if index == 4 { play-action.focus(); }
+        else if index == 5 { replay-action.focus(); }
+        else if index == 6 { load-action.focus(); }
+        else if index == 7 { zoom-out-action.focus(); }
+        else if index == 8 { fit-action.focus(); }
+        else if index == 9 { zoom-in-action.focus(); }
+        else { close-action.focus(); }
+    }
+
+    // The ring index `offset` places after (or before) `current`; Rotate
+    // steps as if it were Zoom in.
+    pure function step(current: int, offset: int, forward: bool) -> int {
+        return mod(min(current, 9) + (forward ? offset : 10 - offset), 10);
+    }
+
+    // The nearest enabled ring action after (or before) `current`; Close (0)
+    // is always enabled, so the search ends there at the latest.
+    pure function next-enabled(current: int, forward: bool) -> int {
+        return root.action-enabled(root.step(current, 1, forward)) ? root.step(current, 1, forward)
+            : root.action-enabled(root.step(current, 2, forward)) ? root.step(current, 2, forward)
+            : root.action-enabled(root.step(current, 3, forward)) ? root.step(current, 3, forward)
+            : root.action-enabled(root.step(current, 4, forward)) ? root.step(current, 4, forward)
+            : root.action-enabled(root.step(current, 5, forward)) ? root.step(current, 5, forward)
+            : root.action-enabled(root.step(current, 6, forward)) ? root.step(current, 6, forward)
+            : root.action-enabled(root.step(current, 7, forward)) ? root.step(current, 7, forward)
+            : root.action-enabled(root.step(current, 8, forward)) ? root.step(current, 8, forward)
+            : root.action-enabled(root.step(current, 9, forward)) ? root.step(current, 9, forward)
+            : 0;
+    }
+
+    function tab(forward: bool) {
+        root.focus-action(root.next-enabled(root.focused-action(), forward));
+    }
+
+    // A focused action that became unavailable may already have dropped
+    // focus; either way the keyboard returns to the dialog.
+    function keep-focus() {
+        let current = root.focused-action();
+        if !root.action-enabled(current) {
+            root.focus-action(root.next-enabled(current, true));
+        } else if current == 0 && !close-action.has-focus && !keys.has-focus {
+            close-action.focus();
+        }
+    }
+
+    background: root.palette.scrim;
+
+    keys := FocusScope {
+        focus-on-tab-navigation: false;
+        init => { close-action.focus(); }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close();
+                accept
+            } else if event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift) {
+                root.tab(false);
+                accept
+            } else if event.text == Key.Tab {
+                root.tab(true);
+                accept
+            } else {
+                reject
+            }
+        }
+        key-pressed(event) => {
+            if event.text == Key.LeftArrow {
+                if root.zoom > 1 { root.pan-to(root.pan-x + root.pan-step, root.pan-y); } else if root.has-previous { root.previous(); }
+                accept
+            } else if event.text == Key.RightArrow {
+                if root.zoom > 1 { root.pan-to(root.pan-x - root.pan-step, root.pan-y); } else if root.has-next { root.next(); }
+                accept
+            } else if event.text == Key.UpArrow {
+                root.pan-to(root.pan-x, root.pan-y + root.pan-step);
+                accept
+            } else if event.text == Key.DownArrow {
+                root.pan-to(root.pan-x, root.pan-y - root.pan-step);
+                accept
+            } else if event.text == Key.Home {
+                if root.has-previous { root.first(); }
+                accept
+            } else if event.text == Key.End {
+                if root.has-next { root.last(); }
+                accept
+            } else if event.text == "+" || event.text == "=" {
+                root.zoom-by(1.25);
+                accept
+            } else if event.text == "-" {
+                root.zoom-by(0.8);
+                accept
+            } else if event.text == "0" {
+                root.reset-view();
+                accept
+            } else if event.text == "]" {
+                root.rotate(true);
+                accept
+            } else if event.text == "[" {
+                root.rotate(false);
+                accept
+            } else if (event.text == "k" || event.text == "K") && root.animated && root.loaded {
+                root.toggle-playback();
+                accept
+            } else if (event.text == "r" || event.text == "R") && root.animated && root.loaded {
+                root.replay();
+                accept
+            } else {
+                reject
+            }
+        }
+
+        // Clicks outside the dialog do nothing; Escape or Close dismisses it.
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(1100px, parent.width - 48px);
+            height: min(820px, parent.height - 48px);
+            border-radius: root.style.dialog-radius;
+            border-width: root.style.line-width;
+            border-color: root.palette.accent;
+            background: root.palette.surface;
+            accessible-role: region;
+            accessible-label: "Image preview " + root.title;
+            accessible-description: "Left and Right show the previous or next image, and Home and End the first or last. Plus, minus and 0 zoom in, zoom out and fit; arrow keys pan a zoomed image. The right and left square brackets turn the view clockwise and counterclockwise."
+                + (root.animated ? " K plays or pauses the animation and R replays it." : "")
+                + " Escape closes the preview.";
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: root.title;
+                        color: root.palette.ink;
+                        font-size: 15px * root.text-scale;
+                        font-weight: 700;
+                        overflow: elide;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    if root.position != "" : Text {
+                        text: root.position;
+                        color: root.palette.muted;
+                        font-size: 12px * root.text-scale;
+                        vertical-alignment: center;
+                        accessible-label: "Image " + root.position;
+                    }
+                    save-action := ViewerAction {
+                        text: "Save…";
+                        label: "Save " + root.title + " to a location you choose";
+                        enabled: root.can-save;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.save(); }
+                    }
+                    close-action := ViewerAction {
+                        text: "Close";
+                        label: "Close image preview";
+                        primary: true;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.close(); }
+                    }
+                }
+                stage := Rectangle {
+                    // The viewport is allocated by the dialog, not by the
+                    // zoomed image's intrinsic layout. Otherwise fitting the
+                    // image would feed back into the viewport's own size.
+                    min-width: 0px;
+                    min-height: 0px;
+                    preferred-width: 0px;
+                    preferred-height: 0px;
+                    vertical-stretch: 1;
+                    background: root.palette.backdrop;
+                    border-radius: root.style.stage-radius;
+                    clip: true;
+                    if root.loaded : Image {
+                        x: (parent.width - self.width) / 2 + root.pan-x;
+                        y: (parent.height - self.height) / 2 + root.pan-y;
+                        width: root.shown-width;
+                        height: root.shown-height;
+                        transform-rotation: root.turns * 90deg;
+                        source: root.image;
+                        image-fit: fill;
+                        accessible-role: AccessibleRole.image;
+                        accessible-label: "Attachment " + root.title
+                            + (root.position != "" ? ", image " + root.position : "")
+                            + ", " + round(root.zoom * root.fit-scale * 100) + "% zoom"
+                            + (root.turns == 0 ? "" : ", turned " + (root.turns * 90) + " degrees clockwise")
+                            + (!root.animated ? "" : root.playing ? ", animation playing" : ", animation paused");
+                    }
+                    if !root.loaded : Text {
+                        text: root.loading ? "Loading…" : "▧";
+                        color: root.palette.muted;
+                        font-size: root.loading ? 16px * root.text-scale : 54px * root.style.glyph-scale;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        accessible-role: none;
+                    }
+                    pointer := TouchArea {
+                        property <length> start-x;
+                        property <length> start-y;
+                        enabled: root.loaded;
+                        mouse-cursor: root.zoom > 1 ? (self.pressed ? MouseCursor.grabbing : MouseCursor.grab) : MouseCursor.default;
+                        pointer-event(event) => {
+                            if event.kind == PointerEventKind.down {
+                                self.start-x = root.pan-x;
+                                self.start-y = root.pan-y;
+                            }
+                        }
+                        moved => {
+                            if self.pressed && root.zoom > 1 {
+                                root.pan-to(self.start-x + self.mouse-x - self.pressed-x, self.start-y + self.mouse-y - self.pressed-y);
+                            }
+                        }
+                        // Zoom keeps the picture point under the pointer.
+                        double-clicked => {
+                            if root.zoom > 1 {
+                                root.reset-view();
+                            } else {
+                                root.zoom-at(2, self.mouse-x - self.width / 2, self.mouse-y - self.height / 2);
+                            }
+                        }
+                        scroll-event(event) => {
+                            if event.delta-y > 0px {
+                                root.zoom-at(1.25, self.mouse-x - self.width / 2, self.mouse-y - self.height / 2);
+                                accept
+                            } else if event.delta-y < 0px {
+                                root.zoom-at(0.8, self.mouse-x - self.width / 2, self.mouse-y - self.height / 2);
+                                accept
+                            } else {
+                                reject
+                            }
+                        }
+                    }
+                    previous-action := ViewerAction {
+                        visible: root.has-previous;
+                        enabled: root.has-previous;
+                        x: 10px;
+                        y: (parent.height - self.height) / 2;
+                        text: "‹";
+                        label: "Previous image";
+                        glyph: true;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        idle-surface: root.palette.surface;
+                        activated => { root.previous(); }
+                    }
+                    next-action := ViewerAction {
+                        visible: root.has-next;
+                        enabled: root.has-next;
+                        x: parent.width - self.width - 10px;
+                        y: (parent.height - self.height) / 2;
+                        text: "›";
+                        label: "Next image";
+                        glyph: true;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        idle-surface: root.palette.surface;
+                        activated => { root.next(); }
+                    }
+                    // Over the stage's lower edge, so the action row keeps its
+                    // width; shown and enabled only for an animation.
+                    play-action := ViewerAction {
+                        visible: root.animated && root.loaded;
+                        enabled: root.animated && root.loaded;
+                        x: (parent.width - self.width - 8px - replay-action.width) / 2;
+                        y: parent.height - self.height - 10px;
+                        text: root.playing ? "Pause" : "Play";
+                        label: root.playing ? "Pause the animation" : "Play the animation";
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        idle-surface: root.palette.surface;
+                        activated => { root.toggle-playback(); }
+                    }
+                    replay-action := ViewerAction {
+                        visible: root.animated && root.loaded;
+                        enabled: root.animated && root.loaded;
+                        x: play-action.x + play-action.width + 8px;
+                        y: play-action.y;
+                        text: "Replay";
+                        label: "Replay the animation from its first frame";
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        idle-surface: root.palette.surface;
+                        activated => { root.replay(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: root.status;
+                        color: root.failed ? root.palette.error : root.palette.muted;
+                        font-size: 12px * root.text-scale;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        accessible-label: "Image preview status: " + root.status;
+                        accessible-live-region: polite;
+                    }
+                    load-action := ViewerAction {
+                        visible: root.loading || root.failed;
+                        enabled: root.loading || root.failed;
+                        text: root.loading ? "Cancel" : "Try again";
+                        label: root.loading ? "Cancel loading this image" : "Try loading this image again";
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => {
+                            if root.loading { root.cancel-loading(); } else { root.retry(); }
+                        }
+                    }
+                    zoom-out-action := ViewerAction {
+                        text: "−";
+                        label: "Zoom out";
+                        enabled: root.loaded && root.zoom > 1;
+                        glyph: true;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.zoom-by(0.8); }
+                    }
+                    fit-action := ViewerAction {
+                        // Relative to fit, so the caption's intrinsic width never
+                        // depends on the viewport it helps lay out.
+                        text: round(root.zoom * 100) + "% fit";
+                        label: "Fit image to the window";
+                        enabled: root.loaded && root.zoom != 1;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.reset-view(); }
+                    }
+                    zoom-in-action := ViewerAction {
+                        text: "+";
+                        label: "Zoom in";
+                        enabled: root.loaded && root.zoom < 8;
+                        glyph: true;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.zoom-by(1.25); }
+                    }
+                    rotate-action := ViewerAction {
+                        text: "Rotate";
+                        label: "Rotate image clockwise";
+                        enabled: root.loaded;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.rotate(true); }
+                    }
+                }
+            }
+        }
+    }
+}

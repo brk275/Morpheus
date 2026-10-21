@@ -1,0 +1,383 @@
+// Copyright 2025 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Long-lived tasks for the timeline.
+
+use std::collections::BTreeSet;
+
+use eyeball::Subscriber as EyeballSubscriber;
+use matrix_sdk::{
+    event_cache::{
+        EventFocusThreadMode, EventFocusedCache, EventsOrigin, PinnedEventsCache, RoomEventCache,
+        RoomEventCacheUpdate, Subscriber, ThreadEventCache, ThreadEventCacheUpdate,
+        TimelineVectorDiffs,
+    },
+    send_queue::RoomSendQueueUpdate,
+};
+use matrix_sdk_base::RoomInfo;
+use ruma::OwnedEventId;
+#[cfg(feature = "unstable-msc4426")]
+use ruma::{OwnedUserId, UserId};
+use tokio::sync::broadcast::{Receiver, error::RecvError};
+use tracing::{error, instrument, trace, warn};
+
+use crate::timeline::{
+    TimelineController, TimelineFocus, controller::ActiveCallInfo, event_item::RemoteEventOrigin,
+    traits::RoomDataProvider,
+};
+
+/// Long-lived task, in the pinned events focus mode, that updates the timeline
+/// after any changes in the pinned events.
+#[instrument(
+    skip_all,
+    fields(
+        room_id = %timeline_controller.room().room_id(),
+    )
+)]
+pub(in crate::timeline) async fn pinned_events_task(
+    pinned_events_cache: PinnedEventsCache,
+    timeline_controller: TimelineController,
+    mut pinned_events_recv: Receiver<TimelineVectorDiffs>,
+) {
+    loop {
+        trace!("Waiting for an event.");
+
+        let update = match pinned_events_recv.recv().await {
+            Ok(up) => up,
+            Err(RecvError::Closed) => break,
+            Err(RecvError::Lagged(num_skipped)) => {
+                warn!(num_skipped, "Lagged behind pinned-event cache updates, resetting timeline");
+
+                // The updates might have lagged, but the room event cache might
+                // have events, so retrieve them and add them back again to the
+                // timeline, after clearing it.
+                let (initial_events, _) = match pinned_events_cache.subscribe().await {
+                    Ok(initial_events) => initial_events,
+                    Err(err) => {
+                        error!(
+                            ?err,
+                            "Failed to replace the initial remote events in the event cache"
+                        );
+                        break;
+                    }
+                };
+
+                timeline_controller
+                    .replace_with_initial_remote_events(initial_events, RemoteEventOrigin::Cache)
+                    .await;
+
+                continue;
+            }
+        };
+
+        trace!("Received new timeline events diffs");
+        let origin = match update.origin {
+            EventsOrigin::Sync => RemoteEventOrigin::Sync,
+            EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
+            EventsOrigin::Cache => RemoteEventOrigin::Cache,
+        };
+        timeline_controller.handle_remote_events_with_diffs(update.diffs, origin).await;
+    }
+}
+
+/// Long-lived task, in the event focus mode, that updates the timeline after
+/// any changes to the underlying timeline.
+#[instrument(
+    skip_all,
+    fields(
+        room_id = %timeline_controller.room().room_id(),
+        focused_event_id = %focused_event,
+        ?thread_mode
+    )
+)]
+pub(in crate::timeline) async fn event_focused_task(
+    focused_event: OwnedEventId,
+    thread_mode: EventFocusThreadMode,
+    event_cache: EventFocusedCache,
+    timeline_controller: TimelineController,
+    mut event_focused_events_recv: Receiver<TimelineVectorDiffs>,
+) {
+    loop {
+        trace!("Waiting for an event.");
+
+        let update = match event_focused_events_recv.recv().await {
+            Ok(up) => up,
+            Err(RecvError::Closed) => break,
+            Err(RecvError::Lagged(num_skipped)) => {
+                warn!(num_skipped, "Lagged behind focused-event cache updates, resetting timeline");
+
+                // The updates might have lagged, but the room event cache might
+                // have events, so retrieve them and add them back again to the
+                // timeline, after clearing it.
+                let Ok((initial_events, _)) = event_cache.subscribe().await else {
+                    error!("Failed to subscribe to the event-focused cache");
+                    break;
+                };
+
+                timeline_controller
+                    .replace_with_initial_remote_events(initial_events, RemoteEventOrigin::Cache)
+                    .await;
+
+                continue;
+            }
+        };
+
+        trace!("Received new timeline events diffs");
+        let origin = match update.origin {
+            EventsOrigin::Sync => RemoteEventOrigin::Sync,
+            EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
+            EventsOrigin::Cache => RemoteEventOrigin::Cache,
+        };
+        timeline_controller.handle_remote_events_with_diffs(update.diffs, origin).await;
+    }
+}
+
+/// For a thread-focused timeline, a long-lived task that will listen to the
+/// underlying thread updates.
+pub(in crate::timeline) async fn thread_updates_task(
+    mut thread_event_cache_subscriber: Subscriber<ThreadEventCacheUpdate>,
+    event_cache: ThreadEventCache,
+    timeline_controller: TimelineController,
+) {
+    trace!("Spawned the thread event subscriber task.");
+
+    loop {
+        trace!("Waiting for an event.");
+
+        let update = match thread_event_cache_subscriber.recv().await {
+            Ok(up) => up,
+            Err(RecvError::Closed) => break,
+            Err(RecvError::Lagged(num_skipped)) => {
+                warn!(num_skipped, "Lagged behind event cache updates, resetting timeline");
+
+                // The updates might have lagged, but the room event cache might
+                // have events, so retrieve them and add them back again to the
+                // timeline, after clearing it.
+                _ = timeline_controller.init_with_thread_root(&event_cache).await;
+
+                continue;
+            }
+        };
+
+        match update {
+            ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, origin }) => {
+                trace!("Received new timeline events diffs");
+
+                let origin = match origin {
+                    EventsOrigin::Sync => RemoteEventOrigin::Sync,
+                    EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
+                    EventsOrigin::Cache => RemoteEventOrigin::Cache,
+                };
+
+                let has_diffs = !diffs.is_empty();
+
+                timeline_controller.handle_remote_events_with_diffs(diffs, origin).await;
+
+                if has_diffs && matches!(origin, RemoteEventOrigin::Cache) {
+                    timeline_controller.retry_event_decryption(None).await;
+                }
+            }
+
+            ThreadEventCacheUpdate::AddReadReceiptEvent { event } => {
+                trace!("Received a new read receipt event from sync.");
+
+                // TODO: ephemeral (read receipts) should be handled by the
+                // event cache (#4113).
+                timeline_controller.handle_read_receipt_event(event).await;
+            }
+        }
+    }
+
+    trace!("Thread event subscriber task finished.");
+}
+
+/// Long-lived task that forwards the [`RoomEventCacheUpdate`]s (remote echoes)
+/// to the timeline.
+pub(in crate::timeline) async fn room_event_cache_updates_task(
+    room_event_cache: RoomEventCache,
+    timeline_controller: TimelineController,
+    mut room_event_cache_subscriber: Subscriber<RoomEventCacheUpdate>,
+    timeline_focus: TimelineFocus,
+) {
+    trace!("Spawned the event subscriber task.");
+
+    loop {
+        trace!("Waiting for an event.");
+
+        let update = match room_event_cache_subscriber.recv().await {
+            Ok(up) => up,
+            Err(RecvError::Closed) => break,
+            Err(RecvError::Lagged(num_skipped)) => {
+                warn!(num_skipped, "Lagged behind event cache updates, resetting timeline");
+
+                // The updates might have lagged, but the room event cache might
+                // have events, so retrieve them and add them back again to the
+                // timeline, after clearing it.
+                let initial_events = match room_event_cache.events().await {
+                    Ok(initial_events) => initial_events,
+                    Err(err) => {
+                        error!(
+                            ?err,
+                            "Failed to replace the initial remote events in the event cache"
+                        );
+                        break;
+                    }
+                };
+
+                timeline_controller
+                    .replace_with_initial_remote_events(initial_events, RemoteEventOrigin::Cache)
+                    .await;
+
+                continue;
+            }
+        };
+
+        match update {
+            RoomEventCacheUpdate::MoveReadMarkerTo { event_id } => {
+                trace!(target = %event_id, "Handling fully read marker.");
+                timeline_controller.handle_fully_read_marker(event_id).await;
+            }
+
+            RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, origin }) => {
+                trace!("Received new timeline events diffs");
+                let origin = match origin {
+                    EventsOrigin::Sync => RemoteEventOrigin::Sync,
+                    EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
+                    EventsOrigin::Cache => RemoteEventOrigin::Cache,
+                };
+
+                let has_diffs = !diffs.is_empty();
+
+                if matches!(timeline_focus, TimelineFocus::Live { .. }) {
+                    timeline_controller.handle_remote_events_with_diffs(diffs, origin).await;
+                } else if matches!(timeline_focus, TimelineFocus::Event { .. }) {
+                    // Only handle the remote aggregation for an event-focused
+                    // timeline.
+                    timeline_controller.handle_remote_aggregations(diffs, origin).await;
+                }
+
+                if has_diffs && matches!(origin, RemoteEventOrigin::Cache) {
+                    timeline_controller.retry_event_decryption(None).await;
+                }
+            }
+
+            RoomEventCacheUpdate::AddReadReceiptEvent { event } => {
+                trace!("Received a new read receipt event from sync.");
+
+                // TODO: ephemeral (read receipts) should be handled by the
+                // event cache (#4113).
+                timeline_controller.handle_read_receipt_event(event).await;
+            }
+
+            RoomEventCacheUpdate::UpdateMembers { ambiguity_changes, avatar_changes } => {
+                if !ambiguity_changes.is_empty()
+                    || !avatar_changes.as_ref().is_none_or(|avatars| avatars.is_empty())
+                {
+                    let member_ambiguity_changes = ambiguity_changes
+                        .values()
+                        .flat_map(|change| change.user_ids())
+                        .collect::<BTreeSet<_>>();
+
+                    let mut user_ids_to_update = member_ambiguity_changes;
+
+                    if let Some(avatar_changes) = &avatar_changes {
+                        let mut user_ids =
+                            avatar_changes.keys().map(|u| u.as_ref()).collect::<BTreeSet<_>>();
+                        user_ids_to_update.append(&mut user_ids)
+                    } else {
+                        warn!(
+                            "No avatar changes to update for {}, ignoring",
+                            room_event_cache.room_id()
+                        );
+                    }
+                    timeline_controller.force_update_sender_profiles(&user_ids_to_update).await;
+                }
+            }
+        }
+    }
+}
+
+/// Long-lived task that refreshes displayed sender profiles when the users'
+/// global profiles change. The controller filters to the senders it shows.
+#[cfg(feature = "unstable-msc4426")]
+pub(in crate::timeline) async fn global_profile_updates_task(
+    mut global_profile_updates_stream: Receiver<BTreeSet<OwnedUserId>>,
+    timeline_controller: TimelineController,
+) {
+    trace!("spawned the global profile updates task!");
+
+    loop {
+        match global_profile_updates_stream.recv().await {
+            Ok(user_ids) => {
+                let sender_ids: BTreeSet<&UserId> =
+                    user_ids.iter().map(|user_id| user_id.as_ref()).collect();
+                timeline_controller.force_update_sender_profiles(&sender_ids).await;
+            }
+
+            Err(RecvError::Lagged(num_missed)) => {
+                warn!("missed {num_missed} global profile updates, ignoring those missed");
+            }
+
+            Err(RecvError::Closed) => {
+                trace!("channel closed, exiting the global profile updates handler");
+                break;
+            }
+        }
+    }
+}
+
+/// Long-lived task that forwards [`RoomSendQueueUpdate`]s (local echoes) to the
+/// timeline.
+pub(in crate::timeline) async fn room_send_queue_update_task(
+    mut send_queue_stream: Receiver<RoomSendQueueUpdate>,
+    timeline_controller: TimelineController,
+) {
+    trace!("spawned the local echo task!");
+
+    loop {
+        match send_queue_stream.recv().await {
+            Ok(update) => timeline_controller.handle_room_send_queue_update(update).await,
+
+            Err(RecvError::Lagged(num_missed)) => {
+                warn!("missed {num_missed} local echoes, ignoring those missed");
+            }
+
+            Err(RecvError::Closed) => {
+                trace!("channel closed, exiting the local echo handler");
+                break;
+            }
+        }
+    }
+}
+
+/// Long-lived task that watches RoomInfo for RTC membership changes and updates
+/// the active RtcNotification timeline item.
+pub(in crate::timeline) async fn rtc_membership_update_task(
+    mut room_info: EyeballSubscriber<RoomInfo>,
+    timeline_controller: TimelineController,
+    initial_call_info: Option<ActiveCallInfo>,
+) {
+    let mut prev_info = initial_call_info;
+    let own_user = timeline_controller.room().own_user_id().to_owned();
+
+    while let Some(info) = room_info.next().await {
+        let active_call = ActiveCallInfo::from_info(info, own_user.clone());
+        // RoomInfo fires for many reasons; only act when the participant list
+        // actually changed.
+        if active_call != prev_info {
+            prev_info = active_call.clone();
+            timeline_controller.handle_active_call_update(active_call).await;
+        }
+    }
+}

@@ -1,0 +1,141 @@
+// Resolved appearance tokens shared by the window and every native screen
+// file. Rust projects each accepted configuration into StyleTokens through
+// the window, which re-exports these items; screen files import them here
+// instead of receiving copies, so a preference reaches every control.
+
+// Optional overrides retain each control's existing color when absent.
+export struct ColorRole {
+    present: bool,
+    color: color,
+}
+
+export struct ThemeRoleSet {
+    error: ColorRole,
+    error-surface: ColorRole,
+    error-ink: ColorRole,
+    success: ColorRole,
+    success-surface: ColorRole,
+    success-ink: ColorRole,
+    selection: ColorRole,
+    selection-ink: ColorRole,
+    focus: ColorRole,
+    link: ColorRole,
+    unread: ColorRole,
+    unread-ink: ColorRole,
+    destructive: ColorRole,
+    destructive-ink: ColorRole,
+    voice: ColorRole,
+    timestamp: ColorRole,
+    sender: ColorRole,
+    message: ColorRole,
+    own-message: ColorRole,
+    own-surface: ColorRole,
+    scrim: ColorRole,
+    shadow: ColorRole,
+    media-backdrop: ColorRole,
+    presence-online: ColorRole,
+    avatar-ink: ColorRole,
+}
+
+// Optional interaction states. An absent state keeps the color it follows,
+// or each control's own state color.
+export struct ThemeStateSet {
+    message-hover: ColorRole,
+    control-hover: ColorRole,
+    control-pressed: ColorRole,
+    control-disabled: ColorRole,
+    input-surface: ColorRole,
+    input-border: ColorRole,
+    composer-surface: ColorRole,
+    composer-border: ColorRole,
+    composer-focus: ColorRole,
+    icon: ColorRole,
+    icon-active: ColorRole,
+    icon-navigation: ColorRole,
+    icon-header: ColorRole,
+    icon-composer: ColorRole,
+    icon-message: ColorRole,
+    nav-hover: ColorRole,
+    nav-selected: ColorRole,
+    nav-selected-ink: ColorRole,
+    mention: ColorRole,
+    mention-ink: ColorRole,
+}
+
+// Sparse `[colors]` overrides of the eleven base colors. An absent entry
+// keeps the theme pack's color, or the built-in palette's.
+export struct BaseColorSet {
+    rail: ColorRole,
+    sidebar: ColorRole,
+    canvas: ColorRole,
+    panel: ColorRole,
+    elevated: ColorRole,
+    hover: ColorRole,
+    ink: ColorRole,
+    muted: ColorRole,
+    divider: ColorRole,
+    accent: ColorRole,
+    accent-ink: ColorRole,
+}
+
+// Runtime geometry shared by small reusable controls and the main view.
+export global StyleTokens {
+    in-out property <length> radius: 10px;
+    in-out property <ThemeRoleSet> roles;
+    in-out property <ThemeStateSet> states;
+    in-out property <BaseColorSet> base;
+    // Share of each window surface's own alpha that is painted, 0 to 1.
+    in-out property <float> window-opacity: 1;
+    in-out property <bool> reduced-motion: false;
+    in-out property <int> hover-duration-ms: 90;
+    out property <duration> interaction-duration: StyleTokens.reduced-motion ? 0ms : StyleTokens.hover-duration-ms * 1ms;
+    // Opt-in decorative fades; zero by default and under reduced motion.
+    in-out property <int> popup-fade-ms: 0;
+    in-out property <int> panel-fade-ms: 0;
+    out property <duration> popup-duration: StyleTokens.reduced-motion ? 0ms : StyleTokens.popup-fade-ms * 1ms;
+    out property <duration> panel-duration: StyleTokens.reduced-motion ? 0ms : StyleTokens.panel-fade-ms * 1ms;
+    // The effective palette is high contrast; borders then stay visible.
+    in-out property <bool> high-contrast: false;
+    // Typography and geometry metrics from the registry. Rust projects every
+    // value with each accepted configuration; these defaults draw the
+    // built-in look. Sizes are logical pixels before text scaling.
+    in-out property <length> sidebar-font-size: 13px;
+    // Zero keeps each surface's own size.
+    in-out property <length> sender-font-size: 0px;
+    // Multiplies each font's natural line height on the composer and
+    // plain-text previews; 1 keeps it. Styled (rich) text has no such
+    // setting in this toolkit version and keeps its natural spacing.
+    in-out property <float> line-height-factor: 1;
+    // Default body weight, inherited by rich messages and unweighted text;
+    // explicit heading/sender/Markdown weights stay explicit. Zero keeps
+    // the platform default.
+    in-out property <int> body-font-weight: 0;
+    in-out property <length> timestamp-font-size: 10px;
+    // Zero follows the message font size.
+    in-out property <length> composer-font-size: 0px;
+    // Negative keeps each control's built-in proportion of `radius`.
+    in-out property <length> control-radius: -1px;
+    in-out property <length> input-radius: -1px;
+    in-out property <length> composer-radius: -1px;
+    in-out property <length> border-width: 1px;
+    out property <length> line-width: StyleTokens.high-contrast ? max(1px, StyleTokens.border-width) : StyleTokens.border-width;
+    in-out property <length> focus-width: 2px;
+    in-out property <length> control-padding: 12px;
+    in-out property <length> input-padding: 10px;
+    in-out property <length> composer-padding: 10px;
+    in-out property <length> icon-size: 18px;
+    // Default-size icon buttons grow to fit the configured icon. Containers
+    // designed around the 34 px button grow by the same amount, so the
+    // button never clips; at the default size both stay unchanged.
+    out property <length> icon-button-size: max(34px, StyleTokens.icon-size + 16px);
+    out property <length> icon-button-growth: StyleTokens.icon-button-size - 34px;
+    // Zero keeps each message layout's avatar size.
+    in-out property <length> message-avatar-size: 0px;
+    // Percent of each avatar's size; negative keeps its built-in corners.
+    in-out property <int> avatar-roundness: -1;
+    // Corners of small controls and single-line fields. An explicit control
+    // or input radius wins; otherwise they keep the built-in 0.7 share of
+    // `radius` used by text buttons, search fields and their tabs.
+    out property <length> control-corner: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
+    out property <length> input-corner: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+}

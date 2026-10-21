@@ -56,6 +56,15 @@ fn settings_failed(operation: &'static str, error: RoomSettingsError) -> ! {
         RoomSettingsError::InvalidJoinRule => "invalid_join_rule",
         RoomSettingsError::InvalidText => "invalid_text",
         RoomSettingsError::EncryptedPreviewDisabled => "encrypted_preview_disabled",
+        RoomSettingsError::SecurityBusy => "security_busy",
+        RoomSettingsError::Refused => "refused",
+        RoomSettingsError::SignInExpired => "sign_in_expired",
+        RoomSettingsError::UploadFailed => "upload_failed",
+        RoomSettingsError::Unknown => "unknown",
+        RoomSettingsError::AvatarUnknown => "avatar_unknown",
+        RoomSettingsError::SavedNotRead => "saved_not_read",
+        RoomSettingsError::AvatarUploadedNotChanged => "avatar_uploaded_not_changed",
+        RoomSettingsError::AvatarUploadUnknown => "avatar_upload_unknown",
     };
     eprintln!("MORPHEUS_SETTINGS_OPERATION {operation}");
     eprintln!("MORPHEUS_SETTINGS_FAILURE {category}");

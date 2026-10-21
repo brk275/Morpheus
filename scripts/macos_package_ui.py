@@ -60,6 +60,12 @@ ACCEPTANCE_SECONDS = 180
 BRIDGE_REPLY_SECONDS = 20
 BRIDGE_EXIT_SECONDS = 5
 OWNERSHIP_SECONDS = 5
+# Hard bound for AppKit to register the already-owned process as an
+# application; only absent-metadata answers are asked again within it.
+REGISTRATION_SECONDS = 10
+REGISTRATION_POLL_SECONDS = 0.2
+REGISTRATION_PENDING = frozenset({"attach_application_missing", "attach_bundle_missing",
+                                  "attach_executable_missing"})
 STOP_SECONDS = 5
 WAIT_SECONDS = 12
 BRIDGE_LINE_BOUND = 4 * 1024 * 1024
@@ -91,6 +97,7 @@ class Diagnostics:
     def __init__(self, report):
         self.value = report["diagnostic"] = {
             "step": "setup", "operation": "none", "failure": "none", "bridge_error": "none",
+            "appearance_stage": "not_started",
             "permission_checked": False, "owned_window_seen": False, "ax_root_seen": False,
             "homeserver_seen": False, "username_seen": False, "password_seen": False,
             "selector_matches": 0, "incomplete_passes": 0, "activation_recoveries": 0,
@@ -102,6 +109,10 @@ class Diagnostics:
     def step(self, step):
         self.value["step"] = step
         self.value["operation"] = "none"
+
+    def appearance_stage(self, stage):
+        require_ui(type(stage) is str and stage in smoke.APPEARANCE_STAGES, "unclassified")
+        self.value["appearance_stage"] = stage
 
     def operation(self, operation):
         self.value["operation"] = operation
@@ -486,12 +497,22 @@ class Bridge:
         finally:
             self.replies.put(None)
 
-    def reply(self):
-        remaining = min(BRIDGE_REPLY_SECONDS, max(0.0, self.diagnostics.deadline - time.monotonic()))
+    def reply(self, deadline=None):
+        """One reply within the reply bound and the acceptance deadline.
+
+        An optional narrower monotonic deadline also cuts the wait; a wait it
+        ends fails as wait_timeout. Without one, nothing changes.
+        """
+        now = time.monotonic()
+        remaining = min(BRIDGE_REPLY_SECONDS, max(0.0, self.diagnostics.deadline - now))
+        if deadline is not None:
+            remaining = min(remaining, max(0.0, deadline - now))
         try:
             line = self.replies.get(timeout=remaining)
         except queue.Empty:
             self.diagnostics.check_deadline()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise DiagnosticFailure("wait_timeout") from None
             raise DiagnosticFailure("bridge_timeout") from None
         require_ui(line is not None, "bridge_exited")
         require_ui(line is not OVERLONG, "bridge_overflow")
@@ -510,17 +531,27 @@ class Bridge:
         except (OSError, ValueError):
             raise DiagnosticFailure("bridge_exited") from None
 
-    def call(self, command, allow_error=False):
+    def call(self, command, allow_error=False, record_error=True, deadline=None):
+        """Send one command and return its successful reply.
+
+        With a narrower monotonic deadline, no command is sent once it has
+        passed, the reply wait ends at it, and a success arriving at or after
+        it is refused as wait_timeout. The default keeps every other
+        operation's bounds unchanged.
+        """
         self.diagnostics.check_deadline()
+        require_ui(deadline is None or time.monotonic() < deadline, "wait_timeout")
         self.transmit(command)
-        value = self.reply()
+        value = self.reply(deadline)
         if not value["ok"]:
             code = value.get("error")
             code = code if code in smoke.MACOS_BRIDGE_ERRORS else "bridge_error"
-            self.diagnostics.bridge_error(code)
+            if record_error:
+                self.diagnostics.bridge_error(code)
             if allow_error:
                 raise BridgeFailure(code)
             raise DiagnosticFailure("bridge_invalid")
+        require_ui(deadline is None or time.monotonic() < deadline, "wait_timeout")
         return value
 
     def close(self):
@@ -737,15 +768,22 @@ def enter_preview(ui):
 
 def menu_keyboard(ui):
     trigger = "Account menu for "
+    # Fixed stages distinguish native focus/keyboard failures without exposing
+    # the account label or the focused element's name in public diagnostics.
+    ui.diagnostics.step("menu_focus_trigger")
     ui.focus(trigger, prefix=True)
+    ui.diagnostics.step("menu_open_return")
     ui.key("Return")
     ui.expect_focus("Switch to ", prefix=True)
     ui.wait("Manage accounts")
+    ui.diagnostics.step("menu_close_escape")
     ui.key("Escape")
     ui.wait_for(lambda: ui.find("Manage accounts") is None)
     ui.expect_focus(trigger, prefix=True)
+    ui.diagnostics.step("menu_reopen_space")
     ui.key("Space")
     ui.expect_focus("Switch to ", prefix=True)
+    ui.diagnostics.step("menu_tab_manage")
     for _ in range(16):
         focused = ui.focused_name()
         if focused == "Manage accounts":
@@ -756,19 +794,23 @@ def menu_keyboard(ui):
         ui.wait_for(lambda: (name := ui.focused_name()) is not None and name != focused)
     else:
         raise RuntimeError("Account menu target was not keyboard reachable")
+    ui.diagnostics.step("menu_open_manage")
     ui.key("Return")
     ui.wait("Manage saved Matrix accounts")
     ui.expect_focus("Done")
+    ui.diagnostics.step("menu_dialog_tabs")
     ui.key("Tab")
     ui.expect_focus("Add account")
     ui.key("ShiftTab")
     ui.expect_focus("Done")
+    ui.diagnostics.step("menu_close_dialog")
     ui.key("Escape")
     ui.wait_for(lambda: ui.find("Manage saved Matrix accounts") is None)
     ui.expect_focus(trigger, prefix=True)
 
 
 def appearance_keyboard(ui):
+    ui.diagnostics.appearance_stage("open_settings")
     ui.focus("Open settings")
     ui.key("Return")
     # Settings rows below the fold are clipped out of the accessibility tree
@@ -776,6 +818,7 @@ def appearance_keyboard(ui):
     # for from here. Reach the control with bounded real Tab presses, checking
     # the owned focused name after each one; focus reveals the row, and only
     # then is its label queried.
+    ui.diagnostics.appearance_stage("reach_scale")
     for _ in range(SETTINGS_TAB_BOUND):
         focused = ui.focused_name()
         require_ui(focused is not None, "focus_unowned")
@@ -785,12 +828,16 @@ def appearance_keyboard(ui):
         ui.wait_for(lambda: (name := ui.focused_name()) is not None and name != focused)
     else:
         raise DiagnosticFailure("scale_unreachable")
+    ui.diagnostics.appearance_stage("read_seed_scale")
     ui.wait("110% · text throughout the app")
+    ui.diagnostics.appearance_stage("increase_scale")
     ui.key("Space")
+    ui.diagnostics.appearance_stage("read_changed_scale")
     ui.wait("120% · text throughout the app")
 
 
 def config_persisted(config, diagnostics, seconds=10):
+    diagnostics.appearance_stage("persist_scale")
     deadline = time.monotonic() + seconds
     while True:
         diagnostics.check_deadline()
@@ -800,9 +847,80 @@ def config_persisted(config, diagnostics, seconds=10):
         except (OSError, ValueError):
             value = {}
         if value.get("appearance", {}).get("scale_percent") == 120:
+            diagnostics.appearance_stage("complete")
             return
         require_ui(time.monotonic() < deadline, "config_mismatch")
         time.sleep(0.2)
+
+
+def require_anchored(process, executable, diagnostics):
+    """The launched leader is still our live, unreaped child leading its own
+    group and session and running the installed executable."""
+    diagnostics.operation("ownership")
+    require_ui(smoke.process_status(process) is None, "app_exited")
+    require_ui(owned_mac_pid(process.pid, process.pid, executable), "ownership_lost")
+
+
+def attach_owned(bridge, process, executable, bundle, diagnostics, seconds=REGISTRATION_SECONDS):
+    """Attach the bridge to the owned app once AppKit reports its complete identity.
+
+    libproc can show the installed executable as soon as exec completes, before
+    AppKit has registered the process as an application, so the bridge may
+    report absent metadata. Only those answers are asked again. A bundle
+    identifier or executable that is present but different fails at once,
+    and the bridge never keeps a partial identity.
+
+    The registration budget is a monotonic deadline:
+
+    - no attempt starts once it has passed, and a zero budget makes none;
+    - each reply wait ends at it;
+    - the pause between attempts is clipped to what remains;
+    - a success counts only if it is still inside the budget after the
+      anchored recheck that follows it.
+
+    The anchored process is rechecked before every attempt and after every
+    attempt, including failed or timed-out ones; a lost anchor takes
+    precedence. Those rechecks are OS queries with their own bounds (the
+    process table read times out at 5 seconds), so wall time can pass the
+    budget by their duration, but no late success is ever accepted. The
+    acceptance deadline still applies throughout. Transient answers are not
+    recorded, so a successful report is unchanged.
+    """
+    command = {"op": "attach", "pid": process.pid, "executable": str(executable), "bundle": bundle}
+    deadline = time.monotonic() + seconds
+    pending = None
+
+    def expired():
+        # The last absent-metadata answer, if any, explains the timeout.
+        if pending is not None:
+            diagnostics.bridge_error(pending)
+        return DiagnosticFailure("wait_timeout")
+
+    while True:
+        diagnostics.check_deadline()
+        diagnostics.operation("attach")
+        if time.monotonic() >= deadline:
+            raise expired()
+        require_anchored(process, executable, diagnostics)
+        diagnostics.operation("attach")
+        if time.monotonic() >= deadline:
+            raise expired()
+        try:
+            bridge.call(command, allow_error=True, record_error=False, deadline=deadline)
+            pending = None
+        except BridgeFailure as error:
+            pending = error.code
+        finally:
+            require_anchored(process, executable, diagnostics)
+            diagnostics.operation("attach")
+        if pending is None:
+            # Accept only within the budget, after the recheck that followed.
+            require_ui(time.monotonic() < deadline, "wait_timeout")
+            return
+        if pending not in REGISTRATION_PENDING:
+            diagnostics.bridge_error(pending)
+            raise DiagnosticFailure("bridge_invalid")
+        time.sleep(min(REGISTRATION_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
 
 def owned_window(bridge, process, diagnostics, seconds=30):
@@ -885,8 +1003,7 @@ def acceptance(executable, nonce, bridge_binary, report, diagnostics=None):
                 require_ui(smoke.process_status(process) is None, "app_exited")
                 time.sleep(0.1)
             require_ui(owned_mac_pid(process.pid, process.pid, executable), "install_state")
-            diagnostics.operation("attach")
-            bridge.call({"op": "attach", "pid": process.pid, "executable": str(executable), "bundle": bundle})
+            attach_owned(bridge, process, executable, bundle, diagnostics)
             diagnostics.step("window")
             owned_window(bridge, process, diagnostics)
             ui = MacUI(bridge, process.pid, process, diagnostics)

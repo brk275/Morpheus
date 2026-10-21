@@ -31,6 +31,9 @@ const SLOT: &str = "m.call#room";
 const MAX_PARTICIPANTS: usize = 128;
 const MAX_LIVE_EVENTS: usize = 512;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
+// Bound the authenticated state response while streaming, before JSON is
+// buffered/parsed. Decoded slot content is bounded separately above.
+const MAX_SLOT_RESPONSE_BYTES: u64 = 128 * 1024;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -202,7 +205,8 @@ impl PassiveCallObserver {
                     .with_request_config(
                         RequestConfig::new()
                             .retry_limit(0)
-                            .timeout(SNAPSHOT_TIMEOUT),
+                            .timeout(SNAPSHOT_TIMEOUT)
+                            .max_response_bytes(MAX_SLOT_RESPONSE_BYTES),
                     )
                     .await
             }

@@ -1,17 +1,17 @@
 //! Account-scoped room membership and power-level administration.
 //! Permission checks and the final authorization decision belong to the
 //! homeserver; this API keeps all mutations tied to the visible account.
+//! The `_for` calls run through the bounded, at-most-once paths: member
+//! actions, power levels and redactions through `moderation`, the room name
+//! and topic through a fresh `room_settings` session.
 
-use matrix_sdk::{
-    RoomMemberships,
-    ruma::{Int, events::room::power_levels::UserPowerLevel},
-};
-use matrix_sdk_ui::timeline::TimelineEventItemId;
+use matrix_sdk::{RoomMemberships, ruma::events::room::power_levels::UserPowerLevel};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AccountManager, MatrixCoreError, Result, account_room, parse_event_id, parse_user_id,
-    selected_loaded_for,
+    AccountManager, MatrixCoreError, MemberAction, ModerationCancellation, ModerationError,
+    ModerationScope, Result, RoomSettingsCancellation, RoomSettingsError, account_room,
+    parse_user_id, selected_loaded_for,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,13 +35,8 @@ impl AccountManager {
         room_id: &str,
         user_id: &str,
     ) -> Result<()> {
-        let user_id = parse_user_id(user_id)?;
-        let state = self.state.lock().await;
-        selected_loaded_for(&state, expected_account_id)?;
-        let room = account_room(&state, expected_account_id, room_id)?;
-        room.invite_user_by_id(&user_id)
+        self.member_action_for(expected_account_id, room_id, user_id, MemberAction::Invite)
             .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
     }
 
     /// Kick a member from the selected account's room. Matrix enforces the
@@ -53,13 +48,10 @@ impl AccountManager {
         user_id: &str,
         reason: Option<&str>,
     ) -> Result<()> {
-        let user_id = parse_user_id(user_id)?;
-        let state = self.state.lock().await;
-        selected_loaded_for(&state, expected_account_id)?;
-        let room = account_room(&state, expected_account_id, room_id)?;
-        room.kick_user(&user_id, reason)
+        let reason = reason.map(str::to_owned);
+        let action = MemberAction::Kick { reason };
+        self.member_action_for(expected_account_id, room_id, user_id, action)
             .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
     }
 
     pub async fn ban_user_for(
@@ -69,13 +61,10 @@ impl AccountManager {
         user_id: &str,
         reason: Option<&str>,
     ) -> Result<()> {
-        let user_id = parse_user_id(user_id)?;
-        let state = self.state.lock().await;
-        selected_loaded_for(&state, expected_account_id)?;
-        let room = account_room(&state, expected_account_id, room_id)?;
-        room.ban_user(&user_id, reason)
+        let reason = reason.map(str::to_owned);
+        let action = MemberAction::Ban { reason };
+        self.member_action_for(expected_account_id, room_id, user_id, action)
             .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
     }
 
     pub async fn unban_user_for(
@@ -85,43 +74,78 @@ impl AccountManager {
         user_id: &str,
         reason: Option<&str>,
     ) -> Result<()> {
-        let user_id = parse_user_id(user_id)?;
-        let state = self.state.lock().await;
-        selected_loaded_for(&state, expected_account_id)?;
-        let room = account_room(&state, expected_account_id, room_id)?;
-        room.unban_user(&user_id, reason)
+        let reason = reason.map(str::to_owned);
+        let action = MemberAction::Unban { reason };
+        self.member_action_for(expected_account_id, room_id, user_id, action)
             .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
     }
 
+    async fn member_action_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        user_id: &str,
+        action: MemberAction,
+    ) -> Result<()> {
+        parse_user_id(user_id)?;
+        let selection = self
+            .account_selection(expected_account_id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        let cancellation = ModerationCancellation::new();
+        let scope = ModerationScope {
+            selection: &selection,
+            cancellation: &cancellation,
+            admission: &|| true,
+        };
+        self.moderate_member_selected(&scope, room_id, user_id, action)
+            .await
+            .map(|_| ())
+            .map_err(moderation_failure)
+    }
+
+    /// Rename through a fresh room-settings session: its permission and
+    /// baseline read, then one bounded write.
     pub async fn rename_room_for(
         &self,
         expected_account_id: &str,
         room_id: &str,
         name: &str,
     ) -> Result<()> {
-        let state = self.state.lock().await;
-        selected_loaded_for(&state, expected_account_id)?;
-        let room = account_room(&state, expected_account_id, room_id)?;
-        room.set_name(name.into())
+        let session = self.settings_for(expected_account_id, room_id).await?;
+        session
+            .set_name(name)
             .await
             .map(|_| ())
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+            .map_err(settings_failure)
     }
 
+    /// Set the topic through a fresh room-settings session, like the name.
     pub async fn set_room_topic_for(
         &self,
         expected_account_id: &str,
         room_id: &str,
         topic: &str,
     ) -> Result<()> {
-        let state = self.state.lock().await;
-        selected_loaded_for(&state, expected_account_id)?;
-        let room = account_room(&state, expected_account_id, room_id)?;
-        room.set_room_topic(topic)
+        let session = self.settings_for(expected_account_id, room_id).await?;
+        session
+            .set_topic(topic)
             .await
             .map(|_| ())
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+            .map_err(settings_failure)
+    }
+
+    async fn settings_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+    ) -> Result<crate::RoomSettingsSession> {
+        let selection = self
+            .account_selection(expected_account_id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        let cancellation = RoomSettingsCancellation::new();
+        self.open_room_settings_for(&selection, room_id, cancellation)
+            .await
+            .map_err(settings_failure)
     }
 
     pub async fn redact_message_for(
@@ -131,14 +155,19 @@ impl AccountManager {
         event_id: &str,
         reason: Option<&str>,
     ) -> Result<()> {
-        let state = self.state.lock().await;
-        let loaded = selected_loaded_for(&state, expected_account_id)?;
-        let timeline = loaded.timeline(room_id).await?;
-        let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
-        timeline
-            .redact(&item_id, reason)
+        let selection = self
+            .account_selection(expected_account_id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        let cancellation = ModerationCancellation::new();
+        let scope = ModerationScope {
+            selection: &selection,
+            cancellation: &cancellation,
+            admission: &|| true,
+        };
+        self.redact_event_selected(&scope, room_id, event_id, reason)
             .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+            .map(|_| ())
+            .map_err(moderation_failure)
     }
 
     /// Fetch the joined, invited, and banned membership list for a room.
@@ -189,10 +218,10 @@ impl AccountManager {
         Ok(result)
     }
 
-    /// Update a member's exact Matrix power level. Matrix decides whether the
-    /// selected user is allowed to make this change, including creator rules.
-    /// Holding the account selection lock prevents a delayed action from
-    /// writing under another account after a switch.
+    /// Update a member's exact Matrix power level through the bounded,
+    /// lossless power-level write (`moderation`). Matrix decides whether the
+    /// selected user is allowed to make this change, including creator rules;
+    /// Morpheus refuses first what the fresh power levels already forbid.
     pub async fn set_member_power_level_for(
         &self,
         expected_account_id: &str,
@@ -200,18 +229,40 @@ impl AccountManager {
         user_id: &str,
         level: i64,
     ) -> Result<()> {
-        let user_id = parse_user_id(user_id)?;
-        let level = Int::try_from(level).map_err(|error| {
-            MatrixCoreError::InvalidPowerLevel(format!(
-                "power level is outside Matrix's safe integer range: {error}"
-            ))
-        })?;
-        let state = self.state.lock().await;
-        selected_loaded_for(&state, expected_account_id)?;
-        let room = account_room(&state, expected_account_id, room_id)?;
-        room.update_power_levels(vec![(&user_id, level)])
+        parse_user_id(user_id)?;
+        let selection = self
+            .account_selection(expected_account_id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        let cancellation = ModerationCancellation::new();
+        let scope = ModerationScope {
+            selection: &selection,
+            cancellation: &cancellation,
+            admission: &|| true,
+        };
+        self.set_member_power_level_selected(&scope, room_id, user_id, level)
             .await
             .map(|_| ())
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+            .map_err(moderation_failure)
+    }
+}
+
+/// The fixed text of a moderation failure; a stale selection keeps its own
+/// error so callers can tell an account switch apart.
+fn moderation_failure(error: ModerationError) -> MatrixCoreError {
+    match error {
+        ModerationError::AccountChanged | ModerationError::Cancelled => {
+            MatrixCoreError::SelectedAccountChanged
+        }
+        ModerationError::InvalidPowerLevel => MatrixCoreError::InvalidPowerLevel(error.to_string()),
+        error => MatrixCoreError::Sdk(error.to_string()),
+    }
+}
+
+fn settings_failure(error: RoomSettingsError) -> MatrixCoreError {
+    match error {
+        RoomSettingsError::AccountChanged | RoomSettingsError::Cancelled => {
+            MatrixCoreError::SelectedAccountChanged
+        }
+        error => MatrixCoreError::Sdk(error.to_string()),
     }
 }

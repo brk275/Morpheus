@@ -24,6 +24,7 @@ from fixture_paths import external_path, private_directory, write_private
 from element_peer_fixture import VERSION as ELEMENT_VERSION, IMAGE_DIGEST as ELEMENT_IMAGE_DIGEST
 from run_element_acceptance import diagnostics as element_diagnostics, evidence as element_evidence
 from matrix_fixture_diagnostics import is_progress_line, matrix_fixture_diagnostics
+from sticker_diagnostics import sticker_diagnostics
 from element_process_namespace import namespace_command, stop_owned, wait_owned
 
 
@@ -93,8 +94,38 @@ DRAFTS_STAGES = frozenset((
     "stop_primary", "plaintext_scan", "reopen", "restore_carol", "switch_alice",
     "verify_alice", "clear_alice", "logout_alice", "switch_carol", "verify_carol",
     "logout_carol", "stop_final", "cleanup", "complete",
+    "recovery_fixture", "recovery_prepare", "recovery_wrong_owner", "recovery_cancel",
+    "recovery_crash", "recovery_adopt", "recovery_reselect", "recovery_missing_id",
+    "recovery_quarantine", "recovery_unsupported", "recovery_coverage",
+    "recovery_stop", "recovery_cleanup", "recovery_complete",
 ))
 DRAFTS_STAGE = re.compile(r"^MORPHEUS_DRAFTS_STAGE ([a-z_]{1,48})$", re.MULTILINE)
+APP_RECOVERY_LABEL = "app-draft-recovery"
+APP_TIMELINE_LABEL = "app-live-timeline"
+APP_TIMELINE_CASE = "account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation"
+APP_TIMELINE_CHECKS = frozenset((
+    "room_delivery", "thread_delivery", "thread_root_excluded", "feeds_running",
+    "old_lease_revoked", "idle_feeds_stopped", "late_events_in_core",
+    "stale_room_rejected", "stale_thread_rejected", "renewed_thread_delivery",
+    "renewed_room_delivery", "queued_callbacks_observed", "queued_room_rejected",
+    "queued_thread_rejected", "link_follow_up_stale_retry_rejected",
+    "link_follow_up_owned_retry", "link_follow_up_held_focus_rejected",
+    "link_follow_up_owned_focus", "member_publication", "cleanup_complete",
+))
+APP_TIMELINE_STAGES = frozenset((
+    "setup", "activation", "room_open", "room_delivery", "thread_delivery",
+    "revocation", "renewal", "reopen", "queued_revocation", "queued_drain",
+    "queued_reopen", "link_continuation", "member_publication", "cleanup", "complete",
+))
+APP_TIMELINE_STAGE = re.compile(r"^MORPHEUS_LIVE_TIMELINE_STAGE ([a-z_]{1,48})$", re.MULTILINE)
+APP_TIMELINE_CHECK = re.compile(r"MORPHEUS_LIVE_TIMELINE_CHECK ([a-z_]{1,48})=(true|false)")
+APP_RECOVERY_CASES = frozenset((
+    "observer_revocation", "interrupted_prepare", "rollback_race", "writer_transaction",
+    "thread_index", "release_revocation", "write_revocation", "writer_lock_revocation",
+    "typed_retention", "late_typing_retention", "revoked_retention", "thread_retention",
+))
+APP_RECOVERY_STAGE = re.compile(r"^MORPHEUS_APP_RECOVERY_STAGE ([a-z_]{1,48})$", re.MULTILINE)
+APP_RECOVERY_CHECK = re.compile(r"^MORPHEUS_APP_RECOVERY_CHECK ([a-z_]{1,48})=(true|false)$", re.MULTILINE)
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
 LATE_JOIN_DECRYPT_RESULTS = frozenset((
     "decrypted", "MissingMegolmSession", "UnknownMegolmMessageIndex", "otherUTD", "unavailable",
@@ -210,7 +241,7 @@ INCOMING_ERRORS = frozenset((
     "admission_transport", "admission_unavailable", "admission_timed_out", "admission_revoked",
     "wrong_call", "cancelled", "account_changed", "incoming_offer_unavailable", "room_not_loaded",
     "encryption_state", "room_state", "matrix", "rtc", "media", "worker_stopped", "timed_out",
-    "cleanup", "update", "assertion",
+    "cleanup", "update", "connection_lost", "assertion",
     "invitation_account_mismatch",
     "invitation_call_unavailable",
     "invitation_clock",
@@ -317,7 +348,26 @@ ELEMENT_TEST_STAGES = frozenset((
     "browser_leave", "native_test", "complete",
 ))
 RTC_CHECKS = ("unsupported_transport_local", *RING_LABELS, *RTC_LABELS, ELEMENT_LABEL)
-PLANNED_CHECKS = (*CHAT_CHECKS, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
+PLANNED_CHECKS = (*CHAT_CHECKS, APP_TIMELINE_LABEL, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
+# A focused retry still establishes the identity required by moderation and
+# runs every app recovery guard. It cannot stand in for full acceptance.
+DRAFT_RECOVERY_CHECKS = ("drafts_local", "formatted_local", "moderation_local", APP_RECOVERY_LABEL)
+DRAFT_ONLY_CHECKS = ("drafts_local",)
+# These fixtures call snapshot/room/thread feed reads. Preserve the formatting
+# prerequisite for moderation, both search sync paths and real key recovery.
+TIMELINE_READ_TESTS = ("live_local", "formatted_local", "media_local", "moderation_local", "search_local")
+TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_local", "unsupported_transport_local", APP_TIMELINE_LABEL)
+# Retry the two failed binaries and formatting's dependent moderation check.
+# Passing room/thread UI, media and search cases retain their own evidence.
+TIMELINE_FAILURE_CHECKS = ("formatted_local", "moderation_local", "recovery_local")
+# App-only live controller coverage keeps its existing fixture and cleanup.
+APP_TIMELINE_ONLY_CHECKS = (APP_TIMELINE_LABEL,)
+MEDIA_ONLY_CHECKS = ("media_local",)
+SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
+          "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
+          "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
+          "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
+          "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS)}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -365,6 +415,75 @@ def drafts_diagnostics(output: str) -> dict:
             result["test_entered"] |= stage == "fixture"
             result["stage"] = stage
     return result
+
+
+def drafts_completed(output: str) -> bool:
+    # Either test order is valid; both fixtures must enter and finish cleanup.
+    stages = {match[1] for match in DRAFTS_STAGE.finditer(output)
+              if match[1] in DRAFTS_STAGES}
+    return {"fixture", "complete", "recovery_fixture", "recovery_complete"} <= stages
+
+
+def app_recovery_diagnostics(output: str) -> dict:
+    result = {}
+    for match in APP_RECOVERY_STAGE.finditer(output):
+        if match[1] in APP_RECOVERY_CASES:
+            result["stage"] = match[1]
+    return result
+
+
+def app_recovery_evidence(output: str) -> dict[str, bool]:
+    checks = {}
+    for match in APP_RECOVERY_CHECK.finditer(output):
+        name, value = match[1], match[2]
+        if name in APP_RECOVERY_CASES:
+            if name in checks or value != "true":
+                raise RuntimeError("Live app recovery evidence is incomplete")
+            checks[name] = True
+    entered = {match[1] for match in APP_RECOVERY_STAGE.finditer(output)
+               if match[1] in APP_RECOVERY_CASES}
+    if (passed_tests(output) != len(APP_RECOVERY_CASES)
+            or entered != APP_RECOVERY_CASES or checks.keys() != APP_RECOVERY_CASES):
+        raise RuntimeError("Live app recovery evidence is incomplete")
+    return {name: True for name in sorted(APP_RECOVERY_CASES)}
+
+
+def app_timeline_diagnostics(output: str) -> dict:
+    result = {"test_entered": False}
+    for match in APP_TIMELINE_STAGE.finditer(output):
+        if match[1] in APP_TIMELINE_STAGES:
+            result["test_entered"] |= match[1] == "setup"
+            result["stage"] = match[1]
+    return result
+
+
+def app_timeline_evidence(output: str) -> dict[str, bool]:
+    """One real harness, all fixed assertions, and cleanup before completion."""
+    checks = {}
+    proof = []
+    error = "Live timeline UI evidence is incomplete"
+    for line in output.splitlines():
+        if line.startswith("MORPHEUS_LIVE_TIMELINE_CHECK"):
+            match = APP_TIMELINE_CHECK.fullmatch(line)
+            if (not match or match[1] not in APP_TIMELINE_CHECKS
+                    or match[1] in checks or match[2] != "true"):
+                raise RuntimeError(error)
+            checks[match[1]] = True
+            proof.append(("check", match[1]))
+        elif line.startswith("MORPHEUS_LIVE_TIMELINE_STAGE"):
+            match = APP_TIMELINE_STAGE.fullmatch(line)
+            if not match or match[1] not in APP_TIMELINE_STAGES:
+                raise RuntimeError(error)
+            proof.append(("stage", match[1]))
+        if len(proof) > 64:
+            raise RuntimeError(error)
+    if (passed_tests(output) != 1 or checks.keys() != APP_TIMELINE_CHECKS
+            or not proof or proof[0] != ("stage", "setup")
+            or proof[-1] != ("stage", "complete")
+            or proof.count(("stage", "setup")) != 1
+            or proof.count(("stage", "complete")) != 1):
+        raise RuntimeError(error)
+    return {name: True for name in sorted(APP_TIMELINE_CHECKS)}
 
 
 def native_process_diagnostics(output: str, returncode, timed_out: bool) -> dict:
@@ -623,7 +742,11 @@ def fixture_from_output(output: str, root: Path) -> Path:
 
 
 class Acceptance:
-    def __init__(self, root: Path, gitleaks: str, *, started=None):
+    def __init__(self, root: Path, gitleaks: str, *, started=None, suite="full"):
+        if suite not in SUITES:
+            raise ValueError("Unknown acceptance suite")
+        self.suite = suite
+        self.planned_checks = SUITES[suite]
         self.root = private_directory(root)
         self.logs = private_directory(root / "logs")
         self.gitleaks = gitleaks
@@ -670,7 +793,7 @@ class Acceptance:
 
     def finish_checks(self):
         completed = {item["check"] for item in self.results}
-        if self.failures or self.not_run or any(label not in completed for label in PLANNED_CHECKS):
+        if self.failures or self.not_run or any(label not in completed for label in self.planned_checks):
             raise RuntimeError("Matrix acceptance has failed or unexecuted required checks")
 
     def require_containment(self):
@@ -763,6 +886,13 @@ class Acceptance:
             or (element_checks and element_diagnostics(output).get("stage") in ELEMENT_TEST_STAGES)
         )
         if process.returncode or timed_out:
+            if label == "timeline_10k":
+                # The child already emits a closed summary, but run() raises
+                # before returning its output on failure. Forward only that
+                # validated record, after the independent log scan above.
+                from run_timeline_acceptance import SUMMARY_PREFIX, failed_summary
+                if timeline_failure := failed_summary(output):
+                    print(SUMMARY_PREFIX + json.dumps(timeline_failure, sort_keys=True), flush=True)
             # Scanner coverage is not a guarantee: arbitrary server errors can
             # reflect secrets without a recognizable prefix. Never publish raw
             # child logs, including on failure. Only source locations and Rust
@@ -770,16 +900,25 @@ class Acceptance:
             failed = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. FAILED$", output, re.MULTILINE)
             locations = re.findall(r"panicked at (crates/[A-Za-z0-9_./-]+\.rs:\d+:\d+)", output)
             evidence = {"check": label, "failed_tests": failed, "panic_locations": locations}
+            if test:
+                # All entered test binaries need the same bounded process
+                # facts, including aborts without a Rust FAILED/panic record.
+                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
             if label == "live_local":
                 evidence["live_diagnostics"] = live_diagnostics(output)
-                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
                 if timed_out:
                     evidence["live_diagnostics"]["failure"] = "deadline"
             if label == "drafts_local":
                 evidence["drafts_diagnostics"] = drafts_diagnostics(output)
-                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
                 if timed_out:
                     evidence["drafts_diagnostics"]["failure"] = "deadline"
+            if label == "media_local":
+                if diagnostics := sticker_diagnostics(output):
+                    evidence["sticker_diagnostics"] = diagnostics
+            if label == APP_RECOVERY_LABEL:
+                evidence["app_recovery_diagnostics"] = app_recovery_diagnostics(output)
+            if label == APP_TIMELINE_LABEL:
+                evidence["app_timeline_diagnostics"] = app_timeline_diagnostics(output)
             if fixture_diagnostics := matrix_fixture_diagnostics(output):
                 if timed_out:
                     fixture_diagnostics["failure"] = "deadline"
@@ -859,10 +998,20 @@ class Acceptance:
             record["live_diagnostics"] = diagnostics
         if label == "drafts_local":
             diagnostics = drafts_diagnostics(output)
-            if not diagnostics["test_entered"] or diagnostics.get("stage") != "complete":
+            if record.get("passed") != 2 or not drafts_completed(output):
                 print(json.dumps({"check": label, "drafts_diagnostics": diagnostics}), flush=True)
                 raise RuntimeError("Draft restart acceptance completion evidence is incomplete")
             record["drafts_diagnostics"] = diagnostics
+        if label == APP_RECOVERY_LABEL:
+            record["app_recovery_checks"] = app_recovery_evidence(output)
+        if label == APP_TIMELINE_LABEL:
+            if not test:
+                raise RuntimeError("Live timeline UI evidence is incomplete")
+            try:
+                record["app_timeline_checks"] = app_timeline_evidence(output)
+            except RuntimeError:
+                print(json.dumps({"check": label, "app_timeline_diagnostics": app_timeline_diagnostics(output)}), flush=True)
+                raise
         if label == "moderation_local":
             # A green moderation result must exercise an existing, unverified
             # account identity on this fresh device without changing trust.
@@ -895,6 +1044,81 @@ class Acceptance:
         if env.get("MORPHEUS_RTC_LATE_JOIN") == "1":
             label += "-late-join"
         self.run(label, args, extra=env, test=True, pid_namespace=True)
+
+    def app_recovery(self, fixture: Path):
+        self.run(
+            APP_RECOVERY_LABEL,
+            ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+             "--bin", "morpheus-app", "live::stale_observer_tests::", "--",
+             "--nocapture", "--test-threads=1"],
+            extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
+            test=True, pid_namespace=True,
+        )
+
+    def app_timeline(self, fixture: Path):
+        self.run(
+            APP_TIMELINE_LABEL,
+            ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+             "--bin", "morpheus-app", APP_TIMELINE_CASE, "--", "--exact",
+             "--nocapture", "--test-threads=1"],
+            extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
+            # The existing account harness has a 20-second bound before the
+            # live scenario's 420-second bound. Preserve time for both plus
+            # process startup; final credential scanning has its own reserve.
+            seconds=480, test=True, pid_namespace=True,
+        )
+
+    def draft_recovery_cases(self, fixture: Path):
+        self.group(("drafts_local",), lambda: self.test("drafts_local", fixture))
+        formatted = self.group(("formatted_local",), lambda: self.test("formatted_local", fixture))
+        if formatted:
+            self.group(("moderation_local",), lambda: self.test("moderation_local", fixture))
+        else:
+            self.not_run["moderation_local"] = "dependency_failed"
+            print(json.dumps({"check": "moderation_local", "status": "not_run",
+                              "reason": "dependency_failed"}), flush=True)
+        self.group((APP_RECOVERY_LABEL,), lambda: self.app_recovery(fixture))
+
+    def timeline_failure_cases(self, fixture: Path):
+        formatted = self.group(("formatted_local",), lambda: self.test("formatted_local", fixture))
+        if formatted:
+            self.group(("moderation_local",), lambda: self.test("moderation_local", fixture))
+        else:
+            self.not_run["moderation_local"] = "dependency_failed"
+            print(json.dumps({"check": "moderation_local", "status": "not_run",
+                              "reason": "dependency_failed"}), flush=True)
+
+        def recovery_case():
+            recovery = fixture_from_output(self.script("local_matrix_env", "recovery-fixture"), self.root)
+            self.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
+        self.group(("recovery_local",), recovery_case)
+
+    def timeline_read_cases(self, fixture: Path):
+        formatted_passed = False
+        for name in TIMELINE_READ_TESTS:
+            if name == "moderation_local" and not formatted_passed:
+                self.not_run[name] = "dependency_failed"
+                print(json.dumps({"check": name, "status": "not_run", "reason": "dependency_failed"}), flush=True)
+                continue
+            succeeded = self.group((name,), lambda name=name: self.test(name, fixture))
+            if name == "formatted_local":
+                formatted_passed = succeeded
+        self.group(("search_local-classic",), lambda: self.test(
+            "search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}))
+
+        def recovery_case():
+            recovery = fixture_from_output(self.script("local_matrix_env", "recovery-fixture"), self.root)
+            self.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
+        self.group(("recovery_local",), recovery_case)
+
+        # This existing RTC service gate also reads message snapshots. It uses
+        # Synapse B without a call service; no SFU or browser peer is needed.
+        def unsupported_case():
+            gate = fixture_from_output(self.script("local_matrix_env", "rtc-gate-fixture"), self.root)
+            self.test("unsupported_transport_local", gate, rtc=True,
+                      extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
+        self.group(("unsupported_transport_local",), unsupported_case)
+        self.group((APP_TIMELINE_LABEL,), lambda: self.app_timeline(fixture))
 
     def rtc_cases(self):
         # Every run gets different users/room: existing devices and keys would
@@ -1022,16 +1246,54 @@ class Acceptance:
     def summary(self):
         completed = {item["check"] for item in self.results + self.failures}
         unexecuted = {label: self.not_run.get(label, "prerequisite_failed")
-                      for label in PLANNED_CHECKS if label not in completed}
+                      for label in self.planned_checks if label not in completed}
         write_private(self.root / "outcomes.json", json.dumps({
+            "suite": self.suite,
             "passed": self.results, "failed": self.failures, "not_run": unexecuted,
         }, indent=2) + "\n")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
             with open(summary, "a", encoding="utf-8") as output:
                 output.write("### Disposable Matrix integration\n\n")
-                output.write("Real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
-                             "synthetic call media and OAuth browser-form protocol automation.\n\n")
+                if self.suite == "full":
+                    output.write("Full suite: real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
+                                 "synthetic call media and OAuth browser-form protocol automation.\n\n")
+                elif self.suite == "timeline-reads":
+                    output.write("Focused timeline-read checks: real Synapse and an ephemeral OS Secret Service. "
+                                 "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths, key recovery, chat without a call service and generated-window model delivery/revocation. "
+                                 "No OAuth, live-call interoperability or installed-app checks; this is not full acceptance.\n\n")
+                elif self.suite == "timeline-failures":
+                    output.write("Focused formatting, dependent moderation and fresh encrypted-history recovery checks. "
+                                 "This is not full acceptance; other native and live UI evidence is recorded separately.\n\n")
+                elif self.suite == "drafts-only":
+                    output.write("Focused drafts-only rerun: real Synapse and an ephemeral OS Secret Service. "
+                                 "Only the draft persistence/recovery cases ran. "
+                                 "No app recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
+                elif self.suite == "app-timeline":
+                    output.write("Focused generated-window timeline checks: real Synapse and an ephemeral OS Secret Service. "
+                                 "Only app-live-timeline ran, covering model delivery, stale callback rejection, member publication and cleanup. "
+                                 "No draft recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
+                elif self.suite == "native-call":
+                    output.write("Focused generated-window timeline and encrypted invitation/incoming actor checks: "
+                                 "one disposable Synapse, OS Secret Service and LiveKit lifecycle. "
+                                 "Includes app-live-timeline followed by fresh Current/Sticky2025 DM/room cases. "
+                                 "No OAuth, broader call interoperability, physical-device or installed-package "
+                                 "checks; this is not full acceptance. "
+                                 "The invitation cases do not exercise live cross-device Decline.\n\n")
+                elif self.suite == "outgoing-ring":
+                    output.write("Focused encrypted invitation and incoming actor checks: real Synapse, "
+                                 "an ephemeral OS Secret Service and LiveKit, with fresh users and rooms "
+                                 "for Current/Sticky2025 and DM/room cases. "
+                                 "This is not full call, Element interoperability, UI, physical-device "
+                                 "or installed-package acceptance.\n\n")
+                elif self.suite == "media-only":
+                    output.write("Focused encrypted media checks: real Synapse and an ephemeral OS Secret Service. "
+                                 "Only media_local ran; this is not full acceptance. "
+                                 "Native picker, keyboard, physical devices and installed-package checks remain separate.\n\n")
+                else:
+                    output.write("Focused draft-recovery rerun: real Synapse and an ephemeral OS Secret Service. "
+                                 "Includes the formatting prerequisite for moderation and all app recovery guards. "
+                                 "No OAuth or RTC checks; this is not full acceptance.\n\n")
                 output.write("| Check | Passed tests | Seconds |\n| --- | ---: | ---: |\n")
                 for item in self.results:
                     if "passed" in item:
@@ -1070,6 +1332,8 @@ def main():
     started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gitleaks", required=True)
+    parser.add_argument("--suite", choices=tuple(SUITES), default="full",
+                        help="Focused retries do not establish full acceptance (default: full)")
     args = parser.parse_args()
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise RuntimeError("This harness is restricted to ephemeral Linux GitHub runners")
@@ -1094,13 +1358,54 @@ def main():
         if set(result.stdout.splitlines()).intersection(names):
             raise RuntimeError("Pre-existing Matrix fixture found; refusing to modify it")
     root = Path(tempfile.mkdtemp(prefix="morpheus-hosted-acceptance-", dir=os.environ.get("RUNNER_TEMP")))
-    acceptance = Acceptance(root, args.gitleaks, started=started)
+    acceptance = Acceptance(root, args.gitleaks, started=started, suite=args.suite)
     body_failed = False
     try:
         acceptance.start_keyring()
         acceptance.require_containment()
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "native-call":
+            def native_call_checks():
+                acceptance.app_timeline(fixture)
+                acceptance.script("local_matrix_rtc", "up")
+                acceptance.script("local_matrix_rtc", "probe")
+                acceptance.outgoing_ring_cases()
+            acceptance.group(SUITES["native-call"], native_call_checks)
+            acceptance.finish_checks()
+            return
+        if args.suite == "outgoing-ring":
+            def ring_checks():
+                acceptance.script("local_matrix_rtc", "up")
+                acceptance.script("local_matrix_rtc", "probe")
+                acceptance.outgoing_ring_cases()
+            acceptance.group(RING_LABELS, ring_checks)
+            acceptance.finish_checks()
+            return
+        if args.suite == "app-timeline":
+            acceptance.group(APP_TIMELINE_ONLY_CHECKS, lambda: acceptance.app_timeline(fixture))
+            acceptance.finish_checks()
+            return
+        if args.suite == "media-only":
+            acceptance.group(MEDIA_ONLY_CHECKS, lambda: acceptance.test("media_local", fixture))
+            acceptance.finish_checks()
+            return
+        if args.suite == "drafts-only":
+            acceptance.group(DRAFT_ONLY_CHECKS, lambda: acceptance.test("drafts_local", fixture))
+            acceptance.finish_checks()
+            return
+        if args.suite == "draft-recovery":
+            acceptance.draft_recovery_cases(fixture)
+            acceptance.finish_checks()
+            return
+        if args.suite == "timeline-reads":
+            acceptance.timeline_read_cases(fixture)
+            acceptance.finish_checks()
+            return
+        if args.suite == "timeline-failures":
+            acceptance.timeline_failure_cases(fixture)
+            acceptance.finish_checks()
+            return
         # Each selector owns its local profile, fresh devices and unique test
         # data. They share seeded accounts/rooms, not the preceding result.
         # Moderation is the one exception: it asserts an existing identity is
@@ -1117,6 +1422,8 @@ def main():
                 formatted_passed = succeeded
         acceptance.group(("search_local-classic",), lambda: acceptance.test(
             "search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}))
+        acceptance.group((APP_TIMELINE_LABEL,), lambda: acceptance.app_timeline(fixture))
+        acceptance.group((APP_RECOVERY_LABEL,), lambda: acceptance.app_recovery(fixture))
         def recovery_case():
             recovery = fixture_from_output(acceptance.script("local_matrix_env", "recovery-fixture"), root)
             acceptance.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})

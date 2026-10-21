@@ -18,6 +18,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
 
 let maxNodes = 5000
@@ -26,6 +27,7 @@ let maxLine = 256
 let keyCodes: [String: CGKeyCode] = ["Return": 0x24, "Tab": 0x30, "Space": 0x31, "Escape": 0x35]
 let shiftCode: CGKeyCode = 0x38
 let staticTextRole = "AXStaticText"
+let runLoopTurn: TimeInterval = 0.05
 
 struct Target {
     let pid: pid_t
@@ -73,6 +75,39 @@ func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
     return result == .success ? value : nil
 }
 
+// AXError.noValue explicitly reports that this attribute has no value. Native
+// AppKit leaf buttons use it for AXChildren. It is distinct from an unsupported
+// attribute or an unreadable subtree: those errors must remain incomplete.
+// A success with no array, or a noValue result with a contradictory payload,
+// proves nothing. Keep this classification separate for native boundary tests.
+func classifiedChildren(_ result: AXError, _ value: CFTypeRef?) -> [AXUIElement]? {
+    if result == .noValue && value == nil {
+        return []
+    }
+    guard result == .success, let value = value,
+          CFGetTypeID(value) == CFArrayGetTypeID() else { return nil }
+    let array = value as! CFArray
+    // Check the count before materializing a Swift array. The AX API already
+    // returned its CFArray; this bound limits our own retained children.
+    guard CFArrayGetCount(array) <= maxNodes,
+          let objects = value as? [AnyObject] else { return nil }
+    var children: [AXUIElement] = []
+    children.reserveCapacity(objects.count)
+    for object in objects {
+        // Swift conditional casts to CF reference types do not prove the
+        // runtime CF type. Validate each item before the guarded force cast.
+        guard CFGetTypeID(object) == AXUIElementGetTypeID() else { return nil }
+        children.append(object as! AXUIElement)
+    }
+    return children
+}
+
+func childElements(_ element: AXUIElement) -> [AXUIElement]? {
+    var value: CFTypeRef? = nil
+    let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value)
+    return classifiedChildren(result, value)
+}
+
 func string(_ element: AXUIElement, _ name: String) -> String? {
     return attribute(element, name) as? String
 }
@@ -114,22 +149,64 @@ func permissions() {
     reply(["accessibility": AXIsProcessTrusted(), "post_event": CGPreflightPostEventAccess()])
 }
 
+// The driver sends the executable fully resolved, as libproc reports it.
+// Foundation's URL standardization and symlink resolution strip a leading
+// /private (documented for NSURL), so they cannot be compared with it;
+// realpath resolves both sides the same way.
+func canonicalPath(_ url: URL) -> String? {
+    guard url.isFileURL else { return nil }
+    return url.withUnsafeFileSystemRepresentation { representation -> String? in
+        guard let representation = representation, let resolved = realpath(representation, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+}
+
+// One bounded turn of this bridge's otherwise idle main run loop. AppKit
+// documents that NSRunningApplication's time-varying properties and
+// NSWorkspace.runningApplications change only when the main run loop runs in
+// a common mode (.default is one). The turn only lets pending updates arrive;
+// it never waits for, retries or accepts an identity.
+func refreshApplicationState() {
+    _ = RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: runLoopTurn))
+}
+
 func attach(_ command: [String: Any]) {
-    guard let pidValue = command["pid"] as? Int, pidValue > 0,
+    // A failed new attachment must never leave the previous target usable.
+    target = nil
+    elements = []
+    guard let pidValue = command["pid"] as? Int, pidValue > 0, pidValue <= Int(Int32.max),
           let executable = command["executable"] as? String, !executable.isEmpty,
           let bundle = command["bundle"] as? String, !bundle.isEmpty else {
         fail("invalid_command")
         return
     }
     let pid = pid_t(pidValue)
+    refreshApplicationState()
+    // Absent metadata (*_missing) is reported apart from a present value that
+    // differs (*_mismatch); only the driver decides whether to ask again.
     guard let running = NSRunningApplication(processIdentifier: pid) else {
-        fail("attach_mismatch")
+        fail("attach_application_missing")
         return
     }
-    guard running.bundleIdentifier == bundle,
-          let url = running.executableURL,
-          url.standardizedFileURL.resolvingSymlinksInPath().path == executable else {
-        fail("attach_mismatch")
+    guard let identifier = running.bundleIdentifier else {
+        fail("attach_bundle_missing")
+        return
+    }
+    guard identifier == bundle else {
+        fail("attach_bundle_mismatch")
+        return
+    }
+    guard let url = running.executableURL else {
+        fail("attach_executable_missing")
+        return
+    }
+    guard let path = canonicalPath(url) else {
+        fail("attach_executable_unresolved")
+        return
+    }
+    guard path == executable else {
+        fail("attach_executable_mismatch")
         return
     }
     target = Target(pid: pid, executable: executable, bundle: bundle)
@@ -187,7 +264,7 @@ func snapshot() {
                 node["truncated"] = truncated
                 node["name_source"] = source
                 node["focused"] = (attribute(element, kAXFocusedAttribute as String) as? Bool) ?? false
-                if let children = attribute(element, kAXChildrenAttribute as String) as? [AXUIElement] {
+                if let children = childElements(element) {
                     for child in children {
                         if elements.count + (queue.count - index) >= maxNodes {
                             wasBounded = true

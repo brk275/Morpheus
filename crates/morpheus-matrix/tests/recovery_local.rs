@@ -3,6 +3,9 @@
 //! the fixture's mode-0600 JSON path. The recovery key stays in memory only.
 #![recursion_limit = "512"]
 
+#[path = "support/opened_room.rs"]
+mod opened_room;
+
 use std::{collections::HashMap, fs, future::Future, path::PathBuf, time::Duration};
 
 use morpheus_matrix::{AccountInfo, AccountManager, MatrixCoreError, MessageInfo};
@@ -88,6 +91,7 @@ async fn wait_for_room(manager: &AccountManager, room_id: &str) -> TestResult<()
         )
         .await?;
         if rooms.iter().any(|room| room.room_id == room_id) {
+            opened_room::scan(manager, room_id).await?;
             return Ok(());
         }
         if Instant::now() >= deadline {

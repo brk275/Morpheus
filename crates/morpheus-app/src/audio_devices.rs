@@ -1,5 +1,7 @@
-//! Persisted audio routing for the next join. Catalog discovery opens no stream.
-//! The UI holds checked preferences; each call receives its own owned copy.
+//! Persisted audio routing for new joins. Catalog discovery opens no stream.
+//! The UI holds checked preferences; each call receives its own owned copy,
+//! and a call in progress changes only on an explicit Use for this call
+//! (`CallController::set_audio_route`), never on a save or a file edit.
 
 use morpheus_config::{Config, ConfigStore};
 use sha2::{Digest, Sha256};
@@ -66,7 +68,9 @@ fn id_tag(id: &str) -> String {
         .collect()
 }
 
-fn friendly_name(name: &str) -> String {
+/// A platform device name, bounded and without control or direction
+/// characters, for showing only (never an identity).
+pub(crate) fn friendly_name(name: &str) -> String {
     let cleaned = name.chars().filter(|character| {
         !character.is_control()
             && !matches!(*character, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
@@ -200,7 +204,7 @@ fn save_selection(ui: &AppWindow, store: &ConfigStore, input: bool, label: &str)
         }
     }) {
         apply_config(ui, &config);
-        ui.set_audio_device_notice("Audio device saved. Applies to your next call; leave and rejoin to change an active call.".into());
+        ui.set_audio_device_notice("Audio device saved for new calls. During a call, choose Use for this call to switch without leaving.".into());
     } else {
         // ComboBox updates its index before selected fires. Restore the last
         // checked preference after a failed save, including invalid TOML edits.
@@ -298,7 +302,7 @@ fn register_discovery(ui: &AppWindow, handle: &tokio::runtime::Handle) {
                         ui.set_audio_catalog_loaded(true);
                         render(&ui);
                         ui.set_audio_device_notice(
-                            "Device list refreshed. Choices apply to your next call.".into(),
+                            "Device list refreshed. Choices apply to new calls; Use for this call switches a call in progress.".into(),
                         );
                     }
                     Err(_) => ui.set_audio_device_notice(

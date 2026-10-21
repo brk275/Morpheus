@@ -39,7 +39,9 @@ fresh evidence. See [the verification log](VERIFICATION.md).
       behavior remain unverified. The room-mention projection and expanded
       encrypted room/reply/thread/edit fixture passed again in Linux at
       `51c04ce`. Composer keyboard/IME/accessibility, live rendered UI, rendered
-      emoji breadth, stickers and the complete behavior set remain open.
+      emoji breadth, stickers and the complete behavior set remain open. A
+      source-only sticker catalog, picker and gated send path
+      ([details](STICKERS.md)) has not executed.
 - [ ] Upload, download, preview, and safely open images, video, audio, and
       files in encrypted and unencrypted rooms. The Matrix core passed an
       encrypted binary-file upload/download roundtrip with metadata, account
@@ -62,9 +64,14 @@ fresh evidence. See [the verification log](VERIFICATION.md).
       per-thread guard prevents duplicate submissions during that session.
       Controller regressions passed all four native targets at `3f1a3df`;
       Linux live checks passed encrypted persistence/isolation and tracked-send
-      acknowledgement. Live thread UI acceptance remains open. Pending sends
-      completed after app exit can leave stale drafts; queue reconciliation
-      after restart and retry/cancel controls remain open.
+      acknowledgement. Live thread UI acceptance remains open. Queued room
+      and thread sends are now recorded in the encrypted draft row before
+      enqueue with their complete typed text, reconciled by exact transaction
+      after restart, and offered per-record native retry, cancel, restore,
+      copy and unconfirmed-review choices; unreadable saved data, and readable
+      drafts other clients stored with attachments or reply/edit targets, are
+      kept untouched until an explicit review of exactly that row. That source
+      has not been built or run yet.
 - [ ] Render long and mixed-height timelines with virtualization and keyboard
       navigation; benchmark a 10,000-message room.
 
@@ -119,6 +126,8 @@ fresh evidence. See [the verification log](VERIFICATION.md).
       recovered in a native test. Persisted next-call microphone/speaker
       selectors passed native compilation and regressions on all four targets
       at `3f1a3df`; real routing, permissions and unplug behavior remain open.
+      In-call switching (Use for this call) and disconnect recovery were added
+      later in source only and have not been compiled or run.
       A full network outage, SFU restart, GUI capture stop/start and
       cross-platform call acceptance also remain open.
 - [ ] Settings, themes, accessibility, and platform packaging work on macOS,

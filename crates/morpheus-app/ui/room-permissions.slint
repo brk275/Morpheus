@@ -1,0 +1,680 @@
+// Roles and permissions of the open room: the third view of the room admin
+// dialog. Rust owns every value, read, check and the save
+// (src/room_permissions.rs); this file lays rows out, keeps the selection
+// and reports explicit choices. A change is only staged here; nothing is
+// sent before the review's Save.
+
+import { ListView, ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TextAction, TokenCheck, TokenSelect } from "controls.slint";
+
+export struct PermissionRow {
+    // Stable: "u:" and a user ID, "k:" and a permission name, "e:" and an
+    // event type.
+    id: string,
+    // A display name, or what the permission allows.
+    title: string,
+    // The user ID or event type, or empty.
+    detail: string,
+    // "Moderator · 50", "Moderators and above · 50", "Creator · unlimited".
+    level: string,
+    // The staged change ("→ 75", "→ default, 0"), or empty.
+    change: string,
+    editable: bool,
+    // The entry can be removed so a default applies again.
+    removable: bool,
+    // Why it cannot be changed, or empty.
+    reason: string,
+}
+
+export struct PermissionsPalette {
+    ink: color,
+    muted: color,
+    surface: color,
+    elevated: color,
+    hover: color,
+    outline: color,
+    focus: color,
+    selection: color,
+    selection-ink: color,
+    has-selection-ink: bool,
+    accent: color,
+    error: color,
+    warning: color,
+    scrim: color,
+    input-surface: color,
+    input-border: color,
+}
+
+export global RoomPermissions {
+    // 0 nothing, 1 reading, 2 shown, 3 failed.
+    in-out property <int> state: 0;
+    in-out property <string> room-name;
+    // Your level, what changing permissions needs, read-only reasons and
+    // what was left out of the lists.
+    in-out property <string> summary;
+    in-out property <string> error;
+    in-out property <string> notice;
+    // A save is running.
+    in-out property <bool> busy: false;
+    // An uncertain or refused save: read again before another change.
+    in-out property <bool> refresh-required: false;
+    // 0 people, 1 permissions.
+    in-out property <int> section: 0;
+    in-out property <string> query;
+    in-out property <[PermissionRow]> rows;
+    // Advanced when the list is replaced or filtered: it starts at its first row.
+    in-out property <int> generation: 0;
+    in-out property <int> staged: 0;
+    // The review of the staged changes.
+    in-out property <bool> review-open: false;
+    in-out property <[string]> review-lines;
+    in-out property <string> review-warning;
+    in-out property <bool> review-needs-confirmation: false;
+    in-out property <bool> review-confirmed: false;
+    // The view was shown or hidden, or the account or room on screen changed.
+    callback shown(bool);
+    callback context-changed();
+    // A room or account change, a lock or a detach: clear everything now.
+    callback reset();
+    callback refresh();
+    callback filter(string, int);
+    // A row and a level as typed; an empty level removes the entry.
+    callback stage(string, string);
+    callback unstage(string);
+    callback discard();
+    callback review();
+    callback cancel-review();
+    callback save();
+}
+
+component PermissionRowView inherits Rectangle {
+    in property <PermissionRow> entry;
+    in property <bool> current;
+    in property <float> text-scale: 1;
+    in property <PermissionsPalette> palette;
+    callback chosen();
+    property <bool> inked: root.current && root.palette.has-selection-ink;
+
+    background: root.current ? root.palette.selection : root.palette.elevated;
+    border-radius: StyleTokens.radius * 0.8;
+    accessible-role: list-item;
+    accessible-item-selected: root.current;
+    accessible-label: root.entry.title
+        + (root.entry.detail != "" ? ", " + root.entry.detail : "")
+        + ", " + root.entry.level
+        + (root.entry.change != "" ? ", staged " + root.entry.change : "")
+        + (root.entry.reason != "" ? ", " + root.entry.reason : "");
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.chosen(); }
+    }
+    VerticalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 2px;
+        alignment: center;
+        Text {
+            text: root.entry.title;
+            color: root.inked ? root.palette.selection-ink : root.palette.ink;
+            font-size: 13px * root.text-scale;
+            font-weight: 700;
+            overflow: elide;
+        }
+        Text {
+            text: root.entry.detail;
+            color: root.inked ? root.palette.selection-ink : root.palette.muted;
+            font-size: 11px * root.text-scale;
+            overflow: elide;
+        }
+        Text {
+            text: root.entry.level + (root.entry.change != "" ? "  " + root.entry.change : "");
+            color: root.inked ? root.palette.selection-ink
+                : root.entry.change != "" ? root.palette.accent : root.palette.muted;
+            font-size: 11px * root.text-scale;
+            font-weight: root.entry.change != "" ? 700 : 400;
+            overflow: elide;
+        }
+    }
+}
+
+export component RoomPermissionsDialog inherits FocusScope {
+    in property <float> text-scale: 1;
+    in property <PermissionsPalette> palette;
+    in property <ControlColors> controls;
+    callback back();
+    callback close();
+
+    // The selected row of the shown list.
+    property <int> current: 0;
+    // Every row is exactly this tall (its lines elide), so a row's top is
+    // its index times the pitch: the geometry the list really lays out.
+    property <length> row-height: 14px + 44px * root.text-scale;
+    property <length> row-gap: 4px;
+    property <length> pitch: root.row-height + root.row-gap;
+    property <length> line-height: 16px * root.text-scale;
+    property <int> count: RoomPermissions.rows.length;
+    property <bool> has-current: root.current >= 0 && root.current < root.count;
+    property <bool> ready: RoomPermissions.state == 2 && !RoomPermissions.busy;
+    property <int> page-rows: max(1, floor(list.visible-height / root.pitch));
+
+    focus-on-tab-navigation: false;
+    init => { search-input.focus(); }
+    changed count => {
+        root.current = max(0, min(root.current, root.count - 1));
+    }
+    property <int> shown-list: RoomPermissions.generation;
+    changed shown-list => { root.current = 0; list.viewport-y = 0; }
+
+    function reveal() {
+        let top = root.current * root.pitch;
+        if top < -list.viewport-y {
+            list.viewport-y = -top;
+        } else if top + root.row-height > -list.viewport-y + list.visible-height {
+            list.viewport-y = -(top + root.row-height - list.visible-height);
+        }
+    }
+    function move-to(index: int) {
+        if root.count > 0 {
+            root.current = max(0, min(root.count - 1, index));
+            root.reveal();
+        }
+    }
+    function edited(text: string) {
+        root.current = 0;
+        list.viewport-y = 0;
+        RoomPermissions.filter(text, RoomPermissions.section);
+    }
+    // The stable ID of the selected row, and of the row the typed level
+    // was typed for. A level only ever stages for the row it belongs to:
+    // when the selected row changes for any reason (another index, a
+    // refreshed or filtered list putting another row at the same index),
+    // the draft is dropped.
+    property <string> current-id: root.has-current ? RoomPermissions.rows[root.current].id : "";
+    property <string> draft-owner: "";
+    changed current-id => {
+        if root.current-id != root.draft-owner {
+            level-input.text = "";
+            root.draft-owner = "";
+        }
+    }
+    function stage-current() {
+        if root.ready && root.has-current && root.draft-owner == root.current-id {
+            RoomPermissions.stage(root.current-id, level-input.text);
+        }
+    }
+
+    capture-key-pressed(event) => {
+        if RoomPermissions.review-open {
+            // The review's own scope below handles its keys.
+            reject
+        } else if event.text == Key.Escape {
+            if RoomPermissions.query != "" && search-input.has-focus {
+                RoomPermissions.query = "";
+                root.edited("");
+            } else {
+                root.close();
+            }
+            accept
+        } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && search-input.has-focus {
+            close-button.focus();
+            accept
+        } else if event.text == Key.Tab && !event.modifiers.shift && close-button.has-focus {
+            search-input.focus();
+            accept
+        } else if search-input.has-focus && event.text == Key.DownArrow {
+            root.move-to(root.current + 1);
+            accept
+        } else if search-input.has-focus && event.text == Key.UpArrow {
+            root.move-to(root.current - 1);
+            accept
+        } else if search-input.has-focus && event.text == Key.PageDown {
+            root.move-to(root.current + root.page-rows);
+            accept
+        } else if search-input.has-focus && event.text == Key.PageUp {
+            root.move-to(root.current - root.page-rows);
+            accept
+        } else if search-input.has-focus && event.modifiers.control && event.text == Key.Home {
+            root.move-to(0);
+            accept
+        } else if search-input.has-focus && event.modifiers.control && event.text == Key.End {
+            root.move-to(root.count - 1);
+            accept
+        } else {
+            reject
+        }
+    }
+
+    Rectangle {
+        background: root.palette.scrim;
+        // Clicks and wheel events on the scrim stop here: nothing behind moves.
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            scroll-event(event) => { accept }
+        }
+        dialog := Rectangle {
+            width: min(720px, parent.width - 40px);
+            height: min(760px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.palette.surface;
+            border-radius: StyleTokens.radius * 1.4;
+            border-color: root.palette.outline;
+            border-width: StyleTokens.line-width;
+            accessible-role: groupbox;
+            accessible-label: "Roles and permissions of " + RoomPermissions.room-name;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+                title-row := HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Roles and permissions";
+                        color: root.palette.ink;
+                        font-size: 17px * root.text-scale;
+                        font-weight: 750;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    TextAction {
+                        text: RoomPermissions.state == 1 ? "Reading…" : "Refresh";
+                        label: "Read this room's permissions again";
+                        enabled: RoomPermissions.state != 1 && !RoomPermissions.busy;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { RoomPermissions.refresh(); }
+                    }
+                }
+                filter-row := HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: max(32px, 16px * root.text-scale + 14px);
+                        background: root.palette.input-surface;
+                        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+                        border-width: search-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+                        border-color: search-input.has-focus ? root.palette.focus : root.palette.input-border;
+                        clip: true;
+                        search-input := TextInput {
+                            x: StyleTokens.input-padding * root.text-scale;
+                            width: parent.width - 2 * StyleTokens.input-padding * root.text-scale;
+                            height: parent.height;
+                            text <=> RoomPermissions.query;
+                            color: root.palette.ink;
+                            selection-background-color: root.palette.selection;
+                            selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                            font-size: 12px * root.text-scale;
+                            vertical-alignment: center;
+                            single-line: true;
+                            accessible-label: "Search people and permissions, or enter a Matrix user ID to give them a level; arrows select";
+                            edited => { root.edited(self.text); }
+                        }
+                        if RoomPermissions.query == "" : Text {
+                            x: StyleTokens.input-padding * root.text-scale;
+                            width: parent.width - 2 * StyleTokens.input-padding * root.text-scale;
+                            height: parent.height;
+                            text: RoomPermissions.section == 0 ? "Search people or enter @name:server" : "Search permissions";
+                            color: root.palette.muted;
+                            font-size: 12px * root.text-scale;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                    section-select := TokenSelect {
+                        width: max(160px, 120px * root.text-scale);
+                        model: ["People", "Permissions"];
+                        current-index <=> RoomPermissions.section;
+                        colors: root.controls;
+                        text-scale: root.text-scale;
+                        accessible-label: "Show people or permissions";
+                        selected(value) => { root.edited(RoomPermissions.query); }
+                    }
+                }
+                // The words that can grow: the coverage line, an error and a
+                // notice. They scroll inside a region that never takes the
+                // room the first row, the edit strip and the footer need, so
+                // at the minimum window height with 200% text one whole row
+                // and every action stay on screen.
+                body := ScrollView {
+                    min-height: root.line-height + 4px;
+                    preferred-height: body-content.preferred-height;
+                    max-height: max(self.min-height,
+                        dialog.height - 32px - 48px - title-row.preferred-height - filter-row.preferred-height
+                            - edit-strip.preferred-height - footer.preferred-height - root.pitch);
+                    vertical-stretch: 0;
+                    viewport-width: self.visible-width;
+                    viewport-height: body-content.preferred-height;
+                    body-content := VerticalLayout {
+                        width: body.visible-width;
+                        spacing: 4px;
+                        Rectangle {
+                            height: summary-text.height;
+                            summary-text := Text {
+                                width: parent.width;
+                                height: self.preferred-height;
+                                text: RoomPermissions.state == 1 ? "Reading this room's permissions…"
+                                    : RoomPermissions.busy ? "Saving… Closing this view cancels what has not been sent."
+                                    : RoomPermissions.summary;
+                                color: root.palette.muted;
+                                font-size: 11px * root.text-scale;
+                                wrap: word-wrap;
+                                accessible-live-region: polite;
+                            }
+                        }
+                        if RoomPermissions.error != "" : Rectangle {
+                            height: error-text.height;
+                            error-text := Text {
+                                width: parent.width;
+                                height: self.preferred-height;
+                                text: RoomPermissions.error;
+                                color: root.palette.error;
+                                font-size: 12px * root.text-scale;
+                                wrap: word-wrap;
+                                accessible-live-region: polite;
+                            }
+                        }
+                        if RoomPermissions.notice != "" : Rectangle {
+                            height: notice-text.height;
+                            notice-text := Text {
+                                width: parent.width;
+                                height: self.preferred-height;
+                                text: RoomPermissions.notice;
+                                color: root.palette.ink;
+                                font-size: 12px * root.text-scale;
+                                wrap: word-wrap;
+                                accessible-live-region: polite;
+                            }
+                        }
+                    }
+                }
+                // Lazy: only the rows in view are instantiated. At the minimum
+                // window height and 200% text one whole row still shows.
+                list := ListView {
+                    vertical-stretch: 1;
+                    min-height: root.pitch;
+                    horizontal-scrollbar-policy: always-off;
+                    accessible-role: AccessibleRole.list;
+                    accessible-label: RoomPermissions.section == 0 ? "People with a level" : "Permissions";
+                    for row[index] in RoomPermissions.rows : Rectangle {
+                        width: list.visible-width;
+                        height: root.pitch;
+                        PermissionRowView {
+                            y: 0px;
+                            height: root.row-height;
+                            entry: row;
+                            current: index == root.current;
+                            text-scale: root.text-scale;
+                            palette: root.palette;
+                            chosen => {
+                                root.current = index;
+                                root.reveal();
+                                level-input.focus();
+                            }
+                        }
+                    }
+                }
+                // The change for the selected row: a level, its default, or undo.
+                edit-strip := HorizontalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+                        height: max(32px, 16px * root.text-scale + 14px);
+                        background: root.palette.input-surface;
+                        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+                        border-width: level-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+                        border-color: level-input.has-focus ? root.palette.focus : root.palette.input-border;
+                        clip: true;
+                        level-input := TextInput {
+                            x: StyleTokens.input-padding * root.text-scale;
+                            width: parent.width - 2 * StyleTokens.input-padding * root.text-scale;
+                            height: parent.height;
+                            color: root.palette.ink;
+                            selection-background-color: root.palette.selection;
+                            selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                            font-size: 12px * root.text-scale;
+                            vertical-alignment: center;
+                            single-line: true;
+                            enabled: root.ready && root.has-current && RoomPermissions.rows[root.current].editable;
+                            accessible-label: root.has-current
+                                ? "New level for " + RoomPermissions.rows[root.current].title + "; Enter stages it"
+                                : "New level";
+                            edited => { root.draft-owner = root.current-id; }
+                            accepted => { root.stage-current(); }
+                        }
+                        if level-input.text == "" : Text {
+                            x: StyleTokens.input-padding * root.text-scale;
+                            width: parent.width - 2 * StyleTokens.input-padding * root.text-scale;
+                            height: parent.height;
+                            text: root.has-current && !RoomPermissions.rows[root.current].editable
+                                ? RoomPermissions.rows[root.current].reason : "New level, for example 50";
+                            color: root.palette.muted;
+                            font-size: 12px * root.text-scale;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                    TextAction {
+                        text: "Set";
+                        label: root.has-current ? "Stage this level for " + RoomPermissions.rows[root.current].title : "Stage this level";
+                        enabled: root.ready && root.has-current && RoomPermissions.rows[root.current].editable && level-input.text != "" && root.draft-owner == root.current-id;
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { root.stage-current(); }
+                    }
+                    TextAction {
+                        text: "Default";
+                        label: root.has-current ? "Stage the default for " + RoomPermissions.rows[root.current].title : "Stage the default";
+                        enabled: root.ready && root.has-current && RoomPermissions.rows[root.current].editable && RoomPermissions.rows[root.current].removable;
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { RoomPermissions.stage(root.current-id, ""); }
+                    }
+                    TextAction {
+                        text: "Undo";
+                        label: root.has-current ? "Undo the staged change for " + RoomPermissions.rows[root.current].title : "Undo";
+                        enabled: root.ready && root.has-current && RoomPermissions.rows[root.current].change != "";
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { RoomPermissions.unstage(RoomPermissions.rows[root.current].id); }
+                    }
+                }
+                // The fixed footer: its actions never scroll away.
+                footer := HorizontalLayout {
+                    spacing: 6px;
+                    TextAction {
+                        text: "Back";
+                        label: "Back to room settings; staged changes are discarded";
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { root.back(); }
+                    }
+                    TextAction {
+                        text: "Discard";
+                        label: "Discard every staged change";
+                        enabled: RoomPermissions.staged > 0 && !RoomPermissions.busy;
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { RoomPermissions.discard(); }
+                    }
+                    TextAction {
+                        text: RoomPermissions.staged > 0 ? "Review " + RoomPermissions.staged + "…" : "Review…";
+                        label: "Review the staged changes before saving";
+                        enabled: root.ready && RoomPermissions.staged > 0 && !RoomPermissions.refresh-required;
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { RoomPermissions.review(); }
+                    }
+                    close-button := TextAction {
+                        text: "Close";
+                        label: "Close roles and permissions; staged changes are discarded";
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { root.close(); }
+                    }
+                }
+            }
+            // The review: what each change does, and the explicit
+            // confirmation lowering your own level needs. Save sends one
+            // change of the room's permissions.
+            if RoomPermissions.review-open : FocusScope {
+                // Tab and Shift+Tab cycle over the enabled controls only, in
+                // order: the confirmation (when asked), Cancel, Save (while
+                // enabled). Focus never reaches a disabled control or leaves
+                // the review.
+                property <bool> asks: RoomPermissions.review-needs-confirmation;
+                property <bool> can-save: review-save.enabled;
+                function focus-first() {
+                    if self.asks { review-check.focus(); } else { review-cancel.focus(); }
+                }
+                function focus-last() {
+                    if self.can-save { review-save.focus(); } else { review-cancel.focus(); }
+                }
+                capture-key-pressed(event) => {
+                    if event.text == Key.Escape {
+                        RoomPermissions.cancel-review();
+                        search-input.focus();
+                        accept
+                    } else if event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift) {
+                        if review-save.has-focus {
+                            review-cancel.focus();
+                        } else if review-cancel.has-focus && self.asks {
+                            review-check.focus();
+                        } else {
+                            // The first control, or anything else: the last enabled.
+                            self.focus-last();
+                        }
+                        accept
+                    } else if event.text == Key.Tab {
+                        if review-check.has-focus {
+                            review-cancel.focus();
+                        } else if review-cancel.has-focus && self.can-save {
+                            review-save.focus();
+                        } else {
+                            // The last enabled control, or anything else: the first.
+                            self.focus-first();
+                        }
+                        accept
+                    } else {
+                        reject
+                    }
+                }
+                Rectangle {
+                    background: root.palette.scrim;
+                    TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        scroll-event(event) => { accept }
+                    }
+                    Rectangle {
+                        x: 16px;
+                        y: 16px;
+                        width: parent.width - 32px;
+                        height: parent.height - 32px;
+                        background: root.palette.elevated;
+                        border-radius: StyleTokens.radius * 1.2;
+                        border-color: root.palette.outline;
+                        border-width: StyleTokens.line-width;
+                        accessible-role: groupbox;
+                        accessible-label: "Review permission changes";
+                        VerticalLayout {
+                            padding: 16px;
+                            spacing: 8px;
+                            Text {
+                                text: "Review changes";
+                                color: root.palette.ink;
+                                font-size: 17px * root.text-scale;
+                                font-weight: 750;
+                                overflow: elide;
+                            }
+                            ScrollView {
+                                vertical-stretch: 1;
+                                viewport-width: self.visible-width;
+                                viewport-height: review-content.preferred-height;
+                                review-content := VerticalLayout {
+                                    width: parent.visible-width;
+                                    spacing: 6px;
+                                    for line in RoomPermissions.review-lines : Text {
+                                        text: line;
+                                        color: root.palette.ink;
+                                        font-size: 12px * root.text-scale;
+                                        wrap: word-wrap;
+                                    }
+                                    if RoomPermissions.review-warning != "" : Text {
+                                        text: RoomPermissions.review-warning;
+                                        color: root.palette.warning;
+                                        font-size: 12px * root.text-scale;
+                                        font-weight: 700;
+                                        wrap: word-wrap;
+                                        accessible-live-region: polite;
+                                    }
+                                    Text {
+                                        text: "Permissions are checked again when saving. Matrix has no conditional write: a change made elsewhere at the same moment can be overwritten.";
+                                        color: root.palette.muted;
+                                        font-size: 11px * root.text-scale;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+                            // Always present so the focus cycle can name it; shown
+                            // and focusable only when the confirmation is asked.
+                            review-check := TokenCheck {
+                                visible: RoomPermissions.review-needs-confirmation;
+                                enabled: RoomPermissions.review-needs-confirmation;
+                                min-height: RoomPermissions.review-needs-confirmation ? max(28px, 16px * root.text-scale + 8px) : 0px;
+                                max-height: RoomPermissions.review-needs-confirmation ? 1000px : 0px;
+                                text: "I understand I cannot raise my own level again myself";
+                                checked <=> RoomPermissions.review-confirmed;
+                                colors: root.controls;
+                                text-scale: root.text-scale;
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                review-cancel := TextAction {
+                                    text: "Cancel";
+                                    label: "Cancel the review; nothing is sent";
+                                    wrap-caption: true;
+                                    text-scale: root.text-scale;
+                                    ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                                    hover-surface: root.palette.hover; outline: root.palette.outline;
+                                    init => { self.focus(); }
+                                    activated => { RoomPermissions.cancel-review(); search-input.focus(); }
+                                }
+                                review-save := TextAction {
+                                    text: "Save changes";
+                                    label: "Save these changes to the room's permissions";
+                                    enabled: !RoomPermissions.busy && (!RoomPermissions.review-needs-confirmation || RoomPermissions.review-confirmed);
+                                    wrap-caption: true;
+                                    text-scale: root.text-scale;
+                                    ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                                    hover-surface: root.palette.hover; outline: root.palette.outline;
+                                    activated => { RoomPermissions.save(); search-input.focus(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

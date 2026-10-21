@@ -1,0 +1,155 @@
+// Copyright 2024 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A collection of room filters.
+//!
+//! The room list can provide an access to the rooms per list, like with
+//! [`super::RoomList::entries_with_dynamic_adapters`]. The provided collection
+//! of rooms can be filtered with these filters. A classical usage would be the
+//! following:
+//!
+//! ```rust
+//! use matrix_sdk_ui::room_list_service::{
+//!     RoomListDynamicEntriesController, filters,
+//! };
+//!
+//! fn configure_room_list(
+//!     entries_controller: &RoomListDynamicEntriesController,
+//! ) {
+//!     // _All_ non-left rooms
+//!     // _and_ that fall in the “People” category,
+//!     // _and_ that are marked as favourite,
+//!     // _and_ that _do not have_ unread notifications.
+//!     entries_controller.set_filter(Box::new(
+//!         // All
+//!         filters::new_filter_all(vec![
+//!             // Non-left
+//!             Box::new(filters::new_filter_non_left()),
+//!             // People
+//!             Box::new(filters::new_filter_category(
+//!                 filters::RoomCategory::People,
+//!             )),
+//!             // Favourite
+//!             Box::new(filters::new_filter_favourite()),
+//!             // No notification
+//!             Box::new(
+//!                 // No…
+//!                 filters::new_filter_not(Box::new(
+//!                     // … unread notifications
+//!                     filters::new_filter_read_receipts(
+//!                         filters::ReadReceiptsCategory::Notifications,
+//!                     ),
+//!                 )),
+//!             ),
+//!         ]),
+//!     ));
+//! }
+//! ```
+
+#[cfg(test)]
+use matrix_sdk::{Client, test_utils::mocks::MatrixMockServer};
+#[cfg(test)]
+use matrix_sdk_test::JoinedRoomBuilder;
+#[cfg(test)]
+use ruma::RoomId;
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+
+use super::RoomListItem;
+
+mod all;
+mod any;
+mod category;
+mod deduplicate_versions;
+mod favourite;
+mod fuzzy_match_room_name;
+mod identifiers;
+mod invite;
+mod joined;
+mod low_priority;
+mod non_left;
+mod none;
+mod normalized_match_room_name;
+mod not;
+mod read_receipts;
+mod space;
+
+pub use self::{
+    all::new_filter as new_filter_all,
+    any::new_filter as new_filter_any,
+    category::{RoomCategory, new_filter as new_filter_category},
+    deduplicate_versions::new_filter as new_filter_deduplicate_versions,
+    favourite::new_filter as new_filter_favourite,
+    fuzzy_match_room_name::new_filter as new_filter_fuzzy_match_room_name,
+    identifiers::new_filter as new_filter_identifiers,
+    invite::new_filter as new_filter_invite,
+    joined::new_filter as new_filter_joined,
+    low_priority::new_filter as new_filter_low_priority,
+    non_left::new_filter as new_filter_non_left,
+    none::new_filter as new_filter_none,
+    normalized_match_room_name::new_filter as new_filter_normalized_match_room_name,
+    not::new_filter as new_filter_not,
+    read_receipts::{Category as ReadReceiptsCategory, new_filter as new_filter_read_receipts},
+    space::new_filter as new_filter_space,
+};
+
+/// A trait “alias” that represents a _filter_.
+///
+/// A filter is simply a function that receives a `&Room` and returns a `bool`.
+pub trait Filter: Fn(&RoomListItem) -> bool {}
+
+impl<F> Filter for F where F: Fn(&RoomListItem) -> bool {}
+
+/// Type alias for a boxed filter function.
+#[cfg(not(target_family = "wasm"))]
+pub type BoxedFilterFn = Box<dyn Filter + Send + Sync>;
+#[cfg(target_family = "wasm")]
+pub type BoxedFilterFn = Box<dyn Filter>;
+
+/// Normalize a string, i.e. decompose it into NFD (Normalization Form D, i.e. a
+/// canonical decomposition, see http://www.unicode.org/reports/tr15/) and
+/// filter out the combining marks.
+fn normalize_string(str: &str) -> String {
+    str.nfd().filter(|c| !is_combining_mark(*c)).collect::<String>()
+}
+
+#[cfg(test)]
+pub(super) async fn new_rooms<const N: usize>(
+    room_ids: [&RoomId; N],
+    client: &Client,
+    server: &MatrixMockServer,
+) -> [RoomListItem; N] {
+    server
+        .mock_sync()
+        .ok_and_run(client, |builder| {
+            for room_id in room_ids {
+                builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+            }
+        })
+        .await;
+
+    room_ids.map(|room_id| client.get_room(room_id).unwrap().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_string;
+
+    #[test]
+    fn test_normalize_string() {
+        assert_eq!(&normalize_string("abc"), "abc");
+        assert_eq!(&normalize_string("Ștefan Été"), "Stefan Ete");
+        assert_eq!(&normalize_string("Ç ṩ ḋ Å"), "C s d A");
+        assert_eq!(&normalize_string("هند"), "هند");
+    }
+}

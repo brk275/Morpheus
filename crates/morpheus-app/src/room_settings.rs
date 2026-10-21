@@ -22,8 +22,32 @@ use std::{
 use tokio::{runtime::Handle, sync::Notify};
 use zeroize::Zeroizing;
 
+mod room_access_settings;
+
+/// An account was removed from this app: its room-access change receipts
+/// (changes with no known result) go with it.
+pub(crate) fn forget_access_account(account: &str) {
+    room_access_settings::forget_account(account);
+}
+
 static FILE_WORKER: AtomicBool = AtomicBool::new(false);
+/// Which form holds the chooser (an `AvatarConsumer` as u8, 0 none), only so
+/// a waiting form can say who has it. Never used for admission.
+static FILE_WORKER_OWNER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The form holding the native image chooser or its file read now.
+pub(crate) fn chooser_owner() -> Option<crate::image_previews::avatar::AvatarConsumer> {
+    crate::image_previews::avatar::AvatarConsumer::from_u8(
+        FILE_WORKER_OWNER.load(Ordering::Acquire),
+    )
+}
 const REFRESH_FIRST: &str = "The change may have reached your homeserver. Refresh room details before making another change.";
+const NOTHING_CHANGED: &str =
+    "Nothing was changed. Refresh room details before making another change.";
+const SAVED_NOT_READ: &str =
+    "The change was saved. Refresh room details to see the current settings.";
+const AVATAR_NOT_CHANGED: &str =
+    "The room avatar was not changed. Refresh room details before making another change.";
 const UNAVAILABLE: &str = "Room settings are unavailable. Close this form and reopen it.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,6 +142,7 @@ struct Form {
     cancellation: RoomSettingsCancellation,
     wake: Notify,
     content: Mutex<Content>,
+    access: Mutex<room_access_settings::Access>,
 }
 impl Form {
     fn cancel(&self) {
@@ -185,6 +210,7 @@ impl RoomSettingsUi {
                 this.edited(&ui, field);
             }
         });
+        room_access_settings::register(ui, &owner);
         owner
     }
     fn edited(&self, ui: &AppWindow, field: i32) {
@@ -220,6 +246,7 @@ impl RoomSettingsUi {
             ui.set_room_admin_busy(false);
         }
         clear_image(ui);
+        room_access_settings::clear(ui);
         ui.set_room_settings_confirmation(0);
         ui.set_room_settings_dirty(false);
         ui.set_room_settings_access_description("".into());
@@ -267,6 +294,12 @@ impl RoomSettingsUi {
             && ui.get_room_admin_account_id().as_str() == form.selection.account_id()
             && ui.get_room_admin_room_id().as_str() == form.room
     }
+    /// Writes are admitted only while no account access, restart or recovery
+    /// step holds the security gate; the core asks right before each send.
+    fn admission(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let gate = self.live.security_gate.clone();
+        Arc::new(move || !gate.blocked())
+    }
     fn current_for(&self, ui: &AppWindow) -> Option<Arc<Form>> {
         let form = self
             .current
@@ -276,6 +309,9 @@ impl RoomSettingsUi {
         self.matches_ui(&form, ui).then_some(form)
     }
     fn open(self: &Arc<Self>, ui: &AppWindow) {
+        if crate::room_addresses::is_open(ui) || crate::room_leave::is_open(ui) {
+            return;
+        }
         self.close(ui);
         if !ui.get_live_session() || !self.live.is_live.load(Ordering::Acquire) {
             return;
@@ -305,6 +341,7 @@ impl RoomSettingsUi {
             cancellation: RoomSettingsCancellation::new(),
             wake: Notify::new(),
             content: Mutex::new(Content::default()),
+            access: Mutex::default(),
         });
         *self.current.lock().expect("Room settings owner poisoned") = Some(form.clone());
         ui.set_room_admin_mode(0);
@@ -324,6 +361,9 @@ impl RoomSettingsUi {
         ui.set_room_settings_refresh_required(false);
         ui.set_room_admin_error("".into());
         ui.set_room_admin_notice("".into());
+        crate::matrix_links::clear(ui);
+        crate::thread_browser::withdraw(ui);
+        crate::withdraw_call_bar(ui);
         ui.set_room_admin_open(true);
         let this = self.clone();
         let watched = form.clone();
@@ -375,7 +415,7 @@ impl RoomSettingsUi {
                     if !this.active(&form) { return Err(RoomSettingsError::Cancelled); }
                     match session {
                         Some(session) => { let snapshot = session.refresh().await?; Ok((session, snapshot)) },
-                        None => { let session = Arc::new(this.live.manager.open_room_settings_for(&form.selection, &form.room, form.cancellation.clone()).await?);
+                        None => { let session = Arc::new(this.live.manager.open_room_settings_for(&form.selection, &form.room, form.cancellation.clone()).await?.with_admission(this.admission()));
                             let snapshot = session.snapshot(); Ok((session, snapshot)) },
                     }
                 } => result,
@@ -745,7 +785,7 @@ impl RoomSettingsUi {
             }
             Err(error) => {
                 state.error = settings_error(error);
-                state.notice = REFRESH_FIRST;
+                state.notice = write_notice(error);
             }
         }
         drop(state);
@@ -956,6 +996,57 @@ fn settings_error(error: RoomSettingsError) -> &'static str {
         RoomSettingsError::EncryptedPreviewDisabled => {
             "Enable previews in encrypted rooms in Appearance before viewing this avatar."
         }
+        RoomSettingsError::SecurityBusy => {
+            "Finish the account or security step in progress first. Nothing was sent."
+        }
+        RoomSettingsError::Refused => "The homeserver refused this change. Nothing was changed.",
+        RoomSettingsError::SignInExpired => {
+            "This sign-in needs renewing. The homeserver did not apply the change."
+        }
+        RoomSettingsError::UploadFailed => {
+            "The image could not be uploaded. The room avatar was not changed."
+        }
+        RoomSettingsError::Unknown => {
+            "No answer came back. The setting may or may not have changed; it is not sent again."
+        }
+        RoomSettingsError::AvatarUnknown => {
+            "The image was uploaded, but whether the room avatar changed is unknown. It is \
+             not sent again."
+        }
+        RoomSettingsError::SavedNotRead => {
+            "Saved, but the current settings could not be read back."
+        }
+        RoomSettingsError::AvatarUploadedNotChanged => {
+            "The image was uploaded to your homeserver, but the room avatar was not changed. \
+             It is not uploaded again unless you save again."
+        }
+        RoomSettingsError::AvatarUploadUnknown => {
+            "No answer came back for the image upload. The image may be on your homeserver, \
+             but the room avatar was not changed. It is not uploaded again unless you save \
+             again."
+        }
+    }
+}
+/// What a failed write may have done. Only an unknown outcome may have
+/// changed the room; every failure still asks for a refresh first.
+fn write_notice(error: RoomSettingsError) -> &'static str {
+    match error {
+        RoomSettingsError::Unknown | RoomSettingsError::AvatarUnknown => REFRESH_FIRST,
+        RoomSettingsError::SavedNotRead => SAVED_NOT_READ,
+        // The image left this device, or may have; only the room is
+        // unchanged.
+        RoomSettingsError::AvatarUploadedNotChanged | RoomSettingsError::AvatarUploadUnknown => {
+            AVATAR_NOT_CHANGED
+        }
+        _ => NOTHING_CHANGED,
+    }
+}
+/// Clears the chooser owner before the permit is released (declared after
+/// the permit, so it drops first).
+struct ChooserOwnerMark;
+impl Drop for ChooserOwnerMark {
+    fn drop(&mut self) {
+        FILE_WORKER_OWNER.store(0, Ordering::Release);
     }
 }
 struct FilePermit<'a>(&'a AtomicBool);
@@ -972,19 +1063,38 @@ impl Drop for FilePermit<'_> {
     }
 }
 async fn choose_file(form: Arc<Form>) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
+    let active = Arc::new(move || form.selection.is_current() && !form.cancellation.is_cancelled());
+    choose_avatar_file(
+        crate::image_previews::avatar::AvatarConsumer::RoomSettings,
+        "Choose room avatar",
+        active,
+    )
+    .await
+}
+/// The one guarded native image chooser and bounded file read, shared by the
+/// room-avatar form and the account's own public-profile editor. One chooser
+/// or read runs process-wide; `active` is checked before and after the dialog
+/// and between reads, so a closed form or changed account reads nothing more.
+pub(crate) async fn choose_avatar_file(
+    consumer: crate::image_previews::avatar::AvatarConsumer,
+    title: &'static str,
+    active: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
     let permit = FilePermit::acquire(&FILE_WORKER).ok_or("A native image chooser or file read is still active. Finish it before choosing another image.")?;
+    FILE_WORKER_OWNER.store(consumer as u8, Ordering::Release);
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("morpheus-avatar-file".into())
         .spawn(move || {
             let _permit = permit;
-            let active = || form.selection.is_current() && !form.cancellation.is_cancelled();
+            let _owner = ChooserOwnerMark;
+            let active = || active();
             let result = (|| {
                 if !active() {
                     return Ok(None);
                 }
                 let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose room avatar")
+                    .set_title(title)
                     .add_filter("PNG or baseline JPEG", &["png", "jpg", "jpeg"])
                     .pick_file()
                 else {
@@ -1012,7 +1122,10 @@ async fn choose_file(form: Arc<Form>) -> Result<Option<Zeroizing<Vec<u8>>>, &'st
             })();
             let _ = tx.send(result);
         })
-        .map_err(|_| "The native image chooser could not start.")?;
+        .map_err(|_| {
+            FILE_WORKER_OWNER.store(0, Ordering::Release);
+            "The native image chooser could not start."
+        })?;
     rx.await
         .map_err(|_| "The selected file could not be read.")?
 }
@@ -1046,6 +1159,39 @@ fn read_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_an_unknown_write_says_it_may_have_reached_the_homeserver() {
+        use RoomSettingsError as Error;
+        for error in [Error::Unknown, Error::AvatarUnknown] {
+            assert_eq!(write_notice(error), REFRESH_FIRST);
+        }
+        assert_eq!(write_notice(Error::SavedNotRead), SAVED_NOT_READ);
+        // After a confirmed upload nothing claims that nothing was sent.
+        let uploaded = Error::AvatarUploadedNotChanged;
+        assert_eq!(write_notice(uploaded), AVATAR_NOT_CHANGED);
+        assert!(settings_error(uploaded).contains("image was uploaded"));
+        assert!(!settings_error(uploaded).contains("Nothing was sent"));
+        // An upload handed over without an answer may have stored the image.
+        let unanswered = Error::AvatarUploadUnknown;
+        assert_eq!(write_notice(unanswered), AVATAR_NOT_CHANGED);
+        assert!(settings_error(unanswered).contains("may be on your homeserver"));
+        assert!(!settings_error(unanswered).contains("Nothing was sent"));
+        assert!(!settings_error(unanswered).contains("could not be uploaded"));
+        for error in [
+            Error::SecurityBusy,
+            Error::Refused,
+            Error::SignInExpired,
+            Error::UploadFailed,
+            Error::PermissionDenied,
+            Error::RateLimited,
+            Error::BaselineChanged,
+        ] {
+            assert_eq!(write_notice(error), NOTHING_CHANGED);
+        }
+        assert!(settings_error(Error::Unknown).contains("may or may not have changed"));
+        assert!(settings_error(Error::AvatarUnknown).contains("image was uploaded"));
+        assert!(settings_error(Error::SecurityBusy).contains("Nothing was sent"));
+    }
     #[test]
     fn stale_forms_do_not_match_returning_to_same_account_and_room() {
         assert!(form_matches(

@@ -1,0 +1,488 @@
+// Settings › Security & recovery › Devices: the signed-in account's
+// sessions. The window owns every property; this file presents them and
+// reports input. A row key is an exact device ID that only routes a request:
+// the controller re-resolves it against its current list, and the core
+// checks a fresh server list of the same account before anything is sent.
+// Nothing here claims a server result; pending, error and notice text come
+// from the controller after the homeserver answers.
+
+import { ListView, Palette } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ActionRect, ControlColors, TokenButton, TokenField } from "controls.slint";
+
+// One signed-in session. Text is sanitized and bounded in Rust.
+export struct DeviceSessionRow {
+    key: string,
+    // The name to show; a placeholder when the session has none.
+    name: string,
+    // The session's own name, or empty, for the rename field.
+    raw-name: string,
+    device-id: string,
+    status: string,
+    last-seen: string,
+    // The device this app runs on.
+    current: bool,
+    // 0 verified, 1 trusted on this device only, 2 signed but not
+    // confirmable here, 3 not verified, 4 blocked, 5 no keys, 6 unknown
+    trust: int,
+}
+
+export struct DeviceSessionsView {
+    // Fences every asynchronous result to one opened list.
+    panel-id: string,
+    // A live account with its session list open.
+    available: bool,
+    loading: bool,
+    loaded: bool,
+    // A rename, verification request or sign-out is running.
+    busy: bool,
+    summary: string,
+    // Cross-signing and this device's own verification.
+    identity: string,
+    pending: string,
+    error: string,
+    notice: string,
+    // "Showing N of M" when searching or bounded.
+    shown: string,
+    selected-key: string,
+    selected: DeviceSessionRow,
+    selected-detail: string,
+    can-rename: bool,
+    // Empty when the selected session offers no verification step.
+    verify-label: string,
+    verify-hint: string,
+    // Empty when the selected session cannot be signed out from here.
+    sign-out-label: string,
+    sign-out-hint: string,
+    // Sign-out: 0 closed, 1 review, 2 password, 3 homeserver page,
+    // 4 sign-in provider page, 5 not possible here, 6 sending
+    stage: int,
+    stage-title: string,
+    stage-body: string,
+    // The homeserver refused the previous password.
+    rejected: bool,
+    page-opened: bool,
+}
+
+// The homeserver's password check. The typed value stays in this element:
+// submitting clears it before the callback runs, and the element (with
+// anything typed) is destroyed when the step, account or page changes.
+component SecretField inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    out property <bool> empty: input.text == "";
+    callback submitted(string);
+    callback cancelled();
+    callback focused();
+    public function submit() {
+        if root.enabled && input.text != "" {
+            let secret = input.text;
+            input.text = "";
+            root.submitted(secret);
+        }
+    }
+    forward-focus: input;
+    min-height: max(32px, 16px * root.text-scale + 14px);
+    horizontal-stretch: 1;
+    // The password TextInput clips its own contents. Keep the surrounding
+    // Settings Flickable reachable by native Tab when this field is offscreen.
+    background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.colors.surface;
+    border-radius: StyleTokens.input-corner;
+    border-width: input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+    border-color: input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.colors.accent)
+        : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.colors.outline;
+    input := TextInput {
+        x: StyleTokens.input-padding;
+        width: max(0px, parent.width - 2 * StyleTokens.input-padding);
+        height: parent.height;
+        input-type: password;
+        single-line: true;
+        enabled: root.enabled;
+        color: root.colors.ink;
+        font-size: 12px * root.text-scale;
+        vertical-alignment: center;
+        selection-background-color: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : Palette.selection-background;
+        selection-foreground-color: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground;
+        accessible-label: root.label;
+        accepted => { root.submit(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                input.text = "";
+                root.cancelled();
+                accept
+            } else { reject }
+        }
+        changed has-focus => { if self.has-focus { root.focused(); } }
+    }
+}
+
+export component DeviceSessionsPanel inherits VerticalLayout {
+    in property <DeviceSessionsView> view;
+    in property <[DeviceSessionRow]> rows;
+    in property <ControlColors> colors;
+    // Card and divider colors of the surrounding Settings section.
+    in property <color> surface;
+    in property <color> divider;
+    in property <float> text-scale: 1;
+    // The live account. A change reopens the list for it.
+    in property <string> scope-key;
+    // Changes when settings search asks for this list.
+    in property <int> reveal-request;
+    // Verification or another security action is running on this page.
+    in property <bool> security-busy;
+    in-out property <string> query;
+    callback scope-changed();
+    callback refresh();
+    callback search(string);
+    callback select(string);
+    callback rename(string, string);
+    callback verify(string);
+    // Opens the review for one session; nothing is sent yet.
+    callback sign-out(string);
+    callback confirm-sign-out();
+    callback submit-password(string);
+    callback open-page();
+    callback continue-sign-out();
+    callback cancel-sign-out();
+    // Scroll the Settings page so this absolute position is visible.
+    callback reveal-at(length);
+    callback revealed(string);
+
+    property <color> error-ink: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
+    property <color> success-ink: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.colors.accent;
+    property <color> destructive: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : root.error-ink;
+    property <color> selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.colors.hover;
+    property <color> selection-ink: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.colors.ink;
+    property <length> row-height: max(48px, 30px * root.text-scale + 18px);
+    property <bool> ready: root.view.available && root.view.loaded;
+    property <bool> can-refresh: !root.view.loading && !root.view.busy;
+    property <string> rename-text;
+    // Prefill the rename field whenever another session is selected.
+    property <string> shown-key: root.view.selected-key;
+
+    function save-rename() {
+        if !root.view.busy && root.rename-text != "" {
+            root.rename(root.view.selected-key, root.rename-text);
+        }
+    }
+
+    init => { root.scope-changed(); }
+    changed scope-key => {
+        root.rename-text = "";
+        root.scope-changed();
+    }
+    changed shown-key => { root.rename-text = root.view.selected.raw-name; }
+    changed reveal-request => {
+        if root.reveal-request > 0 {
+            root.reveal-at(refresh-action.absolute-position.y);
+            if root.can-refresh {
+                refresh-action.focus();
+                if refresh-action.has-focus { root.revealed("security.devices"); }
+            } else {
+                // Unavailable now: focus the status that explains why.
+                status-field.focus();
+                if status-field.has-focus { root.revealed("security.devices:status"); }
+            }
+        }
+    }
+
+    spacing: 8px;
+
+    HorizontalLayout {
+        spacing: 8px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: "Devices and sessions";
+                color: root.colors.ink; font-size: 13px * root.text-scale; font-weight: 700;
+            }
+            // Read-only and focusable, so search can reveal it while Refresh is busy.
+            status-field := TextInput {
+                text: root.view.summary;
+                read-only: true; single-line: false; wrap: word-wrap;
+                color: root.colors.muted; font-size: 11px * root.text-scale;
+                accessible-label: "Session list status: " + root.view.summary;
+                changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            refresh-action := TokenButton {
+                colors: root.colors; text-scale: root.text-scale;
+                text: root.view.loading ? "Loading…" : "Refresh";
+                label: "Refresh the sessions signed in to this account";
+                enabled: root.can-refresh;
+                activated => { root.refresh(); }
+                focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
+            }
+        }
+    }
+    if root.view.identity != "" : Text {
+        text: root.view.identity;
+        color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+    if root.view.pending != "" : Text {
+        text: root.view.pending;
+        color: root.colors.accent; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    if root.view.error != "" : Text {
+        text: root.view.error;
+        color: root.error-ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: assertive;
+    }
+    if root.view.notice != "" : Text {
+        text: root.view.notice;
+        color: root.success-ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    if root.ready : TokenField {
+        colors: root.colors; text-scale: root.text-scale;
+        text <=> root.query;
+        placeholder-text: "Search by name or session ID";
+        label: "Search this account's sessions by name or session ID";
+        edited(text) => { root.search(text); }
+        changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } }
+    }
+    if root.ready && root.rows.length == 0 : Text {
+        height: 40px;
+        text: root.query != "" ? "No sessions match this search." : "The homeserver lists no sessions.";
+        color: root.colors.muted; font-size: 11px * root.text-scale;
+        vertical-alignment: center;
+    }
+    if root.ready && root.rows.length > 0 : session-list := ListView {
+        height: min(6, root.rows.length) * root.row-height;
+        horizontal-scrollbar-policy: always-off;
+        for row in root.rows : ActionRect {
+            width: session-list.visible-width;
+            height: root.row-height;
+            border-radius: StyleTokens.control-corner;
+            background: row.key == root.view.selected-key ? root.selection : self.has-hover ? root.colors.hover : transparent;
+            focus-color: root.colors.accent;
+            accessible-role: list-item;
+            accessible-item-selectable: true;
+            accessible-item-selected: row.key == root.view.selected-key;
+            label: row.name + (row.current ? ", this device" : "") + ", session " + row.device-id + ", " + row.status + ", " + row.last-seen;
+            activated => { root.select(row.key); }
+            focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
+            HorizontalLayout {
+                padding-left: 10px; padding-right: 10px; spacing: 8px;
+                VerticalLayout {
+                    alignment: center; horizontal-stretch: 1; spacing: 1px;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: row.name;
+                            color: row.key == root.view.selected-key ? root.selection-ink : root.colors.ink;
+                            font-size: 12px * root.text-scale; font-weight: 700;
+                            horizontal-stretch: 1; overflow: elide;
+                        }
+                        if row.current : Rectangle {
+                            width: badge.preferred-width + 12px;
+                            border-radius: StyleTokens.control-corner;
+                            background: root.colors.accent;
+                            badge := Text {
+                                text: "This device";
+                                color: root.colors.accent-ink; font-size: 10px * root.text-scale; font-weight: 700;
+                                horizontal-alignment: center; vertical-alignment: center;
+                                accessible-role: none;
+                            }
+                        }
+                    }
+                    Text {
+                        text: row.device-id + "  ·  " + row.status + "  ·  " + row.last-seen;
+                        color: row.trust == 4 ? root.error-ink : root.colors.muted;
+                        font-size: 10px * root.text-scale; overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+    if root.view.shown != "" : Text {
+        text: root.view.shown;
+        color: root.colors.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+    }
+    if root.ready && root.view.selected-key != "" : Rectangle {
+        background: root.surface;
+        border-color: root.divider;
+        border-width: StyleTokens.line-width;
+        border-radius: StyleTokens.radius * 0.8;
+        accessible-role: groupbox;
+        accessible-label: "Session " + root.view.selected.name + ", " + root.view.selected.device-id;
+        VerticalLayout {
+            padding: 12px; spacing: 7px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: root.view.selected.current ? root.view.selected.name + " (this device)" : root.view.selected.name;
+                    color: root.colors.ink; font-size: 13px * root.text-scale; font-weight: 700;
+                    horizontal-stretch: 1; overflow: elide; vertical-alignment: center;
+                }
+                ActionRect {
+                    width: 28px; height: 28px;
+                    border-radius: StyleTokens.control-corner;
+                    background: self.has-hover ? root.colors.hover : transparent;
+                    focus-color: root.colors.accent;
+                    label: "Close session details";
+                    activated => { root.select(""); }
+                    Text {
+                        text: "×"; color: root.colors.muted; font-size: 14px;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+            }
+            Text {
+                text: "Session ID " + root.view.selected.device-id;
+                color: root.colors.muted; font-size: 11px * root.text-scale; overflow: elide;
+            }
+            Text {
+                text: root.view.selected-detail;
+                color: root.colors.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+            }
+            if root.view.can-rename && root.view.stage == 0 : HorizontalLayout {
+                spacing: 6px;
+                TokenField {
+                    colors: root.colors; text-scale: root.text-scale;
+                    text <=> root.rename-text;
+                    placeholder-text: "Session name";
+                    label: "New name for " + root.view.selected.name;
+                    enabled: !root.view.busy;
+                    accepted(text) => { root.save-rename(); }
+                    changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } }
+                }
+                TokenButton {
+                    colors: root.colors; text-scale: root.text-scale;
+                    text: "Rename";
+                    label: "Save the new name for " + root.view.selected.name;
+                    enabled: !root.view.busy && root.rename-text != "" && root.rename-text != root.view.selected.raw-name;
+                    activated => { root.save-rename(); }
+                    focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
+                }
+            }
+            if root.view.stage == 0 && (root.view.verify-label != "" || root.view.sign-out-label != "") : HorizontalLayout {
+                spacing: 6px; alignment: start;
+                if root.view.verify-label != "" : TokenButton {
+                    colors: root.colors; text-scale: root.text-scale;
+                    text: root.view.verify-label;
+                    label: root.view.verify-label + ". Opens the emoji comparison above; nothing is trusted until you confirm a match.";
+                    enabled: !root.view.busy && !root.security-busy;
+                    activated => { root.verify(root.view.selected-key); }
+                    focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
+                }
+                if root.view.sign-out-label != "" : TokenButton {
+                    colors: root.colors; text-scale: root.text-scale;
+                    text: root.view.sign-out-label;
+                    label: "Review signing out " + root.view.selected.name + ", session " + root.view.selected.device-id;
+                    enabled: !root.view.busy;
+                    activated => { root.sign-out(root.view.selected-key); }
+                    focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
+                }
+            }
+            if root.view.stage == 0 && root.view.verify-hint != "" : Text {
+                text: root.view.verify-hint;
+                color: root.colors.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+            }
+            if root.view.stage == 0 && root.view.sign-out-hint != "" : Text {
+                text: root.view.sign-out-hint;
+                color: root.colors.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+            }
+            // Signing out: a review that names the exact session and account,
+            // then whatever the homeserver asks for. Nothing is sent before
+            // "Sign out" in the review.
+            if root.view.stage != 0 : Rectangle {
+                border-radius: StyleTokens.radius * 0.6;
+                border-width: max(StyleTokens.line-width, 1px);
+                border-color: root.view.stage == 1 || root.view.stage == 2 ? root.destructive : root.divider;
+                accessible-role: groupbox;
+                accessible-label: root.view.stage-title;
+                VerticalLayout {
+                    padding: 10px; spacing: 7px;
+                    Text {
+                        text: root.view.stage-title;
+                        color: root.colors.ink; font-size: 12px * root.text-scale; font-weight: 700; wrap: word-wrap;
+                        accessible-live-region: polite;
+                    }
+                    Text {
+                        text: root.view.stage-body;
+                        color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                    }
+                    if root.view.stage == 2 && root.view.rejected : Text {
+                        text: "The homeserver did not accept that password. Try again, or cancel.";
+                        color: root.error-ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        accessible-live-region: assertive;
+                    }
+                    if root.view.stage == 2 : HorizontalLayout {
+                        spacing: 6px;
+                        password := SecretField {
+                            colors: root.colors; text-scale: root.text-scale;
+                            label: "Account password, to sign out " + root.view.selected.name;
+                            enabled: !root.view.busy;
+                            submitted(secret) => { root.submit-password(secret); }
+                            cancelled => { root.cancel-sign-out(); }
+                            focused => { root.reveal-at(self.absolute-position.y); }
+                        }
+                        TokenButton {
+                            colors: root.colors; text-scale: root.text-scale;
+                            text: "Continue"; primary: true;
+                            label: "Send the password and sign out " + root.view.selected.name;
+                            enabled: !root.view.busy && !password.empty;
+                            activated => { password.submit(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px; alignment: start;
+                        if root.view.stage == 1 : TokenButton {
+                            colors: root.colors; text-scale: root.text-scale;
+                            text: "Sign out"; primary: true;
+                            label: "Sign out " + root.view.selected.name + ", session " + root.view.selected.device-id + ", now";
+                            enabled: !root.view.busy;
+                            activated => { root.confirm-sign-out(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
+                            focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
+                        }
+                        if root.view.stage == 3 || root.view.stage == 4 : TokenButton {
+                            colors: root.colors; text-scale: root.text-scale;
+                            text: root.view.page-opened ? "Open page again" : "Open page in browser";
+                            label: root.view.stage == 3 ? "Open your homeserver's confirmation page in the system browser" : "Open your sign-in provider's page for this session in the system browser";
+                            enabled: !root.view.busy;
+                            activated => { root.open-page(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
+                        }
+                        if root.view.stage == 3 : TokenButton {
+                            colors: root.colors; text-scale: root.text-scale;
+                            text: "Continue"; primary: true;
+                            label: "Continue signing out after confirming in the browser";
+                            enabled: !root.view.busy && root.view.page-opened;
+                            activated => { root.continue-sign-out(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
+                        }
+                        if root.view.stage == 4 : TokenButton {
+                            colors: root.colors; text-scale: root.text-scale;
+                            text: "Refresh list";
+                            label: "Close this step and refresh the session list";
+                            enabled: !root.view.busy;
+                            activated => { root.continue-sign-out(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
+                        }
+                        TokenButton {
+                            colors: root.colors; text-scale: root.text-scale;
+                            text: root.view.stage == 5 ? "Close" : "Cancel";
+                            label: root.view.stage == 6 ? "Stop waiting; the sign-out may still complete" : root.view.stage == 5 ? "Close this step" : "Cancel signing out this session";
+                            activated => { root.cancel-sign-out(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

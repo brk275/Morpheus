@@ -3,6 +3,9 @@
 
 #![recursion_limit = "512"]
 
+#[path = "support/opened_room.rs"]
+mod opened_room;
+
 use std::{collections::HashMap, fs, path::Path, time::Duration};
 
 use morpheus_matrix::{AccountManager, MatrixCoreError, QueuedSendOutcome, SyncPolicy};
@@ -104,6 +107,9 @@ async fn encrypted_message_search_is_account_scoped() {
         Err(MatrixCoreError::InvalidSearchQuery(_))
     ));
 
+    opened_room::scan(&manager, room_id)
+        .await
+        .expect("Opened fixture room must be scanned");
     let marker = format!("morpheus{}", &Uuid::new_v4().simple().to_string()[..10]);
     let body = format!("Searchable encrypted message {marker}");
     let queued = manager

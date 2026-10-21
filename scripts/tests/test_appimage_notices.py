@@ -1,15 +1,18 @@
 """Inventory checks with mocked ELF tooling; no download.
 
-Fixtures reproduce GNU readelf --wide --dynamic --notes output. The single
-exception to mocking is SystemReadelfTests, which runs only on a fresh
-GitHub-hosted Ubuntu 24.04 runner and checks the genuine installed readelf
-against the parser on a trusted system ELF.
+Fixtures reproduce GNU readelf --wide --dynamic --notes output. The only
+exceptions to mocking run on a fresh GitHub-hosted Ubuntu 24.04 runner alone:
+SystemReadelfTests checks the genuine installed readelf against the parser on
+a trusted system ELF, and SystemNoticePreflightTests takes the production
+dependency steps, read-only, over fixed installed library seeds.
 """
 
+import json
 import os
 from pathlib import Path
 import platform
 import re
+import stat
 import struct
 import subprocess
 import sys
@@ -230,13 +233,52 @@ class PathTests(unittest.TestCase):
             root = Path(folder).resolve(); dirs = (root / "a", root / "b")
             for directory in dirs:
                 directory.mkdir(); (directory / "libx.so").write_bytes(b"ELF placeholder")
-            with mock.patch.object(N, "SYSTEM_DIRS", dirs), mock.patch.object(N, "root_owned", side_effect=lambda p: p.resolve()):
+            with mock.patch.object(N, "SYSTEM_DIRS", dirs), mock.patch.object(N, "root_owned", side_effect=lambda p, family: p.resolve()):
                 with self.assertRaises(N.InventoryFailure): N.resolve_library("libx.so")
                 (dirs[1] / "libx.so").unlink()
                 (dirs[1] / "libx.so").symlink_to(dirs[0] / "libx.so")
                 self.assertEqual(N.resolve_library("libx.so"), dirs[0] / "libx.so")
                 with self.assertRaises(N.InventoryFailure): N.resolve_library("missing.so")
                 with self.assertRaises(N.InventoryFailure): N.resolve_library("../libx.so")
+
+    def test_root_owned_names_the_failed_property_without_relaxing_any_check(self):
+        def lstat_as(uid, mode):
+            return lambda self: os.stat_result((mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+        file_mode = stat.S_IFREG | 0o644
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            target = root / "notice"; target.write_bytes(b"text")
+            cases = (("missing", root / "absent", lstat_as(0, file_mode)),
+                     ("owner", target, lstat_as(1000, file_mode)),
+                     ("mode", target, lstat_as(0, stat.S_IFREG | 0o664)),
+                     ("type", root, lstat_as(0, stat.S_IFDIR | 0o755)))
+            for family in (*N.PATH_FAMILIES, "tool"):
+                expected = (lambda kind: "tool") if family == "tool" else (lambda kind: family + "_" + kind)
+                for kind, path, lstat in cases:
+                    with (self.subTest(family=family, kind=kind), mock.patch.object(Path, "lstat", lstat),
+                          self.assertRaises(N.InventoryFailure) as caught):
+                        N.root_owned(path, family)
+                    self.assertEqual(caught.exception.reason, expected(kind))
+                for error in (PermissionError, RuntimeError):
+                    with (self.subTest(family=family, error=error), mock.patch.object(Path, "resolve", side_effect=error),
+                          self.assertRaises(N.InventoryFailure) as caught):
+                        N.root_owned(target, family)
+                    self.assertEqual(caught.exception.reason, expected("access"))
+                self.assertIn(caught.exception.reason, N.REASONS)
+            # Unchanged gate: root-owned symlinks are exempt from the mode check
+            # and a fully root-owned regular target is returned resolved.
+            for mode in (file_mode, stat.S_IFLNK | 0o777):
+                with mock.patch.object(Path, "lstat", lstat_as(0, mode)):
+                    self.assertEqual(N.root_owned(target, "copyright"), target)
+
+    def test_library_path_failure_reports_its_own_family(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder).resolve(); (directory / "libx.so").write_bytes(b"ELF placeholder")
+            owned_by_user = lambda self: os.stat_result((stat.S_IFREG | 0o644, 0, 0, 1, 1000, 0, 0, 0, 0, 0))
+            with (mock.patch.object(N, "SYSTEM_DIRS", (directory,)), mock.patch.object(Path, "lstat", owned_by_user),
+                  self.assertRaises(N.InventoryFailure) as caught):
+                N.resolve_library("libx.so")
+            self.assertEqual(caught.exception.reason, "library_path_owner")
 
 
 class DeploymentTests(unittest.TestCase):
@@ -337,7 +379,7 @@ class PreparationTests(unittest.TestCase):
             b"", b"libsample1:amd64: /lib/x86_64-linux-gnu/libsample.so.1\n",
             b"libsample1:amd64\t1.2-3\tsample\t1.2-3\n",
         ]
-        with (mock.patch.object(N, "root_owned", side_effect=Path),
+        with (mock.patch.object(N, "root_owned", side_effect=lambda path, family="tool": Path(path)),
               mock.patch.object(N, "regular", return_value=b"Exact copyright")):
             package, copyright_text, common = N.package_record(
                 runner, Path("/usr/lib/x86_64-linux-gnu/libsample.so.1"), Path("/private"), {})
@@ -354,12 +396,41 @@ class PreparationTests(unittest.TestCase):
             failure = CommandFailure(reason)
             runner.run.side_effect = failure
             with (self.subTest(reason=reason),
-                  mock.patch.object(N, "root_owned", side_effect=Path),
+                  mock.patch.object(N, "root_owned", side_effect=lambda path, family="tool": Path(path)),
                   self.assertRaises(CommandFailure) as caught):
                 N.package_record(runner, Path("/usr/lib/x86_64-linux-gnu/libsample.so.1"),
                                  Path("/private"), {})
             self.assertIs(caught.exception, failure)
             self.assertEqual(runner.run.call_count, 1)
+
+    def test_copyright_and_common_license_failures_name_their_own_family(self):
+        notice = b"See /usr/share/common-licenses/GPL-2 and /usr/share/common-licenses/GPL-2+."
+        library = Path("/usr/lib/x86_64-linux-gnu/libsample.so.1")
+        for failing in (None, "tool", "copyright", "common_license"):
+            families = []
+
+            def checked(path, family="tool"):
+                families.append(family)
+                if family == failing:
+                    raise N.InventoryFailure("tool" if family == "tool" else family + "_missing")
+                return Path(path)
+            runner = mock.Mock()
+            runner.run.side_effect = [b"", b"libsample1:amd64: /lib/x86_64-linux-gnu/libsample.so.1\n",
+                                      b"libsample1:amd64\t1.2-3\tsample\t1.2-3\n"]
+            with (self.subTest(failing=failing), mock.patch.object(N, "root_owned", side_effect=checked),
+                  mock.patch.object(N, "regular", return_value=notice)):
+                if failing is None:
+                    # Every referenced license name stays required, including
+                    # an "or later" spelling that may have no installed file.
+                    _, _, common = N.package_record(runner, library, Path("/private"), {})
+                    self.assertEqual(set(common), {"GPL-2", "GPL-2+"})
+                    self.assertEqual(families, ["tool", "copyright", "common_license", "common_license"])
+                    continue
+                with self.assertRaises(N.InventoryFailure) as caught:
+                    N.package_record(runner, library, Path("/private"), {})
+                self.assertEqual(caught.exception.reason, "tool" if failing == "tool" else failing + "_missing")
+                self.assertEqual(families[-1], failing)
+                self.assertEqual(runner.run.call_count, 0 if failing == "tool" else 3)
 
     def test_graph_is_bounded_deduplicated_and_notices_are_immutable_copies(self):
         with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as checkout:
@@ -456,15 +527,16 @@ def fresh_hosted_ubuntu():
 class SystemRunner:
     """Run exactly the inventory's argv within its bounds: no shell, no stdin."""
 
-    def __init__(self):
+    def __init__(self, keep_output=True):
         self.calls = []
+        self.keep_output = keep_output
 
     def run(self, label, argv, *, cwd, env, timeout, output_limit, expected_status):
         result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                 capture_output=True, timeout=timeout, check=False)
-        self.calls.append((label, list(argv), result.stdout))
+        self.calls.append((label, list(argv), result.stdout if self.keep_output else b""))
         if result.returncode not in expected_status or len(result.stdout) > output_limit:
-            raise AssertionError("installed readelf did not complete within the inventory bounds")
+            raise AssertionError("installed tool did not complete within the inventory bounds")
         return result.stdout
 
 
@@ -498,6 +570,99 @@ class SystemReadelfTests(unittest.TestCase):
         build_id = bytes.fromhex(result["build_id"])
         note = struct.pack("<III", 4, len(build_id), 3) + b"GNU\0" + build_id
         self.assertEqual(data.count(note), 1)
+
+
+# Fixed, reviewed preflight seeds from package_smoke's STARTUP_LIBRARY_NAMES,
+# leaving out the windowing, GL, X11 session and AppImage runtime libraries and
+# the separately staged PipeWire client. Their DT_NEEDED closure follows. This
+# approximates, but is not, the app's exact dependency graph.
+NOTICE_SEEDS = ("libasound.so.2", "libatomic.so.1", "libc.so.6", "libcrypto.so.3", "libdbus-1.so.3",
+                "libfontconfig.so.1", "libfreetype.so.6", "libgcc_s.so.1", "libglib-2.0.so.0",
+                "libgobject-2.0.so.0", "libm.so.6", "libsqlite3.so.0", "libssl.so.3", "libstdc++.so.6",
+                "libudev.so.1", "libz.so.1")
+PREFLIGHT_COMPONENTS = 128
+PREFLIGHT_REPORTED_FAILURES = 32
+
+
+def installed_library(name):
+    return any((directory / name).exists() or (directory / name).is_symlink()
+               for directory in N.SYSTEM_DIRS)
+
+
+def notice_preflight(runner, root, environment):
+    """Production dependency steps, read-only, over installed fixed seeds.
+
+    Returns counts and, per failure, only a closed reason, the component
+    SONAME and the owning package when dpkg-query named one, each validated.
+    No path, command output, error text or notice prose is kept.
+    """
+    pending = [name for name in reversed(NOTICE_SEEDS) if installed_library(name)]
+    summary = {"seeds": len(NOTICE_SEEDS), "absent_seeds": len(NOTICE_SEEDS) - len(pending),
+               "failure_count": 0, "failures": []}
+    seen, packages, licenses = set(), set(), set()
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        start = len(runner.calls)
+        if len(seen) >= PREFLIGHT_COMPONENTS:
+            reason = "limit"
+        else:
+            seen.add(name)
+            try:
+                record, package, _, common = N.system_dependency(runner, name, root, environment)
+                # The same component checks prepare applies.
+                if record["soname"] != name:
+                    raise N.InventoryFailure("dependency")
+                if record["search"]:
+                    raise N.InventoryFailure("search")
+            # Closed reasons only: InventoryFailure's own, or these fixed
+            # tokens for the bounded runner and the filesystem probes.
+            except N.InventoryFailure as error:
+                reason = error.reason
+            except AssertionError:
+                reason = "tool_bounds"
+            except subprocess.TimeoutExpired:
+                reason = "tool_deadline"
+            except OSError:
+                reason = "os_error"
+            else:
+                packages.add(package["package"])
+                licenses.update(common)
+                pending.extend(record["needed"])
+                continue
+        owners = [argv[-1] for label, argv, _ in runner.calls[start:] if label == "inventory-package"]
+        summary["failure_count"] += 1
+        if len(summary["failures"]) < PREFLIGHT_REPORTED_FAILURES:
+            summary["failures"].append({
+                "component": name if N.SONAME.fullmatch(name) else None,
+                "package": owners[-1] if owners and N.PACKAGE.fullmatch(owners[-1]) else None,
+                "reason": reason,
+            })
+        if reason == "limit":
+            break
+    summary.update(components=len(seen), packages=len(packages), common_licenses=len(licenses))
+    return summary
+
+
+@unittest.skipUnless(fresh_hosted_ubuntu(), "installed notices are checked only on a fresh "
+                     "GitHub-hosted Ubuntu 24.04 runner")
+class SystemNoticePreflightTests(unittest.TestCase):
+    def test_installed_dependency_notices_pass_the_production_inventory_steps(self):
+        # Runs only the root-owned readelf and dpkg-query: never an inspected
+        # ELF or ldd. Reads notices but writes and prints none of their text.
+        runner = SystemRunner(keep_output=False)
+        with tempfile.TemporaryDirectory() as folder:
+            summary = notice_preflight(runner, Path(folder), N.client.R.clean_environment({}))
+        print("APPIMAGE_NOTICE_PREFLIGHT " + json.dumps(summary, sort_keys=True), flush=True)
+        tools = {str(N.root_owned("/usr/bin/readelf")), str(N.root_owned("/usr/bin/dpkg-query"))}
+        self.assertTrue(runner.calls)
+        self.assertTrue(all(argv[0] in tools for _, argv, _ in runner.calls))
+        self.assertTrue({label for label, _, _ in runner.calls}
+                        <= {"inventory-elf-dependency", "inventory-owner", "inventory-package"})
+        self.assertLess(summary["absent_seeds"], summary["seeds"])
+        self.assertEqual(summary["failure_count"], 0, "installed notice preflight failed; see its fixed summary")
+        self.assertGreater(summary["packages"], 0)
 
 
 if __name__ == "__main__":
