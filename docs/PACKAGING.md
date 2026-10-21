@@ -19,9 +19,14 @@ source-review approval; follow [the contribution review policy](../AGENTS.md#rev
 before dispatching it.
 
 Package workers check out the selected commit and verify its identity and clean
-tracked source before installing the toolchain or building. The source is scanned
-with independently pinned default secret rules before workers execute its code.
-Candidates must include the current package QA tools, including
+tracked source before installing the toolchain or building. Before any worker
+starts, the selection job scans the selected commit's complete fetched history
+with the reviewed `scripts/scan_history.py` and `scripts/public-fixtures.json`,
+both read from the workflow's own revision, never from the candidate: pinned
+default secret rules on a bare mirror, excepting only reviewed public fixtures by
+exact fingerprint and file content. Reports stay on the runner; the log shows
+only a closed summary of counts and hashes. Candidates must include the current
+package QA tools, including
 `scripts/package_revision.py`. Package receipts and update-source exports identify
 the selected source; `GITHUB_SHA` continues to identify the workflow itself.
 
