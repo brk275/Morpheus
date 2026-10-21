@@ -223,7 +223,9 @@ export component TokenField inherits Rectangle {
     min-width: 48px;
     horizontal-stretch: 1;
     vertical-stretch: 0;
-    clip: true;
+    // TextInput clips its own glyphs, selection and cursor. An extra Clip
+    // here would hide offscreen fields from native Tab before a surrounding
+    // Flickable can scroll them into view.
     background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.colors.surface;
     border-radius: StyleTokens.input-corner;
     border-width: input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;

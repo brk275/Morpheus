@@ -4870,6 +4870,108 @@ async fn assert_themed_select(ui: &AppWindow) {
     settle(ui).await;
 }
 
+async fn assert_scrolled_text_field_keyboard(ui: &AppWindow) {
+    use slint::private_unstable_api::re_exports::Flickable;
+    use std::{cell::Cell, ops::ControlFlow, rc::Rc};
+
+    let saved = (
+        ui.window().size(),
+        ui.get_font_scale_percent(),
+        ui.get_live_session(),
+        ui.get_page(),
+    );
+    assert!(!ui.get_poll_dialog_open());
+    let polls = ui.global::<crate::PollUiState>();
+    let saved_draft = (
+        polls.get_dialog_room(),
+        polls.get_dialog_question(),
+        polls.get_dialog_answers(),
+        polls.get_dialog_busy(),
+        polls.get_dialog_ready(),
+    );
+    let sends = Rc::new(Cell::new(0));
+    let sent = sends.clone();
+    polls.on_submit_poll(move || sent.set(sent.get() + 1));
+    ui.window().set_size(slint::PhysicalSize::new(1280, 620));
+    ui.set_font_scale_percent(200);
+    ui.set_page(0);
+    ui.set_live_session(true);
+    polls.set_dialog_room("Synthetic room".into());
+    polls.set_dialog_question("Choose an option".into());
+    polls.set_dialog_answers(ModelRc::new(VecModel::from(
+        (1..=20)
+            .map(|index| SharedString::from(format!("Option {index}")))
+            .collect::<Vec<_>>(),
+    )));
+    polls.set_dialog_busy(false);
+    polls.set_dialog_ready(false);
+    ui.set_poll_dialog_open(true);
+    settle(ui).await;
+
+    // Native Tab reveals this row's button at the bottom of the viewport.
+    // The following field is still outside it: the very next Tab must reach
+    // that field and scroll it into view without losing the visible origin.
+    let label = "Poll option 20";
+    let field = control_with_label(ui, label);
+    let mut viewports = Vec::new();
+    for node in geometry_nodes(ui) {
+        if node.downcast::<Flickable>().is_some() {
+            let mut contains_field = false;
+            let _ = node.visit_descendants(|item| {
+                if item == &field {
+                    contains_field = true;
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+            if contains_field {
+                viewports.push(item_bounds(&node));
+            }
+        }
+    }
+    assert_eq!(viewports.len(), 1, "one actual poll body viewport");
+    let viewport = viewports[0];
+    assert!(inside_window(ui, viewport));
+    tab_to_control(ui, "Remove poll option 19");
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Remove poll option 19"));
+    let origin = item_bounds(&control_with_label(ui, "Remove poll option 19"));
+    assert!(
+        inside_window(ui, origin)
+            && origin.top >= viewport.top - 0.5
+            && origin.bottom <= viewport.bottom + 0.5
+    );
+    assert!(
+        item_bounds(&field).top >= viewport.bottom,
+        "the next text field is fully outside the actual viewport"
+    );
+    key(ui, Key::Tab);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, label));
+    let bounds = item_bounds(&field);
+    assert!(
+        inside_window(ui, bounds)
+            && bounds.top >= viewport.top - 0.5
+            && bounds.bottom <= viewport.bottom + 0.5,
+        "native Tab reveals the whole text field: {bounds:?}, viewport={viewport:?}"
+    );
+    assert_eq!(sends.get(), 0, "navigation must never send a poll");
+
+    ui.set_poll_dialog_open(false);
+    polls.on_submit_poll(|| {});
+    polls.set_dialog_room(saved_draft.0);
+    polls.set_dialog_question(saved_draft.1);
+    polls.set_dialog_answers(saved_draft.2);
+    polls.set_dialog_busy(saved_draft.3);
+    polls.set_dialog_ready(saved_draft.4);
+    ui.set_live_session(saved.2);
+    ui.set_page(saved.3);
+    ui.set_font_scale_percent(saved.1);
+    ui.window().set_size(saved.0);
+    settle(ui).await;
+}
+
 async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     use morpheus_config::style_profiles::ProfileStore;
     use morpheus_config::{ConfigStore, LoadedConfig};
@@ -5253,6 +5355,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert_live_preview(&ui).await;
     phase.set(20);
     assert_themed_select(&ui).await;
+    assert_scrolled_text_field_keyboard(&ui).await;
     phase.set(26);
     assert_layout_navigation_recovery(&ui, directory.path()).await;
     phase.set(27);

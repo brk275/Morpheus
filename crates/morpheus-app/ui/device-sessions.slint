@@ -86,7 +86,8 @@ component SecretField inherits Rectangle {
     forward-focus: input;
     min-height: max(32px, 16px * root.text-scale + 14px);
     horizontal-stretch: 1;
-    clip: true;
+    // The password TextInput clips its own contents. Keep the surrounding
+    // Settings Flickable reachable by native Tab when this field is offscreen.
     background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.colors.surface;
     border-radius: StyleTokens.input-corner;
     border-width: input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
