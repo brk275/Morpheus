@@ -1,8 +1,8 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, personal-account, physical-device or artifact jobs.
-# Linux runs the reviewed disposable app-timeline fixture after offline checks; call-native then runs the four ring cases.
+# Linux runs disposable checks after offline checks; call-native owns timeline and four ring cases in one fixture lifecycle.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed beta catch-up - 5ee2734 - ${{ inputs.platform }}
+run-name: Reviewed beta catch-up - e03c719 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -21,7 +21,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-5ee2734-${{ github.ref }}
+  group: beta-native-e03c719-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   security:
@@ -38,7 +38,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 5ee27349239147adcbc2efbb24ba948307e52287
+          ref: e03c71932e743b3bb7da24b9b4159c2cc6033865
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git -C candidate rev-parse HEAD)" = 5ee27349239147adcbc2efbb24ba948307e52287
+          test "$(git -C candidate rev-parse HEAD)" = e03c71932e743b3bb7da24b9b4159c2cc6033865
           archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --max-filesize 33554432 --max-time 180 \
@@ -86,7 +86,7 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
-          ref: 5ee27349239147adcbc2efbb24ba948307e52287
+          ref: e03c71932e743b3bb7da24b9b4159c2cc6033865
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -325,7 +325,7 @@ jobs:
           if not probe_ok: raise SystemExit(1)
 
           import io, tarfile, urllib.request, zipfile
-          source='5ee27349239147adcbc2efbb24ba948307e52287'
+          source='e03c71932e743b3bb7da24b9b4159c2cc6033865'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -666,7 +666,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
           import io, tarfile, zipfile
-          source='5ee27349239147adcbc2efbb24ba948307e52287'
+          source='e03c71932e743b3bb7da24b9b4159c2cc6033865'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -1162,17 +1162,18 @@ jobs:
           sys.argv = [str(script), *sys.argv[1:]]
           runpy.run_path(str(script), run_name='__main__')
           """
-              checks.append(('app_timeline_disposable',
-                  ['dbus-run-session','--',sys.executable,'-I','-B','-c',fixture_program,
-                      '--suite','app-timeline','--gitleaks',str(scanner)],56*60,None,set()))
               if scope=='call-native':
-                  # App unit execution already compiled the same target; no duplicate precompile.
-                  checks.append(('outgoing_ring_disposable',
+                  # One fixture owner; App unit already compiled the same test target.
+                  checks.append(('native_call_disposable',
                       ['dbus-run-session','--',sys.executable,'-I','-B','-c',fixture_program,
-                          '--suite','outgoing-ring','--gitleaks',str(scanner)],56*60,None,set()))
-          # Parse only the new call check's independently scanned output. No candidate
+                          '--suite','native-call','--gitleaks',str(scanner)],56*60,None,set()))
+              else:
+                  checks.append(('app_timeline_disposable',
+                      ['dbus-run-session','--',sys.executable,'-I','-B','-c',fixture_program,
+                          '--suite','app-timeline','--gitleaks',str(scanner)],56*60,None,set()))
+          # Parse only the combined call check's independently scanned output. No candidate
           # helper is imported here; rebuild public facts from fixed enums/booleans only.
-          def outgoing_ring_evidence(output, helper_ok):
+          def native_call_evidence(output, helper_ok):
               import math
               cases={
                   'outgoing-ring-current-dm':('current','dm'),
@@ -1194,13 +1195,23 @@ jobs:
               fields={'check','status','passed','seconds','ring_checks','incoming_checks',
                   'ring_mode','ring_target','account_replay_exercised','quiet_evidence',
                   'withdrawal_evidence','actor_withdrawal_processing_confirmed'}
+              timeline_keys={
+                  'room_delivery','thread_delivery','thread_root_excluded','feeds_running',
+                  'old_lease_revoked','idle_feeds_stopped','late_events_in_core',
+                  'stale_room_rejected','stale_thread_rejected','renewed_thread_delivery',
+                  'renewed_room_delivery','queued_callbacks_observed','queued_room_rejected',
+                  'queued_thread_rejected','link_follow_up_stale_retry_rejected',
+                  'link_follow_up_owned_retry','link_follow_up_held_focus_rejected',
+                  'link_follow_up_owned_focus','member_publication','cleanup_complete',
+              }
+              timeline_fields={'check','status','passed','seconds','app_timeline_checks'}
               def unique_object(pairs):
                   value={}
                   for key,item in pairs:
                       if key in value: raise ValueError('duplicate_json_key')
                       value[key]=item
                   return value
-              found={}; invalid=False; objects=0
+              found={}; timeline_ok=False; invalid=False; objects=0
               for raw in io.StringIO(output):
                   line=raw.strip()
                   if not line.startswith('{'): continue
@@ -1214,8 +1225,21 @@ jobs:
                       invalid=True; continue
                   label=row.get('check')
                   if type(label) is not str: continue
+                  if label=='app-live-timeline':
+                      if timeline_ok:
+                          invalid=True; continue
+                      timeline=row.get('app_timeline_checks'); seconds=row.get('seconds')
+                      seconds_ok=((type(seconds) is int and 0<=seconds<=540)
+                          or (type(seconds) is float and math.isfinite(seconds) and 0<=seconds<=540))
+                      valid=(set(row)==timeline_fields and row.get('status')=='passed'
+                          and type(row.get('passed')) is int and row['passed']==1 and seconds_ok
+                          and type(timeline) is dict and set(timeline)==timeline_keys
+                          and all(value is True for value in timeline.values()))
+                      if not valid:
+                          invalid=True; continue
+                      timeline_ok=True; continue
                   if label not in cases:
-                      if label.startswith('outgoing-ring-'): invalid=True
+                      if label.startswith(('outgoing-ring-','app-live-timeline')): invalid=True
                       continue
                   if label in found:
                       invalid=True; continue
@@ -1246,8 +1270,11 @@ jobs:
                       'quiet_evidence_is_sampled_cache_and_media_state':True,
                       'withdrawal_evidence_is_joined_after_sdk_cache_removal':True,
                       'actor_withdrawal_processing_confirmed':False}
-              complete=helper_ok and not invalid and set(found)==set(cases)
+              complete=helper_ok and not invalid and timeline_ok and set(found)==set(cases)
               return {'complete':complete,'helper_exit_ok':bool(helper_ok),
+                  'timeline':{'check':'app-live-timeline','complete':timeline_ok,
+                      'tests_passed':1 if timeline_ok else 0,
+                      'app_timeline_checks':{key:True for key in sorted(timeline_keys)} if timeline_ok else {}},
                   'required_case_count':4,'valid_case_count':len(found),
                   'cases':[found[label] for label in sorted(found)],
                   # These existing cases do not exercise cross-device Decline delivery.
@@ -1255,7 +1282,7 @@ jobs:
           # All four platform scopes use this exact stable reviewed candidate.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
-              if name in ('app_timeline_disposable','outgoing_ring_disposable') and not all_passed:
+              if name in ('app_timeline_disposable','native_call_disposable') and not all_passed:
                   print(json.dumps({'check':name,'status':'not_run','reason':'dependency_failed',
                       'source':source,'raw_logs_public':False},sort_keys=True),flush=True)
                   continue
@@ -1300,13 +1327,13 @@ jobs:
                       and ignored==allowed_ignored and required<=okay)
                   record.update({'complete_test_accounting':complete,'tests_passed':a,'tests_failed':b,
                       'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
-              if name=='outgoing_ring_disposable':
-                  evidence=outgoing_ring_evidence(output,passed)
+              if name=='native_call_disposable':
+                  evidence=native_call_evidence(output,passed)
                   passed=passed and evidence['complete']
-                  record['outgoing_ring_evidence']=evidence
-              if name!='outgoing_ring_disposable':
+                  record['native_call_evidence']=evidence
+              if name!='native_call_disposable':
                   record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
-              if not passed and name!='outgoing_ring_disposable':
+              if not passed and name!='native_call_disposable':
                   # Compiler diagnostics leave this process only after the independent scan.
                   # Exclude panic/assertion/authentication bodies. Keep compiler type-chain notes
                   # needed to diagnose Send/Sync constraints, bounded to 4 KiB in total.
