@@ -4900,7 +4900,7 @@ async fn assert_scrolled_text_field_keyboard(ui: &AppWindow) {
     polls.set_dialog_question("Choose an option".into());
     polls.set_dialog_answers(ModelRc::new(VecModel::from(
         (1..=20)
-            .map(|index| SharedString::from(format!("Option {index}")))
+            .map(|index| slint::SharedString::from(format!("Option {index}")))
             .collect::<Vec<_>>(),
     )));
     polls.set_dialog_busy(false);
