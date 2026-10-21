@@ -36,9 +36,36 @@ Decline uses the MatrixRTC decline event (MSC4310,
   known whether the decline arrived (any server error, other answer, network
   failure or timeout; the caller may still see it ringing). Nothing is retried.
   Results never include server messages or identifiers.
-- Declines sent from your other devices do not yet dismiss the offer here: the
-  pinned SDK's decline subscription reports only a sender, not the encryption
-  and device trust this would require.
+
+## Declined on another device
+
+When you decline a call on another of your verified devices, it stops ringing
+here and its offer goes away. Its desktop alert can no longer open anything; on
+Linux it is also withdrawn where the system allows, but on macOS and Windows an
+alert already shown may stay on screen until you close it. Nothing is sent,
+joined or opened on this device.
+
+- Only an encrypted decline of exactly that call, received through this
+  account's sync, counts. It must be verified at decryption as sent by you from
+  another device (not this one, and not decrypted with forwarded keys), and
+  that device must still be cross-signing verified, with the same keys, when
+  the offer is removed. Plaintext, undecryptable, redacted, unverified or
+  another person's declines, and events fetched from history, are ignored. A
+  decline that arrives in a catch-up batch of the sync still counts, but only
+  for a call that is ringing now.
+- A decline can arrive in the same sync as its call, before the offer is
+  shown. A buffer of up to 16 waiting declines is kept in memory for at most
+  two minutes, for the active account only (declines whose trust is being
+  checked are held separately while that check runs); switching accounts or
+  quitting discards them. Each device's decline of a call is checked once;
+  repeats of it are ignored. While that check runs (at most a few seconds), a
+  call not yet shown waits; a call already ringing keeps ringing until the
+  decline is confirmed. Answering or dismissing other calls is never held up,
+  and a decline for one call never interrupts or loses another incoming call.
+  A decline that is not kept, or whose device is no longer trusted, leaves the
+  call ringing until it is answered, declined, dismissed or expires.
+- A call you are already answering or declining on this device is not
+  affected.
 
 ## Sound
 
@@ -56,8 +83,8 @@ and actual audible output have not yet been verified.
   lifetime, whichever is shorter. Refreshing the list or re-enabling sound does
   not replay an old offer. Only one offer can sound at a time; other offers stay
   visible without queuing later sounds.
-- Answer, Decline, Dismiss, withdrawal, expiry, account revocation and app
-  shutdown stop the sound. Starting an outgoing call also suppresses it immediately, including
+- Answer, Decline, Dismiss, a decline on your other verified device,
+  withdrawal, expiry, account revocation and app shutdown stop the sound. Starting an outgoing call also suppresses it immediately, including
   while the request waits for another account operation. Recovery/security and
   update/call reservations suppress sound as well.
 - Preview mode is silent. Ringing opens only speaker output; it does not open a
@@ -165,7 +192,15 @@ source review and five small regression additions (claim exclusivity and
 cancellation, bounded command replies, fixed result text, rejection
 classification, and fenced polling of the send) that have not run;
 its real send, the caller's handling of it and each result path against a
-homeserver are unverified. The subtle
+homeserver are unverified. Stopping on another device's decline has source
+review and eight regression additions (receipt qualification, bounded
+retained declines, retention cleanup across stop and account changes, held
+trust checks with replayed declines, exact settlement before the decline's own
+deadline, another call's admission surviving a decline's arrival, checks
+finishing while another call is admitted, and new declines checked and applied
+while another call is admitted) that
+have not run; a real decline from a second verified
+device, same-sync ordering and trust changes are unverified. The subtle
 status announcement also needs keyboard/screen-reader acceptance. Source review
 does not establish these runtime results.
 

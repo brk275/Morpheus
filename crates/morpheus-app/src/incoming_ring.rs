@@ -224,6 +224,57 @@ impl fmt::Debug for IncomingOffer {
     }
 }
 
+/// The replay ledger as admission uses it: one observation before any network
+/// work and, on failure, one retirement. Implemented for an exclusively
+/// borrowed ledger and for the incoming actor's shared one, where each call
+/// locks only for that call, never across an await, so the actor can keep
+/// settling other offers while an admission waits. Either way the claim and
+/// its one-time observation are exactly those of the original admission.
+pub(crate) trait AdmissionLedger: Send {
+    fn observe(
+        &mut self,
+        key: OfferKey<'_>,
+        window: RingWindow,
+        now: Instant,
+    ) -> Result<Observation, AdmissionFailure>;
+    fn retire(&mut self, key: OfferKey<'_>);
+}
+impl AdmissionLedger for &mut OfferLedger {
+    fn observe(
+        &mut self,
+        key: OfferKey<'_>,
+        window: RingWindow,
+        now: Instant,
+    ) -> Result<Observation, AdmissionFailure> {
+        (**self)
+            .observe(key, window, now)
+            .map_err(|_| AdmissionFailure::Replay)
+    }
+    fn retire(&mut self, key: OfferKey<'_>) {
+        let _ = (**self).retire(key);
+    }
+}
+impl AdmissionLedger for &std::sync::Mutex<OfferLedger> {
+    fn observe(
+        &mut self,
+        key: OfferKey<'_>,
+        window: RingWindow,
+        now: Instant,
+    ) -> Result<Observation, AdmissionFailure> {
+        // A poisoned ledger admits nothing.
+        self.lock()
+            .map_err(|_| AdmissionFailure::Replay)?
+            .observe(key, window, now)
+            .map_err(|_| AdmissionFailure::Replay)
+    }
+    fn retire(&mut self, key: OfferKey<'_>) {
+        let _ = self
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retire(key);
+    }
+}
+
 impl IncomingOffer {
     /// Admit only an unsolicited receipt already retained by this account's
     /// running sticky sync. Fetching a notification by event ID cannot ring.
@@ -234,7 +285,7 @@ impl IncomingOffer {
         preferences: &VoiceSpaces,
         room_id: &RoomId,
         event_id: &EventId,
-        ledger: &mut OfferLedger,
+        mut ledger: impl AdmissionLedger,
     ) -> Result<Self, AdmissionFailure> {
         time::timeout(ADMISSION_LIMIT, async {
             let account = manager
