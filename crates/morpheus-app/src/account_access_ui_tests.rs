@@ -1670,11 +1670,43 @@ async fn assert_seek_policy_and_thread_keeper(
     ui.set_member_confirm_open(true);
     settle(ui).await;
     let shorter = height_of(&replies[0].body);
+    // Where the first two replies' texts start, for the diagnostic below.
+    let (first_before, second_before) = (control_bounds(ui, &replies[0].body), at(1));
     grow(&mut replies, 12);
     settle(ui).await;
     let grown = height_of(&replies[0].body) - shorter;
     assert!(grown > 1.0, "the first reply grew: {grown}");
     let after = at(moved);
+    if after[0].top <= kept[0].top + 1.0 || (after[0].top - kept[0].top - grown).abs() > 1.0 {
+        // The one bounded diagnostic of this point, for a hosted log:
+        // numbers and booleans only. The first reply's top moving is
+        // scrolling; the second reply not moving below the first is the
+        // layout; Rust admitting the keeper here is the keeper.
+        let top = |bounds: &[Bounds]| bounds.first().map_or(f32::NAN, |b| b.top);
+        let (first_now, second_now) = (control_bounds(ui, &replies[0].body), at(1));
+        let bottom = first_now.first().map_or(f32::NAN, |b| b.bottom);
+        eprintln!(
+            concat!(
+                "MORPHEUS_THREAD_KEEPER_BLOCKED grown={:.1} first={:.1}/{:.1}",
+                " first_bottom={:.1} second={:.1}/{:.1} reader={:.1}/{:.1}",
+                " modal={} allowed={} admit={} anchor={} offset={:.1} seek={}"
+            ),
+            grown,
+            top(&first_before),
+            top(&first_now),
+            bottom,
+            top(&second_before),
+            top(&second_now),
+            kept[0].top,
+            after[0].top,
+            ui.get_member_confirm_open(),
+            ui.get_viewport_seek_allowed(),
+            ui.invoke_viewport_anchor_admit(),
+            ui.get_thread_anchor_index(),
+            ui.get_thread_anchor_offset(),
+            ui.get_thread_seek_id()
+        );
+    }
     assert!(after[0].top > kept[0].top + 1.0, "moved with the layout");
     let shift = after[0].top - kept[0].top;
     assert!(
