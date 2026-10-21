@@ -1,8 +1,8 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, personal-account, physical-device or artifact jobs.
 # Linux runs disposable checks after offline checks; call-native owns timeline and four ring cases in one fixture lifecycle.
-name: Owner exact15c native-call fixture diagnostic
-run-name: Exact15c native-call fixture diagnostic
+name: Owner exact15c timeline assertion diagnosis
+run-name: Exact15c timeline assertion diagnosis
 on:
   workflow_dispatch:
     inputs:
@@ -1409,6 +1409,45 @@ jobs:
                   if (type(fixed) is dict and type(fixed.get('stage')) is str
                           and fixed['stage'] in timeline_stages):
                       record['timeline_stage']=fixed['stage']
+                  if row['check']=='app-live-timeline':
+                      # Forward only facts already emitted after the helper's own scan.
+                      known_test='account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'
+                      tests=row.get('failed_tests')
+                      if type(tests) is list and len(tests)<=8:
+                          record['failed_tests']=[known_test] if known_test in tests else []
+                          record['other_failed_test']=any(value!=known_test for value in tests)
+                      locations=row.get('panic_locations')
+                      if type(locations) is list and len(locations)<=24:
+                          sources={
+                              'crates/morpheus-app/src/account_access_ui_tests.rs':('account_ui',14317),
+                              'crates/morpheus-app/src/live_timeline_controller_tests.rs':('timeline_live',1300),
+                              'crates/morpheus-app/src/people_directory_live_tests.rs':('people_live',359),
+                              'crates/morpheus-app/src/people_directory.rs':('people_controller',696),
+                              'crates/morpheus-app/src/live.rs':('live_controller',9490),
+                          }
+                          bounded_locations=[]; other_location=False
+                          for value in locations:
+                              match=re.fullmatch(r'([^:\r\n]{1,180}):([0-9]{1,7}):([0-9]{1,5})',value) if type(value) is str else None
+                              if (match and match[1] in sources and 1<=int(match[2])<=sources[match[1]][1]
+                                      and 1<=int(match[3])<=10000):
+                                  bounded_locations.append({'source':sources[match[1]][0],
+                                      'line':int(match[2]),'column':int(match[3])})
+                              else: other_location=True
+                          record['panic_locations']=bounded_locations
+                          record['other_panic_location']=other_location
+                      native=row.get('native_process')
+                      if type(native) is dict:
+                          bounded_native={}
+                          if native.get('result') in ('unknown','exited','signalled','deadline'):
+                              bounded_native['result']=native['result']
+                          for key in ('panic_observed','assertion_observed','stack_overflow'):
+                              if type(native.get(key)) is bool: bounded_native[key]=native[key]
+                          for key,low,high in (('exit_code',0,255),('signal',1,64),('test_signal',1,64)):
+                              value=native.get(key)
+                              if type(value) is int and low<=value<=high: bounded_native[key]=value
+                          if native.get('panic_family') in ('morpheus','matrix_sdk','sqlite','other'):
+                              bounded_native['panic_family']=native['panic_family']
+                          record['native_process']=bounded_native
                   if len(records)<64: records.append(record)
                   else: invalid=True
               return {'complete':not invalid,'input_limit_exceeded':False,
