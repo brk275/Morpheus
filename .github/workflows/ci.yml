@@ -1,426 +1,1704 @@
-name: CI
-
+# PRIVATE source-bound proposal. Independent source review and root preflight remain required.
+# TEMPORARY affected App-native verification. NEVER MERGE this workflow.
+# No package, installed UI, Wayland, personal-account, physical-device or artifact jobs.
+# Linux App units warm the exact fixture target before one timeline/four-ring lifecycle.
+name: Owner recovery App native validation
+run-name: Recovery App native e6c2ff3 - ${{ inputs.platform }}
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
-
+    inputs:
+      platform:
+        description: Select affected App native platforms after fresh no-overlap preflight
+        type: choice
+        required: true
+        default: linux
+        options: [all, macos-arm64, macos-intel, windows, linux, remaining-native]
+      checks:
+        description: Existing App build and units; Linux adds one existing native-call fixture
+        type: choice
+        required: true
+        default: app-native
+        options: [app-native]
 permissions:
   contents: read
-
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_BUILD_JOBS: "2"
-  CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
-
+  group: beta-recovery-app-native-e6c2ff3-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  scope:
-    name: Security and change scope
-    # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false
+  security:
+    name: Reviewed candidate history
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    outputs:
-      native: ${{ steps.scope.outputs.native }}
-      native_matrix: ${{ steps.scope.outputs.native_matrix }}
-      config: ${{ steps.scope.outputs.config }}
-      wayland: ${{ steps.scope.outputs.wayland }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        env:
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
         with:
+          ref: e6c2ff30d665b25ca5abaddc21360d550f46d208
           path: candidate
           fetch-depth: 0
           persist-credentials: false
-      - name: Check out reviewed validation inputs
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # PR input is read as data; classification code comes from its base.
-          # Push uses reviewed main; dispatch uses its owner-selected revision.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          ref: 5078f4951c4f6ff6e65ddb560312f655e933e4e2
           path: trusted
           persist-credentials: false
-      - name: Scan committed history for credentials
-        working-directory: candidate
+      - name: Scan reviewed source with fixed independent rules and fixture provenance
         shell: bash
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
+          test "$(git -C candidate rev-parse HEAD)" = e6c2ff30d665b25ca5abaddc21360d550f46d208
+          archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --max-filesize 33554432 --max-time 180 \
             https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
             --output "$archive"
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          # Scanner code and exact fixture manifest come from the reviewed base.
-          # The candidate's ignore files, attributes and config are not trusted.
-          python3 -I ../trusted/scripts/scan_history.py \
-            --candidate "$PWD" --scanner "$RUNNER_TEMP/gitleaks/gitleaks" \
-            --manifest ../trusted/scripts/public-fixtures.json \
-            --evidence "$RUNNER_TEMP/morpheus-history-scan"
-      - name: Select checks from changed inputs using reviewed classifier
-        id: scope
-        working-directory: candidate
-        # Isolated mode excludes the candidate working directory and Python
-        # environment hooks from import lookup. The classifier uses stdlib only.
-        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
-
-  helpers:
-    name: Validation helper tests
-    needs: scope
-    if: github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Verify checkout identity before host provisioning
-        shell: bash
-        env:
-          REVIEWED_SOURCE: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          [[ "$REVIEWED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"
-      - name: Tighten hosted notice tree permissions before candidate imports
-        timeout-minutes: 5
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          # Bootstrap from this immutable reviewed workflow revision, including
-          # when the selected package source predates the provisioning helper.
-          git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |
-            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS /usr/bin/python3 -I -B -
-      - name: Check scope and packaging helpers
-        run: |
-          python3 -m unittest discover -s scripts/tests -v
-          python3 -m unittest discover -s scripts -p 'test_*.py' -v
-          python3 -m compileall -q scripts
-          node --check scripts/element_call_peer.mjs
-          node --check scripts/element_call_stock_peer.mjs
-          python3 scripts/package.py --check
-
-  config:
-    name: Theme configuration tests
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.config == 'true'
-    runs-on: ubuntu-24.04
-    concurrency:
-      group: native-${{ github.sha }}-ubuntu-24.04
-      cancel-in-progress: false
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
-        with:
-          toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: cargo test --locked -p morpheus-config
-
-  compile:
-    name: Check and test (${{ matrix.os }})
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
-    runs-on: ${{ matrix.os }}
-    concurrency:
-      group: native-${{ github.sha }}-${{ matrix.os }}
-      cancel-in-progress: false
-    timeout-minutes: 90
+          mkdir "$RUNNER_TEMP/history-scanner"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/history-scanner" gitleaks
+          python3 -I trusted/scripts/scan_history.py --candidate candidate \
+            --scanner "$RUNNER_TEMP/history-scanner/gitleaks" \
+            --manifest trusted/scripts/public-fixtures.json \
+            --evidence "$RUNNER_TEMP/reviewed-candidate-history"
+  native:
+    needs: security
+    name: Native ${{ matrix.name }}
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && contains(fromJSON('["all","macos-arm64","macos-intel","windows","linux","remaining-native"]'), inputs.platform) && inputs.checks == 'app-native'
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
+      matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || inputs.platform == 'remaining-native' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      MORPHEUS_EXPECTED_OS: ${{ matrix.os }}
+      MORPHEUS_EXPECTED_ARCH: ${{ matrix.arch }}
+      MORPHEUS_CHECK_SCOPE: ${{ inputs.checks }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        env:
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
         with:
+          ref: e6c2ff30d665b25ca5abaddc21360d550f46d208
+          path: candidate
+          fetch-depth: 0
           persist-credentials: false
-      - name: Linux native dependencies
+      - name: Verify source and prepare independent private-log scanner
+        timeout-minutes: 10
+        shell: python -I {0}
+        run: |
+          import hashlib, json, os, pathlib, queue, re, signal, subprocess, tempfile, threading, time
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert (os.environ.get('RUNNER_OS'),os.environ.get('RUNNER_ARCH')) == (
+              os.environ['MORPHEUS_EXPECTED_OS'],os.environ['MORPHEUS_EXPECTED_ARCH'])
+          os.umask(0o077)
+          workspace=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()/'candidate'
+          private=pathlib.Path(os.environ['RUNNER_TEMP'])/'morpheus-native-private'
+          private.mkdir(mode=0o700,exist_ok=True)
+          logs=private/'logs'; logs.mkdir(mode=0o700,exist_ok=True)
+          # Only compilation/runtime essentials. No GITHUB_TOKEN, ACTIONS tokens, inherited
+          # credentials, personal accounts, signing identities, or release environment.
+          names=('PATH','HOME','USERPROFILE','HOMEDRIVE','HOMEPATH','SYSTEMROOT','SystemRoot',
+              'WINDIR','COMSPEC','PATHEXT','TEMP','TMP','TMPDIR','LANG','LC_ALL',
+              'ProgramFiles','ProgramFiles(x86)','ProgramW6432','ALLUSERSPROFILE',
+              'LOCALAPPDATA','APPDATA','VCToolsInstallDir','VCINSTALLDIR','VSINSTALLDIR',
+              'WindowsSdkDir','WindowsSDKVersion','INCLUDE','LIB','LIBPATH','LIBCLANG_PATH',
+              'CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN','PKG_CONFIG_PATH',
+              'LD_LIBRARY_PATH','DYLD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR',
+              'SDKROOT','DEVELOPER_DIR','MACOSX_DEPLOYMENT_TARGET',
+              'CARGO_BUILD_JOBS','CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG',
+              'CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR','SLINT_EMIT_DEBUG_INFO',
+              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','RUNNER_ARCH','ImageOS',
+              'RUNNER_TEMP','RUNNER_TRACKING_ID')
+          environment={name:os.environ[name] for name in names if name in os.environ}
+          environment['GIT_CONFIG_GLOBAL']=os.devnull
+          environment['GIT_CONFIG_NOSYSTEM']='1'
+          environment['GIT_TERMINAL_PROMPT']='0'
+          environment['RUST_LOG']='off'
+          import stat, sys
+          # The supervisor owns the process group until cleanup, including successful exit.
+          # A private pipe carries only the direct command's numeric exit status; descendants
+          # never inherit it. Windows starts the command only after Job assignment.
+          SUPERVISOR = """import json, os, subprocess, sys
+          fd=int(sys.argv[1])
+          if os.name=='nt':
+              import msvcrt
+              fd=msvcrt.open_osfhandle(fd,os.O_WRONLY)
+          args=json.loads(sys.stdin.buffer.readline(65536))
+          code=subprocess.Popen(args,stdin=subprocess.DEVNULL,close_fds=True).wait()
+          os.write(fd,(str(code)+'\\n').encode('ascii')); os.close(fd)
+          sys.stdin.buffer.read(1)
+          """
+          def windows_job():
+              import ctypes
+              from ctypes import wintypes as w
+              api=ctypes.WinDLL('kernel32',use_last_error=True)
+              class Basic(ctypes.Structure):
+                  _fields_=[('process_time',ctypes.c_longlong),('job_time',ctypes.c_longlong),
+                      ('flags',w.DWORD),('minimum',ctypes.c_size_t),('maximum',ctypes.c_size_t),
+                      ('active',w.DWORD),('affinity',ctypes.c_size_t),('priority',w.DWORD),('scheduling',w.DWORD)]
+              class Limits(ctypes.Structure):
+                  _fields_=[('basic',Basic),('io',ctypes.c_ulonglong*6),('process_memory',ctypes.c_size_t),
+                      ('job_memory',ctypes.c_size_t),('peak_process',ctypes.c_size_t),('peak_job',ctypes.c_size_t)]
+              api.CreateJobObjectW.argtypes=[ctypes.c_void_p,w.LPCWSTR]; api.CreateJobObjectW.restype=w.HANDLE
+              api.SetInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD]
+              api.SetInformationJobObject.restype=w.BOOL
+              api.AssignProcessToJobObject.argtypes=[w.HANDLE,w.HANDLE]; api.AssignProcessToJobObject.restype=w.BOOL
+              api.TerminateJobObject.argtypes=[w.HANDLE,w.UINT]; api.TerminateJobObject.restype=w.BOOL
+              api.QueryInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD,ctypes.c_void_p]
+              api.QueryInformationJobObject.restype=w.BOOL
+              api.CloseHandle.argtypes=[w.HANDLE]; api.CloseHandle.restype=w.BOOL
+              handle=api.CreateJobObjectW(None,None)
+              if not handle: raise OSError('job_create_failed')
+              limits=Limits(); limits.basic.flags=0x2000 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+              if not api.SetInformationJobObject(handle,9,ctypes.byref(limits),ctypes.sizeof(limits)):
+                  api.CloseHandle(handle); raise OSError('job_limits_failed')
+              return api,handle
+
+          def regular_bytes(path,limit):
+              # Do not open a FIFO, follow a symlink/reparse point, or read an unbounded file.
+              before=path.lstat()
+              if (not stat.S_ISREG(before.st_mode) or before.st_size>limit
+                  or getattr(before,'st_file_attributes',0)&0x400): raise ValueError('unsafe_regular_file')
+              flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_CLOEXEC',0)
+              descriptor=os.open(path,flags)
+              with os.fdopen(descriptor,'rb') as stream:
+                  opened=os.fstat(stream.fileno())
+                  if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)
+                      or getattr(opened,'st_file_attributes',0)&0x400): raise ValueError('changed_regular_file')
+                  data=stream.read(limit+1); after=os.fstat(stream.fileno())
+                  if (len(data)>limit or len(data)!=after.st_size
+                      or (opened.st_size,opened.st_mtime_ns)!=(after.st_size,after.st_mtime_ns)):
+                      raise ValueError('changed_regular_file')
+                  return data
+
+          def bounded(args,name,seconds,limit=64*1024*1024,cwd=None):
+              directory=logs/name; directory.mkdir(mode=0o700)
+              log=directory/'output.log'
+              blocks=queue.Queue(maxsize=8); status=queue.Queue(maxsize=1)
+              stop=threading.Event(); errors=[]; code=None; reason=None; cleaned=False; cleanup_ok=False
+              read_fd,write_fd=os.pipe(); job=None; child=None; threads=[]
+              kwargs={'start_new_session':True,'pass_fds':(write_fd,)}
+              status_arg=write_fd
+              if os.name=='nt':
+                  import msvcrt
+                  job=windows_job(); status_arg=msvcrt.get_osfhandle(write_fd)
+                  os.set_handle_inheritable(status_arg,True)
+                  startup=subprocess.STARTUPINFO(); startup.lpAttributeList={'handle_list':[status_arg]}
+                  kwargs={'startupinfo':startup,'close_fds':True}
+              def cleanup():
+                  nonlocal cleaned,cleanup_ok
+                  if cleaned: return
+                  cleaned=True
+                  if job:
+                      import ctypes
+                      class Accounting(ctypes.Structure):
+                          _fields_=[('times',ctypes.c_longlong*4),('faults',ctypes.c_uint32),
+                              ('total',ctypes.c_uint32),('active',ctypes.c_uint32),('terminated',ctypes.c_uint32)]
+                      try:
+                          if not job[0].TerminateJobObject(job[1],1): raise OSError('job_terminate_failed')
+                          until=time.monotonic()+10
+                          while True:
+                              accounting=Accounting()
+                              if not job[0].QueryInformationJobObject(job[1],1,ctypes.byref(accounting),ctypes.sizeof(accounting),None):
+                                  raise OSError('job_query_failed')
+                              if accounting.active==0: break
+                              if time.monotonic()>=until: raise OSError('job_cleanup_deadline')
+                              time.sleep(0.05)
+                      finally:
+                          if not job[0].CloseHandle(job[1]): raise OSError('job_close_failed')
+                  elif child is not None:
+                      # No poll()/wait() before this signal: the supervisor still reserves
+                      # its group identity even if it exited unexpectedly.
+                      try: os.killpg(child.pid,signal.SIGKILL)
+                      except ProcessLookupError: pass
+                  cleanup_ok=True
+              try:
+                  with log.open('x+b') as output:
+                      try:
+                          child=subprocess.Popen([sys.executable,'-I','-c',SUPERVISOR,str(status_arg)],
+                              cwd=cwd or workspace,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT,env=environment,**kwargs)
+                          if job and not job[0].AssignProcessToJobObject(job[1],int(child._handle)):
+                              # The supervisor is waiting for input; no command was started.
+                              child.kill(); raise OSError('job_assignment_failed')
+                          if os.name=='nt': os.set_handle_inheritable(status_arg,False)
+                          os.close(write_fd); write_fd=None
+                          def reader():
+                              try:
+                                  while not stop.is_set():
+                                      block=os.read(child.stdout.fileno(),65536)
+                                      while not stop.is_set():
+                                          try: blocks.put(block,timeout=0.2); break
+                                          except queue.Full: pass
+                                      if not block: return
+                              except OSError:
+                                  if not stop.is_set(): errors.append(True)
+                          def read_status():
+                              try:
+                                  data=b''
+                                  while len(data)<=32 and not data.endswith(b'\n'):
+                                      block=os.read(read_fd,33-len(data))
+                                      if not block: break
+                                      data+=block
+                                  status.put(int(data) if re.fullmatch(rb'-?[0-9]{1,10}\n',data) else None)
+                              except (OSError,ValueError): status.put(None)
+                          threads=[threading.Thread(target=reader,daemon=True),threading.Thread(target=read_status,daemon=True)]
+                          for thread in threads: thread.start()
+                          payload=(json.dumps(args,separators=(',',':'))+'\n').encode('utf-8')
+                          if len(payload)>65535: raise ValueError('command_too_large')
+                          child.stdin.write(payload); child.stdin.flush()
+                          deadline=time.monotonic()+seconds
+                          while True:
+                              if not cleaned:
+                                  try: returned=status.get_nowait()
+                                  except queue.Empty: pass
+                                  else:
+                                      if returned is None: reason='process_error'; break
+                                      code=returned; cleanup()
+                                      # Drain buffered output after killing remaining descendants.
+                                      deadline=min(deadline,time.monotonic()+10)
+                              remaining=deadline-time.monotonic()
+                              if remaining<=0: reason='deadline'; break
+                              try: block=blocks.get(timeout=min(0.2,remaining))
+                              except queue.Empty: continue
+                              if not block:
+                                  if code is None: reason='process_error'
+                                  break
+                              if output.tell()+len(block)>limit: reason='output_limit'; break
+                              output.write(block)
+                      except (OSError,ValueError,subprocess.SubprocessError): reason='process_error'
+                      finally:
+                          try: cleanup()
+                          except OSError: reason='cleanup_failed'
+                          if not cleanup_ok: reason='cleanup_failed'
+                          if child is not None:
+                              try: child.wait(timeout=10)
+                              except subprocess.SubprocessError: reason='cleanup_failed'
+                              child.stdin.close()
+                          stop.set()
+                          if write_fd is not None: os.close(write_fd); write_fd=None
+                          for thread in threads: thread.join(timeout=2)
+                          if any(thread.is_alive() for thread in threads): reason='cleanup_failed'
+                          if child is not None: child.stdout.close()
+                          os.close(read_fd)
+                      output.flush(); output.seek(0); captured=output.read(limit+1)
+                      if not stat.S_ISREG(os.fstat(output.fileno()).st_mode) or len(captured)>limit:
+                          reason='output_limit'; captured=b''
+              finally:
+                  if write_fd is not None: os.close(write_fd)
+              if errors: reason=reason or 'process_error'
+              # Parsing and scanning consume these same captured bytes, never a reopened path.
+              return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
+
+          # Verify the owner runner wrapper on generated processes before candidate code.
+          # The orphan redirects its output, reproducing the normal-exit cleanup bug.
+          probe_root=private/'lifecycle-probe'; probe_root.mkdir(mode=0o700)
+          ready=probe_root/'ready'; late=probe_root/'late'
+          orphan_code="import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(2); pathlib.Path(sys.argv[2]).write_text('escaped'); time.sleep(30)"
+          parent_code="""import pathlib,subprocess,sys,time
+          child=subprocess.Popen([sys.executable,'-I','-c',sys.argv[1],sys.argv[2],sys.argv[3]],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True)
+          until=time.monotonic()+5
+          while not pathlib.Path(sys.argv[2]).exists():
+              if time.monotonic()>=until: raise SystemExit(8)
+              time.sleep(0.01)
+          sys.stdout.buffer.write(b'ready\\n'); sys.stdout.buffer.flush()
+          """
+          normal=bounded([sys.executable,'-I','-c',parent_code,orphan_code,str(ready),str(late)],'owner-orphan-probe',15,1024)
+          time.sleep(2.2)
+          nonzero=bounded([sys.executable,'-I','-c','raise SystemExit(7)'],'owner-exit-probe',10,1024)
+          deadline=bounded([sys.executable,'-I','-c','import time; time.sleep(30)'],'owner-deadline-probe',0.2,1024)
+          overflow=bounded([sys.executable,'-I','-c',"print('x'*4096,flush=True)"],'owner-output-probe',10,1024)
+          probe_ok=(normal['reason'] is None and normal['code']==0 and normal['captured']==b'ready\n'
+              and ready.is_file() and not late.exists() and nonzero['reason'] is None and nonzero['code']==7
+              and deadline['reason']=='deadline' and overflow['reason']=='output_limit')
+          print(json.dumps({'check':'owner_process_lifecycle','status':'passed' if probe_ok else 'failed',
+              'candidate_executed':False,'raw_logs_public':False},sort_keys=True),flush=True)
+          if not probe_ok: raise SystemExit(1)
+
+          import io, tarfile, urllib.request, zipfile
+          source='e6c2ff30d665b25ca5abaddc21360d550f46d208'
+          identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
+          if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
+              print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
+          archives={
+              ('Linux','X64'):('linux_x64.tar.gz','551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'),
+              ('macOS','ARM64'):('darwin_arm64.tar.gz','b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5'),
+              ('macOS','X64'):('darwin_x64.tar.gz','dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709'),
+              ('Windows','X64'):('windows_x64.zip','d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e'),
+          }
+          archive,digest=archives[(os.environ['RUNNER_OS'],os.environ['RUNNER_ARCH'])]
+          url='https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_'+archive
+          try:
+              data=bytearray(); deadline=time.monotonic()+180
+              with urllib.request.urlopen(url,timeout=30) as response:
+                  while True:
+                      chunk=response.read(65536)
+                      if not chunk: break
+                      data.extend(chunk)
+                      if len(data)>32*1024*1024 or time.monotonic()>deadline: raise ValueError()
+              if hashlib.sha256(data).hexdigest()!=digest: raise ValueError()
+              with (private/'verified-scanner-archive').open('xb') as saved: saved.write(data)
+              executable='gitleaks.exe' if os.name=='nt' else 'gitleaks'
+              if archive.endswith('.zip'):
+                  with zipfile.ZipFile(io.BytesIO(data)) as packaged:
+                      member=packaged.getinfo(executable)
+                      if member.file_size>64*1024*1024: raise ValueError()
+                      binary=packaged.read(member)
+              else:
+                  with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as packaged:
+                      member=packaged.getmember(executable)
+                      if not member.isfile() or member.size>64*1024*1024: raise ValueError()
+                      binary=packaged.extractfile(member).read(64*1024*1024+1)
+              if not binary or len(binary)>64*1024*1024: raise ValueError()
+              scanner=private/executable
+              with scanner.open('xb') as output: output.write(binary)
+              scanner.chmod(0o700)
+          except Exception:
+              print(json.dumps({'check':'verified_scanner_bootstrap','status':'failed'})); raise SystemExit(1)
+          config=private/'default.toml'; config.write_bytes(b'[extend]\nuseDefault = true\n')
+          ignore=private/'empty.ignore'; ignore.write_bytes(b'')
+          print(json.dumps({'check':'reviewed_source_and_private_scanner','status':'passed',
+              'source':source,'raw_logs_public':False},sort_keys=True))
+      - name: Install reviewed Linux native compilation dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
-            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev libudev-dev \
-            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xdotool \
-            dbus-x11 gnome-keyring libsecret-tools libglib2.0-bin \
-            sway swaybg pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
-          # Ubuntu 24.04 Chromium dependencies from pinned Playwright 1.62.1.
-          # Install before the peer drops privileges inside its PID namespace.
-          sudo apt-get install -y \
-            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
-            libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
-            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
-            libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
-            fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
-            xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic \
-            fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
+          sudo apt-get install -y libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
+            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev \
+            libsystemd-dev libudev-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xauth \
+            dbus-x11 gnome-keyring libsecret-tools libgl1-mesa-dri fonts-noto-color-emoji
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # reviewed action pin
         with:
           toolchain: 1.99.0
-          components: rustfmt, clippy
+          components: rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # Preserve compiled dependencies when a later acceptance check fails.
-          # The save guard still makes untrusted/PR executions restore-only.
-          cache-on-failure: true
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - name: Check formatting
-        if: runner.os == 'Linux'
-        run: cargo fmt --all -- --check
-      - name: Test configuration, Matrix, and RTC protocol models
-        id: model-tests
-        # Still fail the job below, but collect independent desktop/device
-        # results on this candidate instead of paying the compilation cost
-        # again merely because an authentication fixture failed first.
-        continue-on-error: true
-        run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
-      - name: Check desktop and Matrix crates
-        run: cargo check --locked -p morpheus-app -p morpheus-matrix
-      - name: Build desktop with native call and device adapters
-        run: cargo build --locked -p morpheus-app --features native-calls
-      - name: Capture actual native preview screens
-        id: preview-capture
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
-        continue-on-error: true
-        timeout-minutes: 2
-        env:
-          SLINT_SCALE_FACTOR: "1"
-          SLINT_BACKEND: winit-software
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          preview_root="$RUNNER_TEMP/morpheus-preview-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir "$preview_root"
-          # This debug-only early CLI renders fictional fixtures before any
-          # account/config store or network service initialization. Native
-          # logs and raw frames stay private and are never uploaded.
-          # Reviewed PRs capture their tested merge tree before integration;
-          # their PNGs remain untrusted until visual/privacy review.
-          if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1440x900x24' \
-            sh -c 'xdotool mousemove 1 1 && exec "$@"' sh \
-            target/debug/morpheus-app --morpheus-capture-preview "$preview_root/raw" \
-            >"$preview_root/native.log" 2>&1; then
-            echo "Native preview capture failed; private output was not published."
-            exit 1
-          fi
-          python3 scripts/encode_preview_pngs.py \
-            --input-dir "$preview_root/raw" --output-dir "$preview_root/png" \
-            --source-commit "$GITHUB_SHA" --binary target/debug/morpheus-app \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
-      - name: Upload native preview PNGs and provenance only
-        id: preview-upload
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && steps.preview-capture.outcome == 'success'
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: native-preview-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/desktop-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-switcher.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/incoming-call.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/room-settings.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/paper-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/manage-accounts.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-sidebar.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-space-labels.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-          include-hidden-files: false
-      - name: Smoke test Linux desktop startup under Xvfb
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set +e
-          timeout 12s xvfb-run -a -s '-screen 0 1280x800x24' target/debug/morpheus-app
-          result=$?
-          if [ "$result" -ne 124 ]; then
-            echo "Morpheus exited before the Linux desktop smoke window (status $result)"
-            exit 1
-          fi
-      - name: Test desktop controller and call guards
-        id: desktop-tests
-        # The independently built app can still exercise disposable fixtures
-        # after a unit assertion fails. Keep that evidence and reject the
-        # candidate at the final gate instead of rebuilding just to reach it.
-        continue-on-error: true
-        run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
-      - name: Test native device and call guards
-        run: cargo test --locked -p morpheus-rtc --features native-devices --lib
-      - name: Test Windows capture of an owned synthetic window and display
-        id: windows-capture-tests
+          key: verified-sdk-archives-v1
+          workspaces: candidate -> target
+          save-if: false
+      - name: Select the installed Microsoft x64 compiler environment
         if: runner.os == 'Windows'
-        continue-on-error: true
-        timeout-minutes: 15
+        timeout-minutes: 2
+        shell: python -I {0}
+        run: |
+          import json, os, pathlib, shutil, subprocess
+          assert os.environ['RUNNER_OS']=='Windows' and os.environ['RUNNER_ARCH']=='X64'
+          # Use the runner's installed vendor tools, without a new setup action.
+          # Keep tokens out of the compiler environment and print no raw output.
+          allowed=('PATH','SystemRoot','SYSTEMROOT','SystemDrive','PROCESSOR_ARCHITECTURE','OS','WINDIR','COMSPEC','PATHEXT',
+              'ProgramFiles','ProgramFiles(x86)','ProgramW6432','TEMP','TMP',
+              'USERPROFILE','HOMEDRIVE','HOMEPATH','LOCALAPPDATA','APPDATA',
+              'CARGO_HOME','RUSTUP_HOME')
+          environment={key:os.environ[key] for key in allowed if key in os.environ}
+          installer=pathlib.Path(os.environ['ProgramFiles(x86)'])/'Microsoft Visual Studio'/'Installer'/'vswhere.exe'
+          def command(args):
+              result=subprocess.run(args,env=environment,stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,check=False)
+              if result.returncode!=0 or len(result.stdout)>256*1024 or len(result.stderr)>64*1024:
+                  # Fixed diagnostics only; no setup output or environment data.
+                  text=(result.stdout+result.stderr).decode('utf-8',errors='ignore').lower()
+                  markers={'command_not_recognized':'is not recognized as an internal or external command',
+                      'invalid_syntax':'the syntax of the command is incorrect',
+                      'vsdevcmd_error':'[error:', 'vcvars_error':'error in script usage'}
+                  print(json.dumps({'check':'msvc_environment','status':'failed',
+                      'exit_code':result.returncode,'stdout_bytes':len(result.stdout),
+                      'stderr_bytes':len(result.stderr),
+                      'markers':sorted(key for key,value in markers.items() if value in text)}),flush=True)
+                  raise SystemExit(1)
+              return result.stdout
+          selected=command([str(installer),'-latest','-products','*','-requires',
+              'Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-property','installationPath']).decode('utf-8').strip()
+          assert selected and not any(char in selected for char in '\r\n"%')
+          installation=pathlib.Path(selected).resolve(strict=True)
+          assert installation.is_relative_to(pathlib.Path(os.environ['ProgramFiles']).resolve())
+          setup=installation/'Common7'/'Tools'/'VsDevCmd.bat'
+          assert setup.is_file()
+          cmd=pathlib.Path(os.environ['SystemRoot'])/'System32'/'cmd.exe'
+          # cmd.exe uses its own quoting rules. Pass a raw CreateProcess
+          # command line, avoiding list2cmdline's C-runtime quote escapes.
+          raw=command(f'"{cmd}" /d /s /c ""{setup}" -no_logo -arch=x64 -host_arch=x64 >nul && set"')
+          wanted={'PATH','INCLUDE','LIB','LIBPATH','VCTOOLSINSTALLDIR','VCINSTALLDIR',
+              'VSINSTALLDIR','WINDOWSSDKDIR','WINDOWSSDKVERSION'}
+          values={}
+          # cmd writes OEM text to pipes; preserve all characters in tool paths.
+          import ctypes
+          encoding='cp'+str(ctypes.windll.kernel32.GetOEMCP())
+          for line in raw.decode(encoding,errors='strict').splitlines():
+              name,separator,value=line.partition('=')
+              if separator and name.upper() in wanted:
+                  assert name.upper() not in values and value and not any(c in value for c in '\r\n\x00')
+                  values[name.upper()]=value
+          assert wanted<=values.keys()
+          compiler_root=pathlib.Path(values['VCTOOLSINSTALLDIR']).resolve(strict=True)
+          assert compiler_root.is_relative_to(installation/'VC'/'Tools'/'MSVC')
+          linker=shutil.which('link.exe',path=values['PATH'])
+          assert linker and pathlib.Path(linker).resolve().is_relative_to(compiler_root/'bin'/'Hostx64'/'x64')
+          # Fixed names, single-line values; no credentials or compiler stdout.
+          with pathlib.Path(os.environ['GITHUB_ENV']).open('a',encoding='utf-8',newline='\n') as output:
+              for name,value in values.items():
+                  output.write(name+'='+value+'\n')
+          print(json.dumps({'check':'msvc_environment','status':'passed','target':'x64','linker':'msvc'}))
+      - name: Build native desktop and run existing unit and controller suites
+        timeout-minutes: 160
         env:
-          MORPHEUS_WINDOWS_CAPTURE_ACCEPTANCE: "1"
-        run: python scripts/run_windows_capture_acceptance.py
-      - name: Test real Wayland portal streaming, source loss, and cancellation
-        id: wayland-tests
-        # Missing/malformed selection is fail-closed; the result gate below
-        # rejects it even if the fixture happens to pass.
-        if: runner.os == 'Linux' && needs.scope.outputs.wayland != 'false'
-        # Collect independent Matrix/OAuth/RTC evidence even if this desktop
-        # fixture fails. The final outcome gate still rejects the candidate.
-        continue-on-error: true
-        timeout-minutes: 15
-        run: python3 scripts/run_wayland_acceptance.py
-      - name: Test vendored security fixes
-        id: vendor-tests
-        # Keep independent SDK and live checks on the already-built app.
-        # The final gate still rejects any failed vendor regression command.
-        continue-on-error: true
-        shell: bash
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_TERM_COLOR: never
+          SLINT_EMIT_DEBUG_INFO: "1"
+        shell: python -I {0}
         run: |
-          cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
-          cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
-          cargo test --locked -p matrix-rtc-livekit --lib
-          cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
-          cargo test --locked -p cargo-packager-updater --lib
-      - name: Test pinned SDK sticky receipt and redaction regressions
-        id: sdk-receipt-tests
-        # Keep collecting the independently built app's live acceptance. The
-        # final outcome gate still rejects failed SDK unit regressions.
-        continue-on-error: true
-        shell: bash
-        run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
-      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
-        if: runner.os == 'Linux'
-        # Four fresh invitation cases each have a bounded 300-second command.
-        # Preserve room for the existing checks and their service cleanup.
-        timeout-minutes: 55
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            --output "$archive"
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir -p "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
-            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
-      - name: Require the selected Wayland result
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
-        env:
-          WAYLAND_SELECTED: ${{ needs.scope.outputs.wayland }}
-          WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
-        shell: bash
-        run: |
-          python3 - <<'PY_WAYLAND_ACCEPTANCE'
-          import os
-          import sys
+          import hashlib, json, os, pathlib, queue, re, signal, subprocess, tempfile, threading, time
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert (os.environ.get('RUNNER_OS'),os.environ.get('RUNNER_ARCH')) == (
+              os.environ['MORPHEUS_EXPECTED_OS'],os.environ['MORPHEUS_EXPECTED_ARCH'])
+          os.umask(0o077)
+          workspace=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()/'candidate'
+          private=pathlib.Path(os.environ['RUNNER_TEMP'])/'morpheus-native-private'
+          private.mkdir(mode=0o700,exist_ok=True)
+          logs=private/'logs'; logs.mkdir(mode=0o700,exist_ok=True)
+          # Only compilation/runtime essentials. No GITHUB_TOKEN, ACTIONS tokens, inherited
+          # credentials, personal accounts, signing identities, or release environment.
+          names=('PATH','HOME','USERPROFILE','HOMEDRIVE','HOMEPATH','SYSTEMROOT','SystemRoot',
+              'WINDIR','COMSPEC','PATHEXT','TEMP','TMP','TMPDIR','LANG','LC_ALL',
+              'ProgramFiles','ProgramFiles(x86)','ProgramW6432','ALLUSERSPROFILE',
+              'LOCALAPPDATA','APPDATA','VCToolsInstallDir','VCINSTALLDIR','VSINSTALLDIR',
+              'WindowsSdkDir','WindowsSDKVersion','INCLUDE','LIB','LIBPATH','LIBCLANG_PATH',
+              'CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN','PKG_CONFIG_PATH',
+              'LD_LIBRARY_PATH','DYLD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR',
+              'SDKROOT','DEVELOPER_DIR','MACOSX_DEPLOYMENT_TARGET',
+              'CARGO_BUILD_JOBS','CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG',
+              'CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR','SLINT_EMIT_DEBUG_INFO',
+              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','RUNNER_ARCH','ImageOS',
+              'RUNNER_TEMP','RUNNER_TRACKING_ID')
+          environment={name:os.environ[name] for name in names if name in os.environ}
+          environment['GIT_CONFIG_GLOBAL']=os.devnull
+          environment['GIT_CONFIG_NOSYSTEM']='1'
+          environment['GIT_TERMINAL_PROMPT']='0'
+          environment['RUST_LOG']='off'
+          import stat, sys
+          # The supervisor owns the process group until cleanup, including successful exit.
+          # A private pipe carries only the direct command's numeric exit status; descendants
+          # never inherit it. Windows starts the command only after Job assignment.
+          SUPERVISOR = """import json, os, subprocess, sys
+          fd=int(sys.argv[1])
+          if os.name=='nt':
+              import msvcrt
+              fd=msvcrt.open_osfhandle(fd,os.O_WRONLY)
+          args=json.loads(sys.stdin.buffer.readline(65536))
+          code=subprocess.Popen(args,stdin=subprocess.DEVNULL,close_fds=True).wait()
+          os.write(fd,(str(code)+'\\n').encode('ascii')); os.close(fd)
+          sys.stdin.buffer.read(1)
+          """
+          def windows_job():
+              import ctypes
+              from ctypes import wintypes as w
+              api=ctypes.WinDLL('kernel32',use_last_error=True)
+              class Basic(ctypes.Structure):
+                  _fields_=[('process_time',ctypes.c_longlong),('job_time',ctypes.c_longlong),
+                      ('flags',w.DWORD),('minimum',ctypes.c_size_t),('maximum',ctypes.c_size_t),
+                      ('active',w.DWORD),('affinity',ctypes.c_size_t),('priority',w.DWORD),('scheduling',w.DWORD)]
+              class Limits(ctypes.Structure):
+                  _fields_=[('basic',Basic),('io',ctypes.c_ulonglong*6),('process_memory',ctypes.c_size_t),
+                      ('job_memory',ctypes.c_size_t),('peak_process',ctypes.c_size_t),('peak_job',ctypes.c_size_t)]
+              api.CreateJobObjectW.argtypes=[ctypes.c_void_p,w.LPCWSTR]; api.CreateJobObjectW.restype=w.HANDLE
+              api.SetInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD]
+              api.SetInformationJobObject.restype=w.BOOL
+              api.AssignProcessToJobObject.argtypes=[w.HANDLE,w.HANDLE]; api.AssignProcessToJobObject.restype=w.BOOL
+              api.TerminateJobObject.argtypes=[w.HANDLE,w.UINT]; api.TerminateJobObject.restype=w.BOOL
+              api.QueryInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD,ctypes.c_void_p]
+              api.QueryInformationJobObject.restype=w.BOOL
+              api.CloseHandle.argtypes=[w.HANDLE]; api.CloseHandle.restype=w.BOOL
+              handle=api.CreateJobObjectW(None,None)
+              if not handle: raise OSError('job_create_failed')
+              limits=Limits(); limits.basic.flags=0x2000 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+              if not api.SetInformationJobObject(handle,9,ctypes.byref(limits),ctypes.sizeof(limits)):
+                  api.CloseHandle(handle); raise OSError('job_limits_failed')
+              return api,handle
 
-          def wayland_error(selected, outcome):
-              if selected not in ("true", "false"):
-                  return "Wayland selection is missing or malformed."
-              expected = "success" if selected == "true" else "skipped"
-              if outcome != expected:
-                  return "The selected Wayland check failed, was cancelled, or did not run."
-              return None
+          def regular_bytes(path,limit):
+              # Do not open a FIFO, follow a symlink/reparse point, or read an unbounded file.
+              before=path.lstat()
+              if (not stat.S_ISREG(before.st_mode) or before.st_size>limit
+                  or getattr(before,'st_file_attributes',0)&0x400): raise ValueError('unsafe_regular_file')
+              flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_CLOEXEC',0)
+              descriptor=os.open(path,flags)
+              with os.fdopen(descriptor,'rb') as stream:
+                  opened=os.fstat(stream.fileno())
+                  if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)
+                      or getattr(opened,'st_file_attributes',0)&0x400): raise ValueError('changed_regular_file')
+                  data=stream.read(limit+1); after=os.fstat(stream.fileno())
+                  if (len(data)>limit or len(data)!=after.st_size
+                      or (opened.st_size,opened.st_mtime_ns)!=(after.st_size,after.st_mtime_ns)):
+                      raise ValueError('changed_regular_file')
+                  return data
 
-          error = wayland_error(os.environ.get("WAYLAND_SELECTED"), os.environ.get("WAYLAND_OUTCOME"))
-          if error:
-              print(error, file=sys.stderr)
-              raise SystemExit(1)
-          if os.environ["WAYLAND_SELECTED"] == "false":
-              print("System Wayland was outside this change's inputs; its existing release gate remains open.")
-          PY_WAYLAND_ACCEPTANCE
-      - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
-        shell: bash
-        run: |
-          echo "Protocol model, native preview, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
-          exit 1
-
-  acceptance:
-    name: CI acceptance
-    needs: [scope, helpers, config, compile]
-    # Run after failed/skipped dependencies too. A selected check may never
-    # disappear behind a skipped aggregate that branch protection accepts.
-    if: always() && github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    permissions: {}
-    timeout-minutes: 2
-    steps:
-      # No checkout, dependency/cache restore, artifacts, or submitted code.
-      # This combines job conclusions; source/workflow review remains required.
-      - name: Require every selected check to succeed
-        env:
-          CHECK_RESULTS: ${{ toJSON(needs) }}
-        shell: bash
-        run: |
-          python3 - <<'PY_ACCEPTANCE'
-          import json
-          import os
-          import sys
-
-          def acceptance_error(needs):
-              if not isinstance(needs, dict) or set(needs) != {"scope", "helpers", "config", "compile"}:
-                  return "Missing dependency conclusions."
-              if any(not isinstance(value, dict) for value in needs.values()):
-                  return "Malformed dependency conclusions."
-              if needs["scope"].get("result") != "success":
-                  return "Security and change scope did not succeed."
-              if needs["helpers"].get("result") != "success":
-                  return "Validation helper tests did not succeed."
-              outputs = needs["scope"].get("outputs")
-              if not isinstance(outputs, dict):
-                  return "Scope outputs are missing."
-              native, config, wayland = outputs.get("native"), outputs.get("config"), outputs.get("wayland")
-              if any(flag not in ("true", "false") for flag in (native, config, wayland)):
-                  return "Scope flags are missing or malformed."
-              if native == config == "true":
-                  return "Native checks already include configuration tests."
+          def bounded(args,name,seconds,limit=64*1024*1024,cwd=None):
+              directory=logs/name; directory.mkdir(mode=0o700)
+              log=directory/'output.log'
+              blocks=queue.Queue(maxsize=8); status=queue.Queue(maxsize=1)
+              stop=threading.Event(); errors=[]; code=None; reason=None; cleaned=False; cleanup_ok=False
+              read_fd,write_fd=os.pipe(); job=None; child=None; threads=[]
+              kwargs={'start_new_session':True,'pass_fds':(write_fd,)}
+              status_arg=write_fd
+              if os.name=='nt':
+                  import msvcrt
+                  job=windows_job(); status_arg=msvcrt.get_osfhandle(write_fd)
+                  os.set_handle_inheritable(status_arg,True)
+                  startup=subprocess.STARTUPINFO(); startup.lpAttributeList={'handle_list':[status_arg]}
+                  kwargs={'startupinfo':startup,'close_fds':True}
+              def cleanup():
+                  nonlocal cleaned,cleanup_ok
+                  if cleaned: return
+                  cleaned=True
+                  if job:
+                      import ctypes
+                      class Accounting(ctypes.Structure):
+                          _fields_=[('times',ctypes.c_longlong*4),('faults',ctypes.c_uint32),
+                              ('total',ctypes.c_uint32),('active',ctypes.c_uint32),('terminated',ctypes.c_uint32)]
+                      try:
+                          if not job[0].TerminateJobObject(job[1],1): raise OSError('job_terminate_failed')
+                          until=time.monotonic()+10
+                          while True:
+                              accounting=Accounting()
+                              if not job[0].QueryInformationJobObject(job[1],1,ctypes.byref(accounting),ctypes.sizeof(accounting),None):
+                                  raise OSError('job_query_failed')
+                              if accounting.active==0: break
+                              if time.monotonic()>=until: raise OSError('job_cleanup_deadline')
+                              time.sleep(0.05)
+                      finally:
+                          if not job[0].CloseHandle(job[1]): raise OSError('job_close_failed')
+                  elif child is not None:
+                      # No poll()/wait() before this signal: the supervisor still reserves
+                      # its group identity even if it exited unexpectedly.
+                      try: os.killpg(child.pid,signal.SIGKILL)
+                      except ProcessLookupError: pass
+                  cleanup_ok=True
               try:
-                  matrix = json.loads(outputs.get("native_matrix", ""))
-              except (TypeError, ValueError):
-                  return "Native matrix is missing or malformed."
-              if not isinstance(matrix, dict) or set(matrix) != {"os"}:
-                  return "Native matrix must contain only standard operating systems."
-              platforms = matrix["os"]
-              allowed = {"macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"}
-              if (not isinstance(platforms, list)
-                      or any(not isinstance(item, str) or item not in allowed for item in platforms)
-                      or len(platforms) != len(set(platforms))
-                      or bool(platforms) != (native == "true")):
-                  return "Native matrix disagrees with the selected standard checks."
-              if wayland == "true" and "ubuntu-24.04" not in platforms:
-                  return "Selected Wayland acceptance requires the Linux native job."
-              for job, selected in (("config", config), ("compile", native)):
-                  expected = "success" if selected == "true" else "skipped"
-                  if needs[job].get("result") != expected:
-                      return "A selected check failed, was cancelled, or did not run."
-              return None
+                  with log.open('x+b') as output:
+                      try:
+                          child=subprocess.Popen([sys.executable,'-I','-c',SUPERVISOR,str(status_arg)],
+                              cwd=cwd or workspace,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT,env=environment,**kwargs)
+                          if job and not job[0].AssignProcessToJobObject(job[1],int(child._handle)):
+                              # The supervisor is waiting for input; no command was started.
+                              child.kill(); raise OSError('job_assignment_failed')
+                          if os.name=='nt': os.set_handle_inheritable(status_arg,False)
+                          os.close(write_fd); write_fd=None
+                          def reader():
+                              try:
+                                  while not stop.is_set():
+                                      block=os.read(child.stdout.fileno(),65536)
+                                      while not stop.is_set():
+                                          try: blocks.put(block,timeout=0.2); break
+                                          except queue.Full: pass
+                                      if not block: return
+                              except OSError:
+                                  if not stop.is_set(): errors.append(True)
+                          def read_status():
+                              try:
+                                  data=b''
+                                  while len(data)<=32 and not data.endswith(b'\n'):
+                                      block=os.read(read_fd,33-len(data))
+                                      if not block: break
+                                      data+=block
+                                  status.put(int(data) if re.fullmatch(rb'-?[0-9]{1,10}\n',data) else None)
+                              except (OSError,ValueError): status.put(None)
+                          threads=[threading.Thread(target=reader,daemon=True),threading.Thread(target=read_status,daemon=True)]
+                          for thread in threads: thread.start()
+                          payload=(json.dumps(args,separators=(',',':'))+'\n').encode('utf-8')
+                          if len(payload)>65535: raise ValueError('command_too_large')
+                          child.stdin.write(payload); child.stdin.flush()
+                          deadline=time.monotonic()+seconds
+                          while True:
+                              if not cleaned:
+                                  try: returned=status.get_nowait()
+                                  except queue.Empty: pass
+                                  else:
+                                      if returned is None: reason='process_error'; break
+                                      code=returned; cleanup()
+                                      # Drain buffered output after killing remaining descendants.
+                                      deadline=min(deadline,time.monotonic()+10)
+                              remaining=deadline-time.monotonic()
+                              if remaining<=0: reason='deadline'; break
+                              try: block=blocks.get(timeout=min(0.2,remaining))
+                              except queue.Empty: continue
+                              if not block:
+                                  if code is None: reason='process_error'
+                                  break
+                              if output.tell()+len(block)>limit: reason='output_limit'; break
+                              output.write(block)
+                      except (OSError,ValueError,subprocess.SubprocessError): reason='process_error'
+                      finally:
+                          try: cleanup()
+                          except OSError: reason='cleanup_failed'
+                          if not cleanup_ok: reason='cleanup_failed'
+                          if child is not None:
+                              try: child.wait(timeout=10)
+                              except subprocess.SubprocessError: reason='cleanup_failed'
+                              child.stdin.close()
+                          stop.set()
+                          if write_fd is not None: os.close(write_fd); write_fd=None
+                          for thread in threads: thread.join(timeout=2)
+                          if any(thread.is_alive() for thread in threads): reason='cleanup_failed'
+                          if child is not None: child.stdout.close()
+                          os.close(read_fd)
+                      output.flush(); output.seek(0); captured=output.read(limit+1)
+                      if not stat.S_ISREG(os.fstat(output.fileno()).st_mode) or len(captured)>limit:
+                          reason='output_limit'; captured=b''
+              finally:
+                  if write_fd is not None: os.close(write_fd)
+              if errors: reason=reason or 'process_error'
+              # Parsing and scanning consume these same captured bytes, never a reopened path.
+              return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
-          try:
-              error = acceptance_error(json.loads(os.environ["CHECK_RESULTS"]))
-          except (KeyError, ValueError):
-              error = "Dependency conclusions are missing or malformed."
-          if error:
-              print(error, file=sys.stderr)
-              raise SystemExit(1)
-          print("Security checks and every selected validation job succeeded.")
-          PY_ACCEPTANCE
+          import io, tarfile, zipfile
+          source='e6c2ff30d665b25ca5abaddc21360d550f46d208'
+          scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
+          archive_digests={
+              ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
+              ('macOS','ARM64'):'b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5',
+              ('macOS','X64'):'dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709',
+              ('Windows','X64'):'d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e',
+          }
+          # Revalidate the independently pinned scanner and its rules after every
+          # candidate process. Candidate output cannot authorize a new scanner.
+          def scanner_intact():
+              try:
+                  data=regular_bytes(private/'verified-scanner-archive',32*1024*1024)
+                  if len(data)>32*1024*1024 or hashlib.sha256(data).hexdigest()!=archive_digests[(os.environ['RUNNER_OS'],os.environ['RUNNER_ARCH'])]: return False
+                  if os.name=='nt':
+                      with zipfile.ZipFile(io.BytesIO(data)) as packaged:
+                          member=packaged.getinfo('gitleaks.exe')
+                          if member.file_size>64*1024*1024: return False
+                          expected=packaged.read(member)
+                  else:
+                      with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as packaged:
+                          member=packaged.getmember('gitleaks')
+                          if not member.isfile() or member.size>64*1024*1024: return False
+                          expected=packaged.extractfile(member).read(64*1024*1024+1)
+                  actual=regular_bytes(scanner,64*1024*1024)
+                  fixed=regular_bytes(config,1024)
+                  empty=regular_bytes(ignore,0)
+                  return (len(expected)<=64*1024*1024 and hashlib.sha256(actual).digest()==hashlib.sha256(expected).digest()
+                      and fixed==b'[extend]\nuseDefault = true\n' and empty==b'')
+              except Exception: return False
+          config=private/'default.toml'; ignore=private/'empty.ignore'
+          # Anchor every tracked input to the immutable reviewed Git tree before execution.
+          # Compare content directly, without Git index stat caches, filters or ignore rules.
+          git_args=['git','--no-pager','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
+              '-c','core.attributesFile='+os.devnull,'-c','core.useReplaceRefs=false']
+          identity=bounded(git_args+['rev-parse','HEAD'],'execution-source-identity',15,4096)
+          listing=bounded(git_args+['ls-tree','-r','-l','-z',source],'execution-source-tree',15,1024*1024)
+          if (identity['reason'] or identity['code']!=0 or identity['captured'].strip()!=source.encode('ascii')
+              or listing['reason'] or listing['code']!=0):
+              print(json.dumps({'check':'tracked_input_integrity','status':'failed'})); raise SystemExit(1)
+          tracked=[]; total=0
+          for row in listing['captured'].split(b'\0'):
+              if not row: continue
+              header,raw_path=row.split(b'\t',1); mode,kind,blob,length=header.split()
+              path=pathlib.PurePosixPath(os.fsdecode(raw_path)); size=int(length)
+              if (mode not in (b'100644',b'100755') or kind!=b'blob' or path.is_absolute()
+                  or not path.parts or any(part in ('.','..') for part in path.parts)
+                  or size>32*1024*1024): raise SystemExit('tracked_input_shape_failed')
+              total+=size
+              if len(tracked)>=10000 or total>256*1024*1024: raise SystemExit('tracked_input_bound_failed')
+              tracked.append((path,mode,blob,size))
+          if not tracked: raise SystemExit('tracked_input_empty')
+          lock_digest='cb3a29f33a89b21b482d3c7ccdab026534533acfa209803379bf3da23ce4019b'
+          pinned_head=regular_bytes(workspace/'.git/HEAD',4096)
+          if pinned_head.strip()!=source.encode('ascii'): raise SystemExit('tracked_input_head_failed')
+          def tracked_intact():
+              try:
+                  if regular_bytes(workspace/'.git/HEAD',4096)!=pinned_head: return False
+                  if hashlib.sha256(regular_bytes(workspace/'Cargo.lock',1024*1024)).hexdigest()!=lock_digest: return False
+                  for path,mode,blob,size in tracked:
+                      parent=workspace
+                      for component in path.parts[:-1]:
+                          parent=parent/component; metadata=parent.lstat()
+                          if (not stat.S_ISDIR(metadata.st_mode)
+                              or getattr(metadata,'st_file_attributes',0)&0x400): return False
+                      file=workspace/path
+                      data=regular_bytes(file,size)
+                      if len(data)!=size: return False
+                      # Git's blob identity binds the direct bytes and size to the reviewed commit.
+                      if hashlib.sha1(b'blob '+str(size).encode('ascii')+b'\0'+data).hexdigest().encode('ascii')!=blob: return False
+                      if os.name!='nt' and bool(file.lstat().st_mode&stat.S_IXUSR)!=(mode==b'100755'): return False
+                  return True
+              except (OSError,ValueError): return False
+          if not tracked_intact():
+              print(json.dumps({'check':'tracked_input_integrity','status':'failed'})); raise SystemExit(1)
+          if not scanner_intact():
+              print(json.dumps({'check':'scanner_integrity','status':'failed'})); raise SystemExit(1)
+          # Retain independently verified scanner bytes in this owner process. Reconstruct
+          # controls only after command cleanup, in a fresh directory that did not exist
+          # during candidate execution. Explicitly scan one sealed regular file, not its
+          # candidate-writable original directory (which could inject .gitleaksignore).
+          scanner_bytes=regular_bytes(scanner,64*1024*1024)
+          def scan_captured(result,name):
+              with tempfile.TemporaryDirectory(prefix='morpheus-sealed-',dir=os.environ['RUNNER_TEMP']) as fresh:
+                  sealed=pathlib.Path(fresh); sealed.chmod(0o700)
+                  binary=sealed/scanner.name; rules=sealed/'default.toml'; exclusions=sealed/'empty.ignore'
+                  capture=sealed/'output.log'; report=sealed/'report.json'
+                  for path,data in ((binary,scanner_bytes),(rules,b'[extend]\nuseDefault = true\n'),
+                      (exclusions,b''),(capture,result['captured'])):
+                      with path.open('xb') as stream: stream.write(data)
+                      path.chmod(0o500 if path==binary else 0o400)
+                  if regular_bytes(capture,64*1024*1024)!=result['captured']: return False
+                  scanned=bounded([str(binary),'dir',str(capture),'--redact=100','--ignore-gitleaks-allow',
+                      '--no-banner','--max-target-megabytes','0','--config',str(rules),
+                      '--gitleaks-ignore-path',str(exclusions),'--report-format','json','--report-path',str(report)],
+                      name+'-scan',60,8*1024*1024,cwd=sealed)
+                  try:
+                      return (scanned['reason'] is None and scanned['code']==0
+                          and regular_bytes(capture,64*1024*1024)==result['captured']
+                          and regular_bytes(rules,1024)==b'[extend]\nuseDefault = true\n'
+                          and regular_bytes(exclusions,0)==b''
+                          and hashlib.sha256(regular_bytes(binary,64*1024*1024)).digest()==hashlib.sha256(scanner_bytes).digest()
+                          and json.loads(regular_bytes(report,8*1024*1024))==[])
+                  except (OSError,ValueError): return False
+          # Failure-only closed diagnostics: emit known marker IDs and exact locked
+          # package identities, never a server/build response, path or raw log line.
+          import tomllib
+          locked={(package['name'],package['version']) for package in
+              tomllib.loads((workspace/'Cargo.lock').read_text())['package']}
+          failure_markers={
+              'custom_build_command':'failed to run custom build command',
+              'cxx_bridge':'cxxbridge',
+              'cc_tool_missing':'ToolNotFound',
+              'cc_command_failed':'error occurred in cc-rs',
+              'cmake_error':'CMake Error',
+              'linker_error':'linking with',
+              'gnu_link_extra_operand':'extra operand',
+              'gnu_link_help':"link --help",
+              'linker_not_found':'linker `link.exe` not found',
+              'linker_unrecognized_option':'unrecognized command-line option',
+              'linker_invalid_argument':'invalid argument',
+              'linker_no_such_file':'No such file or directory',
+              'linker_machine_conflict':'conflicts with target machine',
+              'linker_corrupt':'invalid or corrupt file',
+              'linker_undefined':'undefined reference',
+              'linker_unresolved':'unresolved external symbol',
+              'proc_macro_target':'does not support these crate types',
+              'locked_resolution':'lock file needs to be updated',
+              'tls_certificate':'certificate verify failed',
+              'permission_denied':'Access is denied',
+              'file_missing':'The system cannot find the file specified',
+              'path_too_long':'The filename or extension is too long',
+              'disk_full':'There is not enough space on the disk',
+              'sdk_download_request':'Native SDK download request failed',
+              'sdk_download_response':'Native SDK download response does not match the reviewed release',
+              'sdk_identity':'Native SDK archive identity does not match the reviewed release',
+              'sdk_missing_receipt':'Native SDK cache has no verified-download receipt',
+              'sdk_invalid_receipt':'Invalid native SDK cache receipt',
+              'sdk_receipt_mismatch':'Native SDK cache receipt does not match the reviewed release',
+              'sdk_unsafe_cache':'Unsafe native SDK cache directory',
+              'sdk_unsupported_path':'Unsupported native SDK archive path',
+              'sdk_unsafe_path':'Unsafe native SDK archive path',
+              'sdk_unsupported_type':'Native SDK archive contains an unsupported entry type',
+              'sdk_extraction':'Cannot unpack native SDK archive entry',
+              'sdk_cache_publish':'Cannot publish verified native SDK cache',
+          }
+          # Exact libtest IDs reconstructed from the reviewed public config
+          # test functions. Raw assertion values and arbitrary test prefixes
+          # cannot enter the diagnostic summary.
+          known_test_ids=set()
+          for unit in ('lib','registry','diagnostics','input','style_profiles'):
+              text=(workspace/f'crates/morpheus-config/src/{unit}.rs').read_text(encoding='utf-8')
+              prefix='tests::' if unit=='lib' else unit+'::tests::'
+              for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
+                  known_test_ids.add(prefix+function)
+          needed_app={
+              'incoming_ring::tests::decline_failure_needs_a_proven_client_rejection',
+              'incoming_ring::tests::a_decline_send_is_polled_only_while_its_original_fence_holds',
+              'incoming_ring::controller::tests::a_decline_claim_excludes_answer_and_ends_with_its_scope',
+              'incoming_ring::ui::tests::decline_notices_claim_a_decline_only_when_confirmed',
+              'incoming_ring::worker::tests::bounded_commands_drop_unhandled_answer_reply_and_wake_waiter',
+              'incoming_ring::desktop::tests::a_refreshed_offer_shows_once_and_only_newer_offers_show_again',
+              'incoming_ring::desktop::tests::ended_expired_or_revoked_offers_retire_and_withdraw_their_banners',
+              'incoming_ring::desktop::tests::a_stale_completion_never_brings_a_record_back',
+              'incoming_ring::desktop::tests::a_click_resolves_once_only_after_the_os_took_it_and_before_expiry',
+              'incoming_ring::desktop::tests::records_are_bounded_and_the_oldest_is_withdrawn',
+              'incoming_ring::desktop::tests::a_private_screen_opened_during_the_held_account_read_applies',
+              'incoming_ring::desktop::tests::account_only_permission_never_allows_a_named_banner',
+              'incoming_ring::desktop::tests::a_completion_that_named_more_than_now_allowed_is_withdrawn',
+              'incoming_ring::desktop::tests::delivery_threads_never_accumulate',
+              'incoming_ring::desktop::tests::a_late_delivery_nobody_waits_for_withdraws_itself',
+              'incoming_ring::desktop::tests::the_handover_window_sample_is_bounded',
+              'incoming_ring::desktop::tests::a_private_screen_opened_after_the_plan_refuses_a_named_handover',
+              'incoming_ring::desktop::tests::a_late_failure_finds_waiting_and_handed_banners_only',
+              'notifications::tests::call_banners_follow_alert_and_privacy_settings_and_stay_silent',
+              'verification::tests::confirmation_requires_explicit_human_comparison',
+              'verification::tests::verification_acts_only_on_the_unprotected_settings_page',
+              'verification::tests::expiry_comes_from_the_request_and_is_never_restarted',
+              'verification::tests::a_forgotten_flow_is_unconfirmed_and_another_method_is_unsupported',
+              'space_management::tests::form_clear_and_replacement_cancel_only_the_owned_space_write',
+              'space_management::tests::receipt_saturation_refuses_new_mutations_without_eviction_or_empty_scopes',
+              'room_media_browser::tests::failed_or_discarded_loads_cannot_bypass_the_event_budget',
+              'room_media_browser::tests::partial_and_unreadable_coverage_survives_later_pages',
+              'people_directory::tests::a_busy_creation_refuses_every_new_step_so_its_completion_still_applies',
+              'people_directory::tests::an_exact_id_is_offered_first_and_never_twice',
+              'people_directory::tests::a_created_room_is_never_reported_failed_for_its_listing',
+              'people_directory::tests::several_and_none_known_are_distinct_states',
+              'room_organization::tests::authoritative_noop_order_replaces_the_plan_and_sync_ends_its_overlay',
+
+              'kept_replies::tests::a_queued_restore_cannot_outlive_a_clear_or_a_room_change',
+              'live::account_presentation_tests::a_focused_view_loaded_out_of_order_never_replaces_the_shown_one',
+              'live::account_presentation_tests::a_withdrawn_search_navigation_held_at_its_commit_changes_nothing',
+              'live::account_presentation_tests::no_refresh_samples_a_reveal_until_it_is_decided_or_given_back',
+              'message_search::tests::context_keeps_the_hit_near_the_top_and_stays_bounded',
+              'message_search::tests::search_result_display_sanitizes_untrusted_text_without_changing_ids',
+              'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
+              'discovery_tests::timeline_link_handler_accepts_only_browser_urls',
+              'discovery_tests::call_stage_uses_joined_room_even_after_chat_navigation',
+              'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
+              'video_render::tests::screen_share_is_featured_while_cameras_stay_in_a_bounded_filmstrip',
+              'video_render::tests::hidden_stage_pauses_every_remote_stream_and_drops_pictures',
+              'video_render::tests::released_slot_discards_a_late_conversion',
+              'local_video::tests::signaling_gate_withholds_frames_without_an_owner_or_stop',
+              'local_video::tests::transmission_pause_serializes_with_pushes_and_stale_resumes',
+              'call_recovery::tests::only_running_sticky_sync_may_transmit',
+              'calls::tests::recovering_calls_keep_blocking_account_switches',
+              'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
+          }
+          needed_matrix={
+              'own_verification::tests::requests_are_reserved_per_loaded_account_and_settled_truthfully',
+              'own_verification::tests::late_completions_and_overflow_stay_with_their_loaded_account',
+              'own_verification::tests::steps_are_fenced_before_hand_off_and_unknown_after',
+              'own_verification::tests::recorded_flows_and_listings_are_bounded_with_truthful_counts',
+              'room_activity::tests::a_typing_start_waiting_for_the_account_lock_expires_at_its_idle_deadline',
+              'member_privacy::tests::the_strict_reader_fails_closed_on_any_duplicate_key',
+              'member_privacy::tests::a_change_copies_untouched_raw_json_byte_for_byte',
+              'member_privacy::tests::a_change_whose_admission_ends_before_the_write_sends_nothing',
+              'moderation::tests::every_action_is_one_bounded_request_and_a_level_change_keeps_other_bytes',
+              'moderation::tests::a_held_account_lock_ends_with_the_cancellation_or_the_selection',
+              'moderation::tests::after_the_hand_off_a_stop_or_failure_is_unknown_and_a_changed_baseline_sends_nothing',
+              'space_management::tests::a_closed_space_form_withdraws_the_actual_manager_wait',
+              'space_management::tests::the_production_dispatch_rechecks_held_preflight_authority_and_keeps_unknown_after_start',
+              'space_management::tests::unknown_fields_survive_byte_for_byte_including_big_and_decimal_numbers',
+              'room_media_browser::tests::an_overlong_page_stops_at_the_gap_even_if_the_server_reports_the_start',
+              'room_media_browser::tests::a_final_one_event_budget_is_sent_as_one_and_zero_sends_nothing',
+              'room_media_browser::tests::page_admission_rechecks_joined_membership_after_the_previous_wait',
+              'room_media_browser::tests::an_unknown_token_never_refreshes_or_replays_the_history_page',
+              'people_directory::tests::cancelled_or_revoked_people_lookup_releases_a_held_manager_wait',
+              'people_directory::tests::ended_application_admission_refuses_before_request_work_is_polled',
+              'people_directory::tests::queries_and_exact_ids_are_bounded',
+              'people_directory::tests::directory_pages_are_bounded_deduplicated_and_never_list_this_account',
+              'people_directory::tests::several_and_none_known_are_distinguished',
+              'people_directory::tests::requests_are_single_bounded_authenticated_attempts',
+              'people_directory::tests::rejected_authorization_returns_a_fixed_read_error',
+              'room_tags::tests::fresh_server_tags_and_orders_survive_stale_confirmation_hints',
+              'room_tags::tests::malformed_rereads_after_accepted_writes_report_partial_changes',
+              'room_tags::tests::fresh_tags_govern_writes_despite_every_cached_hint',
+              'direct_account_data::tests::unknown_fields_and_numbers_survive_byte_for_byte',
+              'direct_account_data::tests::an_existing_listing_writes_nothing_and_invalid_targets_are_refused',
+              'direct_account_data::tests::a_baseline_differing_only_in_a_big_number_is_a_change',
+              'direct_account_data::tests::requests_are_bounded_single_attempts',
+
+              'history::tests::a_focused_view_is_owned_only_by_the_selection_that_loaded_it',
+              'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one',
+              'tests::homeserver_must_not_send_password_over_plain_http',
+              'tests::registry_rejects_path_like_account_ids',
+              'tests::sso_redirect_must_be_private_loopback_listener',
+          }
+          # Exact new regression IDs from the reviewed source cohort. Broad suites
+          # remain unchanged; a filtered/ignored/missing repair case cannot pass.
+          needed_matrix.update({
+              'room_settings::tests::settings_expired_sign_in_does_not_refresh_or_replay_its_bounded_state_read',
+              'room_settings::tests::addresses_expired_sign_in_does_not_refresh_or_replay_its_bounded_read',
+              'room_settings::room_addresses::tests::address_reads_are_feature_local_single_attempt_without_auth_refresh',
+              'discovery::tests::nothing_is_sent_unless_the_exact_selection_and_the_caller_admit_it',
+              'discovery::tests::a_held_join_cancelled_after_its_hand_off_is_unknown_and_never_resent',
+              'discovery::tests::a_typed_room_id_is_joined_exactly_and_an_alias_takes_its_answer',
+              'account_recovery::tests::every_generated_key_is_kept_with_how_far_setup_got',
+              'account_recovery::tests::a_late_backup_import_failure_never_claims_nothing_was_imported',
+              'account_recovery::tests::a_replaced_client_waits_for_its_own_encryption_setup',
+              'account_recovery::tests::critical_operations_are_fenced_before_they_start',
+          })
+          needed_app.update({
+              'room_addresses::tests::retained_receipts_never_settle_unknown_from_reads_or_resurrect_after_removal',
+              'room_addresses::tests::accepted_receipt_needs_later_fresh_read_and_saturation_never_evicts',
+              'room_addresses::tests::dropping_the_actual_completion_owner_keeps_the_existing_receipt_unknown',
+          })
+          # Require changed security-boundary regressions from this reviewed batch.
+          # The existing whole suites still run; no accepted assertion is removed.
+          needed_app.update({
+              'calls::tests::final_cleanup_reasserts_clear_after_late_old_call_update',
+              'calls::tests::a_held_call_slot_bounds_a_route_switch_and_never_queues_it_late',
+              'room_permissions::tests::completed_account_cleanup_cannot_let_an_old_save_complete_a_new_one',
+              'room_settings::room_access_settings::tests::a_read_never_settles_an_unanswered_change_and_no_second_change_is_sent',
+              'room_settings::room_access_settings::tests::the_production_book_is_forgotten_only_at_account_removal',
+              'matrix_links::tests::a_joined_message_opens_only_under_the_join_s_own_receipt',
+          })
+          needed_matrix.update({
+              'room_settings::room_permissions::tests::a_changed_baseline_or_fresh_authority_or_closed_gate_sends_nothing',
+              'room_settings::room_permissions::tests::a_write_handed_over_then_stopped_or_refused_is_reported_as_it_is_and_never_resent',
+              'room_settings::room_access_settings::tests::closing_withdraws_a_change_only_until_its_request_is_handed_over',
+              'room_settings::room_access_settings::tests::the_access_reads_opt_out_of_authentication_refresh',
+              'matrix_links::tests::an_alias_resolves_once_to_a_typed_room_and_ignores_its_servers',
+          })
+          needed_rtc={
+              'tests::build_capability_matches_feature','tests::device_capability_matches_features',
+              'audio_device::tests::signaling_gate_withholds_audio_without_an_owner_or_revocation',
+              'audio_device::tests::paused_transmission_withholds_audio_and_keeps_the_requested_mute_state',
+              'reconnect::tests::no_attempt_starts_at_or_after_the_budget',
+              'reconnect::tests::deliberate_removals_are_not_treated_as_connection_loss',
+              'video_device::tests::cancelled_camera_open_returns_before_native_enumeration',
+              'video_device::tests::camera_permission::stop_while_permission_is_pending_drops_late_grant',
+          }
+          allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
+          needed_config={
+              'tests::every_editor_metric_is_a_bounded_field_with_one_accessor',
+              'tests::pane_composition_and_fades_default_off_round_trip_and_survive_presets',
+              'tests::interaction_states_are_optional_validated_and_absent_from_shipped_presets',
+              'tests::config_sender_palette_is_bounded_round_trips_and_survives_presets',
+              'tests::metric_edits_reject_invalid_files_without_repeating_values_and_recover',
+              'tests::validation_errors_never_repeat_the_rejected_value',
+          }
+          checks=[
+              ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
+              ('native_sdk_archive_unit',['cargo','test','--locked','-p','webrtc-sys-build','--lib','--','--test-threads=1'],20*60,
+                  {'archive_tests::cache_receipts_are_bounded_and_match_the_reviewed_identity'},set()),
+              ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                  '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
+              ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
+              ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib','--','--test-threads=1'],20*60,needed_config,set()),
+              ('rtc_unit',['cargo','test','--locked','-p','morpheus-rtc','--features','native-devices','--lib','--','--test-threads=1'],30*60,needed_rtc,set()),
+          ]
+          if os.environ.get('RUNNER_OS')=='Linux':
+              # New opt-in SDK key handoff: a loopback mock's final default-key PUT
+              # takes effect and fails. Its retained key must still open the store.
+              checks.append(('recovery_key_handoff',
+                  ['cargo','test','--locked','-p','matrix-sdk','--features','testing',
+                      '--test','integration','encryption::recovery::test_recovery_setup_hands_over_the_key_when_its_last_request_fails',
+                      '--','--exact','--test-threads=1'],20*60,
+                  {'encryption::recovery::test_recovery_setup_hands_over_the_key_when_its_last_request_fails'},set()))
+          if os.environ.get('RUNNER_OS')=='Linux':
+              # Changed SDK no-sync identity stream: synthetic loopback fixtures,
+              # including default syncing behavior and queued departures.
+              checks.append(('identity_sdk',
+                  ['cargo','test','--locked','-p','matrix-sdk','--features','testing',
+                      '--lib','room::identity_status_changes::tests::',
+                      '--','--test-threads=1'],20*60,
+                  {
+                      'room::identity_status_changes::tests::test_no_sync_stream_never_requests_the_member_list',
+                      'room::identity_status_changes::tests::test_syncing_stream_requests_an_incomplete_member_list',
+                      'room::identity_status_changes::tests::test_no_sync_stream_does_not_report_a_member_who_left_again',
+                      'room::identity_status_changes::tests::test_no_sync_stream_reconciles_queued_pin_before_leave_or_ban',
+                      'room::identity_status_changes::tests::test_no_sync_stream_reconciles_queued_verification_before_leave_or_ban',
+                      'room::identity_status_changes::tests::test_no_sync_stream_ends_if_departure_rebuild_cannot_read_members',
+                      'room::identity_status_changes::tests::test_syncing_stream_keeps_queued_departure_and_historical_member_behavior',
+                      'room::identity_status_changes::tests::test_stored_reconciliation_keeps_own_identity_excluded_from_publication',
+                      'room::identity_status_changes::tests::test_no_sync_stream_does_not_start_from_an_unreadable_member_list',
+                      'room::identity_status_changes::tests::test_no_sync_stream_ends_when_a_stored_member_cannot_be_read',
+                  },set()))
+          # Current product additions: require the existing boundary regressions,
+          # rather than treating an absent or ignored test as execution evidence.
+          needed_app.update({
+              'live::member_tests::a_member_load_publishes_only_while_it_is_the_latest_for_what_is_shown',
+              'room_creation::tests::a_full_journal_refuses_a_create_before_anything_is_sent_and_evicts_nothing',
+              'room_creation::tests::a_forgotten_account_ignores_its_late_completions',
+              'room_creation::tests::a_reservation_dropped_unsettled_keeps_its_account_unknown',
+              'unread_navigation::tests::flag_receipts_are_forgotten_only_by_complete_removal_or_logout',
+              'unread_navigation::tests::a_held_jump_is_withdrawn_and_never_readopts_an_epoch',
+              'unread_navigation::tests::the_flag_clear_keeps_the_click_time_fence',
+              'invitations::tests::a_forgotten_account_keeps_nothing_and_its_late_finish_records_nothing',
+              'invitations::tests::the_centers_open_goes_through_the_owned_reveal_only',
+          })
+          needed_matrix.update({
+              'room_creation::tests::rooms_start_encrypted_and_invite_only_and_spaces_are_never_encrypted',
+              'room_creation::tests::a_revocation_while_a_token_refresh_waits_sends_nothing_more_and_reads_unknown',
+              'room_creation::tests::a_space_without_a_usable_name_is_shown_by_its_id_as_bounded_plain_text',
+              'unread_navigation::tests::requests_are_bounded_single_attempts_without_auth_replay',
+              'unread_navigation::tests::stopped_or_superseded_work_sends_nothing',
+              'invitations::tests::declining_leaves_only_the_invited_room_never_its_joined_predecessor',
+              'invitations::tests::an_invitation_that_sync_ended_during_the_preflight_gets_no_answer',
+          })
+          if os.environ.get('RUNNER_OS')=='Linux':
+              # One affected SDK-UI integration filter covers the changed opt-in
+              # and existing default receipt behavior, using synthetic loopback data.
+              checks.append(('unread_receipt_sdk',
+                  ['cargo','test','--locked','-p','matrix-sdk-ui','--test','integration',
+                      'timeline::read_receipts::test_mark_as_read',
+                      '--','--test-threads=1'],20*60,
+                  {
+                      'timeline::read_receipts::test_mark_as_read_without_unread_flag_never_writes_the_flag',
+                      'timeline::read_receipts::test_mark_as_read_with_unread_flag',
+                  },set()))
+          if os.environ.get('RUNNER_OS')=='Linux':
+              # Entire existing affected helper module, bound to the reviewed source.
+              # Exact count; skips and expected failures remain failures.
+              helper_program = """import sys, unittest
+          expected_cases = 161
+          if type(expected_cases) is not int or expected_cases <= 0:
+              raise SystemExit('unbound_helper_case_count')
+          sys.path.insert(0, 'scripts/tests')
+          suite = unittest.defaultTestLoader.loadTestsFromName('test_matrix_acceptance')
+          if suite.countTestCases() != expected_cases: raise SystemExit(1)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          okay = (result.wasSuccessful() and result.testsRun == expected_cases and not result.skipped
+                  and not result.expectedFailures and not result.unexpectedSuccesses)
+          raise SystemExit(0 if okay else 1)
+          """
+              checks.append(('matrix_acceptance_helpers',
+                  [sys.executable, '-I', '-B', '-c', helper_program], 300, None, set()))
+          # Require the eight reviewed V5 receipt/controller/worker boundaries.
+          needed_app.update({
+              'incoming_ring::controller::tests::only_verified_own_other_device_declines_qualify_at_receipt',
+              'incoming_ring::controller::tests::retained_declines_are_bounded_short_lived_and_scoped',
+              'incoming_ring::controller::tests::retained_declines_cannot_outlive_a_stop_or_scope_change',
+              'incoming_ring::controller::tests::a_held_decline_check_withholds_only_its_unshown_offer',
+              'incoming_ring::controller::tests::a_decline_settles_only_its_exact_offer_before_its_own_deadline',
+              'incoming_ring::worker::tests::a_decline_receipt_never_interrupts_another_calls_admission',
+              'incoming_ring::worker::tests::decline_checks_finish_while_another_calls_admission_is_held',
+              'incoming_ring::worker::tests::a_new_decline_is_checked_and_applied_while_another_call_admits',
+          })
+          # Critical media repairs belong only to this affected-source scope.
+          # Update the referenced sets before constructing the closed diagnostic IDs.
+          if os.environ.get('MORPHEUS_CHECK_SCOPE','full') in ('media-native','call-native','shared-native','app-native'):
+              needed_app.update({
+                  'image_previews::animation::tests::autoplay_is_decided_when_playback_starts_and_explicit_play_still_works',
+                  'image_previews::animation::tests::a_forced_pause_is_never_lost_behind_other_commands_or_a_playing_frame',
+                  'image_previews::animation::tests::long_frame_delays_still_pause_when_the_play_budget_runs_out',
+                  'image_previews::animation::tests::closing_during_a_long_frame_wakes_the_player_at_once',
+                  'image_previews::tests::turning_on_reduced_motion_pauses_the_current_request_reliably',
+                  'webp_complexity_tests::lossless_meta_huffman_budget_rejects_before_missing_group_data',
+                  'webp_complexity_tests::lossless_meta_huffman_budget_keeps_the_last_admitted_group',
+                  'webp_complexity_tests::lossless_without_meta_huffman_image_remains_supported',
+              })
+              needed_config.add('registry::tests::setting_targets_are_unique_and_searchable_by_their_aliases')
+          # Require the reviewed recovery state and typed Matrix projection regressions.
+          needed_app.update({
+              'timeline_recovery::tests::queued_recovery_presentation_cannot_adopt_a_new_security_epoch',
+              'timeline_recovery::tests::recovery_notice_serial_never_reuses_an_old_callback',
+              'timeline_recovery::tests::loaded_status_survives_page_roundtrip_with_a_new_action_serial',
+              'timeline_recovery::tests::hidden_sdk_replacement_keeps_latest_status_and_stale_cleanup_cannot_remove_it',
+              'timeline_recovery::tests::own_recovery_entry_hides_actions_without_consuming_loaded_authority',
+          })
+          needed_matrix.update({
+              'message_presentation_tests::loaded_undecryptable_status_changes_without_inserting_message_rows',
+              'message_presentation_tests::unable_to_decrypt_is_typed_status_not_a_redaction_or_error_body',
+          })
+          for _name, _args, _seconds, required, _ignored in checks:
+              if required is not None: known_test_ids.update(required)
+          if os.environ.get('RUNNER_OS')=='Linux':
+              checks.insert(0, ('format', ['cargo','fmt','--all','--','--check'], 300, None, set()))
+          # Preserve full checks by default. The test-only repair reuses unchanged
+          # successful production/RTC/config/SDK evidence on Linux, and reruns only
+          # the two failed suites plus formatting. Other native platforms stay full.
+          scope=os.environ.get('MORPHEUS_CHECK_SCOPE','full')
+          if scope not in ('full','failed-linux','account-ui','product-linux','app-linux','product-sdk-linux','helper-linux','app-timeline-linux','app-tests','media-native','call-native','call-fixture-linux','shared-native','app-native'):
+              raise SystemExit('unknown_check_scope')
+          if scope=='call-fixture-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('call_fixture_linux_requires_linux')
+              # Rebuild only this required test target on a fresh runner; no offline suites.
+              checks=[('native_call_fixture_compile',
+                  ['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                      '--bin','morpheus-app','--no-run'],40*60,None,set())]
+          if scope=='helper-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('helper_linux_requires_linux')
+              checks=[check for check in checks if check[0]=='matrix_acceptance_helpers']
+          if scope=='failed-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('failed_linux_requires_linux')
+              checks=[check for check in checks if check[0] in
+                  {'format','app_unit_controller','matrix_unit'}]
+          if scope=='account-ui':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('account_ui_requires_linux')
+              ui_test='account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'
+              checks=[check for check in checks if check[0]=='format']+[
+                  ('account_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                      '--bin','morpheus-app',ui_test,'--','--exact','--test-threads=1'],
+                      40*60,{ui_test},set())]
+          if scope=='app-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('app_linux_requires_linux')
+              checks=[check for check in checks if check[0] in
+                  {'format','native_app_build','app_unit_controller'}]
+          if scope=='product-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('product_linux_requires_linux')
+              checks=[check for check in checks if check[0] in
+                  {'format','native_app_build','app_unit_controller','matrix_unit'}]
+          if scope=='product-sdk-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('product_sdk_linux_requires_linux')
+              checks=[check for check in checks if check[0] in
+                  {'format','native_app_build','app_unit_controller','matrix_unit','config_unit','identity_sdk','unread_receipt_sdk','matrix_acceptance_helpers'}]
+          # Reuse this runner's compiled native test graph for the actual opt-in
+          # disposable timeline/member-publication case. No fixture is opened if
+          # an earlier selected check fails. Other native platforms stay offline.
+          if scope=='app-tests':
+              checks=[check for check in checks if check[0] in
+                  {'format','app_unit_controller','matrix_acceptance_helpers'}]
+          if scope in ('media-native','call-native'):
+              selected={'format','native_app_build','app_unit_controller','config_unit'}
+              if scope=='call-native': selected.add('matrix_acceptance_helpers')
+              checks=[check for check in checks if check[0] in selected]
+              # Config and its 59 build/theme/example inputs are unchanged.
+              # Reuse immutable platform-specific passes, not an App pass:
+              # Linux9be6d31/39545876808; Mac/Windows987e5d0/39552046988.
+              checks=[check for check in checks if check[0]!='config_unit']
+              config_producer={
+                  ('Linux','X64'):(39545876808,119043889959,'9be6d31fda19195a3dd8492ab4f78405543897bf',101),
+                  ('macOS','ARM64'):(39552046988,119063295206,'987e5d0584469ede45655dea2712a0c8546c6907',101),
+                  ('macOS','X64'):(39552046988,119063295247,'987e5d0584469ede45655dea2712a0c8546c6907',101),
+                  ('Windows','X64'):(39552046988,119063295346,'987e5d0584469ede45655dea2712a0c8546c6907',94),
+              }[(os.environ['RUNNER_OS'],os.environ['RUNNER_ARCH'])]
+              print(json.dumps({'check':'config_unit','status':'reused','source':source,
+                  'producing_run':config_producer[0],'producing_job':config_producer[1],
+                  'producing_source':config_producer[2],'tests_passed':config_producer[3],
+                  'tests_failed':0,'candidate_config_executed':False}))
+          if scope=='call-native' and os.environ.get('RUNNER_OS')=='Linux':
+              # Reuse only the78 Matrix/package cases across12 unchanged inputs.
+              # The changed scanner module is covered separately by its fresh12-case pass.
+              checks=[check for check in checks if check[0]!='matrix_acceptance_helpers']
+              print(json.dumps({'check':'matrix_acceptance_helpers','status':'reused','source':source,
+                  'producing_run':39608284042,'producing_job':119250255961,
+                  'producing_source':'9836a78ae78e337e9dc5c93040cdecf1e012ddf7',
+                  'input_sha256':'67e3c93029c4c526687aae3056cab52b34a820cb741dca8321d6544a87483b8a',
+                  'tests_passed':78,'tests_failed':0,'candidate_helpers_executed':False,
+                  'excluded_module':'scripts.tests.test_scan_history'}))
+              print(json.dumps({'check':'history_scanner_boundary','status':'reused','source':source,
+                  'producing_run':39646934962,'producing_job':119384868110,
+                  'producing_source':'f9efc8ea119468dd4e464dc65959d1ae5ce8192f',
+                  'input_sha256':'5cc88aebe6c107a38c276d57d3e6606c9e5f887809bfaf5bf9ff723b3436df21',
+                  'scanner_script_sha256':'4acde7ed74259339d9494b5e2d52aff42e1317bbdf23400cc67bf7bf3085caef',
+                  'test_module_sha256':'039d1c6b5abfcaae009c7d01dd01cf172463a7e9ad2f52ab3568521c9238142a',
+                  'tests_passed':12,'tests_failed':0,'tests_skipped':0,
+                  'candidate_scanner_tests_executed':False}))
+          if scope=='app-timeline-linux':
+              if os.environ.get('RUNNER_OS')!='Linux':
+                  raise SystemExit('app_timeline_linux_requires_linux')
+              checks=[check for check in checks if check[0] in {'format','matrix_acceptance_helpers'}]
+              checks.append(('app_timeline_compile',
+                  ['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                      '--bin','morpheus-app','--no-run'],40*60,None,set()))
+          if scope=='app-native':
+              # Full App units already compile the exact later fixture target.
+              # No Matrix/SDK/RTC/Config/helper rerun or stale reuse row in this scope.
+              selected={'native_app_build','app_unit_controller'}
+              if os.environ.get('RUNNER_OS')=='Linux':
+                  selected.add('format')
+              checks=[check for check in checks if check[0] in selected]
+          if scope=='shared-native':
+              # Same full App/native-calls target supplies the later exact fixture binary.
+              # No extra --no-run build and no stale helper/config reuse records in this scope.
+              selected={'native_app_build','app_unit_controller','matrix_unit'}
+              if os.environ.get('RUNNER_OS')=='Linux':
+                  selected.update({'format','matrix_acceptance_helpers'})
+              checks=[check for check in checks if check[0] in selected]
+          if os.environ.get('RUNNER_OS')=='Linux' and scope in ('full','app-timeline-linux','app-tests','media-native','call-native','call-fixture-linux','shared-native','app-native'):
+              # Isolated Python excludes script siblings. Add only this exact
+              # reviewed checkout's helper directory after importing stdlib.
+              fixture_program = """import pathlib, runpy, sys
+          script = pathlib.Path('scripts/run_matrix_acceptance.py').resolve(strict=True)
+          sys.path.insert(0, str(script.parent))
+          sys.argv = [str(script), *sys.argv[1:]]
+          runpy.run_path(str(script), run_name='__main__')
+          """
+              if scope in ('call-native','call-fixture-linux','shared-native','app-native'):
+                  # One fixture owner; its required test target is already compiled.
+                  checks.append(('native_call_disposable',
+                      ['dbus-run-session','--',sys.executable,'-I','-B','-c',fixture_program,
+                          '--suite','native-call','--gitleaks',str(scanner)],56*60,None,set()))
+              else:
+                  checks.append(('app_timeline_disposable',
+                      ['dbus-run-session','--',sys.executable,'-I','-B','-c',fixture_program,
+                          '--suite','app-timeline','--gitleaks',str(scanner)],56*60,None,set()))
+          # Parse only the combined call check's independently scanned output. No candidate
+          # helper is imported here; rebuild public facts from fixed enums/booleans only.
+          def native_call_evidence(output, helper_ok):
+              import math
+              cases={
+                  'outgoing-ring-current-dm':('current','dm'),
+                  'outgoing-ring-current-room':('current','room'),
+                  'outgoing-ring-sticky-2025-dm':('sticky-2025','dm'),
+                  'outgoing-ring-sticky-2025-room':('sticky-2025','room'),
+              }
+              ring_keys={
+                  'sticky_sync','own_crypto','peer_trust','joined_without_media',
+                  'encrypted_membership','invitation_receipt','unsolicited_encrypted_notification',
+                  'fetched_decrypted_notification','targeted_reference','redaction_receipt',
+                  'redaction_observed','unsolicited_redaction_observed','cleanup',
+              }
+              actor_keys={
+                  'actor_discovered','exact_key_once','actor_withdrew','admitted_target_preserved',
+                  'accepted_join_identity','slot_unchanged','quiet_receive_only',
+                  'established_after_withdrawal','accepted_leave_observed','actor_cleanup',
+              }
+              fields={'check','status','passed','seconds','ring_checks','incoming_checks',
+                  'ring_mode','ring_target','account_replay_exercised','quiet_evidence',
+                  'withdrawal_evidence','actor_withdrawal_processing_confirmed'}
+              timeline_keys={
+                  'room_delivery','thread_delivery','thread_root_excluded','feeds_running',
+                  'old_lease_revoked','idle_feeds_stopped','late_events_in_core',
+                  'stale_room_rejected','stale_thread_rejected','renewed_thread_delivery',
+                  'renewed_room_delivery','queued_callbacks_observed','queued_room_rejected',
+                  'queued_thread_rejected','link_follow_up_stale_retry_rejected',
+                  'link_follow_up_owned_retry','link_follow_up_held_focus_rejected',
+                  'link_follow_up_owned_focus','member_publication','cleanup_complete',
+              }
+              timeline_fields={'check','status','passed','seconds','app_timeline_checks'}
+              def unique_object(pairs):
+                  value={}
+                  for key,item in pairs:
+                      if key in value: raise ValueError('duplicate_json_key')
+                      value[key]=item
+                  return value
+              found={}; timeline_ok=False; invalid=False; objects=0
+              for raw in io.StringIO(output):
+                  line=raw.strip()
+                  if not line.startswith('{'): continue
+                  objects+=1
+                  if objects>64 or len(line)>16384:
+                      invalid=True; break
+                  try: row=json.loads(line,object_pairs_hook=unique_object)
+                  except (ValueError,RecursionError,OverflowError):
+                      invalid=True; continue
+                  if type(row) is not dict:
+                      invalid=True; continue
+                  label=row.get('check')
+                  if type(label) is not str: continue
+                  if label=='app-live-timeline':
+                      if timeline_ok:
+                          invalid=True; continue
+                      timeline=row.get('app_timeline_checks'); seconds=row.get('seconds')
+                      seconds_ok=((type(seconds) is int and 0<=seconds<=540)
+                          or (type(seconds) is float and math.isfinite(seconds) and 0<=seconds<=540))
+                      valid=(set(row)==timeline_fields and row.get('status')=='passed'
+                          and type(row.get('passed')) is int and row['passed']==1 and seconds_ok
+                          and type(timeline) is dict and set(timeline)==timeline_keys
+                          and all(value is True for value in timeline.values()))
+                      if not valid:
+                          invalid=True; continue
+                      timeline_ok=True; continue
+                  if label not in cases:
+                      if label.startswith(('outgoing-ring-','app-live-timeline')): invalid=True
+                      continue
+                  if label in found:
+                      invalid=True; continue
+                  mode,target=cases[label]
+                  replay=mode=='current' and target=='dm'
+                  expected_actor=actor_keys|({'account_replay_rejected'} if replay else set())
+                  ring=row.get('ring_checks'); actor=row.get('incoming_checks')
+                  seconds=row.get('seconds')
+                  seconds_ok=((type(seconds) is int and 0<=seconds<=360)
+                      or (type(seconds) is float and math.isfinite(seconds) and 0<=seconds<=360))
+                  valid=(set(row)==fields and row.get('status')=='passed'
+                      and type(row.get('passed')) is int and row['passed']==1 and seconds_ok
+                      and row.get('ring_mode')==mode and row.get('ring_target')==target
+                      and row.get('account_replay_exercised') is replay
+                      and row.get('actor_withdrawal_processing_confirmed') is False
+                      and row.get('quiet_evidence')=='sampled_cache_and_media_state'
+                      and row.get('withdrawal_evidence')=='joined_after_sdk_cache_removal'
+                      and type(ring) is dict and set(ring)==ring_keys
+                      and all(value is True for value in ring.values())
+                      and type(actor) is dict and set(actor)==expected_actor
+                      and all(value is True for value in actor.values()))
+                  if not valid:
+                      invalid=True; continue
+                  found[label]={'check':label,'ring_mode':mode,'ring_target':target,
+                      'tests_passed':1,'ring_checks':{key:True for key in sorted(ring_keys)},
+                      'incoming_checks':{key:True for key in sorted(expected_actor)},
+                      'account_replay_exercised':replay,
+                      'quiet_evidence_is_sampled_cache_and_media_state':True,
+                      'withdrawal_evidence_is_joined_after_sdk_cache_removal':True,
+                      'actor_withdrawal_processing_confirmed':False}
+              complete=helper_ok and not invalid and timeline_ok and set(found)==set(cases)
+              return {'complete':complete,'helper_exit_ok':bool(helper_ok),
+                  'timeline':{'check':'app-live-timeline','complete':timeline_ok,
+                      'tests_passed':1 if timeline_ok else 0,
+                      'app_timeline_checks':{key:True for key in sorted(timeline_keys)} if timeline_ok else {}},
+                  'required_case_count':4,'valid_case_count':len(found),
+                  'cases':[found[label] for label in sorted(found)],
+                  # These existing cases do not exercise cross-device Decline delivery.
+                  'cross_device_decline_exercised':False}
+          def native_call_failure_evidence(output):
+              # Called only AFTER independent default scan. All strings below are fixed
+              # reviewed labels/categories; no exception body, path, ID or raw line escapes.
+              import math
+              labels={
+                  'unlock-disposable-keyring','vault-store','vault-read','vault-clear',
+                  'acceptance-process-containment','local_matrix_env-up','local_matrix_env-down',
+                  'local_matrix_rtc-up','local_matrix_rtc-probe','local_matrix_rtc-rtc-fixture',
+                  'local_matrix_rtc-down','verify-fixture-container-cleanup',
+                  'verify-fixture-network-cleanup','app-live-timeline',
+                  'outgoing-ring-current-dm','outgoing-ring-current-room',
+                  'outgoing-ring-sticky-2025-dm','outgoing-ring-sticky-2025-room'}
+              stages={
+                  'disk_check','network','credentials','registration','seed_rooms','verify',
+                  'recovery','rtc_gate','status','cleanup','rtc_disk_check','rtc_network',
+                  'rtc_stop_native','rtc_configs','rtc_federation','rtc_sfu','rtc_auth_bridge',
+                  'rtc_auth_service','rtc_auth_ready','rtc_synapse_configure','rtc_synapse_restart',
+                  'rtc_synapse_ready','rtc_versions','rtc_login','rtc_transports',
+                  'rtc_probe_login','rtc_openid','rtc_token_exchange','rtc_sfu_ready',
+                  *('{}_{}'.format(operation,server) for operation in
+                      ('volume','generate','configure','start','ready') for server in ('a','b'))}
+              fixture_failures={'docker','docker_disk','docker_permission','docker_registry',
+                  'docker_network','http','network','os','invalid_data','fixture_operation','deadline'}
+              timeline_stages={'setup_profile','setup_config','setup_window','setup_controller',
+                  'setup_dispatch','setup_login','setup_rooms','setup_ready',
+                  'setup','activation','room_open','room_delivery','thread_delivery',
+                  'revocation','renewal','reopen','queued_revocation','queued_drain',
+                  'queued_reopen','link_continuation','member_publication','cleanup','complete',
+                  'cleanup_logout_primary','cleanup_logout_other','cleanup_manager_stop',
+                  'cleanup_drop_live','cleanup_drop_ui','cleanup_wait_profile',
+                  'cleanup_drop_manager','cleanup_remove_directory'}
+              fatal_messages={
+                  'This harness is restricted to ephemeral Linux GitHub runners':'runner_guard',
+                  'Run the harness inside dbus-run-session':'dbus_missing',
+                  'Could not verify absence of a pre-existing Matrix fixture':'fixture_absence_unproved',
+                  'Pre-existing Matrix fixture found; refusing to modify it':'fixture_preexisting',
+                  'Disposable OS credential vault failed its round trip':'vault_round_trip',
+                  'Acceptance process containment failed':'process_containment',
+                  'Acceptance process containment has not been verified':'containment_unverified',
+                  'Acceptance owned process cleanup failed':'owned_cleanup',
+                  'Acceptance command could not be started':'command_start',
+                  'Acceptance log credential scanner failed; raw log withheld':'inner_log_scan',
+                  'Outgoing invitation acceptance cleanup failed':'ring_cleanup',
+                  'Disposable Matrix fixture absence could not be verified':'cleanup_absence_unproved',
+                  'Disposable Matrix fixture resources remain after cleanup':'cleanup_resources_remain',
+                  'Disposable Matrix service cleanup did not complete':'service_cleanup',
+                  'Matrix acceptance summary could not be written':'summary_failed',
+                  'Matrix acceptance has failed or unexecuted required checks':'required_checks_incomplete',
+                  'Acceptance cleanup deadline exhausted':'cleanup_deadline'}
+              exception_kinds={'RuntimeError','OSError','FileNotFoundError','PermissionError',
+                  'ValueError','TypeError','KeyError','ImportError','ModuleNotFoundError',
+                  'TimeoutExpired','CalledProcessError','JSONDecodeError','UnicodeDecodeError'}
+              records=[]; started=[]; fatal=set(); kinds=set(); invalid=False; unknown=False
+              if len(output)>4*1024*1024:
+                  return {'complete':False,'input_limit_exceeded':True}
+              for line in io.StringIO(output):
+                  line=line.rstrip('\r\n')
+                  if len(line)>16384:
+                      invalid=True; continue
+                  if line.startswith('Starting '):
+                      label=line[len('Starting '):]
+                      if label in labels and len(started)<64: started.append(label)
+                      else: invalid=True
+                  if line.startswith('Matrix acceptance failed: '):
+                      body=line[len('Matrix acceptance failed: '):]
+                      if body in fatal_messages: fatal.add(fatal_messages[body])
+                      elif body.startswith('Required command unavailable: '): fatal.add('required_command_missing')
+                      else:
+                          match=re.fullmatch(r'([a-zA-Z0-9_-]{1,80}) failed with exit status (-?[0-9]{1,3})',body)
+                          if match and match[1] in labels and -64<=int(match[2])<=255:
+                              fatal.add('command_exit')
+                              if len(records)<64:
+                                  records.append({'check':match[1],'status':'failed','exit_code':int(match[2])})
+                              else: invalid=True
+                          else: unknown=True
+                  match=re.match(r'^(?:[a-z_]+\.)?([A-Za-z][A-Za-z0-9]{0,63}):',line)
+                  if match and match[1] in exception_kinds: kinds.add(match[1])
+                  if line in ('Cleanup incomplete: local_matrix_rtc',
+                              'Cleanup incomplete: local_matrix_env','Cleanup incomplete: fixture_absence'):
+                      fatal.add('cleanup_incomplete')
+                  if not line.startswith('{'): continue
+                  try: row=json.loads(line)
+                  except (ValueError,TypeError,RecursionError):
+                      invalid=True; continue
+                  if (type(row) is not dict or type(row.get('check')) is not str
+                          or row['check'] not in labels): continue
+                  record={'check':row['check'],'status':'diagnostic'}
+                  status=row.get('status')
+                  if status in ('passed','failed','not_run'): record['status']=status
+                  if row.get('reason') in ('test_failed','deadline','evidence_incomplete',
+                          'dependency_failed','budget_spent','prerequisite_failed'):
+                      record['reason']=row['reason']
+                  count=row.get('passed'); seconds=row.get('seconds')
+                  if type(count) is int and 0<=count<=10000: record['tests_passed']=count
+                  if type(seconds) in (int,float) and 0<=seconds<=54*60 and math.isfinite(seconds):
+                      record['elapsed_ms']=int(seconds*1000)
+                  fixed=row.get('matrix_fixture_diagnostics')
+                  if type(fixed) is dict:
+                      if type(fixed.get('stage')) is str and fixed['stage'] in stages:
+                          record['fixture_stage']=fixed['stage']
+                      if type(fixed.get('failure')) is str and fixed['failure'] in fixture_failures:
+                          record['fixture_failure']=fixed['failure']
+                      for key in ('docker_exit','http_status','os_errno'):
+                          value=fixed.get(key)
+                          if type(value) is int and (100<=value<=599 if key=='http_status' else 0<=value<=255):
+                              record[key]=value
+                  fixed=row.get('app_timeline_diagnostics')
+                  if (type(fixed) is dict and type(fixed.get('stage')) is str
+                          and fixed['stage'] in timeline_stages):
+                      record['timeline_stage']=fixed['stage']
+                  if row['check']=='app-live-timeline':
+                      # Forward only facts already emitted after the helper's own scan.
+                      known_test='account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'
+                      tests=row.get('failed_tests')
+                      if type(tests) is list and len(tests)<=8:
+                          record['failed_tests']=[known_test] if known_test in tests else []
+                          record['other_failed_test']=any(value!=known_test for value in tests)
+                      locations=row.get('panic_locations')
+                      if type(locations) is list and len(locations)<=24:
+                          # Exact line bounds of the reviewed source; unknown locations remain classified.
+                          # New recovery ownership code is included without broadening any bound.
+                          sources={
+                              'crates/morpheus-app/src/account_access_ui_tests.rs':('account_ui',14462),
+                              'crates/morpheus-app/src/live_timeline_controller_tests.rs':('timeline_live',1711),
+                              'crates/morpheus-app/src/people_directory_live_tests.rs':('people_live',361),
+                              'crates/morpheus-app/src/people_directory.rs':('people_controller',696),
+                              'crates/morpheus-app/src/live.rs':('live_controller',9599),
+                              'crates/morpheus-app/src/timeline_recovery.rs':('timeline_recovery',459),
+                          }
+                          bounded_locations=[]; other_location=False
+                          for value in locations:
+                              match=re.fullmatch(r'([^:\r\n]{1,180}):([0-9]{1,7}):([0-9]{1,5})',value) if type(value) is str else None
+                              if (match and match[1] in sources and 1<=int(match[2])<=sources[match[1]][1]
+                                      and 1<=int(match[3])<=10000):
+                                  bounded_locations.append({'source':sources[match[1]][0],
+                                      'line':int(match[2]),'column':int(match[3])})
+                              else: other_location=True
+                          record['panic_locations']=bounded_locations
+                          record['other_panic_location']=other_location
+                      native=row.get('native_process')
+                      if type(native) is dict:
+                          bounded_native={}
+                          if native.get('result') in ('unknown','exited','signalled','deadline'):
+                              bounded_native['result']=native['result']
+                          for key in ('panic_observed','assertion_observed','stack_overflow'):
+                              if type(native.get(key)) is bool: bounded_native[key]=native[key]
+                          for key,low,high in (('exit_code',0,255),('signal',1,64),('test_signal',1,64)):
+                              value=native.get(key)
+                              if type(value) is int and low<=value<=high: bounded_native[key]=value
+                          if native.get('panic_family') in ('morpheus','matrix_sdk','sqlite','other'):
+                              bounded_native['panic_family']=native['panic_family']
+                          record['native_process']=bounded_native
+                  if len(records)<64: records.append(record)
+                  else: invalid=True
+              return {'complete':not invalid,'input_limit_exceeded':False,
+                  'started_checks':started,'last_started':started[-1] if started else 'none',
+                  'records':records,'fatal_categories':sorted(fatal),
+                  'unclassified_fatal':unknown,'exception_kinds':sorted(kinds),
+                  'traceback_present':'Traceback (most recent call last):' in output}
+          # All four platform scopes use this exact stable reviewed candidate.
+          all_passed=True
+          for name,args,seconds,required,allowed_ignored in checks:
+              if name in ('app_timeline_disposable','native_call_disposable') and not all_passed:
+                  print(json.dumps({'check':name,'status':'not_run','reason':'dependency_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True),flush=True)
+                  continue
+              if not tracked_intact():
+                  print(json.dumps({'check':name,'status':'failed','reason':'tracked_input_integrity_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True)); raise SystemExit(1)
+              result=bounded(args,name,seconds)
+              if result['reason']=='cleanup_failed':
+                  print(json.dumps({'check':name,'status':'failed','reason':'cleanup_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True)); raise SystemExit(1)
+              if not tracked_intact() or not scanner_intact():
+                  print(json.dumps({'check':name,'status':'failed','reason':'input_or_scanner_integrity_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True)); raise SystemExit(1)
+              clean=scan_captured(result,name)
+              if not clean:
+                  print(json.dumps({'check':name,'status':'failed','reason':'private_log_scan_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True),flush=True)
+                  raise SystemExit(1)
+              output=result['captured'].decode('utf-8',errors='replace')
+              passed=result['reason'] is None and result['code']==0
+              record={'check':name,'status':'passed' if passed else 'failed','reason':result['reason'],
+                  'source':source,'exit_code':result['code'],'log_bytes':result['bytes'],
+                  'raw_logs_public':False,'real_accounts':False,'physical_devices':False,
+                  'installed_app':False,'packages_uploaded':False}
+              # Interleaved CLI stdout does not guarantee each name and ok share a line.
+              # Account for every unique prefix and exact failure/ignore sets instead.
+              failures=set()
+              if required is not None:
+                  names=re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\.',output,re.MULTILINE)
+                  seen=set(names)
+                  failures=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$',output,re.MULTILINE))
+                  ignored=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ignored',output,re.MULTILINE))
+                  summaries=re.findall(r'^test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored;',output,re.MULTILINE)
+                  complete=len(summaries)==1 and len(names)==len(seen)
+                  a=b=c=None
+                  if complete:
+                      status,a,b,c=summaries[0]; a,b,c=map(int,(a,b,c))
+                      complete=(len(seen)==a+b+c and len(failures)==b and len(ignored)==c
+                          and failures<=seen and ignored<=seen and not failures&ignored)
+                  okay=seen-failures-ignored if complete else set()
+                  passed=(passed and complete and summaries[0][0]=='ok' and a>0 and b==0
+                      and ignored==allowed_ignored and required<=okay)
+                  record.update({'complete_test_accounting':complete,'tests_passed':a,'tests_failed':b,
+                      'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
+              if name=='native_call_disposable':
+                  evidence=native_call_evidence(output,passed)
+                  passed=passed and evidence['complete']
+                  record['native_call_evidence']=evidence
+                  if not passed:
+                      record['native_call_failure_evidence']=native_call_failure_evidence(output)
+              if name!='native_call_disposable':
+                  record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
+              if not passed and name!='native_call_disposable':
+                  # Compiler diagnostics leave this process only after the independent scan.
+                  # Exclude panic/assertion/authentication bodies. Keep compiler type-chain notes
+                  # needed to diagnose Send/Sync constraints, bounded to 4 KiB in total.
+                  diagnostics=[]; diagnostic_bytes=0
+                  diagnostic_candidates=[]
+                  for sequence,line in enumerate(output.splitlines()):
+                      line=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',line)
+                      stripped=line.strip()
+                      type_note=re.match(r'^(?:=\s*)?(?:note|help): (?:required (?:because|by)|within `|the trait |consider (?:removing|using|further)|future (?:created|is)|this (?:value|type))',stripped)
+                      source_span=re.match(r'^(?:-->|:::)\s+[^\r\n]{1,1000}\.(?:rs|slint):[0-9]{1,7}:[0-9]{1,5}',stripped)
+                      compiler_error=re.match(r'^error(?:\[E[0-9]{4}\])?: (?:could not compile|aborting|failed to run custom build command|cannot|expected|unexpected|unresolved|unknown|Unknown|No such|Cannot|invalid|unterminated|mismatched|attribute|proc macro|item|recursion|reached|linking|The binding)',stripped)
+                      coded_error=re.match(r'^error\[E[0-9]{4}\]: ',stripped)
+                      if not (compiler_error or coded_error or stripped.startswith(('fatal error:',
+                          'MORPHEUS_SLINT_CONST_REFERENCE')) or type_note or source_span
+                          or 'Unknown property' in stripped or 'Unknown element' in stripped
+                          or 'Cannot access' in stripped or 'No such property' in stripped): continue
+                      for value in sorted({str(workspace),str(private),os.environ.get('RUNNER_TEMP',''),
+                          environment.get('HOME',''),environment.get('USERPROFILE',''),
+                          environment.get('CARGO_HOME',''),environment.get('RUSTUP_HOME','')},key=len,reverse=True):
+                          if value: line=line.replace(value,'<runner>')
+                      line=re.sub(r"(?i)[a-z]:[\\/][^\s'\"`<>]+",'<runner-path>',line)
+                      line=re.sub(r"(?<![A-Za-z0-9_.>])/(?:[^\s'\"`<>]+)",'<runner-path>',line)
+                      line=''.join(ch for ch in line if ord(ch)>=32 and ord(ch)!=127)[:1000]
+                      # Source spans from warnings must not consume the budget before errors.
+                      priority=0 if compiler_error or coded_error or stripped.startswith(('fatal error:',
+                          'MORPHEUS_SLINT_CONST_REFERENCE')) else 1 if not source_span else 2
+                      diagnostic_candidates.append((priority,sequence,line))
+                  for _,_,line in sorted(diagnostic_candidates):
+                      encoded=line.encode('utf-8')
+                      if diagnostic_bytes+len(encoded)>4096: continue
+                      if len(diagnostics)>=32: break
+                      diagnostics.append(line); diagnostic_bytes+=len(encoded)
+                  record['compiler_diagnostics']=diagnostics
+                  crates=set(re.findall(r"failed to run custom build command for `([A-Za-z0-9_-]+) v([0-9][A-Za-z0-9.+_-]*)`",output))
+                  # Only fixed tool families and package names from the reviewed lock
+                  # may leave the private log. Normalize NULs for native UTF-16 output.
+                  normalized=output.replace('\x00','')
+                  folded_output=normalized.lower()
+                  linker_failures=re.findall(r'linking with `([^`\r\n]{1,1024})` failed: exit code: ([0-9]{1,10})',normalized)
+                  def tool_family(path):
+                      value=path.replace('\\','/').lower()
+                      name=value.rsplit('/',1)[-1]
+                      if name not in ('link.exe','lld-link.exe','clang-cl.exe','cc','clang','gcc'): return 'other'
+                      if '/git/usr/bin/' in value: return 'git_coreutils_link' if name=='link.exe' else 'other'
+                      if '/vc/tools/msvc/' in value: return 'msvc_link' if name=='link.exe' else 'other'
+                      return {'link.exe':'link','lld-link.exe':'lld_link','clang-cl.exe':'clang_cl',
+                          'cc':'cc','clang':'clang','gcc':'gcc'}[name]
+                  import shutil
+                  resolved_link=shutil.which('link.exe',path=environment.get('PATH','')) if os.name=='nt' else None
+                  locked_names={package for package,version in locked}
+                  failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
+                  # Only reviewed public filenames and numeric compiler spans.
+                  # Missing identifiers are admitted only if already in those public sources.
+                  source_files=('crates/morpheus-app/src/voice_rosters/mod.rs',
+                      'crates/morpheus-app/src/voice_rosters/model.rs',
+                      'crates/morpheus-app/src/voice_rosters/tests.rs',
+                      'crates/morpheus-app/ui/voice-rosters.slint',
+                      'crates/morpheus-app/ui/icons.slint',
+                      'crates/morpheus-rtc/src/observer.rs',
+                      'crates/morpheus-config/src/lib.rs',
+                      'crates/morpheus-config/src/registry.rs',
+                      'crates/morpheus-config/src/diagnostics.rs',
+                      'crates/morpheus-config/src/input.rs',
+                      'crates/morpheus-config/src/style_profiles.rs',
+                      'crates/morpheus-app/src/workspace_layout.rs',
+                      'crates/morpheus-app/src/attachment_workbench.rs',
+                      'crates/morpheus-app/src/attachments.rs',
+                      'crates/morpheus-app/ui/transfer-center.slint',
+                      'crates/morpheus-matrix/src/media.rs',
+                      'crates/morpheus-config/src/registry.rs',
+                      'crates/morpheus-matrix/src/device_sessions.rs',
+                      'crates/morpheus-app/src/device_sessions.rs',
+                      'crates/morpheus-app/ui/device-sessions.slint',
+                      'vendor/matrix-sdk/src/config/request.rs',
+                      'vendor/matrix-sdk/src/error.rs',
+                      'vendor/matrix-sdk/src/http_client/mod.rs',
+                      'vendor/matrix-sdk/src/http_client/native.rs',
+                      'vendor/matrix-sdk/src/search_index/mod.rs',
+                      'vendor/matrix-sdk/src/message_search.rs',
+                      'vendor/matrix-sdk-search/src/index/mod.rs',
+                      'vendor/matrix-sdk-search/src/schema.rs',
+                      'crates/morpheus-matrix/src/search.rs',
+                      'crates/morpheus-app/src/main.rs',
+                      'crates/morpheus-app/src/settings_search.rs',
+                      'crates/morpheus-app/src/room_organization/mod.rs',
+                      'crates/morpheus-app/src/navigation.rs',
+                      'crates/morpheus-app/ui/room-organization.slint',
+                      'crates/morpheus-matrix/src/room_tags.rs',
+                      'crates/morpheus-app/src/appearance.rs',
+                      'crates/morpheus-app/src/style_profiles.rs',
+                      'crates/morpheus-app/ui/controls.slint',
+                      'crates/morpheus-app/ui/style-tokens.slint',
+                      'crates/morpheus-app/ui/call-stage.slint',
+                      'crates/morpheus-app/ui/message-search.slint',
+                      'crates/morpheus-app/ui/poll-card.slint',
+                      'crates/morpheus-app/ui/poll-dialog.slint',
+                      'crates/morpheus-app/ui/attachment-workbench.slint',
+                      'crates/morpheus-app/ui/media-viewer.slint',
+                      'crates/morpheus-app/src/account_access_ui_tests.rs',
+                      'crates/morpheus-app/src/live.rs',
+                      'crates/morpheus-app/src/timeline_model.rs',
+                      'crates/morpheus-app/src/pinned_messages/mod.rs',
+                      'crates/morpheus-app/src/pinned_messages/view.rs',
+                      'crates/morpheus-app/src/message_search.rs',
+                      'crates/morpheus-app/src/polls/mod.rs',
+                      'crates/morpheus-app/ui/app-window.slint',
+                      'crates/morpheus-app/ui/pinned-messages.slint',
+                      'crates/morpheus-matrix/src/lib.rs',
+                      'crates/morpheus-matrix/src/pinned_messages.rs')
+                  # All current Rust/Slint files in the reviewed tracked source tree,
+                  # including theme_studio/{mod,fonts,packs}.rs and new compiled modules.
+                  source_files=tuple(sorted(set(source_files)|{str(path) for path,_mode,_blob,_size in tracked
+                      if str(path).startswith(('crates/morpheus-app/src/','crates/morpheus-app/ui/',
+                          'crates/morpheus-config/src/','crates/morpheus-matrix/src/','crates/morpheus-rtc/src/'))
+                      and path.suffix in ('.rs','.slint')}))
+                  locations=[]; public_identifiers=set()
+                  for path in source_files:
+                      file=workspace/path
+                      if not file.is_file(): continue
+                      text=file.read_text(encoding='utf-8')
+                      public_identifiers.update(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{0,127}\b',text))
+                      line_limit=len(text.splitlines())+1
+                      spans={(int(line),int(column)) for line,column in re.findall(re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})',normalized)
+                          if 0<int(line)<=line_limit and 0<int(column)<=4096}
+                      locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
+                  missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
+                  record['failure_diagnostics']={
+                      'ui_timeout_phases':[int(phase) for phase in re.findall(r'morpheus-ui-timeout-phase=([0-9]{1,3})', output)[:8]],
+                  'ui_phase_timings':[{'phase':int(phase),'elapsed_ms':int(elapsed),'phase_ms':int(duration)}
+                      for phase,elapsed,duration in re.findall(
+                          r'MORPHEUS_UI_PHASE phase=([0-9]{1,3}) elapsed_ms=([0-9]{1,7}) phase_ms=([0-9]{1,7})',output)[:64]],
+                      'transfer_focus_state':[{'page':int(page),'panel':panel=='true','tab':int(tab),'pending':pending=='true','headings':int(headings)}
+                          for page,panel,tab,pending,headings in re.findall(r'MORPHEUS_TRANSFER_FOCUS_STATE page=([0-9]{1,2}) panel=(true|false) tab=([0-9]{1,2}) pending=(true|false) headings=([0-9]{1,3})',output)[:8]],
+                      'ui_settings_target_failures':[{'stage':int(stage),'index':int(index),'live':live=='true'}
+                          for stage,index,live in re.findall(r'MORPHEUS_SETTINGS_TARGET_FAILURE stage=([01]) index=([0-9]{1,3}) live=(true|false)',output)[:8]],
+                      'failed_test_ids':[name for name in sorted(failures) if name in known_test_ids][:16],
+                      'source_locations':locations,
+                      'missing_public_identifiers':sorted(missing & public_identifiers)[:32],
+                      'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
+                      'path_link_family':tool_family(resolved_link) if resolved_link else 'not_resolved',
+                      'locked_failed_packages':sorted(failed_packages & locked_names),
+                      'markers':sorted(key for key,value in failure_markers.items() if value.lower() in folded_output),
+                      'locked_build_script_crates':sorted(name+'@'+version for name,version in crates if (name,version) in locked),
+                      'native_error_codes':sorted(set(re.findall(r'\b(?:LNK[0-9]{4}|C[0-9]{4})\b',normalized))),
+                      'os_error_codes':sorted(set(int(code) for code in re.findall(r'os error ([0-9]{1,5})\b',output))),
+                  }
+              loops=len(re.findall(r'part of a binding loop',output))
+              passed=passed and loops==0
+              record.update({'status':'passed' if passed else 'failed','ui_binding_loop_warnings':loops})
+              print(json.dumps(record,sort_keys=True),flush=True)
+              all_passed=all_passed and passed
+              # Failed compilation cannot yield meaningful unit checks. Independent test
+              # suites still run after a test failure, using the same compiled graph.
+              if name=='native_app_build' and not passed: break
+          if not all_passed: raise SystemExit(1)
