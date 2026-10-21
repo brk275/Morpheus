@@ -241,7 +241,7 @@ INCOMING_ERRORS = frozenset((
     "admission_transport", "admission_unavailable", "admission_timed_out", "admission_revoked",
     "wrong_call", "cancelled", "account_changed", "incoming_offer_unavailable", "room_not_loaded",
     "encryption_state", "room_state", "matrix", "rtc", "media", "worker_stopped", "timed_out",
-    "cleanup", "update", "assertion",
+    "cleanup", "update", "connection_lost", "assertion",
     "invitation_account_mismatch",
     "invitation_call_unavailable",
     "invitation_clock",
