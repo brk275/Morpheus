@@ -11774,6 +11774,10 @@ export component AppWindow inherits Window {
                             }
                             if root.viewport-anchor-admit() {
                                 self.content-y = goal;
+                                // The keeper's own move is no scrolling: the anchor stays
+                                // with this reply, and the next layout change above it is
+                                // told from scrolling again (report-top).
+                                root.thread-anchor-scroll = self.content-y;
                             } else {
                                 root.thread-anchor-index = -1;
                             }

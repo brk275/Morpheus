@@ -1591,29 +1591,47 @@ async fn assert_seek_policy_and_thread_keeper(
     assert!((1..29).contains(&index), "below the first reply: {index}");
     assert_eq!(held.len(), 1, "the anchor reply is laid out once");
     let at = |index: usize| control_bounds(ui, &rich_fixture(30_001 + index).body);
-    // The first reply (always above the reader) grows by `lines` sentences.
+    // The first reply (always above the reader) becomes `lines` lines long.
+    // Hard line breaks, as Matrix sends them, so its growth never depends
+    // on word wrapping in the window's current width, fonts or styling.
     let grow = |replies: &mut Vec<Arc<morpheus_matrix::MessageInfo>>, lines: usize| {
-        let more = "It grew much longer. ".repeat(lines);
+        let more = vec!["It grew one line longer."; lines - 1].join("\n");
         let row = Arc::make_mut(&mut replies[0]);
-        row.body = format!("Edited first reply. {more}");
-        row.rich_markdown = Some(row.body.clone());
+        row.body = format!("Edited first reply.\n{more}");
+        row.rich_markdown = Some(row.body.replace('\n', "  \n"));
         row.rich_accessible = Some(row.body.clone());
         ui.set_thread_messages(update_shared(ui.get_thread_messages(), replies.clone()));
     };
+    // A text's laid-out height, from its real generated geometry. Every
+    // change above the reader below must really change the layout there:
+    // a place kept across no change would prove nothing.
+    let height_of = |label: &str| {
+        let bounds = control_bounds(ui, label);
+        assert_eq!(bounds.len(), 1, "laid out once: {label}");
+        bounds[0].bottom - bounds[0].top
+    };
 
     // A reply above the reader grows: the anchor reply stays where it was.
-    grow(&mut replies, 30);
+    let shorter = height_of(&replies[0].body);
+    grow(&mut replies, 6);
     settle(ui).await;
+    let grown = height_of(&replies[0].body) - shorter;
+    assert!(grown > 1.0, "the first reply grew: {grown}");
     let kept = at(index);
     assert!(
         (kept[0].top - held[0].top).abs() <= 1.0,
         "{held:?} {kept:?}"
     );
 
-    // The root above every reply reflows: it stays there too.
-    let longer = message_item(&rich_fixture(30_104));
+    // The root above every reply reflows, from one line to four: it stays
+    // there too.
+    let root_label = rich_fixture(30_000).body;
+    let short_root = height_of(&root_label);
+    let longer = message_item(&rich_fixture(30_107));
     ui.set_thread_root_rich_body(longer.rich_body);
     settle(ui).await;
+    let grown = height_of(&root_label) - short_root;
+    assert!(grown > 1.0, "the root grew: {grown}");
     let kept = at(index);
     assert!(
         (kept[0].top - held[0].top).abs() <= 1.0,
@@ -1635,8 +1653,11 @@ async fn assert_seek_policy_and_thread_keeper(
     let (moved, scrolled) = reader();
     let followed = moved != index || (scrolled[0].top - kept[0].top).abs() > 1.0;
     assert!(followed, "the anchor followed the scroll");
-    grow(&mut replies, 60);
+    let shorter = height_of(&replies[0].body);
+    grow(&mut replies, 9);
     settle(ui).await;
+    let grown = height_of(&replies[0].body) - shorter;
+    assert!(grown > 1.0, "the first reply grew: {grown}");
     let kept = at(moved);
     assert!(
         (kept[0].top - scrolled[0].top).abs() <= 1.0,
@@ -1644,15 +1665,53 @@ async fn assert_seek_policy_and_thread_keeper(
     );
 
     // Behind a protected surface the keeper moves nothing: the reply moves
-    // with the layout, and its place is taken again.
+    // with the layout, by exactly the growth above it, and its place is
+    // taken again.
     ui.set_member_confirm_open(true);
     settle(ui).await;
-    grow(&mut replies, 90);
+    let shorter = height_of(&replies[0].body);
+    grow(&mut replies, 12);
     settle(ui).await;
+    let grown = height_of(&replies[0].body) - shorter;
+    assert!(grown > 1.0, "the first reply grew: {grown}");
     let after = at(moved);
     assert!(after[0].top > kept[0].top + 1.0, "moved with the layout");
+    let shift = after[0].top - kept[0].top;
+    assert!(
+        (shift - grown).abs() <= 1.0,
+        "by that growth: {shift} {grown}"
+    );
     ui.set_member_confirm_open(false);
     settle(ui).await;
+
+    // Nothing moves late once it closes: the keeper ended when the surface
+    // came up and stays stopped until the thread's next publication binds
+    // it again. The reply across the top takes the anchor again, and the
+    // next layout change above it is still not corrected.
+    for _ in 0..2 {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(16));
+        settle(ui).await;
+    }
+    let closed = at(moved);
+    assert!(
+        (closed[0].top - after[0].top).abs() <= 1.0,
+        "no late move: {after:?} {closed:?}"
+    );
+    assert!(
+        ui.get_thread_anchor_index() >= 0,
+        "the anchor is taken again"
+    );
+    let shorter = height_of(&replies[0].body);
+    grow(&mut replies, 13);
+    settle(ui).await;
+    let grown = height_of(&replies[0].body) - shorter;
+    assert!(grown > 1.0, "the first reply grew: {grown}");
+    let later = at(moved);
+    let shift = later[0].top - closed[0].top;
+    assert!(
+        (shift - grown).abs() <= 1.0,
+        "not corrected: {shift} {grown}"
+    );
 
     // A brief protected entry (opened and closed before any change handler
     // runs) also stops the thread keeper, at once, until the thread's next
@@ -1666,7 +1725,7 @@ async fn assert_seek_policy_and_thread_keeper(
     crate::matrix_links::clear(ui);
     ui.set_account_menu_open(true);
     ui.set_account_menu_open(false);
-    grow(&mut replies, 120);
+    grow(&mut replies, 14);
     settle(ui).await;
     let after = at(index);
     assert!(after[0].top > before[0].top + 1.0, "the keeper was stopped");
@@ -1685,8 +1744,11 @@ async fn assert_seek_policy_and_thread_keeper(
     live.invalidate_navigation();
     crate::matrix_links::tests::end_stale_reads(ui, live, clicked);
     live.is_live.store(was_live, Ordering::Release);
-    grow(&mut replies, 150);
+    let shorter = height_of(&replies[0].body);
+    grow(&mut replies, 15);
     settle(ui).await;
+    let grown = height_of(&replies[0].body) - shorter;
+    assert!(grown > 1.0, "the first reply grew: {grown}");
     let after = at(index);
     assert!(
         (after[0].top - before[0].top).abs() <= 1.0,

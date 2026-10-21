@@ -124,11 +124,12 @@ The first rows of another feed, view or thread start without an anchor.
   scrolling (the person's or a seek's) takes the thread's anchor; a layout
   change does not. When the anchor reply's laid-out position changes (the
   root or an earlier reply reflows, a font or width change), the keeper puts
-  it back at its measured offset in one move, clamped at the ends. It acts
-  only under the thread's latest publication, its security generation and no
-  protected surface. Refused, the place moves with the layout and is taken
-  again. It reacts to layouts only, so it never fights the person's scrolling
-  and runs no timer.
+  it back at its measured offset in one move, clamped at the ends. That move
+  is not scrolling either: the anchor stays with the same reply, so each
+  later layout change is kept the same way. It acts only under the thread's
+  latest publication, its security generation and no protected surface.
+  Refused, the place moves with the layout and is taken again. It reacts to
+  layouts only, so it never fights the person's scrolling and runs no timer.
 - New messages below never move the reader. The conversation does not follow
   new messages to the bottom; it never did.
 - A thread reader looking at the root, above every reply, has no anchor: the
