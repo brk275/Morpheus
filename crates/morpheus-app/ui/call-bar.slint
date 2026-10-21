@@ -177,7 +177,7 @@ component CaptureChip inherits Rectangle {
     border-width: root.live ? StyleTokens.line-width * 2 : StyleTokens.line-width;
     border-color: root.live ? root.palette.accent
         : StyleTokens.high-contrast ? root.palette.ink : root.palette.divider;
-    accessible-role: text;
+    accessible-role: AccessibleRole.text;
     accessible-label: root.text;
     HorizontalLayout {
         padding-left: 7px;
