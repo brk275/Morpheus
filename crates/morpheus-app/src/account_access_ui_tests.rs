@@ -7559,6 +7559,8 @@ async fn assert_vector_icons(ui: &AppWindow) {
     if was_muted {
         click_control_once(ui, "Unmute microphone preview");
         settle(ui).await;
+        key(ui, Key::Tab);
+        settle(ui).await;
     }
     let (_, unmuted) = drawn_icon(ui, "Mute microphone preview");
     click_control_once(ui, "Mute microphone preview");
@@ -7575,8 +7577,14 @@ async fn assert_vector_icons(ui: &AppWindow) {
     assert!(back.texts.is_empty(), "no legacy R caption");
     // Both preview controls draw in the window's ink.
     assert_eq!(muted.strokes[0], back.strokes[0]);
+    // IconAction keeps focus while its label toggles. Move focus before
+    // another first-click check; Tab does not activate a preview control.
+    key(ui, Key::Tab);
+    settle(ui).await;
     click_control_once(ui, "Unmute microphone preview");
     if was_muted {
+        settle(ui).await;
+        key(ui, Key::Tab);
         settle(ui).await;
         click_control_once(ui, "Mute microphone preview");
     }
