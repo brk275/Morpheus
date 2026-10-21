@@ -5914,7 +5914,6 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
 }
 
 /// Whether any instantiated item's accessible label contains `needle`.
-#[cfg(feature = "native-calls")]
 fn any_label_contains(ui: &AppWindow, needle: &str) -> bool {
     use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
     use std::ops::ControlFlow;
@@ -13164,12 +13163,21 @@ async fn assert_member_row_actions_fit(ui: &AppWindow) {
     settle(ui).await;
 }
 
-/// The SAS comparison values leave the real generated window the moment the
-/// verification view closes (leaving Settings) or protection starts (a
-/// security step, account access, a pending switch, sign-in), whatever the
-/// controller does later. Synthetic values only; no account is used.
+/// The actual navigation and protection entry retire the SAS comparison
+/// synchronously, including leave-and-return within one event batch. Direct
+/// property setters exercise the separate, deferred Slint fallback: displayed
+/// labels are masked at once and retained values clear when the handler runs.
+/// Synthetic values only; no Matrix account or verification request is used.
 async fn assert_sas_values_leave_on_close_and_protection(ui: &AppWindow) {
     let saved = (ui.get_page(), ui.get_live_session(), ui.get_show_sign_in());
+    // Exercise the same retirement body registered at application startup,
+    // without registering network-facing timers or any verification action.
+    let weak = ui.as_weak();
+    ui.on_verification_protected(move || {
+        if let Some(window) = weak.upgrade() {
+            crate::verification::hide_sensitive(&window);
+        }
+    });
     let protections: [(&str, fn(&AppWindow, bool)); 4] = [
         ("security step", |ui, on| ui.set_security_busy(on)),
         ("account access", |ui, on| ui.set_access_open(on)),
@@ -13179,15 +13187,41 @@ async fn assert_sas_values_leave_on_close_and_protection(ui: &AppWindow) {
     let show_values = |ui: &AppWindow| {
         ui.set_sas_stage(4);
         ui.set_sas_emoji("synthetic emoji".into());
-        ui.set_sas_decimals("1111 \u{b7} 2222 \u{b7} 3333".into());
+        ui.set_sas_decimals("1111 · 2222 · 3333".into());
         ui.set_sas_compared(true);
+    };
+    let cleared = |ui: &AppWindow| {
+        assert_eq!(ui.get_sas_emoji(), "");
+        assert_eq!(ui.get_sas_decimals(), "");
+        assert!(!ui.get_sas_compared());
+    };
+    let labels_present = |ui: &AppWindow| {
+        assert!(any_label_contains(
+            ui,
+            "SAS emoji comparison: synthetic emoji"
+        ));
+        assert!(any_label_contains(
+            ui,
+            "SAS number comparison: 1111 · 2222 · 3333"
+        ));
+    };
+    let labels_masked = |ui: &AppWindow| {
+        assert!(!any_label_contains(
+            ui,
+            "SAS emoji comparison: synthetic emoji"
+        ));
+        assert!(!any_label_contains(
+            ui,
+            "SAS number comparison: 1111 · 2222 · 3333"
+        ));
     };
     ui.set_live_session(true);
     ui.set_show_sign_in(false);
-    ui.set_page(1);
+    ui.invoke_navigate_page(1);
     settle(ui).await;
     show_values(ui);
-    ui.set_page(0);
+    let operation = ui.get_sas_operation();
+    ui.invoke_navigate_page(0);
     assert_eq!(ui.get_sas_emoji(), "", "leaving Settings clears the emoji");
     assert_eq!(
         ui.get_sas_decimals(),
@@ -13195,22 +13229,64 @@ async fn assert_sas_values_leave_on_close_and_protection(ui: &AppWindow) {
         "leaving Settings clears the numbers"
     );
     assert!(!ui.get_sas_compared());
-    ui.set_page(1);
+    assert_ne!(ui.get_sas_operation(), operation, "the old view retires");
+    // Returning before any deferred changed handler runs cannot revive it.
+    ui.invoke_navigate_page(1);
+    cleared(ui);
+    assert_eq!(ui.get_sas_stage(), 3, "returning requires fresh SAS values");
+    settle(ui).await;
+    cleared(ui);
+
+    // A direct property write has no synchronous changed-handler promise.
+    // Its display guard masks old material even before handler settlement.
+    show_values(ui);
+    settle(ui).await;
+    labels_present(ui);
+    ui.set_page(0);
+    labels_masked(ui);
+    settle(ui).await;
+    cleared(ui);
+    ui.invoke_navigate_page(1);
+    cleared(ui);
     for (name, protect) in protections {
         show_values(ui);
         assert!(!ui.get_sas_protected(), "{name}: not protected before");
+        let operation = ui.get_sas_operation();
+        // This is the shared entry called by admitted account/security
+        // surfaces before they set their flag, not their deferred fallback.
+        ui.invoke_withdraw_verification();
         protect(ui, true);
         assert!(ui.get_sas_protected(), "{name}: protected");
         assert_eq!(ui.get_sas_emoji(), "", "{name} clears the emoji");
         assert_eq!(ui.get_sas_decimals(), "", "{name} clears the numbers");
         assert!(!ui.get_sas_compared(), "{name} clears the comparison");
+        assert_ne!(ui.get_sas_operation(), operation, "{name}: view retires");
         protect(ui, false);
+        cleared(ui);
+        settle(ui).await;
+        cleared(ui);
+
+        // Also retain coverage of an out-of-band flag setter. Presentation
+        // refuses its values immediately; the fallback then clears storage.
+        show_values(ui);
+        settle(ui).await;
+        labels_present(ui);
+        protect(ui, true);
+        assert!(ui.get_sas_protected(), "{name}: fallback protected");
+        labels_masked(ui);
+        settle(ui).await;
+        cleared(ui);
+        protect(ui, false);
+        settle(ui).await;
+        cleared(ui);
     }
     ui.set_sas_stage(0);
-    ui.set_page(saved.0);
+    ui.invoke_navigate_page(saved.0);
     ui.set_live_session(saved.1);
     ui.set_show_sign_in(saved.2);
     settle(ui).await;
+    // This fixture had no verification callback before this local binding.
+    ui.on_verification_protected(|| {});
 }
 
 /// Actual generated join controls and the production withdrawal handlers,

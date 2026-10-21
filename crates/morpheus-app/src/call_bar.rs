@@ -620,7 +620,7 @@ pub(crate) fn register(
             crate::matrix_links::clear(&ui);
             crate::identity_warnings::withdraw(&ui);
             ui.set_call_stage_focus_pending(true);
-            ui.set_page(2);
+            ui.invoke_navigate_page(2);
         }
     });
     let weak = ui.as_weak();

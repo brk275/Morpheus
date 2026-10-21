@@ -410,7 +410,7 @@ fn reset_capture_overlays(ui: &AppWindow) {
     ui.set_incoming_call_offers(slint::ModelRc::new(slint::VecModel::from(Vec::<
         super::IncomingCallItem,
     >::new())));
-    ui.set_page(0);
+    ui.invoke_navigate_page(0);
 }
 
 fn save_snapshot(ui: &AppWindow, path: &Path) -> Result<(), Box<dyn std::error::Error>> {

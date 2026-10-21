@@ -197,6 +197,7 @@ impl AccountAccessUi {
             crate::matrix_links::clear(&ui);
             crate::thread_browser::withdraw(&ui);
             crate::withdraw_call_bar(&ui);
+            ui.invoke_withdraw_verification();
             clear_passwords(&ui);
             ui.set_access_mode(mode);
             ui.set_access_target(label.into());
@@ -214,6 +215,7 @@ impl AccountAccessUi {
         if let Some(ui) = self.ui.upgrade() {
             if self.switch_generation.load(Ordering::Acquire) == generation {
                 if pending {
+                    ui.invoke_withdraw_verification();
                     crate::room_addresses::clear(&ui);
                     crate::matrix_links::clear(&ui);
                     crate::thread_browser::withdraw(&ui);
@@ -227,6 +229,7 @@ impl AccountAccessUi {
                 // A completed request must not re-enable a newer switch.
                 if access.switch_generation.load(Ordering::Acquire) == generation {
                     if pending {
+                        ui.invoke_withdraw_verification();
                         crate::room_addresses::clear(&ui);
                         crate::matrix_links::clear(&ui);
                         crate::thread_browser::withdraw(&ui);

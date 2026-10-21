@@ -4109,16 +4109,26 @@ export component AppWindow inherits Window {
     // its ID coming back: no new one until the person acknowledges that.
     in-out property <bool> sas-request-uncertain: false;
     property <length> sas-inbox-row-h: max(44px, 30px * root.text-scale + 14px);
+    // Native navigation and protection entries call this before changing
+    // their visible state. A changed handler is only a deferred fallback;
+    // a leave-and-return in one event batch must still retire the old view.
+    public function withdraw-verification() {
+        root.sas-compared = false;
+        root.sas-emoji = "";
+        root.sas-decimals = "";
+        root.verification-protected();
+    }
+    public function navigate-page(next: int) {
+        if next != 1 { root.withdraw-verification(); }
+        root.page = next;
+    }
     // While any of these holds, no SAS value stays in the window.
     out property <bool> sas-protected: RoomLeave.view.open || RoomAddresses.open || root.security-busy || root.access-open
         || root.account-switch-pending || root.show-sign-in || !root.live-session
         || root.security-recovery-key != "";
     changed sas-protected => {
         if root.sas-protected {
-            root.sas-emoji = "";
-            root.sas-decimals = "";
-            root.sas-compared = false;
-            root.verification-protected();
+            root.withdraw-verification();
         }
     }
     // Settings › Security & recovery › Devices: device-sessions.slint, owned
@@ -4617,7 +4627,7 @@ export component AppWindow inherits Window {
     }
     // Presentation only: show the thread tab of the side panel.
     public function show-thread-panel() {
-        root.page = 0;
+        root.navigate-page(0);
         root.show-side-panel = true;
         root.details-reveal-open = true;
         root.side-panel-tab = 1;
@@ -4625,14 +4635,14 @@ export component AppWindow inherits Window {
     // Presentation only: show the pinned-messages tab of the side panel.
     public function show-pinned-panel() {
         if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
-        root.page = 0;
+        root.navigate-page(0);
         root.show-side-panel = true;
         root.details-reveal-open = true;
         root.side-panel-tab = 3;
     }
     callback focus-room-search();
     focus-room-search => {
-        root.page = 0;
+        root.navigate-page(0);
         root.show-side-panel = true;
         root.details-reveal-open = true;
         root.side-panel-tab = 2;
@@ -4643,11 +4653,11 @@ export component AppWindow inherits Window {
         root.active-space-id = "";
         root.active-space-name = "Home";
         root.select-space("");
-        root.page = 0;
+        root.navigate-page(0);
     }
     // Presentation only, like show-thread-panel.
     public function show-members-panel() {
-        root.page = 0;
+        root.navigate-page(0);
         root.show-side-panel = true;
         root.details-reveal-open = true;
         root.side-panel-tab = 0;
@@ -4657,7 +4667,7 @@ export component AppWindow inherits Window {
     public function show-transfer-panel() {
         root.transfer-focus-request += 1;
         root.transfer-focus-pending = true;
-        root.page = 0;
+        root.navigate-page(0);
         root.show-side-panel = true;
         root.details-reveal-open = true;
         root.side-panel-tab = 4;
@@ -4674,7 +4684,7 @@ export component AppWindow inherits Window {
         } else {
             RoomMedia.focus-request += 1;
         }
-        root.page = 0;
+        root.navigate-page(0);
         root.show-side-panel = true;
         root.details-reveal-open = true;
         root.side-panel-tab = 5;
@@ -4703,7 +4713,7 @@ export component AppWindow inherits Window {
         root.settings-search-focus-pending = true;
         MatrixLink.withdraw(); UnreadNavigation.withdraw-jump();
         IdentityWarnings.withdraw(); ThreadBrowser.withdraw();
-        root.page = 1;
+        root.navigate-page(1);
         // Searching again returns to the last results instead of hiding them.
         if root.settings-search-query != "" { root.settings-search-dismissed = false; }
         root.settings-search-focus-request += 1;
@@ -5025,7 +5035,7 @@ export component AppWindow inherits Window {
         } else if slot == 5 {
             root.show-transfer-panel();
         } else if slot == 6 {
-            if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 2;
+            if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.navigate-page(2);
         } else if slot == 7 {
             root.set-side-panel(!root.show-side-panel);
         } else if slot == 8 {
@@ -5343,10 +5353,7 @@ export component AppWindow inherits Window {
             if root.shortcut-recording != "" { root.shortcut-cancel-recording(); }
             root.security-recovery-input = "";
             // Leaving Settings closes the verification view: its values go now.
-            root.sas-compared = false;
-            root.sas-emoji = "";
-            root.sas-decimals = "";
-            root.verification-protected();
+            root.withdraw-verification();
             root.device-sessions-left();
             root.notification-highlight-error = "";
         }
@@ -5967,7 +5974,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 0 && root.active-space-id == "";
-                    activated => { root.active-space-id = ""; root.active-space-name = "Home"; root.select-space(""); root.page = 0; }
+                    activated => { root.active-space-id = ""; root.active-space-name = "Home"; root.select-space(""); root.navigate-page(0); }
                 }
                 ScrollView {
                     vertical-stretch: 1;
@@ -5990,7 +5997,7 @@ export component AppWindow inherits Window {
                                 root.active-space-id = space.id;
                                 root.active-space-name = space.name;
                                 root.select-space(space.id);
-                                root.page = 0;
+                                root.navigate-page(0);
                             }
                             AvatarBadge {
                                 x: (parent.width - 38px) / 2;
@@ -6020,7 +6027,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 3;
-                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 3; root.open-discovery(); }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.navigate-page(3); root.open-discovery(); }
                 }
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
@@ -6032,7 +6039,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 2;
-                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.navigate-page(2); }
                 }
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
@@ -6044,7 +6051,7 @@ export component AppWindow inherits Window {
                     surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 1;
-                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+                    activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.navigate-page(1); root.open-security(); }
                 }
             }
         }
@@ -6157,10 +6164,10 @@ export component AppWindow inherits Window {
                                 focus-state-changed(focused) => { root.navigation-focus-changed(1, "route:" + index, focused); }
                                 activated => {
                                     if RoomLeave.view.open { return; }
-                                    if index == 0 { root.active-space-id = ""; root.active-space-name = "Home"; root.select-space(""); root.page = 0; }
-                                    else if index == 1 { MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 3; root.open-discovery(); }
-                                    else if index == 2 { MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 2; }
-                                    else { MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+                                    if index == 0 { root.active-space-id = ""; root.active-space-name = "Home"; root.select-space(""); root.navigate-page(0); }
+                                    else if index == 1 { MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.navigate-page(3); root.open-discovery(); }
+                                    else if index == 2 { MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.navigate-page(2); }
+                                    else { MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.navigate-page(1); root.open-security(); }
                                 }
                             }
                             if root.spaces.length > 0 : Text {
@@ -6175,7 +6182,7 @@ export component AppWindow inherits Window {
                                 focus-state-changed(focused) => { root.navigation-focus-changed(1, "space:" + space.id, focused); }
                                 activated => {
                                     root.active-space-id = space.id; root.active-space-name = space.name;
-                                    root.select-space(space.id); root.page = 0;
+                                    root.select-space(space.id); root.navigate-page(0);
                                 }
                             }
                             Rectangle { height: 1px; vertical-stretch: 0; background: root.divider; }
@@ -6298,7 +6305,7 @@ export component AppWindow inherits Window {
                                 mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
                                 open(id, voice) => {
                                     if voice && root.live-session { root.open-voice-space(id); }
-                                    else { root.page = 0; root.open-room(id); }
+                                    else { root.navigate-page(0); root.open-room(id); }
                                 }
                             }
                         }
@@ -6320,7 +6327,7 @@ export component AppWindow inherits Window {
                                     mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
                                     open(id, voice) => {
                                         if voice && root.live-session { root.open-voice-space(id); }
-                                        else { root.page = 0; root.open-room(id); }
+                                        else { root.navigate-page(0); root.open-room(id); }
                                     }
                                 }
                             }
@@ -6337,7 +6344,7 @@ export component AppWindow inherits Window {
                                 mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
                                 open(id, voice) => {
                                     if voice && root.live-session { root.open-voice-space(id); }
-                                    else { root.page = 0; root.open-room(id); }
+                                    else { root.navigate-page(0); root.open-room(id); }
                                 }
                             }
                             if !root.direct-messages-first : Text {
@@ -6355,7 +6362,7 @@ export component AppWindow inherits Window {
                                     mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
                                     open(id, voice) => {
                                         if voice && root.live-session { root.open-voice-space(id); }
-                                        else { root.page = 0; root.open-room(id); }
+                                        else { root.navigate-page(0); root.open-room(id); }
                                     }
                                 }
                             }
@@ -6371,7 +6378,7 @@ export component AppWindow inherits Window {
                                 mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
                                 open(id, voice) => {
                                     if voice && root.live-session { root.open-voice-space(id); }
-                                    else { root.page = 0; root.open-room(id); }
+                                    else { root.navigate-page(0); root.open-room(id); }
                                 }
                             }
                         }
@@ -6392,7 +6399,7 @@ export component AppWindow inherits Window {
                                 mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
                                 open(id, voice) => {
                                     if voice && root.live-session { root.open-voice-space(id); }
-                                    else { root.page = 0; root.open-room(id); }
+                                    else { root.navigate-page(0); root.open-room(id); }
                                 }
                             }
                         }
@@ -10482,24 +10489,24 @@ export component AppWindow inherits Window {
                                             : "Your confirmation was sent. Waiting for the other device to finish.";
                                         color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
                                     }
-                                    if root.sas-stage == 4 && root.sas-emoji != "" : Text {
-                                        text: root.sas-emoji; color: root.ink; font-size: 14px * root.text-scale;
-                                        wrap: word-wrap; accessible-label: "SAS emoji comparison: " + root.sas-emoji;
+                                    if root.sas-stage == 4 && !root.sas-protected && root.sas-emoji != "" : Text {
+                                        text: root.page == 1 && !root.sas-protected ? root.sas-emoji : ""; color: root.ink; font-size: 14px * root.text-scale;
+                                        wrap: word-wrap; accessible-label: root.page == 1 && !root.sas-protected ? "SAS emoji comparison: " + root.sas-emoji : "";
                                     }
-                                    if root.sas-stage == 4 && root.sas-decimals != "" : Text {
-                                        text: "Numbers: " + root.sas-decimals; color: root.ink;
+                                    if root.sas-stage == 4 && !root.sas-protected && root.sas-decimals != "" : Text {
+                                        text: root.page == 1 && !root.sas-protected ? "Numbers: " + root.sas-decimals : ""; color: root.ink;
                                         font-family: root.monospace-font-family; font-size: 14px * root.text-scale;
-                                        accessible-label: "SAS number comparison: " + root.sas-decimals;
+                                        accessible-label: root.page == 1 && !root.sas-protected ? "SAS number comparison: " + root.sas-decimals : "";
                                     }
-                                    if root.sas-stage == 4 : ActionRect {
+                                    if root.sas-stage == 4 && !root.sas-protected : ActionRect {
                                         height: 38px; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
                                         background: root.sas-compared ? root.hover : root.panel;
                                         border-color: root.sas-compared ? root.accent : root.divider;
                                         border-width: StyleTokens.line-width; focus-color: root.accent;
                                         label: "I compared these values on both devices and they match exactly";
-                                        accessible-checkable: true; accessible-checked: root.sas-compared;
-                                        enabled: !root.sas-busy;
-                                        activated => { root.sas-compared = !root.sas-compared; }
+                                        accessible-checkable: true; accessible-checked: root.page == 1 && !root.sas-protected && root.sas-compared;
+                                        enabled: root.page == 1 && !root.sas-busy && !root.sas-protected;
+                                        activated => { if root.page == 1 && !root.sas-protected { root.sas-compared = !root.sas-compared; } }
                                         Text {
                                             x: 10px; width: parent.width - 20px; height: parent.height;
                                             text: (root.sas-compared ? "✓ " : "○ ") + "I compared both devices; the values match";
@@ -10524,7 +10531,7 @@ export component AppWindow inherits Window {
                                         }
                                         if root.sas-stage == 4 : Button {
                                             text: root.sas-busy ? "Confirming…" : "Confirm match";
-                                            primary: true; enabled: root.sas-compared && !root.sas-busy;
+                                            primary: true; enabled: root.page == 1 && root.sas-compared && !root.sas-busy && !root.sas-protected;
                                             accessible-label: "Confirm that SAS values match on both devices";
                                             clicked => { root.confirm-sas-verification(); }
                                         }
@@ -11226,7 +11233,7 @@ export component AppWindow inherits Window {
                                     Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.room-call-mode == 2 ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? (StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b) : root.accent-ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                             }
-                            IconAction { width: 40px; height: 43px; icon: "chat"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
+                            IconAction { width: 40px; height: 43px; icon: "chat"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.navigate-page(0); } }
                         }
                     }
                 }
@@ -12409,7 +12416,7 @@ export component AppWindow inherits Window {
                         label: "Open settings from account controls";
                         ink: root.ink; muted: root.muted; surface: root.window-sidebar;
                         hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                        activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+                        activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.navigate-page(1); root.open-security(); }
                     }
                     if root.layout-customized : TextAction {
                         text: "Restore";
@@ -12470,7 +12477,7 @@ export component AppWindow inherits Window {
             icon: "⚙";
             label: "Open settings";
             ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
-            activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.page = 1; root.open-security(); }
+            activated => { if RoomLeave.view.open { return; } MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.navigate-page(1); root.open-security(); }
         }
 
         // Drawn after every pane so it opens upward over them.

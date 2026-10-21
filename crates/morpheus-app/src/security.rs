@@ -434,13 +434,13 @@ pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool 
     }
     if gate.0.load(Ordering::Acquire) == SECURITY_RESTART_PENDING {
         crate::thread_browser::withdraw(ui);
-        ui.set_page(1);
+        ui.invoke_navigate_page(1);
         ui.set_security_error("Wait for the application restart before changing accounts.".into());
         return true;
     }
     if gate.0.load(Ordering::Acquire) == SECURITY_BUSY {
         crate::thread_browser::withdraw(ui);
-        ui.set_page(1);
+        ui.invoke_navigate_page(1);
         ui.set_security_error(
             "Wait for the security operation to finish before changing accounts.".into(),
         );
@@ -448,7 +448,7 @@ pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool 
     }
     if gate.0.load(Ordering::Acquire) == SECURITY_KEY_PENDING {
         crate::thread_browser::withdraw(ui);
-        ui.set_page(1);
+        ui.invoke_navigate_page(1);
         ui.set_security_error(
             "Save and acknowledge the new recovery key before changing accounts.".into(),
         );
@@ -482,7 +482,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 );
             } else if close_gate.0.load(Ordering::Acquire) == SECURITY_BUSY {
                 crate::thread_browser::withdraw(&window);
-                window.set_page(1);
+                window.invoke_navigate_page(1);
                 window.set_security_error(
                     "Recovery is still running. Keep Morpheus open until it finishes.".into(),
                 );
@@ -580,6 +580,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         // The reservation's generation: setup starts only while it holds.
         let generation = enable_gate.ringing_generation();
         let operation = next_operation(&window);
+        window.invoke_withdraw_verification();
         crate::withdraw_call_bar(&window);
         window.set_security_busy(true);
         set_outcome(&window, "", false);
@@ -703,6 +704,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         }
         let generation = recover_gate.ringing_generation();
         let operation = next_operation(&window);
+        window.invoke_withdraw_verification();
         crate::withdraw_call_bar(&window);
         window.set_security_busy(true);
         set_outcome(&window, "", false);

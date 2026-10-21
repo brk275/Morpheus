@@ -476,7 +476,7 @@ fn run(ui: &AppWindow, action: ShortcutAction) -> bool {
             else {
                 return false;
             };
-            ui.set_page(0);
+            ui.invoke_navigate_page(0);
             ui.invoke_open_room(room);
         }
         // Always the conversation view: cycling never joins a voice space.
@@ -486,7 +486,7 @@ fn run(ui: &AppWindow, action: ShortcutAction) -> bool {
             else {
                 return false;
             };
-            ui.set_page(0);
+            ui.invoke_navigate_page(0);
             ui.invoke_open_room(room);
         }
         ShortcutAction::GoHome => ui.invoke_go_home(),
@@ -494,7 +494,7 @@ fn run(ui: &AppWindow, action: ShortcutAction) -> bool {
         ShortcutAction::OpenSettings => {
             crate::matrix_links::clear(ui);
             crate::thread_browser::withdraw(ui);
-            ui.set_page(1);
+            ui.invoke_navigate_page(1);
             ui.invoke_open_security();
         }
         ShortcutAction::SearchSettings => {
@@ -601,7 +601,7 @@ pub fn register(ui: &AppWindow, store: ConfigStore) {
             return;
         }
         ui.invoke_close_quick_switcher();
-        ui.set_page(0);
+        ui.invoke_navigate_page(0);
         ui.invoke_open_room(room.id);
     });
 

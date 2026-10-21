@@ -1053,7 +1053,7 @@ fn open(ui: &AppWindow, live: &LiveUi, room_id: &str) {
         return;
     };
     clear(ui);
-    ui.set_page(0);
+    ui.invoke_navigate_page(0);
     if is_space {
         ui.set_active_space_id(room_id.as_str().into());
         ui.set_active_space_name(name.into());

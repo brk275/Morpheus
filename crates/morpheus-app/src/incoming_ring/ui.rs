@@ -314,7 +314,7 @@ fn show_answered_call(
         ui.set_incoming_call_notice("".into());
         crate::matrix_links::clear(ui);
         crate::thread_browser::withdraw(ui);
-        ui.set_page(2);
+        ui.invoke_navigate_page(2);
     } else {
         ui.set_incoming_call_notice("The call is no longer active.".into());
     }

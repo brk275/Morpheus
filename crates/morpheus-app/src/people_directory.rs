@@ -488,7 +488,7 @@ fn open_known(ui: &AppWindow) {
         return;
     };
     clear_presentation(ui);
-    ui.set_page(0);
+    ui.invoke_navigate_page(0);
     ui.invoke_open_conversation(
         account.into(),
         room.into(),
@@ -556,7 +556,7 @@ fn confirm_start(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
                 Ok(created) if created.synced && created.direct_listing.is_ok() => {
                     let account = SharedString::from(scope.account.as_str());
                     clear_presentation(&ui);
-                    ui.set_page(0);
+                    ui.invoke_navigate_page(0);
                     ui.invoke_open_conversation(
                         account,
                         created.room_id.as_str().into(),

@@ -2745,7 +2745,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window.invoke_open_room(room_id);
             matrix_links::clear(&window);
             thread_browser::withdraw(&window);
-            window.set_page(2);
+            window.invoke_navigate_page(2);
             return;
         }
         let account_id = window.get_active_account_local_id().to_string();
@@ -2785,7 +2785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         matrix_links::clear(&window);
                         thread_browser::withdraw(&window);
-                        window.set_page(2);
+                        window.invoke_navigate_page(2);
                         #[cfg(feature = "native-calls")]
                         if !calls.status().blocks_account_switch() {
                             // Joining publishes membership in the room slot;
@@ -3258,7 +3258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(()) => {
                             window.set_directory_join_input("".into());
                             if window.get_page() == 3 {
-                                window.set_page(0);
+                                window.invoke_navigate_page(0);
                             }
                         }
                         Err(error) => window.set_directory_join_error(error.into()),
@@ -3354,7 +3354,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(()) => {
                         window.set_room_actions_open(false);
                         window.set_room_action_input("".into());
-                        window.set_page(0);
+                        window.invoke_navigate_page(0);
                     }
                     Err(error) => window.set_room_action_error(error.into()),
                 }
@@ -3929,6 +3929,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             matrix_links::clear(&ui);
             thread_browser::withdraw(&ui);
             withdraw_call_bar(&ui);
+            ui.invoke_withdraw_verification();
             ui.set_login_error("".into());
             ui.set_show_sign_in(true);
         }
