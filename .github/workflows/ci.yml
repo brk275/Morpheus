@@ -1,438 +1,779 @@
-name: CI
-
+# TEMPORARY affected helper checks only. NEVER MERGE this workflow.
+# Source-only proposal; independent workflow review and execution admission are separate.
+name: Owner reviewed AppImage capture selector helpers
+run-name: Reviewed AppImage capture selector helpers
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
-
+    inputs:
+      platform:
+        description: Existing affected helpers on standard Linux only
+        type: choice
+        required: true
+        default: linux
+        options: [linux]
+      checks:
+        description: Whole existing AppImage capture helper module; 18 exact cases
+        type: choice
+        required: true
+        default: appimage-selector-helper-linux
+        options: [appimage-selector-helper-linux]
 permissions:
   contents: read
-
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_BUILD_JOBS: "2"
-  CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
-
+  group: beta-appimage-selector-helpers-630689c-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  scope:
-    name: Security and change scope
-    # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false
+  security:
+    name: Reviewed candidate history
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    outputs:
-      native: ${{ steps.scope.outputs.native }}
-      native_matrix: ${{ steps.scope.outputs.native_matrix }}
-      config: ${{ steps.scope.outputs.config }}
-      wayland: ${{ steps.scope.outputs.wayland }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        env:
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
         with:
+          ref: 630689c697d60eaffac9de24c8d2ce34a9ea2bd7
           path: candidate
           fetch-depth: 0
           persist-credentials: false
-      - name: Check out reviewed validation inputs
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # PR input is read as data; classification code comes from its base.
-          # Push uses reviewed main; dispatch uses its owner-selected revision.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          ref: f9efc8ea119468dd4e464dc65959d1ae5ce8192f
           path: trusted
           persist-credentials: false
-      - name: Scan committed history for credentials
-        working-directory: candidate
+      - name: Scan reviewed source with fixed independent rules and fixture provenance
         shell: bash
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
+          test "$(git -C candidate rev-parse HEAD)" = 630689c697d60eaffac9de24c8d2ce34a9ea2bd7
+          archive="$RUNNER_TEMP/gitleaks-linux.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --max-filesize 33554432 --max-time 180 \
             https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
             --output "$archive"
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          # Scanner code and exact fixture manifest come from the reviewed base.
-          # The candidate's ignore files, attributes and config are not trusted.
-          python3 -I ../trusted/scripts/scan_history.py \
-            --candidate "$PWD" --scanner "$RUNNER_TEMP/gitleaks/gitleaks" \
-            --manifest ../trusted/scripts/public-fixtures.json \
-            --evidence "$RUNNER_TEMP/morpheus-history-scan"
-      - name: Select checks from changed inputs using reviewed classifier
-        id: scope
-        working-directory: candidate
-        # Isolated mode excludes the candidate working directory and Python
-        # environment hooks from import lookup. The classifier uses stdlib only.
-        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
-
+          mkdir "$RUNNER_TEMP/history-scanner"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/history-scanner" gitleaks
+          python3 -I trusted/scripts/scan_history.py --candidate candidate \
+            --scanner "$RUNNER_TEMP/history-scanner/gitleaks" \
+            --manifest trusted/scripts/public-fixtures.json \
+            --evidence "$RUNNER_TEMP/reviewed-candidate-history"
   helpers:
-    name: Validation helper tests
-    needs: scope
-    if: github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Verify checkout identity before host provisioning
-        shell: bash
-        env:
-          REVIEWED_SOURCE: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          [[ "$REVIEWED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"
-      - name: Tighten hosted notice tree permissions before candidate imports
-        timeout-minutes: 5
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          # Bootstrap from this immutable reviewed workflow revision, including
-          # when the selected package source predates the provisioning helper.
-          git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |
-            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS /usr/bin/python3 -I -B -
-      - name: Check scope and packaging helpers
-        run: |
-          python3 -m unittest discover -s scripts/tests -v
-          python3 -m unittest discover -s scripts -p 'test_*.py' -v
-          python3 -m compileall -q scripts
-          node --check scripts/element_call_peer.mjs
-          node --check scripts/element_call_stock_peer.mjs
-          python3 scripts/package.py --check
-
-  config:
-    name: Theme configuration tests
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.config == 'true'
-    runs-on: ubuntu-24.04
-    concurrency:
-      group: native-${{ github.sha }}-ubuntu-24.04
-      cancel-in-progress: false
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
-        with:
-          toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: cargo test --locked -p morpheus-config
-
-  compile:
-    name: Check and test (${{ matrix.os }})
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
-    runs-on: ${{ matrix.os }}
-    concurrency:
-      group: native-${{ github.sha }}-${{ matrix.os }}
-      cancel-in-progress: false
-    timeout-minutes: 90
+    needs: security
+    name: Helpers ${{ matrix.name }}
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && inputs.platform == 'linux' && inputs.checks == 'appimage-selector-helper-linux'
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
+      matrix: {include: [{name: 'Linux x64', runner: ubuntu-24.04, os: Linux, arch: X64}]}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      MORPHEUS_EXPECTED_OS: ${{ matrix.os }}
+      MORPHEUS_EXPECTED_ARCH: ${{ matrix.arch }}
+      MORPHEUS_CHECK_SCOPE: ${{ inputs.checks }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        env:
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
         with:
+          ref: 630689c697d60eaffac9de24c8d2ce34a9ea2bd7
+          path: candidate
+          fetch-depth: 0
           persist-credentials: false
-      - name: Linux native dependencies
-        if: runner.os == 'Linux'
+      - name: Verify source and prepare independent private-log scanner
+        timeout-minutes: 10
+        shell: python -I {0}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
-            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev libudev-dev \
-            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xdotool \
-            dbus-x11 gnome-keyring libsecret-tools libglib2.0-bin \
-            sway swaybg pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
-          # Ubuntu 24.04 Chromium dependencies from pinned Playwright 1.62.1.
-          # Install before the peer drops privileges inside its PID namespace.
-          sudo apt-get install -y \
-            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
-            libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
-            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
-            libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
-            fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
-            xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic \
-            fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
-        with:
-          toolchain: 1.99.0
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          # Preserve compiled dependencies when a later acceptance check fails.
-          # The save guard still makes untrusted/PR executions restore-only.
-          # Older SDK extractions lack the verified downloader's receipt.
-          # The key separates both primary and fallback cache namespaces.
-          key: verified-sdk-archives-v1
-          cache-on-failure: true
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - name: Check formatting
-        if: runner.os == 'Linux'
-        run: cargo fmt --all -- --check
-      - name: Check native interface compilation before desktop dependencies
-        run: cargo check --locked -p morpheus-ui-check
-      - name: Test configuration, Matrix, and RTC protocol models
-        id: model-tests
-        # Still fail the job below, but collect independent desktop/device
-        # results on this candidate instead of paying the compilation cost
-        # again merely because an authentication fixture failed first.
-        continue-on-error: true
-        run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
-      - name: Check desktop and Matrix crates
-        run: cargo check --locked -p morpheus-app -p morpheus-matrix
-      - name: Build desktop with native call and device adapters
-        run: cargo build --locked -p morpheus-app --features native-calls
-      - name: Capture actual native preview screens
-        id: preview-capture
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
-        continue-on-error: true
-        timeout-minutes: 2
-        env:
-          SLINT_SCALE_FACTOR: "1"
-          SLINT_BACKEND: winit-software
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          preview_root="$RUNNER_TEMP/morpheus-preview-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir "$preview_root"
-          # This debug-only early CLI renders fictional fixtures before any
-          # account/config store or network service initialization. Native
-          # logs and raw frames stay private and are never uploaded.
-          # Reviewed PRs capture their tested merge tree before integration;
-          # their PNGs remain untrusted until visual/privacy review.
-          if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1440x900x24' \
-            sh -c 'xdotool mousemove 1 1 && exec "$@"' sh \
-            target/debug/morpheus-app --morpheus-capture-preview "$preview_root/raw" \
-            >"$preview_root/native.log" 2>&1; then
-            echo "Native preview capture failed; private output was not published."
-            exit 1
-          fi
-          python3 scripts/encode_preview_pngs.py \
-            --input-dir "$preview_root/raw" --output-dir "$preview_root/png" \
-            --source-commit "$GITHUB_SHA" --binary target/debug/morpheus-app \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
-      - name: Upload native preview PNGs and provenance only
-        id: preview-upload
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && steps.preview-capture.outcome == 'success'
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: native-preview-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/desktop-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-switcher.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/incoming-call.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/room-settings.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/paper-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/manage-accounts.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-sidebar.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-space-labels.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery-thread-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-          include-hidden-files: false
-      - name: Smoke test Linux desktop startup under Xvfb
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set +e
-          timeout 12s xvfb-run -a -s '-screen 0 1280x800x24' target/debug/morpheus-app
-          result=$?
-          if [ "$result" -ne 124 ]; then
-            echo "Morpheus exited before the Linux desktop smoke window (status $result)"
-            exit 1
-          fi
-      - name: Test desktop controller and call guards
-        id: desktop-tests
-        # ElementHandle queries need compiler-generated element metadata even
-        # when Rust debug symbols are disabled for the hosted test build.
-        env:
-          SLINT_EMIT_DEBUG_INFO: "1"
-        # The independently built app can still exercise disposable fixtures
-        # after a unit assertion fails. Keep that evidence and reject the
-        # candidate at the final gate instead of rebuilding just to reach it.
-        continue-on-error: true
-        run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
-      - name: Test native device and call guards
-        run: cargo test --locked -p morpheus-rtc --features native-devices --lib
-      - name: Test Windows capture of an owned synthetic window and display
-        id: windows-capture-tests
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        timeout-minutes: 15
-        env:
-          MORPHEUS_WINDOWS_CAPTURE_ACCEPTANCE: "1"
-        run: python scripts/run_windows_capture_acceptance.py
-      - name: Test real Wayland portal streaming, source loss, and cancellation
-        id: wayland-tests
-        # Missing/malformed selection is fail-closed; the result gate below
-        # rejects it even if the fixture happens to pass.
-        if: runner.os == 'Linux' && needs.scope.outputs.wayland != 'false'
-        # Collect independent Matrix/OAuth/RTC evidence even if this desktop
-        # fixture fails. The final outcome gate still rejects the candidate.
-        continue-on-error: true
-        timeout-minutes: 15
-        run: python3 scripts/run_wayland_acceptance.py
-      - name: Test vendored security fixes
-        id: vendor-tests
-        # Keep independent SDK and live checks on the already-built app.
-        # The final gate still rejects any failed vendor regression command.
-        continue-on-error: true
-        shell: bash
-        run: |
-          cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
-          cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
-          cargo test --locked -p matrix-rtc-livekit --lib
-          cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
-          cargo test --locked -p cargo-packager-updater --lib
-          cargo test --locked -p webrtc-sys-build --lib
-      - name: Test pinned SDK sticky receipt and redaction regressions
-        id: sdk-receipt-tests
-        # Keep collecting the independently built app's live acceptance. The
-        # final outcome gate still rejects failed SDK unit regressions.
-        continue-on-error: true
-        shell: bash
-        run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
-      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
-        if: runner.os == 'Linux'
-        # Four fresh invitation cases each have a bounded 300-second command.
-        # Preserve room for the existing checks and their service cleanup.
-        timeout-minutes: 55
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            --output "$archive"
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir -p "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
-            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
-      - name: Require the selected Wayland result
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
-        env:
-          WAYLAND_SELECTED: ${{ needs.scope.outputs.wayland }}
-          WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
-        shell: bash
-        run: |
-          python3 - <<'PY_WAYLAND_ACCEPTANCE'
-          import os
-          import sys
+          import hashlib, json, os, pathlib, queue, re, signal, subprocess, tempfile, threading, time
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert (os.environ.get('RUNNER_OS'),os.environ.get('RUNNER_ARCH')) == (
+              os.environ['MORPHEUS_EXPECTED_OS'],os.environ['MORPHEUS_EXPECTED_ARCH'])
+          os.umask(0o077)
+          workspace=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()/'candidate'
+          private=pathlib.Path(os.environ['RUNNER_TEMP'])/'morpheus-native-private'
+          private.mkdir(mode=0o700,exist_ok=True)
+          logs=private/'logs'; logs.mkdir(mode=0o700,exist_ok=True)
+          # Only compilation/runtime essentials. No GITHUB_TOKEN, ACTIONS tokens, inherited
+          # credentials, personal accounts, signing identities, or release environment.
+          names=('PATH','HOME','USERPROFILE','HOMEDRIVE','HOMEPATH','SYSTEMROOT','SystemRoot',
+              'WINDIR','COMSPEC','PATHEXT','TEMP','TMP','TMPDIR','LANG','LC_ALL',
+              'ProgramFiles','ProgramFiles(x86)','ProgramW6432','ALLUSERSPROFILE',
+              'LOCALAPPDATA','APPDATA','VCToolsInstallDir','VCINSTALLDIR','VSINSTALLDIR',
+              'WindowsSdkDir','WindowsSDKVersion','INCLUDE','LIB','LIBPATH','LIBCLANG_PATH',
+              'CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN','PKG_CONFIG_PATH',
+              'LD_LIBRARY_PATH','DYLD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR',
+              'SDKROOT','DEVELOPER_DIR','MACOSX_DEPLOYMENT_TARGET',
+              'CARGO_BUILD_JOBS','CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG',
+              'CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR','SLINT_EMIT_DEBUG_INFO',
+              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','RUNNER_ARCH','ImageOS',
+              'RUNNER_TEMP','RUNNER_TRACKING_ID')
+          environment={name:os.environ[name] for name in names if name in os.environ}
+          environment['GIT_CONFIG_GLOBAL']=os.devnull
+          environment['GIT_CONFIG_NOSYSTEM']='1'
+          environment['GIT_TERMINAL_PROMPT']='0'
+          environment['RUST_LOG']='off'
+          import stat, sys
+          # The supervisor owns the process group until cleanup, including successful exit.
+          # A private pipe carries only the direct command's numeric exit status; descendants
+          # never inherit it. Windows starts the command only after Job assignment.
+          SUPERVISOR = """import json, os, subprocess, sys
+          fd=int(sys.argv[1])
+          if os.name=='nt':
+              import msvcrt
+              fd=msvcrt.open_osfhandle(fd,os.O_WRONLY)
+          args=json.loads(sys.stdin.buffer.readline(65536))
+          code=subprocess.Popen(args,stdin=subprocess.DEVNULL,close_fds=True).wait()
+          os.write(fd,(str(code)+'\\n').encode('ascii')); os.close(fd)
+          sys.stdin.buffer.read(1)
+          """
+          def windows_job():
+              import ctypes
+              from ctypes import wintypes as w
+              api=ctypes.WinDLL('kernel32',use_last_error=True)
+              class Basic(ctypes.Structure):
+                  _fields_=[('process_time',ctypes.c_longlong),('job_time',ctypes.c_longlong),
+                      ('flags',w.DWORD),('minimum',ctypes.c_size_t),('maximum',ctypes.c_size_t),
+                      ('active',w.DWORD),('affinity',ctypes.c_size_t),('priority',w.DWORD),('scheduling',w.DWORD)]
+              class Limits(ctypes.Structure):
+                  _fields_=[('basic',Basic),('io',ctypes.c_ulonglong*6),('process_memory',ctypes.c_size_t),
+                      ('job_memory',ctypes.c_size_t),('peak_process',ctypes.c_size_t),('peak_job',ctypes.c_size_t)]
+              api.CreateJobObjectW.argtypes=[ctypes.c_void_p,w.LPCWSTR]; api.CreateJobObjectW.restype=w.HANDLE
+              api.SetInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD]
+              api.SetInformationJobObject.restype=w.BOOL
+              api.AssignProcessToJobObject.argtypes=[w.HANDLE,w.HANDLE]; api.AssignProcessToJobObject.restype=w.BOOL
+              api.TerminateJobObject.argtypes=[w.HANDLE,w.UINT]; api.TerminateJobObject.restype=w.BOOL
+              api.QueryInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD,ctypes.c_void_p]
+              api.QueryInformationJobObject.restype=w.BOOL
+              api.CloseHandle.argtypes=[w.HANDLE]; api.CloseHandle.restype=w.BOOL
+              handle=api.CreateJobObjectW(None,None)
+              if not handle: raise OSError('job_create_failed')
+              limits=Limits(); limits.basic.flags=0x2000 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+              if not api.SetInformationJobObject(handle,9,ctypes.byref(limits),ctypes.sizeof(limits)):
+                  api.CloseHandle(handle); raise OSError('job_limits_failed')
+              return api,handle
 
-          def wayland_error(selected, outcome):
-              if selected not in ("true", "false"):
-                  return "Wayland selection is missing or malformed."
-              expected = "success" if selected == "true" else "skipped"
-              if outcome != expected:
-                  return "The selected Wayland check failed, was cancelled, or did not run."
-              return None
+          def regular_bytes(path,limit):
+              # Do not open a FIFO, follow a symlink/reparse point, or read an unbounded file.
+              before=path.lstat()
+              if (not stat.S_ISREG(before.st_mode) or before.st_size>limit
+                  or getattr(before,'st_file_attributes',0)&0x400): raise ValueError('unsafe_regular_file')
+              flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_CLOEXEC',0)
+              descriptor=os.open(path,flags)
+              with os.fdopen(descriptor,'rb') as stream:
+                  opened=os.fstat(stream.fileno())
+                  if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)
+                      or getattr(opened,'st_file_attributes',0)&0x400): raise ValueError('changed_regular_file')
+                  data=stream.read(limit+1); after=os.fstat(stream.fileno())
+                  if (len(data)>limit or len(data)!=after.st_size
+                      or (opened.st_size,opened.st_mtime_ns)!=(after.st_size,after.st_mtime_ns)):
+                      raise ValueError('changed_regular_file')
+                  return data
 
-          error = wayland_error(os.environ.get("WAYLAND_SELECTED"), os.environ.get("WAYLAND_OUTCOME"))
-          if error:
-              print(error, file=sys.stderr)
-              raise SystemExit(1)
-          if os.environ["WAYLAND_SELECTED"] == "false":
-              print("System Wayland was outside this change's inputs; its existing release gate remains open.")
-          PY_WAYLAND_ACCEPTANCE
-      - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
-        shell: bash
-        run: |
-          echo "Protocol model, native preview, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
-          exit 1
-
-  acceptance:
-    name: CI acceptance
-    needs: [scope, helpers, config, compile]
-    # Run after failed/skipped dependencies too. A selected check may never
-    # disappear behind a skipped aggregate that branch protection accepts.
-    if: always() && github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    permissions: {}
-    timeout-minutes: 2
-    steps:
-      # No checkout, dependency/cache restore, artifacts, or submitted code.
-      # This combines job conclusions; source/workflow review remains required.
-      - name: Require every selected check to succeed
-        env:
-          CHECK_RESULTS: ${{ toJSON(needs) }}
-        shell: bash
-        run: |
-          python3 - <<'PY_ACCEPTANCE'
-          import json
-          import os
-          import sys
-
-          def acceptance_error(needs):
-              if not isinstance(needs, dict) or set(needs) != {"scope", "helpers", "config", "compile"}:
-                  return "Missing dependency conclusions."
-              if any(not isinstance(value, dict) for value in needs.values()):
-                  return "Malformed dependency conclusions."
-              if needs["scope"].get("result") != "success":
-                  return "Security and change scope did not succeed."
-              if needs["helpers"].get("result") != "success":
-                  return "Validation helper tests did not succeed."
-              outputs = needs["scope"].get("outputs")
-              if not isinstance(outputs, dict):
-                  return "Scope outputs are missing."
-              native, config, wayland = outputs.get("native"), outputs.get("config"), outputs.get("wayland")
-              if any(flag not in ("true", "false") for flag in (native, config, wayland)):
-                  return "Scope flags are missing or malformed."
-              if native == config == "true":
-                  return "Native checks already include configuration tests."
+          def bounded(args,name,seconds,limit=64*1024*1024,cwd=None):
+              directory=logs/name; directory.mkdir(mode=0o700)
+              log=directory/'output.log'
+              blocks=queue.Queue(maxsize=8); status=queue.Queue(maxsize=1)
+              stop=threading.Event(); errors=[]; code=None; reason=None; cleaned=False; cleanup_ok=False
+              read_fd,write_fd=os.pipe(); job=None; child=None; threads=[]
+              kwargs={'start_new_session':True,'pass_fds':(write_fd,)}
+              status_arg=write_fd
+              if os.name=='nt':
+                  import msvcrt
+                  job=windows_job(); status_arg=msvcrt.get_osfhandle(write_fd)
+                  os.set_handle_inheritable(status_arg,True)
+                  startup=subprocess.STARTUPINFO(); startup.lpAttributeList={'handle_list':[status_arg]}
+                  kwargs={'startupinfo':startup,'close_fds':True}
+              def cleanup():
+                  nonlocal cleaned,cleanup_ok
+                  if cleaned: return
+                  cleaned=True
+                  if job:
+                      import ctypes
+                      class Accounting(ctypes.Structure):
+                          _fields_=[('times',ctypes.c_longlong*4),('faults',ctypes.c_uint32),
+                              ('total',ctypes.c_uint32),('active',ctypes.c_uint32),('terminated',ctypes.c_uint32)]
+                      try:
+                          if not job[0].TerminateJobObject(job[1],1): raise OSError('job_terminate_failed')
+                          until=time.monotonic()+10
+                          while True:
+                              accounting=Accounting()
+                              if not job[0].QueryInformationJobObject(job[1],1,ctypes.byref(accounting),ctypes.sizeof(accounting),None):
+                                  raise OSError('job_query_failed')
+                              if accounting.active==0: break
+                              if time.monotonic()>=until: raise OSError('job_cleanup_deadline')
+                              time.sleep(0.05)
+                      finally:
+                          if not job[0].CloseHandle(job[1]): raise OSError('job_close_failed')
+                  elif child is not None:
+                      # No poll()/wait() before this signal: the supervisor still reserves
+                      # its group identity even if it exited unexpectedly.
+                      try: os.killpg(child.pid,signal.SIGKILL)
+                      except ProcessLookupError: pass
+                  cleanup_ok=True
               try:
-                  matrix = json.loads(outputs.get("native_matrix", ""))
-              except (TypeError, ValueError):
-                  return "Native matrix is missing or malformed."
-              if not isinstance(matrix, dict) or set(matrix) != {"os"}:
-                  return "Native matrix must contain only standard operating systems."
-              platforms = matrix["os"]
-              allowed = {"macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"}
-              if (not isinstance(platforms, list)
-                      or any(not isinstance(item, str) or item not in allowed for item in platforms)
-                      or len(platforms) != len(set(platforms))
-                      or bool(platforms) != (native == "true")):
-                  return "Native matrix disagrees with the selected standard checks."
-              if wayland == "true" and "ubuntu-24.04" not in platforms:
-                  return "Selected Wayland acceptance requires the Linux native job."
-              for job, selected in (("config", config), ("compile", native)):
-                  expected = "success" if selected == "true" else "skipped"
-                  if needs[job].get("result") != expected:
-                      return "A selected check failed, was cancelled, or did not run."
-              return None
+                  with log.open('x+b') as output:
+                      try:
+                          child=subprocess.Popen([sys.executable,'-I','-c',SUPERVISOR,str(status_arg)],
+                              cwd=cwd or workspace,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT,env=environment,**kwargs)
+                          if job and not job[0].AssignProcessToJobObject(job[1],int(child._handle)):
+                              # The supervisor is waiting for input; no command was started.
+                              child.kill(); raise OSError('job_assignment_failed')
+                          if os.name=='nt': os.set_handle_inheritable(status_arg,False)
+                          os.close(write_fd); write_fd=None
+                          def reader():
+                              try:
+                                  while not stop.is_set():
+                                      block=os.read(child.stdout.fileno(),65536)
+                                      while not stop.is_set():
+                                          try: blocks.put(block,timeout=0.2); break
+                                          except queue.Full: pass
+                                      if not block: return
+                              except OSError:
+                                  if not stop.is_set(): errors.append(True)
+                          def read_status():
+                              try:
+                                  data=b''
+                                  while len(data)<=32 and not data.endswith(b'\n'):
+                                      block=os.read(read_fd,33-len(data))
+                                      if not block: break
+                                      data+=block
+                                  status.put(int(data) if re.fullmatch(rb'-?[0-9]{1,10}\n',data) else None)
+                              except (OSError,ValueError): status.put(None)
+                          threads=[threading.Thread(target=reader,daemon=True),threading.Thread(target=read_status,daemon=True)]
+                          for thread in threads: thread.start()
+                          payload=(json.dumps(args,separators=(',',':'))+'\n').encode('utf-8')
+                          if len(payload)>65535: raise ValueError('command_too_large')
+                          child.stdin.write(payload); child.stdin.flush()
+                          deadline=time.monotonic()+seconds
+                          while True:
+                              if not cleaned:
+                                  try: returned=status.get_nowait()
+                                  except queue.Empty: pass
+                                  else:
+                                      if returned is None: reason='process_error'; break
+                                      code=returned; cleanup()
+                                      # Drain buffered output after killing remaining descendants.
+                                      deadline=min(deadline,time.monotonic()+10)
+                              remaining=deadline-time.monotonic()
+                              if remaining<=0: reason='deadline'; break
+                              try: block=blocks.get(timeout=min(0.2,remaining))
+                              except queue.Empty: continue
+                              if not block:
+                                  if code is None: reason='process_error'
+                                  break
+                              if output.tell()+len(block)>limit: reason='output_limit'; break
+                              output.write(block)
+                      except (OSError,ValueError,subprocess.SubprocessError): reason='process_error'
+                      finally:
+                          try: cleanup()
+                          except OSError: reason='cleanup_failed'
+                          if not cleanup_ok: reason='cleanup_failed'
+                          if child is not None:
+                              try: child.wait(timeout=10)
+                              except subprocess.SubprocessError: reason='cleanup_failed'
+                              child.stdin.close()
+                          stop.set()
+                          if write_fd is not None: os.close(write_fd); write_fd=None
+                          for thread in threads: thread.join(timeout=2)
+                          if any(thread.is_alive() for thread in threads): reason='cleanup_failed'
+                          if child is not None: child.stdout.close()
+                          os.close(read_fd)
+                      output.flush(); output.seek(0); captured=output.read(limit+1)
+                      if not stat.S_ISREG(os.fstat(output.fileno()).st_mode) or len(captured)>limit:
+                          reason='output_limit'; captured=b''
+              finally:
+                  if write_fd is not None: os.close(write_fd)
+              if errors: reason=reason or 'process_error'
+              # Parsing and scanning consume these same captured bytes, never a reopened path.
+              return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
 
+          # Verify the owner runner wrapper on generated processes before candidate code.
+          # The orphan redirects its output, reproducing the normal-exit cleanup bug.
+          probe_root=private/'lifecycle-probe'; probe_root.mkdir(mode=0o700)
+          ready=probe_root/'ready'; late=probe_root/'late'
+          orphan_code="import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(2); pathlib.Path(sys.argv[2]).write_text('escaped'); time.sleep(30)"
+          parent_code="""import pathlib,subprocess,sys,time
+          child=subprocess.Popen([sys.executable,'-I','-c',sys.argv[1],sys.argv[2],sys.argv[3]],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True)
+          until=time.monotonic()+5
+          while not pathlib.Path(sys.argv[2]).exists():
+              if time.monotonic()>=until: raise SystemExit(8)
+              time.sleep(0.01)
+          sys.stdout.buffer.write(b'ready\\n'); sys.stdout.buffer.flush()
+          """
+          normal=bounded([sys.executable,'-I','-c',parent_code,orphan_code,str(ready),str(late)],'owner-orphan-probe',15,1024)
+          time.sleep(2.2)
+          nonzero=bounded([sys.executable,'-I','-c','raise SystemExit(7)'],'owner-exit-probe',10,1024)
+          deadline=bounded([sys.executable,'-I','-c','import time; time.sleep(30)'],'owner-deadline-probe',0.2,1024)
+          overflow=bounded([sys.executable,'-I','-c',"print('x'*4096,flush=True)"],'owner-output-probe',10,1024)
+          probe_ok=(normal['reason'] is None and normal['code']==0 and normal['captured']==b'ready\n'
+              and ready.is_file() and not late.exists() and nonzero['reason'] is None and nonzero['code']==7
+              and deadline['reason']=='deadline' and overflow['reason']=='output_limit')
+          print(json.dumps({'check':'owner_process_lifecycle','status':'passed' if probe_ok else 'failed',
+              'candidate_executed':False,'raw_logs_public':False},sort_keys=True),flush=True)
+          if not probe_ok: raise SystemExit(1)
+
+          import io, tarfile, urllib.request, zipfile
+          source='630689c697d60eaffac9de24c8d2ce34a9ea2bd7'
+          identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
+          if identity['reason'] or identity['code']!=0 or identity['captured'].decode('ascii').strip()!=source:
+              print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
+          archives={
+              ('Linux','X64'):('linux_x64.tar.gz','551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'),
+              ('macOS','ARM64'):('darwin_arm64.tar.gz','b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5'),
+              ('macOS','X64'):('darwin_x64.tar.gz','dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709'),
+              ('Windows','X64'):('windows_x64.zip','d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e'),
+          }
+          archive,digest=archives[(os.environ['RUNNER_OS'],os.environ['RUNNER_ARCH'])]
+          url='https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_'+archive
           try:
-              error = acceptance_error(json.loads(os.environ["CHECK_RESULTS"]))
-          except (KeyError, ValueError):
-              error = "Dependency conclusions are missing or malformed."
-          if error:
-              print(error, file=sys.stderr)
+              data=bytearray(); deadline=time.monotonic()+180
+              with urllib.request.urlopen(url,timeout=30) as response:
+                  while True:
+                      chunk=response.read(65536)
+                      if not chunk: break
+                      data.extend(chunk)
+                      if len(data)>32*1024*1024 or time.monotonic()>deadline: raise ValueError()
+              if hashlib.sha256(data).hexdigest()!=digest: raise ValueError()
+              with (private/'verified-scanner-archive').open('xb') as saved: saved.write(data)
+              executable='gitleaks.exe' if os.name=='nt' else 'gitleaks'
+              if archive.endswith('.zip'):
+                  with zipfile.ZipFile(io.BytesIO(data)) as packaged:
+                      member=packaged.getinfo(executable)
+                      if member.file_size>64*1024*1024: raise ValueError()
+                      binary=packaged.read(member)
+              else:
+                  with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as packaged:
+                      member=packaged.getmember(executable)
+                      if not member.isfile() or member.size>64*1024*1024: raise ValueError()
+                      binary=packaged.extractfile(member).read(64*1024*1024+1)
+              if not binary or len(binary)>64*1024*1024: raise ValueError()
+              scanner=private/executable
+              with scanner.open('xb') as output: output.write(binary)
+              scanner.chmod(0o700)
+          except Exception:
+              print(json.dumps({'check':'verified_scanner_bootstrap','status':'failed'})); raise SystemExit(1)
+          config=private/'default.toml'; config.write_bytes(b'[extend]\nuseDefault = true\n')
+          ignore=private/'empty.ignore'; ignore.write_bytes(b'')
+          print(json.dumps({'check':'reviewed_source_and_private_scanner','status':'passed',
+              'source':source,'raw_logs_public':False},sort_keys=True))
+      - name: Verify only existing AppImage capture helpers
+        timeout-minutes: 8
+        shell: python -I {0}
+        run: |
+          import hashlib, json, os, pathlib, queue, re, signal, subprocess, tempfile, threading, time
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert (os.environ.get('RUNNER_OS'),os.environ.get('RUNNER_ARCH')) == (
+              os.environ['MORPHEUS_EXPECTED_OS'],os.environ['MORPHEUS_EXPECTED_ARCH'])
+          os.umask(0o077)
+          workspace=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()/'candidate'
+          private=pathlib.Path(os.environ['RUNNER_TEMP'])/'morpheus-native-private'
+          private.mkdir(mode=0o700,exist_ok=True)
+          logs=private/'logs'; logs.mkdir(mode=0o700,exist_ok=True)
+          # Only compilation/runtime essentials. No GITHUB_TOKEN, ACTIONS tokens, inherited
+          # credentials, personal accounts, signing identities, or release environment.
+          names=('PATH','HOME','USERPROFILE','HOMEDRIVE','HOMEPATH','SYSTEMROOT','SystemRoot',
+              'WINDIR','COMSPEC','PATHEXT','TEMP','TMP','TMPDIR','LANG','LC_ALL',
+              'ProgramFiles','ProgramFiles(x86)','ProgramW6432','ALLUSERSPROFILE',
+              'LOCALAPPDATA','APPDATA','VCToolsInstallDir','VCINSTALLDIR','VSINSTALLDIR',
+              'WindowsSdkDir','WindowsSDKVersion','INCLUDE','LIB','LIBPATH','LIBCLANG_PATH',
+              'CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN','PKG_CONFIG_PATH',
+              'LD_LIBRARY_PATH','DYLD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR',
+              'SDKROOT','DEVELOPER_DIR','MACOSX_DEPLOYMENT_TARGET',
+              'CARGO_BUILD_JOBS','CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG',
+              'CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR','SLINT_EMIT_DEBUG_INFO',
+              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','RUNNER_ARCH','ImageOS',
+              'RUNNER_TEMP','RUNNER_TRACKING_ID')
+          environment={name:os.environ[name] for name in names if name in os.environ}
+          environment['GIT_CONFIG_GLOBAL']=os.devnull
+          environment['GIT_CONFIG_NOSYSTEM']='1'
+          environment['GIT_TERMINAL_PROMPT']='0'
+          environment['RUST_LOG']='off'
+          import stat, sys
+          # The supervisor owns the process group until cleanup, including successful exit.
+          # A private pipe carries only the direct command's numeric exit status; descendants
+          # never inherit it. Windows starts the command only after Job assignment.
+          SUPERVISOR = """import json, os, subprocess, sys
+          fd=int(sys.argv[1])
+          if os.name=='nt':
+              import msvcrt
+              fd=msvcrt.open_osfhandle(fd,os.O_WRONLY)
+          args=json.loads(sys.stdin.buffer.readline(65536))
+          code=subprocess.Popen(args,stdin=subprocess.DEVNULL,close_fds=True).wait()
+          os.write(fd,(str(code)+'\\n').encode('ascii')); os.close(fd)
+          sys.stdin.buffer.read(1)
+          """
+          def windows_job():
+              import ctypes
+              from ctypes import wintypes as w
+              api=ctypes.WinDLL('kernel32',use_last_error=True)
+              class Basic(ctypes.Structure):
+                  _fields_=[('process_time',ctypes.c_longlong),('job_time',ctypes.c_longlong),
+                      ('flags',w.DWORD),('minimum',ctypes.c_size_t),('maximum',ctypes.c_size_t),
+                      ('active',w.DWORD),('affinity',ctypes.c_size_t),('priority',w.DWORD),('scheduling',w.DWORD)]
+              class Limits(ctypes.Structure):
+                  _fields_=[('basic',Basic),('io',ctypes.c_ulonglong*6),('process_memory',ctypes.c_size_t),
+                      ('job_memory',ctypes.c_size_t),('peak_process',ctypes.c_size_t),('peak_job',ctypes.c_size_t)]
+              api.CreateJobObjectW.argtypes=[ctypes.c_void_p,w.LPCWSTR]; api.CreateJobObjectW.restype=w.HANDLE
+              api.SetInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD]
+              api.SetInformationJobObject.restype=w.BOOL
+              api.AssignProcessToJobObject.argtypes=[w.HANDLE,w.HANDLE]; api.AssignProcessToJobObject.restype=w.BOOL
+              api.TerminateJobObject.argtypes=[w.HANDLE,w.UINT]; api.TerminateJobObject.restype=w.BOOL
+              api.QueryInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,ctypes.c_void_p,w.DWORD,ctypes.c_void_p]
+              api.QueryInformationJobObject.restype=w.BOOL
+              api.CloseHandle.argtypes=[w.HANDLE]; api.CloseHandle.restype=w.BOOL
+              handle=api.CreateJobObjectW(None,None)
+              if not handle: raise OSError('job_create_failed')
+              limits=Limits(); limits.basic.flags=0x2000 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+              if not api.SetInformationJobObject(handle,9,ctypes.byref(limits),ctypes.sizeof(limits)):
+                  api.CloseHandle(handle); raise OSError('job_limits_failed')
+              return api,handle
+
+          def regular_bytes(path,limit):
+              # Do not open a FIFO, follow a symlink/reparse point, or read an unbounded file.
+              before=path.lstat()
+              if (not stat.S_ISREG(before.st_mode) or before.st_size>limit
+                  or getattr(before,'st_file_attributes',0)&0x400): raise ValueError('unsafe_regular_file')
+              flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_CLOEXEC',0)
+              descriptor=os.open(path,flags)
+              with os.fdopen(descriptor,'rb') as stream:
+                  opened=os.fstat(stream.fileno())
+                  if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)
+                      or getattr(opened,'st_file_attributes',0)&0x400): raise ValueError('changed_regular_file')
+                  data=stream.read(limit+1); after=os.fstat(stream.fileno())
+                  if (len(data)>limit or len(data)!=after.st_size
+                      or (opened.st_size,opened.st_mtime_ns)!=(after.st_size,after.st_mtime_ns)):
+                      raise ValueError('changed_regular_file')
+                  return data
+
+          def bounded(args,name,seconds,limit=64*1024*1024,cwd=None):
+              directory=logs/name; directory.mkdir(mode=0o700)
+              log=directory/'output.log'
+              blocks=queue.Queue(maxsize=8); status=queue.Queue(maxsize=1)
+              stop=threading.Event(); errors=[]; code=None; reason=None; cleaned=False; cleanup_ok=False
+              read_fd,write_fd=os.pipe(); job=None; child=None; threads=[]
+              kwargs={'start_new_session':True,'pass_fds':(write_fd,)}
+              status_arg=write_fd
+              if os.name=='nt':
+                  import msvcrt
+                  job=windows_job(); status_arg=msvcrt.get_osfhandle(write_fd)
+                  os.set_handle_inheritable(status_arg,True)
+                  startup=subprocess.STARTUPINFO(); startup.lpAttributeList={'handle_list':[status_arg]}
+                  kwargs={'startupinfo':startup,'close_fds':True}
+              def cleanup():
+                  nonlocal cleaned,cleanup_ok
+                  if cleaned: return
+                  cleaned=True
+                  if job:
+                      import ctypes
+                      class Accounting(ctypes.Structure):
+                          _fields_=[('times',ctypes.c_longlong*4),('faults',ctypes.c_uint32),
+                              ('total',ctypes.c_uint32),('active',ctypes.c_uint32),('terminated',ctypes.c_uint32)]
+                      try:
+                          if not job[0].TerminateJobObject(job[1],1): raise OSError('job_terminate_failed')
+                          until=time.monotonic()+10
+                          while True:
+                              accounting=Accounting()
+                              if not job[0].QueryInformationJobObject(job[1],1,ctypes.byref(accounting),ctypes.sizeof(accounting),None):
+                                  raise OSError('job_query_failed')
+                              if accounting.active==0: break
+                              if time.monotonic()>=until: raise OSError('job_cleanup_deadline')
+                              time.sleep(0.05)
+                      finally:
+                          if not job[0].CloseHandle(job[1]): raise OSError('job_close_failed')
+                  elif child is not None:
+                      # No poll()/wait() before this signal: the supervisor still reserves
+                      # its group identity even if it exited unexpectedly.
+                      try: os.killpg(child.pid,signal.SIGKILL)
+                      except ProcessLookupError: pass
+                  cleanup_ok=True
+              try:
+                  with log.open('x+b') as output:
+                      try:
+                          child=subprocess.Popen([sys.executable,'-I','-c',SUPERVISOR,str(status_arg)],
+                              cwd=cwd or workspace,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT,env=environment,**kwargs)
+                          if job and not job[0].AssignProcessToJobObject(job[1],int(child._handle)):
+                              # The supervisor is waiting for input; no command was started.
+                              child.kill(); raise OSError('job_assignment_failed')
+                          if os.name=='nt': os.set_handle_inheritable(status_arg,False)
+                          os.close(write_fd); write_fd=None
+                          def reader():
+                              try:
+                                  while not stop.is_set():
+                                      block=os.read(child.stdout.fileno(),65536)
+                                      while not stop.is_set():
+                                          try: blocks.put(block,timeout=0.2); break
+                                          except queue.Full: pass
+                                      if not block: return
+                              except OSError:
+                                  if not stop.is_set(): errors.append(True)
+                          def read_status():
+                              try:
+                                  data=b''
+                                  while len(data)<=32 and not data.endswith(b'\n'):
+                                      block=os.read(read_fd,33-len(data))
+                                      if not block: break
+                                      data+=block
+                                  status.put(int(data) if re.fullmatch(rb'-?[0-9]{1,10}\n',data) else None)
+                              except (OSError,ValueError): status.put(None)
+                          threads=[threading.Thread(target=reader,daemon=True),threading.Thread(target=read_status,daemon=True)]
+                          for thread in threads: thread.start()
+                          payload=(json.dumps(args,separators=(',',':'))+'\n').encode('utf-8')
+                          if len(payload)>65535: raise ValueError('command_too_large')
+                          child.stdin.write(payload); child.stdin.flush()
+                          deadline=time.monotonic()+seconds
+                          while True:
+                              if not cleaned:
+                                  try: returned=status.get_nowait()
+                                  except queue.Empty: pass
+                                  else:
+                                      if returned is None: reason='process_error'; break
+                                      code=returned; cleanup()
+                                      # Drain buffered output after killing remaining descendants.
+                                      deadline=min(deadline,time.monotonic()+10)
+                              remaining=deadline-time.monotonic()
+                              if remaining<=0: reason='deadline'; break
+                              try: block=blocks.get(timeout=min(0.2,remaining))
+                              except queue.Empty: continue
+                              if not block:
+                                  if code is None: reason='process_error'
+                                  break
+                              if output.tell()+len(block)>limit: reason='output_limit'; break
+                              output.write(block)
+                      except (OSError,ValueError,subprocess.SubprocessError): reason='process_error'
+                      finally:
+                          try: cleanup()
+                          except OSError: reason='cleanup_failed'
+                          if not cleanup_ok: reason='cleanup_failed'
+                          if child is not None:
+                              try: child.wait(timeout=10)
+                              except subprocess.SubprocessError: reason='cleanup_failed'
+                              child.stdin.close()
+                          stop.set()
+                          if write_fd is not None: os.close(write_fd); write_fd=None
+                          for thread in threads: thread.join(timeout=2)
+                          if any(thread.is_alive() for thread in threads): reason='cleanup_failed'
+                          if child is not None: child.stdout.close()
+                          os.close(read_fd)
+                      output.flush(); output.seek(0); captured=output.read(limit+1)
+                      if not stat.S_ISREG(os.fstat(output.fileno()).st_mode) or len(captured)>limit:
+                          reason='output_limit'; captured=b''
+              finally:
+                  if write_fd is not None: os.close(write_fd)
+              if errors: reason=reason or 'process_error'
+              # Parsing and scanning consume these same captured bytes, never a reopened path.
+              return {'code':code,'reason':reason,'bytes':len(captured),'log':log,'captured':captured}
+
+          import io, tarfile, zipfile
+          source='630689c697d60eaffac9de24c8d2ce34a9ea2bd7'
+          scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
+          archive_digests={
+              ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
+              ('macOS','ARM64'):'b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5',
+              ('macOS','X64'):'dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709',
+              ('Windows','X64'):'d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e',
+          }
+          # Revalidate the independently pinned scanner and its rules after every
+          # candidate process. Candidate output cannot authorize a new scanner.
+          def scanner_intact():
+              try:
+                  data=regular_bytes(private/'verified-scanner-archive',32*1024*1024)
+                  if len(data)>32*1024*1024 or hashlib.sha256(data).hexdigest()!=archive_digests[(os.environ['RUNNER_OS'],os.environ['RUNNER_ARCH'])]: return False
+                  if os.name=='nt':
+                      with zipfile.ZipFile(io.BytesIO(data)) as packaged:
+                          member=packaged.getinfo('gitleaks.exe')
+                          if member.file_size>64*1024*1024: return False
+                          expected=packaged.read(member)
+                  else:
+                      with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as packaged:
+                          member=packaged.getmember('gitleaks')
+                          if not member.isfile() or member.size>64*1024*1024: return False
+                          expected=packaged.extractfile(member).read(64*1024*1024+1)
+                  actual=regular_bytes(scanner,64*1024*1024)
+                  fixed=regular_bytes(config,1024)
+                  empty=regular_bytes(ignore,0)
+                  return (len(expected)<=64*1024*1024 and hashlib.sha256(actual).digest()==hashlib.sha256(expected).digest()
+                      and fixed==b'[extend]\nuseDefault = true\n' and empty==b'')
+              except Exception: return False
+          config=private/'default.toml'; ignore=private/'empty.ignore'
+          # Anchor every tracked input to the immutable reviewed Git tree before execution.
+          # Compare content directly, without Git index stat caches, filters or ignore rules.
+          git_args=['git','--no-pager','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
+              '-c','core.attributesFile='+os.devnull,'-c','core.useReplaceRefs=false']
+          identity=bounded(git_args+['rev-parse','HEAD'],'execution-source-identity',15,4096)
+          listing=bounded(git_args+['ls-tree','-r','-l','-z',source],'execution-source-tree',15,1024*1024)
+          if (identity['reason'] or identity['code']!=0 or identity['captured'].strip()!=source.encode('ascii')
+              or listing['reason'] or listing['code']!=0):
+              print(json.dumps({'check':'tracked_input_integrity','status':'failed'})); raise SystemExit(1)
+          tracked=[]; total=0
+          for row in listing['captured'].split(b'\0'):
+              if not row: continue
+              header,raw_path=row.split(b'\t',1); mode,kind,blob,length=header.split()
+              path=pathlib.PurePosixPath(os.fsdecode(raw_path)); size=int(length)
+              if (mode not in (b'100644',b'100755') or kind!=b'blob' or path.is_absolute()
+                  or not path.parts or any(part in ('.','..') for part in path.parts)
+                  or size>32*1024*1024): raise SystemExit('tracked_input_shape_failed')
+              total+=size
+              if len(tracked)>=10000 or total>256*1024*1024: raise SystemExit('tracked_input_bound_failed')
+              tracked.append((path,mode,blob,size))
+          if not tracked: raise SystemExit('tracked_input_empty')
+          lock_digest='cb3a29f33a89b21b482d3c7ccdab026534533acfa209803379bf3da23ce4019b'
+          pinned_head=regular_bytes(workspace/'.git/HEAD',4096)
+          if pinned_head.strip()!=source.encode('ascii'): raise SystemExit('tracked_input_head_failed')
+          def tracked_intact():
+              try:
+                  if regular_bytes(workspace/'.git/HEAD',4096)!=pinned_head: return False
+                  if hashlib.sha256(regular_bytes(workspace/'Cargo.lock',1024*1024)).hexdigest()!=lock_digest: return False
+                  for path,mode,blob,size in tracked:
+                      parent=workspace
+                      for component in path.parts[:-1]:
+                          parent=parent/component; metadata=parent.lstat()
+                          if (not stat.S_ISDIR(metadata.st_mode)
+                              or getattr(metadata,'st_file_attributes',0)&0x400): return False
+                      file=workspace/path
+                      data=regular_bytes(file,size)
+                      if len(data)!=size: return False
+                      # Git's blob identity binds the direct bytes and size to the reviewed commit.
+                      if hashlib.sha1(b'blob '+str(size).encode('ascii')+b'\0'+data).hexdigest().encode('ascii')!=blob: return False
+                      if os.name!='nt' and bool(file.lstat().st_mode&stat.S_IXUSR)!=(mode==b'100755'): return False
+                  return True
+              except (OSError,ValueError): return False
+          if not tracked_intact():
+              print(json.dumps({'check':'tracked_input_integrity','status':'failed'})); raise SystemExit(1)
+          if not scanner_intact():
+              print(json.dumps({'check':'scanner_integrity','status':'failed'})); raise SystemExit(1)
+          # Retain independently verified scanner bytes in this owner process. Reconstruct
+          # controls only after command cleanup, in a fresh directory that did not exist
+          # during candidate execution. Explicitly scan one sealed regular file, not its
+          # candidate-writable original directory (which could inject .gitleaksignore).
+          scanner_bytes=regular_bytes(scanner,64*1024*1024)
+          def scan_captured(result,name):
+              with tempfile.TemporaryDirectory(prefix='morpheus-sealed-',dir=os.environ['RUNNER_TEMP']) as fresh:
+                  sealed=pathlib.Path(fresh); sealed.chmod(0o700)
+                  binary=sealed/scanner.name; rules=sealed/'default.toml'; exclusions=sealed/'empty.ignore'
+                  capture=sealed/'output.log'; report=sealed/'report.json'
+                  for path,data in ((binary,scanner_bytes),(rules,b'[extend]\nuseDefault = true\n'),
+                      (exclusions,b''),(capture,result['captured'])):
+                      with path.open('xb') as stream: stream.write(data)
+                      path.chmod(0o500 if path==binary else 0o400)
+                  if regular_bytes(capture,64*1024*1024)!=result['captured']: return False
+                  scanned=bounded([str(binary),'dir',str(capture),'--redact=100','--ignore-gitleaks-allow',
+                      '--no-banner','--max-target-megabytes','0','--config',str(rules),
+                      '--gitleaks-ignore-path',str(exclusions),'--report-format','json','--report-path',str(report)],
+                      name+'-scan',60,8*1024*1024,cwd=sealed)
+                  try:
+                      return (scanned['reason'] is None and scanned['code']==0
+                          and regular_bytes(capture,64*1024*1024)==result['captured']
+                          and regular_bytes(rules,1024)==b'[extend]\nuseDefault = true\n'
+                          and regular_bytes(exclusions,0)==b''
+                          and hashlib.sha256(regular_bytes(binary,64*1024*1024)).digest()==hashlib.sha256(scanner_bytes).digest()
+                          and json.loads(regular_bytes(report,8*1024*1024))==[])
+                  except (OSError,ValueError): return False
+          if (os.environ.get('RUNNER_OS'), os.environ.get('RUNNER_ARCH'), os.environ.get('MORPHEUS_CHECK_SCOPE')) != ('Linux', 'X64', 'appimage-selector-helper-linux'):
+              raise SystemExit('focused_installed_helper_scope_required')
+          helper_program = r"""import hashlib, json, pathlib, sys, unittest
+          scripts = pathlib.Path('scripts').resolve(strict=True)
+          # The existing AppImage module imports reviewed local scripts and packaging modules.
+          sys.path.insert(0, str(scripts.parent))
+          sys.path.insert(0, str(scripts))
+          sys.path.insert(0, str(scripts / 'tests'))
+          names = [
+              'test_appimage_capture.OwnershipTests.test_one_cleanup_failure_does_not_skip_other_owned_groups',
+              'test_appimage_capture.OwnershipTests.test_spawn_is_owned_before_any_reader_attachment_failure',
+              'test_appimage_capture.ProofTests.test_capture_output_cannot_contain_the_app_or_ambiguous_app_window',
+              'test_appimage_capture.ProofTests.test_named_peer_and_one_full_success_are_both_required',
+              'test_appimage_capture.ProofTests.test_private_fact_cannot_be_overwritten_or_fabricated_by_other_value',
+              'test_appimage_capture.ProofTests.test_source_markers_match_all_required_peer_receipts',
+              'test_appimage_capture.SelectorTests.test_complete_owned_action_and_editable_matches_are_accepted',
+              'test_appimage_capture.SelectorTests.test_duplicate_matches_still_fail_before_an_incomplete_pass_can_retry',
+              'test_appimage_capture.SelectorTests.test_incomplete_owned_tree_cannot_prove_presence_or_absence',
+              'test_appimage_capture.SelectorTests.test_incomplete_pass_never_enters_text_or_presses_an_action',
+              'test_appimage_capture.SelectorTests.test_known_duplicate_is_fatal_before_a_later_name_lookup_failure',
+              'test_appimage_capture.SelectorTests.test_transient_interface_errors_cannot_hide_a_potential_second_match',
+              'test_appimage_capture.SelectorTests.test_unowned_tree_and_the_existing_tree_bound_remain_enforced',
+              'test_appimage_capture.SelectorTests.test_unsupported_interface_and_zero_action_caption_are_ordinary_nonmatches',
+              'test_appimage_capture.TeardownTests.test_cleanup_failure_cannot_turn_capture_into_success',
+              'test_appimage_capture.TeardownTests.test_normal_and_binding_runs_use_fresh_fixtures_and_retained_volumes',
+              'test_appimage_capture.TeardownTests.test_original_interrupt_survives_both_cleanup_attempts_and_final_inventory',
+              'test_appimage_capture.TeardownTests.test_preexisting_or_unavailable_inventory_never_takes_cleanup_ownership',
+          ]
+          suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+          observed = [case.id() for group in suite for case in group]
+          if suite.countTestCases() != 18 or observed != names:
               raise SystemExit(1)
-          print("Security checks and every selected validation job succeeded.")
-          PY_ACCEPTANCE
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          okay = (result.wasSuccessful() and result.testsRun == 18 and not result.skipped
+                  and not result.expectedFailures and not result.unexpectedSuccesses)
+          print('MORPHEUS_APPIMAGE_CAPTURE_HELPERS ' + json.dumps({
+              'tests_run': result.testsRun, 'zero_skips_xfails': not result.skipped and not result.expectedFailures and not result.unexpectedSuccesses,
+              'required_ids_sha256': hashlib.sha256(json.dumps(observed, separators=(',', ':')).encode('utf-8')).hexdigest(),
+              'complete': okay,
+          }, sort_keys=True), flush=True)
+          raise SystemExit(0 if okay else 1)
+          """
+          required_ids_sha256 = '7f6e1cb1cdda0b36a031b49442d057b0eea7ad7faeb326b9d171534b77f154eb'
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result: raise ValueError('duplicate_field')
+                  result[key] = value
+              return result
+          def report_record(output, prefix):
+              # Parse only a single bounded closed record after independent scan.
+              if len(output) > 4 * 1024 * 1024: return None
+              records = []
+              for line in output.splitlines():
+                  if line.startswith(prefix):
+                      if len(line) > 16384: return None
+                      try:
+                          records.append(json.loads(line[len(prefix):], object_pairs_hook=unique_object))
+                      except (ValueError, TypeError): return None
+              return records[0] if len(records) == 1 and type(records[0]) is dict else None
+          def helper_evidence(output):
+              row = report_record(output, 'MORPHEUS_APPIMAGE_CAPTURE_HELPERS ')
+              return (row is not None and set(row) == {'tests_run', 'zero_skips_xfails', 'required_ids_sha256', 'complete'}
+                  and type(row.get('tests_run')) is int and row['tests_run'] == 18
+                  and row.get('zero_skips_xfails') is True and row.get('complete') is True
+                  and row.get('required_ids_sha256') == required_ids_sha256)
+          name = 'appimage_capture_helpers'
+          if not tracked_intact() or not scanner_intact():
+              print(json.dumps({'check': name, 'status': 'failed', 'reason': 'input_or_scanner_integrity_failed',
+                  'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
+              raise SystemExit(1)
+          result = bounded([sys.executable, '-I', '-B', '-c', helper_program], name, 300)
+          if result['reason'] == 'cleanup_failed':
+              print(json.dumps({'check': name, 'status': 'failed', 'reason': 'cleanup_failed',
+                  'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
+              raise SystemExit(1)
+          if not tracked_intact() or not scanner_intact():
+              print(json.dumps({'check': name, 'status': 'failed', 'reason': 'input_or_scanner_integrity_failed',
+                  'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
+              raise SystemExit(1)
+          if not scan_captured(result, name):
+              print(json.dumps({'check': name, 'status': 'failed', 'reason': 'private_log_scan_failed',
+                  'source': source, 'raw_logs_public': False}, sort_keys=True), flush=True)
+              raise SystemExit(1)
+          output = result['captured'].decode('utf-8', errors='replace')
+          complete = helper_evidence(output)
+          passed = result['reason'] is None and result['code'] == 0 and complete
+          print(json.dumps({
+              'check': name, 'status': 'passed' if passed else 'failed', 'source': source,
+              'reason': result['reason'], 'exit_code': result['code'], 'log_bytes': result['bytes'],
+              'tests_required': 18, 'required_ids_sha256': required_ids_sha256,
+              'complete': complete, 'helper_only': True, 'raw_logs_public': False,
+              'native_build': False, 'installed_app': False, 'peer_fixture': False,
+              'packages_uploaded': False,
+          }, sort_keys=True), flush=True)
+          if not passed: raise SystemExit(1)
