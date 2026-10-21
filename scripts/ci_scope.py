@@ -177,6 +177,75 @@ def scanner_step_only(before, after):
         return False
 
 
+def helpers_host_provisioning_only(before, after):
+    """Recognize only the reviewed two-step addition to the existing helper job.
+
+    Every other workflow byte must match, including the scanner and native
+    jobs. Unknown helper layouts, removals and partial/repeated additions keep
+    the workflow in the normal fail-closed native classification.
+    """
+    original_job = b"""  helpers:
+    name: Validation helper tests
+    needs: scope
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check scope and packaging helpers
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+          python3 -m compileall -q scripts
+          node --check scripts/element_call_peer.mjs
+          node --check scripts/element_call_stock_peer.mjs
+          python3 scripts/package.py --check
+
+"""
+    addition = b"""      - name: Verify checkout identity before host provisioning
+        shell: bash
+        env:
+          REVIEWED_SOURCE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REVIEWED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"
+      - name: Tighten hosted notice tree permissions before candidate imports
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          # Bootstrap from this immutable reviewed workflow revision, including
+          # when the selected package source predates the provisioning helper.
+          git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |
+            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS /usr/bin/python3 -I -B -
+"""
+    marker = b"      - name: Check scope and packaging helpers\n"
+    try:
+        contents = [subprocess.run(
+            ["git", "show", revision + ":.github/workflows/ci.yml"],
+            check=True, capture_output=True, timeout=10,
+        ).stdout for revision in (before, after)]
+        if any(len(content) > 1024 * 1024 for content in contents):
+            return False
+        original, updated = contents
+        # Do not normalize YAML or remove all matching names: duplicates and
+        # altered commands must never disappear behind this exact exception.
+        names = (b"Verify checkout identity before host provisioning",
+                 b"Tighten hosted notice tree permissions before candidate imports")
+        if (original.count(original_job) != 1
+                or re.findall(rb"^  helpers:[^\n]*\n", original, re.MULTILINE) != [b"  helpers:\n"]
+                or any(name in original or updated.count(name) != 1 for name in names)):
+            return False
+        updated_job = original_job.replace(marker, addition + marker, 1)
+        return updated == original.replace(original_job, updated_job, 1)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def changed_paths(event, event_name):
     if event_name == "workflow_dispatch":
         return [], True
@@ -202,7 +271,8 @@ def changed_paths(event, event_name):
         # Missing history must widen verification, never silently skip it.
         return [], True
     paths = [p.decode("utf-8", errors="surrogateescape") for p in result.stdout.split(b"\0") if p]
-    if ".github/workflows/ci.yml" in paths and scanner_step_only(before, after):
+    if ".github/workflows/ci.yml" in paths and (scanner_step_only(before, after)
+                                               or helpers_host_provisioning_only(before, after)):
         paths.remove(".github/workflows/ci.yml")
     return paths, False
 

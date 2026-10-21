@@ -1,10 +1,13 @@
 import subprocess
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.ci_scope import (MACOS, PLATFORMS, WAYLAND_UNRELATED_NATIVE_INPUTS,
                               WAYLAND_UNRELATED_THEME_INPUTS,
-                              WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS, changed_paths, classify, scanner_step_only)
+                              WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS, changed_paths, classify,
+                              helpers_host_provisioning_only, scanner_step_only)
 
 
 class ScopeTests(unittest.TestCase):
@@ -249,6 +252,146 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(paths, ["docs/a file.md", "packaging/linux.toml"])
         self.assertFalse(all_platforms)
         self.assertEqual(run.call_args.args[0][-1], "a" * 40 + "..." + "b" * 40)
+
+
+class HostProvisionScopeTests(unittest.TestCase):
+    # Independently retain the reviewed workflow text, not the classifier's
+    # constant. Command, identity and privilege changes must fail closed.
+    ADDITION = b"""      - name: Verify checkout identity before host provisioning
+        shell: bash
+        env:
+          REVIEWED_SOURCE: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REVIEWED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"
+      - name: Tighten hosted notice tree permissions before candidate imports
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          # Bootstrap from this immutable reviewed workflow revision, including
+          # when the selected package source predates the provisioning helper.
+          git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |
+            sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS /usr/bin/python3 -I -B -
+"""
+
+    def setUp(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_bytes()
+        # Exercise the actual workflow both before and after the additive port.
+        self.assertLessEqual(workflow.count(self.ADDITION), 1)
+        self.before = workflow.replace(self.ADDITION, b"", 1)
+        marker = b"      - name: Check scope and packaging helpers\n"
+        self.assertEqual(self.before.count(marker), 1)
+        self.after = self.before.replace(marker, self.ADDITION + marker, 1)
+
+    def recognized(self, before, after):
+        with patch("scripts.ci_scope.subprocess.run", side_effect=[
+                SimpleNamespace(stdout=before), SimpleNamespace(stdout=after)]):
+            return helpers_host_provisioning_only("a" * 40, "b" * 40)
+
+    def selected(self, after, other_paths=(), event_name="push"):
+        paths = [".github/workflows/ci.yml", *other_paths]
+        event = {"before": "a" * 40, "after": "b" * 40}
+        if event_name == "pull_request":
+            event = {"pull_request": {"base": {"sha": "a" * 40}, "head": {"sha": "b" * 40}}}
+        # First pair belongs to the unchanged scanner exception; the second
+        # belongs to the new exact helper addition recognizer.
+        with patch("scripts.ci_scope.subprocess.run", side_effect=[
+                SimpleNamespace(stdout=b"\0".join(path.encode() for path in paths) + b"\0"),
+                SimpleNamespace(stdout=self.before), SimpleNamespace(stdout=after),
+                SimpleNamespace(stdout=self.before), SimpleNamespace(stdout=after)]):
+            selected, forced = changed_paths(event, event_name)
+        self.assertFalse(forced)
+        return selected, classify(selected)
+
+    def test_exact_addition_preserves_helper_and_manual_package_selection(self):
+        self.assertTrue(self.recognized(self.before, self.after))
+        helpers = ["scripts/harden_linux_notice_host.py", "scripts/tests/test_harden_linux_notice_host.py",
+                   ".github/workflows/package-qa.yml", "packaging/linux/appimage_capture_worker.py"]
+        for event in ("push", "pull_request"):
+            with self.subTest(event=event):
+                paths, selected = self.selected(self.after, helpers, event)
+                self.assertEqual(paths, helpers)
+                self.assertFalse(selected["native"])
+                self.assertEqual(classify(paths, force_all=True)["native_matrix"]["os"], list(PLATFORMS))
+
+    def test_partial_reordered_removed_and_repeated_additions_fail_closed(self):
+        split = self.ADDITION.index(b"      - name: Tighten hosted notice")
+        first, second = self.ADDITION[:split], self.ADDITION[split:]
+        for changed in (self.before, self.after.replace(first, b"", 1),
+                        self.after.replace(second, b"", 1),
+                        self.after.replace(self.ADDITION, second + first, 1),
+                        self.after.replace(self.ADDITION, self.ADDITION * 2, 1)):
+            with self.subTest(changed=changed[-40:]):
+                self.assertFalse(self.recognized(self.before, changed))
+        self.assertFalse(self.recognized(self.after, self.before))
+        self.assertFalse(self.recognized(self.after, self.after))
+
+    def test_changed_identity_privilege_command_and_timeout_fail_closed(self):
+        for old, new in ((b"REVIEWED_SOURCE: ${{ github.sha }}", b"REVIEWED_SOURCE: attacker"),
+                         (b"set -euo pipefail", b"set +e"),
+                         (b"timeout-minutes: 5", b"timeout-minutes: 6"),
+                         (b"git rev-parse HEAD", b"git rev-parse main"),
+                         (b"harden_linux_notice_host.py", b"different-helper.py"),
+                         (b"sudo --preserve-env=", b"sudo -E --preserve-env="),
+                         (b"/usr/bin/python3 -I -B -", b"python3 -")):
+            with self.subTest(command=old):
+                changed = self.after.replace(self.ADDITION, self.ADDITION.replace(old, new, 1), 1)
+                paths, selected = self.selected(changed)
+                self.assertEqual(paths, [".github/workflows/ci.yml"])
+                self.assertEqual(selected["native_matrix"]["os"], list(PLATFORMS))
+                self.assertTrue(selected["wayland"])
+
+    def test_other_workflow_bytes_and_mixed_scanner_edits_remain_native(self):
+        for old, new in ((b"cargo fmt --all -- --check", b"cargo fmt --all"),
+                         (b"persist-credentials: false", b"persist-credentials: true"),
+                         (b"../trusted/scripts/scan_history.py", b"scripts/scan_history.py"),
+                         (b"contents: read", b"contents: write")):
+            with self.subTest(outside=old):
+                self.assertIn(old, self.after)
+                _, selected = self.selected(self.after.replace(old, new, 1))
+                self.assertEqual(selected["native_matrix"]["os"], list(PLATFORMS))
+                self.assertTrue(selected["wayland"])
+
+    def test_unknown_helper_layout_duplicate_job_or_misplaced_steps_fail_closed(self):
+        for before, after in (
+                (self.before.replace(b"    name: Validation helper tests\n", b"    name: Other helpers\n", 1),
+                 self.after.replace(b"    name: Validation helper tests\n", b"    name: Other helpers\n", 1)),
+                (self.before + b"  helpers: {}\n", self.after + b"  helpers: {}\n"),
+                (self.before, self.ADDITION + self.before),
+                (self.before, self.after + b"  unknown-job: {}\n"),
+                (self.before, self.after.replace(b"\n", b"\r\n")),
+                (self.before, self.after + b"\0")):
+            with self.subTest(tail=after[-40:]):
+                self.assertFalse(self.recognized(before, after))
+
+    def test_mixed_shared_native_or_unknown_paths_keep_all_platforms(self):
+        for path in ("Cargo.lock", "crates/morpheus-matrix/src/lib.rs", "new-build-input.conf"):
+            with self.subTest(path=path):
+                paths, selected = self.selected(self.after, [path])
+                self.assertEqual(paths, [path])
+                self.assertEqual(selected["native_matrix"]["os"], list(PLATFORMS))
+                self.assertTrue(selected["wayland"])
+
+    def test_scanner_only_edits_keep_the_existing_separate_exception(self):
+        changed = self.before.replace(b"../trusted/scripts/scan_history.py",
+                                      b"../trusted/scripts/reviewed_scanner.py", 1)
+        self.assertNotEqual(changed, self.before)
+        with patch("scripts.ci_scope.helpers_host_provisioning_only", side_effect=AssertionError):
+            paths, selected = self.selected(changed)
+        self.assertEqual(paths, [])
+        self.assertFalse(selected["native"])
+
+    def test_oversized_or_unreadable_workflow_fails_closed(self):
+        self.assertFalse(self.recognized(self.before + b"#" * (1024 * 1024), self.after))
+        self.assertFalse(self.recognized(self.before, self.after + b"#" * (1024 * 1024)))
+        for error in (OSError("git unavailable"), subprocess.CalledProcessError(128, "git"),
+                      subprocess.TimeoutExpired("git", 10)):
+            with self.subTest(error=type(error).__name__):
+                with patch("scripts.ci_scope.subprocess.run", side_effect=error):
+                    self.assertFalse(helpers_host_provisioning_only("a" * 40, "b" * 40))
 
 
 class ScannerScopeTests(unittest.TestCase):
