@@ -1,0 +1,397 @@
+// Manage which existing rooms one joined Space lists. Rust
+// (space_management.rs) owns every value in SpaceRooms and every request;
+// this file lays out the joined rooms and the review of one change, and
+// reports explicit choices. Add and Remove each open a review that states
+// what will change, and only Confirm writes anything. Removing never leaves
+// or deletes the room, and never touches another Space. A room whose link is
+// not known offers Check, which reviews from a fresh read of that link.
+//
+// Keyboard: the search field leads. Up and Down select a room, Enter reviews
+// it, and Escape cancels a review, then clears the search, then closes. In a
+// review, the arrows and Page keys scroll it; Cancel and Confirm stay below.
+//
+// The panel is modal: its backdrop takes every pointer and wheel event that
+// the dialog does not.
+
+import { ListView, ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton } from "controls.slint";
+
+export struct SpaceRoomEntry {
+    // The stable Matrix room ID.
+    id: string,
+    name: string,
+    initials: string,
+    // In this Space or not, and whether it is a Space itself.
+    detail: string,
+    // Listed by this Space; meaningful only when link-known.
+    linked: bool,
+    // False when the link could not be read or a write left it unknown.
+    link-known: bool,
+    is-space: bool,
+}
+
+export struct SpaceRoomsPalette {
+    ink: color,
+    muted: color,
+    accent: color,
+    surface: color,
+    elevated: color,
+    hover: color,
+    divider: color,
+    error: color,
+    selection: color,
+    selection-ink: color,
+    has-selection-ink: bool,
+    focus: color,
+    scrim: color,
+}
+
+export global SpaceRooms {
+    in-out property <bool> open: false;
+    in-out property <string> space-id;
+    in-out property <string> title;
+    // What this account may do here, read fresh when the panel opened.
+    in-out property <bool> can-manage: false;
+    in-out property <string> permission;
+    in-out property <[SpaceRoomEntry]> rooms;
+    in-out property <string> summary;
+    in-out property <string> query;
+    in-out property <bool> loading: false;
+    in-out property <string> error;
+    in-out property <string> notice;
+    // A reviewed change waiting for Confirm.
+    in-out property <bool> reviewing: false;
+    in-out property <string> review-title;
+    in-out property <[string]> review-lines;
+    in-out property <string> confirm-label;
+    // A review read or the one write is under way.
+    in-out property <bool> busy: false;
+    // Space ID and name.
+    callback show(string, string);
+    callback filter(string);
+    // Room ID, and 0 to add it, 1 to remove it, or 2 to decide from a
+    // fresh read of its link (space_management.rs REVIEW_*).
+    callback review(string, int);
+    callback confirm();
+    callback cancel-review();
+    callback refresh();
+    callback close();
+    // The enclosing window retires the exact form on privacy/navigation changes.
+    callback context-changed();
+}
+
+component SpaceRoomRow inherits Rectangle {
+    in property <SpaceRoomEntry> entry;
+    in property <bool> current;
+    in property <bool> actionable;
+    in property <float> text-scale: 1;
+    in property <ControlColors> button-colors;
+    in property <SpaceRoomsPalette> palette;
+    callback chosen();
+    property <bool> inked: root.current && root.palette.has-selection-ink;
+
+    background: root.current ? root.palette.selection : root.palette.elevated;
+    border-radius: StyleTokens.radius * 0.8;
+    accessible-role: list-item;
+    accessible-item-selected: root.current;
+    accessible-label: (root.entry.is-space ? "Space " : "Room ") + root.entry.name + ", " + root.entry.detail;
+    TouchArea {
+        width: parent.width; height: parent.height;
+        clicked => { root.chosen(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 6px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 30px * min(1.4, root.text-scale); height: self.width;
+                border-radius: root.entry.is-space ? StyleTokens.radius * 0.6 : self.width / 2;
+                background: root.palette.hover;
+                accessible-role: none;
+                Text {
+                    text: root.entry.initials;
+                    color: root.palette.ink;
+                    font-size: 12px * root.text-scale; font-weight: 700;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1; alignment: center; spacing: 2px;
+            Text {
+                text: (root.entry.is-space ? "◇ " : "# ") + root.entry.name;
+                color: root.inked ? root.palette.selection-ink : root.palette.ink;
+                font-size: 13px * root.text-scale; font-weight: 700; overflow: elide;
+            }
+            Text {
+                text: root.entry.detail;
+                color: root.inked ? root.palette.selection-ink : root.entry.linked ? root.palette.accent : root.palette.muted;
+                font-size: 11px * root.text-scale; overflow: elide;
+            }
+        }
+        TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+            text: !root.entry.link-known ? "Check…" : root.entry.linked ? "Remove…" : "Add…";
+            label: !root.entry.link-known ? "Check whether this Space lists " + root.entry.name + ", then review adding or removing it"
+                : root.entry.linked ? "Review removing " + root.entry.name + " from this Space" : "Review adding " + root.entry.name + " to this Space";
+            enabled: root.actionable;
+            activated => { SpaceRooms.review(root.entry.id, !root.entry.link-known ? 2 : root.entry.linked ? 1 : 0); }
+        }
+    }
+}
+
+export component SpaceRoomsPanel inherits FocusScope {
+    in property <float> text-scale: 1;
+    in property <ControlColors> button-colors;
+    in property <SpaceRoomsPalette> palette;
+    property <int> current: 0;
+    property <length> row-height: 18px + 40px * root.text-scale;
+    property <length> row-gap: 4px;
+    property <int> count: SpaceRooms.rooms.length;
+    property <bool> actionable: SpaceRooms.can-manage && !SpaceRooms.busy && !SpaceRooms.reviewing;
+
+    focus-on-tab-navigation: false;
+    init => { search-input.focus(); }
+    changed count => {
+        root.current = max(0, min(root.current, root.count - 1));
+    }
+    // A review takes the keyboard to its own Cancel (see its init); when it
+    // ends, the search field leads again.
+    property <bool> reviewing: SpaceRooms.reviewing;
+    changed reviewing => { if !root.reviewing { search-input.focus(); } }
+
+    function reveal() {
+        let top = root.current * (root.row-height + root.row-gap);
+        if top < -rooms-list.viewport-y {
+            rooms-list.viewport-y = -top;
+        } else if top + root.row-height > -rooms-list.viewport-y + rooms-list.visible-height {
+            rooms-list.viewport-y = -(top + root.row-height - rooms-list.visible-height);
+        }
+    }
+    function choose() {
+        if root.actionable && root.current >= 0 && root.current < root.count {
+            let entry = SpaceRooms.rooms[root.current];
+            SpaceRooms.review(entry.id, !entry.link-known ? 2 : entry.linked ? 1 : 0);
+        }
+    }
+
+    capture-key-pressed(event) => {
+        if event.text == Key.Escape {
+            if SpaceRooms.busy {
+                SpaceRooms.close();
+            } else if SpaceRooms.reviewing {
+                if !SpaceRooms.busy { SpaceRooms.cancel-review(); }
+            } else if SpaceRooms.query != "" {
+                SpaceRooms.query = "";
+                SpaceRooms.filter("");
+            } else if !SpaceRooms.busy {
+                SpaceRooms.close();
+            }
+            accept
+        } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && close-button.has-focus {
+            done-button.focus();
+            accept
+        } else if event.text == Key.Tab && !event.modifiers.shift && done-button.has-focus {
+            close-button.focus();
+            accept
+        } else if search-input.has-focus && event.text == Key.DownArrow && root.count > 0 {
+            root.current = min(root.count - 1, root.current + 1);
+            root.reveal();
+            accept
+        } else if search-input.has-focus && event.text == Key.UpArrow && root.count > 0 {
+            root.current = max(0, root.current - 1);
+            root.reveal();
+            accept
+        } else { reject }
+    }
+
+    Rectangle {
+        background: root.palette.scrim;
+        // Clicks and the wheel stop here: nothing behind the panel moves.
+        TouchArea {
+            width: parent.width; height: parent.height;
+            scroll-event(event) => { accept }
+        }
+        Rectangle {
+            width: min(640px, parent.width - 40px);
+            height: min(640px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.palette.surface;
+            border-radius: StyleTokens.radius * 1.4;
+            border-color: root.palette.divider; border-width: StyleTokens.line-width;
+            accessible-role: groupbox;
+            accessible-label: "Rooms in Space " + SpaceRooms.title;
+            VerticalLayout {
+                padding: 18px; spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        horizontal-stretch: 1; alignment: center; spacing: 1px;
+                        Text {
+                            text: "Rooms in ◇ " + SpaceRooms.title;
+                            color: root.palette.ink; font-size: 17px * root.text-scale; font-weight: 750;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: SpaceRooms.permission;
+                            color: root.palette.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
+                    }
+                    close-button := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Close";
+                        label: "Close managing the rooms of this Space";
+                        activated => { SpaceRooms.close(); }
+                    }
+                }
+                // A long review (a large text size, long names, every
+                // warning) scrolls inside its box; Cancel and Confirm sit
+                // below the scrolling part, so they are always in the panel.
+                // From either of them, the arrows and Page keys scroll it.
+                if SpaceRooms.reviewing : FocusScope {
+                    focus-on-click: false;
+                    focus-on-tab-navigation: false;
+                    init => { cancel-review.focus(); }
+                    key-pressed(event) => {
+                        if event.text == Key.UpArrow || event.text == Key.DownArrow || event.text == Key.PageUp || event.text == Key.PageDown {
+                            let nudge = 24px * root.text-scale;
+                            let page = max(nudge, review-scroll.visible-height - nudge);
+                            let step = event.text == Key.UpArrow ? nudge : event.text == Key.DownArrow ? -nudge : event.text == Key.PageUp ? page : -page;
+                            review-scroll.content-y = max(min(0px, review-scroll.visible-height - review-scroll.content-height), min(0px, review-scroll.content-y + step));
+                            accept
+                        } else { reject }
+                    }
+                    VerticalLayout {
+                        Rectangle {
+                            border-radius: StyleTokens.radius * 0.8;
+                            border-width: max(2px, StyleTokens.line-width);
+                            border-color: root.palette.accent;
+                            background: root.palette.elevated;
+                            accessible-role: groupbox;
+                            accessible-label: SpaceRooms.review-title;
+                            VerticalLayout {
+                                padding: 10px; spacing: 6px;
+                                review-scroll := ScrollView {
+                                    horizontal-scrollbar-policy: always-off;
+                                    // Its whole height when it fits; at least a
+                                    // few lines when it must scroll.
+                                    min-height: min(review-content.preferred-height, 56px * root.text-scale);
+                                    preferred-height: review-content.preferred-height;
+                                    max-height: review-content.preferred-height;
+                                    vertical-stretch: 1;
+                                    review-content := VerticalLayout {
+                                        padding-right: 12px; spacing: 6px;
+                                        Text {
+                                            text: SpaceRooms.review-title;
+                                            color: root.palette.ink; font-size: 13px * root.text-scale; font-weight: 700;
+                                            wrap: word-wrap;
+                                        }
+                                        for line in SpaceRooms.review-lines : Text {
+                                            text: line;
+                                            color: root.palette.ink; font-size: 12px * root.text-scale; wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px; alignment: end;
+                                    cancel-review := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                        text: "Cancel";
+                                        label: "Cancel this change";
+                                        enabled: !SpaceRooms.busy;
+                                        activated => { SpaceRooms.cancel-review(); }
+                                    }
+                                    TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                        primary: true;
+                                        text: SpaceRooms.busy ? "Saving…" : SpaceRooms.confirm-label;
+                                        label: SpaceRooms.confirm-label + ": " + SpaceRooms.review-title;
+                                        enabled: !SpaceRooms.busy;
+                                        activated => { SpaceRooms.confirm(); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 36px * max(1, root.text-scale);
+                    background: root.palette.elevated;
+                    border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                    border-width: StyleTokens.line-width;
+                    border-color: search-input.has-focus ? root.palette.focus : transparent;
+                    if SpaceRooms.query == "" : Text {
+                        x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                        text: "Search your joined rooms";
+                        color: root.palette.muted; font-size: 12px * root.text-scale; vertical-alignment: center;
+                    }
+                    search-input := TextInput {
+                        x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                        text <=> SpaceRooms.query;
+                        color: root.palette.ink;
+                        selection-background-color: root.palette.selection;
+                        selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                        font-size: 12px * root.text-scale; vertical-alignment: center; single-line: true;
+                        accessible-label: "Search your joined rooms; arrows select, Enter reviews adding or removing, Escape closes";
+                        edited => { root.current = 0; SpaceRooms.filter(self.text); }
+                        accepted => { root.choose(); }
+                    }
+                }
+                // A review takes the room of the summary and the list (their
+                // rows cannot act during it), so it fits at any text size.
+                if !SpaceRooms.reviewing : Text {
+                    text: SpaceRooms.loading ? "Reading this Space…" : SpaceRooms.summary;
+                    color: root.palette.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if SpaceRooms.error != "" : Text {
+                    text: SpaceRooms.error;
+                    color: root.palette.error; font-size: 12px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if SpaceRooms.notice != "" : Text {
+                    text: SpaceRooms.notice;
+                    color: root.palette.accent; font-size: 12px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                // Lazy: only the rows in view are instantiated.
+                rooms-list := ListView {
+                    vertical-stretch: 1;
+                    visible: !SpaceRooms.reviewing;
+                    min-height: SpaceRooms.reviewing ? 0px : 50px;
+                    max-height: SpaceRooms.reviewing ? 0px : 100000px;
+                    horizontal-scrollbar-policy: always-off;
+                    accessible-role: AccessibleRole.list;
+                    accessible-label: "Your joined rooms";
+                    for room[index] in SpaceRooms.rooms : Rectangle {
+                        width: rooms-list.visible-width;
+                        height: root.row-height + root.row-gap;
+                        SpaceRoomRow {
+                            y: 0px; height: root.row-height;
+                            entry: room;
+                            current: index == root.current;
+                            actionable: root.actionable;
+                            text-scale: root.text-scale;
+                            button-colors: root.button-colors;
+                            palette: root.palette;
+                            chosen => { root.current = index; search-input.focus(); }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px; alignment: end;
+                    TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Read again";
+                        label: "Read this Space's rooms again";
+                        enabled: !SpaceRooms.busy && !SpaceRooms.loading;
+                        activated => { SpaceRooms.refresh(); }
+                    }
+                    done-button := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Done";
+                        label: "Done managing the rooms of this Space";
+                        activated => { SpaceRooms.close(); }
+                    }
+                }
+            }
+        }
+    }
+}

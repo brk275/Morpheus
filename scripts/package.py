@@ -59,6 +59,8 @@ def main():
         print(f"Package configuration is valid for {sys.platform}")
         return
     preflight_deb_authors(config, args.formats)
+    if sys.platform.startswith("linux"):
+        raise ValueError("Linux packages require the fixed-client AppImage wrapper; generic and DEB packaging remain blocked")
     if sys.platform.startswith("linux") and os.environ.get("CARGO_PACKAGER_SIGN_PRIVATE_KEY"):
         raise ValueError("Package unsigned first, prepare AppImage metadata, then use the official Cargo Packager signer on the final artifact")
     output = ROOT / config.get("out-dir", "dist")

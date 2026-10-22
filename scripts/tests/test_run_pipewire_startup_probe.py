@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest import mock
@@ -18,6 +19,19 @@ def outcome(passed=True, **overrides):
 
 
 class ProbeOrchestrationTests(unittest.TestCase):
+    def test_stock_services_reject_an_additional_native_client_mapping(self):
+        stock = b"1000-2000 r-xp 0 08:01 42 /usr/lib/x86_64-linux-gnu/libpipewire-0.3.so.0.1005.0\n"
+        owned = b"3000-4000 r-xp 0 08:01 43 /private/libmorpheus-pipewire-0.3.so.0\n"
+        services = {role: SimpleNamespace(pid=100) for role in ("pipewire", "wireplumber", "portal-wlr", "portal")}
+        info = SimpleNamespace(st_mode=0o100644, st_uid=0, st_ino=42, st_dev=os.makedev(8, 1))
+        with mock.patch.object(probe.wayland, "peek_returncode", return_value=None), \
+             mock.patch.object(Path, "resolve", autospec=True, side_effect=lambda path, **_: path), \
+             mock.patch.object(Path, "stat", return_value=info), \
+             mock.patch.object(Path, "open", side_effect=lambda *_args, **_kwargs: io.BytesIO(stock)):
+            self.assertTrue(probe.service_library_facts(services))
+            with mock.patch.object(Path, "open", side_effect=lambda *_args, **_kwargs: io.BytesIO(stock + owned)):
+                self.assertFalse(probe.service_library_facts(services))
+
     def test_public_provenance_retains_only_validated_digest_fields(self):
         record = {"binary_sha256": "a" * 64, "binary": "/private/binary",
                   "provenance": {key: "b" * 64 for key in ("loader_sha256", "configuration_sha256", "build_recipe_sha256")},

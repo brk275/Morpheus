@@ -1,0 +1,455 @@
+// Native pinned-message pane for the selected room. Rust owns the list, the
+// search filter, permissions and every request; this file only lays rows out
+// and reports explicit choices. It cannot import the window's globals, so the
+// window passes resolved appearance preferences and text scale in.
+
+import { ListView } from "std-widgets.slint";
+
+export struct PinnedMessageItem {
+    event-id: string,
+    // The thread root of a threaded message; empty otherwise.
+    thread-id: string,
+    sender: string,
+    sender-id: string,
+    time: string,
+    // Bounded single-line text; empty when the row has none to show.
+    text: string,
+    // Why the row has no text ("Redacted", "Can't decrypt", ...), or empty.
+    status: string,
+    // An attachment description. Nothing is downloaded for it.
+    attachment: string,
+    // The event's encryption does not establish its sender.
+    warning: bool,
+    // A later edit exists; the original text is shown.
+    edited: bool,
+    can-open: bool,
+    can-unpin: bool,
+}
+
+export struct PinnedMessagesPalette {
+    ink: color,
+    muted: color,
+    panel: color,
+    elevated: color,
+    hover: color,
+    accent: color,
+    divider: color,
+    focus: color,
+    selection: color,
+    selection-ink: color,
+    error: color,
+    warning: color,
+    pressed: color,
+    disabled: color,
+    input-surface: color,
+    input-border: color,
+}
+
+// Resolved existing appearance preferences; no independent settings store.
+export struct PinnedMessagesStyle {
+    radius: length,
+    control-radius: length,
+    input-radius: length,
+    line-width: length,
+    focus-width: length,
+    control-padding: length,
+    input-padding: length,
+    sender-font-size: length,
+    timestamp-font-size: length,
+}
+
+// An outlined text button with the window's keyboard behavior.
+component PinnedButton inherits Rectangle {
+    in property <string> text;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <PinnedMessagesPalette> palette;
+    in property <PinnedMessagesStyle> style;
+    in property <float> text-scale: 1;
+    callback activated();
+    min-width: caption.preferred-width + 2 * root.style.control-padding * root.text-scale;
+    height: max(26px, 16px * root.text-scale + 10px);
+    border-radius: root.style.control-radius;
+    border-width: root.style.line-width;
+    border-color: root.palette.divider;
+    background: root.enabled && hit.pressed ? root.palette.pressed
+        : root.enabled && hit.has-hover ? root.palette.hover : transparent;
+    opacity: root.enabled ? 1 : 0.55;
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: root.label != "" ? root.label : root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if root.enabled { root.activated(); }
+    }
+    caption := Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.text;
+        color: root.enabled ? root.palette.ink : root.palette.disabled;
+        font-size: 11px * root.text-scale;
+        font-weight: 650;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    keyboard-focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled { root.activated(); }
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            keyboard-focus.focus();
+            root.activated();
+        }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: root.style.focus-width;
+        border-color: root.palette.focus;
+        background: transparent;
+    }
+}
+
+// One pinned entry. Redacted, undecryptable and unavailable entries keep a
+// row so the pinned list is never silently shorter than it is.
+component PinnedRow inherits Rectangle {
+    in property <PinnedMessageItem> item;
+    in property <PinnedMessagesPalette> palette;
+    in property <PinnedMessagesStyle> style;
+    in property <float> text-scale: 1;
+    in property <bool> busy;
+    callback open();
+    callback unpin();
+    background: root.palette.elevated;
+    border-radius: root.style.radius;
+    accessible-role: text;
+    accessible-label: (root.item.sender != "" ? root.item.sender : "Unknown sender")
+        + (root.item.time != "" ? ", " + root.item.time : "")
+        + (root.item.text != "" ? ": " + root.item.text : "")
+        + (root.item.attachment != "" ? ", " + root.item.attachment : "")
+        + (root.item.status != "" ? ", " + root.item.status : "")
+        + (root.item.edited ? ", edited; original text shown" : "")
+        + (root.item.warning ? ", sender not confirmed by encryption" : "")
+        + (root.item.thread-id != "" ? ", in a thread" : "");
+    VerticalLayout {
+        padding: 9px;
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                horizontal-stretch: 1;
+                text: root.item.sender != "" ? root.item.sender : "Unknown sender";
+                color: root.palette.accent;
+                font-size: (root.style.sender-font-size > 0px ? root.style.sender-font-size : 11px) * root.text-scale;
+                font-weight: 700;
+                overflow: elide;
+                accessible-role: none;
+            }
+            Text {
+                text: root.item.time;
+                color: root.palette.muted;
+                font-size: root.style.timestamp-font-size * root.text-scale;
+                overflow: elide;
+                accessible-role: none;
+            }
+        }
+        if root.item.sender-id != "" && root.item.sender-id != root.item.sender : Text {
+            text: root.item.sender-id;
+            color: root.palette.muted;
+            font-size: 10px * root.text-scale;
+            overflow: elide;
+            accessible-role: none;
+        }
+        if root.item.text != "" : Text {
+            text: root.item.text;
+            color: root.palette.ink;
+            font-size: 12px * root.text-scale;
+            wrap: word-wrap;
+            min-width: 0px;
+            accessible-role: none;
+        }
+        if root.item.attachment != "" : Text {
+            text: root.item.attachment;
+            color: root.palette.ink;
+            font-size: 11px * root.text-scale;
+            font-italic: true;
+            overflow: elide;
+            accessible-role: none;
+        }
+        if root.item.status != "" : Text {
+            text: root.item.status;
+            color: root.palette.muted;
+            font-size: 11px * root.text-scale;
+            font-italic: true;
+            wrap: word-wrap;
+            min-width: 0px;
+            accessible-role: none;
+        }
+        if root.item.edited || root.item.warning || root.item.thread-id != "" : Text {
+            text: (root.item.thread-id != "" ? "In a thread" : "")
+                + (root.item.thread-id != "" && (root.item.edited || root.item.warning) ? " · " : "")
+                + (root.item.edited ? "Edited; original text shown" : "")
+                + (root.item.edited && root.item.warning ? " · " : "")
+                + (root.item.warning ? "Sender not confirmed by encryption" : "");
+            color: root.item.warning ? root.palette.warning : root.palette.muted;
+            font-size: 10px * root.text-scale;
+            wrap: word-wrap;
+            min-width: 0px;
+            accessible-role: none;
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+            if root.item.can-open : PinnedButton {
+                text: "Open";
+                label: "Open pinned message from " + (root.item.sender != "" ? root.item.sender : "unknown sender");
+                palette: root.palette;
+                style: root.style;
+                text-scale: root.text-scale;
+                activated => { root.open(); }
+            }
+            if root.item.can-unpin : PinnedButton {
+                text: "Unpin";
+                label: "Unpin message from " + (root.item.sender != "" ? root.item.sender : "unknown sender");
+                enabled: !root.busy;
+                palette: root.palette;
+                style: root.style;
+                text-scale: root.text-scale;
+                activated => { root.unpin(); }
+            }
+        }
+    }
+}
+
+export component PinnedMessagesPanel inherits Rectangle {
+    in property <[PinnedMessageItem]> items;
+    // 0 idle, 1 loading, 2 ready, 3 failed.
+    in property <int> status: 0;
+    in property <string> error;
+    in property <string> notice;
+    // "12 pinned messages", or how many of them are shown.
+    in property <string> summary;
+    // Why pins cannot be changed here, or empty.
+    in property <string> read-only-note;
+    in property <bool> busy;
+    // A live session with a selected room. Otherwise the pane is locked.
+    in property <bool> available;
+    in-out property <string> filter;
+    in property <int> focus-request: 0;
+    in property <PinnedMessagesPalette> palette;
+    in property <PinnedMessagesStyle> style;
+    in property <float> text-scale: 1;
+    callback filter-edited(string);
+    callback refresh();
+    callback open-message(string, string);
+    callback unpin(string);
+
+    background: root.palette.panel;
+    accessible-role: region;
+    accessible-label: "Pinned messages";
+    forward-focus: search;
+
+    changed focus-request => {
+        if root.available { search.focus(); }
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            background: root.palette.panel;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Pinned messages";
+                        color: root.palette.ink;
+                        font-size: 15px * root.text-scale;
+                        font-weight: 750;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    PinnedButton {
+                        text: root.status == 1 ? "Loading…" : "Refresh";
+                        label: "Refresh pinned messages";
+                        enabled: root.available && root.status != 1;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        activated => { root.refresh(); }
+                    }
+                }
+                Rectangle {
+                    height: max(32px, 16px * root.text-scale + 14px);
+                    background: root.palette.input-surface;
+                    border-radius: root.style.input-radius;
+                    border-width: search.has-focus ? root.style.focus-width : root.style.line-width;
+                    border-color: search.has-focus ? root.palette.focus : root.palette.input-border;
+                    HorizontalLayout {
+                        padding-left: root.style.input-padding * root.text-scale;
+                        padding-right: root.style.input-padding * root.text-scale;
+                        Rectangle {
+                            // The typed filter must not widen the pane.
+                            min-width: 0px;
+                            clip: true;
+                            search := TextInput {
+                                width: parent.width;
+                                height: parent.height;
+                                text <=> root.filter;
+                                color: root.palette.ink;
+                                selection-background-color: root.palette.selection;
+                                selection-foreground-color: root.palette.selection-ink;
+                                font-size: 12px * root.text-scale;
+                                vertical-alignment: center;
+                                single-line: true;
+                                enabled: root.available;
+                                accessible-label: "Search pinned messages";
+                                edited => { root.filter-edited(self.text); }
+                                key-pressed(event) => {
+                                    if event.text == Key.Escape && self.text != "" {
+                                        self.text = "";
+                                        root.filter-edited("");
+                                        accept
+                                    } else {
+                                        reject
+                                    }
+                                }
+                            }
+                            if root.filter == "" : Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: "Search pinned messages";
+                                color: root.palette.muted;
+                                font-size: 12px * root.text-scale;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                accessible-role: none;
+                            }
+                        }
+                    }
+                }
+                if root.available && root.summary != "" : Text {
+                    text: root.summary;
+                    color: root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    min-width: 0px;
+                }
+                if root.available && root.read-only-note != "" : Text {
+                    text: root.read-only-note;
+                    color: root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    min-width: 0px;
+                }
+            }
+        }
+        Rectangle { height: root.style.line-width; background: root.palette.divider; }
+        if !root.available : VerticalLayout {
+            padding: 12px;
+            Text {
+                text: "Open a joined room to see its pinned messages.";
+                color: root.palette.muted;
+                font-size: 12px * root.text-scale;
+                wrap: word-wrap;
+                min-width: 0px;
+                accessible-live-region: polite;
+            }
+        }
+        if root.available && root.status == 1 : VerticalLayout {
+            padding: 12px;
+            Text {
+                text: "Loading pinned messages…";
+                color: root.palette.muted;
+                font-size: 12px * root.text-scale;
+                wrap: word-wrap;
+                min-width: 0px;
+                accessible-live-region: polite;
+            }
+        }
+        if root.available && root.status == 3 : VerticalLayout {
+            padding: 12px;
+            spacing: 8px;
+            Text {
+                text: root.error;
+                color: root.palette.error;
+                font-size: 12px * root.text-scale;
+                wrap: word-wrap;
+                min-width: 0px;
+                accessible-live-region: polite;
+            }
+            HorizontalLayout {
+                alignment: start;
+                PinnedButton {
+                    text: "Try again";
+                    label: "Try loading pinned messages again";
+                    palette: root.palette;
+                    style: root.style;
+                    text-scale: root.text-scale;
+                    activated => { root.refresh(); }
+                }
+            }
+        }
+        if root.available && root.status == 2 && root.items.length == 0 : VerticalLayout {
+            padding: 12px;
+            Text {
+                text: root.filter == "" ? "No messages are pinned in this room." : "No pinned messages match your search.";
+                color: root.palette.muted;
+                font-size: 12px * root.text-scale;
+                wrap: word-wrap;
+                min-width: 0px;
+                accessible-live-region: polite;
+            }
+        }
+        if root.available && root.notice != "" : VerticalLayout {
+            padding: 12px;
+            Text {
+                text: root.notice;
+                color: root.palette.muted;
+                font-size: 11px * root.text-scale;
+                wrap: word-wrap;
+                min-width: 0px;
+                accessible-live-region: polite;
+            }
+        }
+        if root.available && root.status == 3 && root.items.length > 0 : Rectangle { height: root.style.line-width; background: root.palette.divider; }
+        pinned-list := ListView {
+            vertical-stretch: 1;
+            horizontal-scrollbar-policy: always-off;
+            visible: root.available && root.items.length > 0;
+            accessible-role: list;
+            accessible-label: "Pinned messages, newest first";
+            for item in root.items : Rectangle {
+                width: pinned-list.visible-width;
+                background: transparent;
+                VerticalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-top: 4px;
+                    padding-bottom: 4px;
+                    PinnedRow {
+                        item: item;
+                        palette: root.palette;
+                        style: root.style;
+                        text-scale: root.text-scale;
+                        busy: root.busy;
+                        open => { root.open-message(item.event-id, item.thread-id); }
+                        unpin => { root.unpin(item.event-id); }
+                    }
+                }
+            }
+        }
+    }
+}

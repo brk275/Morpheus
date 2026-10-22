@@ -4,7 +4,8 @@
 Every capture uses a fresh PID namespace and private desktop. Private libraries
 are passed to one test ELF through the verified system loader's --library-path;
 no installation, loader environment override, or artifact upload occurs. A
-patched-client pass never substitutes for the system-library acceptance gate.
+patched-client experiment never substitutes for the owned-native production gate;
+recorded stock-client failures retain their original failed status.
 """
 from __future__ import annotations
 
@@ -83,41 +84,8 @@ def public_provenance(record):
 
 
 def service_library_facts(services) -> bool:
-    """All three PipeWire clients stay mapped to ordinary root-owned libraries.
-
-    Only a boolean escapes; maps contain private addresses and process paths.
-    The frontend may not use PipeWire itself, but any mapping it has must also
-    be the system library. Leaders remain unreaped throughout the fixture.
-    """
-    try:
-        for role in ("pipewire", "wireplumber", "portal-wlr", "portal"):
-            process = services.get(role)
-            if process is None or wayland.peek_returncode(process) is not None:
-                return False
-            with Path(f"/proc/{process.pid}/maps").open("rb") as source:
-                maps = source.read(2 * 1024 * 1024 + 1)
-            if len(maps) > 2 * 1024 * 1024:
-                return False
-            libraries = set()
-            for line in maps.decode("utf-8", errors="strict").splitlines():
-                fields = line.split(maxsplit=5)
-                if len(fields) != 6 or "libpipewire-0.3.so" not in fields[5]:
-                    continue
-                path = Path(fields[5]).resolve(strict=True)
-                metadata = path.stat()
-                major, minor = fields[3].split(":")
-                if (path.parent != Path("/usr/lib/x86_64-linux-gnu")
-                        or not re.fullmatch(r"libpipewire-0\.3\.so\.[0-9.]+", path.name)
-                        or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
-                        or metadata.st_mode & 0o022 or int(fields[4]) != metadata.st_ino
-                        or (int(major, 16), int(minor, 16)) != (os.major(metadata.st_dev), os.minor(metadata.st_dev))):
-                    return False
-                libraries.add(path)
-            if len(libraries) != (0 if role == "portal" and not libraries else 1):
-                return False
-        return True
-    except (OSError, ValueError, RuntimeError):
-        return False
+    # Existing diagnostic API shares the ordinary gate's stock-service proof.
+    return wayland.service_library_facts(services)
 
 
 class PrivateClient:
@@ -171,7 +139,7 @@ def prepare(root: Path):
     clients = preparation.prepare_clients(root, command)
     output = command("control_build", ["cargo", "test", "--locked", "-p", "morpheus-rtc",
                      "--features", "native-devices", "--test", "wayland_capture", "--no-run",
-                     "--message-format=json"], cwd=REPO, env=runtime_environment(dict(os.environ)),
+                     "--message-format=json"], cwd=REPO, env={**runtime_environment(dict(os.environ)), "MORPHEUS_PIPEWIRE_CLIENT_VARIANT": "system-probe"},
                      timeout=900, output_limit=8 * 1024 * 1024)
     binaries = []
     for line in output.splitlines():
@@ -243,7 +211,8 @@ def run():
             session_root = root / variant
             session_root.mkdir(mode=0o700)
             wayland.configs(session_root)
-            env = wayland.private_environment(session_root)
+            env = {**wayland.private_environment(session_root),
+                   "MORPHEUS_PIPEWIRE_CLIENT_VARIANT": "system-probe"}
             invocation = namespace_command([sys.executable, script, "--contained", str(session_root),
                 "--prepared", str(prepared), "--variant", variant], root / f"namespace-{variant}", env)
             print("PipeWire startup comparison: " + variant, flush=True)

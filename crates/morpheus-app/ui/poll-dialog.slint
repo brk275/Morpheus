@@ -1,0 +1,232 @@
+// Create a native Matrix poll in the current room. Rust owns the draft and
+// its validation; opening the dialog or editing it never sends anything, only
+// Send does. The window passes resolved colors and surfaces; geometry and
+// interaction states come from StyleTokens.
+
+import { ScrollView } from "std-widgets.slint";
+import { PollPalette, PollUiState } from "poll-card.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton, TokenCheck, TokenField } from "controls.slint";
+
+export component PollCreateDialog inherits FocusScope {
+    in property <PollPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> corner: 10px;
+    in property <color> surface;
+    in property <color> scrim;
+    property <ControlColors> button-colors: {
+        ink: root.palette.ink,
+        muted: root.palette.muted,
+        surface: root.palette.elevated,
+        hover: root.palette.hover,
+        outline: root.palette.divider,
+        accent: root.palette.accent,
+        accent-ink: root.palette.accent-ink,
+    };
+
+    focus-on-tab-navigation: false;
+    init => { question.focus(); }
+    // Keep Tab inside the dialog: the question field is first, Send (or
+    // Cancel while Send is unavailable) is last.
+    capture-key-pressed(event) => {
+        if PollUiState.dialog-busy && (event.text == Key.Tab || event.text == Key.Backtab) {
+            accept
+        } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && question.has-focus {
+            if send.enabled {
+                send.focus();
+            } else {
+                cancel.focus();
+            }
+            accept
+        } else if event.text == Key.Tab && !event.modifiers.shift && (send.has-focus || (cancel.has-focus && !send.enabled)) {
+            question.focus();
+            accept
+        } else {
+            reject
+        }
+    }
+    key-pressed(event) => {
+        if event.text == Key.Escape && !PollUiState.dialog-busy {
+            PollUiState.cancel-poll();
+            accept
+        } else {
+            reject
+        }
+    }
+
+    Rectangle {
+        background: root.scrim;
+        TouchArea { }
+        Rectangle {
+            width: min(520px * root.text-scale, parent.width - 32px);
+            height: min(620px * root.text-scale, parent.height - 32px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.surface;
+            border-radius: root.corner * 1.4;
+            border-width: StyleTokens.line-width;
+            border-color: root.palette.divider;
+            accessible-role: region;
+            accessible-label: "Create a poll";
+            VerticalLayout {
+                padding: 22px;
+                spacing: 12px;
+                Text {
+                    text: "Create a poll";
+                    color: root.palette.ink;
+                    font-size: 21px * root.text-scale;
+                    font-weight: 750;
+                }
+                Text {
+                    text: "In " + PollUiState.dialog-room + ". Nothing is sent until you choose Send poll.";
+                    color: root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                }
+                body := ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        width: body.visible-width;
+                        spacing: 8px;
+                        Text {
+                            text: "Question";
+                            color: root.palette.ink;
+                            font-size: 12px * root.text-scale;
+                            font-weight: 650;
+                            accessible-role: none;
+                        }
+                        question := TokenField {
+                            text: PollUiState.dialog-question;
+                            placeholder-text: "Ask a question";
+                            enabled: !PollUiState.dialog-busy;
+                            label: "Poll question";
+                            colors: root.button-colors;
+                            text-scale: root.text-scale;
+                            edited(text) => { PollUiState.question-edited(text); }
+                        }
+                        Text {
+                            text: "Options";
+                            color: root.palette.ink;
+                            font-size: 12px * root.text-scale;
+                            font-weight: 650;
+                            accessible-role: none;
+                        }
+                        for answer[index] in PollUiState.dialog-answers : HorizontalLayout {
+                            spacing: 8px;
+                            TokenField {
+                                text: answer;
+                                placeholder-text: "Option " + (index + 1);
+                                enabled: !PollUiState.dialog-busy;
+                                label: "Poll option " + (index + 1);
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
+                                edited(text) => { PollUiState.answer-edited(index, text); }
+                            }
+                            TokenButton {
+                                text: "Remove";
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
+                                enabled: !PollUiState.dialog-busy && PollUiState.dialog-answers.length > 2;
+                                label: "Remove poll option " + (index + 1);
+                                activated => { PollUiState.remove-answer(index); }
+                            }
+                        }
+                        HorizontalLayout {
+                            alignment: start;
+                            TokenButton {
+                                text: "Add option";
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
+                                enabled: !PollUiState.dialog-busy && PollUiState.dialog-answers.length < 20;
+                                label: "Add a poll option";
+                                activated => { PollUiState.add-answer(); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "People can choose up to";
+                                color: root.palette.ink;
+                                font-size: 12px * root.text-scale;
+                                vertical-alignment: center;
+                                accessible-role: none;
+                            }
+                            TokenButton {
+                                text: "−";
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
+                                enabled: !PollUiState.dialog-busy && PollUiState.dialog-max > 1;
+                                label: "Allow fewer choices per person";
+                                activated => { PollUiState.change-max(-1); }
+                            }
+                            Text {
+                                text: PollUiState.dialog-max == 1 ? "1 option" : PollUiState.dialog-max + " options";
+                                color: root.palette.ink;
+                                font-size: 12px * root.text-scale;
+                                vertical-alignment: center;
+                                accessible-label: "People can choose up to " + self.text;
+                                accessible-live-region: polite;
+                            }
+                            TokenButton {
+                                text: "+";
+                                colors: root.button-colors;
+                                text-scale: root.text-scale;
+                                enabled: !PollUiState.dialog-busy && PollUiState.dialog-max < PollUiState.dialog-answers.length;
+                                label: "Allow more choices per person";
+                                activated => { PollUiState.change-max(1); }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        TokenCheck {
+                            text: "Show results while the poll is open";
+                            checked: PollUiState.dialog-disclosed;
+                            enabled: !PollUiState.dialog-busy;
+                            colors: root.button-colors;
+                            text-scale: root.text-scale;
+                            toggled => { PollUiState.set-disclosed(self.checked); }
+                        }
+                        Text {
+                            text: PollUiState.dialog-disclosed
+                                ? "Everyone in the room sees the votes as they arrive."
+                                : "Morpheus keeps the results hidden until you end the poll. Other apps may show them sooner.";
+                            color: root.palette.muted;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                if PollUiState.dialog-error != "" : Text {
+                    text: PollUiState.dialog-error;
+                    color: root.palette.error;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 10px;
+                    cancel := TokenButton {
+                        text: "Cancel";
+                        colors: root.button-colors;
+                        text-scale: root.text-scale;
+                        enabled: !PollUiState.dialog-busy;
+                        label: "Cancel and close the poll dialog";
+                        activated => { PollUiState.cancel-poll(); }
+                    }
+                    send := TokenButton {
+                        text: PollUiState.dialog-busy ? "Sending…" : "Send poll";
+                        primary: true;
+                        colors: root.button-colors;
+                        text-scale: root.text-scale;
+                        enabled: !PollUiState.dialog-busy && PollUiState.dialog-ready;
+                        label: "Send this poll to the room";
+                        activated => { PollUiState.submit-poll(); }
+                    }
+                }
+            }
+        }
+    }
+}

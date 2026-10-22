@@ -433,6 +433,10 @@ class Feed:
 
 
 def build_image(commands, source, target, version, feed, public_key):
+    # This old generic packager does not ship the native build prefix. The
+    # fixed-runtime/original-SONAME wrapper must be integrated here before this
+    # existing signing/update/rollback gate can run again; do not waive it.
+    raise RuntimeError("AppImage update fixture requires fixed-client package integration")
     replace_app_version(source, version)
     package = runpy.run_path(str(source / "scripts/package.py"))
     config = package["package_config"](root=source, platform="linux")

@@ -25,13 +25,13 @@ C = load("appimage_client")
 B = load("appimage_bindings")
 
 
-def elf(*, runpath=None, legacy=False, marker=b"a", needed="libc.so.6"):
+def elf(*, runpath=None, legacy=False, marker=b"a", needed="libc.so.6", soname=C.SONAME):
     data = bytearray(2048)
     data[:16] = b"\x7fELF\x02\x01\x01" + bytes(9)
     struct.pack_into("<HHIQQQIHHHHHH", data, 16, 3, 62, 1, 0, 64, 0, 0, 64, 56, 3, 0, 0, 0)
     note = struct.pack("<III", 4, 20, 3) + b"GNU\0" + marker * 20
-    strings = b"\0" + C.SONAME.encode() + b"\0" + needed.encode() + b"\0"
-    tags = [(5, 0x1000 + 1024), (14, 1), (1, len(C.SONAME) + 2)]
+    strings = b"\0" + soname.encode() + b"\0" + needed.encode() + b"\0"
+    tags = [(5, 0x1000 + 1024), (14, 1), (1, len(soname) + 2)]
     if runpath is not None:
         tags.append((15 if legacy else 29, len(strings)))
         strings += runpath.encode() + b"\0"
@@ -133,7 +133,7 @@ class ToolTests(unittest.TestCase):
     def test_source_rejection_precedes_any_command(self):
         callback = mock.Mock(side_effect=AssertionError("native work forbidden"))
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(C, "require_build_platform"), self.assertRaises(C.PackageFailure):
-            C.prepare_client(Path(directory).resolve(), {}, b"", callback)
+            C.prepare_client(Path(directory).resolve(), {}, b"", callback, variant="appimage")
         callback.assert_not_called()
 
     def test_only_unprivileged_ubuntu_2404_x64_build_platform(self):
@@ -157,6 +157,49 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(result["appimage"]["files"]["/private/stage/" + C.SONAME], C.DESTINATION)
         self.assertEqual(sum(path.endswith(C.SONAME) for path in result["appimage"]["files"]), 1)
         self.assertTrue(any(name.endswith("exported-node-startup.patch") for name in result["appimage"]["files"]))
+
+    def test_distinct_native_soname_requires_actual_elf_identity(self):
+        native = elf(soname=C.R.NATIVE_SONAME)
+        self.assertEqual(C.R.elf_identity(native, library=True, expected_soname=C.R.NATIVE_SONAME),
+                         ("61" * 20, ("libc.so.6",)))
+        with self.assertRaises(C.R.ProbeFailure):
+            C.R.elf_identity(native, library=True)
+        with self.assertRaises(C.R.ProbeFailure):
+            C.R.elf_identity(elf(), library=True, expected_soname=C.R.NATIVE_SONAME)
+        with self.assertRaises(C.R.ProbeFailure):
+            C.R.elf_identity(native, library=True, expected_soname="unreviewed.so")
+
+    def test_native_receipt_binds_source_bytes_and_cannot_relabel_stock_elf(self):
+        data = elf(soname=C.R.NATIVE_SONAME)
+        metadata = {"schema": 1, "source_client_sha256": C.sha256(data), "build_id": "61" * 20,
+                    "needed": ["libc.so.6"], "source_version": C.R.VERSION,
+                    "upstream_commit": C.R.COMMIT, "upstream_patch_sha256": C.R.UPSTREAM_PATCH_SHA256,
+                    "patched_source_sha256": C.R.PATCHED_SOURCE_SHA256,
+                    "source_archives": {k: v[1] for k, v in C.R.ARCHIVES.items()},
+                    "variant": "native", "soname": C.R.NATIVE_SONAME,
+                    "native_meson_sha256": C.NATIVE_MESON_PATCHED_SHA256}
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory).resolve()
+            (stage / C.R.NATIVE_SONAME).write_bytes(data)
+            receipt = C.build_receipt(stage, metadata, variant="native")
+            artifact = json.loads((stage / "artifact.json").read_bytes())
+            self.assertEqual(artifact["sha256"], C.sha256(data))
+            self.assertEqual(artifact["library_path"], str(stage / C.R.NATIVE_SONAME))
+            self.assertIn("variant=native\n", receipt.read_text())
+            self.assertEqual(artifact["variant"], "native")
+        for change in ("stock", "source", "digest"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                stage = Path(directory).resolve()
+                (stage / C.R.NATIVE_SONAME).write_bytes(elf() if change == "stock" else data)
+                altered = dict(metadata)
+                if change == "source":
+                    altered["patched_source_sha256"] = "0" * 64
+                if change == "digest":
+                    altered["source_client_sha256"] = "0" * 64
+                with self.assertRaises((C.PackageFailure, C.R.ProbeFailure)):
+                    C.build_receipt(stage, altered, variant="native")
+                self.assertFalse((stage / "build-client.txt").exists())
+                self.assertFalse((stage / "artifact.json").exists())
 
     def test_ambiguous_existing_appimage_config_rejected(self):
         with self.assertRaises(C.PackageFailure):
@@ -252,7 +295,7 @@ class PreparationContractTests(unittest.TestCase):
                 mock.patch.object(C.R, "patch_series", return_value=[]), \
                 mock.patch.object(C.R, "apply_upstream_patch") as patched, \
                 mock.patch.dict(C.os.environ, {"LD_LIBRARY_PATH": "/untrusted"}):
-            stage, metadata = C.prepare_client(Path(directory).resolve(), archives, patch, command)
+            stage, metadata = C.prepare_client(Path(directory).resolve(), archives, patch, command, variant="appimage")
             self.assertEqual(metadata["source_client_sha256"], C.sha256(elf()))
             self.assertEqual(len(metadata["objects"]), 33)
             self.assertEqual((stage / "exported-node-startup.patch").read_bytes(), patch)
@@ -271,7 +314,7 @@ class PreparationContractTests(unittest.TestCase):
                 mock.patch.object(C.R, "trusted_tool", side_effect=lambda name: "/usr/bin/" + name), \
                 mock.patch.object(C.R, "verified_archive", side_effect=lambda data, key: data):
             with self.assertRaises(C.PackageFailure) as error:
-                C.prepare_client(Path(directory).resolve(), {key: b"fixture" for key in C.R.ARCHIVES}, patch, calls)
+                C.prepare_client(Path(directory).resolve(), {key: b"fixture" for key in C.R.ARCHIVES}, patch, calls, variant="appimage")
             self.assertEqual(str(error.exception), "AppImage client preparation failed: command")
             self.assertEqual(calls.call_count, 1)
 
@@ -285,7 +328,7 @@ class PreparationContractTests(unittest.TestCase):
                 mock.patch.object(C.R, "verified_archive", side_effect=lambda data, key: data), \
                 mock.patch.object(C.time, "monotonic", side_effect=[0, 601]):
             with self.assertRaises(C.PackageFailure) as error:
-                C.prepare_client(Path(directory).resolve(), {key: b"fixture" for key in C.R.ARCHIVES}, patch, calls)
+                C.prepare_client(Path(directory).resolve(), {key: b"fixture" for key in C.R.ARCHIVES}, patch, calls, variant="appimage")
             self.assertEqual(error.exception.reason, "deadline")
             calls.assert_not_called()
 

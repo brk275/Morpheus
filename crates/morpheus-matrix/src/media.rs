@@ -32,6 +32,7 @@ use matrix_sdk::{
                 MediaSource,
                 message::{MessageType, SyncRoomMessageEvent},
             },
+            sticker::{StickerEventContent, SyncStickerEvent},
         },
     },
     send_queue::{RoomSendQueueUpdate, SendHandle},
@@ -39,7 +40,10 @@ use matrix_sdk::{
 use matrix_sdk_crypto::AttachmentDecryptor;
 use mime::Mime;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::broadcast, task};
+use tokio::{
+    sync::{broadcast, watch},
+    task,
+};
 use url::{Host, Url};
 
 use crate::{AccountManager, MatrixCoreError, QueuedSendOutcome, Result, account_room};
@@ -49,9 +53,20 @@ use crate::{AccountManager, MatrixCoreError, QueuedSendOutcome, Result, account_
 pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 /// Explicit native image previews have a smaller input budget than Save.
 pub const MAX_IMAGE_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
+/// Explicit audio playback is memory-only and smaller than Save.
+pub const MAX_AUDIO_PLAYBACK_BYTES: usize = 16 * 1024 * 1024;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(300);
+/// Bound on asking a homeserver for its upload limit.
+const UPLOAD_LIMIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MEDIA_REDIRECTS: usize = 5;
 const MAX_MATRIX_ERROR_BYTES: usize = 4096;
+// Bound secondary parsing of untrusted attachment events.
+const MAX_ATTACHMENT_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_MEDIA_ADDRESS_BYTES: usize = 64 * 1024;
+const MAX_MEDIA_SERVER_BYTES: usize = 512;
+// A cancelled blocking read keeps its permit until its worker exits. Repeated
+// cancellation must not bypass the two-reader bound or grow the blocking pool.
+static ATTACHMENT_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +109,23 @@ pub struct ImagePreviewDownload {
 impl ImagePreviewDownload {
     pub fn into_plaintext(self) -> Result<DownloadedAttachment> {
         let bytes = decrypt_media(self.source, self.ciphertext, MAX_IMAGE_PREVIEW_BYTES)?;
+        Ok(DownloadedAttachment {
+            metadata: self.metadata,
+            bytes,
+        })
+    }
+}
+
+/// Opaque bounded audio input. Decryption stays on the caller's single owner
+/// worker; no plaintext cache, detached blocking SDK job or URL/key reaches UI.
+pub struct AudioPlaybackDownload {
+    metadata: AttachmentMetadata,
+    source: MediaSource,
+    ciphertext: Vec<u8>,
+}
+impl AudioPlaybackDownload {
+    pub fn into_plaintext(self) -> Result<DownloadedAttachment> {
+        let bytes = decrypt_media(self.source, self.ciphertext, MAX_AUDIO_PLAYBACK_BYTES)?;
         Ok(DownloadedAttachment {
             metadata: self.metadata,
             bytes,
@@ -214,6 +246,11 @@ impl QueuedAttachment {
     }
 }
 
+async fn attachment_cancelled(signal: &watch::Receiver<bool>) {
+    let mut signal = signal.clone();
+    let _ = signal.wait_for(|stopped| *stopped).await;
+}
+
 struct ResolvedAttachment {
     metadata: AttachmentMetadata,
     source: MediaSource,
@@ -233,29 +270,95 @@ impl AccountManager {
         path: impl AsRef<Path>,
         mime_type: &str,
     ) -> Result<QueuedAttachment> {
+        let selection = self
+            .account_selection(expected_account_id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        let (_keep_open, cancelled) = watch::channel(false);
+        self.send_attachment_selected_for(&selection, room_id, path, mime_type, &cancelled)
+            .await?
+            .ok_or(MatrixCoreError::SelectedAccountChanged)
+    }
+
+    /// Prepare a file for one exact account selection. Cancellation before the
+    /// SDK commit returns None and never queues a new upload. Once handed to
+    /// the SDK, await its real handle; callers can then explicitly abort it.
+    pub async fn send_attachment_selected_for(
+        &self,
+        selection: &crate::AccountSelection,
+        room_id: &str,
+        path: impl AsRef<Path>,
+        mime_type: &str,
+        cancelled: &watch::Receiver<bool>,
+    ) -> Result<Option<QueuedAttachment>> {
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+            return Ok(None);
+        }
         let mime_type = parse_mime(mime_type)?;
         let path = path.as_ref().to_path_buf();
-        let (filename, bytes) = task::spawn_blocking(move || read_bounded_file(&path))
-            .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))??;
+        let reader = tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            permit = ATTACHMENT_READERS.acquire() => permit.map_err(|_| MatrixCoreError::InvalidMedia("attachment preparation is unavailable".into()))?,
+        };
+        let read = task::spawn_blocking(move || {
+            let _reader = reader;
+            read_bounded_file(&path)
+        });
+        let (filename, bytes) = tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            value = read => value.map_err(|error| MatrixCoreError::Sdk(error.to_string()))??,
+        };
         let size = UInt::try_from(bytes.len() as u64)
             .map_err(|_| MatrixCoreError::InvalidMedia("attachment size is invalid".into()))?;
         let info = attachment_info(&mime_type, size);
-
-        // Hold the switch lock through queueing. If the user changed accounts
-        // while the file was read, no upload can be directed to the old room.
-        let state = self.state.lock().await;
-        if state.active_account_id.as_deref() != Some(expected_account_id) {
+        // Cancellation remains effective while waiting for the switch lock,
+        // authorization, and the subscription. None of these queues this file.
+        let state = tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            state = self.state.lock() => state,
+        };
+        if !self.attachment_selection_is_current(selection)
+            || state.active_account_id.as_deref() != Some(selection.account_id())
+        {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
-        let room = account_room(&state, expected_account_id, room_id)?;
+        let room = account_room(&state, selection.account_id(), room_id)?;
+        let loaded = state
+            .loaded
+            .get(selection.account_id())
+            .ok_or_else(|| MatrixCoreError::AccountNotFound(selection.account_id().into()))?;
+        tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            result = crate::resume_room_queue(loaded, &room) => result?,
+        }
         let queue = room.send_queue();
-        let (_, updates) = queue
-            .subscribe()
-            .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
-        let handle = queue
-            .send_attachment(
+        let (_, updates) = tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            result = queue.subscribe() => result.map_err(|error| MatrixCoreError::Sdk(error.to_string()))?,
+        };
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        // Order the last cancellation check with handing the send to the SDK.
+        // Never drop an entered enqueue future and pretend it did not send.
+        let send = {
+            let stopped = cancelled.borrow();
+            if *stopped || cancelled.has_changed().is_err() {
+                return Ok(None);
+            }
+            queue.send_attachment(
                 filename,
                 mime_type,
                 bytes,
@@ -264,14 +367,63 @@ impl AccountManager {
                     ..Default::default()
                 },
             )
+        };
+        let handle = send
             .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
-        Ok(QueuedAttachment {
+            // An entered SDK enqueue may have persisted before an error.
+            // Never advertise this as a safe-to-resend preparation failure.
+            .map_err(|_| MatrixCoreError::AttachmentSendUncertain)?;
+        Ok(Some(QueuedAttachment {
             transaction_id: handle.transaction_id().to_string(),
             handle,
             updates,
             finished: false,
-        })
+        }))
+    }
+
+    /// The largest attachment the selected account can send: the upload size
+    /// its homeserver reports (cached by the SDK after the first request),
+    /// never more than `MAX_ATTACHMENT_BYTES`. No file is read.
+    pub async fn attachment_upload_limit_selected(
+        &self,
+        selection: &crate::AccountSelection,
+    ) -> Result<u64> {
+        let client = {
+            let state = tokio::select! {
+                biased;
+                _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+                state = self.state.lock() => state,
+            };
+            if !self.attachment_selection_is_current(selection)
+                || state.active_account_id.as_deref() != Some(selection.account_id())
+            {
+                return Err(MatrixCoreError::SelectedAccountChanged);
+            }
+            state
+                .loaded
+                .get(selection.account_id())
+                .ok_or_else(|| MatrixCoreError::AccountNotFound(selection.account_id().into()))?
+                .client
+                .clone()
+        };
+        let limit = tokio::select! {
+            biased;
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            limit = tokio::time::timeout(UPLOAD_LIMIT_TIMEOUT, client.load_or_fetch_max_upload_size()) => limit
+                .map_err(|_| MatrixCoreError::Sdk("the homeserver did not answer in time".into()))?
+                .map_err(|_| MatrixCoreError::Sdk("the homeserver's upload limit is unavailable".into()))?,
+        };
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(u64::from(limit).min(MAX_ATTACHMENT_BYTES as u64))
+    }
+
+    fn attachment_selection_is_current(&self, selection: &crate::AccountSelection) -> bool {
+        selection.is_current()
+            && self
+                .account_selection(selection.account_id())
+                .is_some_and(|current| current.same_epoch(selection))
     }
 
     /// Inspect media metadata from an event without handing its encrypted
@@ -383,6 +535,82 @@ impl AccountManager {
         })
     }
 
+    /// Explicit selected audio playback. Same redirect/authentication policy as
+    /// other media, without the SDK cache. Room encryption must be known and the
+    /// encrypted-preview preference must allow both encrypted rooms and events.
+    pub async fn download_audio_playback_for(
+        &self,
+        selection: &crate::AccountSelection,
+        room_id: &str,
+        event_id: &str,
+        allow_encrypted: bool,
+    ) -> Result<AudioPlaybackDownload> {
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let room = {
+            let state = selection
+                .guard(self.state.lock())
+                .await
+                .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+            if !self.attachment_selection_is_current(selection)
+                || state.active_account_id.as_deref() != Some(selection.account_id())
+            {
+                return Err(MatrixCoreError::SelectedAccountChanged);
+            }
+            account_room(&state, selection.account_id(), room_id)?
+        };
+        let encryption = selection
+            .guard(room.latest_encryption_state())
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?
+            .map_err(|_| MatrixCoreError::InvalidMedia("Cannot check room encryption".into()))?;
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        if encryption.is_unknown() {
+            return Err(MatrixCoreError::InvalidMedia(
+                "Cannot check room encryption".into(),
+            ));
+        }
+        // Do not fetch the event or any media for a room whose policy refuses it.
+        if encryption.is_encrypted() && !allow_encrypted {
+            return Err(MatrixCoreError::InvalidMedia(
+                "Encrypted media previews are disabled".into(),
+            ));
+        }
+        let resolved = selection
+            .guard(resolve_attachment(&room, event_id))
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)??;
+        validate_audio_metadata(
+            &resolved.metadata,
+            encryption.is_encrypted(),
+            resolved.event_was_encrypted,
+            allow_encrypted,
+        )?;
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let client = room.client();
+        let ciphertext = selection
+            .guard(fetch_bounded_media(
+                &client,
+                &resolved.source,
+                MAX_AUDIO_PLAYBACK_BYTES,
+            ))
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)??;
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(AudioPlaybackDownload {
+            metadata: resolved.metadata,
+            source: resolved.source,
+            ciphertext,
+        })
+    }
+
     async fn assert_active(&self, expected_account_id: &str) -> Result<()> {
         if self
             .state
@@ -411,6 +639,7 @@ pub(crate) async fn fetch_bounded_media(
         MediaSource::Plain(uri) => uri,
         MediaSource::Encrypted(file) => &file.url,
     };
+    let (server_name, media_id) = validate_media_address(uri)?;
     let supported = client
         .supported_versions()
         .await
@@ -444,18 +673,20 @@ pub(crate) async fn fetch_bounded_media(
             let token = client.access_token().ok_or_else(|| {
                 MatrixCoreError::Sdk("authenticated media requires a session".into())
             })?;
-            authenticated_media::get_content::v1::Request::from_uri(uri)
-                .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?
-                .try_into_http_request::<Vec<u8>>(
-                    base_url.as_str(),
-                    SendAccessToken::IfRequired(&token),
-                    Cow::Borrowed(&supported),
-                )
-                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
+            authenticated_media::get_content::v1::Request::new(
+                media_id.to_owned(),
+                server_name.clone(),
+            )
+            .try_into_http_request::<Vec<u8>>(
+                base_url.as_str(),
+                SendAccessToken::IfRequired(&token),
+                Cow::Borrowed(&supported),
+            )
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
         } else {
             #[allow(deprecated)]
-            let request = media::get_content::v3::Request::from_url(uri)
-                .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?;
+            let request =
+                media::get_content::v3::Request::new(media_id.to_owned(), server_name.clone());
             request
                 .try_into_http_request::<Vec<u8>>(
                     base_url.as_str(),
@@ -609,6 +840,39 @@ fn validate_preview_metadata(
     }
     if let Some(size) = metadata.declared_size {
         check_size_limit(size, MAX_IMAGE_PREVIEW_BYTES)?;
+    }
+    Ok(())
+}
+
+fn validate_audio_metadata(
+    metadata: &AttachmentMetadata,
+    encrypted_room: bool,
+    encrypted_event: bool,
+    allow_encrypted: bool,
+) -> Result<()> {
+    if metadata.kind != AttachmentKind::Audio
+        || !matches!(
+            metadata.mime_type.as_str(),
+            "audio/mpeg"
+                | "audio/mp3"
+                | "audio/wav"
+                | "audio/x-wav"
+                | "audio/wave"
+                | "audio/vnd.wave"
+        )
+    {
+        return Err(MatrixCoreError::InvalidMedia(
+            "Playback supports MP3 and PCM/float WAV audio messages only; Save remains available"
+                .into(),
+        ));
+    }
+    if (encrypted_room || encrypted_event || metadata.encrypted) && !allow_encrypted {
+        return Err(MatrixCoreError::InvalidMedia(
+            "Encrypted media previews are disabled".into(),
+        ));
+    }
+    if let Some(size) = metadata.declared_size {
+        check_size_limit(size, MAX_AUDIO_PLAYBACK_BYTES)?;
     }
     Ok(())
 }
@@ -805,10 +1069,15 @@ async fn resolve_attachment(
         .await
         .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
     let event_was_encrypted = event.encryption_info().is_some();
+    if event.raw().json().get().len() > MAX_ATTACHMENT_EVENT_BYTES {
+        return Err(MatrixCoreError::InvalidMedia(
+            "The attachment event is too large to read".into(),
+        ));
+    }
     let raw = event
         .raw()
         .deserialize()
-        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+        .map_err(|_| MatrixCoreError::InvalidMedia("Cannot read the attachment event".into()))?;
     match raw {
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             SyncRoomMessageEvent::Original(event),
@@ -817,8 +1086,103 @@ async fn resolve_attachment(
             resolved.event_was_encrypted = event_was_encrypted;
             Ok(resolved)
         }
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Sticker(
+            SyncStickerEvent::Original(sticker),
+        )) => {
+            // Some clients use an encrypted-file extension. If this SDK build
+            // cannot interpret it, never fall back to a second plaintext URL.
+            let content = event
+                .raw()
+                .get_field::<serde_json::Value>("content")
+                .map_err(|_| {
+                    MatrixCoreError::InvalidMedia("Cannot read the attachment event".into())
+                })?;
+            let has_file = content
+                .as_ref()
+                .is_some_and(|value| value.get("file").is_some());
+            let mut resolved = from_sticker(event_id, &sticker.content, has_file)?;
+            resolved.event_was_encrypted = event_was_encrypted;
+            Ok(resolved)
+        }
         _ => Err(MatrixCoreError::NotMediaAttachment),
     }
+}
+
+pub(crate) fn validate_media_address(
+    uri: &matrix_sdk::ruma::MxcUri,
+) -> Result<(matrix_sdk::ruma::OwnedServerName, &str)> {
+    // Validate bounded components before building a media request.
+    // Long valid DNS authorities still work; endpoint constructors receive
+    // independent typed components, never a direct HTTP/file URL.
+    let invalid = || {
+        MatrixCoreError::InvalidMedia(
+            "The attachment has an unsupported Matrix media address".into(),
+        )
+    };
+    if uri.as_str().len() > MAX_MEDIA_ADDRESS_BYTES {
+        return Err(invalid());
+    }
+    let (server, media) = uri
+        .as_str()
+        .strip_prefix("mxc://")
+        .and_then(|value| value.split_once('/'))
+        .ok_or_else(invalid)?;
+    if server.len() > MAX_MEDIA_SERVER_BYTES
+        || media.is_empty()
+        || !media
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(invalid());
+    }
+    let server = matrix_sdk::ruma::ServerName::parse(server).map_err(|_| invalid())?;
+    Ok((server, media))
+}
+
+fn from_sticker(
+    event_id: &str,
+    sticker: &StickerEventContent,
+    has_file: bool,
+) -> Result<ResolvedAttachment> {
+    let source: MediaSource = sticker.source.clone().into();
+    if has_file && !matches!(source, MediaSource::Encrypted(_)) {
+        return Err(MatrixCoreError::InvalidMedia(
+            "This encrypted sticker format is not supported".into(),
+        ));
+    }
+    let uri = match &source {
+        MediaSource::Plain(uri) => uri,
+        MediaSource::Encrypted(file) => &file.url,
+    };
+    validate_media_address(uri)?;
+    let mime_type = sticker
+        .info
+        .mimetype
+        .as_deref()
+        .and_then(|value| parse_mime(value).ok())
+        .map_or_else(
+            || "application/octet-stream".into(),
+            |value| value.to_string(),
+        );
+    let filename = match mime_type.as_str() {
+        "image/png" => "sticker.png",
+        "image/jpeg" => "sticker.jpg",
+        "image/gif" => "sticker.gif",
+        "image/webp" => "sticker.webp",
+        _ => "sticker",
+    };
+    Ok(ResolvedAttachment {
+        event_was_encrypted: false,
+        metadata: AttachmentMetadata {
+            event_id: event_id.into(),
+            filename: filename.into(),
+            mime_type,
+            declared_size: sticker.info.size.map(u64::from),
+            kind: AttachmentKind::Image,
+            encrypted: matches!(source, MediaSource::Encrypted(_)),
+        },
+        source,
+    })
 }
 
 fn from_message(event_id: &str, message: &MessageType) -> Result<ResolvedAttachment> {
@@ -1006,6 +1370,159 @@ mod tests {
     use super::*;
     use futures_util::stream;
 
+    fn sticker_fixture() -> StickerEventContent {
+        let mut info = matrix_sdk::ruma::events::room::ImageInfo::new();
+        info.mimetype = Some("image/png".into());
+        info.size = Some(69_u32.into());
+        StickerEventContent::new(
+            "../private-description\u{202e}.exe".into(),
+            info,
+            "mxc://example.org/private-sticker-source".into(),
+        )
+    }
+
+    #[test]
+    fn sticker_metadata_preserves_image_hints_without_source_or_body() {
+        let resolved = from_sticker("$sticker", &sticker_fixture(), false).unwrap();
+        assert_eq!(resolved.metadata.kind, AttachmentKind::Image);
+        assert_eq!(resolved.metadata.filename, "sticker.png");
+        assert_eq!(resolved.metadata.mime_type, "image/png");
+        assert_eq!(resolved.metadata.declared_size, Some(69));
+        assert!(!resolved.metadata.encrypted);
+        let public = serde_json::to_string(&resolved.metadata).unwrap();
+        assert!(!public.contains("private-sticker-source"));
+        assert!(!public.contains("private-description"));
+        assert!(!public.contains("mxc://"));
+    }
+
+    #[test]
+    fn sticker_encrypted_extension_never_falls_back_to_plain_url() {
+        assert!(matches!(
+            from_sticker("$sticker", &sticker_fixture(), true),
+            Err(MatrixCoreError::InvalidMedia(_))
+        ));
+    }
+
+    #[test]
+    fn sticker_sources_must_be_valid_matrix_media_addresses() {
+        let mut sticker = sticker_fixture();
+        for address in [
+            "https://example.org/image.png",
+            "file:///private/image.png",
+            "mxc://example.org",
+            "mxc://example.org/",
+            "mxc://example.org/a/b",
+        ] {
+            sticker.source =
+                matrix_sdk::ruma::events::sticker::StickerMediaSource::Plain(address.into());
+            assert!(matches!(
+                from_sticker("$sticker", &sticker, false),
+                Err(MatrixCoreError::InvalidMedia(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn sticker_previews_keep_encrypted_context_and_size_guards() {
+        let mut sticker = sticker_fixture();
+        let resolved = from_sticker("$sticker", &sticker, false).unwrap();
+        assert!(validate_preview_metadata(&resolved.metadata, true, false, false).is_err());
+        assert!(validate_preview_metadata(&resolved.metadata, false, true, false).is_err());
+        assert!(validate_preview_metadata(&resolved.metadata, true, true, true).is_ok());
+        sticker.info.size = Some(((MAX_IMAGE_PREVIEW_BYTES + 1) as u32).into());
+        let oversized = from_sticker("$sticker", &sticker, false).unwrap();
+        assert!(matches!(
+            validate_preview_metadata(&oversized.metadata, false, false, true),
+            Err(MatrixCoreError::MediaTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn media_address_limits_are_checked_before_endpoint_construction() {
+        for length in [MAX_MEDIA_SERVER_BYTES + 1, 2048] {
+            let address = format!("mxc://{}/image", "a".repeat(length));
+            assert!(validate_media_address(address.as_str().into()).is_err());
+        }
+        let address = format!("mxc://example.org/{}", "a".repeat(MAX_MEDIA_ADDRESS_BYTES));
+        assert!(validate_media_address(address.as_str().into()).is_err());
+        for address in [
+            "https://example.org/image",
+            "file:///image",
+            "mxc://example.org",
+            "mxc://example.org/",
+            "mxc:///image",
+            "mxc://example.org/a/b",
+            "mxc://example.org/image?key=value",
+            "mxc://example.org/é",
+        ] {
+            assert!(validate_media_address(address.into()).is_err());
+        }
+        for address in [
+            "mxc://example.org/image",
+            "mxc://example.org:8448/image_1-2",
+            "mxc://[::1]:8448/image",
+        ] {
+            assert!(validate_media_address(address.into()).is_ok());
+        }
+    }
+
+    #[test]
+    fn long_media_authorities_keep_their_endpoint_components() {
+        for labels in [32, 36, 40] {
+            let server = format!("{}.example.org:8448", vec!["aaaaa"; labels].join("."));
+            assert!(server.len() > 200);
+            let address = format!("mxc://{server}/image_1-2");
+            let (parsed, media) = validate_media_address(address.as_str().into()).unwrap();
+            let authenticated = authenticated_media::get_content::v1::Request::new(
+                media.to_owned(),
+                parsed.clone(),
+            );
+            #[allow(deprecated)]
+            let legacy = media::get_content::v3::Request::new(media.to_owned(), parsed);
+            assert_eq!(authenticated.server_name.as_str(), server);
+            assert_eq!(legacy.server_name.as_str(), server);
+            assert_eq!(authenticated.media_id, "image_1-2");
+            assert_eq!(legacy.media_id, "image_1-2");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_media_is_rejected_before_any_homeserver_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_millis(250))
+            .build()
+            .unwrap();
+        let client = Client::builder()
+            .http_client(http)
+            .homeserver_url(format!("http://{}", listener.local_addr().unwrap()))
+            .build()
+            .await
+            .unwrap();
+        for address in [
+            "https://example.org/image",
+            "file:///image",
+            "mxc://example.org/",
+            "mxc://example.org/a/b",
+            "mxc://example.org/é",
+        ] {
+            let source = MediaSource::Plain(address.into());
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_bounded_media(&client, &source, MAX_IMAGE_PREVIEW_BYTES),
+            )
+            .await;
+            assert!(matches!(result, Ok(Err(MatrixCoreError::InvalidMedia(_)))));
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
     #[test]
     fn media_redirects_validate_targets_before_request() {
         let initial =
@@ -1146,6 +1663,144 @@ mod tests {
         );
     }
 
+    // Real public admission path, fresh synthetic profile, no client or vault
+    // credentials. Nonexistent paths prove rejected work never reads a file.
+    #[tokio::test]
+    async fn owned_upload_rejects_cancelled_closed_and_aba_selections_before_io() {
+        let root =
+            std::env::temp_dir().join(format!("morpheus-owned-upload-{}", uuid::Uuid::new_v4()));
+        let manager = AccountManager::open(&root).unwrap();
+        manager.selections.replace(Some("synthetic-account"));
+        let original = manager.account_selection("synthetic-account").unwrap();
+        let missing = root.join("must-not-be-read.png");
+        let (cancel, signal) = watch::channel(true);
+        let result = manager
+            .send_attachment_selected_for(
+                &original,
+                "!room:example.org",
+                &missing,
+                "image/png",
+                &signal,
+            )
+            .await;
+        assert!(matches!(result, Ok(None)));
+        cancel.send(false).unwrap();
+        drop(cancel);
+        assert!(matches!(
+            manager
+                .send_attachment_selected_for(
+                    &original,
+                    "!room:example.org",
+                    &missing,
+                    "image/png",
+                    &signal
+                )
+                .await,
+            Ok(None)
+        ));
+        let (_cancel, live) = watch::channel(false);
+        manager.selections.replace(Some("other-account"));
+        manager.selections.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager
+                .send_attachment_selected_for(
+                    &original,
+                    "!room:example.org",
+                    &missing,
+                    "image/png",
+                    &live
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        let current = manager.account_selection("synthetic-account").unwrap();
+        assert!(!original.is_current() && current.is_current());
+        // A foreign manager's matching account string confers no authority.
+        let foreign = crate::account_selection::Selections::default();
+        foreign.replace(Some("synthetic-account"));
+        let foreign = foreign.for_account("synthetic-account").unwrap();
+        assert!(matches!(
+            manager
+                .send_attachment_selected_for(
+                    &foreign,
+                    "!room:example.org",
+                    &missing,
+                    "image/png",
+                    &live
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        // Cancellation also wins while waiting for actual read admission.
+        {
+            let readers = ATTACHMENT_READERS.acquire_many(2).await.unwrap();
+            let (cancel, signal) = watch::channel(false);
+            let waiting = manager.send_attachment_selected_for(
+                &current,
+                "!room:example.org",
+                &missing,
+                "image/png",
+                &signal,
+            );
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            cancel.send(true).unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), waiting)
+                    .await
+                    .unwrap(),
+                Ok(None)
+            ));
+            drop(readers);
+        }
+        assert!(!missing.exists());
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_limits_reject_foreign_revoked_and_aba_selections_before_client_access() {
+        let root =
+            std::env::temp_dir().join(format!("morpheus-upload-limit-{}", uuid::Uuid::new_v4()));
+        let manager = AccountManager::open(&root).unwrap();
+        manager.selections.replace(Some("synthetic-account"));
+        manager.state.lock().await.active_account_id = Some("synthetic-account".into());
+        let original = manager.account_selection("synthetic-account").unwrap();
+        manager.selections.replace(Some("other-account"));
+        manager.selections.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager.attachment_upload_limit_selected(&original).await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        let foreign = crate::account_selection::Selections::default();
+        foreign.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager
+                .attachment_upload_limit_selected(
+                    &foreign.for_account("synthetic-account").unwrap()
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        let current = manager.account_selection("synthetic-account").unwrap();
+        {
+            let locked = manager.state.lock().await;
+            let waiting = manager.attachment_upload_limit_selected(&current);
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            manager.selections.replace(Some("other-account"));
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), waiting)
+                    .await
+                    .unwrap(),
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            drop(locked);
+        }
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn file_read_rejects_oversized_input() {
         let path = std::env::temp_dir().join(format!("morpheus-media-{}", uuid::Uuid::new_v4()));
@@ -1258,5 +1913,93 @@ mod preview_tests {
             check_size_limit(MAX_IMAGE_PREVIEW_BYTES as u64 + 1, MAX_IMAGE_PREVIEW_BYTES).is_err()
         );
         assert!(check_size(MAX_IMAGE_PREVIEW_BYTES as u64 + 1).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod audio_playback_admission_tests {
+    use super::*;
+    #[tokio::test]
+    async fn audio_rejects_foreign_and_revoked_aba_selection_before_client_or_media_access() {
+        let root =
+            std::env::temp_dir().join(format!("morpheus-audio-admission-{}", uuid::Uuid::new_v4()));
+        let manager = AccountManager::open(&root).unwrap();
+        manager.selections.replace(Some("synthetic-account"));
+        manager.state.lock().await.active_account_id = Some("synthetic-account".into());
+        let original = manager.account_selection("synthetic-account").unwrap();
+        manager.selections.replace(Some("other-account"));
+        manager.selections.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager
+                .download_audio_playback_for(
+                    &original,
+                    "!fixture:example.org",
+                    "$fixture:example.org",
+                    true
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        let foreign = crate::account_selection::Selections::default();
+        foreign.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager
+                .download_audio_playback_for(
+                    &foreign.for_account("synthetic-account").unwrap(),
+                    "!fixture:example.org",
+                    "$fixture:example.org",
+                    true
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        {
+            let current = manager.account_selection("synthetic-account").unwrap();
+            let locked = manager.state.lock().await;
+            let waiting = manager.download_audio_playback_for(
+                &current,
+                "!fixture:example.org",
+                "$fixture:example.org",
+                true,
+            );
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            manager.selections.replace(Some("other-account"));
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), waiting)
+                    .await
+                    .unwrap(),
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            drop(locked);
+        }
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_requires_typed_kind_mime_size_and_all_encryption_signals() {
+        let mut m = AttachmentMetadata {
+            event_id: "$fixture:example.org".into(),
+            filename: "fixture.mp3".into(),
+            mime_type: "audio/mpeg".into(),
+            declared_size: Some(128),
+            kind: AttachmentKind::Audio,
+            encrypted: false,
+        };
+        assert!(validate_audio_metadata(&m, false, false, false).is_ok());
+        assert!(validate_audio_metadata(&m, true, false, false).is_err());
+        assert!(validate_audio_metadata(&m, false, true, false).is_err());
+        m.encrypted = true;
+        assert!(validate_audio_metadata(&m, false, false, false).is_err());
+        assert!(validate_audio_metadata(&m, true, true, true).is_ok());
+        m.mime_type = "audio/ogg".into();
+        assert!(validate_audio_metadata(&m, false, false, true).is_err());
+        m.mime_type = "audio/wav".into();
+        m.kind = AttachmentKind::File;
+        assert!(validate_audio_metadata(&m, false, false, true).is_err());
+        m.kind = AttachmentKind::Audio;
+        m.declared_size = Some(MAX_AUDIO_PLAYBACK_BYTES as u64 + 1);
+        assert!(validate_audio_metadata(&m, false, false, true).is_err());
     }
 }

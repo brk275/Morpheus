@@ -2,7 +2,7 @@
 """Losslessly encode the native preview CLI's exact RGB snapshots as PNG.
 
 This encoder does not render, draw, crop, resize, or alter pixels. Raw snapshots
-and native logs remain outside the upload directory. Only twelve fixed PNG names
+and native logs remain outside the upload directory. Only fourteen fixed PNG names
 and a path-free provenance document are produced in a newly created directory.
 """
 
@@ -22,7 +22,8 @@ HEADER = b"P6\n1440 900\n255\n"
 PIXEL_BYTES = WIDTH * HEIGHT * 3
 NAMES = ("desktop-preview", "account-switcher", "sign-in", "incoming-call", "room-settings",
          "paper-preview", "manage-accounts", "account-password", "account-password-large",
-         "sign-in-large", "terminal-sidebar", "terminal-space-labels")
+         "sign-in-large", "terminal-sidebar", "terminal-space-labels",
+         "send-recovery", "send-recovery-thread-large")
 
 
 def require(condition):

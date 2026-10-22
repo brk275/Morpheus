@@ -1,4 +1,4 @@
-# Linux PipeWire symbol isolation
+# Native SDK admission and Linux PipeWire symbol isolation
 
 This directory vendors the original `webrtc-sys` 0.3.35 crate, Apache-2.0,
 from crates.io. Original source copyrights and `NOTICE.md` are retained; a
@@ -12,6 +12,21 @@ and the nested generated lockfile are omitted. Upstream crate SHA-256:
 Morpheus changes `build.rs`, adds the `sha2` build dependency, and adds
 `pipewire_isolation.rs` plus `pipewire-symbols.txt`. The Rust/C++ transport,
 cryptography, audio, video and capture source remain upstream code.
+
+## Prebuilt cache admission
+
+Whenever the native build script runs, it calls the pinned `webrtc-sys-build`
+helper on prebuilt cache hits as well as misses before using the SDK. An
+existing cache must pass that helper's receipt and directory-metadata checks.
+A missing cache uses the helper's existing bounded, checksum-verified download
+and extraction.
+The receipt records download provenance; it does not authenticate the mutable
+cached library or header contents, and a cache hit is not a fresh download.
+
+Existing explicit `LK_CUSTOM_WEBRTC` paths retain their upstream opt-in behavior
+on platforms that support them. These custom builds are outside the archive
+pins and release acceptance. Linux's existing isolation policy still rejects
+custom SDK paths and independently verifies the linked static library below.
 
 ## Why this patch exists
 
@@ -62,9 +77,10 @@ The build script:
 1. Accepts only native `x86_64-unknown-linux-gnu` with the pinned release
    archive. Upstream selects release WebRTC for both Cargo dev/test and release
    profiles. `LK_DEBUG_WEBRTC=true`, `LK_CUSTOM_WEBRTC`, other Linux targets,
-   future tags or unknown archive bytes fail closed. macOS/Windows keep the
-   original build path; the isolation module and its calls are compiled only
-   on a Linux build host. A Linux target on another host is explicitly refused.
+   future tags or unknown archive bytes fail closed. macOS/Windows use the
+   upstream native build path with the shared cache admission above; the
+   isolation module and its calls are compiled only on a Linux build host.
+   A Linux target on another host is explicitly refused.
 2. Copies the archive into this build's `OUT_DIR`, verifies its hash and exact
    PipeWire inventory with GNU `nm`, and writes a fixed mapping from every
    `pw_*` stub to `morpheus_webrtc_pw_*`.

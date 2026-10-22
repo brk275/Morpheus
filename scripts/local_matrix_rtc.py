@@ -453,7 +453,7 @@ def start_federation_bridge() -> None:
             "run", "-d", "--name", FEDERATION, "--network", NETWORK,
             "--network-alias", "morpheus-a.test", "--entrypoint", "python3",
             "--mount", f"type=bind,src={STATE},dst=/etc/rtc,readonly",
-            "ghcr.io/element-hq/synapse:v1.162.0",
+            matrix_env.IMAGE,
             "-u", "/etc/rtc/federation_proxy.py",
         )
     elif not running(FEDERATION):

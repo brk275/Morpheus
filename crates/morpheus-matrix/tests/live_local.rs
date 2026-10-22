@@ -2,6 +2,9 @@
 //! Run with MORPHEUS_MATRIX_TEST_ACCOUNTS pointing to its mode-0600 JSON file.
 #![recursion_limit = "512"]
 
+#[path = "support/opened_room.rs"]
+mod opened_room;
+
 use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
 
 use morpheus_matrix::{
@@ -60,6 +63,9 @@ async fn wait_for_room(manager: &AccountManager, expected: &str) -> Vec<RoomInfo
             .await
             .expect("Room snapshot failed");
         if rooms.iter().any(|room| room.room_id == expected) {
+            opened_room::scan(manager, expected)
+                .await
+                .expect("Opened fixture room must be scanned");
             return rooms;
         }
         assert!(

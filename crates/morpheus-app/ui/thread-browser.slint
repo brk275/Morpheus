@@ -1,0 +1,384 @@
+// The native thread browser: the thread roots of the room on screen, a page
+// at a time. Rust (thread_browser.rs) owns every value in ThreadBrowser and
+// every request; this file lays the list out and reports explicit choices.
+// Roots are other users' bounded plain text: an undecryptable root shows a
+// status, never its body, and there is no unread count. Opening a root hands
+// it to the window's thread navigation; nothing here shows a conversation.
+//
+// Keyboard: the search field leads. Up and Down select a row, Page Up and
+// Page Down move by the rows in view, Ctrl+Home and Ctrl+End go to the
+// ends, Enter opens the selected thread and Escape clears the search, then
+// closes. Tab stays inside the browser: search, the rows' Open buttons in
+// view, Load more, Retry, Close, and round again.
+//
+// Layout, down to the window's minimum (640 x 620) at 200% text: the title
+// and search field, then the words that can grow (the status line, an error,
+// the no-match note) in a bounded region that scrolls, then the list (never
+// less than one whole row), then a fixed footer with Load more, Retry and
+// Close. The scrim takes clicks and wheel events, so nothing behind the
+// browser moves.
+
+import { ListView, ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton } from "controls.slint";
+
+export struct ThreadBrowserRow {
+    // The root's stable event ID: the thread to open.
+    id: string,
+    sender: string,
+    sender-id: string,
+    time: string,
+    excerpt: string,
+    // Deleted, undecryptable or not shown; empty for a message.
+    status: string,
+    attachment: string,
+    // What the server's thread summary states; empty when it stated nothing.
+    latest: string,
+    warning: bool,
+    edited: bool,
+}
+
+export struct ThreadBrowserPalette {
+    ink: color,
+    muted: color,
+    accent: color,
+    surface: color,
+    elevated: color,
+    hover: color,
+    divider: color,
+    error: color,
+    warning: color,
+    selection: color,
+    selection-ink: color,
+    has-selection-ink: bool,
+    focus: color,
+    scrim: color,
+}
+
+export global ThreadBrowser {
+    in-out property <bool> open: false;
+    in-out property <[ThreadBrowserRow]> rows;
+    in-out property <string> room-name;
+    in-out property <string> summary;
+    in-out property <string> error;
+    in-out property <bool> loading: false;
+    in-out property <bool> can-load-more: false;
+    in-out property <bool> can-retry: false;
+    in-out property <string> query;
+    // Advanced by every open: a new list starts at its first row.
+    in-out property <int> generation: 0;
+    // Advanced when the browser's own Close or Escape closes it, so the
+    // header action that opened it takes focus back.
+    in-out property <int> return-focus: 0;
+    callback show();
+    callback load-more();
+    callback retry();
+    callback filter(string);
+    callback choose(string);
+    callback close();
+    // The account or room on screen changed, or the window was locked.
+    callback context-changed();
+    // Another surface is about to take the window: the browser ends now,
+    // unconditionally, before that surface opens (each modal entry calls it).
+    callback withdraw();
+}
+
+component ThreadRowView inherits Rectangle {
+    in property <ThreadBrowserRow> entry;
+    in property <bool> current;
+    in property <float> text-scale: 1;
+    in property <ControlColors> button-colors;
+    in property <ThreadBrowserPalette> palette;
+    callback chosen();
+    property <bool> inked: root.current && root.palette.has-selection-ink;
+    // A status replaces the body; an attachment label leads it.
+    property <string> body: root.entry.status != "" ? root.entry.status
+        : root.entry.excerpt == "" ? root.entry.attachment
+        : root.entry.attachment == "" ? root.entry.excerpt
+        : root.entry.attachment + " · " + root.entry.excerpt;
+    property <string> marks: (root.entry.edited ? " · edited; original text shown" : "")
+        + (root.entry.warning ? " · sender not confirmed by encryption" : "");
+
+    background: root.current ? root.palette.selection : root.palette.elevated;
+    border-radius: StyleTokens.radius * 0.8;
+    accessible-role: list-item;
+    accessible-item-selected: root.current;
+    accessible-label: "Thread started by " + root.entry.sender
+        + (root.entry.time != "" ? ", " + root.entry.time : "")
+        + (root.body != "" ? ", " + root.body : "")
+        + (root.entry.edited ? ", edited; original text shown" : "")
+        + (root.entry.warning ? ", sender not confirmed by encryption" : "")
+        + (root.entry.latest != "" ? ", " + root.entry.latest : "");
+    TouchArea {
+        width: parent.width; height: parent.height;
+        clicked => { root.chosen(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 6px;
+        spacing: 10px;
+        VerticalLayout {
+            horizontal-stretch: 1; alignment: center; spacing: 2px;
+            Text {
+                text: root.entry.sender + (root.entry.time != "" ? " · " + root.entry.time : "") + root.marks;
+                color: root.inked ? root.palette.selection-ink
+                    : root.entry.warning ? root.palette.warning : root.palette.ink;
+                font-size: 12px * root.text-scale; font-weight: 700; overflow: elide;
+            }
+            Text {
+                text: root.body;
+                color: root.inked ? root.palette.selection-ink
+                    : root.entry.status != "" ? root.palette.muted : root.palette.ink;
+                font-size: 13px * root.text-scale; font-italic: root.entry.status != "";
+                overflow: elide;
+            }
+            // Kept when empty, so every row has the same height.
+            Text {
+                text: root.entry.latest;
+                color: root.inked ? root.palette.selection-ink : root.palette.accent;
+                font-size: 11px * root.text-scale; overflow: elide;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                text: "Open";
+                label: "Open the thread started by " + root.entry.sender;
+                activated => { ThreadBrowser.choose(root.entry.id); }
+            }
+        }
+    }
+}
+
+export component ThreadBrowserPanel inherits FocusScope {
+    in property <float> text-scale: 1;
+    in property <ControlColors> button-colors;
+    in property <ThreadBrowserPalette> palette;
+    // The selected row of the shown list.
+    property <int> current: 0;
+    // Every row is exactly this tall (its lines elide), so a row's top is
+    // its index times the pitch: the geometry the list really lays out.
+    property <length> row-height: 16px + 48px * root.text-scale;
+    property <length> row-gap: 4px;
+    property <length> pitch: root.row-height + root.row-gap;
+    // One line of the status words, for the smallest status region.
+    property <length> line-height: 16px * root.text-scale;
+    property <int> count: ThreadBrowser.rows.length;
+    // Rows wholly in view, at least one.
+    property <int> page-rows: max(1, floor(list.visible-height / root.pitch));
+
+    focus-on-tab-navigation: false;
+    init => { search-input.focus(); }
+    changed count => {
+        root.current = max(0, min(root.current, root.count - 1));
+    }
+    property <int> shown-list: ThreadBrowser.generation;
+    changed shown-list => { root.current = 0; list.viewport-y = 0; }
+
+    function reveal() {
+        let top = root.current * root.pitch;
+        if top < -list.viewport-y {
+            list.viewport-y = -top;
+        } else if top + root.row-height > -list.viewport-y + list.visible-height {
+            list.viewport-y = -(top + root.row-height - list.visible-height);
+        }
+    }
+    function move-to(index: int) {
+        if root.count > 0 {
+            root.current = max(0, min(root.count - 1, index));
+            root.reveal();
+        }
+    }
+    function choose() {
+        if root.current >= 0 && root.current < root.count {
+            ThreadBrowser.choose(ThreadBrowser.rows[root.current].id);
+        }
+    }
+
+    capture-key-pressed(event) => {
+        if event.text == Key.Escape {
+            if ThreadBrowser.query != "" {
+                ThreadBrowser.query = "";
+                root.current = 0;
+                list.viewport-y = 0;
+                ThreadBrowser.filter("");
+            } else {
+                ThreadBrowser.close();
+            }
+            accept
+        } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && search-input.has-focus {
+            close-button.focus();
+            accept
+        } else if event.text == Key.Tab && !event.modifiers.shift && close-button.has-focus {
+            search-input.focus();
+            accept
+        } else if search-input.has-focus && event.text == Key.DownArrow {
+            root.move-to(root.current + 1);
+            accept
+        } else if search-input.has-focus && event.text == Key.UpArrow {
+            root.move-to(root.current - 1);
+            accept
+        } else if search-input.has-focus && event.text == Key.PageDown {
+            root.move-to(root.current + root.page-rows);
+            accept
+        } else if search-input.has-focus && event.text == Key.PageUp {
+            root.move-to(root.current - root.page-rows);
+            accept
+        } else if search-input.has-focus && event.modifiers.control && event.text == Key.Home {
+            root.move-to(0);
+            accept
+        } else if search-input.has-focus && event.modifiers.control && event.text == Key.End {
+            root.move-to(root.count - 1);
+            accept
+        } else { reject }
+    }
+
+    Rectangle {
+        background: root.palette.scrim;
+        // Clicks and wheel events on the scrim (and on the dialog's parts
+        // that do not scroll) stop here: nothing behind the browser moves.
+        TouchArea {
+            width: parent.width; height: parent.height;
+            scroll-event(event) => { accept }
+        }
+        dialog := Rectangle {
+            width: min(720px, parent.width - 40px);
+            height: min(660px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.palette.surface;
+            border-radius: StyleTokens.radius * 1.4;
+            border-color: root.palette.divider; border-width: StyleTokens.line-width;
+            accessible-role: groupbox;
+            accessible-label: "Threads in " + ThreadBrowser.room-name;
+            VerticalLayout {
+                padding: 16px; spacing: 8px;
+                title-text := Text {
+                    text: "Threads in " + ThreadBrowser.room-name;
+                    color: root.palette.ink; font-size: 17px * root.text-scale; font-weight: 750;
+                    overflow: elide;
+                }
+                search-box := Rectangle {
+                    height: 36px * max(1, root.text-scale);
+                    background: root.palette.elevated;
+                    border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                    border-width: StyleTokens.line-width;
+                    border-color: search-input.has-focus ? root.palette.focus : transparent;
+                    if ThreadBrowser.query == "" : Text {
+                        x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                        text: "Search the loaded threads";
+                        color: root.palette.muted; font-size: 12px * root.text-scale; vertical-alignment: center;
+                    }
+                    search-input := TextInput {
+                        x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                        text <=> ThreadBrowser.query;
+                        color: root.palette.ink;
+                        selection-background-color: root.palette.selection;
+                        selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                        font-size: 12px * root.text-scale; vertical-alignment: center; single-line: true;
+                        accessible-label: "Search loaded threads; arrows select, Enter opens the thread, Escape closes";
+                        edited => { root.current = 0; list.viewport-y = 0; ThreadBrowser.filter(self.text); }
+                        accepted => { root.choose(); }
+                    }
+                }
+                // The words that can grow: the status line, an error and the
+                // no-match note. They scroll inside a region that never takes
+                // the room the list's first row and the footer need, so at
+                // 640 x 620 with 200% text a long error and an incomplete or
+                // search status leave one whole row and every action on
+                // screen. Each wrapped text is measured at its width before
+                // the scroll extent is summed.
+                body := ScrollView {
+                    min-height: root.line-height + 4px;
+                    preferred-height: body-content.preferred-height;
+                    max-height: max(self.min-height,
+                        dialog.height - 32px - title-text.preferred-height - search-box.height
+                            - footer.preferred-height - 32px - root.pitch);
+                    vertical-stretch: 0;
+                    viewport-width: self.visible-width;
+                    viewport-height: body-content.preferred-height;
+                    body-content := VerticalLayout {
+                        width: body.visible-width;
+                        spacing: 4px;
+                        Rectangle {
+                            height: status-text.height;
+                            status-text := Text {
+                                width: parent.width; height: self.preferred-height;
+                                text: ThreadBrowser.loading
+                                    ? (ThreadBrowser.rows.length == 0 && ThreadBrowser.query == "" ? "Reading this room's threads…" : "Loading more threads…")
+                                    : ThreadBrowser.summary;
+                                color: root.palette.muted; font-size: 11px * root.text-scale;
+                                wrap: word-wrap;
+                                accessible-live-region: polite;
+                            }
+                        }
+                        if ThreadBrowser.error != "" : Rectangle {
+                            height: error-text.height;
+                            error-text := Text {
+                                width: parent.width; height: self.preferred-height;
+                                text: ThreadBrowser.error;
+                                color: root.palette.error; font-size: 12px * root.text-scale;
+                                wrap: word-wrap;
+                                accessible-live-region: polite;
+                            }
+                        }
+                        if !ThreadBrowser.loading && ThreadBrowser.query != "" && ThreadBrowser.rows.length == 0 : Rectangle {
+                            height: no-match-text.height;
+                            no-match-text := Text {
+                                width: parent.width; height: self.preferred-height;
+                                text: "No loaded thread matches. Load more or change the search.";
+                                color: root.palette.muted; font-size: 12px * root.text-scale;
+                                wrap: word-wrap;
+                                accessible-live-region: polite;
+                            }
+                        }
+                    }
+                }
+                // Lazy: only the rows in view are instantiated. At the
+                // minimum window size and 200% text one whole row still shows.
+                list := ListView {
+                    vertical-stretch: 1;
+                    min-height: root.pitch;
+                    horizontal-scrollbar-policy: always-off;
+                    accessible-role: AccessibleRole.list;
+                    accessible-label: "Threads in " + ThreadBrowser.room-name;
+                    for row[index] in ThreadBrowser.rows : Rectangle {
+                        width: list.visible-width;
+                        height: root.pitch;
+                        ThreadRowView {
+                            y: 0px; height: root.row-height;
+                            entry: row;
+                            current: index == root.current;
+                            text-scale: root.text-scale;
+                            button-colors: root.button-colors;
+                            palette: root.palette;
+                            chosen => { root.current = index; root.reveal(); search-input.focus(); }
+                        }
+                    }
+                }
+                // The fixed footer: its actions never scroll away.
+                footer := HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    if ThreadBrowser.can-load-more : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Load more";
+                        label: "Load more threads of " + ThreadBrowser.room-name;
+                        // The button goes while the page loads: focus stays in the
+                        // browser first, so Escape and Tab keep working.
+                        activated => { search-input.focus(); ThreadBrowser.load-more(); }
+                    }
+                    if ThreadBrowser.can-retry : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Retry";
+                        label: "Read this page of threads again";
+                        // As for Load more: Retry goes with the error it answers.
+                        activated => { search-input.focus(); ThreadBrowser.retry(); }
+                    }
+                    close-button := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Close";
+                        label: "Close the thread browser";
+                        activated => { ThreadBrowser.close(); }
+                    }
+                }
+            }
+        }
+    }
+}

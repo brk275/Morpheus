@@ -192,6 +192,15 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(classify([classifier, path])["native_matrix"]["os"], list(PLATFORMS))
         self.assertEqual(classify([classifier], force_all=True)["native_matrix"]["os"], list(PLATFORMS))
 
+    def test_native_fixed_client_build_inputs_select_linux_and_wayland(self):
+        for path in ("scripts/build_linux_native.py", "scripts/pipewire_startup_probe.py",
+                     "crates/linux_native_pipewire.rs"):
+            with self.subTest(path=path):
+                selected = classify([path])
+                self.assertEqual(selected["native_matrix"]["os"], ["ubuntu-24.04"])
+                self.assertTrue(selected["wayland"])
+                self.assertEqual(classify([path, "Cargo.lock"])["native_matrix"]["os"], list(PLATFORMS))
+
     def test_pipewire_isolation_inputs_only_select_linux(self):
         for path in ("vendor/webrtc-sys/pipewire_isolation.rs", "vendor/webrtc-sys/pipewire-symbols.txt"):
             with self.subTest(path=path):

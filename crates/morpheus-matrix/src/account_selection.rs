@@ -52,6 +52,23 @@ impl AccountSelection {
             notified.await;
         }
     }
+
+    /// Run one wait under this selection. Returns `None` the moment the
+    /// selection is revoked, whether or not the wait would ever complete, so
+    /// observers of a queue that never emits again end with their account and
+    /// release what they hold. A completed wait is still reported as `None`
+    /// when the selection was revoked meanwhile; callers never act on a result
+    /// for a departed selection.
+    pub async fn guard<F: std::future::Future>(&self, wait: F) -> Option<F::Output> {
+        let output = tokio::select! {
+            // Do not poll work that may dispatch a request when revocation
+            // is already ready, including when a held read becomes ready too.
+            biased;
+            _ = self.revoked() => return None,
+            output = wait => output,
+        };
+        self.is_current().then_some(output)
+    }
 }
 
 #[derive(Default)]
@@ -92,11 +109,99 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn guarded_waits_end_on_revocation_without_another_event_and_release_their_hold() {
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("a"));
+            let selection = selections.for_account("a").unwrap();
+            // A hold such as a composer lease or an observed request handle.
+            let hold = Arc::new(());
+            let held = hold.clone();
+            let task = tokio::spawn(async move {
+                let _held = held;
+                // Nothing will ever complete this wait: a paused queue that
+                // never emits again.
+                selection.guard(std::future::pending::<()>()).await
+            });
+            tokio::task::yield_now().await;
+            assert_eq!(
+                Arc::strong_count(&hold),
+                2,
+                "the task holds its resource while waiting"
+            );
+            // Switching the account revokes the selection: the task ends and
+            // drops what it held without any queue event.
+            selections.replace(Some("b"));
+            let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("the guarded wait must end on revocation")
+                .unwrap();
+            assert_eq!(outcome, None);
+            assert_eq!(
+                Arc::strong_count(&hold),
+                1,
+                "the hold is released with the task"
+            );
+            // A wait that completes after revocation is not reported either.
+            let stale = selections.for_account("b").unwrap();
+            selections.replace(None);
+            assert_eq!(stale.guard(async { 7 }).await, None);
+            // A wait under a live selection completes normally.
+            selections.replace(Some("c"));
+            let live = selections.for_account("c").unwrap();
+            assert_eq!(live.guard(async { 7 }).await, Some(7));
+        });
+    }
+
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn revoked_work_is_never_polled_even_when_it_is_ready() {
+        use std::sync::atomic::AtomicUsize;
+
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("a"));
+            let selection = selections.for_account("a").unwrap();
+            selections.replace(Some("b"));
+            let dispatched = AtomicUsize::new(0);
+            let result = selection
+                .guard(async {
+                    dispatched.fetch_add(1, Ordering::SeqCst);
+                })
+                .await;
+            assert_eq!(result, None);
+            assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn revocation_wins_when_a_held_read_and_its_next_action_are_ready_together() {
+        use std::sync::atomic::AtomicUsize;
+
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("a"));
+            let selection = selections.for_account("a").unwrap();
+            let dispatched = AtomicUsize::new(0);
+            let (release, held) = tokio::sync::oneshot::channel::<()>();
+            let mut work = Box::pin(selection.guard(async {
+                held.await.unwrap();
+                dispatched.fetch_add(1, Ordering::SeqCst);
+            }));
+            assert!(futures_util::poll!(work.as_mut()).is_pending());
+            // Both branches become ready before the guard's next poll.
+            release.send(()).unwrap();
+            selections.replace(Some("b"));
+            assert_eq!(work.await, None);
+            assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]

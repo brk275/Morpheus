@@ -14,8 +14,8 @@ use matrix_sdk::{
     },
 };
 use morpheus_matrix::{
-    AccountManager, MatrixCoreError, MatrixLinkTarget, PublicRoomsPage, PublicRoomsQuery,
-    parse_matrix_link_target,
+    AccountManager, JoinCancellation, JoinError, MatrixCoreError, MatrixLinkTarget,
+    PublicRoomsPage, PublicRoomsQuery, parse_matrix_link_target,
 };
 use serde::Deserialize;
 use tokio::time::{Instant, sleep};
@@ -172,6 +172,9 @@ fn public_directory_is_paginated_and_account_scoped() {
         let link = format!("https://matrix.to/#/%23morpheus_{marker}_one:{a_server}");
         assert!(matches!(parse_matrix_link_target(&link).unwrap(), MatrixLinkTarget::Room { room_or_alias_id, .. } if room_or_alias_id == alias));
 
+        // Captured while Alice is shown; signing in Carol revokes it.
+        let alice_selection = manager.account_selection(&alice_account.id)
+            .expect("Alice selection missing");
         let carol_account = manager.add_password_account(
             &carol.homeserver_url, &carol.username, &carol.password,
         ).await.expect("Cannot sign in Carol");
@@ -208,14 +211,29 @@ fn public_directory_is_paginated_and_account_scoped() {
         ).await.expect("Cannot sign in Bob");
         let routed_link = format!("{link}?via={a_server}");
         let target = parse_matrix_link_target(&routed_link).expect("Cannot parse routed room link");
-        assert!(matches!(
-            manager.join_matrix_room_for(&alice_account.id, &target).await,
-            Err(MatrixCoreError::SelectedAccountChanged)
-        ));
+        // A departed selection, or a caller check refusing at the hand-off,
+        // sends nothing.
         assert_eq!(
-            manager.join_matrix_room_for(&bob_account.id, &target).await
+            manager.join_room_for(&alice_selection, &target, &JoinCancellation::new(), || true)
+                .await,
+            Err(JoinError::AccountChanged)
+        );
+        let bob_selection = manager.account_selection(&bob_account.id)
+            .expect("Bob selection missing");
+        assert_eq!(
+            manager.join_room_for(&bob_selection, &target, &JoinCancellation::new(), || false)
+                .await,
+            Err(JoinError::Blocked)
+        );
+        assert_eq!(
+            manager.join_room_for(&bob_selection, &target, &JoinCancellation::new(), || true).await
                 .expect("Cannot join discovered room from matrix.to link"),
             a_one
+        );
+        // The room is shown as joined once sync says so, not before.
+        assert_eq!(
+            manager.await_joined_for(&bob_selection, &a_one, &JoinCancellation::new()).await,
+            Some(false)
         );
         manager.switch_to(&alice_account.id).await.expect("Cannot return to Alice");
         unpublish_room(&alice_client, &a_one).await;

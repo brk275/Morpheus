@@ -138,7 +138,8 @@ jobs:
     concurrency:
       group: native-${{ github.sha }}-${{ matrix.os }}
       cancel-in-progress: false
-    timeout-minutes: 90
+    # Intel cold native graphs need room to compile; test deadlines stay fixed.
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 150 || 90 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
@@ -152,7 +153,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
-            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev libudev-dev \
+            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev systemd-dev libudev-dev \
             libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xdotool \
@@ -177,11 +178,24 @@ jobs:
         with:
           # Preserve compiled dependencies when a later acceptance check fails.
           # The save guard still makes untrusted/PR executions restore-only.
+          # Older SDK extractions lack the verified downloader's receipt.
+          # The key separates both primary and fallback cache namespaces.
+          key: verified-sdk-archives-v1
           cache-on-failure: true
           save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
+      - name: Prepare the pinned owned native PipeWire client
+        if: runner.os == 'Linux'
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build_linux_native.py --variant native \
+            --prefix "$RUNNER_TEMP/morpheus-native-pipewire-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --github-env
+      - name: Check native interface compilation before desktop dependencies
+        run: cargo check --locked -p morpheus-ui-check
       - name: Test configuration, Matrix, and RTC protocol models
         id: model-tests
         # Still fail the job below, but collect independent desktop/device
@@ -193,6 +207,125 @@ jobs:
         run: cargo check --locked -p morpheus-app -p morpheus-matrix
       - name: Build desktop with native call and device adapters
         run: cargo build --locked -p morpheus-app --features native-calls
+      - name: Verify the actual Linux app uses its owned native client
+        if: runner.os == 'Linux'
+        timeout-minutes: 2
+        shell: /usr/bin/python3 -I -B {0}
+        run: |
+          import hashlib, json, os, pathlib, re, selectors, signal, stat, subprocess, sys, tempfile, time
+          root = pathlib.Path.cwd().resolve(strict=True)
+          sys.path.insert(0, str(root / 'packaging/linux'))
+          sys.path.insert(0, str(root / 'scripts'))
+          import appimage_client as client
+          from prepare_appimage_update import validate_metadata
+
+          def interrupted(_signal, _frame):
+              raise RuntimeError('native link verification interrupted')
+          signal.signal(signal.SIGTERM, interrupted)
+          private = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-native-link-', dir=os.environ['RUNNER_TEMP']))
+          home, temporary = private / 'home', private / 'tmp'
+          home.mkdir(mode=0o700)
+          temporary.mkdir(mode=0o700)
+          environment = {'PATH':'/usr/bin:/bin', 'HOME':str(home), 'TMPDIR':str(temporary), 'LANG':'C', 'LC_ALL':'C'}
+
+          def bounded(label, argv, limit=4096):
+              # Only fixed reviewed commands run here. Keep all output private,
+              # stop the owned group before reaping its leader, and bound bytes.
+              process = subprocess.Popen(argv, cwd=private, env=environment,
+                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  start_new_session=True)
+              output = bytearray()
+              deadline = time.monotonic() + 20
+              selector = selectors.DefaultSelector()
+              try:
+                  selector.register(process.stdout, selectors.EVENT_READ)
+                  while True:
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0 or not selector.select(remaining):
+                          raise RuntimeError('native link command deadline')
+                      block = os.read(process.stdout.fileno(), min(8192, limit + 1 - len(output)))
+                      if not block:
+                          break
+                      output.extend(block)
+                      if len(output) > limit:
+                          raise RuntimeError('native link command output limit')
+                  # Observe completion without reaping, so group cleanup cannot
+                  # race PID reuse or turn a successful early close into SIGKILL.
+                  while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
+                      remaining = deadline - time.monotonic()
+                      if remaining <= 0:
+                          raise RuntimeError('native link command exit deadline')
+                      time.sleep(min(0.01, remaining))
+              finally:
+                  try:
+                      os.killpg(process.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
+                  process.wait(timeout=5)
+                  selector.close()
+                  process.stdout.close()
+                  descriptor = os.open(private / (label + '.log'), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                  with os.fdopen(descriptor, 'wb') as target:
+                      target.write(output)
+              return process.returncode, bytes(output)
+
+          try:
+              client.require_build_platform()
+              assert os.environ.get('GITHUB_ACTIONS') == 'true'
+              assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+              assert os.environ.get('MORPHEUS_PIPEWIRE_CLIENT_VARIANT') == 'native'
+              receipt = pathlib.Path(os.environ['MORPHEUS_PIPEWIRE_CLIENT_RECEIPT'])
+              stage = client.private_directory(receipt.parent)
+              assert receipt.name == 'build-client.txt'
+              assert stage.is_relative_to(pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True))
+              library = stage / client.R.NATIVE_SONAME
+              hidden = stage / '.native-link-absence-check'
+              assert not hidden.exists() and not hidden.is_symlink()
+              identity = library.lstat()
+              assert stat.S_ISREG(identity.st_mode) and identity.st_uid == os.getuid()
+              assert identity.st_nlink == 1 and not identity.st_mode & 0o022
+              content = client.read_regular(library, client.R.MAX_LIBRARY)
+              client.R.elf_identity(content, library=True, expected_soname=client.R.NATIVE_SONAME)
+              original_hash = hashlib.sha256(content).hexdigest()
+              binary = root / 'target/debug/morpheus-app'
+              details = binary.lstat()
+              assert stat.S_ISREG(details.st_mode) and not binary.is_symlink()
+              assert details.st_uid == os.getuid() and details.st_mode & 0o111
+              code, dynamic = bounded('readelf', [client.R.trusted_tool('readelf'), '--dynamic', str(binary)], 65536)
+              assert code == 0
+              needed = re.findall(rb'\(NEEDED\).*?\[([^\]\n]+)\]', dynamic)
+              assert needed.count(client.R.NATIVE_SONAME.encode()) == 1
+              assert client.SONAME.encode() not in needed and b'\x00' not in dynamic
+              paths = re.findall(rb'\((RPATH|RUNPATH)\).*?\[([^\]\n]*)\]', dynamic)
+              assert paths == [(b'RUNPATH', str(stage).encode())]
+              command = [str(binary), '--morpheus-update-metadata']
+              code, first = bounded('metadata-before', command)
+              assert code == 0
+              metadata = json.loads(first)
+              validate_metadata(metadata)
+              try:
+                  os.rename(library, hidden)
+                  code, refusal = bounded('metadata-missing-client', command)
+                  expected = (str(binary).encode() + b': error while loading shared libraries: '
+                      + client.R.NATIVE_SONAME.encode()
+                      + b': cannot open shared object file: No such file or directory\n')
+                  assert code == 127 and refusal == expected
+              finally:
+                  if hidden.exists() or hidden.is_symlink():
+                      moved = hidden.lstat()
+                      assert (moved.st_dev, moved.st_ino, moved.st_mode) == (identity.st_dev, identity.st_ino, identity.st_mode)
+                      assert hashlib.sha256(client.read_regular(hidden, client.R.MAX_LIBRARY)).hexdigest() == original_hash
+                      assert not library.exists() and not library.is_symlink()
+                      os.rename(hidden, library)
+              code, restored = bounded('metadata-restored', command)
+              assert code == 0 and json.loads(restored) == metadata
+              assert not list(home.iterdir()) and not list(temporary.iterdir())
+              print('Native app client linkage: ' + json.dumps({'distinct_needed':True,
+                  'current_runpath':True, 'missing_client_refused':True, 'same_library_restored':True,
+                  'metadata_only_no_profile':True}, sort_keys=True))
+          except Exception:
+              print('Native app client linkage failed; bounded output remains private on the ephemeral runner.')
+              raise SystemExit(1) from None
       - name: Capture actual native preview screens
         id: preview-capture
         if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
@@ -243,6 +376,8 @@ jobs:
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in-large.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-sidebar.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-space-labels.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery-thread-large.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
           if-no-files-found: error
           retention-days: 1
@@ -261,6 +396,10 @@ jobs:
           fi
       - name: Test desktop controller and call guards
         id: desktop-tests
+        # ElementHandle queries need compiler-generated element metadata even
+        # when Rust debug symbols are disabled for the hosted test build.
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
         # The independently built app can still exercise disposable fixtures
         # after a unit assertion fails. Keep that evidence and reject the
         # candidate at the final gate instead of rebuilding just to reach it.
@@ -298,6 +437,7 @@ jobs:
           cargo test --locked -p matrix-rtc-livekit --lib
           cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
           cargo test --locked -p cargo-packager-updater --lib
+          cargo test --locked -p webrtc-sys-build --lib
       - name: Test pinned SDK sticky receipt and redaction regressions
         id: sdk-receipt-tests
         # Keep collecting the independently built app's live acceptance. The

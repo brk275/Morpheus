@@ -1,9 +1,9 @@
-"""Private draft: prepare and identify the AppImage-only fixed PipeWire client.
+"""Prepare the pinned fixed PipeWire client for explicit native/AppImage builds.
 
 This module does not download executables, launch apps, set process-global loader
 variables, or enable packaging. The Linux packaging adapter must own subprocess
 containment, private bounded logs and installed acceptance before enabling it.
-The existing system-library acceptance remains separate and mandatory.
+Native uses a distinct SONAME; the original AppImage deployment stays separate.
 """
 
 from __future__ import annotations
@@ -189,7 +189,27 @@ def verify_tools_after(root, original_payloads):
     return receipts
 
 
-def prepare_client(root, archives, upstream_patch, run_command):
+NATIVE_MESON_SHA256 = "edf88a811c34f4f301d30321128bb23570d6ed39cd9c4db47dd0f0982c091639"
+NATIVE_MESON_PATCHED_SHA256 = "01e57c7f2b10a615cb07f64c2dbf3eac63383c1bcd242c36882aecfbd8c7b4ce"
+
+
+def native_library_name(source):
+    # Native source builds need an ELF dependency stock PipeWire cannot satisfy.
+    # Only the target name changes; headers, protocol, C sources and plugins do
+    # not. AppImage keeps its original name and relocated deployment contract.
+    path = source / "src/pipewire/meson.build"
+    original = read_regular(path, 16384)
+    before = b"libpipewire = shared_library(pipewire_name, pipewire_sources,"
+    after = b"libpipewire = shared_library('morpheus-pipewire-0.3', pipewire_sources,"
+    if sha256(original) != NATIVE_MESON_SHA256 or original.count(before) != 1:
+        raise PackageFailure("source")
+    modified = original.replace(before, after, 1)
+    if sha256(modified) != NATIVE_MESON_PATCHED_SHA256:
+        raise PackageFailure("source")
+    path.write_bytes(modified)
+
+
+def prepare_client(root, archives, upstream_patch, run_command, *, variant):
     """Build only the pinned fixed client; never install anything globally.
 
     ``run_command(stage, argv, cwd=, env=, timeout=, output_limit=)`` must drain
@@ -198,6 +218,8 @@ def prepare_client(root, archives, upstream_patch, run_command):
     This is a recipe with pinned sources, not a claim of bit-reproducible output:
     exact tool versions/configuration/object hashes are retained for comparison.
     """
+    if variant not in ("appimage", "native"):
+        raise PackageFailure("configuration")
     require_build_platform()
     root = private_directory(root)
     if set(archives) != set(R.ARCHIVES):
@@ -234,20 +256,29 @@ def prepare_client(root, archives, upstream_patch, run_command):
         for patch in R.patch_series(source):
             run("distro-patch", [tools["patch"], "--batch", "--forward", "--fuzz=0", "--get=0", "-p1", "--input", str(patch)], cwd=source)
         R.apply_upstream_patch(source)
+        if variant == "native":
+            native_library_name(source)
+        target = R.NATIVE_TARGET if variant == "native" else R.TARGET
+        soname = R.NATIVE_SONAME if variant == "native" else SONAME
         build = root / "build"
         # Strip source/build path differences from file/debug macros. No host
         # compiler flags or package-loader overrides are accepted.
         environment["CFLAGS"] = " ".join(shlex.quote(f"{flag}={root}=/usr/src/morpheus-pipewire")
                                          for flag in ("-ffile-prefix-map", "-fdebug-prefix-map"))
         run("configure", [tools["meson"], "setup", str(build), str(source), *R.CONFIGURE], budget=120)
-        run("client-build", [tools["ninja"], "-C", str(build), "-j2", R.TARGET], budget=300)
-        library = read_regular(build / R.TARGET, R.MAX_LIBRARY)
-        build_id, needed = R.elf_identity(library, library=True)
-        objects = R.object_inventory(build)
+        run("client-build", [tools["ninja"], "-C", str(build), "-j2", target], budget=300)
+        library = read_regular(build / target, R.MAX_LIBRARY)
+        build_id, needed = R.elf_identity(library, library=True, expected_soname=soname)
+        objects = R.object_inventory(build, target=target)
         stage = root / "stage"
         stage.mkdir(mode=0o700)
-        client = stage / SONAME
+        client = stage / soname
         write_new(client, library, 0o500)
+        if variant == "native":
+            # The Rust sys crate still links -lpipewire-0.3. GNU ld reads the
+            # distinct DT_SONAME from this file, so it cannot fall back to stock.
+            (stage / "libpipewire-0.3.so").symlink_to(soname)
+            (stage / SONAME).symlink_to(soname)
         for name, expected in LICENSES.items():
             data = read_regular(source / name, 8192)
             if sha256(data) != expected:
@@ -267,12 +298,59 @@ def prepare_client(root, archives, upstream_patch, run_command):
                     "configure": list(R.CONFIGURE),
                     "config_sha256": sha256(read_regular(build / "config.h", 65536)),
                     "recipe_sha256": sha256(read_regular(build / "build.ninja", 4 * 1024 * 1024))}
+        if variant == "native":
+            metadata.update(variant="native", soname=soname,
+                            native_meson_sha256=NATIVE_MESON_PATCHED_SHA256)
         write_new(stage / "SOURCE.json", json.dumps(metadata, sort_keys=True, indent=2).encode() + b"\n")
         return stage, metadata
     except R.ProbeFailure:
         raise PackageFailure("source") from None
     except OSError:
         raise PackageFailure("input") from None
+
+
+
+def build_receipt(stage, metadata, *, variant):
+    """Explicit build input; not a signature or proof against its owner changing it.
+
+    The native link uses a unique SONAME. AppImage validates its original client
+    here, then keeps its existing deployment-time byte/build-ID measurement.
+    """
+    if variant not in ("appimage", "native"):
+        raise PackageFailure("configuration")
+    stage = private_directory(stage)
+    soname = R.NATIVE_SONAME if variant == "native" else SONAME
+    data = read_regular(stage / soname, R.MAX_LIBRARY)
+    identity, needed = R.elf_identity(data, library=True, expected_soname=soname)
+    if (metadata.get("schema") != 1
+            or sha256(data) != metadata.get("source_client_sha256")
+            or identity != metadata.get("build_id") or list(needed) != metadata.get("needed")
+            or metadata.get("source_version") != R.VERSION
+            or metadata.get("upstream_patch_sha256") != R.UPSTREAM_PATCH_SHA256
+            or metadata.get("upstream_commit") != R.COMMIT
+            or metadata.get("patched_source_sha256") != R.PATCHED_SOURCE_SHA256
+            or metadata.get("source_archives") != {k: v[1] for k, v in R.ARCHIVES.items()}
+            or variant == "native" and (metadata.get("variant") != "native"
+                or metadata.get("soname") != soname
+                or metadata.get("native_meson_sha256") != NATIVE_MESON_PATCHED_SHA256)):
+        raise PackageFailure("client")
+    values = {"schema": "1", "variant": variant, "soname": soname,
+              "source_version": R.VERSION, "upstream_commit": R.COMMIT,
+              "upstream_patch_sha256": R.UPSTREAM_PATCH_SHA256,
+              "patched_source_sha256": R.PATCHED_SOURCE_SHA256,
+              "original_archive_sha256": R.ARCHIVES["original"][1],
+              "debian_archive_sha256": R.ARCHIVES["debian"][1],
+              "dsc_sha256": R.ARCHIVES["dsc"][1],
+              "sha256": sha256(data), "build_id": identity,
+              "native_meson_sha256": NATIVE_MESON_PATCHED_SHA256 if variant == "native" else "none"}
+    receipt = stage / "build-client.txt"
+    write_new(receipt, "".join(k + "=" + v + "\n" for k, v in sorted(values.items())).encode("ascii"), 0o400)
+    if variant == "native":
+        write_new(stage / "artifact.json", json.dumps({
+            "schema": 1, "variant": "native", "library_path": str(stage / soname),
+            "sha256": sha256(data), "build_id": identity,
+        }, sort_keys=True).encode("ascii") + b"\n", 0o400)
+    return receipt
 
 
 def appimage_config(base, stage):

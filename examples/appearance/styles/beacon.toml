@@ -1,0 +1,23 @@
+# Beacon: maximum legibility. The high-contrast palette with heavier
+# outlines, a wide focus ring, larger icons and type, and no decorative
+# motion. A sparse example: merge these keys into config.toml.
+schema_version = 1
+
+[appearance]
+theme = "high_contrast"
+reduce_motion = true
+
+[typography]
+message_size = 16
+sidebar_size = 15
+timestamp_size = 13
+composer_size = 16
+sender_weight = 700
+
+[geometry]
+border_width = 2
+focus_width = 4
+control_padding = 14
+input_padding = 12
+composer_padding = 12
+icon_size = 22

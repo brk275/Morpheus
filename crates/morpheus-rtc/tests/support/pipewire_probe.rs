@@ -1,5 +1,5 @@
-//! Provenance for the separately named, opt-in private-client diagnostic.
-//! The ordinary capture test never calls this verifier.
+//! Exact provenance for the native fixed client and the separate A/B diagnostic.
+//! These modes never accept each other's artifact or library identity.
 
 use std::{
     ffi::{CStr, c_void},
@@ -169,14 +169,33 @@ fn mapped_function(maps: &str, address: usize, expected_device: u64, expected_in
 }
 
 pub(super) fn verify(addresses: &[*const c_void]) -> Result<(), &'static str> {
-    if addresses.len() != 33
-        || std::env::var("MORPHEUS_WAYLAND_STARTUP_PROBE").as_deref() != Ok("1")
-    {
+    if std::env::var("MORPHEUS_WAYLAND_STARTUP_PROBE").as_deref() != Ok("1") {
         return Err("private-client diagnostic was not selected");
     }
     let manifest = PathBuf::from(
         std::env::var_os("MORPHEUS_PIPEWIRE_PROBE_ARTIFACT").ok_or("artifact manifest missing")?,
     );
+    verify_artifact(addresses, manifest, false)
+}
+
+pub(super) fn verify_native(addresses: &[*const c_void]) -> Result<(), &'static str> {
+    // Build-script output, not a runtime environment override. Normal ELF
+    // loading already requires the distinct native SONAME before Rust starts.
+    let manifest = PathBuf::from(
+        option_env!("MORPHEUS_NATIVE_PIPEWIRE_ARTIFACT")
+            .ok_or("native fixed client was not prepared at build time")?,
+    );
+    verify_artifact(addresses, manifest, true)
+}
+
+fn verify_artifact(
+    addresses: &[*const c_void],
+    manifest: PathBuf,
+    native: bool,
+) -> Result<(), &'static str> {
+    if addresses.len() != 33 {
+        return Err("PipeWire address inventory changed");
+    }
     let parent = manifest.parent().ok_or("artifact directory missing")?;
     private_metadata(parent, true)?;
     if manifest.canonicalize().ok().as_ref() != Some(&manifest) {
@@ -186,7 +205,11 @@ pub(super) fn verify(addresses: &[*const c_void]) -> Result<(), &'static str> {
     let artifact: Artifact =
         serde_json::from_slice(&bytes).map_err(|_| "artifact manifest rejected")?;
     if artifact.schema != 1
-        || !matches!(artifact.variant.as_str(), "control" | "patched")
+        || !(if native {
+            artifact.variant == "native"
+        } else {
+            matches!(artifact.variant.as_str(), "control" | "patched")
+        })
         || !lower_hex(&artifact.sha256, 64, 64)
         || !lower_hex(&artifact.build_id, 16, 128)
         || artifact.library_path.parent() != Some(parent)
@@ -194,7 +217,11 @@ pub(super) fn verify(addresses: &[*const c_void]) -> Result<(), &'static str> {
             .library_path
             .file_name()
             .and_then(|value| value.to_str())
-            != Some("libpipewire-0.3.so.0.1005.0")
+            != Some(if native {
+                "libmorpheus-pipewire-0.3.so.0"
+            } else {
+                "libpipewire-0.3.so.0.1005.0"
+            })
         || artifact.library_path.canonicalize().ok().as_ref() != Some(&artifact.library_path)
     {
         return Err("artifact manifest contract rejected");
@@ -235,11 +262,20 @@ pub(super) fn verify(addresses: &[*const c_void]) -> Result<(), &'static str> {
             return Err("function origin differs from reviewed artifact");
         }
     }
-    let facts = serde_json::json!({
-        "schema": 1, "variant": artifact.variant, "checked": 33,
-        "private_probe": 33, "digest_verified": true, "build_id_verified": true,
-        "mapped_file_verified": true,
-    });
+    let facts = if native {
+        serde_json::json!({
+            "schema": 1, "variant": "native", "checked": 33,
+            "owned_fixed_client": 33, "system_pipewire": 0, "executable": 0, "other": 0, "unavailable": 0,
+            "sha256": artifact.sha256, "build_id": artifact.build_id,
+            "digest_verified": true, "build_id_verified": true, "mapped_file_verified": true,
+        })
+    } else {
+        serde_json::json!({
+            "schema": 1, "variant": artifact.variant, "checked": 33,
+            "private_probe": 33, "digest_verified": true, "build_id_verified": true,
+            "mapped_file_verified": true,
+        })
+    };
     let path = std::env::var_os("MORPHEUS_WAYLAND_BINDING_PATH")
         .ok_or("private binding facts path missing")?;
     fs::write(

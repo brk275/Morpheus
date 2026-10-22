@@ -1,0 +1,41 @@
+# Morpheus theme pack: Ember. Warm paper surfaces with a terracotta accent.
+# Colors only; import it from Settings > Appearance > Theme packs.
+schema_version = 1
+name = "Ember"
+
+[colors]
+rail = "#EFE6DC"
+sidebar = "#F6EFE7"
+canvas = "#FFFBF6"
+panel = "#F8F1E8"
+elevated = "#FFFFFF"
+hover = "#F1E3D3"
+ink = "#2B211B"
+muted = "#6B5A4E"
+divider = "#E2D3C3"
+accent = "#B5532A"
+accent_ink = "#FFFFFF"
+
+[roles]
+link = "#2F5F8A"
+focus = "#2F6F5F"
+selection = "#F3D7C4"
+selection_ink = "#2B211B"
+error = "#A3333D"
+error_surface = "#F7DDDF"
+error_ink = "#6E1F27"
+success = "#2F6B45"
+success_surface = "#DFEEDF"
+success_ink = "#244F33"
+timestamp = "#7A675A"
+
+[states]
+icon = "#7A675A"
+icon_active = "#B5532A"
+icon_navigation = "#5E4B3F"
+icon_header = "#7A675A"
+icon_composer = "#8C5A3C"
+icon_message = "#7A675A"
+
+[senders]
+colors = ["#8A3B1F", "#2F5F8A", "#5D4A8A", "#2F6B45", "#8A4A6A", "#6A5A1E"]

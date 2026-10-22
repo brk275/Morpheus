@@ -1,0 +1,643 @@
+// The invitations center: every room and Space invitation of the account
+// on screen, searchable, each answered on its own and only by a deliberate
+// choice. Rust (crate::invitations) owns every value in InvitationsState;
+// this file only presents it and reports choices.
+
+import { ListView } from "std-widgets.slint";
+import { NotificationPalette, RuleAction, RuleOption } from "notification-settings.slint";
+
+// One invitation. Every text is sanitized in Rust and shows only what the
+// invitation's own state supplied.
+export struct InvitationItem {
+    // Routing only, never shown.
+    room-id: string,
+    // This invitation's generation in the account's listing; a choice echoes
+    // it, so a row from an older listing or account selection never answers.
+    generation: int,
+    name: string,
+    // Kind, inviter and alias, joined in Rust from what was supplied.
+    detail: string,
+    topic: string,
+    // 0 room, 1 Space, 2 direct message.
+    kind: int,
+    // 0 not stated, 1 encrypted, 2 not encrypted.
+    encryption: int,
+    // Its answer is waiting for the homeserver.
+    busy: bool,
+    // Its own last outcome or error, in fixed wording.
+    status: string,
+    failed: bool,
+}
+
+export global InvitationsState {
+    // Slint opens and closes the center; Rust reads and fills it.
+    in-out property <bool> open: false;
+    // Routing only, never shown: the account Rust listed. The window closes
+    // the center once another account is on screen.
+    in-out property <string> account-id;
+    in-out property <bool> loading: false;
+    in-out property <string> error;
+    // The latest answer's outcome, in fixed wording.
+    in-out property <string> notice;
+    // A joined room the notice can open; empty for none.
+    in-out property <string> notice-room-id;
+    // Sync already brought that room here, so Open opens it at once. When
+    // false the action is a manual "Check and open": Rust opens the room only
+    // if this device then has it joined, and nothing retries by itself.
+    in-out property <bool> notice-room-ready: false;
+    in-out property <[InvitationItem]> items;
+    // All invitations of the account, how many were read (at most 500) and
+    // how many of those match the search.
+    in-out property <int> total: 0;
+    in-out property <int> read: 0;
+    in-out property <int> matching: 0;
+    in-out property <string> query;
+    // The highlighted row; arrows in the search field move it.
+    in-out property <int> index: -1;
+    // A bulk decline waiting for its confirmation: how many; 0 for none.
+    in-out property <int> bulk-count: 0;
+    in-out property <bool> bulk-running: false;
+    // An answer of the account on screen is waiting for the homeserver.
+    in-out property <bool> answering: false;
+    // Raised by Rust when it rebuilt the rows: a focused row is gone, so the
+    // search field takes focus; the highlight stays on the same invitation.
+    in-out property <int> focus-request: 0;
+    // Read the account's invitations again.
+    callback refresh();
+    // The center closed: Rust clears its rows; answers already sent go on.
+    callback closed();
+    callback search(string);
+    // Room, generation, accept (true) or decline (false).
+    callback answer(string, int, bool);
+    // Prepare, confirm or drop a bounded decline of the shown invitations.
+    callback ask-bulk-decline();
+    callback confirm-bulk-decline();
+    callback cancel-bulk-decline();
+    // Open a room this account just joined.
+    callback open-room(string);
+}
+
+export component InvitationsCenter inherits Rectangle {
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> radius: 10px;
+    in property <bool> live;
+    in property <string> account-handle;
+    // The window's size; the center never grows past it.
+    in property <length> available-width: 10000px;
+    in property <length> available-height: 10000px;
+    // The first and last controls hold focus; the window wraps Tab here.
+    out property <bool> at-start: close-action.has-focus;
+    out property <bool> at-end: refresh-action.has-focus;
+    // The person closed the center: ×.
+    callback dismissed();
+    // The search field took focus; a search deep link reports it.
+    callback revealed();
+    property <length> row-height: max(84px, 66px * root.text-scale + 18px);
+    property <bool> highlighted: InvitationsState.index >= 0 && InvitationsState.index < InvitationsState.items.length;
+    // An index outside the rows reads as an empty item.
+    property <InvitationItem> current: InvitationsState.items[InvitationsState.index];
+    property <bool> can-answer: root.live && !InvitationsState.bulk-running;
+    // Keyboard focus is on a row's own button, which a rebuild removes.
+    property <bool> list-focused: false;
+    property <int> focus-request: InvitationsState.focus-request;
+    changed focus-request => {
+        if root.list-focused {
+            root.list-focused = false;
+            search-input.focus();
+        }
+    }
+    public function focus-first() {
+        search-input.focus();
+    }
+    public function focus-last() {
+        refresh-action.focus();
+    }
+    function step(delta: int) {
+        if InvitationsState.items.length > 0 {
+            InvitationsState.index = max(0, min(InvitationsState.items.length - 1, (InvitationsState.index < 0 && delta < 0 ? InvitationsState.items.length : InvitationsState.index) + delta));
+        }
+    }
+    // Rows have one fixed height, so a row's offset in the list is exact. A
+    // row taller than the list's view shows from its top.
+    function reveal(row: int) {
+        if row >= 0 {
+            let top = row * root.row-height;
+            if top < -list.content-y || root.row-height > list.visible-height {
+                list.content-y = -top;
+            } else if top + root.row-height > -list.content-y + list.visible-height {
+                list.content-y = -(top + root.row-height - list.visible-height);
+            }
+        }
+    }
+    // Scroll the body so the span from `top` (an absolute y) over `extent` is
+    // in view, its start first when it is taller than the view.
+    function show(top: length, extent: length) {
+        let offset = top - body.absolute-position.y;
+        let shown = -scroller.viewport-y;
+        let last = max(0px, scroller.viewport-height - scroller.height);
+        if offset < shown || extent > scroller.height {
+            scroller.viewport-y = -max(0px, min(offset, last));
+        } else if offset + extent > shown + scroller.height {
+            scroller.viewport-y = -max(0px, min(offset + extent - scroller.height, last));
+        }
+    }
+    // The list takes what the body has left once the rest is laid out, and
+    // never less than one whole row: below that, the body scrolls instead,
+    // so a long notice, the bulk confirmation, the focused row and every
+    // action stay reachable. Measured from the center's own height, which
+    // never depends on them.
+    property <length> list-min: root.row-height;
+    property <length> list-height: max(root.list-min, root.height - 32px - heading.preferred-height - 10px - above.preferred-height - below.preferred-height - 20px);
+    pure function status() -> string {
+        if !root.live {
+            return "Sign in to see this account's invitations.";
+        }
+        if InvitationsState.loading {
+            return "Reading invitations…";
+        }
+        if InvitationsState.error != "" {
+            return InvitationsState.error;
+        }
+        if InvitationsState.total == 0 {
+            return "No invitations.";
+        }
+        if InvitationsState.query != "" && InvitationsState.matching == 0 {
+            return "No invitations match.";
+        }
+        if InvitationsState.read < InvitationsState.total {
+            return "Showing " + InvitationsState.matching + " of the first " + InvitationsState.read + " of " + InvitationsState.total + " invitations by name.";
+        }
+        return InvitationsState.matching + " of " + InvitationsState.total + " invitations";
+    }
+    pure function kind-name(kind: int) -> string {
+        return kind == 1 ? "Space" : kind == 2 ? "Direct message" : "Room";
+    }
+    property <int> highlight: InvitationsState.index;
+    changed highlight => {
+        root.reveal(root.highlight);
+    }
+    width: min(root.available-width - 24px, 600px);
+    height: min(root.available-height - 24px, max(420px, 360px * root.text-scale + 160px));
+    clip: true;
+    border-radius: root.radius;
+    border-width: 1px;
+    border-color: root.palette.divider;
+    background: root.palette.elevated;
+    accessible-role: region;
+    accessible-label: "Invitations for " + root.account-handle;
+    // Clicks on the center's own background stay in it.
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+    }
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+        heading := HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Invitations · " + root.account-handle;
+                color: root.palette.ink;
+                font-size: 17px * root.text-scale;
+                font-weight: 750;
+                overflow: elide;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            close-action := RuleAction {
+                label: "Close invitations";
+                focused-at(offset) => {
+                    root.list-focused = false;
+                }
+                focus-color: root.palette.focus;
+                width: max(30px, 24px * root.text-scale);
+                height: self.width;
+                border-radius: 6px;
+                background: self.has-hover ? root.palette.hover : transparent;
+                activated => {
+                    root.dismissed();
+                }
+                Text {
+                    width: parent.width;
+                    height: parent.height;
+                    text: "×";
+                    color: root.palette.muted;
+                    font-size: 16px * root.text-scale;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        // Everything below the heading scrolls once the list is at its
+        // minimum; see `list-height`.
+        scroller := Flickable {
+            vertical-stretch: 1;
+            viewport-width: self.width;
+            viewport-height: body.preferred-height;
+            body := VerticalLayout {
+                width: scroller.width;
+                spacing: 10px;
+                above := VerticalLayout {
+                    spacing: 10px;
+                    search-box := Rectangle {
+                        height: max(38px, 26px * root.text-scale);
+                        border-radius: 8px;
+                        background: root.palette.panel;
+                        border-width: 1px;
+                        border-color: search-input.has-focus ? root.palette.accent : root.palette.divider;
+                        // Arrows, Page Up and Page Down move the highlight before the
+                        // field edits with them.
+                        FocusScope {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            height: parent.height;
+                            focus-on-click: false;
+                            focus-on-tab-navigation: false;
+                            capture-key-pressed(event) => {
+                                if event.text == Key.DownArrow {
+                                    root.step(1);
+                                    accept
+                                } else if event.text == Key.UpArrow {
+                                    root.step(-1);
+                                    accept
+                                } else if event.text == Key.PageDown {
+                                    root.step(5);
+                                    accept
+                                } else if event.text == Key.PageUp {
+                                    root.step(-5);
+                                    accept
+                                } else if event.text == Key.Home && InvitationsState.items.length > 0 {
+                                    InvitationsState.index = 0;
+                                    accept
+                                } else if event.text == Key.End && InvitationsState.items.length > 0 {
+                                    InvitationsState.index = InvitationsState.items.length - 1;
+                                    accept
+                                } else if event.text == Key.Escape && search-input.text != "" {
+                                    search-input.text = "";
+                                    InvitationsState.index = -1;
+                                    InvitationsState.search("");
+                                    accept
+                                } else {
+                                    reject
+                                }
+                            }
+                            search-input := TextInput {
+                                width: parent.width;
+                                height: parent.height;
+                                vertical-alignment: center;
+                                single-line: true;
+                                enabled: root.live;
+                                text <=> InvitationsState.query;
+                                color: root.palette.ink;
+                                font-size: 12px * root.text-scale;
+                                accessible-label: "Search invitations";
+                                accessible-description: root.highlighted ? root.current.name + ", " + root.current.detail : "";
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        root.list-focused = false;
+                                        root.show(search-box.absolute-position.y, search-box.height);
+                                        root.revealed();
+                                    }
+                                }
+                                edited => {
+                                    InvitationsState.index = -1;
+                                    InvitationsState.search(self.text);
+                                }
+                            }
+                        }
+                        if search-input.text == "": Text {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            height: parent.height;
+                            vertical-alignment: center;
+                            text: "Search by room, Space, alias or inviter";
+                            color: root.palette.muted;
+                            font-size: 12px * root.text-scale;
+                            accessible-role: none;
+                        }
+                    }
+                    Text {
+                        text: root.status();
+                        color: InvitationsState.error != "" ? root.palette.error : root.palette.muted;
+                        font-size: 11px * root.text-scale;
+                        wrap: word-wrap;
+                        accessible-live-region: polite;
+                    }
+                    // The notice wraps in full and scrolls into view with its
+                    // Open action.
+                    if InvitationsState.notice != "": notice-box := Rectangle {
+                        height: notice-row.preferred-height;
+                        notice-row := HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: InvitationsState.notice;
+                                color: root.palette.ink;
+                                font-size: 11px * root.text-scale;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                accessible-live-region: polite;
+                            }
+                            if InvitationsState.notice-room-id != "": RuleOption {
+                                palette: root.palette;
+                                text-scale: root.text-scale;
+                                // Unsynced, this is a manual check that opens the room only
+                                // once this device has it joined; nothing retries by itself.
+                                text: InvitationsState.notice-room-ready ? "Open" : "Check and open";
+                                label: InvitationsState.notice-room-ready ? "Open the room just joined" : "Open the joined room if sync has brought it here";
+                                focused-at(offset) => {
+                                    root.list-focused = false;
+                                }
+                                focused-span(at, extent) => {
+                                    root.show(notice-box.absolute-position.y, notice-box.height);
+                                }
+                                selected: false;
+                                checkable: false;
+                                enabled: root.live;
+                                activated => {
+                                    InvitationsState.open-room(InvitationsState.notice-room-id);
+                                }
+                            }
+                        }
+                    }
+                }
+                list := ListView {
+                    // Fills what the body has left, and gives way first, down to its
+                    // minimum; past that the body scrolls (see `list-height`).
+                    height: root.list-height;
+                    horizontal-scrollbar-policy: always-off;
+                    accessible-label: "Invitations";
+                    for item[row] in InvitationsState.items: row-item := Rectangle {
+                        property <bool> highlighted: row == InvitationsState.index;
+                        width: list.visible-width;
+                        height: root.row-height;
+                        border-radius: 8px;
+                        border-width: self.highlighted ? 1px : 0px;
+                        border-color: root.palette.accent;
+                        background: self.highlighted ? root.palette.selection : transparent;
+                        accessible-role: list-item;
+                        accessible-label: item.name + ", " + item.detail + (item.status != "" ? ", " + item.status : "");
+                        accessible-item-selectable: true;
+                        accessible-item-selected: self.highlighted;
+                        accessible-item-index: row;
+                        accessible-item-count: InvitationsState.items.length;
+                        TouchArea {
+                            clicked => {
+                                InvitationsState.index = row;
+                            }
+                        }
+                        HorizontalLayout {
+                            padding: 8px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                spacing: 2px;
+                                Text {
+                                    text: item.name;
+                                    color: row-item.highlighted && root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                                    font-size: 13px * root.text-scale;
+                                    font-weight: 700;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: item.detail + (item.encryption == 1 ? " · Encrypted" : item.encryption == 2 ? " · Not encrypted" : "");
+                                    color: root.palette.muted;
+                                    font-size: 10px * root.text-scale;
+                                    overflow: elide;
+                                }
+                                if item.topic != "": Text {
+                                    text: item.topic;
+                                    color: root.palette.muted;
+                                    font-size: 10px * root.text-scale;
+                                    overflow: elide;
+                                }
+                                if item.status != "": Text {
+                                    text: item.status;
+                                    color: item.failed ? root.palette.error : root.palette.accent;
+                                    font-size: 10px * root.text-scale;
+                                    overflow: elide;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 4px;
+                                RuleOption {
+                                    palette: root.palette;
+                                    text-scale: root.text-scale;
+                                    text: item.busy ? "…" : "Accept";
+                                    label: "Accept invitation to " + item.name;
+                                    selected: false;
+                                    checkable: false;
+                                    enabled: root.can-answer && !item.busy;
+                                    focused-at(offset) => {
+                                        InvitationsState.index = row;
+                                        root.list-focused = true;
+                                    }
+                                    focused-span(at, extent) => {
+                                        root.show(at, extent);
+                                    }
+                                    activated => {
+                                        InvitationsState.answer(item.room-id, item.generation, true);
+                                    }
+                                }
+                                RuleOption {
+                                    palette: root.palette;
+                                    text-scale: root.text-scale;
+                                    text: "Decline";
+                                    label: "Decline invitation to " + item.name;
+                                    selected: false;
+                                    checkable: false;
+                                    enabled: root.can-answer && !item.busy;
+                                    focused-at(offset) => {
+                                        InvitationsState.index = row;
+                                        root.list-focused = true;
+                                    }
+                                    focused-span(at, extent) => {
+                                        root.show(at, extent);
+                                    }
+                                    activated => {
+                                        InvitationsState.answer(item.room-id, item.generation, false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                below := VerticalLayout {
+                    spacing: 10px;
+                    // The highlighted invitation's answers, for the keyboard: the search
+                    // field's arrows choose it, Tab reaches these. A pending bulk
+                    // confirmation takes their place.
+                    if InvitationsState.bulk-count == 0: HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: root.highlighted ? root.kind-name(root.current.kind) + ": " + root.current.name : "Use the arrow keys in the search field to choose an invitation.";
+                            color: root.palette.muted;
+                            font-size: 11px * root.text-scale;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                        RuleOption {
+                            palette: root.palette;
+                            text-scale: root.text-scale;
+                            text: "Accept";
+                            label: root.highlighted ? "Accept invitation to " + root.current.name : "Accept the chosen invitation";
+                            focused-at(offset) => {
+                                root.list-focused = false;
+                            }
+                            focused-span(at, extent) => {
+                                root.show(at, extent);
+                            }
+                            selected: false;
+                            checkable: false;
+                            enabled: root.can-answer && root.highlighted && !root.current.busy;
+                            activated => {
+                                InvitationsState.answer(root.current.room-id, root.current.generation, true);
+                            }
+                        }
+                        RuleOption {
+                            palette: root.palette;
+                            text-scale: root.text-scale;
+                            text: "Decline";
+                            label: root.highlighted ? "Decline invitation to " + root.current.name : "Decline the chosen invitation";
+                            focused-at(offset) => {
+                                root.list-focused = false;
+                            }
+                            focused-span(at, extent) => {
+                                root.show(at, extent);
+                            }
+                            selected: false;
+                            checkable: false;
+                            enabled: root.can-answer && root.highlighted && !root.current.busy;
+                            activated => {
+                                InvitationsState.answer(root.current.room-id, root.current.generation, false);
+                            }
+                        }
+                    }
+                    if InvitationsState.bulk-count > 0: confirm-box := Rectangle {
+                        border-radius: 8px;
+                        background: root.palette.panel;
+                        border-width: 1px;
+                        border-color: root.palette.error;
+                        height: confirm-layout.preferred-height;
+                        // An unanswered confirmation expires; Rust refuses a late one too.
+                        Timer {
+                            interval: 60s;
+                            running: true;
+                            triggered => {
+                                InvitationsState.cancel-bulk-decline();
+                            }
+                        }
+                        // Text above the buttons, so both stay whole at 200% text.
+                        confirm-layout := VerticalLayout {
+                            padding: 8px;
+                            spacing: 6px;
+                            Text {
+                                text: "Decline these " + InvitationsState.bulk-count + " invitations? Each one is declined on its own and cannot be taken back here.";
+                                accessible-label: self.text;
+                                color: root.palette.ink;
+                                font-size: 11px * root.text-scale;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: end;
+                                RuleOption {
+                                    palette: root.palette;
+                                    text-scale: root.text-scale;
+                                    text: "Decline " + InvitationsState.bulk-count;
+                                    label: "Confirm: decline " + InvitationsState.bulk-count + " invitations";
+                                    focused-at(offset) => {
+                                        root.list-focused = false;
+                                    }
+                                    focused-span(at, extent) => {
+                                        // The disclosure above the buttons comes into view with them
+                                        // whenever the whole confirmation fits.
+                                        if confirm-box.height <= scroller.height {
+                                            root.show(confirm-box.absolute-position.y, confirm-box.height);
+                                        } else {
+                                            root.show(at, extent);
+                                        }
+                                    }
+                                    selected: false;
+                                    checkable: false;
+                                    enabled: root.can-answer;
+                                    activated => {
+                                        InvitationsState.confirm-bulk-decline();
+                                    }
+                                }
+                                RuleOption {
+                                    palette: root.palette;
+                                    text-scale: root.text-scale;
+                                    text: "Cancel";
+                                    label: "Keep these invitations";
+                                    focused-at(offset) => {
+                                        root.list-focused = false;
+                                    }
+                                    focused-span(at, extent) => {
+                                        // The disclosure above the buttons comes into view with them
+                                        // whenever the whole confirmation fits.
+                                        if confirm-box.height <= scroller.height {
+                                            root.show(confirm-box.absolute-position.y, confirm-box.height);
+                                        } else {
+                                            root.show(at, extent);
+                                        }
+                                    }
+                                    selected: false;
+                                    checkable: false;
+                                    activated => {
+                                        InvitationsState.cancel-bulk-decline();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        RuleOption {
+                            palette: root.palette;
+                            text-scale: root.text-scale;
+                            text: InvitationsState.bulk-running ? "Declining…" : "Decline all shown…";
+                            label: "Decline the shown invitations, at most 25, after a confirmation";
+                            focused-at(offset) => {
+                                root.list-focused = false;
+                            }
+                            focused-span(at, extent) => {
+                                root.show(at, extent);
+                            }
+                            selected: false;
+                            checkable: false;
+                            enabled: root.can-answer && InvitationsState.matching > 0 && InvitationsState.bulk-count == 0 && !InvitationsState.answering;
+                            activated => {
+                                InvitationsState.ask-bulk-decline();
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+                        refresh-action := RuleOption {
+                            palette: root.palette;
+                            text-scale: root.text-scale;
+                            text: "Refresh";
+                            label: "Read this account's invitations again";
+                            focused-at(offset) => {
+                                root.list-focused = false;
+                            }
+                            focused-span(at, extent) => {
+                                root.show(at, extent);
+                            }
+                            selected: false;
+                            checkable: false;
+                            activated => {
+                                InvitationsState.refresh();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

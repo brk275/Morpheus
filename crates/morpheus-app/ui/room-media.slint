@@ -1,0 +1,495 @@
+// The media browser of the open room: the Media tab of the details panel.
+// Rust owns the rows, every load, the search and every action
+// (src/room_media_browser.rs); this file lays rows out and reports explicit
+// choices. Nothing is fetched or shown for a row beyond its declared name,
+// type, size, sender and time: View and Save open the existing viewer and
+// save only when chosen.
+
+import { ListView, ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { TextAction, TokenSelect, ControlColors } from "controls.slint";
+import { MorpheusIcon } from "icons.slint";
+
+export struct RoomMediaRow {
+    // The message's event ID: what Open, View and Save act on.
+    id: string,
+    // 0 image, 1 video, 2 audio, 3 file.
+    kind: int,
+    // The sender's declared file name, a display-only basename.
+    name: string,
+    // "Image · 2.0 KB · image/png": what the sender declared, when known.
+    detail: string,
+    // The sender and, when known, the time.
+    origin: string,
+    thread: bool,
+    // The message's encryption does not establish its sender.
+    warning: bool,
+    // An image the viewer may open under the media settings.
+    can-view: bool,
+}
+
+export struct RoomMediaPalette {
+    ink: color,
+    muted: color,
+    panel: color,
+    elevated: color,
+    hover: color,
+    outline: color,
+    focus: color,
+    selection: color,
+    selection-ink: color,
+    has-selection-ink: bool,
+    error: color,
+    warning: color,
+    input-surface: color,
+    input-border: color,
+}
+
+export global RoomMedia {
+    in-out property <[RoomMediaRow]> rows;
+    // What the loaded list covers, or empty before the first load.
+    in-out property <string> summary;
+    in-out property <string> error;
+    in-out property <bool> loading: false;
+    in-out property <bool> can-load-older: false;
+    in-out property <bool> can-retry: false;
+    // The search of the loaded rows, and the kind shown (0 all, 1 images,
+    // 2 videos, 3 audio, 4 files).
+    in-out property <string> query;
+    in-out property <int> kind: 0;
+    // Advanced when the list is replaced or filtered: it starts at its first row.
+    in-out property <int> generation: 0;
+    in-out property <int> focus-request: 0;
+    // Set by an explicit open of the hidden tab; Rust consumes it once the
+    // tab is shown, so merely revealing the panel never moves focus.
+    in-out property <bool> focus-pending: false;
+    // The account, room or session on screen changed.
+    callback context-changed();
+    // A room or account change, a lock or a detach: clear everything now.
+    callback reset();
+    callback shown(bool);
+    callback load-older();
+    callback retry();
+    callback filter(string, int);
+    callback open(string);
+    callback view(string);
+    callback save(string);
+}
+
+component RoomMediaRowView inherits Rectangle {
+    in property <RoomMediaRow> entry;
+    in property <bool> current;
+    in property <float> text-scale: 1;
+    in property <RoomMediaPalette> palette;
+    callback chosen();
+    property <bool> inked: root.current && root.palette.has-selection-ink;
+    property <string> marks: (root.entry.thread ? " · in a thread" : "")
+        + (root.entry.warning ? " · sender not confirmed by encryption" : "");
+
+    background: root.current ? root.palette.selection : root.palette.elevated;
+    border-radius: StyleTokens.radius * 0.8;
+    accessible-role: list-item;
+    accessible-item-selected: root.current;
+    accessible-label: root.entry.name + ", " + root.entry.detail + ", " + root.entry.origin
+        + (root.entry.thread ? ", in a thread" : "")
+        + (root.entry.warning ? ", sender not confirmed by encryption" : "");
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.chosen(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            MorpheusIcon {
+                width: 18px * root.text-scale;
+                height: 18px * root.text-scale;
+                icon: root.entry.kind == 0 || root.entry.kind == 1 ? "media" : "files";
+                ink: root.inked ? root.palette.selection-ink : root.palette.muted;
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.entry.name;
+                color: root.inked ? root.palette.selection-ink : root.palette.ink;
+                font-size: 13px * root.text-scale;
+                font-weight: 700;
+                overflow: elide;
+                accessible-role: none;
+            }
+            Text {
+                text: root.entry.detail;
+                color: root.inked ? root.palette.selection-ink : root.palette.muted;
+                font-size: 11px * root.text-scale;
+                overflow: elide;
+                accessible-role: none;
+            }
+            Text {
+                text: root.entry.origin + root.marks;
+                color: root.inked ? root.palette.selection-ink
+                    : root.entry.warning ? root.palette.warning : root.palette.muted;
+                font-size: 11px * root.text-scale;
+                overflow: elide;
+                accessible-role: none;
+            }
+        }
+    }
+}
+
+export component RoomMediaPanel inherits FocusScope {
+    in property <string> room-name;
+    // A live session with a selected room. Otherwise the tab is locked.
+    in property <bool> available;
+    in property <float> text-scale: 1;
+    in property <RoomMediaPalette> palette;
+    in property <ControlColors> select-colors;
+    callback close();
+
+    // The selected row of the shown list.
+    property <int> current: 0;
+    // Every row is exactly this tall (its lines elide), so a row's top is
+    // its index times the pitch: the geometry the list really lays out.
+    property <length> row-height: 14px + 44px * root.text-scale;
+    property <length> row-gap: 4px;
+    property <length> pitch: root.row-height + root.row-gap;
+    property <length> line-height: 16px * root.text-scale;
+    // Intrinsic space for the fixed footer and one whole row. It must
+    // not depend on the height the parent later allocates to this panel.
+    property <length> reserved-height: 24px + 16px + footer.preferred-height + root.pitch;
+    min-height: root.reserved-height + root.line-height + 4px;
+    preferred-height: self.min-height;
+    property <int> count: RoomMedia.rows.length;
+    property <bool> has-current: root.available && root.current >= 0 && root.current < root.count;
+    // Rows wholly in view, at least one.
+    property <int> page-rows: max(1, floor(list.visible-height / root.pitch));
+
+    focus-on-tab-navigation: false;
+    accessible-role: region;
+    accessible-label: "Media in " + root.room-name;
+    forward-focus: search-input;
+
+    changed count => {
+        root.current = max(0, min(root.current, root.count - 1));
+    }
+    property <int> shown-list: RoomMedia.generation;
+    changed shown-list => { root.current = 0; list.viewport-y = 0; }
+    property <int> focus-request: RoomMedia.focus-request;
+    changed focus-request => {
+        if root.available { search-input.focus(); }
+    }
+
+    function reveal() {
+        let top = root.current * root.pitch;
+        if top < -list.viewport-y {
+            list.viewport-y = -top;
+        } else if top + root.row-height > -list.viewport-y + list.visible-height {
+            list.viewport-y = -(top + root.row-height - list.visible-height);
+        }
+    }
+    function reveal-header(offset: length, extent: length) {
+        let shown = -body.viewport-y;
+        let target = offset < shown ? offset
+            : offset + extent > shown + body.visible-height
+                ? min(offset, offset + extent - body.visible-height) : shown;
+        body.viewport-y = -max(0px, min(target, max(0px, body.viewport-height - body.visible-height)));
+    }
+    function move-to(index: int) {
+        if root.count > 0 {
+            root.current = max(0, min(root.count - 1, index));
+            root.reveal();
+        }
+    }
+    function open-current() {
+        if root.has-current {
+            RoomMedia.open(RoomMedia.rows[root.current].id);
+        }
+    }
+    function edited(text: string) {
+        root.current = 0;
+        list.viewport-y = 0;
+        RoomMedia.filter(text, RoomMedia.kind);
+    }
+
+    capture-key-pressed(event) => {
+        if !search-input.has-focus {
+            reject
+        } else if event.text == Key.Escape {
+            if RoomMedia.query != "" {
+                RoomMedia.query = "";
+                root.edited("");
+            } else {
+                root.close();
+            }
+            accept
+        } else if event.text == Key.DownArrow {
+            root.move-to(root.current + 1);
+            accept
+        } else if event.text == Key.UpArrow {
+            root.move-to(root.current - 1);
+            accept
+        } else if event.text == Key.PageDown {
+            root.move-to(root.current + root.page-rows);
+            accept
+        } else if event.text == Key.PageUp {
+            root.move-to(root.current - root.page-rows);
+            accept
+        } else if event.modifiers.control && event.text == Key.Home {
+            root.move-to(0);
+            accept
+        } else if event.modifiers.control && event.text == Key.End {
+            root.move-to(root.count - 1);
+            accept
+        } else {
+            reject
+        }
+    }
+    // Let a selector popup consume its own Escape first. An unconsumed
+    // Escape from any other panel control closes, just like its Close
+    // action; the search's capture handler still clears before closing.
+    key-pressed(event) => {
+        if event.text == Key.Escape {
+            root.close();
+            accept
+        } else {
+            reject
+        }
+    }
+
+    Rectangle {
+        // Positioned content uses the allocated panel geometry without
+        // feeding its height-dependent scroll cap back into our intrinsic size.
+        x: 0px; y: 0px;
+        width: root.width; height: root.height;
+        background: root.palette.panel;
+        VerticalLayout {
+            padding: 12px;
+            spacing: 8px;
+            // The header controls and growing coverage/error text share a
+            // bounded scroll region. One whole list row and the fixed footer
+            // keep their space even at the minimum height with 200% text.
+            body := ScrollView {
+                min-height: root.line-height + 4px;
+                preferred-height: body-content.preferred-height;
+                max-height: max(self.min-height, root.height - root.reserved-height);
+                vertical-stretch: 0;
+                viewport-width: self.visible-width;
+                viewport-height: body-content.preferred-height;
+                body-content := VerticalLayout {
+                    width: body.visible-width;
+                    spacing: 4px;
+                    title := Text {
+                        text: "Media";
+                        color: root.palette.ink;
+                        font-size: 15px * root.text-scale;
+                        font-weight: 750;
+                        overflow: elide;
+                    }
+                    search-box := Rectangle {
+                        height: max(32px, 16px * root.text-scale + 14px);
+                        background: root.palette.input-surface;
+                        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+                        border-width: search-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+                        border-color: search-input.has-focus ? root.palette.focus : root.palette.input-border;
+                        HorizontalLayout {
+                            padding-left: StyleTokens.input-padding * root.text-scale;
+                            padding-right: StyleTokens.input-padding * root.text-scale;
+                            Rectangle {
+                                // The typed search must not widen the panel.
+                                min-width: 0px;
+                                // TextInput clips its own text. An ancestor clip
+                                // would hide it from Tab navigation while it is
+                                // scrolled out, before the viewport can reveal it.
+                                search-input := TextInput {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    text <=> RoomMedia.query;
+                                    color: root.palette.ink;
+                                    selection-background-color: root.palette.selection;
+                                    selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                                    font-size: 12px * root.text-scale;
+                                    vertical-alignment: center;
+                                    single-line: true;
+                                    enabled: root.available;
+                                    accessible-label: "Search loaded media; arrows select, Enter shows it in the conversation, Escape clears or closes";
+                                    changed has-focus => {
+                                        if self.has-focus {
+                                            root.reveal-header(search-box.absolute-position.y - body-content.absolute-position.y, search-box.height);
+                                        }
+                                    }
+                                    edited => { root.edited(self.text); }
+                                    accepted => { root.open-current(); }
+                                }
+                                if RoomMedia.query == "" : Text {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    text: "Search loaded media";
+                                    color: root.palette.muted;
+                                    font-size: 12px * root.text-scale;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    accessible-role: none;
+                                }
+                            }
+                        }
+                    }
+                    kind-select := TokenSelect {
+                        model: ["All media", "Images", "Videos", "Audio", "Files"];
+                        current-index <=> RoomMedia.kind;
+                        enabled: root.available;
+                        colors: root.select-colors;
+                        text-scale: root.text-scale;
+                        accessible-label: "Kind of media shown";
+                        changed has-focus => {
+                            if self.has-focus {
+                                root.reveal-header(self.absolute-position.y - body-content.absolute-position.y, self.height);
+                            }
+                        }
+                        selected(value) => {
+                            root.current = 0;
+                            list.viewport-y = 0;
+                            RoomMedia.filter(RoomMedia.query, self.current-index);
+                        }
+                    }
+                    Rectangle {
+                        height: status-text.height;
+                        status-text := Text {
+                            width: parent.width;
+                            height: self.preferred-height;
+                            text: !root.available ? "Open a joined room to browse its media."
+                                : RoomMedia.loading ? "Reading this room's media…" : RoomMedia.summary;
+                            color: root.palette.muted;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                    }
+                    if root.available && RoomMedia.error != "" : Rectangle {
+                        height: error-text.height;
+                        error-text := Text {
+                            width: parent.width;
+                            height: self.preferred-height;
+                            text: RoomMedia.error;
+                            color: root.palette.error;
+                            font-size: 12px * root.text-scale;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                    }
+                    if root.available && !RoomMedia.loading && RoomMedia.summary != "" && root.count == 0 && (RoomMedia.query != "" || RoomMedia.kind != 0) : Rectangle {
+                        height: no-match-text.height;
+                        no-match-text := Text {
+                            width: parent.width;
+                            height: self.preferred-height;
+                            text: "No loaded item matches. Load older media or change the search.";
+                            color: root.palette.muted;
+                            font-size: 12px * root.text-scale;
+                            wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                    }
+                }
+            }
+            // Lazy: only the rows in view are instantiated. At the minimum
+            // window height and 200% text one whole row still shows.
+            list := ListView {
+                vertical-stretch: 1;
+                min-height: root.pitch;
+                horizontal-scrollbar-policy: always-off;
+                accessible-role: AccessibleRole.list;
+                accessible-label: "Media in " + root.room-name + ", newest first";
+                for row[index] in RoomMedia.rows : Rectangle {
+                    width: list.visible-width;
+                    height: root.pitch;
+                    RoomMediaRowView {
+                        y: 0px;
+                        height: root.row-height;
+                        entry: row;
+                        current: index == root.current;
+                        text-scale: root.text-scale;
+                        palette: root.palette;
+                        chosen => {
+                            root.current = index;
+                            root.reveal();
+                            search-input.focus();
+                        }
+                    }
+                }
+            }
+            // The fixed footer: its actions never scroll away. Captions wrap
+            // inside the panel's width rather than widening it.
+            footer := VerticalLayout {
+                spacing: 6px;
+                if root.has-current : HorizontalLayout {
+                    spacing: 6px;
+                    TextAction {
+                        text: "Open";
+                        label: "Show " + RoomMedia.rows[root.current].name + " in the conversation";
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { RoomMedia.open(RoomMedia.rows[root.current].id); }
+                    }
+                    if RoomMedia.rows[root.current].can-view : TextAction {
+                        text: "View";
+                        label: "View " + RoomMedia.rows[root.current].name;
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { RoomMedia.view(RoomMedia.rows[root.current].id); }
+                    }
+                    TextAction {
+                        text: "Save…";
+                        label: "Save " + RoomMedia.rows[root.current].name;
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { RoomMedia.save(RoomMedia.rows[root.current].id); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    if root.available && RoomMedia.can-load-older : TextAction {
+                        text: "Load older";
+                        label: "Load older media of " + root.room-name;
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        // The button goes while media loads: focus stays in
+                        // the panel first, so Escape and the arrows keep working.
+                        activated => { search-input.focus(); RoomMedia.load-older(); }
+                    }
+                    if root.available && RoomMedia.can-retry : TextAction {
+                        text: "Try again";
+                        label: "Read this part of the room's media again";
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { search-input.focus(); RoomMedia.retry(); }
+                    }
+                    TextAction {
+                        text: "Close";
+                        label: "Close the media list";
+                        wrap-caption: true;
+                        text-scale: root.text-scale;
+                        ink: root.palette.ink; muted: root.palette.muted; surface: transparent;
+                        hover-surface: root.palette.hover; outline: root.palette.outline;
+                        activated => { root.close(); }
+                    }
+                }
+            }
+        }
+    }
+}

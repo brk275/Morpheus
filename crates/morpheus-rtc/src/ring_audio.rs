@@ -11,7 +11,7 @@ use cpal::{
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -22,6 +22,47 @@ const MAX_DEVICES: usize = 512;
 const MAX_CONFIGS: usize = 512;
 const MAX_RING: Duration = Duration::from_secs(30);
 static OWNED: AtomicBool = AtomicBool::new(false);
+
+// One actual output owner for both ringtone and attachment PCM. A ringtone
+// reservation retires old PCM before waiting for that owner's native teardown.
+struct OutputArbitration {
+    ringing: AtomicBool,
+    epoch: AtomicU64,
+}
+impl OutputArbitration {
+    const fn new() -> Self {
+        Self {
+            ringing: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
+        }
+    }
+    fn reserve_ring(&self) -> Option<RingReservation<'_>> {
+        self.ringing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        if self
+            .epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .is_err()
+        {
+            self.ringing.store(false, Ordering::Release);
+            return None;
+        }
+        Some(RingReservation(self))
+    }
+    fn allows_pcm(&self, original: u64) -> bool {
+        original != u64::MAX
+            && !self.ringing.load(Ordering::Acquire)
+            && self.epoch.load(Ordering::Acquire) == original
+    }
+}
+struct RingReservation<'a>(&'a OutputArbitration);
+impl Drop for RingReservation<'_> {
+    fn drop(&mut self) {
+        self.0.ringing.store(false, Ordering::Release);
+    }
+}
+static OUTPUT: OutputArbitration = OutputArbitration::new();
 
 struct Permit;
 impl Permit {
@@ -104,15 +145,17 @@ impl RingPlayback {
         if !run.active() {
             return Err(RingAudioError::Cancelled);
         }
-        let permit = Permit::take().ok_or(RingAudioError::Busy)?;
+        let reservation = OUTPUT.reserve_ring().ok_or(RingAudioError::Busy)?;
         let worker = run.clone();
         thread::Builder::new()
             .name("morpheus-ring-output".into())
             .spawn(move || {
-                // Move permit first so stack unwinding releases it after local device
-                // objects. No JoinHandle is retained by the UI/Tokio shutdown pool.
-                let _permit = permit;
-                let result = play(&worker, speaker.as_deref());
+                // This dedicated owner waits; never the UI or Tokio worker. The
+                // reservation already silences/retires old PCM, and the one actual
+                // output permit cannot release before its native stream is gone.
+                let _reservation = reservation;
+                let result =
+                    acquire_output(&worker).and_then(|_permit| play(&worker, speaker.as_deref()));
                 worker.status.store(
                     if result == Err(RingAudioError::Unavailable)
                         || worker.status.load(Ordering::Acquire) == 3
@@ -141,6 +184,22 @@ impl RingPlayback {
 impl Drop for RingPlayback {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+fn acquire_output(run: &Run) -> Result<Permit, RingAudioError> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if !run.active() {
+            return Err(RingAudioError::Cancelled);
+        }
+        if let Some(permit) = Permit::take() {
+            return Ok(permit);
+        }
+        if Instant::now() >= deadline {
+            return Err(RingAudioError::Unavailable);
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -496,5 +555,339 @@ mod tests {
             Err(RingAudioError::Unavailable)
         );
         assert_eq!(calls, MAX_DEVICES + 1);
+    }
+}
+
+/// One explicit attachment's output state. The caller owns its single worker
+/// permit until play_pcm returns, after destruction of the actual native stream.
+/// These controls never touch microphone capture, a call mixer, route or OS volume.
+pub struct PcmPlayback {
+    run: Arc<Run>,
+    paused: AtomicBool,
+    ended: AtomicBool,
+    consumed: AtomicU64,
+    total: AtomicU64,
+    rate: AtomicU32,
+}
+impl PcmPlayback {
+    /// Original output epoch: a ringtone reservation permanently retires it,
+    /// including a reservation which later fails to open a native speaker.
+    pub fn output_authority() -> RingAudioAuthority {
+        let original = OUTPUT.epoch.load(Ordering::Acquire);
+        Arc::new(move || OUTPUT.allows_pcm(original))
+    }
+    pub fn new(allowed: RingAudioAuthority) -> Arc<Self> {
+        let output = Self::output_authority();
+        let allowed = Arc::new(move || allowed() && output());
+        Arc::new(Self {
+            run: Arc::new(Run {
+                stopped: AtomicBool::new(false),
+                status: AtomicU8::new(0),
+                deadline: Instant::now() + Duration::from_secs(600),
+                allowed,
+            }),
+            paused: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+            consumed: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            rate: AtomicU32::new(0),
+        })
+    }
+    pub fn stop(&self) {
+        self.run.stopped.store(true, Ordering::Release);
+    }
+    pub fn toggle_pause(&self) {
+        if self.run.active() {
+            self.paused.fetch_xor(true, Ordering::AcqRel);
+        }
+    }
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
+    }
+    pub fn unavailable(&self) -> bool {
+        self.run.status.load(Ordering::Acquire) == 3
+    }
+    pub fn active(&self) -> bool {
+        self.run.active()
+    }
+    pub fn playing(&self) -> bool {
+        self.run.status.load(Ordering::Acquire) == 1 && !self.paused() && self.active()
+    }
+    /// Source frames consumed by the output callback, not a playback timer or
+    /// the file's advertised duration. OS/device presentation latency is unknown.
+    pub fn position_ms(&self) -> u64 {
+        let rate = self.rate.load(Ordering::Acquire);
+        if rate == 0 {
+            0
+        } else {
+            self.consumed.load(Ordering::Acquire).saturating_mul(1000) / u64::from(rate)
+        }
+    }
+    pub fn duration_ms(&self) -> Option<u64> {
+        let rate = self.rate.load(Ordering::Acquire);
+        (rate != 0)
+            .then(|| self.total.load(Ordering::Acquire).saturating_mul(1000) / u64::from(rate))
+    }
+    /// On the caller's dedicated owner thread only. PCM stays in memory and
+    /// is dropped with the stream; no default-device setting is written.
+    pub fn play_pcm(
+        self: &Arc<Self>,
+        samples: Vec<f32>,
+        rate: u32,
+        channels: u16,
+    ) -> Result<(), RingAudioError> {
+        let count = usize::from(channels);
+        if !(1..=2).contains(&count)
+            || !(8_000..=96_000).contains(&rate)
+            || samples.is_empty()
+            || samples.len() % count != 0
+            || samples.len() > 12 * 1024 * 1024
+            || samples.len() / count > rate as usize * 180
+            || samples.iter().any(|v| !v.is_finite() || v.abs() > 1.0)
+        {
+            return Err(RingAudioError::Unavailable);
+        }
+        if !self.run.active() {
+            return Err(RingAudioError::Cancelled);
+        }
+        // No waiting/retry or extra native opener on an explicit Play.
+        let _permit = Permit::take().ok_or(RingAudioError::Busy)?;
+        if !self.run.active() {
+            return Err(RingAudioError::Cancelled);
+        }
+        self.total
+            .store((samples.len() / count) as u64, Ordering::Release);
+        self.rate.store(rate, Ordering::Release);
+        let result = self.open_pcm(samples, rate, channels);
+        if result == Err(RingAudioError::Unavailable) {
+            self.run.status.store(3, Ordering::Release);
+        } else if self.run.status.load(Ordering::Acquire) != 3 {
+            self.run.status.store(2, Ordering::Release);
+        }
+        self.stop();
+        result
+    }
+    fn open_pcm(
+        self: &Arc<Self>,
+        samples: Vec<f32>,
+        rate: u32,
+        channels: u16,
+    ) -> Result<(), RingAudioError> {
+        let device = speaker(&self.run, None)?;
+        let config = output_config(&self.run, &device)?;
+        let samples = Arc::new(samples);
+        let stream = entered(&self.run, || match config.sample_format() {
+            SampleFormat::F32 => pcm_stream::<f32>(
+                &device,
+                &config,
+                self.clone(),
+                samples.clone(),
+                rate,
+                channels,
+            ),
+            SampleFormat::I16 => pcm_stream::<i16>(
+                &device,
+                &config,
+                self.clone(),
+                samples.clone(),
+                rate,
+                channels,
+            ),
+            SampleFormat::U16 => pcm_stream::<u16>(
+                &device,
+                &config,
+                self.clone(),
+                samples.clone(),
+                rate,
+                channels,
+            ),
+            _ => Err(RingAudioError::Unavailable),
+        })?;
+        entered(&self.run, || {
+            stream.play().map_err(|_| RingAudioError::Unavailable)
+        })?;
+        self.run
+            .status
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .ok();
+        while self.run.active() && self.run.status.load(Ordering::Acquire) != 3 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Callback buffers go silent on revocation without waiting for a native
+        // drop. Already submitted OS audio cannot be recalled. Never release the
+        // caller's permit before this stream and its captured PCM are destroyed.
+        drop(stream);
+        drop(samples);
+        if self.unavailable() {
+            Err(RingAudioError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+}
+struct PcmCursor {
+    phase: u64,
+}
+impl PcmCursor {
+    fn frame(
+        &mut self,
+        samples: &[f32],
+        source_channels: usize,
+        rate: u32,
+        output_channels: usize,
+    ) -> Option<[f32; 2]> {
+        let frames = samples.len() / source_channels;
+        let index = (self.phase / u64::from(RATE)) as usize;
+        if index >= frames {
+            return None;
+        }
+        let next = (index + 1).min(frames - 1);
+        let fraction = (self.phase % u64::from(RATE)) as f32 / RATE as f32;
+        let channel = |n: usize| {
+            let n = n.min(source_channels - 1);
+            let a = samples[index * source_channels + n];
+            let b = samples[next * source_channels + n];
+            (a + (b - a) * fraction).clamp(-1.0, 1.0) * 0.8
+        };
+        let (left, right) = (channel(0), channel(1));
+        self.phase += u64::from(rate);
+        Some(if output_channels == 1 {
+            [(left + right) * 0.5, 0.0]
+        } else {
+            [left, right]
+        })
+    }
+}
+fn pcm_stream<T: ToneSample>(
+    device: &cpal::Device,
+    config: &SupportedStreamConfig,
+    state: Arc<PcmPlayback>,
+    samples: Arc<Vec<f32>>,
+    rate: u32,
+    source_channels: u16,
+) -> Result<Stream, RingAudioError> {
+    let output_channels = usize::from(config.channels());
+    let failed = state.clone();
+    let mut cursor = PcmCursor { phase: 0 };
+    device
+        .build_output_stream(
+            config.config(),
+            move |data: &mut [T], _| {
+                fill_pcm(
+                    data,
+                    output_channels,
+                    &samples,
+                    source_channels as usize,
+                    rate,
+                    &mut cursor,
+                    &state,
+                );
+            },
+            move |_| {
+                failed.run.status.store(3, Ordering::Release);
+                failed.stop();
+            },
+            Some(Duration::from_secs(2)),
+        )
+        .map_err(|_| RingAudioError::Unavailable)
+}
+fn fill_pcm<T: ToneSample>(
+    data: &mut [T],
+    output_channels: usize,
+    samples: &[f32],
+    source_channels: usize,
+    rate: u32,
+    cursor: &mut PcmCursor,
+    state: &PcmPlayback,
+) {
+    for frame in data.chunks_mut(output_channels) {
+        let value = if !state.run.active() || state.paused() {
+            [0.0, 0.0]
+        } else if let Some(value) = cursor.frame(samples, source_channels, rate, output_channels) {
+            value
+        } else {
+            state.ended.store(true, Ordering::Release);
+            state.stop();
+            [0.0, 0.0]
+        };
+        for (n, out) in frame.iter_mut().enumerate() {
+            *out = T::tone(value[n]);
+        }
+    }
+    state.consumed.store(
+        (cursor.phase / u64::from(RATE)).min((samples.len() / source_channels) as u64),
+        Ordering::Release,
+    );
+}
+#[cfg(test)]
+mod pcm_tests {
+    use super::*;
+    #[test]
+    fn ringtone_reservation_retires_pcm_before_native_wait_and_never_revives_it() {
+        let state = OutputArbitration::new();
+        let original = state.epoch.load(Ordering::Acquire);
+        assert!(state.allows_pcm(original));
+        let ring = state.reserve_ring().unwrap();
+        assert!(!state.allows_pcm(original));
+        assert!(state.reserve_ring().is_none());
+        drop(ring);
+        assert!(!state.allows_pcm(original));
+        assert!(state.allows_pcm(state.epoch.load(Ordering::Acquire)));
+        state.epoch.store(u64::MAX, Ordering::Release);
+        assert!(state.reserve_ring().is_none());
+        assert!(!state.ringing.load(Ordering::Acquire));
+        assert!(!state.allows_pcm(u64::MAX));
+    }
+    #[test]
+    fn pcm_pause_and_revocation_silence_without_advancing_or_reviving() {
+        let allowed = Arc::new(AtomicBool::new(true));
+        let gate = allowed.clone();
+        let state = PcmPlayback::new(Arc::new(move || gate.load(Ordering::Acquire)));
+        let samples = [0.5f32; 12];
+        let mut cursor = PcmCursor { phase: 0 };
+        let mut out = [1.0f32; 4];
+        state.toggle_pause();
+        fill_pcm(&mut out, 2, &samples, 2, 48_000, &mut cursor, &state);
+        assert_eq!(out, [0.0; 4]);
+        assert_eq!(cursor.phase, 0);
+        state.toggle_pause();
+        fill_pcm(&mut out, 2, &samples, 2, 48_000, &mut cursor, &state);
+        assert!(out.iter().all(|v| *v > 0.0));
+        assert_eq!(state.consumed.load(Ordering::Acquire), 2);
+        allowed.store(false, Ordering::Release);
+        fill_pcm(&mut out, 2, &samples, 2, 48_000, &mut cursor, &state);
+        assert_eq!(out, [0.0; 4]);
+        let at = cursor.phase;
+        allowed.store(true, Ordering::Release);
+        fill_pcm(&mut out, 2, &samples, 2, 48_000, &mut cursor, &state);
+        assert_eq!(out, [0.0; 4]);
+        assert_eq!(cursor.phase, at);
+    }
+    #[test]
+    fn pcm_resampling_channels_completion_and_consumed_position_are_explicit() {
+        let state = PcmPlayback::new(Arc::new(|| true));
+        let mut cursor = PcmCursor { phase: 0 };
+        let samples: Vec<f32> = (0..240).flat_map(|_| [1.0, -1.0]).collect();
+        let mut out = [0.0f32; 480];
+        state.rate.store(24_000, Ordering::Release);
+        state.total.store(240, Ordering::Release);
+        assert_eq!(state.duration_ms(), Some(10));
+        assert_eq!(state.position_ms(), 0);
+        fill_pcm(&mut out, 2, &samples, 2, 24_000, &mut cursor, &state);
+        assert_eq!(state.consumed.load(Ordering::Acquire), 120);
+        assert_eq!(state.position_ms(), 5);
+        assert!(out.chunks(2).all(|c| c[0] > 0.0 && c[1] < 0.0));
+        fill_pcm(&mut out, 2, &samples, 2, 24_000, &mut cursor, &state);
+        assert_eq!(state.position_ms(), 10);
+        fill_pcm(&mut out, 2, &samples, 2, 24_000, &mut cursor, &state);
+        assert!(state.ended());
+        assert_eq!(out, [0.0; 480]);
+        let mut mono = PcmCursor { phase: 0 };
+        assert_eq!(mono.frame(&[1.0, -1.0], 2, 48_000, 1), Some([0.0, 0.0]));
+        let mut stereo = PcmCursor { phase: 0 };
+        assert_eq!(stereo.frame(&[0.5], 1, 48_000, 2), Some([0.4, 0.4]));
     }
 }

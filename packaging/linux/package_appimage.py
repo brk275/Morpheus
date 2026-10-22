@@ -157,14 +157,17 @@ def build_unsigned(runner, root, *, tools, environment, notices):
     payloads, archives, patch = download_inputs(runner, root, environment)
     package_environment = {**environment, **client.seed_tools(root, payloads)}
     package_environment["PATH"] = str(Path(tools["cargo"]).parent) + ":/usr/bin:/bin"
-    stage, source_metadata = client.prepare_client(root, archives, patch, runner.run)
+    stage, source_metadata = client.prepare_client(root, archives, patch, runner.run, variant="appimage")
     # Reuse the ordinary runner cache. Build output is not an installer or a
     # profile; only the fresh packaging/output directories must be private.
     target = ROOT / "target"
     if target.exists() and (target.is_symlink() or target.resolve() != target
                             or target.stat().st_uid != os.getuid()):
         raise PackageFailure("output")
-    native_environment = {**package_environment, "CARGO_TARGET_DIR": str(target)}
+    receipt = client.build_receipt(stage, source_metadata, variant="appimage")
+    native_environment = {**package_environment, "CARGO_TARGET_DIR": str(target),
+                          "MORPHEUS_PIPEWIRE_CLIENT_VARIANT": "appimage",
+                          "MORPHEUS_PIPEWIRE_CLIENT_RECEIPT": str(receipt)}
     runner.run("native-build", [tools["cargo"], "build", "--release", "--locked", "-p", "morpheus-app",
                "--features", "native-calls"], cwd=ROOT, env=native_environment, timeout=3600,
                output_limit=8 * 1024 * 1024)
@@ -249,7 +252,9 @@ def inside(root, tools, environment):
         # for the actual sender process or its loaded-library identity.
         progress.wrapper("capture")
         capture_environment = {**environment, "PATH": str(Path(tools["cargo"]).parent) + ":/usr/bin:/bin",
-                               "CARGO_TARGET_DIR": str(ROOT / "target")}
+                               "CARGO_TARGET_DIR": str(ROOT / "target"),
+                               "MORPHEUS_PIPEWIRE_CLIENT_VARIANT": "appimage",
+                               "MORPHEUS_PIPEWIRE_CLIENT_RECEIPT": str(root / "stage/build-client.txt")}
         evidence = capture.run(runner, root, artifact, appdir, record, capture_environment, diagnostics=progress)
         if evidence.get("installed_capture_passed") is not True:
             raise PackageFailure("capture")

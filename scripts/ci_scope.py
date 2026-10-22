@@ -68,6 +68,10 @@ WINDOWS_ACCEPTANCE_INPUTS = {
     "crates/morpheus-rtc/tests/windows_capture.rs",
 }
 LINUX_ACCEPTANCE_INPUTS = {
+    # The fixed native client is an ordinary Linux build dependency now.
+    "scripts/build_linux_native.py",
+    "scripts/pipewire_startup_probe.py",
+    "crates/linux_native_pipewire.rs",
     "scripts/encode_preview_pngs.py",
     "scripts/run_matrix_acceptance.py",
     "scripts/local_matrix_env.py",

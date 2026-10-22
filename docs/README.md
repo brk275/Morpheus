@@ -8,6 +8,7 @@ implemented and what still needs verification.
 | Guide | Covers |
 | --- | --- |
 | [Customization](CUSTOMIZATION.md) | Themes, fonts, message layouts, navigation and live configuration. |
+| [Style profiles](STYLE_PROFILES.md) | Saved, previewable and shareable appearance-only looks and their file format. |
 | [Theme files](../themes/README.md) | Built-in palettes and your own TOML colors. |
 | [Screenshots](screenshots/README.md) | Real native captures with fictional accounts. |
 | [Account controls](ACCOUNT_ACCESS.md) | Switching, the local app password and account removal. |
@@ -15,8 +16,12 @@ implemented and what still needs verification.
 ## Use the app
 
 - [Messages and formatting](MESSAGING_FORMAT.md), [emoji](EMOJI_CATALOG.md) and [image previews](IMAGE_PREVIEWS.md).
-- [Room settings](ROOM_SETTINGS.md) and [notifications](NOTIFICATIONS.md).
+- [Matrix links in messages](MATRIX_LINKS.md).
+- [Room settings](ROOM_SETTINGS.md), [notifications](NOTIFICATIONS.md) and [invitations](INVITATIONS.md).
+- [Room media browser](ROOM_MEDIA.md).
+- [Room roles and permissions](ROOM_PERMISSIONS.md).
 - [Incoming calls](INCOMING_CALLS.md) and [voice spaces](VOICE_SPACES.md).
+- [The call bar](CALL_BAR.md) outside the call page.
 
 ## Build and contribute
 

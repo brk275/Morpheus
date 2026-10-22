@@ -51,3 +51,167 @@ adapters, then measure frame times and interaction latency under the supported
 macOS, Windows, and Linux packages. The offline preview avoids network,
 decryption, pagination, and real event formatting costs, so its result cannot
 be used as a claim that the full beta performance gate has passed.
+
+## Real-room acceptance harness
+
+The optimized instrumented app compiled in
+[run 39155273734](https://github.com/brk275/Morpheus/actions/runs/39155273734)
+at source `92fc431ab7bd71e0b7021540ae4a710e68d1b085`, but the live workload
+failed. The outer fixture runner withheld the inner failure summary along
+with its private log, so this run does not establish the failing stage or any
+performance result. The real-room performance gate remains open.
+
+Failure summaries now use explicit vocabulary for every published field.
+`failed_summary` accepts one exact failed record after a caller scans its
+private log; arbitrary lowercase strings, extra fields, duplicate records,
+oversized records and success claims are refused. The outer fixture runner now
+forwards this validated record for a failed `timeline_10k` command after its
+independent log scan and before raising. Scanner failure withholds diagnostics.
+No other command forwards these records, and raw logs remain private. Synthetic
+forwarding checks do not prove that the live workload succeeds.
+
+### Instrumented build
+
+```sh
+MORPHEUS_TIMELINE_ACCEPTANCE_BUILD=1 cargo build --release --locked \
+  -p morpheus-app --features native-calls
+```
+
+This is the shipping build command plus one variable. With it,
+[`build.rs`](../crates/morpheus-app/build.rs) sets the registered
+`cfg(morpheus_timeline_acceptance)` and refuses any profile except release.
+It also gives the build its own persistence cohort, so it never shares one
+with a shipping build. Ordinary builds compile none of the acceptance code,
+and the instrumented binary refuses to start without a valid run file.
+
+Its only differences from shipping are:
+
+- the acceptance driver;
+- a rendering notifier on the main window;
+- a generated profile root instead of the standard app directories;
+- an explicitly requested sync policy: the shipping `Auto` for sliding sync,
+  or `ClassicOnly`, which forces the same classic `/sync` loop that `Auto`
+  falls back to.
+
+The renderer is still the one Slint's default backend selects, with no
+backend or renderer override. The `AppWindow` and the `LiveUi` controller are
+the real ones. Every report states `shipping_acceptance: false`. It is
+instrumented-build evidence, never installed-package acceptance.
+
+### Fixture and steps
+
+[`scripts/run_timeline_acceptance.py`](../scripts/run_timeline_acceptance.py)
+runs only on a fresh standard GitHub-hosted Ubuntu 24.04 runner. It must run
+inside `dbus-run-session` with a throwaway unlocked keyring and an X display,
+after `scripts/local_matrix_env.py up`. The app and the seeder accept only
+loopback homeservers and generated `.test` users from that fixture. Bob is
+measured and Carol is the account-switch target. Profiles, run files, reports
+and raw logs stay in a private directory outside the checkout. They are never
+printed or uploaded.
+
+1. **Enroll** one fresh generated profile per adapter. Carol signs in first,
+   then Bob, so startup restores Bob. Each enrollment writes Bob's own device
+   ID for that profile to a new owner-only file the run file names, separate
+   from its closed report. The runner accepts one plausible, distinct ID per
+   profile and hands both to the seeder in another private file. The Unix
+   seeder opens it without following final symlinks or blocking on special
+   files, and requires a private regular file of at most 4 KiB outside the
+   checkout. Directory aliases into the checkout are rejected.
+2. **Seed once.**
+   [`timeline_10k_local`](../crates/morpheus-matrix/tests/timeline_10k_local.rs)
+   uses the pinned SDK:
+   - Alice creates a new private encrypted room and invites Bob.
+   - Bob joins from a disposable device.
+   - Before the first message, Alice must see Bob's join in his member state
+     and hold identity and Olm keys for exactly the two enrolled devices and
+     the seeder device. No device count is used: other devices of Bob's could
+     meet one.
+   - Alice then sends exactly 10,000 messages, paced below the fixture's
+     unchanged limit of 10 messages per second. That takes about 18 minutes.
+   - The bodies cycle through seven deterministic kinds: short, two and nine
+     wrapped sentences, four extra lines, a Markdown list, a code block and a
+     quote. Each carries `tl10k-NNNNN`.
+   - The fixture has no replies, reactions, edits, attachments or images.
+3. **Measure** each profile through production paths only:
+   - the startup restore;
+   - the `open-room` and `load-older-messages` callbacks, until the start of
+     history and all 10,000 events have decrypted;
+   - wheel events dispatched in process over the timeline, 120 steps of
+     480 logical pixels in each direction;
+   - the `switch-account` callback to Carol and back, then reopening the room.
+
+Each run must observe its own adapter running: `sliding_sticky` or `classic`.
+Every validated report is closed, with fixed keys, tokens and numbers and
+never IDs or text. The runner prints only a summary built from those reports.
+
+### Metric labels
+
+| Report field | What it is | What it is not |
+| --- | --- | --- |
+| `startup_ms.window_shown` | Process start until `AppWindow::show()` returned | A painted or presented window |
+| `startup_ms.first_render_hook` | Process start until the first `AfterRendering` callback | First presented frame |
+| `startup_ms.sync_running` | Process start until the account manager first reported its adapter running | Room list or timeline readiness |
+| `render_hook_span_us` | CPU time between Slint's `BeforeRendering` and `AfterRendering` callbacks; `AfterRendering` fires before the back buffer is presented | GPU time, presentation or a displayed frame |
+| `render_hook_interval_us` | Time between consecutive `AfterRendering` callbacks during the scroll steps, including waits for the next dispatched event | Display refresh interval or FPS |
+| `dispatch_to_render_hook_us` | In-process wheel-event dispatch to the next `AfterRendering` | OS input latency, presentation or automation timing |
+| `steps_accepted` | Wheel events an element, such as the timeline list, consumed | Proof of a particular scroll distance |
+| `*_observed*` | First seen by a 5 ms event-loop poll; an upper bound | A precise event time |
+| `request_until_loading_cleared_ms` | Production load-older callback until its loading flag clears; rows may publish slightly later | Time to render the new rows |
+| `fixture_distinct_decrypted` | Direct count of distinct fixture events in the window's message model; undecryptable events never enter it | A delegate count |
+| `rss_kib` | `/proc/self/status` on Linux; `unavailable` elsewhere | Heap size, or RSS on macOS or Windows |
+| `delegates` | `unmeasured`: Slint exposes no public count of instantiated rows | Evidence for or against full instantiation |
+
+The accessibility row counts in the offline record above remain a proxy.
+
+### Still needed before claiming the gate
+
+- **Hosted Linux runs.** Run both adapters on a fresh hosted Ubuntu runner and
+  retain the validated reports.
+- **macOS and Windows.** Their hosted runners have no loopback homeserver for
+  this fixture. Those runs need a reviewed way to reach a synthetic server,
+  plus external RSS sampling.
+- **Installed packages.** The instrumented binary is not the installed package.
+  Installed-package performance needs its own path.
+- **Owner thresholds.** No pass or fail threshold is defined. The owner must
+  set responsiveness thresholds from measured evidence.
+- **Unmeasured quantities.** Delegate instantiation, GPU time, presentation and
+  display refresh are not measured.
+- **Fixture variety.** Replies, reactions, edits, attachments and images are
+  not in the fixture.
+- **Device key timing.** The exact-device wait only guards key distribution.
+  The authoritative check is that all 10,000 events decrypt in each profile.
+  An enrolled app that quits before publishing its device keys fails the seed
+  at `enrolled_device_absent`; enrollment does not yet wait for that itself.
+
+### Seed run 39165425640: the `devices` stage
+
+The optimized seed failed at the fixed stage `devices`. That stage covered
+three causes: a device query error, Bob's join not being seen, and too few
+devices. Source review of the pinned SDK and fixture homeserver finds one of
+them is certain:
+
+- the old wait required `room.joined_members_count() >= 2`;
+- in the pinned SDK, classic `/sync` updates that count only from the
+  response's room summary;
+- Synapse v1.162.0 sends a room summary only when the sync filter lazy-loads
+  members, and the seeder's `sync_once` uses no filter.
+
+The count therefore never changed, and the wait could only time out, whatever
+devices existed. The seeder now reads Bob's own member event instead. Each
+cause also has its own closed stage: `member_query` and `devices_query` for
+query errors, `bob_join`, `seeder_device_absent`, `seeder_device_keys`,
+`enrolled_device_absent` and `enrolled_device_keys`. A wait reports the first
+unmet one, in that order. Malformed enrolled device input fails at
+`bob_device_ids`. No retry was added; the next hosted run shows whether
+anything remains.
+- **Workflow integration.** No workflow runs this yet.
+
+### Linux fixed-client source-build prerequisite
+
+Ubuntu24/x64 native builds require the explicit preparation driver described in
+[Linux native source builds](../docs/LINUX_NATIVE_BUILD.md), including optimized
+instrumented builds. Keep `MORPHEUS_TIMELINE_ACCEPTANCE_BUILD=1`, `--release`,
+all measurements and the existing acceptance thresholds unchanged. The prepared
+prefix must remain present throughout enrollment, seeding and measurement;
+removing it is a loader failure, not a reason to fall back to the stock client.
+This prerequisite is not evidence that the encrypted 10K workload has passed.

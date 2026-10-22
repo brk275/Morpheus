@@ -28,11 +28,11 @@ pub enum MediaError {
     #[error("the call audio loop is already running")]
     ControlAlreadyRunning,
     #[error(
-        "the selected microphone is unavailable or its device ID is ambiguous; choose a device in Settings and rejoin"
+        "the selected microphone is unavailable or its device ID is ambiguous; choose another microphone"
     )]
     MicrophoneUnavailable,
     #[error(
-        "the selected speaker is unavailable or its device ID is ambiguous; choose a device in Settings and rejoin"
+        "the selected speaker is unavailable or its device ID is ambiguous; choose another speaker"
     )]
     SpeakerUnavailable,
     #[error("native device error: {0}")]

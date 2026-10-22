@@ -35,6 +35,11 @@ sender = "#DCE9DC"
 message = "#DCE9DC"
 own_message = "#EDF6E9"
 own_surface = "#172A20"
+scrim = "#000000AA"
+shadow = "#00000044"
+media_backdrop = "#0B0F0D"
+presence_online = "#A7D9A0"
+avatar_ink = "#FFFFFF"
 
 [senders]
 # Sender names only; avatar backgrounds retain their separate identity colors.

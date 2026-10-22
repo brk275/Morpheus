@@ -646,7 +646,7 @@ impl AccountManager {
             state.loaded.insert(store.id.clone(), loaded.clone());
             state.active_account_id = Some(account.id.clone());
             self.publish_active_account(Some(account.clone()));
-            self.start_sync(&mut state, loaded.client.clone()).await;
+            self.start_sync(&mut state, &loaded).await;
             Ok(())
         }
         .await;

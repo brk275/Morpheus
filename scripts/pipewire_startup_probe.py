@@ -6,8 +6,9 @@ must accept (stage, argv, *, cwd, env, timeout, output_limit), return captured
 bytes on success, and kill/reap its owned process tree before raising on error.
 No command output, path, environment or exception payload is printed here.
 
-The normal system-library acceptance gate must remain mandatory. These paired
-artifacts are diagnostic evidence only, not a replacement for that gate.
+These paired artifacts remain diagnostic evidence only. The normal owned-native
+capture gate separately verifies the production client; recorded stock-client
+failures are not converted into a pass.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ COMMIT = "800a25a01f99156d7d954f4d7fe1b0a6cf8ae7e3"
 UPSTREAM_PATCH_SHA256 = "d46d38c905bf18e82515ade96fb4a8ab3fbd62fd0784b92655b21266de343584"
 LIBRARY = "libpipewire-0.3.so.0.1005.0"
 SONAME = "libpipewire-0.3.so.0"
+NATIVE_SONAME = "libmorpheus-pipewire-0.3.so.0"
+NATIVE_TARGET = "src/pipewire/libmorpheus-pipewire-0.3.so.0.1005.0"
 TARGET = "src/pipewire/" + LIBRARY
 SOURCE_FILE = "src/pipewire/impl-node.c"
 DISTRO_SOURCE_SHA256 = "8b20d2b364fa3fc2d85d54741e9a11827e66b2795585f30cfb096556567c9fe6"
@@ -311,10 +314,12 @@ def apply_upstream_patch(source: Path) -> None:
     path.write_bytes(modified)
 
 
-def elf_identity(data: bytes, *, library: bool, allow_origin_runpath: bool = False) -> tuple[str, tuple[str, ...]]:
+def elf_identity(data: bytes, *, library: bool, allow_origin_runpath: bool = False, expected_soname: str = SONAME) -> tuple[str, tuple[str, ...]]:
     """Bounded ELF64/x86-64 PT_NOTE/DT_SONAME reader; never execute readelf/ldd."""
     def fail():
         raise ProbeFailure("paired_provenance", "elf_identity")
+    if expected_soname not in (SONAME, NATIVE_SONAME):
+        fail()
     if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
         fail()
     kind, machine, version = struct.unpack_from("<HHI", data, 16)
@@ -387,14 +392,16 @@ def elf_identity(data: bytes, *, library: bool, allow_origin_runpath: bool = Fal
     if search_paths and (not allow_origin_runpath or search_paths != [(29, "$ORIGIN")]):
         fail()
     needed = tuple(sorted(string(value) for tag, value in entries if tag == 1))
-    if (string(only(14)) != SONAME or "libc.so.6" not in needed
+    if (string(only(14)) != expected_soname or "libc.so.6" not in needed
             or set(needed) - {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "libatomic.so.1"}):
         fail()
     return build_ids[0], needed
 
 
-def object_inventory(build: Path) -> dict[str, str]:
-    directory = build / (TARGET + ".p")
+def object_inventory(build: Path, *, target: str = TARGET) -> dict[str, str]:
+    if target not in (TARGET, NATIVE_TARGET):
+        raise ProbeFailure("paired_provenance", "object_identity")
+    directory = build / (target + ".p")
     expected = {name + ".c.o" for name in SOURCES}
     paths = {path.name: path for path in directory.iterdir() if path.name.endswith(".o")}
     if set(paths) != expected:

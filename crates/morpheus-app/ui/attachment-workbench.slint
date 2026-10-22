@@ -1,0 +1,314 @@
+// Composer attachment queue for the room on screen. Rust owns every row's
+// state and the actions it permits; this file only lays the rows out and
+// reports Send and per-row choices. It cannot import the window's globals,
+// so the window passes its resolved semantic colors and appearance
+// preferences (corners, line and focus widths, padding) in.
+
+import { ListView } from "std-widgets.slint";
+
+export struct AttachmentItem {
+    // Stable while the item exists; zero is never an item.
+    id: int,
+    name: string,
+    detail: string,
+    status: string,
+    // 0 to 1 while uploading; negative when no progress applies.
+    progress: float,
+    // 0 ready, 1 preparing, 2 uploading, 3 waiting, 4 paused, 5 cancelling,
+    // 6 failed, 7 can't send, 8 delivery not confirmed.
+    state: int,
+    can-remove: bool,
+    can-cancel: bool,
+    can-retry: bool,
+    // A ready file can move among the room's ready files, which are sent
+    // in the order shown.
+    can-move-up: bool,
+    can-move-down: bool,
+}
+
+export struct AttachmentPalette {
+    ink: color,
+    muted: color,
+    accent: color,
+    accent-ink: color,
+    surface: color,
+    // The control hover state, else the window's hover color.
+    hover: color,
+    // The control pressed state, else the hover color.
+    pressed: color,
+    // Whether a theme or config.toml set the hover or pressed state. A set
+    // state shows on the primary Send action too; otherwise it keeps the
+    // accent.
+    hover-set: bool,
+    pressed-set: bool,
+    divider: color,
+    focus: color,
+    error: color,
+}
+
+// Resolved existing appearance preferences; no settings store of its own.
+// At the default preferences every value equals this queue's built-in look.
+export struct AttachmentStyle {
+    row-radius: length,
+    control-radius: length,
+    // Row outline: the line width in high contrast, otherwise none.
+    row-line-width: length,
+    focus-width: length,
+    // Horizontal padding inside an action, each side.
+    action-padding: length,
+}
+
+// A keyboard and pointer action with a text label.
+component QueueAction inherits Rectangle {
+    in property <string> text;
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <AttachmentPalette> palette;
+    in property <AttachmentStyle> style;
+    in property <float> text-scale: 1;
+    callback activated();
+    width: action-text.preferred-width + 2 * root.style.action-padding;
+    // Never shorter than its own caption line plus 4 px above and below.
+    min-height: action-text.preferred-height + 8px;
+    border-radius: root.style.control-radius;
+    // A configured state shows over the primary accent too, with plain ink.
+    property <bool> state-shown: (hit.pressed && root.palette.pressed-set)
+        || (hit.has-hover && root.palette.hover-set);
+    background: hit.pressed && (root.palette.pressed-set || !root.primary) ? root.palette.pressed
+        : hit.has-hover && (root.palette.hover-set || !root.primary) ? root.palette.hover
+        : root.primary ? root.palette.accent : transparent;
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.activated(); }
+    action-text := Text {
+        text: root.text;
+        color: root.primary && !root.state-shown ? root.palette.accent-ink : root.palette.ink;
+        font-size: 11px * root.text-scale;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    keyboard-focus := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                root.activated();
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            keyboard-focus.focus();
+            root.activated();
+        }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: root.style.focus-width;
+        border-color: root.palette.focus;
+        background: transparent;
+    }
+}
+
+export component AttachmentQueue inherits Rectangle {
+    in property <[AttachmentItem]> items;
+    in property <int> ready-count: 0;
+    in property <string> status;
+    in property <AttachmentPalette> palette;
+    in property <AttachmentStyle> style;
+    in property <float> text-scale: 1;
+    callback send();
+    // (item id, 0 remove, 1 cancel, 2 retry, 4 move up, 5 move down)
+    callback action(int, int);
+
+    // Heights follow the natural line heights of the queue's own captions in
+    // the configured font and text size (measured by the hidden probes
+    // below), never below the built-in 30 px header and 32 px row. Send is
+    // its caption plus 4 px above and below, 2 px inside the header.
+    property <length> header-height: max(30px, action-probe.preferred-height + 12px);
+    // Name and status lines, 2 px apart, 3 px row padding above and below;
+    // and room for an action's caption plus its own padding.
+    property <length> row-height: max(32px,
+        name-probe.preferred-height + status-probe.preferred-height + 2px + 6px,
+        action-probe.preferred-height + 8px + 6px);
+    // Rows beyond three scroll inside the list.
+    out property <length> needed-height: root.items.length == 0 ? 0px : root.header-height + min(3, root.items.length) * root.row-height;
+
+    height: root.needed-height;
+    background: transparent;
+
+    if root.items.length > 0 : HorizontalLayout {
+        y: 0px;
+        height: root.header-height;
+        spacing: 8px;
+        Text {
+            text: root.status;
+            color: root.palette.muted;
+            font-size: 11px * root.text-scale;
+            font-weight: 650;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+            accessible-live-region: polite;
+        }
+        if root.ready-count > 0 : QueueAction {
+            height: root.header-height - 4px;
+            text: root.ready-count == 1 ? "Send attachment" : "Send " + root.ready-count + " attachments";
+            label: root.ready-count == 1 ? "Send the ready attachment" : "Send " + root.ready-count + " ready attachments";
+            primary: true;
+            palette: root.palette;
+            style: root.style;
+            text-scale: root.text-scale;
+            activated => { root.send(); }
+        }
+    }
+
+    if root.items.length > 0 : list := ListView {
+        y: root.header-height;
+        height: root.needed-height - root.header-height;
+        horizontal-scrollbar-policy: always-off;
+        for item in root.items : Rectangle {
+            width: list.visible-width;
+            height: root.row-height;
+            border-radius: root.style.row-radius;
+            border-width: root.style.row-line-width;
+            border-color: root.palette.divider;
+            background: root.palette.surface;
+            accessible-role: list-item;
+            accessible-label: item.name + ", " + item.detail + ", " + item.status;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 6px;
+                padding-top: 3px;
+                padding-bottom: 3px;
+                spacing: 8px;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: item.name;
+                            color: root.palette.ink;
+                            font-size: 11px * root.text-scale;
+                            font-weight: 700;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            accessible-role: none;
+                        }
+                        Text {
+                            text: item.detail;
+                            color: root.palette.muted;
+                            font-size: 10px * root.text-scale;
+                            overflow: elide;
+                            accessible-role: none;
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: item.status;
+                            color: item.state >= 6 ? root.palette.error : root.palette.muted;
+                            font-size: 10px * root.text-scale;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            accessible-role: none;
+                        }
+                        if item.progress >= 0 : VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 72px;
+                                height: 5px;
+                                border-radius: 2.5px;
+                                background: root.palette.divider;
+                                accessible-role: progress-indicator;
+                                accessible-label: "Upload progress";
+                                accessible-value: round(item.progress * 100) + "%";
+                                Rectangle {
+                                    x: 0px;
+                                    width: parent.width * min(1, max(0, item.progress));
+                                    height: parent.height;
+                                    border-radius: parent.border-radius;
+                                    background: root.palette.accent;
+                                }
+                            }
+                        }
+                    }
+                }
+                if item.can-move-up : QueueAction {
+                    text: "Up";
+                    label: "Send " + item.name + " earlier";
+                    palette: root.palette;
+                    style: root.style;
+                    text-scale: root.text-scale;
+                    activated => { root.action(item.id, 4); }
+                }
+                if item.can-move-down : QueueAction {
+                    text: "Down";
+                    label: "Send " + item.name + " later";
+                    palette: root.palette;
+                    style: root.style;
+                    text-scale: root.text-scale;
+                    activated => { root.action(item.id, 5); }
+                }
+                if item.can-retry : QueueAction {
+                    text: "Retry";
+                    label: "Retry " + item.name;
+                    palette: root.palette;
+                    style: root.style;
+                    text-scale: root.text-scale;
+                    activated => { root.action(item.id, 2); }
+                }
+                if item.can-cancel : QueueAction {
+                    text: "Cancel";
+                    label: "Cancel " + item.name;
+                    palette: root.palette;
+                    style: root.style;
+                    text-scale: root.text-scale;
+                    activated => { root.action(item.id, 1); }
+                }
+                if item.can-remove : QueueAction {
+                    text: item.state == 8 ? "Dismiss" : "Remove";
+                    label: (item.state == 8 ? "Dismiss " : "Remove ") + item.name;
+                    palette: root.palette;
+                    style: root.style;
+                    text-scale: root.text-scale;
+                    activated => { root.action(item.id, 0); }
+                }
+            }
+        }
+    }
+
+    // Zero-size, hidden probes with the captions' exact fonts. Their
+    // preferred heights are intrinsic, so measuring them never feeds back
+    // into this queue's own size.
+    action-probe := Text {
+        x: 0px; y: 0px; width: 0px; height: 0px;
+        visible: false;
+        text: "Send";
+        font-size: 11px * root.text-scale;
+        font-weight: 700;
+        accessible-role: none;
+    }
+    name-probe := Text {
+        x: 0px; y: 0px; width: 0px; height: 0px;
+        visible: false;
+        text: "Name";
+        font-size: 11px * root.text-scale;
+        font-weight: 700;
+        accessible-role: none;
+    }
+    status-probe := Text {
+        x: 0px; y: 0px; width: 0px; height: 0px;
+        visible: false;
+        text: "Status";
+        font-size: 10px * root.text-scale;
+        accessible-role: none;
+    }
+}

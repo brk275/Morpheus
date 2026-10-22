@@ -123,6 +123,17 @@ fn pipewire_addresses() -> [*const c_void; 33] {
 }
 
 fn verify_pipewire_bindings() {
+    if option_env!("MORPHEUS_NATIVE_PIPEWIRE_ARTIFACT").is_some() {
+        pipewire_probe::verify_native(&pipewire_addresses())
+            .expect("native fixed-client provenance rejected");
+        return;
+    }
+    // Only the explicit historical comparison can compile the old stock gate.
+    // The ordinary driver requires native preparation and native origin facts.
+    assert_eq!(
+        std::env::var("MORPHEUS_PIPEWIRE_CLIENT_VARIANT").as_deref(),
+        Ok("system-probe")
+    );
     let addresses = pipewire_addresses();
     let mut counts = [0_u32; 4];
     for address in addresses {
@@ -296,6 +307,9 @@ fn wayland_selected_display_streams_changes_and_stops() {
     stage("pipewire_binding_origin");
     verify_pipewire_bindings();
     capture_scenario();
+    if option_env!("MORPHEUS_NATIVE_PIPEWIRE_ARTIFACT").is_some() {
+        verify_pipewire_bindings(); // Retain exact origins after module loading/capture too.
+    }
 }
 
 #[test]
@@ -312,7 +326,7 @@ fn wayland_private_client_startup_diagnostic() {
 }
 
 // Both entries exercise identical capture assertions. Only the ordinary
-// system-library entry can supply the required Wayland acceptance result.
+// owned-native entry can supply the required native Wayland acceptance result.
 fn capture_scenario() {
     stage("pipewire_initializer");
     // Invoke the same public initializer used by PortalCapture only after the

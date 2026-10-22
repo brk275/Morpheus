@@ -16,6 +16,7 @@ use url::Url;
 #[path = "../../../vendor/webrtc-sys/pipewire_isolation.rs"]
 mod pipewire_archive_contract;
 
+mod reconnect;
 mod voice_space;
 
 #[cfg(feature = "device-audio")]
@@ -23,7 +24,7 @@ mod audio_device;
 #[cfg(feature = "device-audio")]
 mod ring_audio;
 #[cfg(feature = "device-audio")]
-pub use ring_audio::{RingAudioAuthority, RingAudioError, RingPlayback};
+pub use ring_audio::{PcmPlayback, RingAudioAuthority, RingAudioError, RingPlayback};
 #[cfg(all(feature = "device-screen", target_os = "linux"))]
 mod linux_portal;
 #[cfg(feature = "native-rtc")]
@@ -41,8 +42,8 @@ mod video_device;
 
 #[cfg(feature = "device-audio")]
 pub use audio_device::{
-    AudioControls, AudioDevice, AudioDeviceCatalog, AudioDeviceSelection, AudioOutput, AudioState,
-    MicrophoneCapture, audio_devices,
+    AudioControls, AudioDevice, AudioDeviceCatalog, AudioDeviceSelection, AudioOutput, AudioResume,
+    AudioRoute, AudioState, DeviceRoute, MicrophoneCapture, RouteNotice, audio_devices,
 };
 #[cfg(feature = "native-rtc")]
 pub use matrix_rtc_call_sdk::CallEvent as RtcCallEvent;
@@ -50,6 +51,10 @@ pub use matrix_rtc_call_sdk::CallEvent as RtcCallEvent;
 pub use matrix_rtc_transport::{
     AudioFrame, I420Buffer, MediaStreamKind, VideoFrame, VideoRotation,
 };
+// Receive-side presentation: frame-stream handles and per-stream
+// subscription constraints (pause or size cap) for a native call stage.
+#[cfg(feature = "native-rtc")]
+pub use matrix_rtc_transport::{Dimensions, MediaConstraints, RemoteTrackHandle, VideoDetail};
 #[cfg(feature = "native-rtc")]
 pub use media::{MediaError, Publication};
 #[cfg(feature = "native-rtc")]
@@ -61,6 +66,9 @@ pub use native::{
 pub use observer::{ObservedCall, ObservedParticipant, ObserverError, PassiveCallObserver};
 #[cfg(feature = "native-rtc")]
 pub use outgoing_notification::NotificationDialect;
+pub use reconnect::{
+    ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd, RtcConnectionSignal,
+};
 #[cfg(feature = "device-camera")]
 pub use video_device::CameraCapture;
 #[cfg(feature = "device-screen")]

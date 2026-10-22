@@ -3,6 +3,7 @@
 //! camera or screen capture call is stuck inside its platform backend.
 
 use std::{
+    collections::VecDeque,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
@@ -29,14 +30,32 @@ const CAMERA_INTERVAL: Duration = Duration::from_millis(67);
 const SCREEN_INTERVAL: Duration = Duration::from_millis(125);
 const SCREEN_WIDTH: u32 = 1280;
 const SCREEN_HEIGHT: u32 = 720;
+const RECONNECTING_START: &str = "the call is reconnecting; start video once it has rejoined";
 
 #[derive(Default)]
 pub(crate) struct CaptureStop {
     requested: AtomicBool,
     notify: Notify,
-    push_gate: StdMutex<()>,
+    // One serialization boundary for permanent stop, temporary pauses and
+    // every outgoing frame push. Never held across an await.
+    push_gate: StdMutex<TransmissionPause>,
     authorization: OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// Read at every push under `push_gate`. A false result withholds the
+    /// frame only; unlike `authorization`, it never latches a stop.
+    transmission: OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
 }
+
+/// A temporary transmission pause, e.g. while signalling reconnects or the
+/// call rejoins. Every pause bumps the epoch, so only the newest pause's
+/// token can resume; a stale resume never re-enables sending.
+#[derive(Default)]
+struct TransmissionPause {
+    epoch: u64,
+    paused: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransmissionPauseToken(u64);
 
 impl CaptureStop {
     pub(crate) fn request(&self) {
@@ -90,12 +109,81 @@ impl CaptureStop {
         self.notify.notified().await;
     }
 
-    fn push_if_active<T>(&self, push: impl FnOnce() -> T) -> Option<T> {
-        let _gate = self
+    /// Bind the call's temporary transmission gate once, before media starts.
+    /// It must be cheap and perform no I/O; it runs under the push lock.
+    pub(crate) fn bind_transmission_gate(
+        &self,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) {
+        let _ = self.transmission.set(Box::new(allowed));
+    }
+
+    fn transmission_allowed(&self) -> bool {
+        self.transmission.get().is_none_or(|allowed| allowed())
+    }
+
+    /// Withhold frames until the returned token resumes. `mute` runs under
+    /// the push lock, so no frame is pushed between the pause and the mute.
+    pub(crate) fn pause_transmission(&self, mute: impl FnOnce()) -> TransmissionPauseToken {
+        let mut gate = self
             .push_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if self.requested() { None } else { Some(push()) }
+        gate.epoch = gate.epoch.wrapping_add(1);
+        gate.paused = true;
+        mute();
+        TransmissionPauseToken(gate.epoch)
+    }
+
+    /// End the pause `token` started unless a newer pause or a permanent
+    /// stop followed it. `unmute` runs under the push lock only on resume.
+    pub(crate) fn resume_transmission(
+        &self,
+        token: TransmissionPauseToken,
+        unmute: impl FnOnce(),
+    ) -> bool {
+        let mut gate = self
+            .push_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !gate.paused || gate.epoch != token.0 || self.requested() {
+            return false;
+        }
+        gate.paused = false;
+        unmute();
+        true
+    }
+
+    fn transmission_paused(&self) -> bool {
+        self.push_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .paused
+    }
+
+    /// Mute a track that was published while a pause began, under the same
+    /// lock, so it cannot send before the matching resume unmutes it.
+    fn mute_if_paused(&self, mute: impl FnOnce()) -> bool {
+        let gate = self
+            .push_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if gate.paused {
+            mute();
+        }
+        gate.paused
+    }
+
+    fn push_if_active<T>(&self, push: impl FnOnce() -> T) -> Option<T> {
+        let gate = self
+            .push_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if gate.paused || self.requested() || !self.transmission_allowed() {
+            None
+        } else {
+            Some(push())
+        }
     }
 }
 
@@ -202,6 +290,15 @@ struct CaptureSlot {
 }
 
 impl CaptureSlot {
+    /// The publication of a capture the user has not stopped.
+    fn live_publication(&self) -> Option<&Publication> {
+        if self.stop.is_some() {
+            self.publication.as_ref()
+        } else {
+            None
+        }
+    }
+
     fn stop_capture(&mut self) {
         if let Some(stop) = self.stop.take() {
             stop.store(true, Ordering::Release);
@@ -245,6 +342,13 @@ pub(crate) struct LocalVideoSession {
     status: watch::Sender<LocalVideoStatus>,
     stop: Arc<CaptureStop>,
     active_workers: Arc<AtomicUsize>,
+    /// The newest pause this session started. Frames are dropped instead of
+    /// sent while the call cannot follow signalling or is rejoining; capture
+    /// keeps running, so resuming never reopens a device or asks for a new
+    /// screen selection.
+    transmission_pause: Option<TransmissionPauseToken>,
+    /// Source-ready and failure reports found while discarding stale frames.
+    deferred: VecDeque<Captured>,
 }
 
 impl LocalVideoSession {
@@ -271,10 +375,92 @@ impl LocalVideoSession {
             status,
             stop,
             active_workers,
+            transmission_pause: None,
+            deferred: VecDeque::new(),
         }
     }
 
+    /// Move this session to the call's new UI generation after a rejoin,
+    /// keeping the capture phases the user already sees.
+    pub(crate) fn set_presentation_token(&mut self, token: u64) {
+        let previous = self.token;
+        self.token = token;
+        self.status.send_if_modified(|current| {
+            if current.token != previous {
+                return false;
+            }
+            current.token = token;
+            true
+        });
+    }
+
+    /// Stop sending without stopping capture or retracting the publications.
+    pub(crate) fn pause_transmission(&mut self) {
+        let camera = &self.camera.publication;
+        let screen = &self.screen.publication;
+        let token = self.stop.pause_transmission(|| {
+            for publication in [camera, screen].into_iter().flatten() {
+                let _ = publication.set_muted(true);
+            }
+        });
+        self.transmission_pause = Some(token);
+    }
+
+    /// Resume sending for captures the user has not stopped, unless Leave
+    /// stopped the call meanwhile. A capture that has not published yet
+    /// publishes on its next frame.
+    pub(crate) fn resume_transmission(&mut self) {
+        let Some(token) = self.transmission_pause else {
+            return;
+        };
+        let camera = self.camera.live_publication();
+        let screen = self.screen.live_publication();
+        let resumed = self.stop.resume_transmission(token, || {
+            for publication in [camera, screen].into_iter().flatten() {
+                // A failed unmute surfaces through the next frame push.
+                let _ = publication.set_muted(false);
+            }
+        });
+        if !resumed {
+            return;
+        }
+        self.transmission_pause = None;
+        // Frames queued before the resume are stale; never replay them after
+        // a reconnect. The queue is bounded, so this drains at most a few.
+        for _ in 0..CAPTURE_QUEUE {
+            let Ok(event) = self.frames.try_recv() else {
+                break;
+            };
+            if !matches!(event, Captured::Frame { .. }) {
+                self.deferred.push_back(event);
+            }
+        }
+        for slot in [&mut self.camera, &mut self.screen] {
+            // The first-frame budget restarts; frames were withheld.
+            if slot.started.is_some() {
+                slot.started = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Release publications that belong to a join which has ended, keeping
+    /// any running capture paused for a rejoin. Dropping a publication mutes
+    /// it; the ended join's leave removes it from peers.
+    pub(crate) fn detach_publications(&mut self) {
+        self.pause_transmission();
+        for kind in [CaptureKind::Camera, CaptureKind::Screen] {
+            drop(self.slot_mut(kind).publication.take());
+        }
+    }
+
+    fn transmission_paused(&self) -> bool {
+        self.stop.transmission_paused()
+    }
+
     pub(crate) async fn next_event(&mut self) -> LocalVideoEvent {
+        if let Some(event) = self.deferred.pop_front() {
+            return LocalVideoEvent::Frame(event);
+        }
         if self.commands_open {
             tokio::select! {
                 command = self.commands.recv() => match command {
@@ -334,6 +520,7 @@ impl LocalVideoSession {
                     self.fail(kind, error.to_string()).await;
                 }
             }
+            LocalVideoEvent::Tick if self.transmission_paused() => {}
             LocalVideoEvent::Tick => {
                 for kind in [CaptureKind::Camera, CaptureKind::Screen] {
                     let selecting = self.current_state(kind).phase == CapturePhase::Selecting;
@@ -360,6 +547,35 @@ impl LocalVideoSession {
                     }
                 }
             }
+        }
+    }
+
+    /// Handle capture events while the call has no join to publish on, i.e.
+    /// while it rejoins. Stop always works; Start waits for the new join.
+    /// Frames are dropped because transmission is paused.
+    pub(crate) async fn handle_detached_event(&mut self, event: LocalVideoEvent) {
+        match event {
+            LocalVideoEvent::Command(CaptureCommand::Start { reply, .. }) => {
+                let error = MediaError::Device(RECONNECTING_START.into());
+                let _ = reply.send(Err(error));
+            }
+            LocalVideoEvent::Command(CaptureCommand::Stop { kind, reply }) => {
+                let result = self.stop(kind).await;
+                let _ = reply.send(result);
+            }
+            LocalVideoEvent::Frame(Captured::SourceReady { kind, generation }) => {
+                self.source_ready(kind, generation);
+            }
+            LocalVideoEvent::Frame(Captured::Failed {
+                kind,
+                generation,
+                error,
+            }) => {
+                if self.slot(kind).generation == generation && self.slot(kind).stop.is_some() {
+                    self.fail(kind, error.to_string()).await;
+                }
+            }
+            LocalVideoEvent::Frame(Captured::Frame { .. }) | LocalVideoEvent::Tick => {}
         }
     }
 
@@ -528,6 +744,7 @@ impl LocalVideoSession {
         frame: VideoFrame,
     ) {
         if self.stop.requested()
+            || self.transmission_paused()
             || self.slot(kind).generation != generation
             || self.slot(kind).stop.is_none()
         {
@@ -567,6 +784,16 @@ impl LocalVideoSession {
         if self.stop.requested() || self.slot(kind).stop.is_none() {
             // A leave can be requested while upstream publish is suspended.
             // The track is now owned by the slot so shutdown can unpublish it.
+            return;
+        }
+        // A pause can begin while publish is suspended. Keep the new track
+        // muted until the worker resumes transmission.
+        let published = self.slot(kind).publication.as_ref();
+        if self.stop.mute_if_paused(|| {
+            if let Some(publication) = published {
+                let _ = publication.set_muted(true);
+            }
+        }) {
             return;
         }
         let Some(result) = self.stop.push_if_active(|| {
@@ -809,6 +1036,59 @@ mod tests {
         );
         current.store(true, Ordering::SeqCst);
         assert!(stop.requested());
+    }
+
+    #[test]
+    fn signaling_gate_withholds_frames_without_an_owner_or_stop() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&open);
+        let stop = CaptureStop::default();
+        stop.bind_transmission_gate(move || gate.load(Ordering::SeqCst));
+        // No session pauses here: the push boundary reads the gate itself.
+        assert_eq!(stop.push_if_active(|| ()), None);
+        assert!(!stop.requested(), "a transient loss must not stop capture");
+        open.store(true, Ordering::SeqCst);
+        assert_eq!(stop.push_if_active(|| 7), Some(7));
+    }
+
+    #[test]
+    fn transmission_pause_serializes_with_pushes_and_stale_resumes() {
+        let stop = Arc::new(CaptureStop::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let pusher = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                stop.push_if_active(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        entered_rx.recv().unwrap();
+        let pauser = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || stop.pause_transmission(|| {}))
+        };
+        // The pause waits for the in-flight push instead of slipping between
+        // that push's authorization check and the push itself.
+        thread::sleep(Duration::from_millis(50));
+        assert!(!pauser.is_finished());
+        release_tx.send(()).unwrap();
+        assert_eq!(pusher.join().unwrap(), Some(()));
+        let first = pauser.join().unwrap();
+        assert_eq!(stop.push_if_active(|| ()), None);
+
+        // Only the newest pause can resume, and Leave dominates any resume.
+        let second = stop.pause_transmission(|| {});
+        assert!(!stop.resume_transmission(first, || panic!("stale resume unmuted")));
+        assert_eq!(stop.push_if_active(|| ()), None);
+        assert!(stop.resume_transmission(second, || {}));
+        assert_eq!(stop.push_if_active(|| 7), Some(7));
+        let third = stop.pause_transmission(|| {});
+        stop.request();
+        assert!(!stop.resume_transmission(third, || panic!("resumed after Leave")));
+        assert_eq!(stop.push_if_active(|| ()), None);
     }
 
     #[test]
