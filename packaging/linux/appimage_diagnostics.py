@@ -35,8 +35,8 @@ PEER_FACTS = frozenset(("unavailable_audio_verified", "peer_ready", "exact_sende
                        "screen_stopped", "reopened_frame", "changed_after_reopen", "source_loss_stopped_track", "app_left", "cleanup", "complete"))
 REASONS = frozenset(("command_deadline", "command_output", "command_exit", "command_pipe", "command_cleanup", "command_input",
                      "command_http_forbidden", "command_http_not_found", "command_http_rate_limited", "command_http_unavailable",
-    "command_http_rejected", "command_download_transport", "command_download_tls",
-    "interrupted", "capture", "identity", "binding", "package", "inventory", "unknown", "namespace_exit",
+                     "command_http_rejected", "command_download_transport", "command_download_tls",
+                     "interrupted", "capture", "identity", "binding", "package", "inventory", "unknown", "namespace_exit",
                      "namespace_deadline", "namespace_output", "cleanup",
                      "inventory_input", "inventory_tool", "inventory_elf", "inventory_dependency",
                      "inventory_package", "inventory_notice", "inventory_deployment", "inventory_limit",

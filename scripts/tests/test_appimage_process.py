@@ -465,6 +465,22 @@ class PackageInputTests(unittest.TestCase):
             self.assertEqual(self.last_runner.run.call_count, 1)
             self.last_delay.assert_not_called()
 
+    def test_permanent_http_status_is_fatal_even_with_a_transport_exit(self):
+        for http, reason in ((403, "http_forbidden"), (404, "http_not_found"), (429, "http_rate_limited")):
+            for code in (18, 28, 52, 55, 56):
+                with self.subTest(http=http, code=code), self.assertRaises(M.PackageDownloadFailure) as caught:
+                    self.invoke([self.frame(b"private reflected server body", http=http, code=code)])
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertEqual(self.last_runner.run.call_count, 1)
+                self.last_delay.assert_not_called()
+                self.assertNotIn("private", str(caught.exception))
+            for code in (35, 51, 60):
+                with self.subTest(http=http, code=code), self.assertRaises(M.PackageDownloadFailure) as caught:
+                    self.invoke([self.frame(http=http, code=code)])
+                self.assertEqual(caught.exception.reason, "download_tls")
+                self.assertEqual(self.last_runner.run.call_count, 1)
+                self.last_delay.assert_not_called()
+
     def test_bad_frame_hash_size_or_misleading_status_is_never_retried(self):
         for output in (self.payload, self.frame(self.payload)[:-1], self.frame(b"wrong"),
                        self.frame(self.payload, http=403), self.frame(self.payload, http=0),

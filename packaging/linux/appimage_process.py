@@ -221,7 +221,8 @@ def download_package_input(runner, *, url, maximum, root, environment,
     Curl appends constant numeric status to its binary stdout; nothing reaches
     the text log. Parse that final envelope, discard failed/partial bytes, and
     verify the original size/digest before returning a successful payload.
-    The total budget, including up to three attempts, remains125 seconds.
+    Up to three attempts share a 125-second command budget. Mandatory owned
+    group cleanup still completes before return, including after a deadline.
     """
     import hashlib
     from urllib.parse import urlsplit
@@ -281,16 +282,20 @@ def download_package_input(runner, *, url, maximum, root, environment,
                     or hashlib.sha256(payload).hexdigest() != expected_sha256):
                 raise CommandFailure("input")
             return payload
-        if code == 22:
+        if code in {35, 51, 60}:
+            reason, retry = "download_tls", False
+        elif http in {403, 404, 429}:
+            # Curl may retain an HTTP status while a transfer times out.
+            # A permanent HTTP refusal must not become a transport retry.
+            reason = {403: "http_forbidden", 404: "http_not_found", 429: "http_rate_limited"}[http]
+            retry = False
+        elif code == 22:
             if http < 400:
                 raise CommandFailure("input")
-            reason = {403: "http_forbidden", 404: "http_not_found", 429: "http_rate_limited"}.get(
-                http, "http_unavailable" if http in transient_http else "http_rejected")
+            reason = "http_unavailable" if http in transient_http else "http_rejected"
             retry = http in transient_http
         elif code in transport:
             reason, retry = "download_transport", True
-        elif code in {35, 51, 60}:
-            reason, retry = "download_tls", False
         else:
             raise CommandFailure("input")
         if not retry or attempt == 2:
