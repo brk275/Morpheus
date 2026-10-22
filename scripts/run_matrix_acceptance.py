@@ -1156,6 +1156,15 @@ class Acceptance:
             self.group((label + ("-late-join" if late_join else ""),), case)
 
     def outgoing_ring_cases(self):
+        # Prepare the same test artifact before creating any case fixture.
+        # This is compile-only, not acceptance; run() retains its 900-second
+        # default, shared work deadline, fatal errors and private log scan.
+        self.run(
+            "outgoing-ring-app-test-compile",
+            ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+             "--bin", "morpheus-app", "--no-run"],
+            extra={"SLINT_EMIT_DEBUG_INFO": "1"},
+        )
         # Each mode/target uses new users and an encrypted room. Existing
         # devices, memberships or notification events cannot satisfy its gate.
         for mode, target in RING_CASES:
@@ -1165,8 +1174,8 @@ class Acceptance:
                 self.run(
                     label,
                     ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
-                     "--bin", "morpheus-app", RING_TEST, "--", "--ignored", "--exact", "--show-output",
-                     "--test-threads=1"],
+                     "--bin", "morpheus-app", RING_TEST, "--", "--ignored", "--exact", "--nocapture",
+                     "--test-threads=2"],
                     extra={"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture),
                            "MORPHEUS_RING_TEST_MODE": mode, "MORPHEUS_RING_TEST_TARGET": target,
                            "SLINT_EMIT_DEBUG_INFO": "1"},

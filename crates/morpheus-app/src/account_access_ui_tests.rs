@@ -8305,6 +8305,8 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
     use crate::draft_recovery;
     use crate::drafts::{PendingItem, PendingStatus, PendingSummary};
     use morpheus_matrix::Generation;
+    use slint::private_unstable_api::re_exports::{Flickable, ItemRc};
+    use std::ops::ControlFlow;
     use std::{cell::RefCell, rc::Rc};
 
     let previous_scale = ui.get_font_scale_percent();
@@ -8365,6 +8367,36 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
     let before_geometry_scale = ui.get_font_scale_percent();
     ui.set_font_scale_percent(100);
     settle(ui).await;
+    // This is capped scroll content. Reveal each status/action pair through
+    // the ordinary wheel path before checking its actual visible geometry.
+    let room_state = || {
+        let model = ui.get_composer_pending_items();
+        let records: Vec<_> = (0..model.row_count())
+            .map(|index| {
+                let item = model.row_data(index).unwrap();
+                (
+                    item.key,
+                    item.status,
+                    item.preview,
+                    item.can_cancel,
+                    item.can_retry,
+                    item.unconfirmed,
+                    item.kept,
+                )
+            })
+            .collect();
+        (
+            records,
+            ui.get_composer_text(),
+            ui.get_composer_pending_count(),
+            ui.get_composer_pending_blocked(),
+            ui.get_composer_unconfirmed(),
+            ui.get_composer_blocked_notice(),
+        )
+    };
+    let before_wheel_state = room_state();
+    let before_wheel_focus = focused_control_identity(ui);
+    let mut room_scroll: Option<(ItemRc, f32)> = None;
     for (index, label) in [
         (0, CANCEL_LABEL),
         (1, KEEP_LABEL),
@@ -8376,6 +8408,104 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
         let action = button_bounds(ui, label);
         assert_eq!(status.len(), 1, "one actual room status for this record");
         assert_eq!(action.len(), 1, "one exact action for this record");
+        let status_item = control_with_label(ui, &caption);
+        let action_item = control_with_label(ui, label);
+        let mut owners = Vec::new();
+        for node in geometry_nodes(ui) {
+            if node.downcast::<Flickable>().is_none() {
+                continue;
+            }
+            let contains = |target: &ItemRc| {
+                node.visit_descendants(|item| {
+                    if item == target {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+                .is_some()
+            };
+            if contains(&status_item) && contains(&action_item) {
+                owners.push(node);
+            }
+        }
+        assert_eq!(
+            owners.len(),
+            1,
+            "one actual viewport owns both record parts"
+        );
+        let owner = owners.pop().unwrap();
+        let (viewport, content_y, content_height) = {
+            let scroll = owner.downcast::<Flickable>().unwrap();
+            let scroll = scroll.as_pin_ref();
+            (
+                item_bounds(&owner),
+                scroll.content_y().0,
+                scroll.content_height().0,
+            )
+        };
+        if let Some((original_owner, _)) = &room_scroll {
+            assert!(
+                original_owner == &owner,
+                "all room records use the same viewport"
+            );
+        } else {
+            room_scroll = Some((owner.clone(), content_y));
+        }
+        assert!(inside_window(ui, viewport));
+        let pair_top = status[0].top.min(action[0].top);
+        let pair_bottom = status[0].bottom.max(action[0].bottom);
+        assert!(pair_bottom - pair_top <= viewport.bottom - viewport.top);
+        assert!(
+            pair_top >= viewport.top + content_y - 0.5
+                && pair_bottom <= viewport.top + content_y + content_height + 0.5,
+            "the scroll range includes the whole status/action pair"
+        );
+        let delta_y = if pair_top < viewport.top - 0.5 {
+            viewport.top - pair_top
+        } else if pair_bottom > viewport.bottom + 0.5 {
+            viewport.bottom - pair_bottom
+        } else {
+            0.0
+        };
+        if delta_y != 0.0 {
+            assert_eq!(
+                ui.window()
+                    .dispatch_event_with_result(WindowEvent::PointerScrolled {
+                        position: slint::LogicalPosition::new(
+                            (viewport.left + viewport.right) / 2.0,
+                            (viewport.top + viewport.bottom) / 2.0,
+                        ),
+                        delta_x: 0.0,
+                        delta_y,
+                    })
+                    .unwrap(),
+                slint::platform::WindowEventDispatchResult::Accepted,
+                "the record's real viewport accepts the reveal wheel"
+            );
+            settle(ui).await;
+            let scroll = owner.downcast::<Flickable>().unwrap();
+            assert!(
+                (scroll.as_pin_ref().content_y().0 - content_y) * delta_y > 0.0,
+                "the wheel actually moves the record in the requested direction"
+            );
+        }
+        assert_eq!(
+            room_state(),
+            before_wheel_state,
+            "scrolling never changes a record or composer"
+        );
+        assert!(
+            focused_control_identity(ui) == before_wheel_focus,
+            "wheel setup never changes focus"
+        );
+        let viewport = item_bounds(&owner);
+        assert!(inside_window(ui, viewport));
+        let status = control_bounds(ui, &caption);
+        let action = button_bounds(ui, label);
+        assert_eq!(status.len(), 1);
+        assert_eq!(action.len(), 1);
+        assert!(bounds_within(status[0], viewport) && bounds_within(action[0], viewport));
         assert!(inside_window(ui, status[0]) && inside_window(ui, action[0]));
         assert!(
             status[0].bottom <= action[0].top + 0.5,
@@ -8384,6 +8514,41 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
             action[0]
         );
     }
+    // Keep the later keyboard/routing scenarios in their original scroll context.
+    let (owner, initial_y) = room_scroll.unwrap();
+    let (viewport, current_y) = {
+        let scroll = owner.downcast::<Flickable>().unwrap();
+        (item_bounds(&owner), scroll.as_pin_ref().content_y().0)
+    };
+    if (current_y - initial_y).abs() > 0.5 {
+        assert_eq!(
+            ui.window()
+                .dispatch_event_with_result(WindowEvent::PointerScrolled {
+                    position: slint::LogicalPosition::new(
+                        (viewport.left + viewport.right) / 2.0,
+                        (viewport.top + viewport.bottom) / 2.0,
+                    ),
+                    delta_x: 0.0,
+                    delta_y: initial_y - current_y,
+                })
+                .unwrap(),
+            slint::platform::WindowEventDispatchResult::Accepted
+        );
+        settle(ui).await;
+    }
+    let restored_y = owner
+        .downcast::<Flickable>()
+        .unwrap()
+        .as_pin_ref()
+        .content_y()
+        .0;
+    assert!(
+        (restored_y - initial_y).abs() <= 0.5,
+        "the normal wheel restores the original offset"
+    );
+    assert_eq!(room_state(), before_wheel_state);
+    assert!(focused_control_identity(ui) == before_wheel_focus);
+    drop(owner);
     ui.set_font_scale_percent(before_geometry_scale);
     settle(ui).await;
     ui.set_composer_text("typing something newer".into());

@@ -2055,18 +2055,33 @@ class OutgoingRingTests(unittest.TestCase):
                 fixture.chmod(0o600)
             with (patch.object(runner, "script", side_effect=[str(path) for path in fixtures]) as script,
                   patch.object(runner, "run") as run):
+                operations = Mock()
+                operations.attach_mock(run, "run")
+                operations.attach_mock(script, "script")
                 runner.outgoing_ring_cases()
             self.assertEqual([item.args for item in script.call_args_list],
                              [("local_matrix_rtc", "rtc-fixture")] * 4)
+            self.assertEqual([item[0] for item in operations.mock_calls],
+                             ["run", "script", "run", "script", "run", "script", "run", "script", "run"])
+            self.assertEqual(run.call_count, 5)
+            compile = run.call_args_list[0]
+            self.assertEqual(compile.args, ("outgoing-ring-app-test-compile", [
+                "cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+                "--bin", "morpheus-app", "--no-run",
+            ]))
+            self.assertEqual(compile.kwargs, {"extra": {"SLINT_EMIT_DEBUG_INFO": "1"}})
             cases = [(mode, target) for mode in ("current", "sticky-2025") for target in ("dm", "room")]
-            for invocation, fixture, case in zip(run.call_args_list, fixtures, cases, strict=True):
+            for invocation, fixture, case in zip(run.call_args_list[1:], fixtures, cases, strict=True):
                 mode, target = case
                 self.assertEqual(invocation.args[0], f"outgoing-ring-{mode}-{target}")
                 self.assertEqual(invocation.args[1], [
                     "cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
                     "--bin", "morpheus-app", acceptance_module.RING_TEST, "--", "--ignored", "--exact",
-                    "--show-output", "--test-threads=1",
+                    "--nocapture", "--test-threads=2",
                 ])
+                self.assertEqual(invocation.args[1][:9], compile.args[1][:-1])
+                self.assertEqual({name: invocation.kwargs["extra"][name] for name in compile.kwargs["extra"]},
+                                 compile.kwargs["extra"])
                 self.assertEqual(invocation.kwargs, {
                     "extra": {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture.resolve()),
                               "MORPHEUS_RING_TEST_MODE": mode, "MORPHEUS_RING_TEST_TARGET": target,
@@ -2075,17 +2090,27 @@ class OutgoingRingTests(unittest.TestCase):
                 })
 
     def test_first_failed_case_stops_later_cases(self):
-        with tempfile.TemporaryDirectory() as folder:
-            runner = Acceptance(Path(folder), "unused-scanner")
-            fixture = Path(folder) / "fixture.json"
-            fixture.write_text("{}")
-            fixture.chmod(0o600)
-            with (patch.object(runner, "script", return_value=str(fixture)) as script,
-                  patch.object(runner, "run", side_effect=RuntimeError("fixed failure")) as run,
-                  self.assertRaisesRegex(RuntimeError, "fixed failure")):
-                runner.outgoing_ring_cases()
-            script.assert_called_once()
-            run.assert_called_once()
+        for failure_at in ("compile", "case"):
+            with self.subTest(failure_at=failure_at), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                fixture = Path(folder) / "fixture.json"
+                fixture.write_text("{}")
+                fixture.chmod(0o600)
+                failure = RuntimeError("fixed failure")
+                outcomes = [failure] if failure_at == "compile" else [None, failure]
+                with (patch.object(runner, "script", return_value=str(fixture)) as script,
+                      patch.object(runner, "run", side_effect=outcomes) as run,
+                      self.assertRaisesRegex(RuntimeError, "fixed failure") as caught):
+                    runner.outgoing_ring_cases()
+                self.assertIs(caught.exception, failure)
+                if failure_at == "compile":
+                    script.assert_not_called()
+                    run.assert_called_once()
+                else:
+                    script.assert_called_once()
+                    self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_args_list[0].args[0], "outgoing-ring-app-test-compile")
+                self.assertEqual(runner.failures, [])
 
     @contextlib.contextmanager
     def mocked_run(self, runner, output, *, returncode=0, scanner_code=0):
@@ -2642,17 +2667,21 @@ class ScopedContinuationTests(unittest.TestCase):
                     path.write_text("{}")
                     path.chmod(0o600)
                 with (patch.object(runner, "script", side_effect=list(map(str, fixtures))) as script,
-                      patch.object(runner, "run", side_effect=[failure, None, None, None]) as run):
+                      patch.object(runner, "run", side_effect=[None, failure, None, None, None]) as run):
                     if isinstance(failure, acceptance_module.CheckFailure):
                         runner.outgoing_ring_cases()
-                        self.assertEqual(run.call_count, 4)
+                        self.assertEqual(run.call_count, 5)
+                        self.assertEqual(runner.failures, [{"check": "outgoing-ring-current-dm", "reason": "test_failed"}])
                     else:
                         with self.assertRaises(RuntimeError):
                             runner.outgoing_ring_cases()
-                        self.assertEqual(run.call_count, 1)
-                self.assertEqual(script.call_count, run.call_count)
+                        self.assertEqual(run.call_count, 2)
+                        self.assertEqual(runner.failures, [])
+                self.assertEqual(run.call_args_list[0].args[0], "outgoing-ring-app-test-compile")
+                case_calls = run.call_args_list[1:]
+                self.assertEqual(script.call_count, len(case_calls))
                 self.assertEqual(len(set(call.kwargs["extra"]["MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS"]
-                                         for call in run.call_args_list)), run.call_count)
+                                         for call in case_calls)), len(case_calls))
 
     def test_oauth_login_failure_skips_restore_and_cleanup_failure_cannot_be_collected(self):
         for cleanup_fails in (False, True):
