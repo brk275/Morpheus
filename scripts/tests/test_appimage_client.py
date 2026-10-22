@@ -285,7 +285,7 @@ class ToolTests(unittest.TestCase):
                         with self.assertRaises(C.PackageFailure):
                             runtime.host_inputs(run, hashlib.sha256(data).hexdigest(), uapi_paths=[allowed])
 
-    def test_musl_quiet_commands_keep_bounds_and_preserve_fixed_failures(self):
+    def test_runtime_make_commands_keep_bounds_and_preserve_fixed_failures(self):
         # Mock commands only; this fixture never executes a compiler or make.
         runtime = load("appimage_runtime_build")
         diagnostics = load("appimage_diagnostics")
@@ -295,7 +295,9 @@ class ToolTests(unittest.TestCase):
                  "meson", "ninja", "autoreconf", "pkg-config")
         for failed_stage, reason in (("runtime-musl-build", "output"),
                                      ("runtime-musl-install", "exit"),
-                                     ("runtime-musl-install", "output")):
+                                     ("runtime-musl-install", "output"),
+                                     ("runtime-malformed-build", "exit"),
+                                     ("runtime-malformed-test", "exit")):
             with self.subTest(stage=failed_stage, reason=reason), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder).resolve()
                 recipe = root / "recipe"
@@ -326,9 +328,23 @@ class ToolTests(unittest.TestCase):
                     if stage == failed_stage:
                         progress.failed(failure)
                         raise failure
+                    work = recipe / "runtime-source-build"
+                    if stage == "runtime-musl-install":
+                        for name in ("bin", "include", "lib"):
+                            (work / "prefix" / name).mkdir(mode=0o700)
+                        (work / "prefix/bin/musl-gcc").write_bytes(b"inert compiler fixture")
+                    elif stage == "runtime-zstd-build":
+                        library = work / "source/zstd/lib"
+                        library.mkdir(mode=0o700, parents=True)
+                        for name in ("libzstd.a", "zstd.h", "zstd_errors.h"):
+                            (library / name).write_bytes(b"inert source fixture")
+                    elif stage == "runtime-malformed-build":
+                        sq = work / "source/squashfuse"
+                        sq.mkdir(mode=0o700)
+                        (sq / "malformedtest").write_bytes(static_runtime())
                     return b"fixed command fixture"
 
-                runner = mock.Mock()
+                runner = mock.Mock(progress=progress)
                 runner.run.side_effect = command
                 with mock.patch.object(C, "require_build_platform"), \
                         mock.patch.object(C, "read_regular", side_effect=read), \
@@ -341,7 +357,7 @@ class ToolTests(unittest.TestCase):
                 self.assertIs(error.exception, failure)
                 musl = [call for call in calls if call[0].startswith("runtime-musl-")]
                 expected = [("runtime-musl-build", [str(binaries / "make"), "-s", "-j2"], 300)]
-                if failed_stage == "runtime-musl-install":
+                if failed_stage != "runtime-musl-build":
                     expected.append(("runtime-musl-install", [str(binaries / "make"), "-s", "install"], 120))
                 self.assertEqual(len(musl), len(expected))
                 for (label, argv, cwd, env, timeout, bound), (wanted, arguments, budget) in zip(musl, expected):
@@ -351,10 +367,62 @@ class ToolTests(unittest.TestCase):
                     self.assertEqual(bound, 1024 * 1024)
                     self.assertEqual(env["PATH"], "/usr/bin:/bin")
                     self.assertNotIn("LD_PRELOAD", env)
+                malformed = [call for call in calls if call[0].startswith("runtime-malformed-")]
+                if failed_stage.startswith("runtime-malformed-"):
+                    self.assertEqual(len(malformed), 2 if failed_stage == "runtime-malformed-test" else 1)
+                    stage, argv, cwd, env, timeout, bound = malformed[0]
+                    self.assertEqual(stage, "runtime-malformed-build")
+                    self.assertEqual(argv, [str(binaries / "make"), "malformedtest", "LDFLAGS=" + env["LDFLAGS"] + " -all-static"])
+                    self.assertTrue(env["LDFLAGS"].startswith("-static -L"))
+                    self.assertNotIn("-all-static", env["LDFLAGS"])
+                    for stage, argv, cwd, env, timeout, bound in malformed:
+                        is_test = stage == "runtime-malformed-test"
+                        self.assertEqual(cwd, recipe / "runtime-source-build/source/squashfuse")
+                        self.assertGreater(timeout, 0)
+                        self.assertLessEqual(timeout, 60 if is_test else 120)
+                        self.assertEqual(bound, 65536 if is_test else 1024 * 1024)
+                        if is_test:
+                            self.assertEqual(argv, [str(cwd / "malformedtest")])
                 self.assertEqual(calls[-1][0], failed_stage)
                 self.assertTrue(diagnostics.valid_record(progress.value))
                 self.assertEqual(progress.value["failure"]["command_stage"], failed_stage)
                 self.assertEqual(progress.value["failure"]["reason"], "command_" + reason)
+
+    def test_regression_elf_accepts_static_exec_and_pie_but_rejects_loader_or_needed(self):
+        runtime = load("appimage_runtime_build")
+        for kind in (2, 3):
+            data = bytearray(static_runtime())
+            struct.pack_into("<H", data, 16, kind)
+            runtime.require_static_regression(bytes(data))
+        dynamic = bytearray(static_runtime())
+        struct.pack_into("<IIQQQQQQ", dynamic, 64 + 2 * 56, 2, 4, 1408, 0, 0, 32, 32, 8)
+        struct.pack_into("<qQqQ", dynamic, 1408, 21, 0, 0, 0)
+        runtime.require_static_regression(bytes(dynamic))
+        needed = bytearray(dynamic)
+        struct.pack_into("<qQ", needed, 1408, 1, 0)
+        interpreter = bytearray(static_runtime())
+        struct.pack_into("<IIQQQQQQ", interpreter, 64 + 2 * 56, 3, 4, 1408, 0, 0, 16, 16, 1)
+        for data in (needed, interpreter):
+            with self.subTest(segment=data[64 + 2 * 56:68 + 2 * 56]), self.assertRaises(C.PackageFailure):
+                runtime.require_static_regression(bytes(data))
+
+    def test_regression_elf_rejects_malformed_header_and_dynamic_bounds(self):
+        runtime = load("appimage_runtime_build")
+        invalid = [b"", static_runtime()[:1023], bytearray(static_runtime())]
+        for offset, format, value in ((16, "H", 1), (18, "H", 183), (20, "I", 0),
+                                      (32, "Q", 63), (32, "Q", 2048), (52, "H", 63),
+                                      (54, "H", 55), (56, "H", 0), (56, "H", 129)):
+            data = bytearray(static_runtime())
+            struct.pack_into("<" + format, data, offset, value)
+            invalid.append(bytes(data))
+        for size, offset, tag in ((16, 1408, 21), (17, 1408, 0), (32, 2040, 0), (65552, 1408, 0)):
+            data = bytearray(static_runtime())
+            struct.pack_into("<IIQQQQQQ", data, 64 + 2 * 56, 2, 4, offset, 0, 0, size, size, 8)
+            struct.pack_into("<qQ", data, 1408, tag, 0)
+            invalid.append(bytes(data))
+        for index, data in enumerate(invalid):
+            with self.subTest(case=index), self.assertRaises(C.PackageFailure):
+                runtime.require_static_regression(data)
 
     def test_source_rejection_precedes_any_command(self):
         callback = mock.Mock(side_effect=AssertionError("native work forbidden"))

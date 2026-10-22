@@ -18,7 +18,7 @@ COMMANDS = frozenset((
     "runtime-zlib-configure", "runtime-zlib-build", "runtime-zlib-install", "runtime-zstd-build",
     "runtime-mimalloc-build", "runtime-mimalloc-archive", "runtime-fuse-configure", "runtime-fuse-install",
     "runtime-squashfuse-bootstrap", "runtime-squashfuse-configure", "runtime-squashfuse-build",
-    "runtime-malformed-build", "runtime-malformed-test", "runtime-squashfuse-install",
+    "runtime-malformed-build", "runtime-malformed-verify", "runtime-malformed-test", "runtime-squashfuse-install",
     "runtime-compile", "runtime-link", "runtime-strip", "runtime-headers", "runtime-zstd-stage",
     "runtime-native-config", "runtime-squashfuse-headers", "runtime-verify", "runtime-notices",
     "download-linuxdeploy", "download-appimage-plugin",
