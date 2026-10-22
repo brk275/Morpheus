@@ -190,5 +190,46 @@ class PackageSourceScopeTests(unittest.TestCase):
         self.assertNotIn("upload-artifact", workflow)
 
 
+@unittest.skipUnless(os.name == "posix" and Path("/bin/bash").is_file(), "Bash fixture requires a POSIX host")
+class RuntimeHostDownloadTests(unittest.TestCase):
+    def test_only_interrupted_transfers_retry_and_partial_files_are_removed(self):
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github/workflows/package-qa.yml").read_text()
+        start = workflow.index("          download_pinned_runtime_deb() {\n")
+        end = workflow.index("          {\n", start)
+        function = "\n".join(line[10:] for line in workflow[start:end].splitlines()) + "\n"
+        self.assertEqual(function.count("/usr/bin/curl"), 1)
+        self.assertEqual(function.count("/bin/sleep"), 1)
+        function = function.replace("/usr/bin/curl", "fixture_curl").replace("/bin/sleep", "fixture_sleep")
+        # Run the actual workflow function with only transport and delay replaced.
+        # The stub refuses a retry unless its previous partial output was removed.
+        fixture = r'''set -euo pipefail
+calls=0
+fixture_curl() {
+  calls=$((calls + 1))
+  printf '%s' "$calls" > calls
+  local destination
+  for destination do :; done
+  [[ ! -e "$destination" ]] || return 90
+  printf 'attempt-%s' "$calls" > "$destination"
+  return "${codes[calls - 1]}"
+}
+fixture_sleep() { [[ "$1" == 2 ]]; }
+'''
+        cases = [([0], 0, 1), ([56, 0], 0, 2), ([18, 28, 0], 0, 3),
+                 ([52, 55, 56], 56, 3), ([22, 0], 22, 1),
+                 ([60, 0], 60, 1), ([23, 0], 23, 1)]
+        for codes, status, calls in cases:
+            with self.subTest(codes=codes), tempfile.TemporaryDirectory() as folder:
+                command = (fixture + "codes=(" + " ".join(map(str, codes)) + ")\n" + function
+                           + 'download_pinned_runtime_deb output.deb 100 https://example.invalid/pinned.deb\n')
+                result = subprocess.run(["/bin/bash", "--noprofile", "--norc", "-c", command],
+                                        cwd=folder, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                                        capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual((Path(folder) / "calls").read_text(), str(calls))
+                self.assertEqual((Path(folder) / "output.deb").read_text(), f"attempt-{calls}")
+
+
 if __name__ == "__main__":
     unittest.main()
