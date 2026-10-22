@@ -196,9 +196,11 @@ jobs:
         run: python3 packaging/linux/package_appimage.py --check-readiness
       - name: Linux native dependencies
         if: runner.os == 'Linux'
+        timeout-minutes: 30
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          set -euo pipefail
+          sudo --non-interactive /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get update
+          sudo --non-interactive /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y \
             libasound2-dev libclang-dev libdbus-1-dev libegl-dev \
             libfontconfig1-dev libfuse2t64 libgbm-dev libglib2.0-dev \
             libpipewire-0.3-dev libssl-dev libsystemd-dev systemd-dev libudev-dev libwayland-dev \
@@ -207,14 +209,18 @@ jobs:
             libxkbcommon-x11-dev libxi6 libxrandr-dev pkg-config xvfb
       - name: Linux installed update QA dependencies
         if: runner.os == 'Linux' && inputs.appimage_updates
+        timeout-minutes: 30
         run: |
-          sudo apt-get update
-          sudo apt-get install -y openssl ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11
+          set -euo pipefail
+          sudo --non-interactive /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get update
+          sudo --non-interactive /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y openssl ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11
       - name: Linux installed capture QA dependencies
         if: runner.os == 'Linux' && !inputs.appimage_updates
+        timeout-minutes: 30
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          set -euo pipefail
+          sudo --non-interactive /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get update
+          sudo --non-interactive /usr/bin/env DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y \
             ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11 \
             gnome-keyring libsecret-tools libglib2.0-bin libdrm-dev libinih-dev \
             libsystemd-dev systemd-dev meson ninja-build wayland-protocols sway swaybg \
