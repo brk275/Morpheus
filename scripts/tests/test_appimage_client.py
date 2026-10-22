@@ -202,7 +202,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(pin["prefix"], "zlib-1.3.2")
         data = (ROOT / "packaging/linux/runtime-build.json").read_bytes()
         # Even another HTTPS URL must fail the exact manifest identity gate.
-        with mock.patch.object(C, "read_regular", return_value=data.replace(url.encode(), b"https://unreviewed.invalid/source")), \
+        with mock.patch.object(runtime.client, "read_regular", return_value=data.replace(url.encode(), b"https://unreviewed.invalid/source")), \
                 self.assertRaises(C.PackageFailure):
             runtime.manifest()
 
