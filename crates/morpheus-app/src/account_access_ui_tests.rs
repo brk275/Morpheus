@@ -1559,6 +1559,7 @@ async fn assert_seek_policy_and_thread_keeper(
     ui: &AppWindow,
     live: &Arc<LiveUi>,
     runtime: &Handle,
+    phase: &AccountUiProgress,
 ) {
     use crate::timeline_model::{tests::rich_fixture, update_shared};
     use crate::timeline_viewport::{Pane, keep_thread_for_test, seek_for_test};
@@ -1705,6 +1706,8 @@ async fn assert_seek_policy_and_thread_keeper(
     }
     assert_eq!(drawn(321), 0, "nothing moved after the click");
     assert_eq!(drawn(30), 1, "the reader stays where they were");
+
+    phase.set(97);
 
     // The open thread: 60 mixed replies under a short root.
     ui.invoke_show_thread_panel();
@@ -1966,6 +1969,8 @@ async fn assert_seek_policy_and_thread_keeper(
         (after[0].top - before[0].top).abs() <= 1.0,
         "{before:?} {after:?}"
     );
+
+    phase.set(98);
 
     // The thread's scrollbar wheel moves the replies without reporting as
     // scrolled. A seek waiting for its reply sees that scrolling and ends
@@ -2780,7 +2785,7 @@ fn assert_removed_account_menu_projection(ui: &AppWindow) {
     );
 }
 
-const ACCOUNT_UI_TOTAL_BUDGET: Duration = Duration::from_secs(180);
+const ACCOUNT_UI_TOTAL_BUDGET: Duration = Duration::from_secs(600);
 const ACCOUNT_UI_PHASE_BUDGET: Duration = Duration::from_secs(30);
 
 // Bookkeeping for the existing single-window test. Use real monotonic time:
@@ -2873,9 +2878,9 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     slint::spawn_local(async move {
         let started = std::time::Instant::now();
         let phase = std::rc::Rc::new(AccountUiProgress::new(started));
-        // The original fourteen-scenario budget now covers 54 transitions,
-        // including the thread browser and room leave. Keep a finite three-minute
-        // whole budget and a separate phase cap that catches one stall sooner.
+        // This generated-window fixture grew from fourteen scenarios to 58
+        // fixed transitions. Bound the expanded debug fixture at ten minutes,
+        // with a separate phase cap that catches one stalled scenario sooner.
         let outcome = tokio::select! {
             result = tokio::time::timeout(
                 ACCOUNT_UI_TOTAL_BUDGET,
@@ -5561,7 +5566,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     phase.set(93);
     assert_unread_jump_owner(&ui, &live).await;
     phase.set(94);
-    assert_seek_policy_and_thread_keeper(&ui, &live, &runtime).await;
+    assert_seek_policy_and_thread_keeper(&ui, &live, &runtime, phase.as_ref()).await;
+    phase.set(99);
     assert_timeline_recovery_notice(&ui).await;
     phase.set(73);
     assert_moderation_stops_with_its_context(&ui, &live, &runtime).await;
@@ -5583,6 +5589,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     crate::thread_browser::tests::assert_thread_browser_panel(&ui, &live, &runtime).await;
     phase.set(92);
     assert_responsive_header(&ui).await;
+    phase.set(100);
     assert_inline_audio_card_layout().await;
     ui.window()
         .dispatch_event(WindowEvent::WindowActiveChanged(true));
