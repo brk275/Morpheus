@@ -136,8 +136,7 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(classify([wrapper]), {
             "native": False, "native_matrix": {"os": []}, "config": False, "wayland": False,
         })
-        for linux in ("packaging/linux.toml", "packaging/linux/runtime-build.json",
-                      "packaging/linux/runtime-build-host.json"):
+        for linux in ("packaging/linux.toml", "packaging/linux/runtime-build-host.json"):
             with self.subTest(linux=linux):
                 selected = classify([wrapper, linux])
                 self.assertEqual(selected["native_matrix"]["os"], ["ubuntu-24.04"])
@@ -183,6 +182,7 @@ class ScopeTests(unittest.TestCase):
                      "packaging/linux/appimage_notices.py",
                      "packaging/linux/appimage_process.py",
                      "packaging/linux/appimage_runtime_build.py",
+                     "packaging/linux/runtime-build.json",
                      "packaging/linux/corresponding_source.py",
                      "packaging/linux/source_bundle_qa.py"):
             with self.subTest(path=path):
@@ -193,7 +193,8 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(classify([path], force_all=True)["native_matrix"]["os"], list(PLATFORMS))
         # The peer is compiled by native CI; unknown package inputs fail closed.
         for path in ("packaging/linux/appimage_peer.rs", "packaging/linux/new-helper.py",
-                     "packaging/linux/AppRun", "packaging/linux/appimage-tools.json"):
+                     "packaging/linux/AppRun", "packaging/linux/appimage-tools.json",
+                     "packaging/linux/runtime-build-local.json"):
             with self.subTest(path=path):
                 self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
 
