@@ -131,11 +131,10 @@ def classify(paths, force_all=False):
             native.add("windows-2025")
         elif path.startswith("themes/"):
             config = True
-        elif path == "scripts/package.py":
-            # This wrapper controls shared native package inputs.
-            native.update(PLATFORMS)
         elif path.startswith(("scripts/", "tests/")):
-            # Scope job checks Python and JavaScript without external accounts.
+            # The always-on helpers cover Python/JavaScript and package.py
+            # --check; native Cargo jobs do not exercise the packaging CLI.
+            # Actual package/install checks remain explicit platform QA gates.
             continue
         elif path in {".github/workflows/package-qa.yml", ".github/workflows/wayland-startup-probe.yml", ".github/workflows/history-security.yml"}:
             # This workflow is manual-only. CI compiles do not exercise its
