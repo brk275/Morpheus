@@ -130,6 +130,32 @@ class ScopeTests(unittest.TestCase):
             classify([".github/workflows/package-qa.yml", "packaging/linux.toml"])["native_matrix"]["os"],
             ["ubuntu-24.04"],
         )
+        # The shared packaging CLI is checked by helpers, not native Cargo.
+        # This selection does not replace actual platform package/install QA.
+        wrapper = "scripts/package.py"
+        self.assertEqual(classify([wrapper]), {
+            "native": False, "native_matrix": {"os": []}, "config": False, "wayland": False,
+        })
+        for linux in ("packaging/linux.toml", "packaging/linux/appimage_runtime_build.py",
+                      "packaging/linux/runtime-build-host.json"):
+            with self.subTest(linux=linux):
+                selected = classify([wrapper, linux])
+                self.assertEqual(selected["native_matrix"]["os"], ["ubuntu-24.04"])
+                self.assertTrue(selected["wayland"])
+        for package, platforms in (("packaging/macos/Info.plist", list(MACOS)),
+                                   ("packaging/windows/installer.nsi", ["windows-2025"])):
+            with self.subTest(package=package):
+                self.assertEqual(classify([wrapper, package])["native_matrix"]["os"], platforms)
+        for shared in ("Cargo.lock", "crates/morpheus-app/src/main.rs",
+                       "crates/morpheus-app/build.rs", "Packager.toml",
+                       "packaging/new-platform/config.toml", "new-build-input.conf"):
+            with self.subTest(shared=shared):
+                selected = classify([wrapper, shared])
+                self.assertEqual(selected["native_matrix"]["os"], list(PLATFORMS))
+                self.assertTrue(selected["wayland"])
+        forced = classify([wrapper], force_all=True)
+        self.assertEqual(forced["native_matrix"]["os"], list(PLATFORMS))
+        self.assertTrue(forced["wayland"])
 
     def test_linux_acceptance_helpers_are_actually_exercised(self):
         for path in ["scripts/run_matrix_acceptance.py", "scripts/local_matrix_rtc.py", "scripts/local_matrix_env.py", "scripts/run_wayland_acceptance.py", "scripts/wayland_fixture_backend.py", "crates/morpheus-rtc/src/linux_portal.rs", "crates/morpheus-app/src/updater/linux_transaction.rs"]:
