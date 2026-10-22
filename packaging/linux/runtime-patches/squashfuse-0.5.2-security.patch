@@ -1,0 +1,452 @@
+diff --git a/Makefile.am b/Makefile.am
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -104,6 +104,13 @@
+ endif
+ 
+ TESTS =
++check_PROGRAMS =
++if SQ_ZLIB_TESTS
++TESTS += malformedtest
++check_PROGRAMS += malformedtest
++malformedtest_SOURCES = tests/malformedtest.c
++malformedtest_LDADD = libsquashfuse.la $(COMPRESSION_LIBS)
++endif
+ if SQ_FUSE_TESTS
+ TESTS += tests/ll-smoke.sh
+ TESTS += tests/notify_test.sh
+@@ -116,7 +123,7 @@
+ if SIGTERM_HANDLER
+ TESTS += tests/umount-test.sh
+ endif
+-check_PROGRAMS = cachetest endiantest
++check_PROGRAMS += cachetest endiantest
+ cachetest_SOURCES=tests/cachetest.c
+ cachetest_LDADD=libsquashfuse.la $(COMPRESSION_LIBS)
+ endiantest_SOURCES = tests/endiantest.c
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -36,6 +36,7 @@
+ 
+ # Decompression
+ SQ_CHECK_DECOMPRESS([ZLIB],[z],[uncompress],[zlib.h],,[gzip])
++AM_CONDITIONAL([SQ_ZLIB_TESTS], [test "x$sq_dec_ok" = xyes])
+ SQ_CHECK_DECOMPRESS([XZ],[lzma],[lzma_stream_buffer_decode],[lzma.h],[liblzma],[xz])
+ SQ_CHECK_DECOMPRESS([LZO],[lzo2],[lzo1x_decompress_safe],[lzo/lzo1x.h],,[lzo])
+ SQ_CHECK_DECOMPRESS([LZ4],[lz4],[LZ4_decompress_safe],[lz4.h],,[lz4])
+diff --git a/dir.c b/dir.c
+--- a/dir.c
++++ b/dir.c
+@@ -150,7 +150,11 @@
+ 	entry->inode = ((uint64_t)dir->header.start_block << 16) + e.offset;
+ 	/* e.inode_number is signed */
+ 	entry->inode_number = dir->header.inode_number + (int16_t)e.inode_number;
+-	
++
++	if (entry->name_size > SQUASHFS_NAME_LEN) {
++		*err = SQFS_ERR;
++		return false;
++	}
+ 	*err = sqfs_dir_md_read(fs, dir, entry->name, sqfs_dentry_name_size(entry));
+ 	if (*err)
+ 		return false;
+@@ -236,7 +240,9 @@
+ 	sqfs_err err;
+ 	sqfs_dir_ff_name_t *args = (sqfs_dir_ff_name_t*)arg;
+ 	size_t name_size = index->size + 1;
+-	
++	if (name_size > SQUASHFS_NAME_LEN)
++		return SQFS_ERR;
++
+ 	if ((err = sqfs_md_read(fs, cur, args->name, name_size)))
+ 		return err;
+ 	args->name[name_size] = '\0';
+diff --git a/file.c b/file.c
+--- a/file.c
++++ b/file.c
+@@ -63,6 +63,11 @@
+ 	
+ 	*offset = inode->xtra.reg.frag_off;
+ 	*size = inode->xtra.reg.file_size % fs->sb.block_size;
++	if (*offset > (*block)->size || *size > (*block)->size - *offset) {
++		sqfs_block_dispose(*block);
++		*block = NULL;
++		return SQFS_ERR;
++	}
+ 	return SQFS_OK;
+ }
+ 
+@@ -172,6 +177,11 @@
+ 			}
+ 		}
+ 		
++		if (read_off >= data_size) {
++			if (block)
++				sqfs_block_dispose(block);
++			return SQFS_ERR;
++		}
+ 		take = data_size - read_off;
+ 		if (take > *size)
+ 			take = (size_t)(*size);
+diff --git a/fs.c b/fs.c
+--- a/fs.c
++++ b/fs.c
+@@ -77,6 +77,12 @@
+ 	}
+ 	if (fs->sb.s_major != SQUASHFS_MAJOR || fs->sb.s_minor > SQUASHFS_MINOR)
+ 		return SQFS_BADVERSION;
++	if (fs->sb.block_size == 0 ||
++			fs->sb.block_size > SQUASHFS_FILE_MAX_SIZE ||
++			(fs->sb.block_size & (fs->sb.block_size - 1)) != 0 ||
++			fs->sb.block_log > SQUASHFS_FILE_MAX_LOG ||
++			fs->sb.block_size != (1U << fs->sb.block_log))
++		return SQFS_BADFORMAT;
+ 	
+ 	if (!(fs->decompressor = sqfs_decompressor_get(fs->sb.compression)))
+ 		return SQFS_BADCOMP;
+@@ -304,6 +310,10 @@
+ 		sqfs_err err = sqfs_md_cache(fs, &pos, &block);
+ 		if (err)
+ 			return err;
++		if (cur->offset >= block->size) {
++			sqfs_block_dispose(block);
++			return SQFS_ERR;
++		}
+ 		
+ 		take = block->size - cur->offset;
+ 		if (take > size)
+diff --git a/table.c b/table.c
+--- a/table.c
++++ b/table.c
+@@ -44,6 +44,7 @@
+ 	bread = nblocks * sizeof(uint64_t);
+ 	
+ 	table->each = each;
++	table->count = count;
+ 	if (!(table->blocks = malloc(bread)))
+ 		goto err;
+ 	if (sqfs_pread(fd, table->blocks, bread, start) != bread)
+@@ -67,11 +68,17 @@
+ 
+ sqfs_err sqfs_table_get(sqfs_table *table, sqfs *fs, size_t idx, void *buf) {
+ 	sqfs_block *block;
+-	size_t pos = idx * table->each;
+-	size_t bnum = pos / SQUASHFS_METADATA_SIZE,
+-		off = pos % SQUASHFS_METADATA_SIZE;
+-	
+-	sqfs_off_t bpos = table->blocks[bnum];
++	size_t pos, bnum, off;
++	sqfs_off_t bpos;
++
++	if (idx >= table->count)
++		return SQFS_ERR;
++
++	pos = idx * table->each;
++	bnum = pos / SQUASHFS_METADATA_SIZE;
++	off = pos % SQUASHFS_METADATA_SIZE;
++
++	bpos = table->blocks[bnum];
+ 	if (sqfs_md_cache(fs, &bpos, &block))
+ 		return SQFS_ERR;
+ 	
+diff --git a/table.h b/table.h
+--- a/table.h
++++ b/table.h
+@@ -29,6 +29,7 @@
+ 
+ typedef struct {
+ 	size_t each;
++	size_t count;
+ 	uint64_t *blocks;
+ } sqfs_table;
+ 
+diff --git a/tests/malformedtest.c b/tests/malformedtest.c
+--- /dev/null
++++ b/tests/malformedtest.c
+@@ -0,0 +1,285 @@
++/* Regression tests for malformed on-disk offsets and block geometry. */
++#include "fs.h"
++#include "file.h"
++#include "swap.h"
++#include "dir.h"
++#include "table.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#define INODE_TABLE_START 96
++#define FRAGMENT_DATA_START 384
++#define FRAGMENT_METADATA_START 400
++#define FRAGMENT_TABLE_START 512
++
++static int write_at(FILE *file, long pos, const void *data, size_t size) {
++	return fseek(file, pos, SEEK_SET) == 0 &&
++		fwrite(data, 1, size, file) == size;
++}
++
++static FILE *make_image(uint32_t block_size, uint16_t block_log) {
++	FILE *file = tmpfile();
++	struct squashfs_super_block sb;
++	struct squashfs_reg_inode inode;
++	struct squashfs_fragment_entry frag;
++	uint16_t header;
++	uint64_t fragment_metadata = FRAGMENT_METADATA_START;
++	static const char data[] = "abcdefgh";
++
++	if (!file)
++		return NULL;
++	memset(&sb, 0, sizeof(sb));
++	sb.s_magic = SQUASHFS_MAGIC;
++	sb.s_major = SQUASHFS_MAJOR;
++	sb.s_minor = SQUASHFS_MINOR;
++	sb.compression = ZLIB_COMPRESSION;
++	sb.block_size = block_size;
++	sb.block_log = block_log;
++	sb.fragments = 1;
++	sb.root_inode = 0;
++	sb.inode_table_start = INODE_TABLE_START;
++	sb.fragment_table_start = FRAGMENT_TABLE_START;
++	sb.lookup_table_start = SQUASHFS_INVALID_BLK;
++	sb.xattr_id_table_start = SQUASHFS_INVALID_BLK;
++	sqfs_swapin_super_block(&sb);
++	if (!write_at(file, 0, &sb, sizeof(sb)))
++		goto error;
++
++	memset(&inode, 0, sizeof(inode));
++	inode.inode_type = SQUASHFS_REG_TYPE;
++	inode.mode = 0644;
++	inode.fragment = 0;
++	inode.file_size = 4;
++	sqfs_swapin_reg_inode(&inode);
++	header = SQUASHFS_COMPRESSED_BIT | sizeof(inode);
++	sqfs_swapin16(&header);
++	if (!write_at(file, INODE_TABLE_START, &header, sizeof(header)) ||
++		!write_at(file, INODE_TABLE_START + sizeof(header), &inode, sizeof(inode)) ||
++		!write_at(file, FRAGMENT_DATA_START, data, sizeof(data) - 1))
++		goto error;
++
++	memset(&frag, 0, sizeof(frag));
++	frag.start_block = FRAGMENT_DATA_START;
++	frag.size = SQUASHFS_COMPRESSED_BIT_BLOCK | (sizeof(data) - 1);
++	sqfs_swapin_fragment_entry(&frag);
++	header = SQUASHFS_COMPRESSED_BIT | sizeof(frag);
++	sqfs_swapin16(&header);
++	sqfs_swapin64(&fragment_metadata);
++	if (!write_at(file, FRAGMENT_METADATA_START, &header, sizeof(header)) ||
++		!write_at(file, FRAGMENT_METADATA_START + sizeof(header), &frag, sizeof(frag)) ||
++		!write_at(file, FRAGMENT_TABLE_START, &fragment_metadata,
++			sizeof(fragment_metadata)) || fflush(file) != 0)
++		goto error;
++	return file;
++
++error:
++	fclose(file);
++	return NULL;
++}
++
++static int test_block_size(uint32_t size, uint16_t log, sqfs_err expected) {
++	FILE *file = make_image(size, log);
++	sqfs fs;
++	sqfs_err err;
++	if (!file)
++		return 0;
++	err = sqfs_init(&fs, fileno(file), 0);
++	if (err == SQFS_OK)
++		sqfs_destroy(&fs);
++	fclose(file);
++	return err == expected;
++}
++
++static int test_metadata_offset(void) {
++	FILE *file = make_image(SQUASHFS_FILE_SIZE, SQUASHFS_FILE_LOG);
++	sqfs fs;
++	sqfs_md_cursor cur;
++	struct squashfs_base_inode base;
++	int ok = 0;
++	if (!file)
++		return 0;
++	if (sqfs_init(&fs, fileno(file), 0) != SQFS_OK)
++		goto done;
++	sqfs_md_cursor_inode(&cur, 0, fs.sb.inode_table_start);
++	if (sqfs_md_read(&fs, &cur, &base, sizeof(base)) != SQFS_OK)
++		goto destroy;
++	sqfs_md_cursor_inode(&cur, sizeof(struct squashfs_reg_inode),
++		fs.sb.inode_table_start);
++	if (sqfs_md_read(&fs, &cur, &base, sizeof(base)) != SQFS_ERR)
++		goto destroy;
++	sqfs_md_cursor_inode(&cur, sizeof(struct squashfs_reg_inode) + 1,
++		fs.sb.inode_table_start);
++	if (sqfs_md_read(&fs, &cur, &base, sizeof(base)) != SQFS_ERR)
++		goto destroy;
++	sqfs_md_cursor_inode(&cur, UINT16_MAX, fs.sb.inode_table_start);
++	ok = sqfs_md_read(&fs, &cur, &base, sizeof(base)) == SQFS_ERR;
++destroy:
++	sqfs_destroy(&fs);
++done:
++	fclose(file);
++	return ok;
++}
++
++static int test_fragment_offset(void) {
++	FILE *file = make_image(SQUASHFS_FILE_SIZE, SQUASHFS_FILE_LOG);
++	sqfs fs;
++	sqfs_inode inode;
++	sqfs_off_t size;
++	char buf[8];
++	int ok = 0;
++	if (!file)
++		return 0;
++	if (sqfs_init(&fs, fileno(file), 0) != SQFS_OK)
++		goto done;
++	if (sqfs_inode_get(&fs, &inode, sqfs_inode_root(&fs)) != SQFS_OK)
++		goto destroy;
++	inode.xtra.reg.frag_off = 2;
++	size = 4;
++	if (sqfs_read_range(&fs, &inode, 0, &size, buf) != SQFS_OK ||
++		size != 4 || memcmp(buf, "cdef", 4) != 0)
++		goto destroy;
++	inode.xtra.reg.frag_off = 4;
++	size = 4;
++	if (sqfs_read_range(&fs, &inode, 0, &size, buf) != SQFS_OK ||
++		size != 4 || memcmp(buf, "efgh", 4) != 0)
++		goto destroy;
++	inode.xtra.reg.frag_off = 5;
++	memset(buf, 0x55, sizeof(buf));
++	size = 4;
++	if (sqfs_read_range(&fs, &inode, 0, &size, buf) != SQFS_ERR ||
++		buf[0] != 0x55)
++		goto destroy;
++	inode.xtra.reg.frag_off = UINT32_MAX;
++	size = 4;
++	ok = sqfs_read_range(&fs, &inode, 0, &size, buf) == SQFS_ERR;
++destroy:
++	sqfs_destroy(&fs);
++done:
++	fclose(file);
++	return ok;
++}
++
++/* Exercise the two earlier upstream parser fixes on real on-disk records. */
++#define DIRECTORY_METADATA_START 640
++
++static int write_metadata(FILE *file, const void *record, size_t record_size,
++		size_t name_size) {
++	char name[SQUASHFS_NAME_LEN + 1];
++	uint16_t header = SQUASHFS_COMPRESSED_BIT | (record_size + name_size);
++	memset(name, 'a', sizeof(name));
++	sqfs_swapin16(&header);
++	return name_size <= sizeof(name) &&
++		write_at(file, DIRECTORY_METADATA_START, &header, sizeof(header)) &&
++		write_at(file, DIRECTORY_METADATA_START + sizeof(header), record, record_size) &&
++		write_at(file, DIRECTORY_METADATA_START + sizeof(header) + record_size,
++			name, name_size) && fflush(file) == 0;
++}
++
++static int test_directory_name(size_t name_size, bool indexed, bool valid) {
++	FILE *file = make_image(SQUASHFS_FILE_SIZE, SQUASHFS_FILE_LOG);
++	sqfs fs;
++	sqfs_dir_entry entry;
++	/* One extra byte also keeps the unfixed negative control's terminator in bounds. */
++	char name[SQUASHFS_NAME_LEN + 2];
++	int ok = 0;
++	if (!file)
++		return 0;
++	if (indexed) {
++		struct squashfs_dir_index index;
++		memset(&index, 0, sizeof(index));
++		index.size = name_size - 1;
++		sqfs_swapin_dir_index(&index);
++		if (!write_metadata(file, &index, sizeof(index), name_size))
++			goto done;
++	} else {
++		struct squashfs_dir_entry record;
++		memset(&record, 0, sizeof(record));
++		record.size = name_size - 1;
++		sqfs_swapin_dir_entry(&record);
++		if (!write_metadata(file, &record, sizeof(record), name_size))
++			goto done;
++	}
++	if (sqfs_init(&fs, fileno(file), 0) != SQFS_OK)
++		goto done;
++	memset(name, 0x55, sizeof(name));
++	sqfs_dentry_init(&entry, name);
++	if (indexed) {
++		sqfs_inode inode;
++		bool found = true;
++		sqfs_err err;
++		memset(&inode, 0, sizeof(inode));
++		inode.base.mode = S_IFDIR | 0755;
++		inode.xtra.dir.idx_count = 1;
++		inode.xtra.dir.dir_size = 3; /* empty directory after the index */
++		inode.next.block = DIRECTORY_METADATA_START;
++		fs.sb.directory_table_start = DIRECTORY_METADATA_START;
++		err = sqfs_dir_lookup(&fs, &inode, "z", 1, &entry, &found);
++		ok = valid ? err == SQFS_OK && !found : err == SQFS_ERR;
++	} else {
++		sqfs_dir dir;
++		sqfs_err err;
++		bool next;
++		memset(&dir, 0, sizeof(dir));
++		dir.header.count = 1;
++		dir.cur.block = DIRECTORY_METADATA_START;
++		dir.total = sizeof(struct squashfs_dir_entry) + name_size;
++		next = sqfs_dir_next(&fs, &dir, &entry, &err);
++		ok = valid ? next && err == SQFS_OK &&
++			sqfs_dentry_name_size(&entry) == name_size : !next && err == SQFS_ERR;
++	}
++	if (valid)
++		ok = ok && name[0] == 'a';
++	else
++		ok = ok && name[0] == 0x55;
++	ok = ok && name[SQUASHFS_NAME_LEN + 1] == 0x55;
++	sqfs_destroy(&fs);
++done:
++	fclose(file);
++	return ok;
++}
++
++static int test_table_bounds(void) {
++	FILE *file = make_image(SQUASHFS_FILE_SIZE, SQUASHFS_FILE_LOG);
++	sqfs fs;
++	struct squashfs_fragment_entry frag;
++	uint32_t id;
++	int ok = 0;
++	if (!file)
++		return 0;
++	if (sqfs_init(&fs, fileno(file), 0) != SQFS_OK)
++		goto done;
++	if (sqfs_frag_entry(&fs, &frag, 0) != SQFS_OK ||
++		frag.start_block != FRAGMENT_DATA_START)
++		goto destroy;
++	ok = sqfs_frag_entry(&fs, &frag, 1) == SQFS_ERR &&
++		sqfs_frag_entry(&fs, &frag, UINT32_MAX) == SQFS_ERR &&
++		sqfs_table_get(&fs.frag_table, &fs, SIZE_MAX, &frag) == SQFS_ERR &&
++		sqfs_table_get(&fs.id_table, &fs, 0, &id) == SQFS_ERR;
++destroy:
++	sqfs_destroy(&fs);
++done:
++	fclose(file);
++	return ok;
++}
++
++int main(void) {
++	if (!test_block_size(SQUASHFS_FILE_SIZE, SQUASHFS_FILE_LOG, SQFS_OK) ||
++		!test_block_size(SQUASHFS_FILE_MAX_SIZE, SQUASHFS_FILE_MAX_LOG, SQFS_OK) ||
++		!test_block_size(0, SQUASHFS_FILE_LOG, SQFS_BADFORMAT) ||
++		!test_block_size(3, SQUASHFS_FILE_LOG, SQFS_BADFORMAT) ||
++		!test_block_size(SQUASHFS_FILE_SIZE, 16, SQFS_BADFORMAT) ||
++		!test_block_size(SQUASHFS_FILE_SIZE, UINT16_MAX, SQFS_BADFORMAT) ||
++		!test_block_size(SQUASHFS_FILE_MAX_SIZE * 2U, 21, SQFS_BADFORMAT) ||
++		!test_metadata_offset() || !test_fragment_offset() ||
++		!test_directory_name(SQUASHFS_NAME_LEN, false, true) ||
++		!test_directory_name(SQUASHFS_NAME_LEN + 1, false, false) ||
++		!test_directory_name(SQUASHFS_NAME_LEN, true, true) ||
++		!test_directory_name(SQUASHFS_NAME_LEN + 1, true, false) ||
++		!test_table_bounds()) {
++		fprintf(stderr, "malformed image regression test failed\n");
++		return 1;
++	}
++	return 0;
++}

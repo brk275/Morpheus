@@ -1,8 +1,10 @@
 import tempfile
+import os
+from unittest import mock
 import unittest
 from pathlib import Path
 
-from scripts.package import package_config, preflight_deb_authors
+from scripts.package import package_config, preflight_deb_authors, linux_appimage
 
 
 class PackageConfigTests(unittest.TestCase):
@@ -20,6 +22,27 @@ class PackageConfigTests(unittest.TestCase):
             with self.subTest(author=author), self.assertRaises(ValueError):
                 preflight_deb_authors({"authors": [author]}, "deb", "linux")
         preflight_deb_authors({"authors": ["Fixture Maintainer <fixture@example.org>"]}, "deb", "linux")
+
+    def test_only_explicit_linux_appimage_routes_to_canonical_installed_gate(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("scripts.package.os.execv", return_value="canonical-controller") as execute:
+            self.assertEqual(linux_appimage("appimage", "/reviewed/scanner"), "canonical-controller")
+            args = execute.call_args.args
+            self.assertEqual(args[1][:3], [args[0], "-I", "-B"])
+            self.assertTrue(args[1][3].endswith("packaging/linux/package_appimage.py"))
+            self.assertEqual(args[1][4:6], ["--gitleaks", "/reviewed/scanner"])
+            self.assertEqual(args[1][6], "--qa-output")
+            self.assertTrue(args[1][7].endswith("/dist"))
+        for formats, scanner in ((None, "/scanner"), ("default", "/scanner"), ("all", "/scanner"),
+                                 ("deb", "/scanner"), ("appimage,deb", "/scanner"),
+                                 ("appimage,appimage", "/scanner"), ("appimage", None)):
+            with self.subTest(formats=formats), mock.patch("scripts.package.os.execv") as execute, self.assertRaises(ValueError):
+                linux_appimage(formats, scanner)
+            execute.assert_not_called()
+        with mock.patch.dict(os.environ, {"CARGO_PACKAGER_SIGN_PRIVATE_KEY": "disposable-key"}, clear=True), \
+                mock.patch("scripts.package.os.execv") as execute, self.assertRaises(ValueError):
+            linux_appimage("appimage", "/scanner")
+        execute.assert_not_called()
 
     def test_linux_includes_platform_dependencies(self):
         config = package_config(platform="linux")

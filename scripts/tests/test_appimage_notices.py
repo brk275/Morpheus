@@ -258,7 +258,8 @@ class DeploymentTests(unittest.TestCase):
             N.client.SONAME: {**records[provider], "kind": "pipewire", "source_version": "1.0.5-test"},
             "libc.so.6": {**record("libc.so.6", marker="c"), "kind": "system-package"},
         }, "notices": {notice.relative_to(root).as_posix(): N.digest(notice.read_bytes())},
-            "launcher_sha256": N.digest(launcher.read_bytes()), "runtime_pin": {"sha256": "d" * 64}}
+            "launcher_sha256": N.digest(launcher.read_bytes()), "runtime_pin": {"sha256": "d" * 64},
+            "runtime_sources": {}, "runtime_source_patches": {}}
         shipped = {"relative_path": N.client.DESTINATION, "sha256": records[provider]["sha256"]}
         return records, prepared, shipped
 
@@ -417,7 +418,11 @@ class PreparationTests(unittest.TestCase):
                   mock.patch.object(N, "root_owned", return_value=Path("/usr/bin/readelf")),
                   mock.patch.object(N, "resolve_library", return_value=system),
                   mock.patch.object(N, "package_record", return_value=(package, b"Exact package copyright", {}))):
-                prepared = N.prepare(runner, root, binary, stage, source, {"appimage": {"files": {}}}, {})
+                prepared = N.prepare(runner, root, binary, stage, source, {"appimage": {"files": {}}}, {},
+                                     runtime_metadata={"schema": 1, "fresh_private_prefix": True,
+                                         "malformedtest_returned_zero": True,
+                                         "upstream_runtime_binary_downloaded": False,
+                                         "runtime": {"sha256": "c" * 64}, "sources": {}, "patches": {}})
             labels = [call.args[0] for call in runner.run.call_args_list]
             self.assertEqual(labels[0], "inventory-elf")
             self.assertEqual(sorted(labels), ["inventory-elf", "inventory-elf-client", "inventory-elf-dependency"])

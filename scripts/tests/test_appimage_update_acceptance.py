@@ -112,6 +112,45 @@ class AppImageAcceptanceTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     target.replace_app_version(root, "0.1.0-updateqa.1")
 
+    def test_update_build_uses_canonical_owned_builder_without_signer_environment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "source"
+            (source / "crates/morpheus-app").mkdir(parents=True)
+            (source / "crates/morpheus-app/Cargo.toml").write_text('[package]\nversion = "0.1.0"\n')
+            (source / "Cargo.lock").write_text('[[package]]\nname = "morpheus-app"\nversion = "0.1.0"\n')
+            commands = mock.Mock()
+            commands.root, commands.reviewed_source, commands.reviewed_revision = root, root / "reviewed", "b" * 40
+            commands.gitleaks = "/reviewed/scanner"
+            commands.env = {"PATH": "/usr/bin:/bin", "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux",
+                            "MORPHEUS_FREE_HOSTED_UPDATE_QA": "1", "CARGO_PACKAGER_SIGN_PRIVATE_KEY": "must-not-cross",
+                            "RUSTFLAGS": "must-not-cross", "GITHUB_TOKEN": "must-not-cross"}
+            metadata = {"protocol": 1, "product": "io.github.brk275.morpheus", "version": "0.1.0-updateqa.1",
+                        "arch": "x86_64", "persistence": "a" * 64}
+            def namespace(args, directory, env):
+                self.assertEqual(args[:3], ["/usr/bin/python3", "-I", "-B"])
+                self.assertEqual(args[3], str(source / "packaging/linux/package_appimage.py"))
+                self.assertEqual(args[4], "--update-build-plan")
+                plan = json.loads(Path(args[5]).read_text())
+                self.assertEqual(plan["reviewed_checkout"], str(root / "reviewed"))
+                self.assertEqual(plan["revision"], "b" * 40)
+                self.assertNotIn("must-not-cross", env.values())
+                destination = root / "artifacts/0.1.0-updateqa.1/packages"
+                destination.mkdir(parents=True)
+                image(destination / "candidate.AppImage", "0.1.0-updateqa.1")
+                return ["/owned/namespace"]
+            commands.run.side_effect = lambda args, **kwargs: json.dumps(metadata) if args[-1] == "--morpheus-update-metadata" else ""
+            helper = {"validate_metadata": mock.Mock(), "prepare_appimage": mock.Mock()}
+            with mock.patch.object(target, "namespace_command", side_effect=namespace), \
+                    mock.patch.object(target.runpy, "run_path", return_value=helper):
+                artifact, observed = target.build_image(commands, source, root / "target", "0.1.0-updateqa.1", "https://127.0.0.1:12345/feed.json", "public-data")
+            self.assertEqual(observed, metadata)
+            self.assertTrue(artifact.is_file())
+            self.assertEqual(commands.run.call_args_list[0].kwargs["seconds"], 3300)
+            self.assertEqual(commands.run.call_args_list[0].kwargs["operation"], "package_build")
+            helper["validate_metadata"].assert_called_once_with(metadata)
+            helper["prepare_appimage"].assert_called_once_with(artifact, metadata)
+
     def test_signed_failure_fixture_preserves_genuine_package_and_footer(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

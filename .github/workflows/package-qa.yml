@@ -50,7 +50,7 @@ env:
 jobs:
   scope:
     name: Select package platforms
-    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false
+    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.id == github.event.repository.owner.id
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -69,7 +69,14 @@ jobs:
           LINUX_FORMATS: ${{ inputs.linux_formats }}
           APPIMAGE_UPDATES: ${{ inputs.appimage_updates }}
           APPIMAGE_CAPTURE: ${{ inputs.appimage_capture }}
-        run: python3 scripts/package_scope.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          # AppImage stays explicit; never remap default/all/DEB selections.
+          if [[ "$PACKAGE_PLATFORM" == linux || "$PACKAGE_PLATFORM" == all ]]; then
+            test "$LINUX_FORMATS" = appimage
+          fi
+          python3 scripts/package_scope.py
       - name: Check out selected source for independent scanning
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -128,7 +135,7 @@ jobs:
   package:
     name: Package validation (${{ matrix.label }})
     needs: scope
-    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false
+    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.id == github.event.repository.owner.id
     runs-on: ${{ matrix.os }}
     # CI and packaging for the same platform/candidate share this lock.
     concurrency:
@@ -177,7 +184,7 @@ jobs:
           }
           python3 scripts/windows_package_ui.py --check-host
       - name: Require reviewed installed capture adapter
-        if: runner.os == 'Linux' && inputs.appimage_capture
+        if: runner.os == 'Linux' && !inputs.appimage_updates
         run: python3 packaging/linux/package_appimage.py --check-readiness
       - name: Linux native dependencies
         if: runner.os == 'Linux'
@@ -186,10 +193,169 @@ jobs:
           sudo apt-get install -y \
             libasound2-dev libclang-dev libdbus-1-dev libegl-dev \
             libfontconfig1-dev libfuse2t64 libgbm-dev libglib2.0-dev \
-            libpipewire-0.3-dev libssl-dev libudev-dev libwayland-dev \
+            libpipewire-0.3-dev libssl-dev libsystemd-dev systemd-dev libudev-dev libwayland-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libxi6 libxrandr-dev pkg-config xvfb
+      - name: Linux installed update QA dependencies
+        if: runner.os == 'Linux' && inputs.appimage_updates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11
+      - name: Linux installed capture QA dependencies
+        if: runner.os == 'Linux' && !inputs.appimage_updates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11 \
+            gnome-keyring libsecret-tools libglib2.0-bin libdrm-dev libinih-dev \
+            libsystemd-dev systemd-dev meson ninja-build wayland-protocols sway swaybg \
+            pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
+      - name: Prepare pinned Linux QA scanner
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          scanner_root="$(mktemp -d "$RUNNER_TEMP/morpheus-package-scanner.XXXXXXXX")"
+          archive="$scanner_root/gitleaks.tar.gz"
+          /usr/bin/curl --disable --fail --silent --show-error --location --max-redirs 3 \
+            --noproxy '*' --proto '=https' --proto-redir '=https' --max-time 120 --max-filesize 33554432 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | /usr/bin/sha256sum --check --status
+          /usr/bin/tar -xzf "$archive" -C "$scanner_root" --no-same-owner --no-same-permissions gitleaks
+          echo "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509  $scanner_root/gitleaks" | /usr/bin/sha256sum --check --status
+          chmod 500 "$scanner_root/gitleaks"
+          printf 'MORPHEUS_QA_GITLEAKS=%s\n' "$scanner_root/gitleaks" >> "$GITHUB_ENV"
+      - name: Provision exact reviewed static-runtime host inputs
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          private="$(mktemp -d "$RUNNER_TEMP/morpheus-runtime-host.XXXXXXXX")"
+          mkdir "$private/debs"
+          : > "$private/provision.log"
+          : > "$private/empty.ignore"
+          printf '[extend]\nuseDefault = true\n' > "$private/gitleaks.toml"
+          root_cache=''
+          stage=inputs
+          finish() {
+            result=$?
+            trap - EXIT
+            if [[ -n "$root_cache" ]]; then
+              if ! sudo --non-interactive /usr/bin/rm -rf -- "$root_cache" >> "$private/provision.log" 2>&1; then
+                result=1
+                stage=cleanup
+              fi
+            fi
+            if ! (cd "$private" && "$MORPHEUS_QA_GITLEAKS" stdin --config "$private/gitleaks.toml" \
+                  --gitleaks-ignore-path "$private/empty.ignore" --ignore-gitleaks-allow --redact=100 --no-banner \
+                  < "$private/provision.log" > /dev/null 2>&1); then
+              result=1
+              stage=scan
+            fi
+            if [[ "$result" == 0 ]]; then
+              printf 'MORPHEUS_RUNTIME_HOST_PROVISION {"passed":true,"packages":18,"hashed_inputs":634}\n'
+            else
+              printf 'MORPHEUS_RUNTIME_HOST_PROVISION {"passed":false,"stage":"%s"}\n' "$stage"
+            fi
+            rm -rf -- "$private"
+            exit "$result"
+          }
+          trap finish EXIT
+          {
+            [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+            git show --no-ext-diff --no-textconv "$GITHUB_SHA:packaging/linux/runtime-build-host.json" > "$private/runtime-host.json"
+            echo "f5a8b93d2d6d670e66c085184fe49135bf7634530838d9fdfed7d7e0390b6656  $private/runtime-host.json" | /usr/bin/sha256sum --check --status
+            echo "f5a8b93d2d6d670e66c085184fe49135bf7634530838d9fdfed7d7e0390b6656  packaging/linux/runtime-build-host.json" | /usr/bin/sha256sum --check --status
+            stage=download
+            while IFS=$'\t' read -r file bytes digest url; do
+              /usr/bin/curl --disable --fail --silent --show-error --location --max-redirs 3 \
+                --noproxy '*' --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 \
+                --max-filesize "$bytes" "$url" --output "$private/debs/$file"
+              test "$(/usr/bin/stat --format='%s' "$private/debs/$file")" = "$bytes"
+              printf '%s  %s\n' "$digest" "$private/debs/$file" | /usr/bin/sha256sum --check --status
+            done <<'PINNED_RUNTIME_HOST_DEBS'
+          01-autoconf.deb	338946	cc3f9f7a1e576173fb59c36652c0a67c6426feae752b352404ba92dfcb1b26c9	https://archive.ubuntu.com/ubuntu/pool/main/a/autoconf/autoconf_2.71-3_all.deb
+          02-automake.deb	558172	5ae9a98e73545002cd891f028859941af2a3c760cb6190e635c7ef36953912de	https://archive.ubuntu.com/ubuntu/pool/main/a/automake-1.16/automake_1.16.5-1.3ubuntu1_all.deb
+          03-libtool.deb	166404	9d1d707179675d38e024bb13613b1d99e0d33fa6c45e5f3bcba19340781781d3	https://archive.ubuntu.com/ubuntu/pool/main/libt/libtool/libtool_2.4.7-7build1_all.deb
+          04-libtool-bin.deb	84062	23959c8be74b4433d635c76e61a6c4bb62f10d3899362598c53173e8e57c0f8a	https://archive.ubuntu.com/ubuntu/pool/main/libt/libtool/libtool-bin_2.4.7-7build1_amd64.deb
+          05-m4.deb	243640	30ea715845a1863abd55d11e47ab91513130bf347852d4cdeae69e9d98fa795c	https://archive.ubuntu.com/ubuntu/pool/main/m/m4/m4_1.4.19-4build1_amd64.deb
+          06-make.deb	179752	1fe6a815b56c7b6e9ce4086a363f09444bbd0a0d30e230c453d0b78e44b57a99	https://archive.ubuntu.com/ubuntu/pool/main/m/make-dfsg/make_4.3-4.1build2_amd64.deb
+          07-meson.deb	603950	5a9ab497255cc51f97866c359fc5cc75a1be4890ad376e471ca45d76bbea4803	https://archive.ubuntu.com/ubuntu/pool/universe/m/meson/meson_1.3.2-1ubuntu1_all.deb
+          08-ninja-build.deb	128926	6a17f76a0f75586f1292f6c61a9b07fd0dec963baf6a102b17673f601c6b323a	https://archive.ubuntu.com/ubuntu/pool/universe/n/ninja-build/ninja-build_1.11.1-2_amd64.deb
+          09-pkgconf-bin.deb	20730	7a812f05ee1610154b433e2ad54f6e4163fcbb306b9fb31afe959afb2e5e1545	https://archive.ubuntu.com/ubuntu/pool/main/p/pkgconf/pkgconf-bin_1.8.1-2build1_amd64.deb
+          10-binutils-x86-64-linux-gnu.deb	2462744	1e510a15f30208d39edcd840e48f26a77bbca7c417805eeccb1e3f7de198ef29	https://archive.ubuntu.com/ubuntu/pool/main/b/binutils/binutils-x86-64-linux-gnu_2.42-4ubuntu2.10_amd64.deb
+          11-cpp-13-x86-64-linux-gnu.deb	10714542	2ca48bf0c2d6465bc39322899715a85d934b4d7442dd5586a7bebbe3ce0f806b	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/cpp-13-x86-64-linux-gnu_13.3.0-6ubuntu2~24.04.1_amd64.deb
+          12-gcc-13-x86-64-linux-gnu.deb	21084546	a134b0319a82d14581b3a14820d2832af4ec9778ed8b9b4ddaeecfb0555ec325	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/gcc-13-x86-64-linux-gnu_13.3.0-6ubuntu2~24.04.1_amd64.deb
+          13-libgcc-13-dev.deb	2680642	cd689db2691edaa10f37329307292796bb599e722e0505c79e14caaa1fe9a93a	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/libgcc-13-dev_13.3.0-6ubuntu2~24.04.1_amd64.deb
+          14-linux-libc-dev.deb	1595188	fec8e4a308c03cd98dace67370a8d5a8031c36741796065c9f6e3f9548ab0cd2	https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-libc-dev_6.8.0-147.147_amd64.deb
+          15-patch.deb	104048	fb7d78ed25c2788a607802270f3c28ac5ed6857bfb6cce9f73ad2cafac9159b3	https://archive.ubuntu.com/ubuntu/pool/main/p/patch/patch_2.7.6-7build3_amd64.deb
+          16-binutils-common.deb	240286	d136073f5e2153f3df11c1d08d66727b9466b28ff483f50085f14bbe3464b5ee	https://archive.ubuntu.com/ubuntu/pool/main/b/binutils/binutils-common_2.42-4ubuntu2.10_amd64.deb
+          17-gcc-13-base.deb	51616	e859aca26585bb91113a451f1e66bc0e5283cb08797d679aacc1d936ae6dff8e	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/gcc-13-base_13.3.0-6ubuntu2~24.04.1_amd64.deb
+          18-libbinutils.deb	576834	064dce00ce94e1fc2d33779cb0071088f4c8aac79e85345f2e78a020f7d14699	https://archive.ubuntu.com/ubuntu/pool/main/b/binutils/libbinutils_2.42-4ubuntu2.10_amd64.deb
+          PINNED_RUNTIME_HOST_DEBS
+            stage=install
+            # No resolver fallback, --fix-broken or force-depends. Missing exact
+            # matching siblings are pinned below; ambient dependencies must pass
+            # the no-download consistency check before any build.
+            root_cache="$(sudo --non-interactive /usr/bin/mktemp -d /var/tmp/morpheus-runtime-host.XXXXXXXX)"
+            [[ "$root_cache" =~ ^/var/tmp/morpheus-runtime-host\.[A-Za-z0-9]{8}$ ]]
+            for file in "$private"/debs/*.deb; do
+              sudo --non-interactive /usr/bin/install -o 0 -g 0 -m 0600 -- "$file" "$root_cache/$(basename "$file")"
+            done
+            while IFS=$'\t' read -r file bytes digest url; do
+              printf '%s  %s\n' "$digest" "$root_cache/$file" | sudo --non-interactive /usr/bin/sha256sum --check --status
+            done <<'PINNED_RUNTIME_HOST_RECHECK'
+          01-autoconf.deb	338946	cc3f9f7a1e576173fb59c36652c0a67c6426feae752b352404ba92dfcb1b26c9	https://archive.ubuntu.com/ubuntu/pool/main/a/autoconf/autoconf_2.71-3_all.deb
+          02-automake.deb	558172	5ae9a98e73545002cd891f028859941af2a3c760cb6190e635c7ef36953912de	https://archive.ubuntu.com/ubuntu/pool/main/a/automake-1.16/automake_1.16.5-1.3ubuntu1_all.deb
+          03-libtool.deb	166404	9d1d707179675d38e024bb13613b1d99e0d33fa6c45e5f3bcba19340781781d3	https://archive.ubuntu.com/ubuntu/pool/main/libt/libtool/libtool_2.4.7-7build1_all.deb
+          04-libtool-bin.deb	84062	23959c8be74b4433d635c76e61a6c4bb62f10d3899362598c53173e8e57c0f8a	https://archive.ubuntu.com/ubuntu/pool/main/libt/libtool/libtool-bin_2.4.7-7build1_amd64.deb
+          05-m4.deb	243640	30ea715845a1863abd55d11e47ab91513130bf347852d4cdeae69e9d98fa795c	https://archive.ubuntu.com/ubuntu/pool/main/m/m4/m4_1.4.19-4build1_amd64.deb
+          06-make.deb	179752	1fe6a815b56c7b6e9ce4086a363f09444bbd0a0d30e230c453d0b78e44b57a99	https://archive.ubuntu.com/ubuntu/pool/main/m/make-dfsg/make_4.3-4.1build2_amd64.deb
+          07-meson.deb	603950	5a9ab497255cc51f97866c359fc5cc75a1be4890ad376e471ca45d76bbea4803	https://archive.ubuntu.com/ubuntu/pool/universe/m/meson/meson_1.3.2-1ubuntu1_all.deb
+          08-ninja-build.deb	128926	6a17f76a0f75586f1292f6c61a9b07fd0dec963baf6a102b17673f601c6b323a	https://archive.ubuntu.com/ubuntu/pool/universe/n/ninja-build/ninja-build_1.11.1-2_amd64.deb
+          09-pkgconf-bin.deb	20730	7a812f05ee1610154b433e2ad54f6e4163fcbb306b9fb31afe959afb2e5e1545	https://archive.ubuntu.com/ubuntu/pool/main/p/pkgconf/pkgconf-bin_1.8.1-2build1_amd64.deb
+          10-binutils-x86-64-linux-gnu.deb	2462744	1e510a15f30208d39edcd840e48f26a77bbca7c417805eeccb1e3f7de198ef29	https://archive.ubuntu.com/ubuntu/pool/main/b/binutils/binutils-x86-64-linux-gnu_2.42-4ubuntu2.10_amd64.deb
+          11-cpp-13-x86-64-linux-gnu.deb	10714542	2ca48bf0c2d6465bc39322899715a85d934b4d7442dd5586a7bebbe3ce0f806b	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/cpp-13-x86-64-linux-gnu_13.3.0-6ubuntu2~24.04.1_amd64.deb
+          12-gcc-13-x86-64-linux-gnu.deb	21084546	a134b0319a82d14581b3a14820d2832af4ec9778ed8b9b4ddaeecfb0555ec325	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/gcc-13-x86-64-linux-gnu_13.3.0-6ubuntu2~24.04.1_amd64.deb
+          13-libgcc-13-dev.deb	2680642	cd689db2691edaa10f37329307292796bb599e722e0505c79e14caaa1fe9a93a	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/libgcc-13-dev_13.3.0-6ubuntu2~24.04.1_amd64.deb
+          14-linux-libc-dev.deb	1595188	fec8e4a308c03cd98dace67370a8d5a8031c36741796065c9f6e3f9548ab0cd2	https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-libc-dev_6.8.0-147.147_amd64.deb
+          15-patch.deb	104048	fb7d78ed25c2788a607802270f3c28ac5ed6857bfb6cce9f73ad2cafac9159b3	https://archive.ubuntu.com/ubuntu/pool/main/p/patch/patch_2.7.6-7build3_amd64.deb
+          16-binutils-common.deb	240286	d136073f5e2153f3df11c1d08d66727b9466b28ff483f50085f14bbe3464b5ee	https://archive.ubuntu.com/ubuntu/pool/main/b/binutils/binutils-common_2.42-4ubuntu2.10_amd64.deb
+          17-gcc-13-base.deb	51616	e859aca26585bb91113a451f1e66bc0e5283cb08797d679aacc1d936ae6dff8e	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/gcc-13-base_13.3.0-6ubuntu2~24.04.1_amd64.deb
+          18-libbinutils.deb	576834	064dce00ce94e1fc2d33779cb0071088f4c8aac79e85345f2e78a020f7d14699	https://archive.ubuntu.com/ubuntu/pool/main/b/binutils/libbinutils_2.42-4ubuntu2.10_amd64.deb
+          PINNED_RUNTIME_HOST_RECHECK
+            /usr/bin/timeout --kill-after=10s 300s sudo --non-interactive /bin/bash -c 'exec /usr/bin/dpkg --install -- "$1"/*.deb' _ "$root_cache"
+            /usr/bin/timeout --kill-after=10s 60s sudo --non-interactive /usr/bin/apt-get --no-download check
+            stage=verify
+            /usr/bin/timeout --kill-after=10s 120s /usr/bin/python3 -I -B - "$private/runtime-host.json" <<'VERIFY_RUNTIME_HOST'
+          import hashlib, json, os, pathlib, stat, subprocess, sys
+          manifest = pathlib.Path(sys.argv[1]).read_bytes()
+          assert hashlib.sha256(manifest).hexdigest() == "f5a8b93d2d6d670e66c085184fe49135bf7634530838d9fdfed7d7e0390b6656"
+          spec = json.loads(manifest)
+          assert len(spec["packages"]) == 18 and len(spec["files"]) == 634
+          names = [pin["package"] for pin in spec["packages"]]
+          query = subprocess.run(["/usr/bin/dpkg-query", "-W", "--showformat=${Package}\t${Version}\t${db:Status-Status}\n", *names],
+                                 capture_output=True, timeout=20, check=True, env={"PATH":"/usr/bin:/bin", "LC_ALL":"C"})
+          assert not query.stderr
+          lines = query.stdout.decode("ascii").splitlines()
+          assert len(lines) == len(names) and set(lines) == {pin["package"]+"\t"+pin["version"]+"\tinstalled" for pin in spec["packages"]}
+          for name, pin in spec["files"].items():
+              path = pathlib.Path(name).resolve(strict=True)
+              for part in (path, *path.parents):
+                  details = part.stat()
+                  assert details.st_uid == 0 and details.st_mode & 0o022 == 0
+              info = path.stat()
+              assert stat.S_ISREG(info.st_mode) and info.st_size == pin["bytes"]
+              with path.open("rb") as stream:
+                  assert hashlib.file_digest(stream, "sha256").hexdigest() == pin["sha256"]
+          VERIFY_RUNTIME_HOST
+          } >> "$private/provision.log" 2>&1
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
         with:
@@ -204,26 +370,15 @@ jobs:
           save-if: ${{ needs.scope.outputs.cache_write == 'true' && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
       - name: Install pinned Cargo Packager
         run: cargo install cargo-packager --version 0.11.8 --locked
-      - name: Linux installed update QA dependencies
-        if: runner.os == 'Linux' && inputs.appimage_updates
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openssl ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11
-      - name: Linux installed capture QA dependencies
-        if: runner.os == 'Linux' && inputs.appimage_capture
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11 \
-            gnome-keyring libsecret-tools libglib2.0-bin libdrm-dev libinih-dev \
-            libsystemd-dev systemd-dev meson ninja-build wayland-protocols sway swaybg \
-            pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
       - name: Prepare verified Windows NSIS tools
         if: runner.os == 'Windows'
         run: python3 scripts/windows_package_tools.py
       - name: Build unsigned QA package
-        if: runner.os != 'Linux' || (!inputs.appimage_updates && !inputs.appimage_capture)
+        if: runner.os != 'Linux'
         run: python3 scripts/package.py --formats ${{ matrix.formats }}
+      - name: Build and inspect canonical Linux QA AppImage
+        if: runner.os == 'Linux' && !inputs.appimage_updates && !inputs.appimage_capture
+        run: /usr/bin/python3 scripts/package.py --formats ${{ matrix.formats }} --gitleaks "$MORPHEUS_QA_GITLEAKS"
       - name: Install, inspect, launch and remove unsigned packages
         if: runner.os != 'Linux' || (!inputs.appimage_updates && !inputs.appimage_capture)
         timeout-minutes: 35
@@ -235,28 +390,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            --output "$archive"
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir -p "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
           /usr/bin/python3 scripts/appimage_update_acceptance.py \
             --source "$GITHUB_WORKSPACE" --target-dir "$GITHUB_WORKSPACE/target" \
-            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --execute-on-free-hosted-runner
+            --gitleaks "$MORPHEUS_QA_GITLEAKS" --execute-on-free-hosted-runner
       - name: Test actual installed AppImage capture and imported client bindings
         if: runner.os == 'Linux' && inputs.appimage_capture
         shell: bash
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            --output "$archive"
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir -p "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          /usr/bin/python3 packaging/linux/package_appimage.py --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
+          /usr/bin/python3 packaging/linux/package_appimage.py --gitleaks "$MORPHEUS_QA_GITLEAKS"
       # Installers deliberately stay on the ephemeral runner. Public artifact
       # uploads and releases require the separate release acceptance gates.

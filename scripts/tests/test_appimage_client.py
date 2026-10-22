@@ -1,10 +1,13 @@
 """Pure/private-draft tests: never invoke native tools, services or downloads."""
 
+import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import struct
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -48,11 +51,48 @@ def elf(*, runpath=None, legacy=False, marker=b"a", needed="libc.so.6", soname=C
     return bytes(data)
 
 
+def static_runtime():
+    """Inert ELF fixture; never executed and not a real runtime build claim."""
+    data = bytearray(2048)
+    data[:16] = b"\x7fELF\x02\x01\x01\0AI\x02" + bytes(5)
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16, 3, 62, 1, 256, 64, 1600, 0, 64, 56, 3, 64, 3, 1)
+    for index, segment in enumerate(((1, 5, 0, 0, 0, 1024, 1024, 4096),
+                                     (1, 6, 1024, 1024, 0, 1024, 1024, 4096),
+                                     (0x6474e551, 6, 0, 0, 0, 0, 0, 16))):
+        struct.pack_into("<IIQQQQQQ", data, 64 + index * 56, *segment)
+    names = b"\0.shstrtab\0.digest_md5\0"
+    data[1536:1536 + len(names)] = names
+    struct.pack_into("<IIQQQQIIQQ", data, 1664, 1, 3, 0, 0, 1536, len(names), 0, 0, 1, 0)
+    struct.pack_into("<IIQQQQIIQQ", data, 1728, 11, 1, 3, 1280, 1280, 16, 0, 0, 1, 0)
+    return bytes(data)
+
+
 class ToolTests(unittest.TestCase):
     def test_official_pins_have_exact_identities(self):
         pins = C.pinned_tools()
-        self.assertEqual({p["asset_id"] for p in pins}, {602438599, 602435573, 596078161})
-        self.assertEqual(len({p["sha256"] for p in pins}), 3)
+        self.assertEqual({p["asset_id"] for p in pins}, {602438599, 602435573})
+        self.assertEqual(len({p["sha256"] for p in pins}), 2)
+        expected = {
+            "linuxdeploy-x86_64.AppImage":
+                "https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/assets/602438599",
+            "linuxdeploy-plugin-appimage.AppImage":
+                "https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/602435573",
+        }
+        self.assertEqual({pin["cache_name"]: C.tool_download_url(pin) for pin in pins}, expected)
+        original = json.loads((ROOT / "packaging/linux/appimage-tools.json").read_text())
+        for changed in ({"asset_id": True}, {"asset_id": "657374641"}, {"asset_id": 0},
+                        {"asset_id": 10 ** 20}, {"url": "https://github.com/other/project/asset"}):
+            with self.subTest(changed=changed):
+                invalid = json.loads(json.dumps(original))
+                invalid["tools"][1].update(changed)
+                with mock.patch.object(C, "read_regular", return_value=json.dumps(invalid).encode()), \
+                        self.assertRaises(C.PackageFailure):
+                    C.pinned_tools()
+        invalid = json.loads(json.dumps(original))
+        invalid["tools"].append({"cache_name": "runtime-x86_64"})
+        with mock.patch.object(C, "read_regular", return_value=json.dumps(invalid).encode()), \
+                self.assertRaises(C.PackageFailure):
+            C.pinned_tools()
 
     def test_original_launcher_preserves_argv_exec_and_relative_runpath(self):
         source = C.launcher_bytes()
@@ -74,25 +114,25 @@ class ToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(C, "pinned_tools", return_value=pins):
             root = Path(directory).resolve()
             with self.assertRaises(C.PackageFailure):
-                C.seed_tools(root, payloads)
+                C.seed_tools(root, payloads, static_runtime())
             self.assertEqual(list(root.iterdir()), [])
 
     def test_new_cache_and_only_header_derivation_allowed(self):
         pins, payloads = self.fake_pins()
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(C, "pinned_tools", return_value=pins):
             root = Path(directory).resolve()
-            environment = C.seed_tools(root, payloads)
+            environment = C.seed_tools(root, payloads, static_runtime())
             self.assertEqual(set(environment), {"XDG_CACHE_HOME", "LDAI_RUNTIME_FILE"})
             with self.assertRaises(C.PackageFailure):
-                C.verify_tools_after(root, payloads)
+                C.verify_tools_after(root, payloads, static_runtime())
 
             path = root / "xdg-cache/.cargo-packager/AppImage/linuxdeploy-x86_64.AppImage"
             original = payloads[path.name]
             path.write_bytes(original[:8] + bytes(3) + original[11:])
-            self.assertEqual(len(C.verify_tools_after(root, payloads)), 4)
+            self.assertEqual(len(C.verify_tools_after(root, payloads, static_runtime())), 4)
             path.write_bytes(path.read_bytes() + b"unexpected")
             with self.assertRaises(C.PackageFailure):
-                C.verify_tools_after(root, payloads)
+                C.verify_tools_after(root, payloads, static_runtime())
 
     def test_existing_or_symlink_cache_is_rejected_before_writes(self):
         pins, payloads = self.fake_pins()
@@ -106,7 +146,7 @@ class ToolTests(unittest.TestCase):
                 else:
                     cache.mkdir(mode=0o700)
                 with self.assertRaises(C.PackageFailure):
-                    C.seed_tools(root, payloads)
+                    C.seed_tools(root, payloads, static_runtime())
                 self.assertEqual(list(Path(elsewhere).iterdir()), [])
                 self.assertEqual(list(cache.iterdir()), [])
 
@@ -114,13 +154,13 @@ class ToolTests(unittest.TestCase):
         pins, payloads = self.fake_pins()
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(C, "pinned_tools", return_value=pins):
             root = Path(directory).resolve()
-            C.seed_tools(root, payloads)
+            C.seed_tools(root, payloads, static_runtime())
             cache = root / "xdg-cache"
             actual = root / "moved-cache"
             cache.rename(actual)
             cache.symlink_to(actual, target_is_directory=True)
             with self.assertRaises(C.PackageFailure):
-                C.verify_tools_after(root, payloads)
+                C.verify_tools_after(root, payloads, static_runtime())
             cache.unlink()
             actual.rename(cache)
             path = cache / ".cargo-packager/AppImage/linuxdeploy-x86_64.AppImage"
@@ -128,7 +168,107 @@ class ToolTests(unittest.TestCase):
             path.write_bytes(original[:8] + bytes(3) + original[11:])
             path.chmod(0o777)
             with self.assertRaises(C.PackageFailure):
-                C.verify_tools_after(root, payloads)
+                C.verify_tools_after(root, payloads, static_runtime())
+
+    def test_source_runtime_is_static_and_only_embedded_md5_can_change(self):
+        runtime = load("appimage_runtime_build")
+        original = static_runtime()
+        self.assertEqual(runtime.static_identity(original)["needed"], [])
+        for offset, value in ((8, 0), (64, 3), (124, 7)):
+            with self.subTest(offset=offset):
+                changed = bytearray(original)
+                changed[offset] = value
+                with self.assertRaises(C.PackageFailure):
+                    runtime.static_identity(bytes(changed))
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "candidate.AppImage"
+            changed = bytearray(original)
+            changed[1280:1296] = b"m" * 16
+            image.write_bytes(bytes(changed) + b"hsqs")
+            self.assertTrue(runtime.verify_embedded(image, original)["code_and_all_other_runtime_bytes_exact"])
+            changed[300] ^= 1
+            image.write_bytes(bytes(changed) + b"hsqs")
+            with self.assertRaises(C.PackageFailure):
+                runtime.verify_embedded(image, original)
+
+    def test_runtime_archive_map_rejects_partial_or_linked_sources_before_writes(self):
+        runtime = load("appimage_runtime_build")
+
+        def archive(entries):
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode="w") as stream:
+                for name, kind, content in entries:
+                    member = tarfile.TarInfo(name)
+                    member.type = kind
+                    if kind == tarfile.SYMTYPE:
+                        member.linkname = content
+                        stream.addfile(member)
+                    else:
+                        member.size = len(content)
+                        stream.addfile(member, io.BytesIO(content))
+            return output.getvalue()
+
+        valid = [("source/file", tarfile.REGTYPE, b"fixed source")]
+        invalid = [valid + valid, [("source/../escape", tarfile.REGTYPE, b"x")],
+                   [("source/link", tarfile.SYMTYPE, "outside")],
+                   [("source/file", tarfile.REGTYPE, b"x"),
+                    ("source/file/child", tarfile.REGTYPE, b"x")]]
+        for entries in invalid:
+            with self.subTest(entries=[entry[0] for entry in entries]), tempfile.TemporaryDirectory() as folder:
+                data = archive(entries)
+                destination = Path(folder) / "source"
+                pin = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "prefix": "source"}
+                with self.assertRaises(C.PackageFailure):
+                    runtime.extract(data, destination, pin)
+                self.assertFalse(destination.exists())
+        with tempfile.TemporaryDirectory() as folder:
+            data = archive(valid)
+            destination = Path(folder) / "source"
+            pin = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "prefix": "source"}
+            runtime.extract(data, destination, pin)
+            self.assertEqual((destination / "file").read_bytes(), b"fixed source")
+
+    def test_runtime_host_version_drift_refuses_before_source_commands(self):
+        runtime = load("appimage_runtime_build")
+        data = json.dumps({"packages": [{"package": "compiler", "version": "fixed"}], "files": {}}).encode()
+        run = mock.Mock(return_value=b"compiler\tdifferent\tinstalled\n")
+        with mock.patch.object(C, "read_regular", return_value=data), \
+                mock.patch.object(C.R, "trusted_tool", return_value="/usr/bin/dpkg-query"), \
+                self.assertRaises(C.PackageFailure):
+            runtime.host_inputs(run, hashlib.sha256(data).hexdigest())
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0], "tool-version")
+
+    def test_runtime_host_headers_require_exact_source_manifest_membership(self):
+        runtime = load("appimage_runtime_build")
+        content = b"fixed UAPI declarations"
+        allowed = "/usr/include/linux/types.h"
+
+        class InertRootOwnedPath:
+            def __init__(self, name): self.name = name
+            def with_name(self, name): return self
+            def resolve(self, *, strict): return self
+            @property
+            def parents(self): return ()
+            def stat(self): return type("Metadata", (), {"st_uid": 0, "st_mode": 0o100644})()
+
+        for name, admitted in ((allowed, True), ("/usr/include/linux/unrecorded.h", False)):
+            with self.subTest(name=name):
+                host = {"packages": [{"package": "compiler", "version": "fixed"}], "files": {
+                    name: {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}}}
+                if name != allowed:
+                    host["files"][allowed] = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+                data = json.dumps(host).encode()
+                run = mock.Mock(return_value=b"compiler\tfixed\tinstalled\n")
+                with mock.patch.object(runtime, "Path", InertRootOwnedPath), \
+                        mock.patch.object(C, "read_regular", side_effect=[data, content]), \
+                        mock.patch.object(C.R, "trusted_tool", return_value="/usr/bin/dpkg-query"):
+                    if admitted:
+                        result = runtime.host_inputs(run, hashlib.sha256(data).hexdigest(), uapi_paths=[allowed])
+                        self.assertTrue(result["actual_bytes_match_pinned_packages"])
+                    else:
+                        with self.assertRaises(C.PackageFailure):
+                            runtime.host_inputs(run, hashlib.sha256(data).hexdigest(), uapi_paths=[allowed])
 
     def test_source_rejection_precedes_any_command(self):
         callback = mock.Mock(side_effect=AssertionError("native work forbidden"))

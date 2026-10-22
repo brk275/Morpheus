@@ -173,24 +173,14 @@ def app_versions(source):
 
 def replace_app_version(source, version):
     """Only the two exclusions explicitly allowed by build.rs may vary."""
-    require(re.fullmatch(r"\d+\.\d+\.\d+-updateqa\.[12]", version))
-    path = source / "crates/morpheus-app/Cargo.toml"
-    text = path.read_text()
-    section = re.search(r"(?ms)^\[package\]\n(.*?)(?=^\[|\Z)", text)
-    require(section is not None)
-    body, count = re.subn(r'^version = "[^"]+"$', f'version = "{version}"', section[1], flags=re.M)
-    require(count == 1)
-    path.write_text(text[:section.start(1)] + body + text[section.end(1):])
-    path = source / "Cargo.lock"
-    blocks = path.read_text().split("[[package]]")
-    count = 0
-    for index, block in enumerate(blocks):
-        if re.search(r'^name = "morpheus-app"$', block, re.M):
-            blocks[index], changed = re.subn(r'^version = "[^"]+"$', f'version = "{version}"', block, flags=re.M)
-            require(changed == 1)
-            count += 1
-    require(count == 1)
-    path.write_text("[[package]]".join(blocks))
+    from package_revision import UPDATE_VERSION_PATHS, versioned_source_bytes
+    for name in sorted(UPDATE_VERSION_PATHS):
+        path = source / name
+        try:
+            replacement = versioned_source_bytes(name, path.read_bytes(), version)
+        except SourceRevisionError:
+            raise QAError("artifact_identity", operation="source_revision") from None
+        path.write_bytes(replacement)
 
 
 def image_metadata(path):
@@ -240,7 +230,9 @@ class Commands:
         self.stage = stage
         print("MORPHEUS_APPIMAGE_QA_STAGE " + stage, flush=True)
 
-    def run(self, args, *, env=None, cwd=None, seconds=180):
+    def run(self, args, *, env=None, cwd=None, seconds=180, operation=None):
+        require(operation is None or operation in OPERATIONS)
+        operation = operation or operation_code(args)
         self.sequence += 1
         timeout = min(seconds, self.deadline - time.monotonic())
         require(timeout > 0)
@@ -253,7 +245,7 @@ class Commands:
             try:
                 result = wait_owned(process, timeout)
             except subprocess.TimeoutExpired:
-                raise QAError("command_deadline", operation=operation_code(args)) from None
+                raise QAError("command_deadline", operation=operation) from None
         finally:
             stop_owned(process)
         if result != 0:
@@ -262,7 +254,7 @@ class Commands:
             with log.open("rb") as source:
                 source.seek(max(0, log.stat().st_size - 65536))
                 nested = child_failure(source.read().decode(errors="replace"))
-            error = nested or QAError("command_failed", operation=operation_code(args))
+            error = nested or QAError("command_failed", operation=operation)
             error.exit_status = result if -64 <= result <= 255 else None
             raise error
         return log.read_text(errors="replace")
@@ -294,6 +286,8 @@ def export_source(commands, source):
                     and (item.isfile() or item.isdir()))
         tar.extractall(destination, filter="data")
     archive.unlink()
+    commands.reviewed_source = Path(source).resolve()
+    commands.reviewed_revision = revision
     return destination, revision
 
 
@@ -432,19 +426,35 @@ class Feed:
         self.thread.join(timeout=5)
 
 
+def package_build_environment(environment):
+    # Namespace control contains public runner/source context, not the broad
+    # fixture environment or generated signer/private-feed inputs.
+    allowed = {"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "CARGO_HOME", "RUSTUP_HOME", "RUNNER_TEMP",
+               "GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "RUNNER_OS", "RUNNER_ARCH", "GITHUB_REPOSITORY",
+               "GITHUB_REF", "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SHA", "GITHUB_ACTOR",
+               "GITHUB_ACTOR_ID", "GITHUB_TRIGGERING_ACTOR", "MORPHEUS_PACKAGE_SOURCE_REVISION",
+               "MORPHEUS_FREE_HOSTED_UPDATE_QA"}
+    return {name: value for name, value in environment.items() if name in allowed}
+
+
 def build_image(commands, source, target, version, feed, public_key):
-    # This old generic packager does not ship the native build prefix. The
-    # fixed-runtime/original-SONAME wrapper must be integrated here before this
-    # existing signing/update/rollback gate can run again; do not waive it.
-    raise RuntimeError("AppImage update fixture requires fixed-client package integration")
     replace_app_version(source, version)
-    package = runpy.run_path(str(source / "scripts/package.py"))
-    config = package["package_config"](root=source, platform="linux")
-    destination = private_directory(commands.root / "artifacts" / version)
-    config.update({"version": version, "out-dir": str(destination), "binaries-dir": str(target / "release")})
-    commands.run(["cargo", "packager", "--release", "--config", json.dumps(config), "--formats", "appimage"],
-                 cwd=source, seconds=3300, env={"CARGO_TARGET_DIR": str(target), "MORPHEUS_UPDATE_FEED": feed,
-                                              "MORPHEUS_UPDATE_PUBLIC_KEY": public_key})
+    build_root = private_directory(commands.root / "artifacts" / version)
+    plan = {"schema": 1, "reviewed_checkout": str(commands.reviewed_source),
+            "revision": commands.reviewed_revision, "target": str(target),
+            "version": version, "feed": feed, "public_key": public_key}
+    plan_path = build_root / "update-plan.json"
+    write_private(plan_path, json.dumps(plan, sort_keys=True), create=True)
+    # One existing owned namespace and the unchanged3300s per-image bound.
+    # The canonical entry authenticates the whole exported source itself; only
+    # these two exact version substitutions are allowed, with no signer env.
+    environment = package_build_environment(commands.env)
+    invocation = namespace_command(["/usr/bin/python3", "-I", "-B",
+                  str(source / "packaging/linux/package_appimage.py"),
+                  "--update-build-plan", str(plan_path), "--gitleaks", commands.gitleaks],
+                  build_root / "namespace", environment)
+    commands.run(invocation, cwd=source, seconds=3300, env=environment, operation="package_build")
+    destination = build_root / "packages"
     helper = runpy.run_path(str(source / "scripts/prepare_appimage_update.py"))
     # Inspect the just-built local binary before any signing/download, using its
     # supported metadata-only entry point, never an untrusted downloaded probe.
@@ -631,6 +641,7 @@ def execute(args):
     checks = set()
     with tempfile.TemporaryDirectory(prefix="morpheus-installed-update-") as temporary:
         commands = Commands(Path(temporary))
+        commands.gitleaks = args.gitleaks
         certificate, feed = Certificate(commands), None
         try:
             commands.mark("preflight")
