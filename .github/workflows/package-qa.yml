@@ -374,6 +374,12 @@ jobs:
             /usr/bin/timeout --kill-after=10s 300s sudo --non-interactive /bin/bash -c 'exec /usr/bin/dpkg --install -- "$1"/*.deb' _ "$root_cache"
             stage=install_consistency
             /usr/bin/timeout --kill-after=10s 60s sudo --non-interactive /usr/bin/apt-get --no-download check
+            stage=runtime_permissions
+            # Exact package installation does not fix writable directories
+            # inherited from the hosted image. Tighten only fixed macro trees;
+            # the unchanged version/owner/size/hash verifier still runs next.
+            git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |
+              sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS /usr/bin/python3 -I -B - --runtime-inputs >&3
             stage=verify
             /usr/bin/timeout --kill-after=10s 120s /usr/bin/python3 -I -B - "$private/runtime-host.json" <<'VERIFY_RUNTIME_HOST'
           import hashlib, json, os, pathlib, stat, subprocess, sys
