@@ -146,6 +146,11 @@ APP_RECOVERY_TESTS = tuple("live::stale_observer_tests::" + name for name in (
 ))
 APP_RECOVERY_STAGE = re.compile(r"^MORPHEUS_APP_RECOVERY_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_RECOVERY_CHECK = re.compile(r"^MORPHEUS_APP_RECOVERY_CHECK ([a-z_]{1,48})=(true|false)$", re.MULTILINE)
+# Share the same bounded first-panic header between process and recovery facts.
+NATIVE_PANIC = re.compile(
+    r"^thread '[^'\r\n]{1,256}'(?: \([0-9]{1,10}\))? panicked at ([^\r\n]{1,1024})$",
+    re.MULTILINE,
+)
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
 LATE_JOIN_DECRYPT_RESULTS = frozenset((
     "decrypted", "MissingMegolmSession", "UnknownMegolmMessageIndex", "otherUTD", "unavailable",
@@ -445,10 +450,39 @@ def drafts_completed(output: str) -> bool:
 
 
 def app_recovery_diagnostics(output: str) -> dict:
+    panic = NATIVE_PANIC.search(output)
+    end = panic.start() if panic else len(output)
     result = {}
-    for match in APP_RECOVERY_STAGE.finditer(output):
+    # Serial libtest cases continue after a panic; later stages are unrelated
+    # to the first failure recorded by native_process_diagnostics.
+    for match in APP_RECOVERY_STAGE.finditer(output, 0, end):
         if match[1] in APP_RECOVERY_CASES:
             result["stage"] = match[1]
+    if (panic and result.get("stage") == "observer_revocation"
+            and panic[0].startswith("thread '" + APP_RECOVERY_TESTS[0] + "'")
+            and re.fullmatch(r"crates/morpheus-app/src/live\.rs:[0-9]+:[0-9]+:?", panic[1])):
+        # Result.expect emits this fixed prefix before the derived Debug variant.
+        # Read only a bounded prefix; never retain or publish its payload.
+        message = output[panic.end():panic.end() + 256]
+        prefix = "\nCannot remove first account: "
+        if message.startswith(prefix):
+            value = message[len(prefix):]
+            category = "other"
+            for variant, token, unit in (
+                    ("AccountAccessBusy", "account_access_busy", True),
+                    ("AccountRemovalPending", "account_removal_pending", True),
+                    ("AccountNotFound", "account_not_found", False),
+                    ("Io", "io", False), ("Json", "json", False),
+                    ("Keyring", "keyring", False), ("Sdk", "sdk", False)):
+                if ((unit and (value == variant or value.startswith(variant + "\n")
+                              or value.startswith(variant + "\r\n")))
+                        or (not unit and value.startswith(variant + "("))):
+                    category = token
+                    break
+            result["cleanup_failure"] = {
+                "case": "observer_revocation", "operation": "first_account_logout",
+                "category": category,
+            }
     return result
 
 
@@ -514,8 +548,7 @@ def native_process_diagnostics(output: str, returncode, timed_out: bool) -> dict
             result.update(result="exited", exit_code=returncode)
         elif -64 <= returncode < 0:
             result.update(result="signalled", signal=-returncode)
-    panic = re.search(r"^thread '[^'\r\n]{1,256}'(?: \([0-9]{1,10}\))? panicked at ([^\r\n]{1,1024})$",
-                      output, re.MULTILINE)
+    panic = NATIVE_PANIC.search(output)
     result["panic_observed"] = panic is not None
     result["assertion_observed"] = re.search(
         r"^assertion (?:failed:|`left (?:==|!=) right` failed)", output, re.MULTILINE) is not None

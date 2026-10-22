@@ -1383,6 +1383,76 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
             self.assertNotIn("app_recovery", visible.getvalue())
             self.assertEqual(runner.results, [])
 
+    def test_recovery_stage_stops_at_first_panic_before_later_serial_cases(self):
+        output = ("MORPHEUS_APP_RECOVERY_STAGE typed_retention\n"
+                  "MORPHEUS_APP_RECOVERY_STAGE observer_revocation\n"
+                  "MORPHEUS_APP_RECOVERY_STAGE PRIVATE_TOKEN\n"
+                  "thread 'worker' (123) panicked at crates/morpheus-app/src/live.rs:42:7:\n"
+                  "PRIVATE_SERVER_RESPONSE\n"
+                  "MORPHEUS_APP_RECOVERY_STAGE late_typing_retention\n"
+                  "thread 'later' panicked at /PRIVATE_PATH/source.rs:7:1:\n")
+        result = acceptance_module.app_recovery_diagnostics(output)
+        self.assertEqual(result, {"stage": "observer_revocation"})
+        process = acceptance_module.native_process_diagnostics(output, 101, False)
+        self.assertTrue(process["panic_observed"])
+        self.assertEqual(process["panic_family"], "morpheus")
+        self.assertNotIn("PRIVATE", json.dumps((result, process)))
+
+    def test_logout_panic_exposes_only_exact_variant_categories_not_payloads(self):
+        header = ("MORPHEUS_APP_RECOVERY_STAGE observer_revocation\nthread '"
+                  + acceptance_module.APP_RECOVERY_TESTS[0]
+                  + "' (123) panicked at crates/morpheus-app/src/live.rs:42:7:\n"
+                  "Cannot remove first account: ")
+        for value, category in (
+                ("AccountAccessBusy", "account_access_busy"),
+                ("AccountRemovalPending", "account_removal_pending"),
+                ('AccountNotFound("PRIVATE_ACCOUNT")', "account_not_found"),
+                ('Io(Os { code: 5, message: "PRIVATE_PATH" })', "io"),
+                ('Json(Error("PRIVATE_JSON"))', "json"),
+                ('Keyring("PRIVATE_KEYRING")', "keyring"),
+                ('Sdk("PRIVATE_SERVER_RESPONSE")', "sdk"),
+                ('InvalidRegistry("PRIVATE_REGISTRY")', "other"),
+                ('AccountAccessBusy("PRIVATE_PAYLOAD")', "other"),
+                ('AccountAccessBusyPRIVATE', "other"),
+                ('IoPRIVATE("PRIVATE_PAYLOAD")', "other"),
+                ('Io', "other"), ("PRIVATE_TOKEN" * 1000, "other")):
+            with self.subTest(category=category):
+                output = (header + value + "\nMORPHEUS_APP_RECOVERY_STAGE late_typing_retention\n")
+                result = acceptance_module.app_recovery_diagnostics(output)
+                self.assertEqual(result, {"stage": "observer_revocation", "cleanup_failure": {
+                    "case": "observer_revocation", "operation": "first_account_logout",
+                    "category": category}})
+                self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_cleanup_category_requires_the_first_exact_case_location_and_prefix(self):
+        stage = "MORPHEUS_APP_RECOVERY_STAGE observer_revocation\n"
+        header = ("thread '" + acceptance_module.APP_RECOVERY_TESTS[0]
+                  + "' panicked at crates/morpheus-app/src/live.rs:42:7:\n")
+        message = "Cannot remove first account: Io(PRIVATE_PAYLOAD)\n"
+        for output in (
+                stage + header.replace(acceptance_module.APP_RECOVERY_TESTS[0], "other_test") + message,
+                stage + header.replace("src/live.rs", "src/other.rs") + message,
+                stage + header + message.replace("first account", "other account"),
+                stage + "thread 'first' panicked at /PRIVATE/source.rs:1:1:\n" + header + message,
+                stage + header + "PRIVATE_LINE\n" + message):
+            with self.subTest(output=output):
+                self.assertEqual(acceptance_module.app_recovery_diagnostics(output),
+                                 {"stage": "observer_revocation"})
+        result = acceptance_module.app_recovery_diagnostics(
+            "MORPHEUS_APP_RECOVERY_STAGE PRIVATE_TOKEN\n" + header + message + stage)
+        self.assertEqual(result, {})
+        self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_nonpanic_quotes_and_malformed_headers_keep_last_allowed_stage(self):
+        output = ("MORPHEUS_APP_RECOVERY_STAGE observer_revocation\n"
+                  "server quoted panicked at PRIVATE_PATH\n"
+                  "thread 'PRIVATE' panicked at \n"
+                  "MORPHEUS_APP_RECOVERY_STAGE late_typing_retention\n"
+                  "MORPHEUS_APP_RECOVERY_STAGE late_typing_retention PRIVATE_TOKEN\n")
+        self.assertEqual(acceptance_module.app_recovery_diagnostics(output),
+                         {"stage": "late_typing_retention"})
+        self.assertFalse(acceptance_module.native_process_diagnostics(output, 1, False)["panic_observed"])
+
     def test_deadline_exposes_only_fixed_stage_and_process_facts(self):
         output = ("MORPHEUS_APP_RECOVERY_STAGE typed_retention\n"
                   "MORPHEUS_APP_RECOVERY_STAGE private_token\nprivate-server-response\n")
