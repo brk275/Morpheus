@@ -86,10 +86,48 @@ class ProgressTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             p = D.Progress(Path(directory))
             p.command("private-user-token")
-            p.failed(ValueError("private URL"))
+            p.failed(RuntimeError("private URL"))
             self.assertEqual(p.value["command_stage"], "unknown")
             self.assertEqual(p.value["failure"]["reason"], "unknown")
             self.assertNotIn("private", json.dumps(p.value))
+
+    def test_builtin_failures_have_closed_categories_without_reflecting_payloads(self):
+        cases = ((FileNotFoundError, "filesystem_missing"), (FileExistsError, "filesystem_exists"),
+                 (PermissionError, "filesystem_denied"), (NotADirectoryError, "filesystem_not_directory"),
+                 (IsADirectoryError, "filesystem_is_directory"), (OSError, "filesystem_io"),
+                 (KeyError, "python_key"), (TypeError, "python_type"), (ValueError, "python_value"))
+        for kind, expected in cases:
+            with self.subTest(kind=kind):
+                error = kind("private filename, URL and server body")
+                self.assertEqual(D.reason(error), expected)
+                self.assertIn(expected, D.REASONS)
+        error = UnicodeDecodeError("utf-8", b"private", 0, 1, "private body")
+        self.assertEqual(D.reason(error), "python_decode")
+        def forbidden(*_):
+            raise AssertionError("foreign payload must not be consulted")
+        for kind, _ in cases:
+            foreign = type(kind.__name__, (kind,), {"__str__": forbidden, "reason": property(forbidden)})
+            self.assertEqual(D.reason(foreign("private")), "unknown")
+        foreign_meta = type("ForeignType", (type,), {"__hash__": forbidden, "__eq__": forbidden})
+        foreign = foreign_meta("FileNotFoundError", (FileNotFoundError,), {"__str__": forbidden})
+        self.assertEqual(D.reason(foreign("private")), "unknown")
+
+    def test_original_filesystem_error_survives_runner_pipe_normalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress = D.Progress(root)
+            progress.wrapper("build")
+            progress.command("runtime-zstd-stage")
+            progress.failed(FileExistsError("private source path"))
+            progress.failed(C.CommandFailure("pipe"))
+            progress.command("cleanup-env")
+            self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                             {"diagnostics": "withheld", "passed": False})
+            record = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(record["failure"]["reason"], "filesystem_exists")
+            self.assertEqual(record["failure"]["command_stage"], "runtime-zstd-stage")
+            self.assertTrue(D.valid_record(progress.value))
+            self.assertNotIn("private", json.dumps(record))
 
     def test_only_real_inventory_fixed_subreasons_are_published(self):
         import appimage_notices as N
@@ -157,12 +195,12 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(D.PEER_FACTS, set(capture.FACTS))
         import ast
         names = set()
-        for name in ("appimage_capture.py", "appimage_capture_worker.py", "package_appimage.py", "appimage_notices.py"):
+        for name in ("appimage_capture.py", "appimage_capture_worker.py", "package_appimage.py", "appimage_notices.py", "appimage_runtime_build.py"):
             tree = ast.parse((ROOT / "packaging/linux" / name).read_text())
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant):
                     call = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)
-                    if call in ("run", "command") and isinstance(node.args[0].value, str):
+                    if call in ("run", "command", "mark") and isinstance(node.args[0].value, str):
                         names.add(node.args[0].value)
         self.assertTrue(names <= D.COMMANDS, names - D.COMMANDS)
 

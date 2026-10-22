@@ -15,6 +15,12 @@ import tempfile
 COMMANDS = frozenset((
     "none", "unknown", "cargo-version", "packager-version", "download", "native-build", "package", "extract", "update-metadata",
     "runtime-musl-build", "runtime-musl-install",
+    "runtime-zlib-configure", "runtime-zlib-build", "runtime-zlib-install", "runtime-zstd-build",
+    "runtime-mimalloc-build", "runtime-mimalloc-archive", "runtime-fuse-configure", "runtime-fuse-install",
+    "runtime-squashfuse-bootstrap", "runtime-squashfuse-configure", "runtime-squashfuse-build",
+    "runtime-malformed-build", "runtime-malformed-test", "runtime-squashfuse-install",
+    "runtime-compile", "runtime-link", "runtime-strip", "runtime-headers", "runtime-zstd-stage",
+    "runtime-native-config", "runtime-squashfuse-headers", "runtime-verify", "runtime-notices",
     "download-linuxdeploy", "download-appimage-plugin",
     "download-pipewire-dsc", "download-pipewire-original", "download-pipewire-debian", "download-pipewire-patch",
     "download-runtime-fuse", "download-runtime-mimalloc", "download-runtime-musl", "download-runtime-runtime",
@@ -33,7 +39,16 @@ PHASES = frozenset(("none", "setup", "bus", "keyring", "display", "portal", "pee
                     "app_left", "app_close", "bindings", "complete"))
 PEER_FACTS = frozenset(("unavailable_audio_verified", "peer_ready", "exact_sender_joined", "static_frame", "changed_frame",
                        "screen_stopped", "reopened_frame", "changed_after_reopen", "source_loss_stopped_track", "app_left", "cleanup", "complete"))
-REASONS = frozenset(("command_deadline", "command_output", "command_exit", "command_pipe", "command_cleanup", "command_input",
+# Exact built-in types only. No exception text, args, errno, filenames or foreign
+# properties are consulted; subclasses and unlisted errors remain unknown.
+BUILTIN_REASONS = {
+    FileNotFoundError: "filesystem_missing", FileExistsError: "filesystem_exists",
+    PermissionError: "filesystem_denied", NotADirectoryError: "filesystem_not_directory",
+    IsADirectoryError: "filesystem_is_directory", OSError: "filesystem_io",
+    UnicodeDecodeError: "python_decode", KeyError: "python_key",
+    TypeError: "python_type", ValueError: "python_value",
+}
+REASONS = frozenset((*BUILTIN_REASONS.values(), "command_deadline", "command_output", "command_exit", "command_pipe", "command_cleanup", "command_input",
                      "command_http_forbidden", "command_http_not_found", "command_http_rate_limited", "command_http_unavailable",
                      "command_http_rejected", "command_download_transport", "command_download_tls",
                      "interrupted", "capture", "identity", "binding", "package", "inventory", "unknown", "namespace_exit",
@@ -53,6 +68,9 @@ def reason(error):
         return "command_" + error.reason if "command_" + error.reason in REASONS else "unknown"
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         return "interrupted"
+    for kind, token in BUILTIN_REASONS.items():
+        if type(error) is kind:
+            return token
     from appimage_notices import InventoryFailure
     # Only our exact exception type has a bounded sub-reason. Never inspect
     # a foreign exception's message, properties or payload for publication.
