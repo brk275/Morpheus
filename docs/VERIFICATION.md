@@ -3,6 +3,105 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Current status: 2026-10-22
+
+The source-generation result below was produced at
+[`989a786`](https://github.com/brk275/Morpheus/commit/989a7867e4ea6214ee2aca4ee17fa6bb41a06e81).
+Results below identify their actual producing source. Later packaging and helper
+changes did not turn the earlier native runs into a new combined pipeline.
+
+### Current producing results
+
+- [PR 27](https://github.com/brk275/Morpheus/pull/27) merged as
+  [`51b3c15`](https://github.com/brk275/Morpheus/commit/51b3c15d33730905a4f53533f0dd8a3a1625779a)
+  after fresh [CI run 39821925679](https://github.com/brk275/Morpheus/actions/runs/39821925679)
+  passed on Apple Silicon, Intel Mac, Windows and Linux. The reviewed source was
+  `446a3b3952b5e3c4fe87f19f3ecace31caf83aab`; the executed test merge was
+  `d0a73f4ffd12f4a9f90bb9e61dcdc950d4cc0ec2`. Both and the merge preserve tree
+  `a6996633694b5ca82c664314b5f8dcf775460c8e`. The desktop app suites passed
+  782 tests on Apple Silicon, 782 on Intel Mac, 781 on Windows and 797 on Linux.
+  All three watcher lifetime regressions passed on each target. All 49 closed
+  Linux live records passed, including the twelve recovery checks and the
+  official Element Call `v0.28.0-rc.1` Sticky2025 pre-synced audio, video, roster
+  and participant-departure fixture. That fixture does not establish broad
+  interoperability, fresh-device or physical-device acceptance. The separate
+  watcher ownership defect is fixed; the older intermittent logout cause
+  described below remains unproved.
+- Fresh [native-vault run 39838186967](https://github.com/brk275/Morpheus/actions/runs/39838186967)
+  at `51b3c15` passed on Apple Silicon, Intel Mac and Windows. Each passed five
+  contracts, 13 preparation checks, 11 restart/removal checks and required
+  cleanup. These are isolated, inactive-account fixtures; they do not instantiate
+  the loaded account watcher or replace its lifetime regressions. Installed
+  sign-in, account interaction and screen-reader acceptance remain open.
+- The [PR 29 classifier change](https://github.com/brk275/Morpheus/pull/29)
+  merged as `0834cf7`. [PR 28 source packaging](https://github.com/brk275/Morpheus/pull/28)
+  merged as `989a786` after the scoped helper checks in
+  [run 39840806984](https://github.com/brk275/Morpheus/actions/runs/39840806984)
+  passed. This helper result does not claim a new native matrix or installed
+  package acceptance.
+- Actual private [source generation run 39841925560](https://github.com/brk275/Morpheus/actions/runs/39841925560)
+  on `989a786` passed: 1,140 original checksummed crate archives, three
+  authenticated Git source trees and all 1,174 locked packages. Owned cleanup
+  passed; both complete job logs passed default secret scans; no artifacts were
+  uploaded. The receipt binds source/tree, bundle/manifest hashes and counts.
+  This does not establish source-content or full license compliance, native and
+  system/compiler source completeness, preferred generated source forms or
+  relinking/install information. Distribution remains disabled.
+- The real installed AppImage capture check
+  [39842840653](https://github.com/brk275/Morpheus/actions/runs/39842840653) on
+  `989a786` **failed before compilation** during pinned host-tool provisioning.
+  It supplies no installed runtime or capture acceptance. Source generation and earlier system-client fixtures
+  are separate evidence.
+
+### Earlier qualified producing results
+
+- [PR 23](https://github.com/brk275/Morpheus/pull/23) merged as `6078abf` after
+  native verification across Apple Silicon, Intel Mac, Windows and Linux.
+  The fresh [Intel App run](https://github.com/brk275/Morpheus/actions/runs/39766785476)
+  passed 782 tests with one intentional ignore. Other platform and component
+  results were reused only for unchanged reviewed inputs; the merge itself
+  was not executed anew on all four platforms.
+- The existing [optimized encrypted 10,000-message check](https://github.com/brk275/Morpheus/actions/runs/39756940224)
+  passed on Linux at `a8404f8b` for native sliding sync and classic `/sync`, with
+  10,000 distinct decrypted records and 240 accepted wheel inputs per adapter,
+  render-hook observations, switch-back, reopen and cleanup. It is an instrumented build,
+  not shipping-app, hardware or cross-platform performance acceptance.
+- The system Wayland fixture passed in [run 39739945431](https://github.com/brk275/Morpheus/actions/runs/39739945431/job/119694729721)
+  at source `256205f9`: first static frame, moving pixels after reopen, source
+  loss, stop, denial and cancellation. All 33 function origins were verified
+  in the owned fixed client with stock PipeWire services. This supersedes the
+  older first-frame failure for that fixture. Untouched-static reopen,
+  native-window capture, GNOME/KDE desktops, packaged capture and physical
+  devices remain unverified by this result.
+- [Native-vault run 39798731971](https://github.com/brk275/Morpheus/actions/runs/39798731971)
+  at `0c829d0` passed on Apple Silicon and Windows: five fixture contracts,
+  13 preparation checks, 11 restart/removal checks and required cleanup.
+  Intel failed during setup without reaching the credential phases.
+  The focused [Intel run 39816876240](https://github.com/brk275/Morpheus/actions/runs/39816876240)
+  at `ea568d6` passed all of those phases and cleanup. The earlier failure did
+  not recur; its cause is unconfirmed. These synthetic core/vault results do
+  not establish installed UI, real-account or later changed-source acceptance.
+- The original [PR 25 CI run 39800579815](https://github.com/brk275/Morpheus/actions/runs/39800579815)
+  remains failed overall. Its Linux builds, protocol/model checks, desktop
+  checks and system Wayland fixture passed, but the twelve-case app recovery
+  command failed while logging out its first synthetic account. Its cause
+  remains unconfirmed. A focused [recovery run 39814600499](https://github.com/brk275/Morpheus/actions/runs/39814600499)
+  at `50d6e78` passed all twelve app recovery checks, the three other existing
+  draft/moderation commands and service/container/network cleanup. Its Rust
+  inputs were byte-identical to PR 25; the changes improved failure diagnostics
+  and added four helper regressions. The original failure did not recur; this
+  is not proof of a production fix. PR 25's merge used these qualified results
+  and the separate current-main helper result from
+  [run 39814910361](https://github.com/brk275/Morpheus/actions/runs/39814910361).
+  No combined green pipeline is claimed.
+
+
+Installed-package, physical-device, recovery, SSO, full interoperability,
+screen-reader, licensing, signing, update and beta release gates remain open.
+Installer downloads remain disabled. See the [release checklist](RELEASE_CHECKLIST.md).
+The entries below retain their historical producing revisions and limitations;
+they do not replace the current results or pending checks above.
+
 ## Appearance and keyboard validation: `2fddb7f`
 
 [PR 9](https://github.com/brk275/Morpheus/pull/9) was reviewed and merged as

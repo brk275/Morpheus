@@ -244,6 +244,9 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          # EXIT may run while the failed command group still redirects stdout.
+          # Keep a separate descriptor for closed, non-secret status only.
+          exec 3>&1
           private="$(mktemp -d "$RUNNER_TEMP/morpheus-runtime-host.XXXXXXXX")"
           mkdir "$private/debs"
           : > "$private/provision.log"
@@ -251,8 +254,10 @@ jobs:
           printf '[extend]\nuseDefault = true\n' > "$private/gitleaks.toml"
           root_cache=''
           stage=inputs
+          input=0
           finish() {
             result=$?
+            command_result=$result
             trap - EXIT
             if [[ -n "$root_cache" ]]; then
               if ! sudo --non-interactive /usr/bin/rm -rf -- "$root_cache" >> "$private/provision.log" 2>&1; then
@@ -266,12 +271,15 @@ jobs:
               result=1
               stage=scan
             fi
-            if [[ "$result" == 0 ]]; then
-              printf 'MORPHEUS_RUNTIME_HOST_PROVISION {"passed":true,"packages":18,"hashed_inputs":634}\n'
-            else
-              printf 'MORPHEUS_RUNTIME_HOST_PROVISION {"passed":false,"stage":"%s"}\n' "$stage"
+            if ! rm -rf -- "$private"; then
+              result=1
+              stage=cleanup
             fi
-            rm -rf -- "$private"
+            if [[ "$result" == 0 ]]; then
+              printf 'MORPHEUS_RUNTIME_HOST_PROVISION {"passed":true,"packages":18,"hashed_inputs":634}\n' >&3
+            else
+              printf 'MORPHEUS_RUNTIME_HOST_PROVISION {"passed":false,"stage":"%s","input":%s,"exit_code":%s}\n' "$stage" "$input" "$command_result" >&3
+            fi
             exit "$result"
           }
           trap finish EXIT
@@ -282,6 +290,7 @@ jobs:
             echo "f5a8b93d2d6d670e66c085184fe49135bf7634530838d9fdfed7d7e0390b6656  packaging/linux/runtime-build-host.json" | /usr/bin/sha256sum --check --status
             stage=download
             while IFS=$'\t' read -r file bytes digest url; do
+              input=$((input + 1))
               /usr/bin/curl --disable --fail --silent --show-error --location --max-redirs 3 \
                 --noproxy '*' --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 \
                 --max-filesize "$bytes" "$url" --output "$private/debs/$file"
@@ -307,6 +316,7 @@ jobs:
           17-gcc-13-base.deb	51616	e859aca26585bb91113a451f1e66bc0e5283cb08797d679aacc1d936ae6dff8e	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/gcc-13-base_13.3.0-6ubuntu2~24.04.1_amd64.deb
           18-libbinutils.deb	576834	064dce00ce94e1fc2d33779cb0071088f4c8aac79e85345f2e78a020f7d14699	https://archive.ubuntu.com/ubuntu/pool/main/b/binutils/libbinutils_2.42-4ubuntu2.10_amd64.deb
           PINNED_RUNTIME_HOST_DEBS
+            input=0
             stage=install
             # No resolver fallback, --fix-broken or force-depends. Missing exact
             # matching siblings are pinned below; ambient dependencies must pass
@@ -338,7 +348,9 @@ jobs:
           17-gcc-13-base.deb	51616	e859aca26585bb91113a451f1e66bc0e5283cb08797d679aacc1d936ae6dff8e	https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-13/gcc-13-base_13.3.0-6ubuntu2~24.04.1_amd64.deb
           18-libbinutils.deb	576834	064dce00ce94e1fc2d33779cb0071088f4c8aac79e85345f2e78a020f7d14699	https://archive.ubuntu.com/ubuntu/pool/main/b/binutils/libbinutils_2.42-4ubuntu2.10_amd64.deb
           PINNED_RUNTIME_HOST_RECHECK
+            stage=install_dpkg
             /usr/bin/timeout --kill-after=10s 300s sudo --non-interactive /bin/bash -c 'exec /usr/bin/dpkg --install -- "$1"/*.deb' _ "$root_cache"
+            stage=install_consistency
             /usr/bin/timeout --kill-after=10s 60s sudo --non-interactive /usr/bin/apt-get --no-download check
             stage=verify
             /usr/bin/timeout --kill-after=10s 120s /usr/bin/python3 -I -B - "$private/runtime-host.json" <<'VERIFY_RUNTIME_HOST'

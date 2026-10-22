@@ -9,6 +9,28 @@ python3 scripts/package.py
 
 The package output goes to `dist/`. This command does not make a public release. The packaged call feature still needs real MatrixRTC interoperability and device testing before a beta can be distributed.
 
+## Current acceptance status: 2026-10-22
+
+The [verification summary](VERIFICATION.md#current-status-2026-10-22) records
+fresh four-platform native checks for PR 27 and three-platform synthetic vault
+checks at `51b3c15`. Those results do not establish installed credential or
+complete platform acceptance.
+
+[Source generation run 39841925560](https://github.com/brk275/Morpheus/actions/runs/39841925560)
+passed on `989a786`: 1,140 original crate archives, three authenticated Git trees
+and all 1,174 locked packages. Owned cleanup and the default diagnostic-log scans
+passed; no artifact was uploaded. This is qualified Rust/workspace source evidence.
+Source-content review and complete licensing, native/system/compiler source and
+relinking requirements remain open; `distribution_ready` remains false.
+
+The installed AppImage capture check
+[39842840653](https://github.com/brk275/Morpheus/actions/runs/39842840653) on
+`989a786` failed during pinned host-tool provisioning before compilation.
+No installed capture acceptance is claimed. The patched runtime and installed
+capture path are not accepted by the source-generation result or earlier
+system Wayland fixtures. No installer release is approved. The platform,
+licensing, signing, update and rollback gates below still apply.
+
 ## Selecting a reviewed package source
 
 The manual **Package validation** workflow runs from `main`. Leave
