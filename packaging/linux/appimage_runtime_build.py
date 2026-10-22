@@ -223,6 +223,13 @@ def prepare(runner, root, environment):
            "LANG": "C", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "0"}
     deadline = time.monotonic() + spec["bounds"]["total_seconds"]
     commands = []
+    progress = getattr(runner, "progress", None)
+
+    def mark(stage):
+        # Label Python-only work as well as commands; the last command alone
+        # cannot identify a later filesystem failure. No paths enter progress.
+        if progress is not None:
+            progress.command(stage)
 
     def run(stage, argv, *, cwd=work, budget=120, bound=1024 * 1024):
         remaining = deadline - time.monotonic()
@@ -280,6 +287,7 @@ def prepare(runner, root, environment):
     run("runtime-musl-install", [tools["make"], "-s", "install"], cwd=source / "musl")
     # The source's only Linux UAPI include is closed to these13 pinned
     # declaration headers. No host glibc include/search directory is added.
+    mark("runtime-headers")
     for destination, original in spec["kernel_headers"].items():
         content = client.read_regular(Path(original).resolve(strict=True), 65536)
         if digest(content) != host_spec["files"][original]["sha256"]:
@@ -294,28 +302,30 @@ def prepare(runner, root, environment):
                LDFLAGS="-static -L" + shlex.quote(str(prefix / "lib")),
                PKG_CONFIG=tools["pkg-config"], PKG_CONFIG_PATH="", PKG_CONFIG_LIBDIR=str(prefix / "lib/pkgconfig"),
                REALGCC=tools["gcc-13"])
-    run("configure", [str(source / "zlib/configure"), "--static", "--prefix=" + str(prefix)], cwd=source / "zlib")
-    run("client-build", [tools["make"], "-j2", "libz.a"], cwd=source / "zlib")
-    run("client-build", [tools["make"], "install"], cwd=source / "zlib")
-    run("client-build", [tools["make"], "-C", str(source / "zstd/lib"), "-j2", "libzstd.a"], budget=300)
+    run("runtime-zlib-configure", [str(source / "zlib/configure"), "--static", "--prefix=" + str(prefix)], cwd=source / "zlib")
+    run("runtime-zlib-build", [tools["make"], "-j2", "libz.a"], cwd=source / "zlib")
+    run("runtime-zlib-install", [tools["make"], "install"], cwd=source / "zlib")
+    run("runtime-zstd-build", [tools["make"], "-C", str(source / "zstd/lib"), "-j2", "libzstd.a"], budget=300)
+    mark("runtime-zstd-stage")
     client.write_new(prefix / "lib/libzstd.a", client.read_regular(source / "zstd/lib/libzstd.a", 16 * 1024 * 1024))
     for name in ("zstd.h", "zstd_errors.h"):
         client.write_new(prefix / "include" / name, client.read_regular(source / "zstd/lib" / name, 1048576))
     # Upstream's supported single-object static target, with Alpine's secure
     # mode and musl definition; no C++/CMake/allocator download is introduced.
     mi = work / "mimalloc.o"
-    run("client-build", [str(wrapper), "-std=c11", "-Os", "-fPIC", "-ftls-model=local-dynamic", "-pthread", "-DMI_SECURE=4", "-DMI_STATIC_LIB", "-DMI_MALLOC_OVERRIDE", "-DMI_LIBC_MUSL=1", "-DNDEBUG", "-I" + str(source / "mimalloc/include"), "-c", str(source / "mimalloc/src/static.c"), "-o", str(mi)])
-    run("client-build", [tools["ar"], "rcs", str(prefix / "lib/libmimalloc.a"), str(mi)])
+    run("runtime-mimalloc-build", [str(wrapper), "-std=c11", "-Os", "-fPIC", "-ftls-model=local-dynamic", "-pthread", "-DMI_SECURE=4", "-DMI_STATIC_LIB", "-DMI_MALLOC_OVERRIDE", "-DMI_LIBC_MUSL=1", "-DNDEBUG", "-I" + str(source / "mimalloc/include"), "-c", str(source / "mimalloc/src/static.c"), "-o", str(mi)])
+    run("runtime-mimalloc-archive", [tools["ar"], "rcs", str(prefix / "lib/libmimalloc.a"), str(mi)])
+    mark("runtime-native-config")
     native = work / "musl-native.ini"
     client.write_new(native, ("[binaries]\nc = " + repr([str(wrapper)]) + "\nar = " + repr(tools["ar"]) + "\nstrip = " + repr(tools["strip"]) + "\npkgconfig = " + repr(tools["pkg-config"]) + "\n[built-in options]\nc_link_args = ['-static']\n").encode())
     fb = work / "fuse-build"
-    run("configure", [tools["meson"], "setup", str(fb), str(source / "fuse"), "--native-file", str(native), "--prefix=" + str(prefix), "--libdir=lib", "--default-library=static", "--wrap-mode=nodownload", "-Dutils=false", "-Dexamples=false", "-Dtests=false", "-Duseroot=false", "-Ddisable-libc-symbol-version=true", "-Dinitscriptdir="], budget=180)
-    run("client-build", [tools["ninja"], "-C", str(fb), "-j2", "install"], budget=180)
+    run("runtime-fuse-configure", [tools["meson"], "setup", str(fb), str(source / "fuse"), "--native-file", str(native), "--prefix=" + str(prefix), "--libdir=lib", "--default-library=static", "--wrap-mode=nodownload", "-Dutils=false", "-Dexamples=false", "-Dtests=false", "-Duseroot=false", "-Ddisable-libc-symbol-version=true", "-Dinitscriptdir="], budget=180)
+    run("runtime-fuse-install", [tools["ninja"], "-C", str(fb), "-j2", "install"], budget=180)
     sq = source / "squashfuse"
-    run("configure", [tools["autoreconf"], "-i"], cwd=sq)
-    run("configure", [str(sq / "configure"), "--prefix=" + str(prefix), "--disable-shared", "--enable-static", "--disable-demo", "--with-zlib=" + str(prefix), "--with-zstd=" + str(prefix), "--without-xz", "--without-lzo", "--without-lz4"], cwd=sq)
-    run("client-build", [tools["make"], "-j2"], cwd=sq, budget=180)
-    run("client-build", [tools["make"], "malformedtest"], cwd=sq)
+    run("runtime-squashfuse-bootstrap", [tools["autoreconf"], "-i"], cwd=sq)
+    run("runtime-squashfuse-configure", [str(sq / "configure"), "--prefix=" + str(prefix), "--disable-shared", "--enable-static", "--disable-demo", "--with-zlib=" + str(prefix), "--with-zstd=" + str(prefix), "--without-xz", "--without-lzo", "--without-lz4"], cwd=sq)
+    run("runtime-squashfuse-build", [tools["make"], "-j2"], cwd=sq, budget=180)
+    run("runtime-malformed-build", [tools["make"], "malformedtest"], cwd=sq)
     # The actual upstream malformed-image target must exist and return0;
     # skip77 is not success. Link it against the same freshly patched libs.
     malformed = sq / "malformedtest"
@@ -324,9 +334,10 @@ def prepare(runner, root, environment):
     malformed_bytes = client.read_regular(malformed, 4 * 1024 * 1024)
     if malformed_bytes[:7] != b"\x7fELF\x02\x01\x01":
         fail()
-    run("client-build", [str(malformed)], cwd=sq, budget=60, bound=65536)
-    run("client-build", [tools["make"], "install"], cwd=sq)
+    run("runtime-malformed-test", [str(malformed)], cwd=sq, budget=60, bound=65536)
+    run("runtime-squashfuse-install", [tools["make"], "install"], cwd=sq)
     # Upstream explicitly installs all public/internal headers for runtime.c.
+    mark("runtime-squashfuse-headers")
     for path in sq.glob("*.h"):
         target = prefix / "include/squashfuse" / path.name
         if not target.exists():
@@ -336,9 +347,10 @@ def prepare(runner, root, environment):
     rs = source / "runtime/src/runtime"
     runtime_object = work / "runtime.o"
     args = [str(wrapper), "-std=gnu99", "-Os", "-fPIE", "-D_FILE_OFFSET_BITS=64", '-DGIT_COMMIT="' + spec["version_label"] + '"', "-ffunction-sections", "-fdata-sections", "-ffile-prefix-map=" + str(work) + "=/usr/src/morpheus-runtime", "-Wall", "-Werror", "-I" + str(prefix / "include/squashfuse"), "-I" + str(prefix / "include/fuse3"), "-c", str(rs / "runtime.c"), "-o", str(runtime_object)]
-    run("client-build", args, cwd=rs)
-    run("client-build", [str(wrapper), "-T", str(rs / "data_sections.ld"), "-Wl,--gc-sections", "-static", "-static-pie", "-L" + str(prefix / "lib"), str(runtime_object), "-Wl,--start-group", "-lsquashfuse", "-lsquashfuse_ll", "-lzstd", "-lz", "-lfuse3", "-lmimalloc", "-Wl,--end-group", "-pthread", "-Wl,-Map," + str(linker_map), "-o", str(output)], cwd=rs)
-    run("client-build", [tools["strip"], "--strip-debug", "--strip-unneeded", str(output)])
+    run("runtime-compile", args, cwd=rs)
+    run("runtime-link", [str(wrapper), "-T", str(rs / "data_sections.ld"), "-Wl,--gc-sections", "-static", "-static-pie", "-L" + str(prefix / "lib"), str(runtime_object), "-Wl,--start-group", "-lsquashfuse", "-lsquashfuse_ll", "-lzstd", "-lz", "-lfuse3", "-lmimalloc", "-Wl,--end-group", "-pthread", "-Wl,-Map," + str(linker_map), "-o", str(output)], cwd=rs)
+    run("runtime-strip", [tools["strip"], "--strip-debug", "--strip-unneeded", str(output)])
+    mark("runtime-verify")
     data = client.read_regular(output, MAX_RUNTIME)
     # Exact upstream type2 header construction, after strip, without dd/shell.
     data = data[:8] + b"AI\x02" + data[11:]
@@ -371,6 +383,7 @@ def prepare(runner, root, environment):
                 "linked_inputs": loaded_files,
                 "fresh_private_prefix": True, "upstream_runtime_binary_downloaded": False,
                 "reproducible_build_proof": False, "distribution_ready": False}
+    mark("runtime-notices")
     stage = work / "notices"
     stage.mkdir(mode=0o700)
     for key, pin in spec["archives"].items():
