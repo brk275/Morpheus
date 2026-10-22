@@ -68,8 +68,9 @@ def reason(error):
         return "command_" + error.reason if "command_" + error.reason in REASONS else "unknown"
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         return "interrupted"
-    if type(error) in BUILTIN_REASONS:
-        return BUILTIN_REASONS[type(error)]
+    for kind, token in BUILTIN_REASONS.items():
+        if type(error) is kind:
+            return token
     from appimage_notices import InventoryFailure
     # Only our exact exception type has a bounded sub-reason. Never inspect
     # a foreign exception's message, properties or payload for publication.

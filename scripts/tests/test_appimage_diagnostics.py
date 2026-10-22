@@ -108,6 +108,9 @@ class ProgressTests(unittest.TestCase):
         for kind, _ in cases:
             foreign = type(kind.__name__, (kind,), {"__str__": forbidden, "reason": property(forbidden)})
             self.assertEqual(D.reason(foreign("private")), "unknown")
+        foreign_meta = type("ForeignType", (type,), {"__hash__": forbidden, "__eq__": forbidden})
+        foreign = foreign_meta("FileNotFoundError", (FileNotFoundError,), {"__str__": forbidden})
+        self.assertEqual(D.reason(foreign("private")), "unknown")
 
     def test_original_filesystem_error_survives_runner_pipe_normalization(self):
         with tempfile.TemporaryDirectory() as directory:
