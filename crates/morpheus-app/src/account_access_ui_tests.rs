@@ -11717,11 +11717,64 @@ async fn assert_inline_audio_card_layout() {
     let pause_label = format!("Pause audio {TITLE}");
     let save_label = format!("Save attachment {TITLE}");
     let stop_label = "Stop audio and release it from memory";
-    let geometry = |stacked: bool| {
+    let geometry = |case: u8, stacked: bool| {
         assert!(ui.get_viewport_seek_allowed() && !ui.get_settings_reveal_protected());
         let cards = control_bounds(&ui, &format!("Audio attachment {TITLE}"));
         assert_eq!(cards.len(), 1);
         let card = cards[0];
+        if !inside_window(&ui, card) {
+            use slint::private_unstable_api::re_exports::Flickable;
+
+            let (width, height) = window_size(&ui);
+            eprintln!(
+                "MORPHEUS_AUDIO_CARD_BOUNDS case={case} stacked={stacked} width={width} height={height} left={} top={} right={} bottom={}",
+                card.left, card.top, card.right, card.bottom
+            );
+            let target = control_with_label(&ui, &format!("Audio attachment {TITLE}"));
+            let nodes = geometry_nodes(&ui);
+            let mut capped = nodes.len() >= GEOMETRY_NODE_LIMIT;
+            let mut views = 0;
+            for node in nodes {
+                let Some(scroll) = node.downcast::<Flickable>() else {
+                    continue;
+                };
+                let mut visited = 0;
+                let mut contains = false;
+                node.visit_descendants(|item| {
+                    visited += 1;
+                    if item == &target {
+                        contains = true;
+                        return ControlFlow::Break(());
+                    }
+                    if visited >= GEOMETRY_NODE_LIMIT {
+                        capped = true;
+                        return ControlFlow::Break(());
+                    }
+                    ControlFlow::Continue(())
+                });
+                if contains {
+                    let viewport = item_bounds(&node);
+                    let scroll = scroll.as_pin_ref();
+                    eprintln!(
+                        "MORPHEUS_AUDIO_SCROLL_BOUNDS case={case} view={views} left={} top={} right={} bottom={} content_x={} content_y={} content_width={} content_height={}",
+                        viewport.left,
+                        viewport.top,
+                        viewport.right,
+                        viewport.bottom,
+                        scroll.content_x().0,
+                        scroll.content_y().0,
+                        scroll.content_width().0,
+                        scroll.content_height().0
+                    );
+                    views += 1;
+                    if views == 4 {
+                        capped = true;
+                        break;
+                    }
+                }
+            }
+            eprintln!("MORPHEUS_AUDIO_SCROLL_COUNT case={case} views={views} capped={capped}");
+        }
         assert!(inside_window(&ui, card));
         let mut buttons = Vec::new();
         for (label, caption) in [
@@ -11789,7 +11842,7 @@ async fn assert_inline_audio_card_layout() {
             );
         }
     };
-    geometry(false);
+    geometry(0, false);
     request_bridge_focus(&ui, &pause_label);
     key(&ui, Key::Tab);
     settle(&ui).await;
@@ -11814,7 +11867,7 @@ async fn assert_inline_audio_card_layout() {
     key(&ui, Key::Space);
     settle(&ui).await;
     assert_eq!(played.get(), 2);
-    geometry(true);
+    geometry(1, true);
     // The minimum valid details pane uses the same production card. All three
     // actions and long status remain within the actual pane at200%/24px padding.
     thread.set(true);
@@ -11833,7 +11886,7 @@ async fn assert_inline_audio_card_layout() {
     ui.set_attachment_audio_duration("2:40".into());
     ui.set_attachment_audio_status(STATUS.into());
     settle(&ui).await;
-    geometry(true);
+    geometry(2, true);
     let pane = control_bounds(&ui, "Conversation details");
     assert_eq!(pane.len(), 1);
     let card = control_bounds(&ui, &format!("Audio attachment {TITLE}"));
