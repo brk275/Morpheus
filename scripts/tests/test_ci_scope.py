@@ -136,7 +136,7 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(classify([wrapper]), {
             "native": False, "native_matrix": {"os": []}, "config": False, "wayland": False,
         })
-        for linux in ("packaging/linux.toml", "packaging/linux/appimage_runtime_build.py",
+        for linux in ("packaging/linux.toml", "packaging/linux/runtime-build.json",
                       "packaging/linux/runtime-build-host.json"):
             with self.subTest(linux=linux):
                 selected = classify([wrapper, linux])
@@ -182,6 +182,7 @@ class ScopeTests(unittest.TestCase):
                      "packaging/linux/appimage_diagnostics.py",
                      "packaging/linux/appimage_notices.py",
                      "packaging/linux/appimage_process.py",
+                     "packaging/linux/appimage_runtime_build.py",
                      "packaging/linux/corresponding_source.py",
                      "packaging/linux/source_bundle_qa.py"):
             with self.subTest(path=path):
