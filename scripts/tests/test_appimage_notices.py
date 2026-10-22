@@ -385,7 +385,11 @@ class PreparationTests(unittest.TestCase):
                   mock.patch.object(N, "elf_record", side_effect=lambda runner, path, *_: infos[path]),
                   mock.patch.object(N, "resolve_library", return_value=system) as resolver,
                   mock.patch.object(N, "package_record", return_value=(package, b"Exact package copyright", {"MIT": b"Common license text"}))):
-                prepared = N.prepare(mock.Mock(), root, binary, stage, source, config, {})
+                prepared = N.prepare(mock.Mock(), root, binary, stage, source, config, {},
+                                     runtime_metadata={"schema": 1, "fresh_private_prefix": True,
+                                         "malformedtest_returned_zero": True,
+                                         "upstream_runtime_binary_downloaded": False,
+                                         "runtime": {"sha256": "c" * 64}, "sources": {}, "patches": {}})
             self.assertEqual(set(prepared["components"]), {"morpheus-app", N.client.SONAME, "libsample.so.1"})
             resolver.assert_called_once_with("libsample.so.1")
             self.assertEqual(len(prepared["notices"]), 4)
