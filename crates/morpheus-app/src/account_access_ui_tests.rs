@@ -8376,6 +8376,48 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
         let action = button_bounds(ui, label);
         assert_eq!(status.len(), 1, "one actual room status for this record");
         assert_eq!(action.len(), 1, "one exact action for this record");
+        if !(inside_window(ui, status[0]) && inside_window(ui, action[0])) {
+            eprintln!(
+                "MORPHEUS_RECOVERY_GEOMETRY record={index}; status={:?}; action={:?}; window={:?}; text_percent={}; control_padding={}; scroll={:?}",
+                status[0],
+                action[0],
+                window_size(ui),
+                ui.get_font_scale_percent(),
+                ui.global::<crate::StyleTokens>().get_control_padding(),
+                {
+                    // Failure only: fixed record index and numeric geometry, never
+                    // message text, labels, account IDs or arbitrary node metadata.
+                    // Read the actual owning viewport; do not move or focus it.
+                    let target = control_with_label(ui, label);
+                    let mut scrolls = Vec::new();
+                    for node in geometry_nodes(ui) {
+                        let Some(scroll) =
+                            node.downcast::<slint::private_unstable_api::re_exports::Flickable>()
+                        else {
+                            continue;
+                        };
+                        let contains_target = node
+                            .visit_descendants(|item| {
+                                if item == &target {
+                                    std::ops::ControlFlow::Break(())
+                                } else {
+                                    std::ops::ControlFlow::Continue(())
+                                }
+                            })
+                            .is_some();
+                        if contains_target {
+                            let scroll = scroll.as_pin_ref();
+                            scrolls.push((
+                                item_bounds(&node),
+                                scroll.content_y().0,
+                                scroll.content_height().0,
+                            ));
+                        }
+                    }
+                    scrolls
+                }
+            );
+        }
         assert!(inside_window(ui, status[0]) && inside_window(ui, action[0]));
         assert!(
             status[0].bottom <= action[0].top + 0.5,
