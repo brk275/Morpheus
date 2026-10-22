@@ -43,7 +43,8 @@ WAYLAND_UNRELATED_THEME_INPUTS = {
     "themes/paper.toml",
     "themes/terminal.toml",
 }
-# These Python drivers run only in explicitly selected Linux package/source QA.
+# These Python drivers and the static-runtime source manifest run only in
+# explicitly selected Linux package/source QA.
 # Ordinary native CI cannot exercise them; its always-on helper suite covers
 # their pure/mocked contracts. Unknown package inputs still select Linux.
 MANUAL_LINUX_PACKAGE_INPUTS = {
@@ -54,6 +55,7 @@ MANUAL_LINUX_PACKAGE_INPUTS = {
     "packaging/linux/appimage_notices.py",
     "packaging/linux/appimage_process.py",
     "packaging/linux/appimage_runtime_build.py",
+    "packaging/linux/runtime-build.json",
     "packaging/linux/corresponding_source.py",
     "packaging/linux/source_bundle_qa.py",
 }
