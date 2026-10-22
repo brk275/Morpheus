@@ -33,6 +33,14 @@ except ModuleNotFoundError:
 REPO = Path(__file__).resolve().parents[1]
 SECURITY = "/usr/bin/security"
 BOUND = 16384
+MAC_CLEANUP_STAGES = frozenset(("mac_group_cleanup", "mac_group_status", "mac_group_signal",
+    "mac_group_snapshot", "mac_group_reap"))
+MAC_CLEANUP_CODES = frozenset(("process_cleanup", "process_cleanup_io", "process_cleanup_ownership",
+    "process_cleanup_timeout", "process_cleanup_subprocess", "process_snapshot_bound",
+    "process_snapshot_encoding", "process_snapshot_shape", "process_snapshot_anchor",
+    "process_snapshot_exit", "process_descendants", "process_deadline", "process_output_bound",
+    "process_io", "process_ownership", "process_status", "process_platform",
+    "process_input_bound", "process_bounds", "children_unconfirmed", "interrupted"))
 PREPARE_CHECKS = frozenset((
     "initial_empty", "password_enabled", "wrong_current_rejected", "password_changed",
     "synthetic_accounts_seeded", "protected_direct_switch_blocked", "wrong_authorization_rejected",
@@ -64,6 +72,23 @@ class Failure(Exception):
         self.code = code
         self.cleanup = cleanup
         self.created = created
+        self.cleanup_diagnostic = None
+
+
+def mac_cleanup_code(error):
+    # Never forward exception text, OS status, or an unrecognized Failure.code.
+    if isinstance(error, Failure):
+        detail = error.cleanup_diagnostic
+        if type(detail) is tuple and len(detail) == 2 and type(detail[1]) is str and detail[1] in MAC_CLEANUP_CODES:
+            return detail[1]
+        return error.code if type(error.code) is str and error.code in MAC_CLEANUP_CODES else "process_cleanup"
+    if isinstance(error, subprocess.TimeoutExpired):
+        return "process_cleanup_timeout"
+    if isinstance(error, OSError):
+        return "process_cleanup_io"
+    if isinstance(error, RuntimeError):
+        return "process_cleanup_ownership"
+    return "process_cleanup_subprocess"
 
 
 def require(condition, code):
@@ -107,6 +132,20 @@ class Evidence:
     def fail(self, stage, code):
         if self.first is None:
             self.first = {"stage": stage, "code": code}
+
+    def mac_cleanup(self, error, *, primary=False):
+        detail = getattr(error, "cleanup_diagnostic", None)
+        if detail is None:
+            return
+        # This is the source-to-public boundary; mutable exception attributes
+        # cannot introduce arbitrary strings into either result field.
+        if (type(detail) is not tuple or len(detail) != 2
+                or type(detail[0]) is not str or detail[0] not in MAC_CLEANUP_STAGES
+                or type(detail[1]) is not str or detail[1] not in MAC_CLEANUP_CODES):
+            detail = ("mac_group_cleanup", "process_cleanup")
+        if primary:
+            self.fail(detail[0], "process_cleanup")
+        self.cleanup_failed(detail[1])
 
     def cleanup_failed(self, code):
         if code not in self.cleanup_failures:
@@ -177,14 +216,17 @@ class MacRunner:
         finally:
             selector.close()
             if process is not None:
+                self.cleanup_stage = "mac_group_cleanup"
                 try:
                     self.stop_owned(process)
                     self.quiescent = True
-                except (Failure, OSError, RuntimeError, subprocess.SubprocessError):
+                except (Failure, OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    detail = (self.cleanup_stage, mac_cleanup_code(error))
                     if failure is None:
                         failure = Failure("process_cleanup", cleanup=True)
                     else:
                         failure.cleanup = True
+                    failure.cleanup_diagnostic = detail
                 finally:
                     if process.stdout is not None:
                         process.stdout.close()
@@ -196,7 +238,9 @@ class MacRunner:
     def stop_owned(self, process):
         # The reviewed fixture/security tools do not detach or start new sessions.
         # Retain the child PID until every member of its original group is dead.
+        self.cleanup_stage = "mac_group_status"
         package_smoke.process_status(process)
+        self.cleanup_stage = "mac_group_signal"
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -205,29 +249,31 @@ class MacRunner:
             pass
         deadline = time.monotonic() + 5
         while True:
+            self.cleanup_stage = "mac_group_snapshot"
             snapshot = _MacSnapshotRunner().snapshot()
             if not group_has_live_members(snapshot, process.pid):
                 break
             require(time.monotonic() < deadline, "process_descendants")
             time.sleep(0.05)
+        self.cleanup_stage = "mac_group_reap"
         process.wait(timeout=5)
         require(process.returncode is not None, "process_cleanup")
 
 
 def group_has_live_members(raw, group):
-    require(type(raw) is bytes and len(raw) <= 65536 and type(group) is int and group > 0, "process_snapshot")
+    require(type(raw) is bytes and len(raw) <= 65536 and type(group) is int and group > 0, "process_snapshot_bound")
     try:
         text = raw.decode("ascii")
     except UnicodeError:
-        raise Failure("process_snapshot") from None
+        raise Failure("process_snapshot_encoding") from None
     states = []
     for line in text.splitlines():
         match = re.fullmatch(r"\s*([0-9]{1,10})\s+([A-Za-z0-9+<=>-]{1,24})\s*", line)
-        require(match is not None, "process_snapshot")
+        require(match is not None, "process_snapshot_shape")
         if int(match.group(1)) == group:
             states.append(match.group(2))
     # Our unreaped leader anchors the group and must appear even as a zombie.
-    require(bool(states), "process_snapshot")
+    require(bool(states), "process_snapshot_anchor")
     return any(not state.startswith("Z") for state in states)
 
 
@@ -235,7 +281,7 @@ class _MacSnapshotRunner(MacRunner):
     """Only the trusted system ps leaf; never a fixture or caller command."""
     def snapshot(self):
         result = super().run(["/bin/ps", "-axo", "pgid=,stat="], seconds=3, output_limit=65536)
-        require(result.status == 0, "process_snapshot")
+        require(result.status == 0, "process_snapshot_exit")
         return result.output
 
     def stop_owned(self, process):
@@ -652,14 +698,16 @@ class MacKeychain:
         for arguments in commands:
             try:
                 self.command(arguments)
-            except (Failure, OSError):
+            except (Failure, OSError) as error:
                 failed = True
                 self.evidence.cleanup_failed("keychain_restore")
+                self.evidence.mac_cleanup(error)
         try:
             self.verify_restored()
-        except (Failure, OSError):
+        except (Failure, OSError) as error:
             failed = True
             self.evidence.cleanup_failed("keychain_restore_verify")
+            self.evidence.mac_cleanup(error)
         # Delete only the new exact keychain. No original path is a target,
         # even when restoring its preference metadata reports an error.
         if self.owned_create_attempted and self.runner.quiescent:
@@ -668,17 +716,19 @@ class MacKeychain:
                     private_object(self.path)
                     self.command(["delete-keychain", self.path])
                 require(not self.path.exists() and not self.path.is_symlink(), "keychain_delete")
-            except (Failure, OSError):
+            except (Failure, OSError) as error:
                 failed = True
                 self.evidence.cleanup_failed("keychain_delete")
+                self.evidence.mac_cleanup(error)
         else:
             failed = True
             self.evidence.cleanup_failed("children_unconfirmed")
         try:
             self.verify_restored()
-        except (Failure, OSError):
+        except (Failure, OSError) as error:
             failed = True
             self.evidence.cleanup_failed("keychain_restore_verify")
+            self.evidence.mac_cleanup(error)
         return not failed
 
     def verify_restored(self):
@@ -780,8 +830,11 @@ class Acceptance:
                 self.evidence.phases[phase] = record
                 self.evidence.fail(record["stage"], record["failure"] or error.code)
             except (Failure, OSError):
+                if error.code == "process_cleanup":
+                    self.evidence.mac_cleanup(error, primary=True)
                 self.evidence.fail(phase, error.code)
             if error.cleanup or not self.runner.quiescent:
+                self.evidence.mac_cleanup(error)
                 self.evidence.cleanup_failed("children_unconfirmed")
             raise error from None
 
@@ -827,8 +880,11 @@ class Acceptance:
                 self.evidence.fail("windows_root_prepare", windows_isolation_code(error))
             else:
                 code = error.code if isinstance(error, Failure) else "private_io"
+                if code == "process_cleanup":
+                    self.evidence.mac_cleanup(error, primary=True)
                 self.evidence.fail("setup_or_fixture", code)
             if isinstance(error, Failure) and error.cleanup:
+                self.evidence.mac_cleanup(error)
                 self.evidence.cleanup_failed("children_unconfirmed")
             if self.root_verified and (windows or keychain.ready) and self.runner.quiescent and (self.root / "owned-items.json").exists():
                 try:

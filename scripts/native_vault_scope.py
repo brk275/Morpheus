@@ -12,9 +12,12 @@ WINDOWS = ({"os": "windows-2025", "label": "windows-x64", "arch": "x86_64"},)
 
 
 def select(platform):
-    if type(platform) is not str or platform not in {"macos", "windows", "all"}:
+    if type(platform) is not str or platform not in {"macos", "macos-arm64", "macos-x64", "windows", "all"}:
         raise ValueError("Unsupported native vault platform selection")
-    selected = MACOS if platform == "macos" else WINDOWS if platform == "windows" else MACOS + WINDOWS
+    if platform in {"macos-arm64", "macos-x64"}:
+        selected = MACOS[:1] if platform == "macos-arm64" else MACOS[1:]
+    else:
+        selected = MACOS if platform == "macos" else WINDOWS if platform == "windows" else MACOS + WINDOWS
     return {"include": [dict(item) for item in selected]}
 
 

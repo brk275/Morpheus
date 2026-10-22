@@ -81,7 +81,7 @@ class SchemaTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
-    def run_mocked(self, *, cleanup_error=False, output=b"private-output", limit=100, deadline=False):
+    def run_mocked(self, *, cleanup_error=False, output=b"private-output", limit=100, deadline=False, cleanup_failure=None):
         process = Mock()
         process.stdout.fileno.return_value = 17
         selector = Mock()
@@ -90,7 +90,7 @@ class ProcessTests(unittest.TestCase):
         with patch.object(M.sys, "platform", "darwin"), \
                 patch.object(M.package_smoke, "require_nonreaping_wait"), \
                 patch.object(M.package_smoke, "process_status", return_value=None if deadline else 0), \
-                patch.object(M.MacRunner, "stop_owned", side_effect=RuntimeError("private-cleanup") if cleanup_error else None) as stop, \
+                patch.object(M.MacRunner, "stop_owned", side_effect=cleanup_failure if cleanup_failure is not None else RuntimeError("private-cleanup") if cleanup_error else None) as stop, \
                 patch.object(M.subprocess, "Popen", return_value=process) as start, \
                 patch.object(M.selectors, "DefaultSelector", return_value=selector), \
                 patch.object(M.os, "set_blocking"), patch.object(M.os, "read", side_effect=[output, b""]), \
@@ -124,6 +124,46 @@ class ProcessTests(unittest.TestCase):
         with self.assertRaises(M.Failure) as raised:
             runner.run(["/must-not-start"])
         self.assertEqual(raised.exception.code, "children_unconfirmed")
+
+    def test_teardown_reason_is_closed_and_attached_without_replacing_original_failure(self):
+        cases = ((M.Failure("process_snapshot_anchor"), "process_snapshot_anchor"),
+                 (M.Failure("PRIVATE_PROCESS_PATH"), "process_cleanup"),
+                 (OSError("PRIVATE_OS_STATUS"), "process_cleanup_io"),
+                 (RuntimeError("PRIVATE_OWNERSHIP"), "process_cleanup_ownership"),
+                 (M.subprocess.TimeoutExpired("PRIVATE_COMMAND", 5), "process_cleanup_timeout"),
+                 (M.subprocess.SubprocessError("PRIVATE_SUBPROCESS"), "process_cleanup_subprocess"))
+        for error, code in cases:
+            for deadline in (False, True):
+                with self.subTest(code=code, deadline=deadline):
+                    runner, _, failure = self.run_mocked(deadline=deadline, cleanup_failure=error)
+                    self.assertEqual(failure.code, "process_deadline" if deadline else "process_cleanup")
+                    self.assertEqual(failure.cleanup_diagnostic, ("mac_group_cleanup", code))
+                    self.assertTrue(failure.cleanup)
+                    self.assertFalse(runner.quiescent)
+                    evidence = M.Evidence()
+                    if deadline:
+                        evidence.fail("setup_or_fixture", failure.code)
+                    evidence.mac_cleanup(failure, primary=True)
+                    self.assertEqual(evidence.first, {"stage": "setup_or_fixture" if deadline else "mac_group_cleanup",
+                        "code": "process_deadline" if deadline else "process_cleanup"})
+                    self.assertEqual(evidence.cleanup_failures, [code])
+                    self.assertNotIn("PRIVATE", json.dumps(evidence.__dict__))
+
+    def test_public_cleanup_boundary_rejects_mutated_diagnostic_strings(self):
+        for code in ("PRIVATE_CODE", True, [], {"PRIVATE": True}):
+            error = M.Failure(code)
+            self.assertEqual(M.mac_cleanup_code(error), "process_cleanup")
+        for detail in (("PRIVATE_STAGE", "process_snapshot_anchor"),
+                       ("mac_group_snapshot", "PRIVATE_CODE"), ["mac_group_reap", "PRIVATE_CODE"],
+                       ([], "process_cleanup"), ("mac_group_snapshot", []),
+                       (True, "process_cleanup"), ("mac_group_snapshot", False)):
+            error = M.Failure("PRIVATE_FAILURE")
+            error.cleanup_diagnostic = detail
+            evidence = M.Evidence()
+            evidence.mac_cleanup(error, primary=True)
+            self.assertEqual(evidence.first, {"stage": "mac_group_cleanup", "code": "process_cleanup"})
+            self.assertEqual(evidence.cleanup_failures, ["process_cleanup"])
+            self.assertNotIn("PRIVATE", json.dumps(evidence.__dict__))
 
 
 class KeychainTransactionTests(unittest.TestCase):
@@ -409,13 +449,15 @@ class PhaseTests(unittest.TestCase):
                 path.write_text(json.dumps({"version": 1, "phase": "prepare", "status": "failed",
                     "stage": "policy_revocation", "failure": "private_original", "checks": {}})); path.chmod(0o600)
                 instance.runner.quiescent = False
-                raise M.Failure("process_deadline", cleanup=True)
+                error = M.Failure("process_deadline", cleanup=True)
+                error.cleanup_diagnostic = ("mac_group_snapshot", "process_snapshot_anchor")
+                raise error
             instance.runner.run.side_effect = run
             with patch.object(M, "executable_identity"):
                 with self.assertRaises(M.Failure):
                     instance.phase("prepare")
             self.assertEqual(instance.evidence.first, {"stage": "policy_revocation", "code": "fixture_failure"})
-            self.assertEqual(instance.evidence.cleanup_failures, ["children_unconfirmed"])
+            self.assertEqual(instance.evidence.cleanup_failures, ["process_snapshot_anchor", "children_unconfirmed"])
             self.assertNotIn("private_original", json.dumps(instance.evidence.phases))
 
     def test_zero_exit_without_result_is_failure(self):
@@ -487,9 +529,13 @@ class DescendantTests(unittest.TestCase):
     def test_snapshot_accepts_only_anchored_zombie_group(self):
         self.assertFalse(M.group_has_live_members(b"12 Zs\n12 Z\n15 R\n", 12))
         self.assertTrue(M.group_has_live_members(b"12 Zs\n12 S+\n", 12))
-        for raw in (b"15 Z\n", b"12 Z command arguments\n", b"12 \xff\n", b"12 Z\n" + b" " * 65536):
-            with self.assertRaises(M.Failure):
+        for raw, code in ((b"15 Z\n", "process_snapshot_anchor"),
+                          (b"12 Z command arguments\n", "process_snapshot_shape"),
+                          (b"12 \xff\n", "process_snapshot_encoding"),
+                          (b"12 Z\n" + b" " * 65536, "process_snapshot_bound")):
+            with self.assertRaises(M.Failure) as raised:
                 M.group_has_live_members(raw, 12)
+            self.assertEqual(raised.exception.code, code)
 
     def test_waits_for_descendant_completion_before_reaping_leader(self):
         process = Mock(pid=12, returncode=None)
@@ -527,6 +573,28 @@ class DescendantTests(unittest.TestCase):
             M.MacRunner().stop_owned(process)
         snapshot.assert_called_once()
         process.wait.assert_called_once_with(timeout=5)
+
+    def test_cleanup_context_tracks_exact_failing_boundary_without_reaping_early(self):
+        cases = (("status", RuntimeError("PRIVATE_STATUS"), "mac_group_status"),
+                 ("signal", OSError("PRIVATE_SIGNAL"), "mac_group_signal"),
+                 ("snapshot", M.Failure("process_snapshot_shape"), "mac_group_snapshot"),
+                 ("reap", M.subprocess.TimeoutExpired("PRIVATE_REAP", 5), "mac_group_reap"))
+        for boundary, error, stage in cases:
+            with self.subTest(boundary=boundary):
+                runner = M.MacRunner()
+                process = Mock(pid=12, returncode=None)
+                with patch.object(M.package_smoke, "process_status", side_effect=error if boundary == "status" else None), \
+                        patch.object(M.os, "killpg", side_effect=error if boundary == "signal" else None), \
+                        patch.object(M._MacSnapshotRunner, "snapshot", side_effect=error if boundary == "snapshot" else None,
+                            return_value=b"12 Z\n"):
+                    if boundary == "reap":
+                        process.wait.side_effect = error
+                    with self.assertRaises(type(error)):
+                        runner.stop_owned(process)
+                self.assertEqual(runner.cleanup_stage, stage)
+                if boundary != "reap":
+                    process.wait.assert_not_called()
+                self.assertIsNone(process.returncode)
 
     def test_inspector_is_exact_system_ps_and_bounded_metadata_only(self):
         with patch.object(M.MacRunner, "run", return_value=M.CommandResult(0, b"12 Z\n")) as run:
@@ -727,6 +795,38 @@ class WindowsRootLifecycleTests(unittest.TestCase):
             self.assertTrue(root.exists())
             self.assertFalse(instance.platform_restored)
             self.assertIn("owned_items_unconfirmed",instance.evidence.cleanup_failures)
+
+
+class MacCleanupLifecycleTests(unittest.TestCase):
+    instance = WindowsRootLifecycleTests.instance
+
+    def test_setup_teardown_failure_keeps_owned_root_and_publishes_only_closed_reason(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "fresh"
+            instance = self.instance(root)
+            instance.runner.quiescent = False
+            error = M.Failure("process_cleanup", cleanup=True)
+            error.cleanup_diagnostic = ("mac_group_snapshot", "process_snapshot_anchor")
+            def create(path, parent):
+                path.mkdir(mode=0o700)
+            def setup(keychain):
+                keychain.snapshotted = True
+                keychain.may_have_changed = True
+                keychain.owned_create_attempted = True
+                raise error
+            with patch.object(M.sys, "platform", "darwin"), patch.object(M, "make_mac_root", side_effect=create), \
+                    patch.object(M.MacKeychain, "setup", autospec=True, side_effect=setup), patch.object(instance, "phase") as phase, \
+                    patch.object(M.shutil, "rmtree") as remove:
+                with self.assertRaises(M.Failure):
+                    instance.run()
+            self.assertEqual(instance.evidence.first,
+                {"stage": "mac_group_snapshot", "code": "process_cleanup"})
+            self.assertEqual(instance.evidence.cleanup_failures,
+                ["process_snapshot_anchor", "children_unconfirmed", "root_cleanup_unconfirmed"])
+            phase.assert_not_called()
+            remove.assert_not_called()
+            self.assertTrue(root.exists())
+            self.assertFalse(instance.platform_restored or instance.profile_removed or instance.runner.quiescent)
 
 
 class WindowsDiagnosticTests(unittest.TestCase):
