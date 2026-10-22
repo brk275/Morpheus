@@ -11833,11 +11833,88 @@ async fn assert_inline_audio_card_layout() {
     ui.set_attachment_audio_duration("2:40".into());
     ui.set_attachment_audio_status(STATUS.into());
     settle(&ui).await;
+    // The minimum-width thread lays this content-sized card below its root,
+    // history action and reply header. Reveal it through the real wheel path
+    // before requiring the complete card to fit, without changing its layout.
+    let target = control_with_label(&ui, &format!("Audio attachment {TITLE}"));
+    let before_scroll = item_bounds(&target);
+    let mut viewports = Vec::new();
+    for node in geometry_nodes(&ui) {
+        let Some(scroll) = node.downcast::<slint::private_unstable_api::re_exports::Flickable>()
+        else {
+            continue;
+        };
+        let contains_target = node
+            .visit_descendants(|item| {
+                if item == &target {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .is_some();
+        if contains_target {
+            let scroll = scroll.as_pin_ref();
+            viewports.push((
+                item_bounds(&node),
+                scroll.content_y().0,
+                scroll.content_height().0,
+            ));
+        }
+    }
+    assert_eq!(viewports.len(), 1, "one actual audio thread viewport");
+    let (viewport, content_y, content_height) = viewports[0];
+    assert!(inside_window(&ui, viewport));
+    assert!(
+        before_scroll.bottom - before_scroll.top <= viewport.bottom - viewport.top,
+        "the complete card fits after scrolling"
+    );
+    assert!(
+        before_scroll.bottom <= viewport.top + content_y + content_height + 0.5,
+        "the scroll range includes the complete card"
+    );
+    let before_wheel_actions = (played.get(), saved.get(), stopped.get());
+    if before_scroll.bottom > viewport.bottom + 0.5 {
+        assert_eq!(
+            ui.window()
+                .dispatch_event_with_result(WindowEvent::PointerScrolled {
+                    position: slint::LogicalPosition::new(
+                        (viewport.left + viewport.right) / 2.0,
+                        (viewport.top + viewport.bottom) / 2.0,
+                    ),
+                    delta_x: 0.0,
+                    delta_y: viewport.bottom - before_scroll.bottom,
+                })
+                .unwrap(),
+            slint::platform::WindowEventDispatchResult::Accepted,
+            "the real thread viewport accepts the reveal wheel"
+        );
+        settle(&ui).await;
+        assert!(
+            item_bounds(&target).top < before_scroll.top - 0.5,
+            "the wheel actually moves the audio card"
+        );
+    }
+    assert_eq!(
+        (played.get(), saved.get(), stopped.get()),
+        before_wheel_actions
+    );
     geometry(true);
     let pane = control_bounds(&ui, "Conversation details");
     assert_eq!(pane.len(), 1);
     let card = control_bounds(&ui, &format!("Audio attachment {TITLE}"));
     assert!(bounds_within(card[0], pane[0]));
+    assert!(
+        bounds_within(card[0], viewport),
+        "the whole card is revealed"
+    );
+    request_bridge_focus(&ui, &pause_label);
+    key(&ui, Key::Tab);
+    settle(&ui).await;
+    assert!(focused_control_has_label(&ui, stop_label));
+    key(&ui, Key::Tab);
+    settle(&ui).await;
+    assert!(focused_control_has_label(&ui, &save_label));
     request_bridge_focus(&ui, &save_label);
     key(&ui, Key::Space);
     settle(&ui).await;
