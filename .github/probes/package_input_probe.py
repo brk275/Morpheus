@@ -1,7 +1,7 @@
 """Temporary owner-only hosted data retrieval proof. Never merge this driver."""
 from pathlib import Path
 import hashlib, json, os, shutil, signal, stat, subprocess, sys, tempfile, time
-SOURCE = "93b08331aea82ce5358a548b44b82bb37f79b4c1"
+SOURCE = "0a50be6b0677cea9e69123d0555fd1728d6fff8e"
 BRANCH = "codex/package-input-probe-93b083-20261022"
 SCANNER_SHA256 = "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509"
 

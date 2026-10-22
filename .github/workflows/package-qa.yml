@@ -1,10 +1,10 @@
-name: Temporary pinned input recovery proof
+name: Temporary mirrored package input proof
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: package-inputs-93b08331aea82ce5358a548b44b82bb37f79b4c1
+  group: package-inputs-0a50be6b0677cea9e69123d0555fd1728d6fff8e
   cancel-in-progress: false
 jobs:
   inputs:
@@ -19,7 +19,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 93b08331aea82ce5358a548b44b82bb37f79b4c1
+          ref: 0a50be6b0677cea9e69123d0555fd1728d6fff8e
           path: selected-source
           persist-credentials: false
           fetch-depth: 0
@@ -29,11 +29,11 @@ jobs:
           set -euo pipefail
           umask 077
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git -C selected-source rev-parse HEAD)" = 93b08331aea82ce5358a548b44b82bb37f79b4c1
+          test "$(git -C selected-source rev-parse HEAD)" = 0a50be6b0677cea9e69123d0555fd1728d6fff8e
           trusted="$RUNNER_TEMP/input-proof-trusted"
           mkdir "$trusted"
           for file in scan_history.py public-fixtures.json; do
-            git show --no-ext-diff --no-textconv eddaade30497866aca6b677fedc9ea7bbd847ee1:scripts/"$file" > "$trusted/$file"
+            git show --no-ext-diff --no-textconv c1e3a5b37c516b09a7afe3f289f70cf1cfaa4257:scripts/"$file" > "$trusted/$file"
           done
           echo "4acde7ed74259339d9494b5e2d52aff42e1317bbdf23400cc67bf7bf3085caef  $trusted/scan_history.py" | sha256sum --check --status
           archive="$trusted/scanner.tar.gz"
@@ -46,7 +46,7 @@ jobs:
           chmod 500 "$trusted/gitleaks"
           /usr/bin/python3 -I -B "$trusted/scan_history.py" --candidate "$GITHUB_WORKSPACE/selected-source" \
             --scanner "$trusted/gitleaks" --manifest "$trusted/public-fixtures.json" --evidence "$RUNNER_TEMP/input-history-proof"
-          /usr/bin/python3 -I -B -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["source"]==sys.argv[2] and v["unexpected_findings"]==0' "$RUNNER_TEMP/input-history-proof/summary.json" 93b08331aea82ce5358a548b44b82bb37f79b4c1
+          /usr/bin/python3 -I -B -c 'import json,sys; v=json.load(open(sys.argv[1])); assert v["source"]==sys.argv[2] and v["unexpected_findings"]==0' "$RUNNER_TEMP/input-history-proof/summary.json" 0a50be6b0677cea9e69123d0555fd1728d6fff8e
       - name: Retrieve original pinned bytes without executing them
         timeout-minutes: 30
         shell: bash
@@ -55,5 +55,5 @@ jobs:
           umask 077
           driver="$RUNNER_TEMP/package_input_probe.py"
           git show --no-ext-diff --no-textconv "$GITHUB_SHA:.github/probes/package_input_probe.py" > "$driver"
-          echo "33ed54f5b88df76df0be022f31bd8f68c4fd15a8f4b254592806a216e877aa81  $driver" | sha256sum --check --status
+          echo "012aad1e6287996857385b55a3049022bfccc63e658e42411d79b10227ae18ee  $driver" | sha256sum --check --status
           /usr/bin/python3 -I -B "$driver" parent "$GITHUB_WORKSPACE/selected-source" "$RUNNER_TEMP/input-proof-trusted/gitleaks"
