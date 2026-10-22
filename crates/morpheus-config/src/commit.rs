@@ -741,18 +741,22 @@ mod tests {
         let mut changed = base.clone();
         changed.geometry.corner_radius = 3;
         let mut inner = None;
+        let mut inner_elapsed = None;
 
-        let started = Instant::now();
         store
             .commit_with(&changed, &revision, |_| {
                 // Another writer while this one holds the locks, as a UI
                 // save during a background save would be.
+                // Only the contended call belongs to this responsiveness check;
+                // the outer writer also stages, syncs and publishes its file.
+                let started = Instant::now();
                 inner = Some(store.commit(&changed, &revision));
+                inner_elapsed = Some(started.elapsed());
             })
             .unwrap();
 
         assert!(matches!(inner, Some(Err(CommitError::Busy))), "{inner:?}");
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(inner_elapsed.unwrap() < Duration::from_millis(500));
         assert_eq!(store.load().unwrap().geometry.corner_radius, 3);
     }
 }
