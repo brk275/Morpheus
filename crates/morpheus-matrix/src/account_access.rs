@@ -510,17 +510,18 @@ impl AccountManager {
             self.publish_active_account(None);
             self.sync_tx.send_replace(SyncStatus::Stopped);
         }
-        // Do not delete a credential while an already-started refresh write
-        // can still recreate it. Retain the join handle for the next retry.
+        // Drain the owned readiness watcher and any started refresh write
+        // before deletion. Keep the existing total shutdown bound and retain
+        // both join handles if that wait is cancelled or runs out of time.
         if let Some(loaded) = state.loaded.get(id) {
-            if !loaded.try_stop_token_persistence(CLEANUP_TIMEOUT).await {
+            if !loaded.try_stop_owned_tasks(CLEANUP_TIMEOUT).await {
                 let loaded = loaded.clone();
                 // The API can report pending cleanup promptly, while the
                 // retained permit keeps updater restart and another cleanup
                 // from racing the in-flight vault write.
                 tokio::spawn(async move {
                     let _permit = permit;
-                    loaded.stop_token_persistence().await;
+                    loaded.stop_owned_tasks().await;
                 });
                 return Ok(RemovalResult {
                     account_id: id.into(),

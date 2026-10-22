@@ -56,7 +56,11 @@ use matrix_sdk::{
         events::secret::request::SecretName,
     },
 };
-use tokio::{sync::watch, time};
+use tokio::{
+    sync::{Mutex, watch},
+    task::JoinHandle,
+    time,
+};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -195,11 +199,15 @@ pub struct EnabledRecovery {
 /// `wait_for_e2ee_initialization_tasks` and forgets it, so a later call
 /// returns at once and proves nothing. This owner is started when the
 /// account's client is loaded, before anything else can take the task, and
-/// runs that one wait detached to its end; every reader of the client's
-/// readiness waits on this outcome with its own bound and never takes a
-/// timeout or a cancel as done. It belongs to its `LoadedAccount`: a client
-/// restored later for the same account and device has its own.
-pub(crate) struct E2eeReadiness(watch::Receiver<bool>);
+/// owns that one wait; every reader of the client's readiness waits on its
+/// outcome with its own bound and never takes a timeout or a cancel as done.
+/// It belongs to its `LoadedAccount`: a client restored later for the same
+/// account and device has its own. Removing or stopping the loaded account
+/// drains this watcher before its client/store can be discarded.
+pub(crate) struct E2eeReadiness {
+    ready: watch::Receiver<bool>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
 
 impl E2eeReadiness {
     /// Starts the one wait for `client`'s encryption setup.
@@ -211,19 +219,35 @@ impl E2eeReadiness {
         })
     }
 
-    /// The outcome of `setup`, which runs detached to its end; dropping
-    /// this owner or a waiter does not stop it.
+    /// Start one owned watcher. Cancelling an individual reader does not stop
+    /// it; stopping or dropping the owner does.
     fn start(setup: impl Future<Output = ()> + Send + 'static) -> Self {
         let (done, ready) = watch::channel(false);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             setup.await;
             let _ = done.send(true);
         });
-        Self(ready)
+        Self {
+            ready,
+            task: Mutex::new(Some(task)),
+        }
     }
 
     fn waiter(&self) -> watch::Receiver<bool> {
-        self.0.clone()
+        self.ready.clone()
+    }
+
+    /// Stop our watcher and release its client clone. The SDK's initialization
+    /// task is separately owned: dropping its JoinHandle does not cancel it or
+    /// any critical recovery operation. Retain our handle until joined so a
+    /// cancelled shutdown can be resumed without detaching this watcher.
+    pub(crate) async fn stop(&self) {
+        let mut slot = self.task.lock().await;
+        if let Some(task) = slot.as_mut() {
+            task.abort();
+            let _ = task.await;
+        }
+        slot.take();
     }
 
     /// Whether the setup finished. Dropping this future only stops this
@@ -233,8 +257,16 @@ impl E2eeReadiness {
     }
 }
 
+impl Drop for E2eeReadiness {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.get_mut().as_ref() {
+            task.abort();
+        }
+    }
+}
+
 /// Waits until `ready` reports true. Dropping this future only stops this
-/// wait; the setup itself and its detached wait go on.
+/// reader; the owned watcher continues until completion or account shutdown.
 async fn until_ready(mut ready: watch::Receiver<bool>) -> bool {
     ready.wait_for(|done| *done).await.is_ok()
 }
@@ -494,8 +526,8 @@ impl AccountManager {
         // secrets only after that settled for this exact loaded client (its
         // own readiness owner, never an earlier client's, and never the
         // keys a store already holds). Nothing is sent before this ends, so
-        // bounding the wait cannot lose a key; the setup's own wait runs on
-        // detached, so a timeout here never counts as done.
+        // bounding this reader cannot lose a key; the client's owned watcher
+        // continues after a reader timeout, which never counts as done.
         let ready = until_ready(ready);
         let ready = selection.guard(bounded(E2EE_READY_TIMEOUT, ready)).await;
         match ready {
@@ -639,7 +671,7 @@ mod tests {
     }
 
     /// The readiness wait never counts a timeout as done: its outcome only
-    /// turns true when the detached setup wait finished, and dropping a
+    /// turns true when the owned setup wait finished, and dropping a
     /// waiter leaves the shared outcome waiting for the next one.
     #[test]
     fn a_timed_out_readiness_wait_is_not_taken_as_done() {
@@ -668,6 +700,93 @@ mod tests {
             assert!(early.is_err(), "timed out, not done");
             finish.send(()).unwrap();
             assert!(owner.settled().await);
+        });
+    }
+
+    async fn pending_readiness() -> (E2eeReadiness, std::sync::Weak<()>) {
+        let held = std::sync::Arc::new(());
+        let released = std::sync::Arc::downgrade(&held);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let owner = E2eeReadiness::start(async move {
+            entered.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+        started.await.unwrap();
+        (owner, released)
+    }
+
+    #[test]
+    fn cancelled_readiness_shutdown_keeps_the_same_join_handle_until_drained() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (owner, released) = pending_readiness().await;
+            let mut stopping = Box::pin(owner.stop());
+            // On this single-thread runtime the abort cannot be observed by
+            // the pending task until this poll returns to the scheduler.
+            assert!(futures_util::poll!(stopping.as_mut()).is_pending());
+            drop(stopping);
+            assert!(owner.task.lock().await.is_some());
+            owner.stop().await;
+            assert!(owner.task.lock().await.is_none());
+            assert!(released.upgrade().is_none());
+            assert!(!owner.settled().await, "cancellation is not readiness");
+            owner.stop().await;
+            assert!(!owner.settled().await);
+        });
+    }
+
+    #[test]
+    fn dropping_readiness_aborts_the_watcher_without_signalling_ready() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (owner, released) = pending_readiness().await;
+            let ready = owner.waiter();
+            drop(owner);
+            let settled = time::timeout(Duration::from_secs(1), until_ready(ready))
+                .await
+                .expect("dropped readiness watcher did not stop");
+            assert!(!settled);
+            assert!(released.upgrade().is_none());
+        });
+    }
+
+    #[test]
+    fn manager_shutdown_drains_readiness_and_removal_wait_keeps_its_bound() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = std::env::temp_dir()
+                .join(format!("morpheus-readiness-stop-{}", uuid::Uuid::new_v4()));
+            let (readiness, released) = pending_readiness().await;
+            let manager = loaded_manager(&root, "account", readiness).await;
+            let loaded = manager.state.lock().await.loaded["account"].clone();
+            let retained = loaded.e2ee.task.lock().await;
+            assert!(retained.is_some());
+            assert!(released.upgrade().is_some());
+            assert!(
+                !loaded.try_stop_owned_tasks(Duration::from_millis(20)).await,
+                "removal must report pending when the watcher cannot be drained"
+            );
+            assert!(retained.is_some());
+            assert!(released.upgrade().is_some());
+            drop(retained);
+            manager.stop().await;
+            assert!(manager.state.lock().await.loaded.is_empty());
+            assert!(loaded.e2ee.task.lock().await.is_none());
+            assert!(released.upgrade().is_none());
+            assert!(!loaded.e2ee.settled().await);
+            drop(loaded);
+            drop(manager);
+            std::fs::remove_dir_all(root).unwrap();
         });
     }
 
