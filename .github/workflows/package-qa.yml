@@ -55,5 +55,5 @@ jobs:
           umask 077
           driver="$RUNNER_TEMP/package_input_probe.py"
           git show --no-ext-diff --no-textconv "$GITHUB_SHA:.github/probes/package_input_probe.py" > "$driver"
-          echo "d6aee3586077411cae161863cfd38549db4cb6358922e22abdba6658fbc8a8b1  $driver" | sha256sum --check --status
+          echo "5b06cde213b3d053e24e5f7af8283159b80e28703559d68c2c17bba033296c81  $driver" | sha256sum --check --status
           /usr/bin/python3 -I -B "$driver" parent "$GITHUB_WORKSPACE/selected-source" "$RUNNER_TEMP/input-proof-trusted/gitleaks"

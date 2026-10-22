@@ -29,7 +29,9 @@ def child(source, root):
                                  curl=code if 0 <= code <= 99 else 0,
                                  size_matches=len(payload) == pin["size"],
                                  digest_matches=hashlib.sha256(payload).hexdigest() == pin["sha256"])
-                P.private_receipt(root / "transport.json", facts)
+                temporary = root / ("transport-%d.json" % self.sequence)
+                P.private_receipt(temporary, facts)
+                os.replace(temporary, root / "transport.json")
                 return output  # Original bytes enter the unchanged production validator.
         runner = InspectedRunner(root / "inspected-commands", progress=progress)
         value = P.runtime_builder.download(runner, url=pin["url"], maximum=pin["size"],
