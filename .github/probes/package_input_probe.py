@@ -14,10 +14,13 @@ def child(source, root):
     try:
         progress.wrapper("build")
         environment = P.controlled_environment(os.environ)
-        pin = P.runtime_builder.manifest()["archives"]["zlib"]
+        spec = P.runtime_builder.manifest()
+        pin = spec["archives"]["zlib"]
         class InspectedRunner(P.OwnedRunner):
             def run(self, stage, argv, **options):
                 output = super().run(stage, argv, **options)
+                if stage != "download-runtime-zlib":
+                    return output
                 # Capture fixed metadata only, after the real owned-group drain.
                 match = P.download.__globals__["PACKAGE_INPUT_STATUS"].search(output)
                 payload = output[:match.start()] if match else b""
@@ -34,11 +37,17 @@ def child(source, root):
                 os.replace(temporary, root / "transport.json")
                 return output  # Original bytes enter the unchanged production validator.
         runner = InspectedRunner(root / "inspected-commands", progress=progress)
-        value = P.runtime_builder.download(runner, url=pin["url"], maximum=pin["size"],
-            expected_size=pin["size"], expected_sha256=pin["sha256"], root=root,
-            environment=environment, stage="download-runtime-zlib")
-        del value
-        count = 1
+        payloads, archives, patch = P.download_inputs(runner, root, environment)
+        del payloads, archives, patch
+        count = 6
+        for key, item in spec["archives"].items():
+            value = P.runtime_builder.download(runner, url=item["url"], maximum=item["size"],
+                expected_size=item["size"], expected_sha256=item["sha256"], root=root,
+                environment=environment, stage="download-runtime-" + key)
+            del value
+            count += 1
+        if count != 13:
+            raise P.PackageFailure("identity")
         progress.wrapper("complete")
         progress.cleanup(True)
         P.private_receipt(root / "passed.json", {"source": SOURCE, "inputs": count, "passed": True})
@@ -118,9 +127,9 @@ def parent(source, scanner):
         info = receipt.lstat()
         if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_nlink != 1
                 or info.st_uid != os.getuid() or not 0 < info.st_size <= 1024
-                or json.loads(receipt.read_bytes()) != {"source":SOURCE, "inputs":1, "passed":True}):
+                or json.loads(receipt.read_bytes()) != {"source":SOURCE, "inputs":13, "passed":True}):
             raise RuntimeError("receipt")
-        facts.update(passed=True, inputs=1)
+        facts.update(passed=True, inputs=13)
     except BaseException:
         facts["passed"] = False
     finally:

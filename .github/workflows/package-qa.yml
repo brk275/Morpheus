@@ -1,4 +1,4 @@
-name: Temporary rejected zlib input proof
+name: Temporary pinned input recovery proof
 on:
   workflow_dispatch:
 permissions:
@@ -8,7 +8,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   inputs:
-    name: Rejected zlib input (Linux only)
+    name: Pinned package inputs (Linux only)
     if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/codex/package-input-probe-93b083-20261022' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.id == github.event.repository.owner.id
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -55,5 +55,5 @@ jobs:
           umask 077
           driver="$RUNNER_TEMP/package_input_probe.py"
           git show --no-ext-diff --no-textconv "$GITHUB_SHA:.github/probes/package_input_probe.py" > "$driver"
-          echo "5b06cde213b3d053e24e5f7af8283159b80e28703559d68c2c17bba033296c81  $driver" | sha256sum --check --status
+          echo "33ed54f5b88df76df0be022f31bd8f68c4fd15a8f4b254592806a216e877aa81  $driver" | sha256sum --check --status
           /usr/bin/python3 -I -B "$driver" parent "$GITHUB_WORKSPACE/selected-source" "$RUNNER_TEMP/input-proof-trusted/gitleaks"
