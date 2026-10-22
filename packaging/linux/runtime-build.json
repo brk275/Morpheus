@@ -1,0 +1,198 @@
+{
+  "archives": {
+    "fuse": {
+      "filename": "fuse-3.15.0.tar.xz",
+      "licenses": {
+        "GPL2.txt": {
+          "bytes": 18092,
+          "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+        },
+        "LGPL2.txt": {
+          "bytes": 26530,
+          "sha256": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551"
+        },
+        "LICENSE": {
+          "bytes": 435,
+          "sha256": "b8832d9caaa075bbbd2aef24efa09f8b7ab66a832812d88c602da0c7b4397fad"
+        }
+      },
+      "prefix": "fuse-3.15.0",
+      "sha256": "70589cfd5e1cff7ccd6ac91c86c01be340b227285c5e200baa284e401eea2ca0",
+      "size": 4589124,
+      "url": "https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz"
+    },
+    "mimalloc": {
+      "filename": "mimalloc-2.1.7.tar.gz",
+      "licenses": {
+        "LICENSE": {
+          "bytes": 1096,
+          "sha256": "19c99805e7a44a34b297a75d1edea9985e300066dfc024d5c99d4236d4573b5d"
+        }
+      },
+      "prefix": "mimalloc-2.1.7",
+      "sha256": "0eed39319f139afde8515010ff59baf24de9e47ea316a315398e8027d198202d",
+      "size": 1181422,
+      "url": "https://github.com/microsoft/mimalloc/archive/v2.1.7/mimalloc-2.1.7.tar.gz"
+    },
+    "musl": {
+      "filename": "musl_1.2.4.orig.tar.gz",
+      "licenses": {
+        "COPYRIGHT": {
+          "bytes": 6204,
+          "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+        }
+      },
+      "prefix": "musl-1.2.4",
+      "sha256": "7a35eae33d5372a7c0da1188de798726f68825513b7ae3ebe97aaaa52114f039",
+      "size": 1063758,
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/m/musl/musl_1.2.4.orig.tar.gz"
+    },
+    "runtime": {
+      "filename": "type2-runtime-fedfad51.tar.gz",
+      "licenses": {
+        "LICENSE": {
+          "bytes": 1678,
+          "sha256": "aa154fc9070614bbe7921f89db11efd1dba7a1f3a41685958110e2230f9c0ca1"
+        }
+      },
+      "prefix": "type2-runtime-fedfad51acc2860b2916a1eef32ba4a500ff31ef",
+      "sha256": "e27ea3c837e9c660e1a9a2993b673ae93bbb53077330efba8654031e302d4e8e",
+      "size": 31128,
+      "url": "https://github.com/AppImage/type2-runtime/archive/fedfad51acc2860b2916a1eef32ba4a500ff31ef.tar.gz"
+    },
+    "squashfuse": {
+      "filename": "squashfuse-0.5.2.tar.gz",
+      "licenses": {
+        "LICENSE": {
+          "bytes": 1592,
+          "sha256": "9e909cc8a8ba27b1a649c964cf9eda37de911f3138c2b64e6d2f01703904ac13"
+        }
+      },
+      "prefix": "squashfuse-0.5.2",
+      "sha256": "db0238c5981dabbd80ee09ae15387f390091668ca060a7bc38047912491443d3",
+      "size": 75404,
+      "url": "https://github.com/vasi/squashfuse/archive/0.5.2.tar.gz"
+    },
+    "zlib": {
+      "filename": "zlib-1.3.2.tar.gz",
+      "licenses": {
+        "LICENSE": {
+          "bytes": 1002,
+          "sha256": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2"
+        }
+      },
+      "prefix": "zlib-1.3.2",
+      "sha256": "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16",
+      "size": 1502830,
+      "url": "https://zlib.net/fossils/zlib-1.3.2.tar.gz"
+    },
+    "zstd": {
+      "filename": "zstd-1.5.6.tar.gz",
+      "licenses": {
+        "COPYING": {
+          "bytes": 18091,
+          "sha256": "f9c375a1be4a41f7b70301dd83c91cb89e41567478859b77eef375a52d782505"
+        },
+        "LICENSE": {
+          "bytes": 1549,
+          "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+        }
+      },
+      "prefix": "zstd-1.5.6",
+      "sha256": "30f35f71c1203369dc979ecde0400ffea93c27391bfd2ac5a9715d2173d92ff7",
+      "size": 2425452,
+      "url": "https://github.com/facebook/zstd/archive/v1.5.6.tar.gz"
+    }
+  },
+  "bounds": {
+    "compressed_each": 16777216,
+    "expanded_each": 134217728,
+    "file_each": 2097152,
+    "members_each": 4000,
+    "runtime": 4194304,
+    "total_seconds": 1200
+  },
+  "claim": "Source recipe and exact input identity only; no reproducibility, runtime, distribution, signing or release acceptance. GCC runtime/corresponding-source compliance remains separately unresolved.",
+  "host_manifest_sha256": "f5a8b93d2d6d670e66c085184fe49135bf7634530838d9fdfed7d7e0390b6656",
+  "kernel_headers": {
+    "asm-generic/bitsperlong.h": "/usr/include/asm-generic/bitsperlong.h",
+    "asm-generic/int-ll64.h": "/usr/include/asm-generic/int-ll64.h",
+    "asm-generic/posix_types.h": "/usr/include/asm-generic/posix_types.h",
+    "asm-generic/types.h": "/usr/include/asm-generic/types.h",
+    "asm/bitsperlong.h": "/usr/include/x86_64-linux-gnu/asm/bitsperlong.h",
+    "asm/posix_types.h": "/usr/include/x86_64-linux-gnu/asm/posix_types.h",
+    "asm/posix_types_32.h": "/usr/include/x86_64-linux-gnu/asm/posix_types_32.h",
+    "asm/posix_types_64.h": "/usr/include/x86_64-linux-gnu/asm/posix_types_64.h",
+    "asm/posix_types_x32.h": "/usr/include/x86_64-linux-gnu/asm/posix_types_x32.h",
+    "asm/types.h": "/usr/include/x86_64-linux-gnu/asm/types.h",
+    "linux/posix_types.h": "/usr/include/linux/posix_types.h",
+    "linux/stddef.h": "/usr/include/linux/stddef.h",
+    "linux/types.h": "/usr/include/linux/types.h"
+  },
+  "musl_patched_files": {
+    "src/locale/gb18030utf.h": "94b51d272a81a1164a035918253004ab71cc21e29f11100dcf9bd3dc22757c28",
+    "src/locale/iconv.c": "a707d34b500e8c5652fd771098e2755d5ce891dc19b0eb6bbf5c957e9191c740",
+    "src/regex/regcomp.c": "2a2e31036916f50f1fc68337d65b11e1fed393d0c4dbf2564bb901963e65e8d7",
+    "src/stdlib/qsort.c": "b40e91d98930b6fa929a42d9129821de5b73ce2fdc3f2a94023143d82408a7f2",
+    "tools/musl-gcc.specs.sh": "0e6f9b02ce8e56aa93d6b05040c5d91f26ce2d063d9d62a1e47f68d5ea8a07f6"
+  },
+  "patches": {
+    "musl-1.2.4-security-static-pie.patch": {
+      "sha256": "9d75bec66cddfd2982fcae1b34e9bb356f819f877edfa8e92fa21b883b5e77d5",
+      "size": 11854
+    },
+    "squashfuse-0.5.2-security.patch": {
+      "sha256": "51121444cf1310e1e117083ba9167d79c5b5c621479f1b5d2c586f6f45a29e87",
+      "size": 13650
+    },
+    "zlib-1.3.2-CVE-2026-85091.patch": {
+      "sha256": "110ff14375733173d8aa54574473424fbd7dfe4b81f1ca34a759c6fe14b15b14",
+      "size": 854
+    }
+  },
+  "runtime_revision": "fedfad51acc2860b2916a1eef32ba4a500ff31ef",
+  "schema": 1,
+  "security_backports": {
+    "current_review_limit": "Known primary advisories/source backports reviewed as data; clean query results are not a code-safety or release guarantee.",
+    "musl": {
+      "advisories": [
+        "CVE-2025-26519",
+        "CVE-2026-6042",
+        "CVE-2026-40200",
+        "CVE-2026-107891"
+      ],
+      "official_patch_source": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.21-stable/main/musl",
+      "patch": "musl-1.2.4-security-static-pie.patch",
+      "scope": "Exact upstream security changes backported to fixed1.2.4, plus Ubuntu static-PIE specs patch. Does not certify all libc defects absent."
+    },
+    "squashfuse": {
+      "advisory": "GHSA-jg98-58rj-3mcc",
+      "patch": "squashfuse-0.5.2-security.patch",
+      "scope": "Rebuild all libraries, internal headers and runtime together. Source correction only until hosted malformed and installed gates pass.",
+      "upstream_commits": [
+        "67c9bb820942eeb61a5a0c1d5ead4cc769422d1b",
+        "e1f8f3c43393b575736572e9f00c375d17547908",
+        "58330d69ab1cc048038dc2c664173b001f67d473"
+      ]
+    },
+    "zlib": {
+      "advisory": "CVE-2026-85091",
+      "patch": "zlib-1.3.2-CVE-2026-85091.patch",
+      "upstream_commit": "df84af25dc1942490e1d1c899a07619152a46148"
+    }
+  },
+  "squashfuse_patched_files": {
+    "Makefile.am": "81f4146f4e3d43654ac2186b340b2fb9102e3dcede2093dc1dcd757cc10e2b8f",
+    "configure.ac": "871478239bae9355f6f4cc075743eaae24f2bde0f334c9b6c76dd70a2817162b",
+    "dir.c": "42d80d2c52da6071adf466ccb593b81f94b474bc4d37b42699958d88b91428f6",
+    "file.c": "061fa7254cd2af2213336ad74626854e64767453f65945e59ae41f150b4725f5",
+    "fs.c": "21af9d31766e8407a41455fed9ad59d4e618dc8c46b6cb7e971f7689adf02fe5",
+    "table.c": "de78769522765a449689f2344bc8fe6673be49b98d3ea82bf7f48a2727879d6e",
+    "table.h": "ddcd5e932267337e31dccfc563582beb198a0ca6168b3464710a73d2f73aa947",
+    "tests/malformedtest.c": "b35f57dfdd6e1ae560947b247655ee33046bbfabdee6fe2b67763fa461387e92"
+  },
+  "version_label": "fedfad51+morpheus-security-3",
+  "zlib_patched_files": {
+    "gzwrite.c": "31d0da140edf382b82b13e2d87a22f59e158d9014ee026459e01cf437d0ab07d"
+  }
+}

@@ -37,8 +37,12 @@ LICENSES = {
     "LICENSE": "be4be5d77424833edf31f53fc1f1cecb6996b9e2d747d9e6fb8f878362ebc92b",
     "COPYING": "8909c319a7e27dbb33a15b9035f89ab3b7b2f6a12f8bcddc755206a8db1ada44",
 }
-TOOL_NAMES = frozenset({"linuxdeploy-x86_64.AppImage",
-                       "linuxdeploy-plugin-appimage.AppImage", "runtime-x86_64"})
+TOOL_RELEASES = {
+    "linuxdeploy-x86_64.AppImage": ("linuxdeploy/linuxdeploy", "linuxdeploy-x86_64.AppImage"),
+    "linuxdeploy-plugin-appimage.AppImage":
+        ("linuxdeploy/linuxdeploy-plugin-appimage", "linuxdeploy-plugin-appimage-x86_64.AppImage"),
+}
+TOOL_NAMES = frozenset(TOOL_RELEASES)
 
 
 class PackageFailure(RuntimeError):
@@ -89,11 +93,24 @@ def write_new(path, data, mode=0o600):
     Path(path).chmod(mode)
 
 
+def tool_download_url(pin):
+    source = TOOL_RELEASES.get(pin.get("cache_name"))
+    asset_id = pin.get("asset_id")
+    if (source is None or type(asset_id) is not int or not 1 <= asset_id < 10 ** 20):
+        raise PackageFailure("tool")
+    repository, filename = source
+    if pin.get("url") != f"https://github.com/{repository}/releases/download/continuous/{filename}":
+        raise PackageFailure("tool")
+    # An exact asset may disappear, but cannot silently select a replacement
+    # uploaded later under the same mutable release tag and filename.
+    return f"https://api.github.com/repos/{repository}/releases/assets/{asset_id}"
+
+
 def pinned_tools():
     data = json.loads(read_regular(Path(__file__).with_name("appimage-tools.json"), 16384))
     tools = data.get("tools", [])
     if (data.get("schema") != 1 or data.get("cargo_packager") != "0.11.8"
-            or len(tools) != 3 or {item.get("cache_name") for item in tools} != TOOL_NAMES):
+            or len(tools) != 2 or {item.get("cache_name") for item in tools} != TOOL_NAMES):
         raise PackageFailure("tool")
     for item in tools:
         if (not re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", ""))
@@ -101,11 +118,12 @@ def pinned_tools():
                 or type(item.get("asset_id")) is not int or item["asset_id"] <= 0
                 or not item.get("url", "").startswith("https://github.com/")):
             raise PackageFailure("tool")
+        tool_download_url(item)
     return tools
 
 
-def seed_tools(root, payloads):
-    """Verify all three authoritative assets before writing any executable.
+def seed_tools(root, payloads, source_runtime):
+    """Verify two assets and the source-built runtime before executable writes.
 
     Caller supplies bounded downloaded bytes. A changed continuous-tag asset
     fails its pinned digest; there is no latest-version or cache fallback.
@@ -120,6 +138,8 @@ def seed_tools(root, payloads):
         data = payloads[pin["cache_name"]]
         if type(data) is not bytes or len(data) != pin["size"] or sha256(data) != pin["sha256"]:
             raise PackageFailure("tool")
+    from appimage_runtime_build import static_identity
+    static_identity(source_runtime)
     cache = root / "xdg-cache"
     directory = cache / ".cargo-packager/AppImage"
     try:
@@ -132,10 +152,11 @@ def seed_tools(root, payloads):
         raise PackageFailure("tool") from None
     for pin in pins:
         write_new(directory / pin["cache_name"], payloads[pin["cache_name"]], 0o700)
+    write_new(directory / "runtime-x86_64", source_runtime, 0o700)
     # Cargo Packager copies this original source launcher to AppDir/AppRun.
     # There is no opaque provider AppRun or ambient LD_LIBRARY_PATH injection.
     write_new(directory / "AppRun-x86_64", launcher_bytes(), 0o700)
-    # The runtime pin prevents appimagetool from choosing/downloading its own
+    # This exact fresh runtime prevents appimagetool from downloading its own
     # runtime. It is an explicit per-child plugin argument, not a loader override.
     return {"XDG_CACHE_HOME": str(cache), "LDAI_RUNTIME_FILE": str(directory / "runtime-x86_64")}
 
@@ -148,7 +169,7 @@ def launcher_bytes():
     return data
 
 
-def verify_tools_after(root, original_payloads):
+def verify_tools_after(root, original_payloads, source_runtime):
     """Only Cargo Packager's documented three-byte header edit is accepted."""
     root = private_directory(root)
     directory = root / "xdg-cache/.cargo-packager/AppImage"
@@ -186,6 +207,13 @@ def verify_tools_after(root, original_payloads):
         if actual != expected:
             raise PackageFailure("tool")
         receipts[name] = sha256(actual)
+    runtime = directory / "runtime-x86_64"
+    info = runtime.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700 or info.st_nlink != 1
+            or read_regular(runtime, len(source_runtime)) != source_runtime):
+        raise PackageFailure("tool")
+    receipts["runtime-x86_64"] = sha256(source_runtime)
     return receipts
 
 

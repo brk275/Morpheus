@@ -49,10 +49,26 @@ def preflight_deb_authors(config, formats=None, platform=sys.platform):
         raise ValueError("DEB maintainer requires an owner-approved public Name <email> author")
 
 
+def linux_appimage(formats, scanner):
+    """Keep an explicit AppImage-only QA route; never redefine default/all/DEB."""
+    if formats is None or [value.strip().lower() for value in formats.split(",")] != ["appimage"]:
+        raise ValueError("Linux fixed-client packaging requires explicit --formats appimage; DEB/default/all remain unsupported")
+    if not scanner:
+        raise ValueError("Linux AppImage QA requires the reviewed --gitleaks executable")
+    if any(name in os.environ for name in ("CARGO_PACKAGER_SIGN_PRIVATE_KEY", "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD")):
+        raise ValueError("Package unsigned first; signing and update acceptance remain separate gates")
+    # Replace this controller so canonical __main__ retains its SIGTERM handler
+    # as well as public/manual/source/namespace/scanner/installed-capture gates.
+    return os.execv(sys.executable, [sys.executable, "-I", "-B",
+                    str(ROOT / "packaging/linux/package_appimage.py"), "--gitleaks", scanner,
+                    "--qa-output", str(ROOT / "dist")])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--formats", help="Cargo Packager formats, such as deb,appimage")
     parser.add_argument("--check", action="store_true", help="Validate configuration without building")
+    parser.add_argument("--gitleaks", help="Reviewed scanner for explicit Linux AppImage QA")
     args = parser.parse_args()
     config = package_config()
     if args.check:
@@ -60,7 +76,7 @@ def main():
         return
     preflight_deb_authors(config, args.formats)
     if sys.platform.startswith("linux"):
-        raise ValueError("Linux packages require the fixed-client AppImage wrapper; generic and DEB packaging remain blocked")
+        return linux_appimage(args.formats, args.gitleaks)
     if sys.platform.startswith("linux") and os.environ.get("CARGO_PACKAGER_SIGN_PRIVATE_KEY"):
         raise ValueError("Package unsigned first, prepare AppImage metadata, then use the official Cargo Packager signer on the final artifact")
     output = ROOT / config.get("out-dir", "dist")

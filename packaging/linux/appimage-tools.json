@@ -21,16 +21,6 @@
       "sha256": "49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e",
       "size": 16488952,
       "updated_at": "2026-10-01T04:30:37Z"
-    },
-    {
-      "cache_name": "runtime-x86_64",
-      "url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64",
-      "asset_id": 596078161,
-      "release_id": 398504756,
-      "release_target": "8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
-      "sha256": "156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074",
-      "size": 944632,
-      "updated_at": "2026-09-28T18:16:03Z"
     }
   ]
 }

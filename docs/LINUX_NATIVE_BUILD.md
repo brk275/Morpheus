@@ -95,9 +95,37 @@ post-deployment hash/build-ID checks and source notices remain in force. Its
 receiving peer's compile receives the same explicit AppImage build input; the
 peer is not substituted for the installed sender.
 
-Generic Linux/DEB packaging and the old direct update-fixture package builder
-fail before producing an artifact. They need integration with the separately
-reviewed fixed-runtime/original-SONAME AppImage wrapper. No signature, update or
-rollback assertion is removed or counted as passed. The pre-existing AppImage
-runtime dependency finding remains unresolved by this PipeWire change; no
-package execution, merge, release, signing or vulnerability waiver is implied.
+Generic Linux packaging has one explicit private QA route:
+`python3 scripts/package.py --formats appimage --gitleaks /reviewed/scanner`.
+It delegates to the canonical fixed-runtime/original-SONAME wrapper, including
+its actual installed-capture, cleanup and log-scan gate. Only after those gates
+and temporary-root cleanup pass does it atomically retain one digest-matched
+QA installer in an empty, owned 0700 `dist` directory for the original package
+smoke gate. No installer is uploaded or published. Default/all/DEB selections
+are not reinterpreted; DEB maintainer and compatible packaging remain deferred.
+This is a public, owner-selected standard-hosted QA path, not ordinary local
+developer packaging or release support.
+
+The existing disposable update harness uses the same original-SONAME builder
+through a private build-only entry. A current clean reviewed Git checkout must
+reproduce the complete exported source; only the two existing app-version
+fields may differ. It accepts bounded HTTPS loopback feed/public-key compile
+metadata, never signer keys or a general packaging-config override. The official
+signer, installed update, invalid-signature/truncation/discard, rollback and
+cohort assertions remain separate and unchanged. Build-only never claims the
+installed-capture gate passed.
+
+Neither route is runnable merely because its entry point exists. The exact
+static-runtime tool/source prerequisite closure and scanner must be admitted and
+provisioned on a fresh standard Ubuntu24/x64 hosted runner first. The
+accompanying Linux-only permanent workflow proposal supplies the scanner
+argument and the exact 18-DEB/634-file runtime host prerequisite set. It preserves
+the original 15 versions and 632 rows, adds only matching compiler/binutils
+siblings and two host-library hashes, and refuses inconsistent standard-host
+dependencies without downloads or resolver fallback. This proposed provisioning,
+its maintainer hooks and ambient dynamic dependencies still require independent
+review and a fresh hosted check before any package run. Mac/Windows commands,
+installed capture/update/smoke assertions and their budgets are unchanged.
+The pre-existing AppImage runtime dependency finding remains open until the
+patched runtime is actually built and the installed Linux gates pass. No package
+execution, merge, release, signing or vulnerability waiver is implied.

@@ -1,6 +1,7 @@
 """Pure/mocked command ownership checks; no child process or service is run."""
 
 import importlib.util
+import base64
 import io
 from pathlib import Path
 import sys
@@ -71,6 +72,7 @@ class ProcessTests(unittest.TestCase):
                 self.assertIsNone(process.returncode)
                 self.assertTrue(process.stdout.closed and process.stderr.closed)
                 self.assertTrue(spawned.call_args.kwargs["start_new_session"])
+                self.assertEqual(spawned.call_args.kwargs["umask"], 0o077)
 
     def test_success_private_output_and_group_cleanup_before_return(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -141,16 +143,71 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
         self.assertEqual(args[args.index("--proto-redir") + 1], "=https")
         self.assertEqual(args[args.index("--noproxy") + 1], "*")
         self.assertTrue(runner.run.call_args.kwargs["binary_output"])
+        self.assertNotIn("--header", args)
+        api_urls = (
+            "https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/assets/602438599",
+            "https://api.github.com/repos/linuxdeploy/linuxdeploy-plugin-appimage/releases/assets/602435573",
+            "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/657374641",
+        )
+        for api_url in api_urls:
+            with self.subTest(api_url=api_url):
+                result = M.download(runner, url=api_url, maximum=5, expected_size=5,
+                                    expected_sha256=hashlib.sha256(b"asset").hexdigest(),
+                                    root=Path("/private"), environment={})
+                self.assertEqual(result, b"asset")
+                args = runner.run.call_args.args[1]
+                self.assertEqual(args[-1], api_url)
+                self.assertEqual(args[args.index("--header") + 1], "Accept: application/octet-stream")
+                self.assertFalse(any(arg.lower().startswith("authorization:") for arg in args))
+                self.assertEqual(args[args.index("--proto") + 1], "=https")
+                self.assertEqual(args[args.index("--proto-redir") + 1], "=https")
+                self.assertEqual(args[args.index("--max-redirs") + 1], "3")
+                self.assertEqual(args[args.index("--max-filesize") + 1], "5")
+                self.assertEqual(runner.run.call_args.kwargs["timeout"], 125)
+                self.assertEqual(runner.run.call_args.kwargs["output_limit"], 5)
+                self.assertTrue(runner.run.call_args.kwargs["binary_output"])
+        source_url = "https://zlib.net/fossils/zlib-1.3.2.tar.gz"
+        self.assertEqual(M.download(runner, url=source_url, maximum=5, expected_size=5,
+                                   expected_sha256=hashlib.sha256(b"asset").hexdigest(),
+                                   root=Path("/private"), environment={}), b"asset")
+        self.assertNotIn("--header", runner.run.call_args.args[1])
+        with mock.patch.object(P, "download", return_value=b"asset") as downloaded:
+            P.download_inputs(runner, Path("/private"), {})
+        self.assertEqual(len(downloaded.call_args_list), 6)
+        self.assertEqual([call.kwargs["url"] for call in downloaded.call_args_list[:2]], list(api_urls[:2]))
+        self.assertFalse(any("/AppImage/type2-runtime/releases/assets/" in call.kwargs["url"]
+                             for call in downloaded.call_args_list))
+        for pin, call in zip(P.client.pinned_tools(), downloaded.call_args_list[:2]):
+            self.assertEqual(call.args, (runner,))
+            self.assertEqual(call.kwargs, {
+                "url": P.client.tool_download_url(pin), "maximum": pin["size"], "expected_size": pin["size"],
+                "expected_sha256": pin["sha256"], "root": Path("/private"), "environment": {},
+            })
 
     def test_invalid_origin_size_or_digest_never_accepted(self):
         runner = SimpleNamespace(run=mock.Mock(return_value=b"asset"))
-        for url in ("http://github.com/x", "https://user:pass@github.com/x", "https://localhost/x"):
+        for url in ("http://github.com/x", "https://user:pass@github.com/x", "https://localhost/x",
+                    "https://zlib.net/", "https://zlib.net/fossils/zlib-latest.tar.gz",
+                    "https://zlib.net/fossils/zlib-1.3.2.tar.gz/extra",
+                    "https://zlib.net/fossils/zlib-1.3.2.tar.gz?private=x",
+                    "https://api.github.com/user",
+                    "https://api.github.com/repos/other/project/releases/assets/1",
+                    "https://api.github.com/repos/AppImage/type2-runtime/releases/latest",
+                    "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/0",
+                    "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/123/extra",
+                    "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/123?private=x",
+                    "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/123#private",
+                    "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/100000000000000000000"):
             with self.subTest(url=url), self.assertRaises(M.CommandFailure):
                 M.download(runner, url=url, maximum=5, root=Path("/private"), environment={})
         runner.run.assert_not_called()
         with self.assertRaises(M.CommandFailure):
             M.download(runner, url="https://github.com/x", maximum=5, expected_sha256="0" * 64,
                        root=Path("/private"), environment={})
+        for pin in ({"expected_size": 4}, {"expected_size": 5, "expected_sha256": "0" * 64}):
+            with self.subTest(pin=pin), self.assertRaises(M.CommandFailure):
+                M.download(runner, url="https://api.github.com/repos/AppImage/type2-runtime/releases/assets/657374641",
+                           maximum=5, root=Path("/private"), environment={}, **pin)
 
     def test_environment_preserves_home_and_removes_secrets_loader_and_signer(self):
         result = P.controlled_environment({"HOME": "/home/runner", "GITHUB_SHA": "a" * 40,
@@ -162,6 +219,94 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
         self.assertEqual(result["MORPHEUS_PACKAGE_SOURCE_REVISION"], "b" * 40)
         self.assertEqual(result["RUSTUP_TOOLCHAIN"], "1.99.0")
         self.assertNotIn("private", result.values())
+
+    def test_update_compile_inputs_are_only_bounded_loopback_public_metadata(self):
+        public = base64.b64encode(b"Ed" + bytes(40)).decode()
+        key = base64.b64encode(("untrusted comment: minisign public key 0000000000000000\n" + public + "\n").encode()).decode()
+        valid = {"version": "0.1.0-updateqa.1", "feed": "https://127.0.0.1:12345/feed.json", "public_key": key,
+                 "source_proof": {"variant": "updateqa-version-only", "version": "0.1.0-updateqa.1", "inventory_sha256": "a" * 64}}
+        P.validate_update_parameters(valid)
+        alternate = base64.b64encode(b"ED" + bytes(40)).decode()
+        P.validate_update_parameters(valid | {"public_key": base64.b64encode(("untrusted comment: minisign public key 0000000000000000\n" + alternate + "\n").encode()).decode()})
+        for change in ({"feed": "http://127.0.0.1:12345/feed.json"}, {"feed": "https://remote.invalid/feed.json"},
+                       {"feed": "https://user@127.0.0.1:12345/feed.json"}, {"feed": "https://127.0.0.1:12345/feed.json?x=1"},
+                       {"version": "0.1.0"}, {"public_key": "private-value"},
+                       {"public_key": base64.b64encode(b"untrusted comment: minisign encrypted secret key\nwrong\n").decode()},
+                       {"source_proof": {"variant": "arbitrary-export"}}):
+            with self.subTest(change=list(change)), self.assertRaises(P.PackageFailure):
+                P.validate_update_parameters(valid | change)
+
+    def test_update_build_flag_does_not_authorize_a_nonpublic_context(self):
+        with mock.patch.dict(P.os.environ, {"MORPHEUS_FREE_HOSTED_UPDATE_QA": "1"}, clear=True), \
+                mock.patch.object(P, "OwnedRunner") as runner, \
+                mock.patch.object(P.containment, "assert_contained") as contained, \
+                self.assertRaises(P.PackageFailure):
+            P.update_build(Path("unused"), "/scanner")
+        runner.assert_not_called()
+        contained.assert_not_called()
+
+    def test_generic_qa_output_is_private_exact_and_requires_capture_identity(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            case = root / "case"
+            (case / "packages").mkdir(parents=True)
+            data = b"synthetic image bytes" * 5
+            (case / "packages/candidate.AppImage").write_bytes(data)
+            with mock.patch.object(P, "ROOT", checkout):
+                with self.assertRaises(P.PackageFailure):
+                    P.qa_output_path(root / "arbitrary-output")
+                output = P.qa_output_path(checkout / "dist")
+                self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+                for receipt in ({"installed_capture_passed": False, "appimage_sha256": hashlib.sha256(data).hexdigest()},
+                                {"installed_capture_passed": True, "appimage_sha256": "0" * 64}):
+                    with self.assertRaises(P.PackageFailure):
+                        P.qa_image_bytes(case, receipt)
+                    self.assertEqual(list(output.iterdir()), [])
+                receipt = {"installed_capture_passed": True, "appimage_sha256": hashlib.sha256(data).hexdigest()}
+                self.assertEqual(P.qa_image_bytes(case, receipt), data)
+                identity = P.retain_qa_image(output, data, receipt)
+                self.assertEqual((output / "morpheus-qa.AppImage").read_bytes(), data)
+                with self.assertRaises(P.PackageFailure):
+                    P.retain_qa_image(output, data, receipt)
+                P.remove_qa_image(output, identity)
+                self.assertEqual(list(output.iterdir()), [])
+                (output / "existing").write_bytes(b"unrelated")
+                with self.assertRaises(P.PackageFailure):
+                    P.qa_output_path(output)
+
+    def test_generic_report_flush_failure_removes_the_private_handoff(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, case = root / "checkout", root / "case"
+            checkout.mkdir()
+            (case / "packages").mkdir(parents=True)
+            data = b"synthetic image bytes" * 5
+            (case / "packages/candidate.AppImage").write_bytes(data)
+            receipt = {"installed_capture_passed": True, "appimage_sha256": hashlib.sha256(data).hexdigest()}
+            def reporting(*args, flush=False, **kwargs):
+                # An unflushed stream may buffer successfully and fail only at
+                # interpreter shutdown, outside main's handoff cleanup scope.
+                if flush:
+                    raise OSError("synthetic reporting failure")
+            with mock.patch.object(P, "ROOT", checkout), \
+                    mock.patch.object(P, "public_hosted_environment"), \
+                    mock.patch.object(P, "controlled_environment", return_value={}), \
+                    mock.patch.object(P, "expected_revision", return_value="a" * 40), \
+                    mock.patch.object(P, "verify_checkout"), \
+                    mock.patch.object(P, "command_tools", return_value={}), \
+                    mock.patch.object(P, "owned_tool", return_value="/reviewed/scanner"), \
+                    mock.patch.object(P.containment, "containment_check"), \
+                    mock.patch.object(P, "contained", return_value=receipt), \
+                    mock.patch.object(P.tempfile, "TemporaryDirectory") as temporary, \
+                    mock.patch("builtins.print", side_effect=reporting), self.assertRaises(OSError):
+                temporary.return_value.__enter__.return_value = str(case)
+                temporary.return_value.__exit__.return_value = False
+                P.main(["--gitleaks", "/reviewed/scanner", "--qa-output", str(checkout / "dist")])
+            self.assertEqual(list((checkout / "dist").iterdir()), [])
 
     def test_source_mismatch_stops_before_tool_selection_or_build(self):
         with mock.patch.object(P.sys, "argv", ["package_appimage", "--gitleaks", "/scanner"]), \

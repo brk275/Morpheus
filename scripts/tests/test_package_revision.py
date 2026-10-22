@@ -1,4 +1,6 @@
 import os
+import io
+import tarfile
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,6 +12,64 @@ from scripts import package_scope
 
 
 class RevisionIdentityTests(unittest.TestCase):
+    def test_update_export_allows_only_exact_two_version_fields_and_full_file_map(self):
+        originals = {"crates/morpheus-app/Cargo.toml": b'[package]\nname = "morpheus-app"\nversion = "0.1.0"\n\n[dependencies]\nother = "0.1.0"\n',
+                     "Cargo.lock": b'[[package]]\nname = "morpheus-app"\nversion = "0.1.0"\n\n[[package]]\nname = "other"\nversion = "0.1.0"\n',
+                     "scripts/unchanged.py": b"reviewed source\n"}
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as stream:
+            for name, content in originals.items():
+                member = tarfile.TarInfo(name)
+                member.size, member.mode = len(content), 0o644
+                stream.addfile(member, io.BytesIO(content))
+        projected = dict(originals)
+        projected["crates/morpheus-app/Cargo.toml"] = originals["crates/morpheus-app/Cargo.toml"].replace(b'version = "0.1.0"', b'version = "0.1.0-updateqa.1"', 1)
+        projected["Cargo.lock"] = originals["Cargo.lock"].replace(b'version = "0.1.0"', b'version = "0.1.0-updateqa.1"', 1)
+        for mutation in (None, "extra", "missing", "other-bytes", "other-dependency", "executable"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                for name, content in projected.items():
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
+                    path.chmod(0o600)
+                if mutation == "extra": (root / "unreviewed").write_text("different")
+                if mutation == "missing": (root / "scripts/unchanged.py").unlink()
+                if mutation == "other-bytes": (root / "scripts/unchanged.py").write_text("different")
+                if mutation == "other-dependency":
+                    path = root / "Cargo.lock"
+                    path.write_bytes(path.read_bytes().replace(b'name = "other"\nversion = "0.1.0"', b'name = "other"\nversion = "0.2.0"'))
+                if mutation == "executable": (root / "scripts/unchanged.py").chmod(0o700)
+                if mutation is None:
+                    result = revision.verify_versioned_export(root, archive.getvalue(), "0.1.0-updateqa.1")
+                    self.assertEqual(result["variant"], "updateqa-version-only")
+                    self.assertEqual(result["files"], 3)
+                    self.assertEqual(result["allowed_paths"], ["Cargo.lock", "crates/morpheus-app/Cargo.toml"])
+                else:
+                    with self.assertRaises(revision.SourceRevisionError):
+                        revision.verify_versioned_export(root, archive.getvalue(), "0.1.0-updateqa.1")
+
+        for invalid_name, kind in (("../outside", tarfile.REGTYPE), ("linked", tarfile.SYMTYPE),
+                                   ("scripts/unchanged.py", tarfile.REGTYPE)):
+            with self.subTest(archive_member=invalid_name), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                for name, content in projected.items():
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
+                    path.chmod(0o600)
+                archive = io.BytesIO()
+                with tarfile.open(fileobj=archive, mode="w") as stream:
+                    for name, content in originals.items():
+                        member = tarfile.TarInfo(name)
+                        member.size, member.mode = len(content), 0o644
+                        stream.addfile(member, io.BytesIO(content))
+                    invalid = tarfile.TarInfo(invalid_name)
+                    invalid.type, invalid.linkname = kind, "outside"
+                    stream.addfile(invalid)
+                with self.assertRaises(revision.SourceRevisionError):
+                    revision.verify_versioned_export(root, archive.getvalue(), "0.1.0-updateqa.1")
+
     def test_default_and_explicit_sources_keep_workflow_identity_separate(self):
         workflow, source = "a" * 40, "b" * 40
         self.assertEqual(revision.select_revision("", workflow), workflow)

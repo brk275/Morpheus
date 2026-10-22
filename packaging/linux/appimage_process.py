@@ -80,7 +80,7 @@ class OwnedRunner:
                 descriptors.append(os.fdopen(descriptor, "wb", buffering=0))
             process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       start_new_session=True)
+                                       start_new_session=True, umask=0o077)
             for stream, kind in ((process.stdout, "stdout"), (process.stderr, "stderr")):
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ, kind)
@@ -152,17 +152,25 @@ def download(runner, *, url, maximum, root, environment, expected_size=None, exp
     import hashlib
     from urllib.parse import urlsplit
     parsed = urlsplit(url)
+    api_asset = parsed.hostname == "api.github.com"
     if (parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
-            or parsed.hostname not in {"github.com", "archive.ubuntu.com"}
+            or parsed.hostname not in {"github.com", "api.github.com", "archive.ubuntu.com", "zlib.net"}
             or parsed.port not in (None, 443) or parsed.fragment or parsed.query
-            or not 1 <= maximum <= 64 * 1024 * 1024):
+            or not 1 <= maximum <= 64 * 1024 * 1024
+            or (parsed.hostname == "zlib.net" and parsed.path != "/fossils/zlib-1.3.2.tar.gz")
+            or (api_asset and not re.fullmatch(
+                r"/repos/(?:linuxdeploy/linuxdeploy|linuxdeploy/linuxdeploy-plugin-appimage|"
+                r"AppImage/type2-runtime)/releases/assets/[1-9][0-9]{0,19}", parsed.path))):
         raise CommandFailure("input")
     # Redirects never carry credentials; HTTPS-only redirection plus an exact
     # required final digest bounds release-asset indirection without accepting a
     # mutable tag as trust. No API Authorization header or ambient curlrc.
+    # Public asset-ID requests require this constant media type to return
+    # bytes instead of JSON metadata; no caller-supplied headers are accepted.
+    headers = ["--header", "Accept: application/octet-stream"] if api_asset else []
     output = runner.run("download", ["/usr/bin/curl", "--disable", "--fail", "--silent", "--show-error",
                         "--location", "--max-redirs", "3", "--noproxy", "*", "--proto", "=https", "--proto-redir", "=https",
-                        "--connect-timeout", "10", "--max-time", "120", "--max-filesize", str(maximum), url],
+                        "--connect-timeout", "10", "--max-time", "120", "--max-filesize", str(maximum), *headers, url],
                         cwd=root, env=environment, timeout=125, output_limit=maximum, binary_output=True)
     if ((expected_size is not None and len(output) != expected_size)
             or (expected_sha256 is not None and hashlib.sha256(output).hexdigest() != expected_sha256)):

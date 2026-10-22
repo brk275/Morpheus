@@ -222,7 +222,7 @@ def add_notice(directory, config, notices, name, data):
     return destination
 
 
-def prepare(runner, root, binary, stage, source_metadata, config, environment):
+def prepare(runner, root, binary, stage, source_metadata, config, environment, *, runtime_metadata):
     root = client.private_directory(root)
     stage = Path(stage)
     if not isinstance(config.get("appimage", {}).get("files"), dict):
@@ -267,12 +267,19 @@ def prepare(runner, root, binary, stage, source_metadata, config, environment):
     add_notice(directory, config, notices, "Morpheus-LICENSE", regular(client.ROOT / "LICENSE", MAX_NOTICE))
     # PipeWire provenance/notices are staged by appimage_config; pin every byte.
     for source, destination in config["appimage"]["files"].items():
-        if destination.startswith(client.NOTICE_DIR + "/"):
+        if destination.startswith((client.NOTICE_DIR + "/", "usr/share/doc/morpheus-app/appimage-runtime/")):
             data = regular(source, 64 * 1024 * 1024)
             notices[destination] = digest(data)
+    runtime = runtime_metadata.get("runtime", {})
+    if (runtime_metadata.get("schema") != 1 or runtime_metadata.get("fresh_private_prefix") is not True
+            or runtime_metadata.get("malformedtest_returned_zero") is not True
+            or runtime_metadata.get("upstream_runtime_binary_downloaded") is not False
+            or not HEX.fullmatch(runtime.get("sha256", ""))):
+        raise InventoryFailure("input")
     return {"schema": 1, "components": components, "notices": notices,
             "launcher_sha256": digest(client.launcher_bytes()),
-            "runtime_pin": next(pin for pin in client.pinned_tools() if pin["cache_name"] == "runtime-x86_64")}
+            "runtime_pin": runtime, "runtime_sources": runtime_metadata["sources"],
+            "runtime_source_patches": runtime_metadata["patches"]}
 
 
 def walk_regular_files(appdir):
@@ -362,8 +369,10 @@ def verify(runner, appdir, notice_record, shipped_pipewire, environment):
             "external_dependencies": sorted(set(components) - seen),
             "notice_sha256": notice_record["notices"], "launcher_sha256": notice_record["launcher_sha256"],
             "runtime_input_sha256": notice_record["runtime_pin"]["sha256"],
+            "runtime_sources": notice_record["runtime_sources"],
+            "runtime_source_patches": notice_record["runtime_source_patches"],
             "identity_basis": "owned deployment; pre/post hashes and matching build IDs, SONAMEs, DT_NEEDED",
             "identity_is_reproducible_build_proof": False, "distribution_ready": False,
-            "unresolved_release_inputs": ["runtime-static-dependency-exact-provenance-and-sources",
+            "unresolved_release_inputs": ["compiler-runtime-corresponding-source-and-exception-compliance",
                                            "rust-and-vendored-static-dependency-notices-and-sources",
                                            "bundled-system-package-corresponding-sources"]}
