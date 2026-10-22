@@ -53,6 +53,7 @@ MANUAL_LINUX_PACKAGE_INPUTS = {
     "packaging/linux/appimage_diagnostics.py",
     "packaging/linux/appimage_notices.py",
     "packaging/linux/appimage_process.py",
+    "packaging/linux/appimage_runtime_build.py",
     "packaging/linux/corresponding_source.py",
     "packaging/linux/source_bundle_qa.py",
 }
