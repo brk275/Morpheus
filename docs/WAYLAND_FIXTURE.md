@@ -1,7 +1,10 @@
 # Wayland capture fixture
 
-Run `python3 scripts/run_wayland_acceptance.py` on the standard Ubuntu 24.04
-CI runner. This is a real, isolated Sway/PipeWire/portal integration check with
+Prepare the explicit owned fixed native client first, as described in
+[Linux native source builds](LINUX_NATIVE_BUILD.md), then run
+`python3 scripts/run_wayland_acceptance.py` on the standard Ubuntu 24.04 CI
+runner. The old unmodified-system client failures recorded below stay failed;
+this gate names its new owned-client identity explicitly. This is a real, isolated Sway/PipeWire/portal integration check with
 two software-rendered displays. It does not capture a user's desktop or ask for
 device permission. It must pass; a failure is not converted into a skip.
 
@@ -74,10 +77,13 @@ wayland-protocols libwayland-dev libpipewire-0.3-dev
 
 Before the first PipeWire initializer, the native test checks the resolved
 addresses of all 33 functions that collide with the pinned WebRTC dlopen stub
-exports. Every one must resolve to the root-owned Ubuntu system PipeWire
-library; executable stubs or other/unknown libraries fail before initialization.
-The helper requires this evidence in addition to the named capture test and
-prints only fixed category counts. Separate `pipewire_binding_origin` and
+exports. Every one must resolve to the exact owned fixed native PipeWire client,
+with the expected SHA, build-ID and executable mapping/inode before initialization.
+Executable stubs, stock client bindings and other/unknown libraries fail. The
+helper requires this evidence in addition to the named capture test, prints only
+closed counts/artifact identity, and verifies stock service mappings separately.
+The following system-client results describe the earlier source, not a pass of
+this new owned-client proposal. Separate `pipewire_binding_origin` and
 `pipewire_initializer` stages survive a native abort. The
 [vendored build patch](../vendor/webrtc-sys/MORPHEUS_PATCH.md) verifies and
 isolates all 33 WebRTC definitions and 46 internal references in `OUT_DIR`.
@@ -379,8 +385,9 @@ installed package/source identities. In
 [run 38147202698](https://github.com/brk275/Morpheus/actions/runs/38147202698)
 at `4352c88`, system and control captures failed while the patched client passed
 the complete named test. See the [recorded comparison](VERIFICATION.md#linux-pipewire-startup-comparison)
-for exact scope and limitations. Ordinary CI keeps its separate, mandatory
-system-library gate; installed acceptance of the
+for exact scope and limitations. Ordinary CI now requires the explicitly named
+owned-native fixed client with the same capture assertions and stock services;
+those recorded stock-client failures remain failed. Installed acceptance of the
 [AppImage-local client](APPIMAGE_PIPEWIRE_PROPOSAL.md) remains open.
 
 The diagnostic collects three conditions, each in a fresh owned PID namespace

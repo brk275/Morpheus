@@ -20,6 +20,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -473,6 +474,36 @@ def bindings_passed(facts: dict) -> bool:
                      "executable": 0, "other": 0, "unavailable": 0}
 
 
+
+def native_binding_facts(path: Path) -> dict:
+    """Fixed counts and actual source-built identity; no paths or addresses."""
+    try:
+        with path.open("rb") as source:
+            raw = source.read(1025)
+        if len(raw) > 1024:
+            return {"status": "invalid"}
+        value = json.loads(raw)
+    except (OSError, ValueError):
+        return {"status": "unavailable"}
+    keys = {"schema", "variant", "checked", "owned_fixed_client", "system_pipewire", "executable", "other",
+            "unavailable", "sha256", "build_id", "digest_verified", "build_id_verified", "mapped_file_verified"}
+    if not isinstance(value, dict) or set(value) != keys:
+        return {"status": "invalid"}
+    numbers = {"schema": 1, "checked": 33, "owned_fixed_client": 33,
+               "system_pipewire": 0, "executable": 0, "other": 0, "unavailable": 0}
+    if (any(type(value[k]) is not int or value[k] != v for k, v in numbers.items())
+            or value["variant"] != "native"
+            or any(value[k] is not True for k in ("digest_verified", "build_id_verified", "mapped_file_verified"))
+            or not isinstance(value["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
+            or not isinstance(value["build_id"], str) or not re.fullmatch(r"(?:[0-9a-f]{2}){8,64}", value["build_id"])):
+        return {"status": "invalid"}
+    return {"status": "valid", **value}
+
+
+def native_bindings_passed(facts: dict) -> bool:
+    return facts.get("status") == "valid" and facts.get("owned_fixed_client") == 33
+
+
 def capture_stage(path: Path) -> str:
     try:
         with path.open("rb") as source:
@@ -763,10 +794,52 @@ def assert_session_namespace() -> None:
         raise RuntimeError("Wayland process containment failed")
 
 
+
+def service_library_facts(services) -> bool:
+    """All three PipeWire clients stay mapped to ordinary root-owned libraries.
+
+    Only a boolean escapes; maps contain private addresses and process paths.
+    The frontend may not use PipeWire itself, but any mapping it has must also
+    be the system library. Leaders remain unreaped throughout the fixture.
+    """
+    try:
+        for role in ("pipewire", "wireplumber", "portal-wlr", "portal"):
+            process = services.get(role)
+            if process is None or peek_returncode(process) is not None:
+                return False
+            with Path(f"/proc/{process.pid}/maps").open("rb") as source:
+                maps = source.read(2 * 1024 * 1024 + 1)
+            if len(maps) > 2 * 1024 * 1024:
+                return False
+            libraries = set()
+            for line in maps.decode("utf-8", errors="strict").splitlines():
+                fields = line.split(maxsplit=5)
+                if len(fields) == 6 and "libmorpheus-pipewire-0.3.so" in fields[5]:
+                    return False  # The fixed client belongs only to the consumer.
+                if len(fields) != 6 or "libpipewire-0.3.so" not in fields[5]:
+                    continue
+                path = Path(fields[5]).resolve(strict=True)
+                metadata = path.stat()
+                major, minor = fields[3].split(":")
+                if (path.parent != Path("/usr/lib/x86_64-linux-gnu")
+                        or not re.fullmatch(r"libpipewire-0\.3\.so\.[0-9.]+", path.name)
+                        or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+                        or metadata.st_mode & 0o022 or int(fields[4]) != metadata.st_ino
+                        or (int(major, 16), int(minor, 16)) != (os.major(metadata.st_dev), os.minor(metadata.st_dev))):
+                    return False
+                libraries.add(path)
+            if len(libraries) != (0 if role == "portal" and not libraries else 1):
+                return False
+        return True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def session(root: Path, *, private_client=None, record_probe: bool = False) -> int:
     assert_session_namespace()
     # Only the separate, explicit hosted diagnostic calls this optional path.
-    # Normal CLI entry points always use the unconditional system-library gate.
+    # Normal CLI entry points require the prepared native client. The old stock
+    # baseline is reachable only through the separately selected comparison.
     if private_client is not None and not record_probe:
         raise RuntimeError("private client requires the separate diagnostic runner")
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
@@ -840,8 +913,7 @@ def session(root: Path, *, private_client=None, record_probe: bool = False) -> i
                 probe = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.portal.Desktop", "--object-path", "/org/freedesktop/portal/desktop", "--method", "org.freedesktop.DBus.Properties.Get", "org.freedesktop.portal.ScreenCast", "AvailableSourceTypes"], capture_output=True, timeout=3)
                 return probe.returncode == 0
             wait_for(portal_ready, list(services.values()), "ScreenCast portal", seconds=30)
-            if record_probe:
-                from run_pipewire_startup_probe import service_library_facts
+            if record_probe or private_client is None:
                 outcome["services_system"] = service_library_facts(services)
                 if not outcome["services_system"]:
                     raise RuntimeError("diagnostic service library provenance failed")
@@ -908,8 +980,12 @@ def session(root: Path, *, private_client=None, record_probe: bool = False) -> i
                 test_sink.finish()
             test_output = (root / "capture-stdout.log").read_text(errors="replace")
             test_stderr = (root / "capture-test.log").read_text(errors="replace")
-            origins = binding_facts(binding_path)
-            origins_passed = bindings_passed(origins)
+            if record_probe:
+                origins = binding_facts(binding_path)
+                origins_passed = bindings_passed(origins)
+            else:
+                origins = native_binding_facts(binding_path)
+                origins_passed = native_bindings_passed(origins)
             if private_client is not None:
                 from run_pipewire_startup_probe import private_binding_facts
                 origins = private_binding_facts(binding_path, private_client.variant)
@@ -928,9 +1004,9 @@ def session(root: Path, *, private_client=None, record_probe: bool = False) -> i
                 raise RuntimeError("Wayland portal acceptance did not execute and pass its required test")
             outcome["capture_passed"] = True
             if private_client is None:
-                print("Actual Wayland first static frame, moving-pixel reopen, stream and cancellation tests passed; untouched-static reopen, native window and GNOME/KDE remain unverified.")
+                print("Owned fixed native client with stock PipeWire services passed actual Wayland first static frame, moving-pixel reopen, source-loss, stop, denial and cancellation; untouched-static reopen, native window and GNOME/KDE remain unverified.")
             else:
-                print("Private-client diagnostic scenario passed; this is not the system-library acceptance gate.")
+                print("Private-client diagnostic scenario passed; this is not owned-native production acceptance.")
             return 0
         except Exception:
             print("Wayland fixture diagnostic facts: " + json.dumps(diagnostic_facts(root, stage, services), sort_keys=True), file=sys.stderr)
@@ -939,8 +1015,7 @@ def session(root: Path, *, private_client=None, record_probe: bool = False) -> i
             trace_boundaries.append((folded_raw_clock(), "cleanup_begin"))
             try:
                 try:
-                    if record_probe:
-                        from run_pipewire_startup_probe import service_library_facts
+                    if record_probe or private_client is None:
                         outcome["services_system"] = outcome["services_system"] and service_library_facts(services)
                 finally:
                     stop_owned_groups(processes)
@@ -959,6 +1034,10 @@ def session(root: Path, *, private_client=None, record_probe: bool = False) -> i
                     result_path = root / "probe-outcome.json"
                     result_path.write_text(json.dumps(outcome, sort_keys=True), encoding="ascii")
                     result_path.chmod(0o600)
+                if private_client is None and not record_probe:
+                    print("Wayland stock service origins: " + json.dumps({"services_system": outcome["services_system"]}))
+                    if not outcome["services_system"]:
+                        raise RuntimeError("owned-native capture did not retain stock service libraries")
 
 
 def run_session(command: list[str], env: dict[str, str], timeout: float = 840) -> int:
@@ -993,6 +1072,9 @@ def main() -> int:
         return session(args.inside_session)
     if sys.platform != "linux":
         raise RuntimeError("the Wayland acceptance fixture requires Linux")
+    if (os.environ.get("MORPHEUS_PIPEWIRE_CLIENT_VARIANT") != "native"
+            or not os.environ.get("MORPHEUS_PIPEWIRE_CLIENT_RECEIPT")):
+        raise RuntimeError("prepare the owned native PipeWire client before ordinary Wayland acceptance")
     for command in ("sway", "swaymsg", "swaybg", "pipewire", "wireplumber", "dbus-run-session", "dbus-update-activation-environment", "gdbus", "cargo", "meson", "ninja", "pkg-config", "cc"):
         if not shutil.which(command):
             raise RuntimeError(f"missing Wayland acceptance dependency: {command}")

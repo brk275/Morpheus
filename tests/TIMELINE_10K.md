@@ -205,3 +205,13 @@ unmet one, in that order. Malformed enrolled device input fails at
 `bob_device_ids`. No retry was added; the next hosted run shows whether
 anything remains.
 - **Workflow integration.** No workflow runs this yet.
+
+### Linux fixed-client source-build prerequisite
+
+Ubuntu24/x64 native builds require the explicit preparation driver described in
+[Linux native source builds](../docs/LINUX_NATIVE_BUILD.md), including optimized
+instrumented builds. Keep `MORPHEUS_TIMELINE_ACCEPTANCE_BUILD=1`, `--release`,
+all measurements and the existing acceptance thresholds unchanged. The prepared
+prefix must remain present throughout enrollment, seeding and measurement;
+removing it is a loader failure, not a reason to fall back to the stock client.
+This prerequisite is not evidence that the encrypted 10K workload has passed.

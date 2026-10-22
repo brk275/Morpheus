@@ -1,4 +1,14 @@
+#[cfg(target_os = "linux")]
+#[path = "../linux_native_pipewire.rs"]
+mod linux_native_pipewire;
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && std::env::var_os("CARGO_FEATURE_NATIVE_CALLS").is_some()
+    {
+        linux_native_pipewire::configure("bins");
+    }
     let timeline_acceptance = timeline_acceptance_build();
     persistence_fingerprint(timeline_acceptance);
     slint_build::compile("ui/app-window.slint").expect("failed to compile Morpheus UI");

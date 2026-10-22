@@ -48,6 +48,29 @@ class WaylandFixtureTests(unittest.TestCase):
             path.write_bytes(b"\xff\xfe")
             self.assertEqual(MODULE.binding_facts(path), {"status": "unavailable"})
 
+    def test_native_binding_facts_require_exact_owned_client_and_artifact_proof(self):
+        valid = {"schema": 1, "variant": "native", "checked": 33, "owned_fixed_client": 33,
+                 "system_pipewire": 0, "executable": 0, "other": 0, "unavailable": 0,
+                 "sha256": "a" * 64, "build_id": "b" * 40, "digest_verified": True,
+                 "build_id_verified": True, "mapped_file_verified": True}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native-facts"
+            path.write_text(MODULE.json.dumps(valid))
+            facts = MODULE.native_binding_facts(path)
+            self.assertTrue(MODULE.native_bindings_passed(facts))
+            self.assertEqual(facts["owned_fixed_client"], 33)
+            self.assertEqual(facts["system_pipewire"], 0)
+            for update in ({"system_pipewire": 1}, {"checked": True}, {"owned_fixed_client": 32},
+                           {"variant": "patched"}, {"digest_verified": False},
+                           {"mapped_file_verified": False}, {"sha256": "private text"},
+                           {"build_id": "0" * 1000}, {"path": "/private/library"}):
+                path.write_text(MODULE.json.dumps(valid | update))
+                rejected = MODULE.native_binding_facts(path)
+                self.assertFalse(MODULE.native_bindings_passed(rejected))
+                self.assertNotIn("private", MODULE.json.dumps(rejected))
+            path.write_bytes(b"x" * 1025)
+            self.assertFalse(MODULE.native_bindings_passed(MODULE.native_binding_facts(path)))
+
     def test_runtime_binding_probe_covers_complete_pinned_archive_inventory(self):
         repo = Path(__file__).resolve().parents[2]
         inventory = (repo / "vendor/webrtc-sys/pipewire-symbols.txt").read_text().splitlines()
@@ -354,7 +377,11 @@ class WaylandFixtureTests(unittest.TestCase):
 
     def test_main_requires_actual_containment_preflight_before_session_launch(self):
         order = []
-        with mock.patch.object(MODULE.sys, "argv", ["wayland-acceptance"]), \
+        with mock.patch.dict(MODULE.os.environ, {
+                "MORPHEUS_PIPEWIRE_CLIENT_VARIANT": "native",
+                "MORPHEUS_PIPEWIRE_CLIENT_RECEIPT": "inert-mocked-receipt",
+                }), \
+                mock.patch.object(MODULE.sys, "argv", ["wayland-acceptance"]), \
                 mock.patch.object(MODULE.sys, "platform", "linux"), \
                 mock.patch.object(MODULE.shutil, "which", return_value="available"), \
                 mock.patch.object(MODULE, "containment_check", side_effect=lambda _: order.append("probe")), \
@@ -365,7 +392,11 @@ class WaylandFixtureTests(unittest.TestCase):
         self.assertIn("--contained-session", wrap.call_args.args[0])
 
     def test_failed_containment_preflight_never_starts_fixture(self):
-        with mock.patch.object(MODULE.sys, "argv", ["wayland-acceptance"]), \
+        with mock.patch.dict(MODULE.os.environ, {
+                "MORPHEUS_PIPEWIRE_CLIENT_VARIANT": "native",
+                "MORPHEUS_PIPEWIRE_CLIENT_RECEIPT": "inert-mocked-receipt",
+                }), \
+                mock.patch.object(MODULE.sys, "argv", ["wayland-acceptance"]), \
                 mock.patch.object(MODULE.sys, "platform", "linux"), \
                 mock.patch.object(MODULE.shutil, "which", return_value="available"), \
                 mock.patch.object(MODULE, "containment_check", side_effect=RuntimeError("containment failed")), \
@@ -375,6 +406,23 @@ class WaylandFixtureTests(unittest.TestCase):
                 MODULE.main()
         wrap.assert_not_called()
         run.assert_not_called()
+
+    def test_main_refuses_missing_native_preparation_before_containment(self):
+        for environment in ({}, {"MORPHEUS_PIPEWIRE_CLIENT_VARIANT": "native"},
+                            {"MORPHEUS_PIPEWIRE_CLIENT_VARIANT": "system-probe",
+                             "MORPHEUS_PIPEWIRE_CLIENT_RECEIPT": "inert-mocked-receipt"}):
+            with self.subTest(environment=environment), \
+                    mock.patch.dict(MODULE.os.environ, environment, clear=True), \
+                    mock.patch.object(MODULE.sys, "argv", ["wayland-acceptance"]), \
+                    mock.patch.object(MODULE.sys, "platform", "linux"), \
+                    mock.patch.object(MODULE, "containment_check") as containment, \
+                    mock.patch.object(MODULE, "namespace_command") as wrap, \
+                    mock.patch.object(MODULE, "run_session") as run:
+                with self.assertRaisesRegex(RuntimeError, "prepare the owned native PipeWire client"):
+                    MODULE.main()
+            containment.assert_not_called()
+            wrap.assert_not_called()
+            run.assert_not_called()
 
     def test_fixture_only_authorizes_chosen_output_and_has_no_x11(self):
         with tempfile.TemporaryDirectory(prefix="fixture with spaces ") as directory:

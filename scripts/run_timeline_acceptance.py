@@ -8,6 +8,10 @@ instrumented release build of the shipping configuration:
     MORPHEUS_TIMELINE_ACCEPTANCE_BUILD=1 cargo build --release --locked \\
         -p morpheus-app --features native-calls
 
+First prepare the owned native client as described in docs/LINUX_NATIVE_BUILD.md
+and retain its receipt in this build's environment. Hosted preparation belongs
+in an earlier step; it does not change this optimized workload or its budgets.
+
 It enrolls one generated profile per sync adapter, seeds one encrypted room
 with 10,000 variable-height events through the pinned SDK, then measures each
 profile with the instrumented app. Profiles, run files, reports and raw logs
