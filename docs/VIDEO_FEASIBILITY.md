@@ -17,19 +17,35 @@ A follow-up macOS proof captured native display and window images, scaled and le
 ## Morpheus call-stage integration
 
 The native-call app now subscribes to MatrixRTC participant changes and remote
-video frames. Its call stage shows a participant list and a single remote tile.
-When several streams are available, it chooses a screen share before a camera.
-The video worker retains only the newest decoded frame, converts validated
-I420 planes to RGB at about 15 frames/s, limits output to 2.07 million pixels
-with a 1920-pixel edge limit,
-and uses a call-generation token to clear stale frames on leave or account
-switch. The focused macOS app tests cover padded planes, rotation, invalid
-dimensions, and stale-call cleanup; the native-call app compiles. A macOS
-click-through showed Alice and Bob in the live roster of a disposable room
-call, including after local audio failed and before Leave. That room was
-unencrypted; current-format calls now reject such rooms because the pinned
-transport could not map their membership to remote media. The tile has not yet
-displayed a received frame in a live encrypted GUI call.
+video frames. Its call stage (`ui/call-stage.slint`, `src/call_stage.rs` and
+`src/video_render.rs`) shows a participant roster beside either an adaptive
+16:9 grid of up to nine tiles per page or one featured tile above a filmstrip
+of up to four. The featured tile is the user's pinned tile, otherwise the
+first live remote screen share, so participant cameras stay visible while a
+share is presented. Tiles report muted, absent, unreachable, undecryptable and
+local media, and a pinned participant who leaves or a pinned share that ends
+is reported for eight seconds before the stage releases it.
+
+Only the planned remote streams are opened as frame streams and asked from the
+SFU at their tile size; every other remote camera or screen stream, and every
+stream while the stage page is hidden, is paused with the pinned transport's
+subscription constraints. Each open stream retains only its newest decoded
+frame. One blocking worker at a time converts a batch of due frames from
+validated I420 planes to scaled RGB (at most 1920×1080 featured, smaller per
+grid or filmstrip tile, at most nine streams) about 15 times per second, or
+half that for small tiles. Frames reach Slint through fixed frame slots whose
+epoch changes whenever a slot is released or reassigned, beside a revisioned
+layout in one latest-value watch channel; the UI applies at most one queued
+update at a time. A call-generation token still clears every picture and tile
+on leave or account switch. These are source changes only: none of the stage
+code has been compiled, unit tested or displayed against a live call yet.
+
+Earlier, a macOS click-through of the previous single-tile stage showed Alice
+and Bob in the live roster of a disposable room call, including after local
+audio failed and before Leave. That room was unencrypted; current-format calls
+now reject such rooms because the pinned transport could not map their
+membership to remote media. No tile has yet displayed a received frame in a
+live encrypted GUI call.
 
 ## Existing interfaces
 
@@ -43,15 +59,17 @@ displayed a received frame in a live encrypted GUI call.
 
 ## Integration steps and next proof
 
-1. **Partly checked in a macOS UI:** The call stage has a remote `image`
-   property, placeholder, participant list, and account/call-scoped clearing.
-   A disposable room-call UI run showed two participants in the roster. A
-   connected encrypted UI run still needs to display a received video frame.
-2. **Implemented in code, live UI pending:** The call worker subscribes to
-   roster changes, reconciles remote camera/screen tracks, consumes
-   `video_frames()`, and retains only the newest frame. Track replacement and
-   participant departure still need a live UI check.
-3. **Unit tested, live UI pending:** A worker converts I420 to RGB after
+1. **Implemented in source, not yet compiled or run:** The multi-tile call
+   stage replaces the earlier single remote `image`. The earlier single-tile
+   stage's disposable room-call UI run showed two participants in the roster.
+   A connected encrypted UI run still needs to display received frames in the
+   grid, featured and filmstrip layouts, with pin, paging and keyboard focus.
+2. **Implemented in source, live UI pending:** The call worker subscribes to
+   roster changes, reconciles remote camera/screen tracks, pauses unpresented
+   streams, consumes `video_frames()` for presented ones and retains only the
+   newest frame of each. Track replacement and participant departure still
+   need a live UI check.
+3. **Reimplemented for the new stage; checks pending:** A worker converts I420 to RGB after
    validating dimensions, strides, and planes; it applies rotation and caps
    output resolution. A bounded frame cadence forwards the image through
    `upgrade_in_event_loop`, guarded by a call-generation token. Check visible
@@ -77,7 +95,7 @@ displayed a received frame in a live encrypted GUI call.
 
 ## Platform and performance risks
 
-- **Current RTC baseline:** the upstream macOS `-ObjC` link workaround and a native loopback LiveKit instance resolved the local Docker Desktop ICE problem. Gated macOS tests connected two disposable participants over UDP, delivered synthetic microphone/camera plus real display/window screen-track frames in encrypted calls, and passed leave/rejoin. The call-stage tile now compiles, but no received video has been viewed in Morpheus. See [the RTC runbook](../tests/LOCAL_MATRIX_RTC.md) and [verification record](VERIFICATION.md).
+- **Current RTC baseline:** the upstream macOS `-ObjC` link workaround and a native loopback LiveKit instance resolved the local Docker Desktop ICE problem. Gated macOS tests connected two disposable participants over UDP, delivered synthetic microphone/camera plus real display/window screen-track frames in encrypted calls, and passed leave/rejoin. The earlier single-tile stage compiled; the new multi-tile stage still needs compilation and runtime checks. No received video has been viewed in Morpheus. See [the RTC runbook](../tests/LOCAL_MATRIX_RTC.md) and [verification record](VERIFICATION.md).
 - **Wayland capture:** XCap's `capture_image()` can fall back to a Screenshot portal PNG per frame. That path is unsuitable for continuous sharing. XCap's `video_recorder()` uses the ScreenCast portal and PipeWire on Wayland; its stream behavior and permissions remain unverified in Morpheus. X11 still capture and recorder paths also need profiling.
 - **Permissions:** the macOS package has microphone, camera, and screen-capture usage strings in `packaging/macos/Info.plist`. The display picker and permission path were exercised in an ad hoc signed QA app; packaged-app consent, revoked permission, and Windows/Linux equivalents need hands-on checks. Never start capture while merely probing homeserver support.
 - **Frame budget:** I420-to-RGB conversion plus Slint texture upload copies each frame. At 1920×1080 RGB, one output frame is about 6 MiB; 30 fps exceeds 180 MiB/s before extra copies. Bound resolution/frame rate and drop stale frames. A WGPU texture path can follow only after renderer compatibility and resource-lifetime tests.

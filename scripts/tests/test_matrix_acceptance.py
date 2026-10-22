@@ -13,7 +13,503 @@ import subprocess
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from run_matrix_acceptance import Acceptance, OAUTH_PHASES, fixture_from_output, oauth_diagnostics, oauth_evidence, passed_tests
 import run_matrix_acceptance as acceptance_module
+import run_timeline_acceptance as timeline_module
 from run_element_acceptance import CHECKS as ELEMENT_CHECKS
+
+
+class TimelineFailureForwardingTests(unittest.TestCase):
+    def invoke(self, output, *, scanner_code=0, label="timeline_10k"):
+        visible = io.StringIO()
+        process = Mock(returncode=1)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "verified-scanner")
+            def child(_args, **kwargs):
+                kwargs["stdout"].write(output.encode())
+                return process
+            def scanned(*args, **kwargs):
+                self.assertNotIn(timeline_module.SUMMARY_PREFIX, visible.getvalue())
+                return subprocess.CompletedProcess([], scanner_code)
+            with (patch.object(acceptance_module.subprocess, "Popen", side_effect=child),
+                  patch.object(acceptance_module.subprocess, "run", side_effect=scanned) as scan,
+                  contextlib.redirect_stdout(visible), self.assertRaises(RuntimeError)):
+                runner.run(label, ["synthetic-child"])
+            scan.assert_called_once()
+        return visible.getvalue()
+
+    def test_failed_command_forwards_only_the_validated_record_after_scanning(self):
+        value = timeline_module.StepFailure("enroll", "sliding", "first_render", "first_render").summary()
+        raw = "private child text\n" + timeline_module.SUMMARY_PREFIX + json.dumps(value) + "\n"
+        output = self.invoke(raw)
+        records = [line for line in output.splitlines() if line.startswith(timeline_module.SUMMARY_PREFIX)]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(records[0][len(timeline_module.SUMMARY_PREFIX):]), value)
+        self.assertNotIn("private child text", output)
+
+    def test_failed_scanner_withholds_the_summary(self):
+        value = timeline_module.StepFailure("enroll", "sliding", "first_render", "first_render").summary()
+        output = self.invoke(timeline_module.SUMMARY_PREFIX + json.dumps(value), scanner_code=1)
+        self.assertNotIn(timeline_module.SUMMARY_PREFIX, output)
+
+    def test_other_commands_unknown_values_duplicate_records_and_success_are_not_forwarded(self):
+        value = timeline_module.StepFailure("enroll", "sliding", "first_render", "first_render").summary()
+        valid = timeline_module.SUMMARY_PREFIX + json.dumps(value)
+        for raw in (timeline_module.SUMMARY_PREFIX + json.dumps(value | {"failure": "privatepassword"}),
+                    timeline_module.SUMMARY_PREFIX + json.dumps(value | {"status": "passed"}),
+                    valid + "\n" + valid):
+            self.assertNotIn(timeline_module.SUMMARY_PREFIX, self.invoke(raw))
+        self.assertNotIn(timeline_module.SUMMARY_PREFIX, self.invoke(valid, label="other_command"))
+
+
+class FocusedSuiteTests(unittest.TestCase):
+    def test_media_only_completion_and_summary_cannot_claim_full_acceptance(self):
+        self.assertEqual(acceptance_module.SUITES["media-only"], ("media_local",))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="media-only")
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+            runner.results = [{"check": "media_local", "passed": 1, "seconds": 1}]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "media-only")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("Only media_local ran", summary.read_text())
+            self.assertIn("not full acceptance", summary.read_text())
+            self.assertNotIn("Full suite:", summary.read_text())
+
+    def test_app_timeline_completion_and_summary_cannot_claim_other_checks(self):
+        self.assertEqual(acceptance_module.SUITES["app-timeline"], ("app-live-timeline",))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="app-timeline")
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+            runner.results = [{"check": "app-live-timeline", "passed": 1, "seconds": 1}]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "app-timeline")
+            self.assertEqual(report["not_run"], {})
+            text = summary.read_text()
+            self.assertIn("Only app-live-timeline ran", text)
+            self.assertIn("member publication and cleanup", text)
+            self.assertIn("No draft recovery, moderation, OAuth or RTC checks", text)
+            self.assertIn("not full acceptance", text)
+            self.assertNotIn("Full suite:", text)
+            self.assertNotIn("Focused draft-recovery rerun:", text)
+            self.assertNotIn("formatting prerequisite", text)
+
+    def test_completion_requires_every_selected_check_and_default_still_requires_full(self):
+        with tempfile.TemporaryDirectory() as folder:
+            focused = Acceptance(Path(folder), "scanner", suite="draft-recovery")
+            focused.results = [{"check": label} for label in acceptance_module.DRAFT_RECOVERY_CHECKS]
+            focused.finish_checks()
+            full = Acceptance(Path(folder), "scanner")
+            full.results = list(focused.results)
+            with self.assertRaisesRegex(RuntimeError, "failed or unexecuted"):
+                full.finish_checks()
+            for missing in acceptance_module.DRAFT_RECOVERY_CHECKS:
+                focused.results = [{"check": label} for label in acceptance_module.DRAFT_RECOVERY_CHECKS
+                                   if label != missing]
+                with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                    focused.finish_checks()
+
+    def test_drafts_only_completion_and_summary_cannot_claim_other_checks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="drafts-only")
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+            runner.results = [{"check": "drafts_local", "passed": 2, "seconds": 1}]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "drafts-only")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("No app recovery, moderation, OAuth or RTC checks", summary.read_text())
+            self.assertIn("not full acceptance", summary.read_text())
+
+    def test_timeline_read_completion_requires_all_selected_checks_and_reports_partial_scope(self):
+        expected = ("live_local", "formatted_local", "media_local", "moderation_local",
+                    "search_local", "search_local-classic", "recovery_local", "unsupported_transport_local", "app-live-timeline")
+        self.assertEqual(acceptance_module.TIMELINE_READ_CHECKS, expected)
+        self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-reads")
+            for missing in expected:
+                runner.results = [{"check": label} for label in expected if label != missing]
+                with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                    runner.finish_checks()
+            runner.results = [{"check": label, "passed": 1, "seconds": 1} for label in expected]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "timeline-reads")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("not full acceptance", summary.read_text())
+            self.assertNotIn("Full suite:", summary.read_text())
+
+    def test_timeline_read_order_keeps_both_sync_paths_and_recovery_fixture(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-reads")
+            fixture, recovery, gate = root / "fixture.json", root / "recovery.json", root / "rtc-gate.json"
+            with patch.object(runner, "test") as test, \
+                    patch.object(runner, "script", side_effect=["private-recovery", "private-gate"]) as script, \
+                    patch.object(acceptance_module, "fixture_from_output", side_effect=[recovery, gate]) as read, \
+                    patch.object(runner, "app_timeline") as app:
+                runner.timeline_read_cases(fixture)
+            self.assertEqual([call.args for call in test.call_args_list], [
+                ("live_local", fixture), ("formatted_local", fixture), ("media_local", fixture),
+                ("moderation_local", fixture), ("search_local", fixture),
+                ("search_local", fixture), ("recovery_local", recovery), ("unsupported_transport_local", gate),
+            ])
+            self.assertEqual([call.kwargs for call in test.call_args_list], [
+                {}, {}, {}, {}, {}, {"extra": {"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}},
+                {"extra": {"MORPHEUS_MATRIX_TEST_RECOVERY": "1"}},
+                {"rtc": True, "extra": {"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)}},
+            ])
+            self.assertEqual([call.args for call in script.call_args_list], [
+                ("local_matrix_env", "recovery-fixture"), ("local_matrix_env", "rtc-gate-fixture"),
+            ])
+            self.assertEqual([call.args for call in read.call_args_list], [
+                ("private-recovery", root), ("private-gate", root),
+            ])
+            app.assert_called_once_with(fixture)
+            self.assertEqual(runner.not_run, {})
+
+    def test_timeline_failed_formatting_skips_moderation_without_hiding_failure(self):
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-reads")
+            failure = acceptance_module.CheckFailure("formatted_local", "test_failed")
+            with patch.object(runner, "test", side_effect=[None, failure, None, None, None, None, None]) as test, \
+                    patch.object(runner, "script", return_value="private-fixture"), \
+                    patch.object(acceptance_module, "fixture_from_output", return_value=root / "recovery.json"), \
+                    patch.object(runner, "app_timeline") as app:
+                runner.timeline_read_cases(root / "fixture.json")
+            self.assertEqual([call.args[0] for call in test.call_args_list], [
+                "live_local", "formatted_local", "media_local", "search_local", "search_local", "recovery_local", "unsupported_transport_local",
+            ])
+            app.assert_called_once_with(root / "fixture.json")
+            self.assertEqual(runner.not_run, {"moderation_local": "dependency_failed"})
+            self.assertEqual(runner.failures, [{"check": "formatted_local", "reason": "test_failed"}])
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+
+    def test_unknown_suite_rejected_before_creating_directories(self):
+        with patch.object(acceptance_module, "private_directory") as directory:
+            with self.assertRaisesRegex(ValueError, "Unknown acceptance suite"):
+                Acceptance(Path("unused"), "scanner", suite="arbitrary")
+        directory.assert_not_called()
+
+    def test_focused_order_includes_moderation_prerequisite_and_all_app_guards(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "scanner", suite="draft-recovery")
+            fixture = Path(folder) / "fixture.json"
+            with patch.object(runner, "test") as test, patch.object(runner, "app_recovery") as app:
+                runner.draft_recovery_cases(fixture)
+            self.assertEqual([call.args for call in test.call_args_list], [
+                ("drafts_local", fixture), ("formatted_local", fixture), ("moderation_local", fixture),
+            ])
+            app.assert_called_once_with(fixture)
+            self.assertEqual(runner.not_run, {})
+
+    def test_failed_prerequisite_skips_moderation_but_runs_independent_recovery(self):
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+            runner = Acceptance(Path(folder), "scanner", suite="draft-recovery")
+            failure = acceptance_module.CheckFailure("formatted_local", "test_failed")
+            with patch.object(runner, "test", side_effect=[None, failure]) as test, \
+                    patch.object(runner, "app_recovery") as app:
+                runner.draft_recovery_cases(Path(folder) / "fixture.json")
+            self.assertEqual(test.call_count, 2)
+            app.assert_called_once()
+            self.assertEqual(runner.not_run, {"moderation_local": "dependency_failed"})
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+
+    def test_summary_labels_focused_evidence_and_does_not_require_unselected_checks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="draft-recovery")
+            runner.results = [{"check": label, "passed": 1, "seconds": 1}
+                              for label in acceptance_module.DRAFT_RECOVERY_CHECKS]
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "draft-recovery")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("not full acceptance", summary.read_text())
+            self.assertNotIn("Full suite:", summary.read_text())
+
+
+class TimelineFailureSuiteTests(unittest.TestCase):
+    def test_closed_retry_requires_all_three_cases_and_cannot_satisfy_full_acceptance(self):
+        expected = ("formatted_local", "moderation_local", "recovery_local")
+        self.assertEqual(acceptance_module.SUITES["timeline-failures"], expected)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-failures")
+            for missing in expected:
+                runner.results = [{"check": label} for label in expected if label != missing]
+                with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                    runner.finish_checks()
+            runner.results = [{"check": label} for label in expected]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+
+    def test_retry_preserves_moderation_prerequisite_and_fresh_recovery_credentials(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-failures")
+            fixture, recovery = root / "fixture.json", root / "recovery.json"
+            with patch.object(runner, "test") as test, \
+                    patch.object(runner, "script", return_value="private-fixture") as script, \
+                    patch.object(acceptance_module, "fixture_from_output", return_value=recovery) as read:
+                runner.timeline_failure_cases(fixture)
+            self.assertEqual([call.args for call in test.call_args_list], [
+                ("formatted_local", fixture), ("moderation_local", fixture), ("recovery_local", recovery),
+            ])
+            self.assertEqual([call.kwargs for call in test.call_args_list], [
+                {}, {}, {"extra": {"MORPHEUS_MATRIX_TEST_RECOVERY": "1"}},
+            ])
+            script.assert_called_once_with("local_matrix_env", "recovery-fixture")
+            read.assert_called_once_with("private-fixture", root)
+            self.assertEqual(runner.failures, [])
+            self.assertEqual(runner.not_run, {})
+
+    def test_formatting_failure_blocks_moderation_but_does_not_hide_recovery(self):
+        visible = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(visible):
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-failures")
+            failure = acceptance_module.CheckFailure("formatted_local", "test_failed")
+            with patch.object(runner, "test", side_effect=[failure, None]) as test, \
+                    patch.object(runner, "script", return_value="private-fixture"), \
+                    patch.object(acceptance_module, "fixture_from_output", return_value=root / "recovery.json"):
+                runner.timeline_failure_cases(root / "fixture.json")
+            self.assertEqual([call.args[0] for call in test.call_args_list], ["formatted_local", "recovery_local"])
+            self.assertEqual(runner.not_run, {"moderation_local": "dependency_failed"})
+            self.assertEqual(runner.failures, [{"check": "formatted_local", "reason": "test_failed"}])
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+        self.assertNotIn("private-fixture", visible.getvalue())
+
+    def test_summary_names_only_the_selected_retry_scope(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-failures")
+            runner.results = [{"check": label, "passed": 1, "seconds": 1}
+                              for label in acceptance_module.TIMELINE_FAILURE_CHECKS]
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "timeline-failures")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("not full acceptance", summary.read_text())
+            self.assertNotIn("Full suite:", summary.read_text())
+
+
+class AppTimelineEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def output():
+        # Representative records from the reviewed native harness, including
+        # the real queued_drain phase. Keep these independent of the parser's
+        # allowlists so an incompatible whitelist fails this contract.
+        records = (
+            "STAGE setup", "STAGE setup_profile", "STAGE setup_config",
+            "STAGE setup_window", "STAGE setup_controller", "STAGE setup_dispatch",
+            "STAGE setup_login", "STAGE setup_rooms", "STAGE setup_ready",
+            "STAGE activation", "STAGE room_open",
+            "STAGE room_delivery", "CHECK room_delivery=true",
+            "STAGE thread_delivery", "CHECK thread_delivery=true",
+            "CHECK thread_root_excluded=true", "CHECK feeds_running=true",
+            "STAGE revocation", "CHECK old_lease_revoked=true",
+            "CHECK idle_feeds_stopped=true", "STAGE renewal",
+            "CHECK late_events_in_core=true", "CHECK stale_room_rejected=true",
+            "CHECK stale_thread_rejected=true", "STAGE reopen",
+            "CHECK renewed_room_delivery=true", "CHECK renewed_thread_delivery=true",
+            "STAGE queued_revocation", "CHECK queued_callbacks_observed=true",
+            "STAGE queued_drain", "CHECK queued_room_rejected=true",
+            "CHECK queued_thread_rejected=true", "STAGE queued_reopen",
+            "STAGE link_continuation", "CHECK link_follow_up_stale_retry_rejected=true",
+            "CHECK link_follow_up_owned_retry=true",
+            "CHECK link_follow_up_held_focus_rejected=true",
+            "CHECK link_follow_up_owned_focus=true",
+            "STAGE member_publication", "CHECK member_publication=true",
+            "STAGE cleanup", "STAGE cleanup_logout_primary", "STAGE cleanup_logout_other",
+            "STAGE cleanup_manager_stop", "STAGE cleanup_drop_live", "STAGE cleanup_drop_ui",
+            "STAGE cleanup_wait_profile", "STAGE cleanup_drop_manager", "STAGE cleanup_remove_directory",
+            "CHECK cleanup_complete=true", "STAGE complete",
+        )
+        lines = ["running 1 test"]
+        lines.extend("MORPHEUS_LIVE_TIMELINE_" + record for record in records)
+        lines.append("test result: ok. 1 passed; 0 failed; 0 ignored;")
+        return "\n".join(lines) + "\n"
+
+    def test_one_harness_requires_all_twenty_observable_facts_and_cleanup(self):
+        checks = acceptance_module.app_timeline_evidence(self.output())
+        self.assertEqual(len(checks), 20)
+        self.assertEqual(set(checks), acceptance_module.APP_TIMELINE_CHECKS)
+        self.assertTrue(all(checks.values()))
+        self.assertIn("queued_callbacks_observed", checks)
+        self.assertIn("queued_room_rejected", checks)
+        self.assertIn("queued_thread_rejected", checks)
+        self.assertIn("link_follow_up_stale_retry_rejected", checks)
+        self.assertIn("link_follow_up_held_focus_rejected", checks)
+        self.assertIn("member_publication", checks)
+        self.assertIn("member_publication", acceptance_module.APP_TIMELINE_STAGES)
+        self.assertIn("cleanup_complete", checks)
+
+    def test_every_missing_fact_is_fatal_even_after_a_green_test_summary(self):
+        for name in acceptance_module.APP_TIMELINE_CHECKS:
+            incomplete = self.output().replace(f"MORPHEUS_LIVE_TIMELINE_CHECK {name}=true\n", "")
+            with self.subTest(missing=name), self.assertRaisesRegex(RuntimeError, "Live timeline UI evidence is incomplete"):
+                acceptance_module.app_timeline_evidence(incomplete)
+
+    def test_false_duplicate_unknown_and_malformed_records_never_pass(self):
+        line = "MORPHEUS_LIVE_TIMELINE_CHECK room_delivery=true"
+        for replacement in (line.replace("true", "false"), line + "\n" + line,
+                            "MORPHEUS_LIVE_TIMELINE_CHECK unknown=true",
+                            "MORPHEUS_LIVE_TIMELINE_CHECK room_delivery=1",
+                            line + " private-server-value", "MORPHEUS_LIVE_TIMELINE_CHECK private=secret",
+                            "MORPHEUS_LIVE_TIMELINE_CHECK"):
+            with self.subTest(value=replacement), self.assertRaises(RuntimeError) as caught:
+                acceptance_module.app_timeline_evidence(self.output().replace(line, replacement))
+            self.assertNotIn("private", str(caught.exception))
+            self.assertNotIn("secret", str(caught.exception))
+
+    def test_member_publication_fact_cannot_be_false_duplicated_or_malformed(self):
+        line = "MORPHEUS_LIVE_TIMELINE_CHECK member_publication=true"
+        for replacement in (line.replace("true", "false"), line + "\n" + line,
+                            "MORPHEUS_LIVE_TIMELINE_CHECK member_publication=1",
+                            "MORPHEUS_LIVE_TIMELINE_CHECK member_publication_unknown=true"):
+            with self.subTest(record=replacement), self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(self.output().replace(line, replacement))
+
+    def test_missing_or_repeated_lifecycle_markers_cannot_stand_in_for_completion(self):
+        setup = "MORPHEUS_LIVE_TIMELINE_STAGE setup\n"
+        complete = "MORPHEUS_LIVE_TIMELINE_STAGE complete\n"
+        outputs = (self.output().replace(setup, ""), self.output().replace(complete, ""),
+                   self.output().replace(setup, setup + setup), self.output().replace(complete, complete + complete),
+                   self.output().replace(setup, "MORPHEUS_LIVE_TIMELINE_STAGE private-secret\n"))
+        for output in outputs:
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(output)
+
+    def test_completion_must_follow_assertions_and_setup_must_precede_them(self):
+        setup = "MORPHEUS_LIVE_TIMELINE_STAGE setup\n"
+        complete = "MORPHEUS_LIVE_TIMELINE_STAGE complete\n"
+        outputs = (complete + self.output().replace(complete, ""),
+                   self.output().replace(setup, "") + setup)
+        for output in outputs:
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(output)
+
+    def test_wrong_count_or_skipped_harness_is_not_live_coverage(self):
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored;"
+        for replacement in ("test result: ok. 0 passed; 0 failed; 1 ignored;",
+                            "test result: ok. 2 passed; 0 failed; 0 ignored;", ""):
+            with self.subTest(summary=replacement), self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(self.output().replace(summary, replacement))
+
+    def test_excessive_stage_records_are_rejected_before_unbounded_proof_growth(self):
+        expanded = self.output().replace("MORPHEUS_LIVE_TIMELINE_STAGE complete",
+                                       "MORPHEUS_LIVE_TIMELINE_STAGE queued_drain\n" * 65
+                                       + "MORPHEUS_LIVE_TIMELINE_STAGE complete")
+        with self.assertRaises(RuntimeError):
+            acceptance_module.app_timeline_evidence(expanded)
+
+    def test_diagnostics_reveal_only_fixed_entered_and_stage_values(self):
+        output = "private-token\nMORPHEUS_LIVE_TIMELINE_STAGE setup\nMORPHEUS_LIVE_TIMELINE_STAGE queued_drain\nMORPHEUS_LIVE_TIMELINE_STAGE private_token\n"
+        self.assertEqual(acceptance_module.app_timeline_diagnostics(output),
+                         {"test_entered": True, "stage": "queued_drain"})
+        self.assertEqual(acceptance_module.app_timeline_diagnostics("private-token"), {"test_entered": False})
+        for stage in (
+            "setup_profile", "setup_config", "setup_window", "setup_controller",
+            "setup_dispatch", "setup_login", "setup_rooms", "setup_ready",
+            "cleanup_logout_primary", "cleanup_logout_other", "cleanup_manager_stop",
+            "cleanup_drop_live", "cleanup_drop_ui", "cleanup_wait_profile",
+            "cleanup_drop_manager", "cleanup_remove_directory",
+        ):
+            prefix = "MORPHEUS_LIVE_TIMELINE_STAGE setup\n"
+            marker = f"MORPHEUS_LIVE_TIMELINE_STAGE {stage}"
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(prefix + marker + "\n"),
+                             {"test_entered": True, "stage": stage})
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(prefix + marker + " private-token\n"),
+                             {"test_entered": True, "stage": "setup"})
+
+    def test_validated_record_requires_native_test_mode_and_attaches_safe_facts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "scanner", suite="timeline-reads")
+            arguments = {"ring_case": None, "oauth_checks": None, "element_checks": None}
+            record = runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=True, **arguments)
+            self.assertEqual(record["passed"], 1)
+            self.assertEqual(len(record["app_timeline_checks"]), 20)
+            self.assertTrue(all(record["app_timeline_checks"].values()))
+            with self.assertRaises(RuntimeError):
+                runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=False, **arguments)
+            with self.assertRaises(RuntimeError):
+                runner.validated_record(acceptance_module.APP_TIMELINE_LABEL,
+                                        "test result: ok. 1 passed; 0 failed; 0 ignored;", test=True, **arguments)
+
+    def test_wrapper_uses_exact_ui_harness_fixture_and_process_containment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-reads")
+            fixture = root / "fixture.json"
+            with patch.object(runner, "run") as run:
+                runner.app_timeline(fixture)
+            args, options = run.call_args
+            self.assertEqual(args[0], acceptance_module.APP_TIMELINE_LABEL)
+            self.assertEqual(args[1], ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+                                      "--bin", "morpheus-app", acceptance_module.APP_TIMELINE_CASE,
+                                      "--", "--exact", "--nocapture", "--test-threads=1"])
+            self.assertEqual(options, {"extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
+                                       "seconds": 480, "test": True, "pid_namespace": True})
+
+    def test_live_ui_case_remains_required_in_full_and_timeline_profiles(self):
+        for suite in ("full", "timeline-reads"):
+            with tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "scanner", suite=suite)
+                self.assertIn(acceptance_module.APP_TIMELINE_LABEL, runner.planned_checks)
+                runner.results = [{"check": label} for label in runner.planned_checks
+                                  if label != acceptance_module.APP_TIMELINE_LABEL]
+                with self.subTest(suite=suite), self.assertRaises(RuntimeError):
+                    runner.finish_checks()
+        self.assertNotIn(acceptance_module.APP_TIMELINE_LABEL, acceptance_module.DRAFT_RECOVERY_CHECKS)
+        self.assertNotIn(acceptance_module.APP_TIMELINE_LABEL, acceptance_module.DRAFT_ONLY_CHECKS)
 
 
 class StartupOwnershipTests(unittest.TestCase):
@@ -124,6 +620,128 @@ class FinalizationTests(unittest.TestCase):
             self.assertIsNone(acceptance_module.main())
         self.assert_both_cleanups(runner)
         self.assertEqual(visible.getvalue(), "")
+
+    def test_focused_suite_uses_only_its_declared_checks_and_preserves_cleanup(self):
+        with self.mocked_main() as (runner, _):
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "draft-recovery"]):
+                self.assertIsNone(acceptance_module.main())
+        runner.draft_recovery_cases.assert_called_once()
+        runner.finish_checks.assert_called_once()
+        runner.test.assert_not_called()
+        runner.app_recovery.assert_not_called()
+        runner.oauth_cases.assert_not_called()
+        runner.outgoing_ring_cases.assert_not_called()
+        runner.rtc_cases.assert_not_called()
+        runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_drafts_only_main_runs_only_drafts_and_preserves_cleanup(self):
+        with self.mocked_main() as (runner, _):
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "drafts-only"]):
+                self.assertIsNone(acceptance_module.main())
+        self.assertEqual(len(runner.test.call_args_list), 1)
+        self.assertEqual(runner.test.call_args.args[0], "drafts_local")
+        runner.finish_checks.assert_called_once()
+        runner.draft_recovery_cases.assert_not_called()
+        runner.app_recovery.assert_not_called()
+        runner.oauth_cases.assert_not_called()
+        runner.rtc_cases.assert_not_called()
+        runner.outgoing_ring_cases.assert_not_called()
+        runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_app_timeline_selection_keeps_cleanup_after_success_or_incomplete_results(self):
+        for failure_at in (None, "app_timeline", "finish_checks"):
+            with self.subTest(failure_at=failure_at), self.mocked_main() as (runner, _):
+                failure = RuntimeError("fixed incomplete live UI result")
+                if failure_at:
+                    getattr(runner, failure_at).side_effect = failure
+                with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                               "--suite", "app-timeline"]):
+                    if failure_at:
+                        with self.assertRaises(RuntimeError) as caught:
+                            acceptance_module.main()
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        self.assertIsNone(acceptance_module.main())
+                runner.app_timeline.assert_called_once()
+                runner.test.assert_not_called()
+                runner.timeline_read_cases.assert_not_called()
+                runner.draft_recovery_cases.assert_not_called()
+                runner.app_recovery.assert_not_called()
+                runner.oauth_cases.assert_not_called()
+                runner.rtc_cases.assert_not_called()
+                runner.outgoing_ring_cases.assert_not_called()
+                runner.element_case.assert_not_called()
+                self.assertNotIn(("local_matrix_rtc", "up"),
+                                 [call.args for call in runner.script.call_args_list])
+                self.assert_both_cleanups(runner)
+
+    def test_media_only_main_runs_only_media_and_preserves_cleanup(self):
+        with self.mocked_main() as (runner, _):
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner", "--suite", "media-only"]):
+                self.assertIsNone(acceptance_module.main())
+        runner.test.assert_called_once()
+        self.assertEqual(runner.test.call_args.args[0], "media_local")
+        runner.finish_checks.assert_called_once()
+        runner.timeline_read_cases.assert_not_called()
+        runner.draft_recovery_cases.assert_not_called()
+        runner.app_recovery.assert_not_called()
+        runner.oauth_cases.assert_not_called()
+        runner.rtc_cases.assert_not_called()
+        runner.outgoing_ring_cases.assert_not_called()
+        runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_media_only_incomplete_results_still_fail_after_cleanup(self):
+        original = RuntimeError("fixed incomplete media result")
+        with self.mocked_main() as (runner, _):
+            runner.finish_checks.side_effect = original
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner", "--suite", "media-only"]):
+                with self.assertRaises(RuntimeError) as caught:
+                    acceptance_module.main()
+        self.assertIs(caught.exception, original)
+        self.assert_both_cleanups(runner)
+
+    def test_timeline_read_main_uses_only_selected_checks_and_preserves_cleanup(self):
+        with self.mocked_main() as (runner, _):
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "timeline-reads"]):
+                self.assertIsNone(acceptance_module.main())
+        runner.timeline_read_cases.assert_called_once()
+        runner.finish_checks.assert_called_once()
+        runner.test.assert_not_called()
+        runner.draft_recovery_cases.assert_not_called()
+        runner.app_recovery.assert_not_called()
+        runner.oauth_cases.assert_not_called()
+        runner.rtc_cases.assert_not_called()
+        runner.outgoing_ring_cases.assert_not_called()
+        runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_timeline_read_incomplete_results_still_fail_after_owned_cleanup(self):
+        original = RuntimeError("fixed incomplete timeline result")
+        with self.mocked_main() as (runner, _):
+            runner.finish_checks.side_effect = original
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "timeline-reads"]):
+                with self.assertRaises(RuntimeError) as caught:
+                    acceptance_module.main()
+        self.assertIs(caught.exception, original)
+        self.assert_both_cleanups(runner)
+
+    def test_focused_suite_failure_cannot_become_success_and_still_cleans_up(self):
+        original = RuntimeError("fixed focused failure")
+        with self.mocked_main() as (runner, _):
+            runner.finish_checks.side_effect = original
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "draft-recovery"]):
+                with self.assertRaises(RuntimeError) as caught:
+                    acceptance_module.main()
+        self.assertIs(caught.exception, original)
+        self.assert_both_cleanups(runner)
 
     def test_outgoing_ring_failure_keeps_original_failure_and_cleans_both_services(self):
         original = RuntimeError("fixed outgoing ring failure")
@@ -338,6 +956,32 @@ class FixtureAbsenceTests(unittest.TestCase):
                 self.assertNotIn("private", visible.getvalue() + str(caught.exception))
 
 
+class StickerFailureForwardingTests(unittest.TestCase):
+    def invoke(self, output, **kwargs):
+        return TimelineFailureForwardingTests.invoke(self, output, label="media_local", **kwargs)
+
+    def test_timeout_stage_is_forwarded_after_scanning_without_private_payload(self):
+        output = self.invoke("private-server-response\nMORPHEUS_STICKER_STAGE room_receive\n"
+                             "MORPHEUS_STICKER_FAILURE scenario_deadline\n")
+        records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+        self.assertEqual(records[0]["sticker_diagnostics"]["stage"], "room_receive")
+        self.assertNotIn("private-server-response", output)
+
+    def test_failed_scanner_does_not_publish_even_the_closed_stage(self):
+        output = self.invoke("MORPHEUS_STICKER_STAGE room_receive\n"
+                             "MORPHEUS_STICKER_FAILURE scenario_deadline\n", scanner_code=1)
+        self.assertNotIn("sticker_diagnostics", output)
+        self.assertNotIn("room_receive", output)
+
+    def test_check_failure_withholds_potential_security_boundary_details(self):
+        output = self.invoke("MORPHEUS_STICKER_STAGE consent\n"
+                             "MORPHEUS_STICKER_FAILURE check_failed\n"
+                             "private-server-response\n")
+        self.assertIn('"stage": "withheld"', output)
+        self.assertNotIn("consent", output)
+        self.assertNotIn("private-server-response", output)
+
+
 class NativeProcessDiagnosticTests(unittest.TestCase):
     def test_exit_facts_are_bounded_and_timeout_is_not_reported_as_a_kill(self):
         for code, expected in ((0, ("exited", "exit_code", 0)),
@@ -416,6 +1060,39 @@ class NativeProcessDiagnosticTests(unittest.TestCase):
             self.assertNotIn("signal", records[0]["native_process"])
             self.assertEqual(records[0]["live_diagnostics"]["stage"], "encrypted_restart_message")
             self.assertNotIn("private-server", visible.getvalue())
+
+
+    def test_all_native_test_failures_report_bounded_abort_facts_without_payload(self):
+        for label in ("formatted_local", "recovery_local"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                runner.containment_verified = True
+                process = Mock(returncode=None)
+                visible = io.StringIO()
+                output = ("running 1 test\nthread 'private-worker' has overflowed its stack\n"
+                          "  process didn't exit successfully: private-command (signal: 6, SIGABRT: abort)\n"
+                          "private-server-response\n")
+                def start(_args, **kwargs):
+                    kwargs["stdout"].write(output.encode())
+                    return process
+                def cleanup(child):
+                    child.returncode = -9
+                with (patch.object(acceptance_module, "namespace_command", return_value=["owned"]),
+                      patch.object(acceptance_module.subprocess, "Popen", side_effect=start),
+                      patch.object(acceptance_module, "wait_owned", return_value=101),
+                      patch.object(acceptance_module, "stop_owned", side_effect=cleanup),
+                      patch.object(acceptance_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)),
+                      contextlib.redirect_stdout(visible), self.assertRaises(acceptance_module.CheckFailure)):
+                    runner.run(label, ["mock-test"], test=True, pid_namespace=True)
+                records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                self.assertEqual(records[0]["failed_tests"], [])
+                self.assertEqual(records[0]["panic_locations"], [])
+                process_facts = records[0]["native_process"]
+                self.assertEqual(process_facts["exit_code"], 101)
+                self.assertTrue(process_facts["stack_overflow"])
+                self.assertEqual((process_facts["test_signal"], process_facts["test_signal_name"]), (6, "SIGABRT"))
+                self.assertNotIn("private", visible.getvalue())
+                self.assertEqual(runner.results, [])
 
 
 class LiveStageTests(unittest.TestCase):
@@ -525,7 +1202,7 @@ class DraftStageTests(unittest.TestCase):
         emitted = re.findall(r"phase!\(([a-z_]+)\)", source)
         self.assertEqual(set(emitted), acceptance_module.DRAFTS_STAGES)
         self.assertEqual(len(emitted), len(set(emitted)))
-        self.assertEqual((emitted[0], emitted[-1]), ("fixture", "complete"))
+        self.assertEqual((emitted[0], emitted[-1]), ("fixture", "recovery_complete"))
         self.assertLess(source.index("phase!(tracked_enqueue)"),
                         source.index(".send_text_tracked_for("))
         self.assertLess(source.index('.expect("Cannot queue tracked message")'),
@@ -534,13 +1211,20 @@ class DraftStageTests(unittest.TestCase):
                         source.index("queued.wait_outcome()"))
         self.assertLess(source.index('fs::remove_dir_all(root)'),
                         source.index("phase!(complete)"))
+        self.assertLess(source.rindex('fs::remove_dir_all(root)'),
+                        source.index("phase!(recovery_complete)"))
 
     def test_success_requires_positive_test_result_entry_and_completed_cleanup(self):
-        passed = "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+        passed = "test result: ok. 2 passed; 0 failed; 0 ignored;\n"
         entry = "MORPHEUS_DRAFTS_STAGE fixture\n"
         complete = "MORPHEUS_DRAFTS_STAGE complete\n"
+        recovery = ("MORPHEUS_DRAFTS_STAGE recovery_fixture\n"
+                    "MORPHEUS_DRAFTS_STAGE recovery_complete\n")
         for output, accepted in ((passed, False), (complete + passed, False),
-                                 (entry + passed, False), (entry + complete + passed, True),
+                                 (entry + passed, False), (entry + complete + passed, False),
+                                 (entry + complete + recovery + passed, True),
+                                 (recovery + entry + complete + passed, True),
+                                 (entry + complete + recovery + passed.replace("2 passed", "1 passed"), False),
                                  (entry + complete + "test result: ok. 0 passed; 0 failed; 1 ignored;\n", False)):
             with self.subTest(output=output), tempfile.TemporaryDirectory() as folder:
                 runner = Acceptance(Path(folder), "unused-scanner")
@@ -579,6 +1263,141 @@ class DraftStageTests(unittest.TestCase):
             self.assertEqual(runner.results, [])
 
 
+class AppRecoveryEvidenceTests(unittest.TestCase):
+    child = LiveStageTests.child
+    cases = {
+        "stale_observers_end_on_revocation_and_never_touch_the_departed_cache":
+            "observer_revocation",
+        "interrupted_prepare_keeps_its_committed_record_for_discovery_and_leaves_the_cache_consistent":
+            "interrupted_prepare",
+        "rollback_racing_a_switch_leaves_cache_and_row_agreeing":
+            "rollback_race",
+        "a_background_flush_cannot_commit_a_record_before_its_preparation_writes_it":
+            "writer_transaction",
+        "the_thread_index_is_durable_before_any_record_exists":
+            "thread_index",
+        "revocation_after_the_release_leaves_the_record_in_cache_and_row":
+            "release_revocation",
+        "revocation_during_the_rollback_write_converges_under_the_release":
+            "write_revocation",
+        "a_preparation_waiting_for_the_writer_lock_creates_nothing_once_its_selection_ended":
+            "writer_lock_revocation",
+        "a_submission_typed_over_during_preparation_is_kept_on_a_definite_failure":
+            "typed_retention",
+        "typing_while_the_rollback_waits_after_the_release_keeps_the_submission":
+            "late_typing_retention",
+        "a_revoked_rollback_retains_a_typed_over_uncommitted_record":
+            "revoked_retention",
+        "a_thread_submission_typed_over_during_preparation_is_kept_with_its_index":
+            "thread_retention",
+    }
+
+    @staticmethod
+    def complete():
+        return "".join(
+            f"MORPHEUS_APP_RECOVERY_STAGE {name}\nMORPHEUS_APP_RECOVERY_CHECK {name}=true\n"
+            for name in sorted(acceptance_module.APP_RECOVERY_CASES)
+        ) + "test result: ok. 12 passed; 0 failed; 0 ignored;\n"
+
+    def test_requires_every_live_case_once_and_no_opt_out(self):
+        complete = self.complete()
+        name = sorted(acceptance_module.APP_RECOVERY_CASES)[0]
+        self.assertEqual(acceptance_module.app_recovery_evidence(complete),
+                         dict.fromkeys(sorted(acceptance_module.APP_RECOVERY_CASES), True))
+        for output in (
+            "test result: ok. 12 passed; 0 failed; 0 ignored;\n",
+            complete.replace(f"MORPHEUS_APP_RECOVERY_STAGE {name}\n", ""),
+            complete.replace(f"MORPHEUS_APP_RECOVERY_CHECK {name}=true\n", ""),
+            complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=true\n",
+            complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=false\n",
+            complete.replace("12 passed", "11 passed"),
+            complete.replace("12 passed", "17 passed"),
+            complete.replace("0 ignored", "1 ignored"),
+            complete + "Skipped local fixture\n",
+        ):
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                acceptance_module.app_recovery_evidence(output)
+
+    def test_exact_source_tokens_cover_each_real_test_and_follow_cleanup(self):
+        source = (Path(__file__).resolve().parents[2] / "crates/morpheus-app/src/live.rs").read_text()
+        source = source.split("mod stale_observer_tests {", 1)[1]
+        bodies = re.split(r"#\[tokio::test\]", source)[1:]
+        tests = {}
+        for body in bodies:
+            name = re.match(r"\s*async fn ([a-z_]+)\s*\(\s*\)", body)
+            self.assertIsNotNone(name)
+            self.assertNotIn(name[1], tests)
+            tests[name[1]] = body
+        # These five native regressions share the module but have no recovery protocol.
+        other_cases = {
+            "a_departed_selection_neither_reveals_nor_focuses_after_a_switch_back",
+            "a_created_room_opens_only_for_its_own_click_and_admitted_snapshot",
+            "a_stale_snapshots_member_load_never_claims_over_a_newer_one",
+            "stale_creation_follow_ups_keep_a_newer_rooms_feed_and_transition",
+            "a_withdrawn_created_room_open_gives_up_held_waits_and_its_locks",
+        }
+        self.assertEqual(tests.keys(), self.cases.keys() | other_cases)
+        for name in other_cases:
+            self.assertNotRegex(tests.pop(name), r"recovery_(?:phase|check)!\(")
+        self.assertEqual(len(tests), len(acceptance_module.APP_RECOVERY_CASES))
+        self.assertEqual(acceptance_module.APP_RECOVERY_TESTS,
+                         tuple("live::stale_observer_tests::" + name for name in self.cases))
+        completed = []
+        for name, body in tests.items():
+            phases = re.findall(r"recovery_phase!\(([a-z_]+)\)", body)
+            checks = re.findall(r"recovery_check!\(([a-z_]+)\)", body)
+            self.assertEqual(phases, checks)
+            self.assertEqual(checks, [self.cases[name]])
+            self.assertEqual(len(checks), 1)
+            self.assertLess(body.index("fixture()"), body.index("recovery_phase!("))
+            self.assertLess(body.index("close_profile(directory, live).await;"),
+                            body.index("recovery_check!("))
+            completed.extend(checks)
+        self.assertEqual(set(completed), acceptance_module.APP_RECOVERY_CASES)
+        self.assertEqual(len(completed), len(set(completed)))
+
+    def test_runs_actual_app_tests_contained_with_fixture_and_serial_execution(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with patch.object(runner, "run") as run:
+                runner.app_recovery(Path(folder) / "fixture.json")
+            label, args = run.call_args.args
+            self.assertEqual(label, acceptance_module.APP_RECOVERY_LABEL)
+            self.assertEqual(args, ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+                                    "--bin", "morpheus-app", "--", "--exact",
+                                    *("live::stale_observer_tests::" + name for name in self.cases),
+                                    "--nocapture", "--test-threads=1"])
+            self.assertEqual(run.call_args.kwargs, {
+                "extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(Path(folder) / "fixture.json")},
+                "test": True, "pid_namespace": True,
+            })
+
+    def test_scanner_rejection_precedes_any_evidence_publication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with self.child(runner, self.complete(), scanner_code=1) as (visible, _):
+                with self.assertRaisesRegex(RuntimeError, "credential scanning"):
+                    runner.run(acceptance_module.APP_RECOVERY_LABEL, ["mock-test"], test=True)
+            self.assertNotIn("app_recovery", visible.getvalue())
+            self.assertEqual(runner.results, [])
+
+    def test_deadline_exposes_only_fixed_stage_and_process_facts(self):
+        output = ("MORPHEUS_APP_RECOVERY_STAGE typed_retention\n"
+                  "MORPHEUS_APP_RECOVERY_STAGE private_token\nprivate-server-response\n")
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with self.child(runner, output, timeout=True) as (visible, _):
+                with self.assertRaisesRegex(RuntimeError, "deadline"):
+                    runner.run(acceptance_module.APP_RECOVERY_LABEL, ["mock-test"], test=True, seconds=1)
+            records = [json.loads(line) for line in visible.getvalue().splitlines()
+                       if line.startswith("{")]
+            self.assertEqual(len(records), 1)
+            record = records[0]
+            self.assertEqual(record["app_recovery_diagnostics"], {"stage": "typed_retention"})
+            self.assertEqual(record["native_process"]["result"], "deadline")
+            self.assertNotIn("private", visible.getvalue())
+
+
 class LiveEvidenceTests(unittest.TestCase):
     def test_rtc_bootstrap_follows_independent_checks_and_failure_stays_fatal(self):
         for failed in (False, True):
@@ -606,6 +1425,7 @@ class LiveEvidenceTests(unittest.TestCase):
                 from unittest.mock import call
                 rtc_up = calls.index(call.script("local_matrix_rtc", "up"))
                 self.assertLess(calls.index(call.oauth_cases()), rtc_up)
+                self.assertLess(calls.index(call.app_recovery(Path(folder) / "fixture.json")), rtc_up)
                 for name in (*acceptance_module.CHAT_TESTS, "recovery_local"):
                     indexes = [i for i, item in enumerate(calls) if item[0] == "test" and item.args[0] == name]
                     self.assertTrue(indexes)
@@ -693,6 +1513,14 @@ class LiveEvidenceTests(unittest.TestCase):
             with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
                 runner.run("element-incomplete", [sys.executable, "-c", "print('MORPHEUS_ELEMENT_CHECK browser_roster=true')"], element_checks=True)
             self.assertEqual(len(runner.results), 1)
+
+            # The outer collector must also reject the formerly complete
+            # eleven-fact peer and any explicit reverse-audio failure.
+            for incomplete in (facts.replace("MORPHEUS_ELEMENT_CHECK browser_audio=true", ""),
+                               facts + "\nMORPHEUS_ELEMENT_CHECK browser_audio=false"):
+                with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                    runner.run("element-reverse-audio-incomplete", [sys.executable, "-c", f"print({incomplete!r})"], element_checks=True)
+                self.assertEqual(len(runner.results), 1)
 
     def test_summary_does_not_claim_element_ran_before_its_check(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1869,6 +2697,7 @@ class ScopedContinuationTests(unittest.TestCase):
 
     def test_element_setup_deadline_is_fatal_and_only_actual_peer_stages_are_collectible(self):
         from run_element_acceptance import STAGES
+        self.assertIn("browser_receive_audio", acceptance_module.ELEMENT_TEST_STAGES)
         for stage in STAGES:
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as folder:
                 runner = Acceptance(Path(folder), "scanner")

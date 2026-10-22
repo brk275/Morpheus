@@ -175,10 +175,52 @@ exposes its call and account/device identity, and its `set_muted()` and
 publication mutes it as a cancellation safeguard; call `unpublish()` to remove
 its stream from peers' rosters.
 
+`run_audio_controlled_with_devices(room_id, &controls, selection)` opens exact
+device IDs. While it runs, `controls.request_route(selection, retry)` switches either
+device: the new stream is opened beside the one in use and swapped in only
+once open, behind the same microphone publication (no republish, no
+encryption or mute change; a later microphone is remixed to the published
+channel count, and deafen applies before a new speaker plays). A failed open
+keeps the device in use. Each open runs on a device thread but the loop awaits
+it, so call audio pauses in both directions until it completes (at most 30
+seconds). `route()` and `subscribe_route()` report the device in use against
+the choice, with a `RouteNotice` for each change. A lost microphone sends
+nothing and is reopened only by the exact ID of the chosen microphone (or, for
+the system default, of the one that was lost), never another; a lost speaker
+falls back, visibly, to the default output until the chosen one returns.
+Returning devices are found by polling every 3 seconds, because CPAL has no
+hotplug listener, until 10 minutes (monotonic) after the last change; no
+device open that could run past that is started, so looking stops by then.
+After a rejoin, `run_audio_resuming(room_id, &controls, resume, chosen, retry)`
+with the previous controls' `resume_point()` reopens the microphone only by its
+retained exact ID: one without an exact identity is not reopened by its route
+(the system default or an alias may name another microphone now) and waits,
+with `MicrophoneNotResumed`, for the chosen exact device or the user's own
+request. It reopens the speaker on its route, keeps waiting for a lost
+microphone (never opening another), keeps a stand-in speaker standing in, and
+lets either side stay closed without stopping the other; it then switches to
+`chosen` where it differs. A request that changes only the speaker never opens
+a microphone in place of a lost one. `retry` marks a user request unchanged
+from the route the call runs with (what its join opened, then each admitted
+request), decided by the caller where requests are admitted one at a time
+(coalesced changes must never look like a repeat); only that, or a changed
+microphone choice, opens a microphone by its route again. Looking
+for a lost microphone runs only while it has an exact device to reopen. The
+resume point is recorded as soon as a join's devices are open, before its
+microphone track is published. A rejoin lost before that keeps the previous
+point; with none at all, the caller resumes from
+`AudioResume::unestablished(chosen)`, which reopens a microphone only by an
+exact chosen ID. Audio that restarts after a failure resumes from the point
+too. On a fresh join, a route chosen while the first devices open is tried
+if they cannot be.
+
 `local_device_support()` reports which adapters were compiled into the binary;
 actual OS availability is checked when a device is opened. The audio loop is a
-native proof. It does not select non-default audio devices, resample unsupported
-device formats, or provide echo cancellation. Mute and deafen controls are
+native proof. It does not resample unsupported device formats or provide echo
+cancellation. The pinned transport fixes the microphone source format at
+publish and has no track replacement or source-buffer reset, so a switch
+cannot change the published sample rate or clear PCM the old device already
+queued. Mute and deafen controls are
 wired to the call stage with applied-state feedback, but live device acceptance
 remains open. Camera/screen pacing and controls, permission UI, and
 Windows/Linux runtime verification still need application integration.

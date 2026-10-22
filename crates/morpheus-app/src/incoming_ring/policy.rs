@@ -26,7 +26,7 @@ use matrix_sdk::{
             ignored_user_list::IgnoredUserListEventContent, push_rules::PushRulesEventContent,
         },
         power_levels::NotificationPowerLevelsKey,
-        push::{Action, PushConditionRoomCtx, Ruleset},
+        push::{Action, PushCondition, PushConditionRoomCtx, RuleKind, Ruleset},
         serde::Raw,
     },
 };
@@ -243,6 +243,29 @@ fn strict_push_rules(raw: Option<&Raw<PushRulesEventContent>>) -> Result<Ruleset
         .map_err(|_| PolicyFailure::PolicyUnavailable)
 }
 
+/// A room's own message level (All messages, Mentions and keywords, Muted)
+/// must not silently change whether its calls ring. Drop exactly the rules
+/// that level is made of: the muting override rule named after the room with
+/// only that room's `room_id` condition, and the room rule named after the
+/// room. Every other rule, including the account's call rules, any other
+/// override and every ignore or trust check, still decides.
+fn without_room_message_level(mut rules: Ruleset, room_id: &RoomId) -> Ruleset {
+    let muting = rules.override_.iter().any(|rule| {
+        rule.rule_id == room_id.as_str()
+            && !rule.actions.iter().any(Action::should_notify)
+            && matches!(
+                rule.conditions.as_slice(),
+                [PushCondition::EventMatch(data)]
+                    if data.key == "room_id" && data.pattern == room_id.as_str()
+            )
+    });
+    if muting {
+        let _ = rules.remove(RuleKind::Override, room_id);
+    }
+    let _ = rules.remove(RuleKind::Room, room_id);
+    rules
+}
+
 async fn evaluate_policy<T>(
     context: PushConditionRoomCtx,
     rules: Ruleset,
@@ -288,7 +311,7 @@ pub(super) async fn require_event_policy<T>(
             .account_data::<PushRulesEventContent>()
             .await
             .map_err(|_| PolicyFailure::PolicyUnavailable)?;
-        let rules = strict_push_rules(rules.as_ref())?;
+        let rules = without_room_message_level(strict_push_rules(rules.as_ref())?, room.room_id());
         let context = room
             .push_condition_room_ctx()
             .await
@@ -729,6 +752,59 @@ mod tests {
             .await,
             Err(PolicyFailure::NotificationDenied)
         );
+    }
+
+    #[tokio::test]
+    async fn a_rooms_message_level_does_not_silence_its_calls() {
+        let room = room_id!("!room:example.org");
+        let caller = user_id!("@caller:example.org");
+        let mut content = serde_json::to_value(PushRulesEventContent::new(
+            Ruleset::server_default(user_id!("@recipient:example.org")),
+        ))
+        .unwrap();
+        // The room's level as the SDK writes it: Muted, plus a room rule.
+        let mute = json!({
+            "rule_id": "!room:example.org", "default": false, "enabled": true,
+            "conditions": [{"kind": "event_match", "key": "room_id", "pattern": "!room:example.org"}],
+            "actions": []
+        });
+        content["global"]["override"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, mute);
+        content["global"]["room"] = json!([{
+            "rule_id": "!room:example.org", "default": false, "enabled": true, "actions": []
+        }]);
+        let mention = || event(json!({"user_ids": ["@recipient:example.org"]}));
+        let rules = without_room_message_level(
+            strict_push_rules(Some(&raw(content.clone()))).unwrap(),
+            room,
+        );
+        assert!(rules.get(RuleKind::Override, "!room:example.org").is_none());
+        assert!(rules.get(RuleKind::Room, "!room:example.org").is_none());
+        assert_eq!(
+            evaluate_policy(context(100), rules, caller, &mention()).await,
+            Ok(RoomMentionPermission::Allowed)
+        );
+        // Any other muting rule still decides: one with its own ID, or one
+        // with more conditions than the room's own.
+        let mut renamed = content.clone();
+        renamed["global"]["override"][0]["rule_id"] = json!("mute-everything");
+        let mut narrowed = content;
+        let sender =
+            json!({"kind": "event_match", "key": "sender", "pattern": "@caller:example.org"});
+        narrowed["global"]["override"][0]["conditions"]
+            .as_array_mut()
+            .unwrap()
+            .push(sender);
+        for other in [renamed, narrowed] {
+            let rules =
+                without_room_message_level(strict_push_rules(Some(&raw(other))).unwrap(), room);
+            assert_eq!(
+                evaluate_policy(context(100), rules, caller, &mention()).await,
+                Err(PolicyFailure::NotificationDenied)
+            );
+        }
     }
 
     #[tokio::test]

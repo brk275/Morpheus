@@ -36,7 +36,24 @@ pub(crate) struct AccountAccessUi {
     pending: Mutex<Option<Pending>>,
     generation: Arc<AtomicU64>,
     accounts_refresh_generation: Arc<AtomicU64>,
+    switch_generation: AtomicU64,
     busy: AtomicBool,
+}
+
+// Declared before the transition/security guards in request(): its completion
+// runs after those guards have dropped, including early returns or cancellation.
+// The generation controls presentation only; core activation grants remain the
+// authority for protected accounts.
+struct SwitchCompletion {
+    access: Arc<AccountAccessUi>,
+    generation: u64,
+}
+
+impl Drop for SwitchCompletion {
+    fn drop(&mut self) {
+        self.access.busy.store(false, Ordering::Release);
+        self.access.show_switch_pending(self.generation, false);
+    }
 }
 
 impl AccountAccessUi {
@@ -54,6 +71,7 @@ impl AccountAccessUi {
             pending: Mutex::new(None),
             generation: Arc::new(AtomicU64::new(0)),
             accounts_refresh_generation: Arc::new(AtomicU64::new(0)),
+            switch_generation: AtomicU64::new(0),
             busy: AtomicBool::new(false),
         });
         let access = this.clone();
@@ -145,6 +163,13 @@ impl AccountAccessUi {
     }
 
     fn open(&self, action: Action, challenge: Option<ActivationChallenge>, label: String) {
+        if self
+            .ui
+            .upgrade()
+            .is_some_and(|ui| crate::room_leave::is_open(&ui))
+        {
+            return;
+        }
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let current_generation = self.generation.clone();
         let mode = match &action {
@@ -168,6 +193,11 @@ impl AccountAccessUi {
             if current_generation.load(Ordering::Acquire) != generation {
                 return;
             }
+            crate::room_addresses::clear(&ui);
+            crate::matrix_links::clear(&ui);
+            crate::thread_browser::withdraw(&ui);
+            crate::withdraw_call_bar(&ui);
+            ui.invoke_withdraw_verification();
             clear_passwords(&ui);
             ui.set_access_mode(mode);
             ui.set_access_target(label.into());
@@ -181,28 +211,67 @@ impl AccountAccessUi {
         });
     }
 
+    fn show_switch_pending(self: &Arc<Self>, generation: u64, pending: bool) {
+        if let Some(ui) = self.ui.upgrade() {
+            if self.switch_generation.load(Ordering::Acquire) == generation {
+                if pending {
+                    ui.invoke_withdraw_verification();
+                    crate::room_addresses::clear(&ui);
+                    crate::matrix_links::clear(&ui);
+                    crate::thread_browser::withdraw(&ui);
+                    crate::withdraw_call_bar(&ui);
+                }
+                ui.set_account_switch_pending(pending);
+            }
+        } else {
+            let access = self.clone();
+            let _ = self.ui.upgrade_in_event_loop(move |ui| {
+                // A completed request must not re-enable a newer switch.
+                if access.switch_generation.load(Ordering::Acquire) == generation {
+                    if pending {
+                        ui.invoke_withdraw_verification();
+                        crate::room_addresses::clear(&ui);
+                        crate::matrix_links::clear(&ui);
+                        crate::thread_browser::withdraw(&ui);
+                        crate::withdraw_call_bar(&ui);
+                    }
+                    ui.set_account_switch_pending(pending);
+                }
+            });
+        }
+    }
+
     pub(crate) fn request(self: &Arc<Self>, id: String) {
         if self.busy.swap(true, Ordering::AcqRel) {
             return;
         }
+        let generation = self
+            .switch_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.show_switch_pending(generation, true);
+        let completion = SwitchCompletion {
+            access: self.clone(),
+            generation,
+        };
         let access = self.clone();
         self.runtime.spawn(async move {
+            // Captured before spawn so even an unpolled, dropped future clears
+            // presentation; initialized before either operation guard below.
+            let _completion = completion;
             let _transition = access.live.account_transition.lock().await;
             if !access.allowed() {
                 access.report(
                     "Leave the call and finish any security operation before changing accounts.",
                 );
-                access.busy.store(false, Ordering::Release);
                 return;
             }
             let Some(_security) = access.live.security_gate.try_account_access() else {
                 access.report("Finish the current security operation before changing accounts.");
-                access.busy.store(false, Ordering::Release);
                 return;
             };
             if let Err(error) = access.live.flush_drafts().await {
                 access.report(error.to_string());
-                access.busy.store(false, Ordering::Release);
                 return;
             }
             let result = access.live.manager.switch_to(&id).await;
@@ -236,7 +305,6 @@ impl AccountAccessUi {
             {
                 access.live.account_detached(access.ui.clone()).await;
             }
-            access.busy.store(false, Ordering::Release);
             access.refresh_accounts().await;
         });
     }
@@ -259,21 +327,26 @@ impl AccountAccessUi {
         let accounts = self.live.manager.accounts().await;
         let status = self.live.manager.app_password_status().await;
         let active = self.live.manager.active_account().await;
-        let rows = accounts
-            .into_iter()
-            .map(|account| SavedAccountItem {
-                id: account.id.as_str().into(),
-                handle: account.user_id.into(),
-                active: active.as_ref().is_some_and(|a| a.id == account.id),
-                removal_pending: status.pending_removals.contains(&account.id),
-            })
-            .collect::<Vec<_>>();
         let current_generation = self.accounts_refresh_generation.clone();
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
             // An earlier Manage refresh must not reinsert a row after removal.
             if current_generation.load(Ordering::Acquire) != generation {
                 return;
             }
+            // Generated rows contain a Slint Image even before an avatar is
+            // attached. Construct the whole row on its UI thread; only the
+            // core account metadata crosses from the worker.
+            let rows = accounts
+                .into_iter()
+                .map(|account| SavedAccountItem {
+                    id: account.id.as_str().into(),
+                    handle: account.user_id.into(),
+                    active: active.as_ref().is_some_and(|a| a.id == account.id),
+                    removal_pending: status.pending_removals.contains(&account.id),
+                    ..Default::default()
+                })
+                .map(crate::account_identity::with_saved_avatar)
+                .collect::<Vec<_>>();
             ui.set_saved_accounts(ModelRc::new(VecModel::from(rows)));
             ui.set_app_password_enabled(status.enabled);
         });
@@ -360,8 +433,19 @@ impl AccountAccessUi {
                         }
                         let result = result?;
                         access.live.forget_account_drafts(&id);
+                        crate::space_management::forget_account(&id);
                         access.live.voice_spaces.forget_account(&id).await;
                         if result.complete {
+                            crate::room_addresses::forget_account(&id);
+                            crate::room_permissions::forget_account(&id);
+                            // Complete only: invitation answers, listings and
+                            // notices of this account are forgotten too.
+                            crate::invitations::forget_account(&id);
+                            crate::unread_navigation::forget_account(&id);
+                            crate::room_leave::forget_account(&id);
+                            crate::room_creation::forget_account(&id);
+                            crate::room_settings::forget_access_account(&id);
+                            access.live.forget_removed_account_joins(&id);
                             if let Err(error) = access.live.voice_spaces.clear_logged_out_account(&id) {
                                 return Ok(format!("Account removed. Some appearance preferences could not be removed: {error}"));
                             }

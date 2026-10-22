@@ -1,0 +1,102 @@
+# Normalized from upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd; see MORPHEUS_PATCH.md.
+# Workspace-inherited entries (rust-version, dependency versions and
+# features, lints) are written out from the upstream workspace Cargo.toml at
+# the same revision. The upstream manifest is kept as Cargo.toml.orig.
+
+[package]
+authors = ["Shrey Patel <shreyrg14@gmail.com>"]
+description = "The search component to build a Matrix client library."
+edition = "2024"
+license = "Apache-2.0"
+name = "matrix-sdk-search"
+repository = "https://github.com/matrix-org/matrix-rust-sdk"
+rust-version = "1.96"
+version = "0.19.1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs", "--generate-link-to-definition"]
+
+[dependencies]
+aes = { version = "0.9.3", default-features = false }
+byteorder = { version = "1.5.0", default-features = false, features = ["std"] }
+ctr = { version = "0.10.1", default-features = false }
+hmac = { version = "0.13.0", features = ["zeroize"] }
+hkdf = "0.13.0"
+matrix-sdk-test = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", optional = true }
+once_cell = { version = "1.21.4", default-features = false, features = ["std"] }
+pbkdf2 = { version = "0.13.0", default-features = false }
+rand = { version = "0.10.2", features = ["thread_rng"] }
+sha2 = { version = "0.11.0", features = ["alloc", "zeroize"] }
+tantivy = { version = "0.26.2", default-features = false, features = ["mmap", "stopwords", "stemmer", "lz4-compression", "columnar-zstd-compression"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+thiserror = { version = "2.0.20", default-features = false }
+ruma = { version = "0.17.0", features = [
+    "client-api-c",
+    "compat-unset-avatar",
+    "compat-upload-signatures",
+    "compat-arbitrary-length-ids",
+    "compat-tag-info",
+    "compat-encrypted-stickers",
+    "compat-lax-room-create-deser",
+    "compat-lax-room-topic-deser",
+    "unstable-msc1763",
+    "unstable-msc3230",
+    "unstable-msc3401",
+    "unstable-msc3417",
+    "unstable-msc3488",
+    "unstable-msc3489",
+    "unstable-msc4075",
+    "unstable-msc4140",
+    "unstable-msc4143",
+    "unstable-msc4171",
+    "unstable-msc4195",
+    "unstable-msc4278",
+    "unstable-msc4286",
+    "unstable-msc4306",
+    "unstable-msc4308",
+    "unstable-msc4310",
+    "unstable-msc4388",
+    "events",
+    "rand",
+    "unstable-msc1767",
+] }
+zeroize = "1.9.0"
+
+[dev-dependencies]
+matrix-sdk-test = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
+tempfile = { version = "3.27.0", default-features = false }
+
+# Upstream workspace lints, as normalized for vendor/matrix-sdk-ui.
+["lints"]
+
+["lints"."rust"]
+"rust_2018_idioms" = "warn"
+"semicolon_in_expressions_from_macros" = "warn"
+"unused_extern_crates" = "warn"
+"unused_import_braces" = "warn"
+"unused_qualifications" = "warn"
+"trivial_casts" = "warn"
+"trivial_numeric_casts" = "warn"
+
+["lints"."rust"."unexpected_cfgs"]
+"level" = "warn"
+"check-cfg" = ["cfg(tarpaulin_include)", "cfg(ruma_unstable_exhaustive_types)"]
+
+["lints"."clippy"]
+"assigning_clones" = "allow"
+"box_default" = "allow"
+"cloned_instead_of_copied" = "warn"
+"dbg_macro" = "warn"
+"inefficient_to_string" = "warn"
+"macro_use_imports" = "warn"
+"manual_let_else" = "warn"
+"mut_mut" = "warn"
+"needless_borrow" = "warn"
+"nonstandard_macro_braces" = "warn"
+"redundant_clone" = "warn"
+"single_range_in_vec_init" = "allow"
+"str_to_string" = "warn"
+"todo" = "warn"
+"unnecessary_semicolon" = "warn"
+"unused_async" = "warn"

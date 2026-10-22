@@ -143,6 +143,139 @@ async function main() {
       return decodedSamples >= 3;
     }, "Browser did not decode native video");
     check("browser_video");
+    mark("browser_receive_audio");
+    const ownerFile = join(root, "native-audio-owner.json");
+    const ownerBytes = readFileSync(ownerFile);
+    if (ownerBytes.length > 8_192) throw new Error("Native audio owner exceeded bound");
+    const owner = JSON.parse(ownerBytes.toString("utf8"));
+    if (owner.room_id !== roomId || owner.user_id !== native.user_id ||
+        ![owner.user_id, owner.device_id, owner.member_id, owner.identity].every(
+          (value) => typeof value === "string" && value.length > 0 && value.length <= 1_024))
+      throw new Error("Native audio owner is incomplete");
+    await page.evaluate(async (owner) => {
+      // Read-only inspection of the pinned RC's React AudioTrack binding.
+      // MatrixAudioRenderer -> AudioTrackWithAudioNodes -> AudioTrack supplies
+      // trackRef. Never patch the stock peer, its SDK, or capture APIs. An
+      // absent/changed binding fails closed instead of selecting any audio.
+      const binding = () => {
+        const client = window.matrixclient;
+        const session = window.rtcSession;
+        const managed = client?.matrixRTC.roomSessions.get(owner.room_id);
+        const members = session?.memberships ?? [];
+        if (!managed || managed !== session || session.room?.roomId !== owner.room_id ||
+            members.length !== 2 || managed.memberships.length !== 2 ||
+            client.getDeviceId() === owner.device_id ||
+            members.filter((member) => member.userId === owner.user_id &&
+              member.deviceId === owner.device_id && member.memberId === owner.member_id &&
+              member.rtcBackendIdentity === owner.identity).length !== 1) return null;
+        const audios = [...document.querySelectorAll("audio")];
+        if (audios.length > 32) throw new Error("Audio element bound exceeded");
+        const matches = [];
+        for (const element of audios) {
+          const keys = Object.keys(element).filter((key) => key.startsWith("__reactFiber$"));
+          if (keys.length !== 1) continue;
+          let fiber = Object.getOwnPropertyDescriptor(element, keys[0])?.value;
+          const refs = new Set();
+          for (let depth = 0; fiber && depth < 32; depth++) {
+            const props = Object.getOwnPropertyDescriptor(fiber, "memoizedProps")?.value;
+            const ref = props && Object.getOwnPropertyDescriptor(props, "trackRef")?.value;
+            if (ref) refs.add(ref);
+            fiber = Object.getOwnPropertyDescriptor(fiber, "return")?.value;
+          }
+          for (const ref of refs) {
+            const { participant, publication } = ref;
+            const track = publication?.track;
+            const media = track?.mediaStreamTrack;
+            const stream = element.srcObject;
+            if (participant?.isLocal !== false || participant.identity !== owner.identity ||
+                ref.source !== "microphone" || publication?.source !== "microphone" ||
+                publication.kind !== "audio" || publication.isLocal !== false ||
+                publication.isSubscribed !== true || !publication.isEncrypted ||
+                publication.isMuted || !publication.trackSid || track?.sid !== publication.trackSid ||
+                track.kind !== "audio" || track.source !== "microphone" ||
+                participant.audioTrackPublications?.get(publication.trackSid) !== publication ||
+                participant.getTrackPublicationBySid(publication.trackSid) !== publication ||
+                !track.attachedElements.includes(element) || !(stream instanceof MediaStream) ||
+                stream.getAudioTracks().length !== 1 || stream.getAudioTracks()[0] !== media ||
+                media?.kind !== "audio" || media.readyState !== "live" || !media.enabled ||
+                element.paused || element.muted || element.volume === 0) continue;
+            if (!matches.some((match) => match.element === element && match.track === track))
+              matches.push({ element, track, media, participant, publication });
+          }
+        }
+        return matches.length === 1 ? matches[0] : null;
+      };
+      const deadline = Date.now() + 45_000;
+      let selected;
+      while (!(selected = binding())) {
+        if (Date.now() >= deadline) throw new Error("Native remote microphone binding missing");
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      const context = new AudioContext();
+      let clone;
+      let source;
+      let analyser;
+      try {
+        // This is a clone of the browser's decoded REMOTE track. No oscillator,
+        // browser microphone, injected PCM, or network sender can feed it.
+        clone = selected.media.clone();
+        source = context.createMediaStreamSource(new MediaStream([clone]));
+        analyser = context.createAnalyser();
+        analyser.fftSize = 4_096;
+        analyser.smoothingTimeConstant = 0;
+        source.connect(analyser);
+        let resumeDeadline;
+        try {
+          await Promise.race([
+            context.resume(),
+            new Promise((_, reject) => {
+              resumeDeadline = setTimeout(() => reject(new Error("Audio context did not start")),
+                Math.max(0, deadline - Date.now()));
+            }),
+          ]);
+        } finally {
+          clearTimeout(resumeDeadline);
+        }
+        const samples = new Float32Array(analyser.fftSize);
+        const spectrum = new Float32Array(analyser.frequencyBinCount);
+        const binHz = context.sampleRate / analyser.fftSize;
+        let consecutive = 0;
+        while (Date.now() < deadline) {
+          const current = binding();
+          if (!current || current.element !== selected.element || current.track !== selected.track ||
+              current.media !== selected.media || current.participant !== selected.participant ||
+              current.publication !== selected.publication || context.state !== "running")
+            throw new Error("Native remote microphone ownership changed");
+          analyser.getFloatTimeDomainData(samples);
+          analyser.getFloatFrequencyData(spectrum);
+          const rms = Math.sqrt(samples.reduce((sum, value) => sum + value * value, 0) / samples.length);
+          let total = 0;
+          let native = 0;
+          let local = 0;
+          let peak = 0;
+          for (let index = 1; index < spectrum.length; index++) {
+            const power = 10 ** (spectrum[index] / 10);
+            const hz = index * binHz;
+            total += power;
+            if (Math.abs(hz - 997) <= 35) native += power;
+            if (Math.abs(hz - 440) <= 35) local += power;
+            if (spectrum[index] > spectrum[peak]) peak = index;
+          }
+          const decoded = Number.isFinite(rms) && rms > 0.02 && total > 0 &&
+            Math.abs(peak * binHz - 997) <= 35 && native / total > 0.8 && native > local * 20;
+          consecutive = decoded ? consecutive + 1 : 0;
+          if (consecutive >= 3) return;
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        throw new Error("Browser did not decode the native microphone tone");
+      } finally {
+        source?.disconnect();
+        analyser?.disconnect();
+        clone?.stop();
+        await context.close();
+      }
+    }, owner);
+    check("browser_audio");
     writeFileSync(join(root, "browser-observed"), "observed\n", { mode: 0o600, flag: "wx" });
     mark("native_media_wait");
     await poll(() => existsSync(join(root, "done")), "Native media checks did not complete", 150_000);

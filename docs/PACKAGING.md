@@ -243,9 +243,13 @@ focus. Then:
 The whole driver and bridge stream stays private; only the fixed JSON record
 with reviewed phase tokens, booleans and bounded counts (`selector_matches`,
 `incomplete_passes`, `foreground_recoveries`, `bounded_snapshots`) is printed
-and validated by the smoke before it is accepted. Names, values, handles,
-process identifiers, paths and raw PowerShell or application output are never
-published. It has a 180-second deadline inside the smoke's 360-second launcher
+and validated by the smoke before it is accepted. It also carries the bounded
+`window_inventory` of the poll that decided window selection. That inventory
+holds closed class families, complete numeric style words, visibility, owner,
+cloaking and clamped size, as described in
+[the window probe notes](WINDOWS_WINDOW_PROBE.md#installed-window-inventory).
+Names, titles, values, handles, process identifiers, positions, paths and raw
+PowerShell or application output are never published. It has a 180-second deadline inside the smoke's 360-second launcher
 bound.
 
 This is focused UI Automation/keyboard coverage, **not Narrator acceptance**,
@@ -304,7 +308,48 @@ Ownership is proven from three independent reads of the PID: group and
 non-zombie state from the kernel process table (`ps -axo pid=,pgid=,stat=`),
 the session from `getsid`, and `proc_pidpath` against the installed bundle
 executable; the bridge additionally checks the running application's bundle
-identifier and executable URL before attaching. Darwin's `ps` prints the
+identifier and executable URL before attaching.
+
+The attach step works as follows:
+
+- **Path comparison.** The bridge resolves the executable URL with `realpath`
+  and compares it with the driver's fully resolved path, which is the form
+  `proc_pidpath` reports. Foundation's URL standardization is not used: it
+  strips a leading `/private` (documented for `NSURL`), so a bundle installed
+  under `/var` or `/tmp` would never compare equal.
+- **Registration wait.** `proc_pidpath` can show the installed executable as
+  soon as `exec` completes, before AppKit has registered the process as an
+  application. So the driver asks again only while the bridge reports absent
+  metadata: no running application, no bundle identifier or no executable
+  URL.
+- **Budget.** Registration has a 10-second monotonic budget:
+  - no attempt starts once the budget has passed, and a zero budget makes
+    none;
+  - each bridge reply wait ends at the budget, as well as at the 20-second
+    reply bound and the acceptance deadline;
+  - the 0.2-second pause between attempts is clipped to what remains;
+  - a success counts only if the budget has not passed, both when the reply
+    arrives and after the ownership recheck that follows it.
+
+  Other bridge commands keep their existing bounds.
+- **Ownership rechecks.** Before and after every attempt, including failed or
+  timed-out ones, the driver rechecks that the anchored process is alive,
+  unreaped and still owned. A lost anchor takes precedence over other
+  failures. These rechecks are OS queries with their own bounds (the
+  process table read times out after 5 seconds). Elapsed time can therefore
+  exceed the budget by their duration, but a late success is never accepted.
+- **Run-loop turn.** Before each lookup the bridge turns its otherwise idle
+  main run loop once, for at most 0.05 seconds, in the default mode.
+- **Failure.** A present identifier or executable that differs, or an
+  executable that cannot be resolved, fails at once. The bridge sets its
+  target only after every check passes.
+  - A budget that runs out between attempts fails as `wait_timeout` with the
+    last absent-metadata token.
+  - A reply wait cut by the budget, or a late success, fails as
+    `wait_timeout` with no bridge token.
+  - Transient answers are not recorded, so a passing report is unchanged.
+
+Darwin's `ps` prints the
 session structure's kernel address under `sess` (Apple adv_cmds
 `ps/keyword.c`), never the session ID, so that column is not read. Every
 group the smoke starts on macOS (the plain 12-second launch, the bridge and
@@ -332,6 +377,17 @@ name on another role. Editable and protected fields are never asked for a
 value. A snapshot with an unreadable or unowned node is incomplete and is
 retried; a partial pass can reject two matches as ambiguous but never
 establishes a label or focus. Then:
+
+For `AXChildren`, an explicit `AXError.noValue` with a nil payload is a
+declared empty collection, as used by native AppKit leaf buttons. It is not
+an unreadable subtree. Unsupported attributes, messaging errors, invalid
+elements, malformed success payloads and contradictory non-nil `noValue`
+payloads remain incomplete. Successful arrays also need an
+explicit CF array type, a count within the retained-node bound and an AX
+element type check for every child before conversion. Swift's conditional
+cast alone does not validate those CF element types. These changes require
+native classifier and owned-tree checks on both Mac architectures, followed by installed-app
+verification; a synthetic AppKit subject does not prove Morpheus's full tree.
 
 - `Homeserver URL` and `Matrix ID or username` must be `AXTextField` without
   the secure subrole; `Password` must be `AXTextField` with
@@ -478,3 +534,17 @@ feedback, retained scale and restoration; arbitrary labels and raw errors are
 not public diagnostics. Success still requires persistence, invalid-edit
 retention, normal close and cleanup, in addition to the earlier sign-in and
 account-menu checks. This does not establish screen-reader acceptance.
+
+The macOS and Windows drivers retain a separate, closed `appearance_stage`
+through lower-level selector operations and cleanup. It identifies opening
+Settings, reaching the scale control, reading the seeded value, increasing it,
+reading the changed value and persisting it. Only successful persistence marks
+this stage complete; the overall installed check still requires normal close
+and cleanup. Unknown stage strings are rejected rather than included in reports.
+
+The macOS account-menu check also identifies its fixed keyboard boundary:
+focusing the trigger, opening with Return, closing with Escape, reopening with
+Space, tabbing to Manage accounts, opening that dialog, its Tab/Shift-Tab order,
+and closing it. These tokens contain no account labels or focused control text.
+A timeout at one boundary remains a failed installed check; these diagnostics
+do not substitute for keyboard or screen-reader acceptance.

@@ -2,6 +2,9 @@
 //! Fixture credentials are read from a protected file and never printed.
 #![recursion_limit = "512"]
 
+#[path = "support/opened_room.rs"]
+mod opened_room;
+
 #[path = "moderation_local/room_settings.rs"]
 mod room_settings;
 
@@ -127,6 +130,11 @@ async fn wait_for_room(manager: &AccountManager, room_id: &str, expected: RoomMe
             .find(|room| room.room_id == room_id)
             .map(|room| room.membership);
         if membership == Some(expected) {
+            if expected == RoomMembership::Joined {
+                opened_room::scan(manager, room_id)
+                    .await
+                    .expect("Opened moderation fixture room must be scanned");
+            }
             return;
         }
         assert!(

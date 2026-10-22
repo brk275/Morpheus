@@ -1,0 +1,440 @@
+// The persistent call bar: on every page but the call page while this
+// device is in a native call (connecting, connected, reconnecting, leaving
+// or with an incomplete cleanup). It shows the call's room and state, the
+// local time in this call, what this device captures, and the call page's
+// own controls. Rust (call_bar.rs) owns the state text, the elapsed time and
+// every action, each bound to the call it was shown for. Capture and
+// microphone values are the window's published call properties, never a
+// wanted setting. Nothing here starts a call, a capture or a device picker.
+//
+// Protected surfaces (sign-in, Manage accounts, account access, a recovery
+// key, no live session) never show this bar; the window shows only
+// CallCaptureBadge then, with no room, account or participant name.
+
+import { StyleTokens } from "style-tokens.slint";
+import { MorpheusIcon } from "icons.slint";
+import { ActionRect } from "controls.slint";
+
+export struct CallBarPalette {
+    ink: color,
+    muted: color,
+    accent: color,
+    surface: color,
+    chip: color,
+    hover: color,
+    divider: color,
+    destructive: color,
+    destructive-ink: color,
+    disabled-ink: color,
+    focus: color,
+}
+
+// What this device captures now, from the published call properties.
+export struct CallCapture {
+    audio-ready: bool,
+    microphone-muted: bool,
+    deafened: bool,
+    camera-active: bool,
+    camera-busy: bool,
+    camera-stopping: bool,
+    screen-active: bool,
+    screen-busy: bool,
+    screen-selecting: bool,
+    screen-stopping: bool,
+}
+
+export global CallBar {
+    // A call this device is in, as Rust presented it to the bar.
+    in-out property <bool> active: false;
+    // Connecting…, Connected, Reconnecting…, Leaving…, or an incomplete
+    // cleanup.
+    in-out property <string> status-text;
+    // The local time in this call (m:ss or h:mm:ss) while connected; empty
+    // when it is not reliably known.
+    in-out property <string> elapsed;
+    // The same time in words, for assistive technology.
+    in-out property <string> elapsed-label;
+    // The exact call is known (starting, connected or reconnecting): Leave
+    // applies. Connecting, leaving and an incomplete cleanup leave it to the
+    // call page.
+    in-out property <bool> can-leave: false;
+    // The exact shown join is known and joined: media controls apply.
+    in-out property <bool> can-control: false;
+    // A protected surface was shown: clicks still waiting are refused.
+    // This is the fallback; every protected entry calls withdraw() first.
+    callback protected-shown();
+    // Called synchronously by every entry that opens a protected surface
+    // (sign-in, account and security surfaces, a link card, and every modal),
+    // before it sets its own flag: clicks still waiting for the call
+    // controller are refused for good, even if the surface closes again.
+    callback withdraw();
+    callback mute();
+    callback deafen();
+    callback stop-camera();
+    callback stop-share();
+    callback return-to-call();
+    callback leave();
+}
+
+// Camera, screen and microphone in a few words, never from a setting.
+export global CallCaptureText {
+    pure public function camera(capture: CallCapture) -> string {
+        return capture.camera-active ? "Camera on"
+            : capture.camera-stopping ? "Camera stopping"
+            : capture.camera-busy ? "Camera starting" : "";
+    }
+    pure public function screen(capture: CallCapture) -> string {
+        return capture.screen-active ? "Sharing screen"
+            : capture.screen-stopping ? "Share stopping"
+            : capture.screen-selecting ? "Choosing a screen"
+            : capture.screen-busy ? "Share starting" : "";
+    }
+    pure public function microphone(capture: CallCapture) -> string {
+        return !capture.audio-ready ? "" : capture.microphone-muted ? "Muted" : "Mic on";
+    }
+    // Two parts of a status, either of which may be empty.
+    pure public function join(first: string, second: string) -> string {
+        return first == "" ? second : second == "" ? first : first + " · " + second;
+    }
+}
+
+// A bar control drawn with the window's control contract (app-window.slint's
+// control-fill and control-disabled-ink): the configured pressed state while
+// pressed, the configured hover state (else the theme's hover) while hovered,
+// and the configured disabled ink when disabled. A destructive control keeps
+// its role colors and tints with its own ink, as a primary TokenButton does,
+// so its label stays readable. High contrast outlines every control. Nothing
+// animates.
+component BarButton inherits ActionRect {
+    in property <string> icon;
+    // A visible caption; empty keeps the button an icon with its label.
+    in property <string> caption;
+    in property <float> text-scale: 1;
+    in property <bool> destructive: false;
+    in property <CallBarPalette> palette;
+    property <color> ink: !root.enabled ? root.palette.disabled-ink
+        : root.destructive ? root.palette.destructive-ink : root.palette.ink;
+    property <bool> is-hovered: root.enabled && root.has-hover;
+    property <bool> is-pressed: root.enabled && root.has-pressed;
+    height: max(30px, 22px * root.text-scale + 8px);
+    min-width: self.height;
+    border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius
+        : StyleTokens.radius * 0.8;
+    background: root.destructive ? root.palette.destructive
+        : root.is-pressed && StyleTokens.states.control-pressed.present
+        ? StyleTokens.states.control-pressed.color
+        : root.is-hovered
+        ? (StyleTokens.states.control-hover.present
+            ? StyleTokens.states.control-hover.color : root.palette.hover)
+        : root.palette.chip;
+    border-width: StyleTokens.high-contrast ? StyleTokens.line-width : 0px;
+    border-color: root.ink;
+    focus-color: root.destructive ? root.palette.destructive-ink : root.palette.focus;
+    if root.destructive : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: parent.border-radius;
+        background: root.is-pressed ? root.palette.destructive-ink.transparentize(0.75)
+            : root.is-hovered ? root.palette.destructive-ink.transparentize(0.85)
+            : transparent;
+    }
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 5px;
+        alignment: center;
+        VerticalLayout {
+            alignment: center;
+            MorpheusIcon {
+                width: 16px * min(1.5, max(1, root.text-scale));
+                height: self.width;
+                icon: root.icon;
+                ink: root.ink;
+            }
+        }
+        if root.caption != "" : Text {
+            text: root.caption;
+            color: root.ink;
+            font-size: 12px * root.text-scale;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// One capture indicator: an icon and, unless compact, its words. It is
+// never hidden by the layout; compact keeps the icon and the full label.
+component CaptureChip inherits Rectangle {
+    in property <string> icon;
+    in property <string> text;
+    in property <bool> compact;
+    in property <bool> live;
+    in property <float> text-scale: 1;
+    in property <CallBarPalette> palette;
+    height: max(24px, 18px * root.text-scale + 6px);
+    border-radius: self.height / 2;
+    background: root.palette.chip;
+    border-width: root.live ? StyleTokens.line-width * 2 : StyleTokens.line-width;
+    border-color: root.live ? root.palette.accent
+        : StyleTokens.high-contrast ? root.palette.ink : root.palette.divider;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    HorizontalLayout {
+        padding-left: 7px;
+        padding-right: 8px;
+        spacing: 4px;
+        alignment: center;
+        VerticalLayout {
+            alignment: center;
+            MorpheusIcon {
+                width: 14px * min(1.5, max(1, root.text-scale));
+                height: self.width;
+                icon: root.icon;
+                ink: root.live ? root.palette.accent : root.palette.ink;
+            }
+        }
+        if !root.compact : Text {
+            text: root.text;
+            color: root.palette.ink;
+            font-size: 11px * root.text-scale;
+            font-weight: 650;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component CallBarActions inherits HorizontalLayout {
+    in property <float> text-scale: 1;
+    in property <CallBarPalette> palette;
+    in property <CallCapture> capture;
+    in property <bool> joined;
+    in property <bool> leave-unconfirmed;
+    in property <bool> compact;
+    spacing: 6px;
+    BarButton {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        icon: root.capture.microphone-muted ? "mic-off" : "mic";
+        label: root.capture.microphone-muted ? "Unmute microphone" : "Mute microphone";
+        enabled: root.joined && root.capture.audio-ready && CallBar.can-control;
+        activated => { CallBar.mute(); }
+    }
+    if !root.compact : BarButton {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        icon: root.capture.deafened ? "headphones-off" : "headphones";
+        label: root.capture.deafened ? "Undeafen speaker" : "Deafen speaker";
+        enabled: root.joined && root.capture.audio-ready && CallBar.can-control;
+        activated => { CallBar.deafen(); }
+    }
+    // Stop controls appear only while that capture runs; they never start
+    // one or open a picker.
+    if root.capture.camera-active : BarButton {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        icon: "camera-off";
+        label: "Stop camera";
+        enabled: root.joined && !root.capture.camera-busy && CallBar.can-control;
+        activated => { CallBar.stop-camera(); }
+    }
+    if root.capture.screen-active || root.capture.screen-selecting : BarButton {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        icon: "screen-share-stop";
+        label: root.capture.screen-selecting ? "Cancel system screen selection"
+            : "Stop screen sharing";
+        enabled: root.joined && (!root.capture.screen-busy || root.capture.screen-selecting)
+            && CallBar.can-control;
+        activated => { CallBar.stop-share(); }
+    }
+    BarButton {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        icon: "calls";
+        caption: root.compact ? "" : "Return";
+        label: "Return to the call page";
+        activated => { CallBar.return-to-call(); }
+    }
+    // Leave acts only on the exact call. Without one (the slot is opening,
+    // the call is leaving, or its cleanup is incomplete) it is disabled and
+    // says so; Return leads to the call page, which handles those.
+    BarButton {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        destructive: CallBar.can-leave;
+        icon: "call-leave";
+        caption: root.compact ? "" : root.leave-unconfirmed ? "See call page" : "Leave";
+        label: CallBar.can-leave ? "Leave call"
+            : root.leave-unconfirmed
+            ? "Leave unavailable here: review the incomplete call cleanup on the call page"
+            : "Leave unavailable while the call is opening or leaving";
+        enabled: CallBar.can-leave;
+        activated => { CallBar.leave(); }
+    }
+}
+
+export component CallBarStrip inherits Rectangle {
+    in property <float> text-scale: 1;
+    in property <CallBarPalette> palette;
+    // The call's room as the call page names it.
+    in property <string> room;
+    // People the current call's roster lists; 0 when none is known.
+    in property <int> participants;
+    in property <CallCapture> capture;
+    // Joined or reconnecting: the call page's media controls apply.
+    in property <bool> joined;
+    in property <bool> leave-unconfirmed;
+    property <bool> compact: root.width < 640px * max(1, root.text-scale);
+    property <string> camera-text: CallCaptureText.camera(root.capture);
+    property <string> screen-text: CallCaptureText.screen(root.capture);
+    property <string> microphone-text: CallCaptureText.microphone(root.capture);
+    background: root.palette.surface;
+    accessible-role: groupbox;
+    accessible-label: "Call controls: " + CallBar.status-text
+        + (root.room != "" ? ", " + root.room : "")
+        + (CallBar.elapsed-label != "" ? ", " + CallBar.elapsed-label : "");
+    height: bar-layout.preferred-height;
+    bar-layout := VerticalLayout {
+        padding-left: 14px;
+        padding-right: 12px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 8px;
+            min-height: max(30px, 22px * root.text-scale + 8px);
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: root.palette.accent;
+                }
+            }
+            Text {
+                text: CallBar.status-text + (root.room != "" ? " · " + root.room : "");
+                color: root.palette.ink;
+                font-size: 12px * root.text-scale;
+                font-weight: 700;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                min-width: 0px;
+                overflow: elide;
+                accessible-live-region: polite;
+            }
+            if CallBar.elapsed != "" : Text {
+                text: CallBar.elapsed;
+                color: root.palette.muted;
+                font-size: 12px * root.text-scale;
+                vertical-alignment: center;
+                accessible-label: CallBar.elapsed-label;
+            }
+            if !root.compact && root.joined && root.participants > 0 : Text {
+                text: root.participants == 1 ? "1 in call" : root.participants + " in call";
+                color: root.palette.muted;
+                font-size: 11px * root.text-scale;
+                vertical-alignment: center;
+            }
+            if root.microphone-text != "" : CaptureChip {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                compact: root.compact;
+                live: !root.capture.microphone-muted;
+                icon: root.capture.microphone-muted ? "mic-off" : "mic";
+                text: root.microphone-text;
+            }
+            if root.camera-text != "" : CaptureChip {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                compact: root.compact;
+                live: true;
+                icon: "camera";
+                text: root.camera-text;
+            }
+            if root.screen-text != "" : CaptureChip {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                compact: root.compact;
+                live: true;
+                icon: "screen-share";
+                text: root.screen-text;
+            }
+            if !root.compact : CallBarActions {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                capture: root.capture;
+                joined: root.joined;
+                leave-unconfirmed: root.leave-unconfirmed;
+                compact: false;
+            }
+        }
+        if root.compact : CallBarActions {
+            alignment: end;
+            palette: root.palette;
+            text-scale: root.text-scale;
+            capture: root.capture;
+            joined: root.joined;
+            leave-unconfirmed: root.leave-unconfirmed;
+            compact: true;
+        }
+    }
+    Rectangle {
+        y: parent.height - self.height;
+        height: StyleTokens.line-width;
+        background: root.palette.divider;
+    }
+}
+
+// The only call presence a protected surface shows: whether a call is
+// active and what this device captures (microphone, camera, screen), with no
+// room, account or participant name, and no control. It never grows wider
+// than the window gives it (available-width); its words wrap rather than
+// elide, so every capture state stays readable at any text size.
+export component CallCaptureBadge inherits Rectangle {
+    in property <float> text-scale: 1;
+    in property <CallBarPalette> palette;
+    in property <bool> call-active;
+    in property <CallCapture> capture;
+    in property <length> available-width: 420px;
+    property <string> microphone-text: !root.call-active || !root.capture.audio-ready ? ""
+        : root.capture.microphone-muted ? "Mic muted" : "Mic on";
+    property <string> camera-text: CallCaptureText.camera(root.capture);
+    property <string> screen-text: CallCaptureText.screen(root.capture);
+    property <string> summary: CallCaptureText.join(
+        CallCaptureText.join(
+            CallCaptureText.join(root.call-active ? "Call active" : "", root.microphone-text),
+            root.camera-text),
+        root.screen-text);
+    width: min(badge-text.preferred-width + 34px, max(0px, root.available-width));
+    height: max(max(26px, 18px * root.text-scale + 8px), badge-text.height + 8px);
+    border-radius: min(self.height / 2, 13px * max(1, root.text-scale));
+    background: root.palette.surface;
+    border-width: StyleTokens.line-width;
+    border-color: root.palette.accent;
+    accessible-role: text;
+    accessible-label: root.summary;
+    Rectangle {
+        x: 10px;
+        y: (parent.height - self.height) / 2;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: root.palette.accent;
+    }
+    badge-text := Text {
+        x: 24px;
+        y: (parent.height - self.height) / 2;
+        width: max(0px, parent.width - 32px);
+        height: self.preferred-height;
+        text: root.summary;
+        color: root.palette.ink;
+        font-size: 11px * root.text-scale;
+        font-weight: 700;
+        vertical-alignment: center;
+        wrap: word-wrap;
+        overflow: clip;
+        // The badge itself carries the summary for assistive technology.
+        accessible-role: none;
+    }
+}

@@ -1,0 +1,329 @@
+// Creating a room or a Space inside the existing "Rooms and Spaces" dialog.
+// Rust (room_creation.rs) owns every value in RoomCreation, validates each
+// change against what the account and homeserver allow, and builds the
+// preview of exactly what is sent. This file lays the choices out and
+// reports explicit actions. The create request is sent only from Create,
+// once; after an unknown outcome, nothing is sent again until the person
+// says they checked. Open, offered for a created room that is not open,
+// only opens that room again.
+
+import { ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ActionRect, ControlColors, TokenButton, TokenCheck, TokenField } from "controls.slint";
+
+export struct RoomCreationLine {
+    label: string,
+    value: string,
+}
+
+export global RoomCreation {
+    // 0 a room, 1 a Space.
+    in-out property <int> kind: 0;
+    in-out property <string> name;
+    in-out property <string> topic;
+    // A localpart such as "team"; "#" and ":server" are shown around it.
+    in-out property <string> alias;
+    // 0 only invited people, 1 members of the Space, 2 anyone with the link.
+    in-out property <int> access: 0;
+    in-out property <bool> listed: false;
+    in-out property <bool> encrypted: true;
+    // Create inside the Space shown in the room list.
+    in-out property <bool> in-space: false;
+    in-out property <bool> suggested: false;
+    // What the account and homeserver allow, read when the dialog opens.
+    in-out property <bool> context-ready: false;
+    in-out property <string> identity;
+    in-out property <string> server-name;
+    // The shown Space, or empty in Home.
+    in-out property <string> parent-name;
+    in-out property <bool> can-place: false;
+    in-out property <bool> space-members-supported: false;
+    in-out property <[RoomCreationLine]> preview;
+    // Why the current choices cannot be created, or empty.
+    in-out property <string> problem;
+    in-out property <bool> valid: false;
+    in-out property <bool> busy: false;
+    in-out property <string> error;
+    // 0 none; 1 created, but its Space placement failed or is unconfirmed;
+    // 2 no reply to the create request; 3 listed after another try;
+    // 4 created and placed but not open; 5 created, still finishing.
+    in-out property <int> outcome: 0;
+    in-out property <string> outcome-text;
+    in-out property <bool> can-relink: false;
+    in-out property <bool> relinking: false;
+    // A confirmed room that is not open may be opened again (Rust keeps its
+    // ID; nothing is created again). Busy while it opens.
+    in-out property <bool> can-open: false;
+    // Raised by Rust once the context of the current open and mode is read
+    // and the name field is enabled; the form then focuses it.
+    in-out property <int> focus-request: 0;
+    callback begin(int);
+    callback changed();
+    callback submit();
+    callback relink();
+    callback open-created();
+    // After an unknown outcome: the person checked and may create again.
+    callback acknowledge();
+    callback done();
+    callback closed();
+}
+
+component AccessChoice inherits ActionRect {
+    in property <string> text;
+    in property <bool> chosen;
+    in property <ControlColors> colors;
+    in property <color> selection;
+    in property <float> text-scale: 1;
+    horizontal-stretch: 1;
+    min-height: max(30px, 16px * root.text-scale + 14px);
+    border-radius: StyleTokens.control-corner;
+    border-width: root.chosen ? max(2px, StyleTokens.line-width) : StyleTokens.line-width;
+    border-color: root.chosen ? root.colors.accent : root.colors.outline;
+    background: root.chosen ? root.selection : root.enabled && root.has-hover ? root.colors.hover : transparent;
+    focus-color: root.colors.accent;
+    accessible-checkable: true;
+    accessible-checked: root.chosen;
+    Text {
+        x: 6px; width: parent.width - 12px;
+        text: root.text;
+        color: root.enabled ? root.colors.ink : root.colors.muted;
+        font-size: 11px * root.text-scale; font-weight: root.chosen ? 700 : 500;
+        horizontal-alignment: center; vertical-alignment: center;
+        wrap: word-wrap;
+    }
+}
+
+export component RoomCreationForm inherits ScrollView {
+    in property <float> text-scale: 1;
+    in property <ControlColors> colors;
+    in property <color> selection;
+    in property <color> error-ink;
+    in property <color> divider;
+    property <bool> editable: RoomCreation.context-ready && !RoomCreation.busy && RoomCreation.outcome == 0;
+    // A disabled field refuses focus, so the name is focused only once it is
+    // enabled: when the form appears ready, or when Rust says this open's
+    // context arrived.
+    public function focus-name() { if root.editable { name-field.focus(); } }
+    property <int> focus-request: RoomCreation.focus-request;
+    changed focus-request => { root.focus-name(); }
+    horizontal-scrollbar-policy: always-off;
+    VerticalLayout {
+        width: root.visible-width;
+        spacing: 7px;
+        alignment: start;
+        Text {
+            text: RoomCreation.context-ready ? "As " + RoomCreation.identity : RoomCreation.error == "" ? "Reading what your homeserver allows…" : "";
+            color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        name-field := TokenField {
+            text <=> RoomCreation.name;
+            placeholder-text: RoomCreation.kind == 1 ? "Space name" : "Room name";
+            label: RoomCreation.kind == 1 ? "Name of the new Space" : "Name of the new room";
+            enabled: root.editable;
+            colors: root.colors; text-scale: root.text-scale;
+            edited => { RoomCreation.changed(); }
+            accepted => { if RoomCreation.valid && root.editable { RoomCreation.submit(); } }
+        }
+        TokenField {
+            text <=> RoomCreation.topic;
+            placeholder-text: "Topic (optional)";
+            label: "Topic, optional";
+            enabled: root.editable;
+            colors: root.colors; text-scale: root.text-scale;
+            edited => { RoomCreation.changed(); }
+        }
+        Text { text: "WHO CAN JOIN"; color: root.colors.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+        Rectangle {
+          accessible-role: groupbox;
+          accessible-label: "Who can join";
+          HorizontalLayout {
+            spacing: 5px;
+            AccessChoice {
+                text: "Only people you invite";
+                label: "Only people you invite can join";
+                chosen: RoomCreation.access == 0;
+                enabled: root.editable;
+                colors: root.colors; selection: root.selection; text-scale: root.text-scale;
+                activated => { RoomCreation.access = 0; RoomCreation.listed = false; RoomCreation.changed(); }
+            }
+            if RoomCreation.parent-name != "" : AccessChoice {
+                text: "Members of " + RoomCreation.parent-name;
+                label: "Members of the Space " + RoomCreation.parent-name + " can join";
+                chosen: RoomCreation.access == 1;
+                enabled: root.editable && RoomCreation.in-space && RoomCreation.space-members-supported;
+                colors: root.colors; selection: root.selection; text-scale: root.text-scale;
+                activated => { RoomCreation.access = 1; RoomCreation.listed = false; RoomCreation.changed(); }
+            }
+            AccessChoice {
+                text: "Anyone with the link";
+                label: "Anyone with the address or a link can join";
+                chosen: RoomCreation.access == 2;
+                enabled: root.editable;
+                colors: root.colors; selection: root.selection; text-scale: root.text-scale;
+                activated => { RoomCreation.access = 2; RoomCreation.changed(); }
+            }
+          }
+        }
+        if RoomCreation.access == 2 : TokenCheck {
+            text: "List it in " + RoomCreation.server-name + "'s public room directory";
+            checked <=> RoomCreation.listed;
+            enabled: root.editable;
+            colors: root.colors; text-scale: root.text-scale;
+            toggled => { RoomCreation.changed(); }
+        }
+        HorizontalLayout {
+            spacing: 4px;
+            Text { text: "#"; color: root.colors.muted; font-size: 13px * root.text-scale; vertical-alignment: center; }
+            TokenField {
+                text <=> RoomCreation.alias;
+                placeholder-text: "address (optional)";
+                label: "Address on " + RoomCreation.server-name + ", optional";
+                enabled: root.editable;
+                colors: root.colors; text-scale: root.text-scale;
+                edited => { RoomCreation.changed(); }
+            }
+            Text {
+                text: ":" + RoomCreation.server-name;
+                color: root.colors.muted; font-size: 12px * root.text-scale; vertical-alignment: center;
+                overflow: elide; max-width: 180px * root.text-scale;
+            }
+        }
+        if RoomCreation.kind == 0 : TokenCheck {
+            text: "Encrypt messages end to end (recommended; cannot be turned off later)";
+            checked <=> RoomCreation.encrypted;
+            enabled: root.editable;
+            colors: root.colors; text-scale: root.text-scale;
+            toggled => { RoomCreation.changed(); }
+        }
+        if RoomCreation.kind == 1 : Text {
+            text: "A Space holds no messages, so it is not encrypted.";
+            color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        }
+        if RoomCreation.parent-name != "" : TokenCheck {
+            text: "Add it to " + RoomCreation.parent-name;
+            checked <=> RoomCreation.in-space;
+            enabled: root.editable && RoomCreation.can-place;
+            colors: root.colors; text-scale: root.text-scale;
+            toggled => {
+                if !RoomCreation.in-space && RoomCreation.access == 1 { RoomCreation.access = 0; }
+                RoomCreation.changed();
+            }
+        }
+        if RoomCreation.parent-name != "" && RoomCreation.context-ready && !RoomCreation.can-place : Text {
+            text: "You can't add rooms to " + RoomCreation.parent-name + ", so it will be created in Home.";
+            color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        }
+        if RoomCreation.in-space : TokenCheck {
+            text: "Suggest it to the Space's members";
+            checked <=> RoomCreation.suggested;
+            enabled: root.editable;
+            colors: root.colors; text-scale: root.text-scale;
+            toggled => { RoomCreation.changed(); }
+        }
+        Rectangle { height: StyleTokens.line-width; background: root.divider; }
+        Text { text: "WHAT WILL BE CREATED"; color: root.colors.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+        Rectangle {
+          accessible-role: list;
+          accessible-label: "Settings that will be applied";
+          VerticalLayout {
+            spacing: 2px;
+            for line in RoomCreation.preview : Rectangle {
+              accessible-role: list-item;
+              accessible-label: line.label + ": " + line.value;
+              HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    width: 96px * min(1.4, root.text-scale);
+                    text: line.label; color: root.colors.muted; font-size: 11px * root.text-scale;
+                    accessible-role: none;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: line.value; color: root.colors.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+                    accessible-role: none;
+                }
+              }
+            }
+          }
+        }
+        if RoomCreation.problem != "" : Text {
+            text: RoomCreation.problem;
+            color: RoomCreation.name == "" ? root.colors.muted : root.error-ink;
+            font-size: 11px * root.text-scale; wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        if RoomCreation.error != "" : Text {
+            text: RoomCreation.error;
+            color: root.error-ink; font-size: 12px * root.text-scale; wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        if RoomCreation.outcome != 0 : Rectangle {
+            border-radius: StyleTokens.radius * 0.8;
+            border-width: max(2px, StyleTokens.line-width);
+            border-color: RoomCreation.outcome == 1 || RoomCreation.outcome == 2 ? root.error-ink : root.colors.accent;
+            background: transparent;
+            VerticalLayout {
+                padding: 10px; spacing: 8px;
+                Text {
+                    text: RoomCreation.outcome-text;
+                    color: root.colors.ink; font-size: 12px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                // One action per right-aligned row, so they fit at any width
+                // and text size (500 px at 200% and the widest control
+                // padding included), in Tab order. The last row is always
+                // there (Done, or the acknowledgement after an unknown
+                // outcome), so an action whose row goes away when it
+                // succeeds (Add to Space again, Open) hands the keyboard to
+                // it first.
+                VerticalLayout {
+                    spacing: 8px;
+                    if RoomCreation.can-relink : HorizontalLayout {
+                        alignment: end;
+                        TokenButton { colors: root.colors; text-scale: root.text-scale;
+                            text: RoomCreation.relinking ? "Adding…" : "Add to Space again";
+                            label: "Add the created room to " + RoomCreation.parent-name + " again";
+                            enabled: !RoomCreation.relinking && !RoomCreation.busy;
+                            activated => { outcome-last.focus(); RoomCreation.relink(); }
+                        }
+                    }
+                    if RoomCreation.can-open && RoomCreation.outcome != 2 : HorizontalLayout {
+                        alignment: end;
+                        TokenButton { colors: root.colors; text-scale: root.text-scale;
+                            text: RoomCreation.busy ? "Opening…" : "Open";
+                            label: "Open the created room";
+                            enabled: !RoomCreation.relinking && !RoomCreation.busy;
+                            activated => { outcome-last.focus(); RoomCreation.open-created(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        outcome-last := TokenButton { colors: root.colors; text-scale: root.text-scale;
+                            primary: RoomCreation.outcome != 2;
+                            text: RoomCreation.outcome == 2 ? "I checked my room list" : "Done";
+                            label: RoomCreation.outcome == 2 ? "I checked my room list; allow creating it again" : "Done";
+                            // The acknowledgement waits for the account's
+                            // settings: until then the name field could not
+                            // take the keyboard from this button.
+                            enabled: !RoomCreation.relinking && !RoomCreation.busy
+                                && (RoomCreation.outcome != 2 || RoomCreation.context-ready);
+                            activated => {
+                                if RoomCreation.outcome == 2 {
+                                    // The fields are enabled again: the name
+                                    // takes the keyboard from this button.
+                                    RoomCreation.acknowledge();
+                                    root.focus-name();
+                                } else {
+                                    // Rust closes the dialog and returns the
+                                    // keyboard to its opener.
+                                    RoomCreation.done();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

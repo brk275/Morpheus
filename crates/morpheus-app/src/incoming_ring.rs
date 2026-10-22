@@ -8,6 +8,7 @@
 
 mod audio;
 pub(crate) mod controller;
+pub(crate) mod desktop;
 pub(crate) mod ledger;
 mod policy;
 pub(crate) mod ui;
@@ -46,6 +47,95 @@ const MAX_BYTES: usize = 64 * 1024;
 const MAX_LIVE_MEMBERS: usize = 512;
 const ADMISSION_LIMIT: Duration = Duration::from_secs(20);
 const REQUEST_LIMIT: Duration = Duration::from_secs(5);
+/// One Decline send, including the SDK's own room-key sharing for it.
+const DECLINE_SEND_LIMIT: Duration = Duration::from_secs(15);
+/// The send's answer is only an event ID.
+const DECLINE_RESPONSE_BYTES: u64 = 16 * 1024;
+/// How often a running Decline send rechecks the click's fence while the
+/// send itself is idle (a wake aid only; every poll of the send is fenced).
+const DECLINE_FENCE_POLL: Duration = Duration::from_millis(100);
+
+/// Resolves once `allowed` stops holding; checked now and then every
+/// DECLINE_FENCE_POLL. Bounded by whatever it races.
+async fn fence_lost(allowed: &impl Fn() -> bool) {
+    while allowed() {
+        time::sleep(DECLINE_FENCE_POLL).await;
+    }
+}
+
+/// Drive the one `inner` future only while `allowed` holds, checked
+/// immediately before every delegated poll. Once it fails, `inner` is never
+/// polled again (it is dropped with this future) and the result is None. It
+/// is never rebuilt or re-entered. Limits: one poll of `inner` may run
+/// several of its own steps that are ready at once, so this does not
+/// intercept the SDK's private HTTP hand-off atomically, and it cannot
+/// retract a request already issued.
+async fn poll_while<F: Future>(inner: F, allowed: &impl Fn() -> bool) -> Option<F::Output> {
+    let mut inner = std::pin::pin!(inner);
+    std::future::poll_fn(|cx| {
+        if !allowed() {
+            return std::task::Poll::Ready(None);
+        }
+        inner.as_mut().poll(cx).map(Some)
+    })
+    .await
+}
+
+/// What one explicit Decline came to. Deliberately contains no server error,
+/// event body, room, event or device identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeclineOutcome {
+    /// The homeserver accepted this device's decline event: it returned the
+    /// event's ID.
+    Confirmed,
+    /// Nothing was sent: a check failed, or the click's scope ended, before
+    /// the send began.
+    NotSent,
+    /// The homeserver refused the send with a client error (4xx) whose Matrix
+    /// error code is a known rejection (decline_rejected): it stored nothing.
+    Failed,
+    /// The send began but its result is not known: a server error (5xx), any
+    /// other status or body, a transport failure, a timeout, or the click's
+    /// scope ending mid-send. Never retried. The caller may still see it ring.
+    Unknown,
+}
+
+/// Whether a send's Matrix-format error answer proves the homeserver
+/// rejected it and stored nothing: a client error (4xx, but not 408, which a
+/// proxy may also send after forwarding) together with one of the known
+/// rejection codes for this request. Every other status, a 4xx with another
+/// code, and every 5xx (whatever its body says) leave the disposition
+/// unknown.
+fn decline_rejected(status: u16, kind: Option<&matrix_sdk::ruma::api::error::ErrorKind>) -> bool {
+    use matrix_sdk::ruma::api::error::ErrorKind;
+    (400..500).contains(&status)
+        && status != 408
+        && kind.is_some_and(|kind| {
+            matches!(
+                kind,
+                ErrorKind::UnknownToken(_)
+                    | ErrorKind::MissingToken
+                    | ErrorKind::Forbidden
+                    | ErrorKind::GuestAccessForbidden
+                    | ErrorKind::LimitExceeded(_)
+                    | ErrorKind::BadJson
+                    | ErrorKind::NotJson
+                    | ErrorKind::InvalidParam
+                    | ErrorKind::TooLarge
+            )
+        })
+}
+
+/// The outcome of a send that returned an error. Only a proven rejection is
+/// Failed; anything else is Unknown.
+fn decline_error_outcome(error: &matrix_sdk::Error) -> DeclineOutcome {
+    match error.as_client_api_error() {
+        Some(answer) if decline_rejected(answer.status_code.as_u16(), answer.error_kind()) => {
+            DeclineOutcome::Failed
+        }
+        _ => DeclineOutcome::Unknown,
+    }
+}
 
 /// Deliberately contains no server error, event body, room or device identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +224,57 @@ impl fmt::Debug for IncomingOffer {
     }
 }
 
+/// The replay ledger as admission uses it: one observation before any network
+/// work and, on failure, one retirement. Implemented for an exclusively
+/// borrowed ledger and for the incoming actor's shared one, where each call
+/// locks only for that call, never across an await, so the actor can keep
+/// settling other offers while an admission waits. Either way the claim and
+/// its one-time observation are exactly those of the original admission.
+pub(crate) trait AdmissionLedger: Send {
+    fn observe(
+        &mut self,
+        key: OfferKey<'_>,
+        window: RingWindow,
+        now: Instant,
+    ) -> Result<Observation, AdmissionFailure>;
+    fn retire(&mut self, key: OfferKey<'_>);
+}
+impl AdmissionLedger for &mut OfferLedger {
+    fn observe(
+        &mut self,
+        key: OfferKey<'_>,
+        window: RingWindow,
+        now: Instant,
+    ) -> Result<Observation, AdmissionFailure> {
+        (**self)
+            .observe(key, window, now)
+            .map_err(|_| AdmissionFailure::Replay)
+    }
+    fn retire(&mut self, key: OfferKey<'_>) {
+        let _ = (**self).retire(key);
+    }
+}
+impl AdmissionLedger for &std::sync::Mutex<OfferLedger> {
+    fn observe(
+        &mut self,
+        key: OfferKey<'_>,
+        window: RingWindow,
+        now: Instant,
+    ) -> Result<Observation, AdmissionFailure> {
+        // A poisoned ledger admits nothing.
+        self.lock()
+            .map_err(|_| AdmissionFailure::Replay)?
+            .observe(key, window, now)
+            .map_err(|_| AdmissionFailure::Replay)
+    }
+    fn retire(&mut self, key: OfferKey<'_>) {
+        let _ = self
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retire(key);
+    }
+}
+
 impl IncomingOffer {
     /// Admit only an unsolicited receipt already retained by this account's
     /// running sticky sync. Fetching a notification by event ID cannot ring.
@@ -144,7 +285,7 @@ impl IncomingOffer {
         preferences: &VoiceSpaces,
         room_id: &RoomId,
         event_id: &EventId,
-        ledger: &mut OfferLedger,
+        mut ledger: impl AdmissionLedger,
     ) -> Result<Self, AdmissionFailure> {
         time::timeout(ADMISSION_LIMIT, async {
             let account = manager
@@ -253,6 +394,121 @@ impl IncomingOffer {
     }
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    /// The synchronous part of a Decline's fence, on the original offer only:
+    /// its exact selection still current, this account's own client and
+    /// device, the room still joined and encrypted, sticky sync running, and
+    /// the retained receipt still the same notification of the same
+    /// generation before the offer's deadline. Never looks anything up again.
+    fn decline_fence(
+        &mut self,
+        manager: &AccountManager,
+        preferences: &VoiceSpaces,
+    ) -> Result<Receipt, AdmissionFailure> {
+        require_scope(manager, preferences, &self.selection, &self.room)?;
+        require_client(&self.client, &self.own_user, &self.own_device)?;
+        if !self.room.encryption_state().is_encrypted() {
+            return Err(AdmissionFailure::Trust);
+        }
+        self.current_receipt()
+    }
+
+    /// One bounded protocol Decline (MSC4310) of exactly this offer's
+    /// notification, as this offer's account. `allowed` is the click's own
+    /// fence (its security generation and the offer's lease), checked with
+    /// decline_fence before the trust check, before the SDK's fetch and
+    /// before the send. The SDK's make_decline_call_event fetches the
+    /// notification and requires an RTC notification sent by someone else;
+    /// that adds to, never replaces, the receipt, trust and scope checks
+    /// here. Its fetch accepts no request config: it is a read with the
+    /// client's own retry and authentication-refresh policy, bounded here by
+    /// REQUEST_LIMIT and dropped if the click's scope ends. Room::send is the
+    /// existing encrypted route: one attempt, no retry, no authentication
+    /// refresh or replay. `sending` is set just before the send begins, so a
+    /// caller that cancels can tell NotSent from Unknown. The offer is spent
+    /// either way.
+    pub(crate) async fn decline(
+        &mut self,
+        manager: &AccountManager,
+        preferences: &VoiceSpaces,
+        allowed: impl Fn() -> bool,
+        sending: &std::sync::atomic::AtomicBool,
+    ) -> DeclineOutcome {
+        if self.revoked || !allowed() {
+            return DeclineOutcome::NotSent;
+        }
+        let Ok(received) = self.decline_fence(manager, preferences) else {
+            self.revoked = true;
+            return DeclineOutcome::NotSent;
+        };
+        // The original caller must still be trusted; the receipt's own
+        // verification was checked in decline_fence.
+        let trusted = time::timeout(
+            REQUEST_LIMIT,
+            policy::require_current_sender(&self.client, &received.encryption),
+        )
+        .await;
+        let Ok(id) = EventId::parse(self.ring.event_id()) else {
+            self.revoked = true;
+            return DeclineOutcome::NotSent;
+        };
+        if !matches!(trusted, Ok(Ok(_)))
+            || !allowed()
+            || self.decline_fence(manager, preferences).is_err()
+        {
+            self.revoked = true;
+            return DeclineOutcome::NotSent;
+        }
+        let content =
+            match time::timeout(REQUEST_LIMIT, self.room.make_decline_call_event(&id)).await {
+                Ok(Ok(content)) => content,
+                _ => {
+                    self.revoked = true;
+                    return DeclineOutcome::NotSent;
+                }
+            };
+        // After the fetch: still the same scope and receipt, right before the
+        // only send.
+        if !allowed() || self.decline_fence(manager, preferences).is_err() {
+            self.revoked = true;
+            return DeclineOutcome::NotSent;
+        }
+        self.revoked = true;
+        sending.store(true, std::sync::atomic::Ordering::Release);
+        // The only mutation: one request with no HTTP retry, no authentication
+        // refresh or replay (an unknown-token answer is returned as an error
+        // and reported, never resent after a refresh), a bounded response.
+        let send = self.room.send(content).with_request_config(
+            RequestConfig::new()
+                .retry_limit(0)
+                .disable_auth_refresh()
+                .timeout(DECLINE_SEND_LIMIT)
+                .max_response_bytes(DECLINE_RESPONSE_BYTES),
+        );
+        // In an encrypted room, Room::send may first share the room key (key
+        // query and claim, to-device messages). Those SDK steps use the
+        // client's own request config and cannot be fenced one by one: the
+        // pinned SDK keeps preshare_room_key private. So the click's own
+        // fence (lease, epoch, selection, security generation) is checked
+        // before every poll of this one send future (poll_while), and also
+        // wakes it every DECLINE_FENCE_POLL while the send is idle. Losing
+        // the fence drops the send, which is never polled, rebuilt or
+        // re-entered again.
+        let fenced = poll_while(std::future::IntoFuture::into_future(send), &allowed);
+        let sent = tokio::select! {
+            biased;
+            () = fence_lost(&allowed) => return DeclineOutcome::Unknown,
+            sent = time::timeout(DECLINE_SEND_LIMIT, fenced) => sent,
+        };
+        match sent {
+            Ok(Some(Ok(_))) => DeclineOutcome::Confirmed,
+            // A proven rejection (including an unknown-token answer, which is
+            // never resent after a refresh) is Failed; anything else Unknown.
+            Ok(Some(Err(error))) => decline_error_outcome(&error),
+            // The fence was lost before a poll, or the send timed out.
+            Ok(None) | Err(_) => DeclineOutcome::Unknown,
+        }
     }
 
     /// Every failure is terminal for this offer; cached success is not reused.
@@ -746,6 +1002,125 @@ mod tests {
             "@caller:example.org",
             "CALLER",
         )
+    }
+
+    /// Only a known Matrix rejection in a 4xx answer proves a Decline was not
+    /// stored. A Matrix-format 5xx, a 408, another code or no code at all
+    /// leaves it unknown, whatever the body says.
+    #[test]
+    fn decline_failure_needs_a_proven_client_rejection() {
+        use matrix_sdk::ruma::api::error::{ErrorKind, UnknownTokenErrorData};
+        let unknown_token = ErrorKind::UnknownToken(UnknownTokenErrorData::new());
+        for (status, kind) in [
+            (401, &unknown_token),
+            (401, &ErrorKind::MissingToken),
+            (403, &ErrorKind::Forbidden),
+            (400, &ErrorKind::BadJson),
+            (413, &ErrorKind::TooLarge),
+        ] {
+            assert!(decline_rejected(status, Some(kind)), "{status} {kind:?}");
+        }
+        for (status, kind) in [
+            // A Matrix-format server error: the event may have been stored.
+            (500, Some(&ErrorKind::Forbidden)),
+            (500, Some(&ErrorKind::Unknown)),
+            (502, Some(&unknown_token)),
+            (503, None),
+            // A request timeout a proxy may send after forwarding.
+            (408, Some(&ErrorKind::Forbidden)),
+            // A client error without a known rejection code.
+            (400, Some(&ErrorKind::Unknown)),
+            (404, Some(&ErrorKind::Unrecognized)),
+            (400, None),
+            (302, Some(&ErrorKind::Forbidden)),
+        ] {
+            assert!(!decline_rejected(status, kind), "{status} {kind:?}");
+        }
+    }
+
+    /// The Decline send is polled only while the click's original fence
+    /// holds. A fence lost while the send waits (for example for keys) is
+    /// seen before the next poll, even when the send is woken before the
+    /// periodic check: the old future is never polled again. An unchanged
+    /// fence polls the same future through to its answer.
+    #[test]
+    fn a_decline_send_is_polled_only_while_its_original_fence_holds() {
+        use std::{
+            pin::pin,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            task::{Context, Poll, Waker},
+        };
+        struct Held {
+            polls: Arc<AtomicUsize>,
+            ready: Arc<AtomicBool>,
+        }
+        impl Future for Held {
+            type Output = u8;
+            fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<u8> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                if self.ready.load(Ordering::SeqCst) {
+                    Poll::Ready(7)
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // The fence is lost while the send is held; it is woken (the keys
+        // arrive) before any timer: the held future is not polled again.
+        let (polls, ready) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let gate = Arc::new(crate::security::SecurityGate::default());
+        let captured = gate.ringing_generation();
+        let held = Held {
+            polls: polls.clone(),
+            ready: ready.clone(),
+        };
+        let allowed = {
+            let gate = gate.clone();
+            move || gate.ringing_allowed(captured)
+        };
+        let mut fenced = pin!(poll_while(held, &allowed));
+        assert!(fenced.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        let lease = gate.try_account_access().expect("security step admitted");
+        drop(lease);
+        assert!(!gate.blocked(), "the security screen already closed");
+        assert!(
+            !gate.ringing_allowed(captured),
+            "old authority stays retired"
+        );
+        ready.store(true, Ordering::SeqCst);
+        assert_eq!(fenced.as_mut().poll(&mut cx), Poll::Ready(None));
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the old send is not polled"
+        );
+
+        // An unchanged fence: the same future is polled to its answer.
+        let (polls, ready) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let held = Held {
+            polls: polls.clone(),
+            ready: ready.clone(),
+        };
+        let gate = Arc::new(crate::security::SecurityGate::default());
+        let captured = gate.ringing_generation();
+        let allowed = || gate.ringing_allowed(captured);
+        let mut fenced = pin!(poll_while(held, &allowed));
+        assert!(fenced.as_mut().poll(&mut cx).is_pending());
+        ready.store(true, Ordering::SeqCst);
+        assert_eq!(fenced.as_mut().poll(&mut cx), Poll::Ready(Some(7)));
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -1,0 +1,1008 @@
+// Copyright 2023 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::sync::Arc;
+
+use as_variant::as_variant;
+use matrix_sdk::{
+    Room,
+    deserialized_responses::{TimelineEvent, TimelineEventKind},
+};
+use matrix_sdk_base::crypto::types::events::UtdCause;
+use ruma::{
+    OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedUserId, UserId,
+    events::{
+        AnyMessageLikeEventContent, AnyStateEventContentChange, Mentions, MessageLikeEventType,
+        StateEventContentChange, StateEventType,
+        policy::rule::{
+            room::PolicyRuleRoomEventContent, server::PolicyRuleServerEventContent,
+            user::PolicyRuleUserEventContent,
+        },
+        relation::{Replacement, Reply, Thread},
+        room::{
+            avatar::RoomAvatarEventContent,
+            canonical_alias::RoomCanonicalAliasEventContent,
+            create::RoomCreateEventContent,
+            encrypted::{EncryptedEventScheme, MegolmV1AesSha2Content, RoomEncryptedEventContent},
+            encryption::RoomEncryptionEventContent,
+            guest_access::RoomGuestAccessEventContent,
+            history_visibility::RoomHistoryVisibilityEventContent,
+            join_rules::RoomJoinRulesEventContent,
+            member::{Change, RoomMemberEventContent},
+            message::{
+                MessageType, Relation, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation,
+            },
+            name::RoomNameEventContent,
+            pinned_events::RoomPinnedEventsEventContent,
+            power_levels::RoomPowerLevelsEventContent,
+            server_acl::RoomServerAclEventContent,
+            third_party_invite::RoomThirdPartyInviteEventContent,
+            tombstone::RoomTombstoneEventContent,
+            topic::RoomTopicEventContent,
+        },
+        rtc::notification::CallIntent,
+        space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
+        sticker::StickerEventContent,
+    },
+    html::RemoveReplyFallback,
+    room_version_rules::RedactionRules,
+};
+use tracing::warn;
+
+mod live_location;
+mod message;
+mod msg_like;
+pub(super) mod other;
+pub(crate) mod pinned_events;
+mod polls;
+mod reply;
+
+pub use pinned_events::RoomPinnedEventsChange;
+
+pub(in crate::timeline) use self::{
+    live_location::beacon_info_matches,
+    message::{
+        extract_bundled_edit_event_json, extract_poll_edit_content, extract_room_msg_edit_content,
+    },
+};
+pub use self::{
+    live_location::{BeaconInfo, LiveLocationState},
+    message::Message,
+    msg_like::{MsgLikeContent, MsgLikeKind, ThreadSummary},
+    other::OtherMessageLike,
+    polls::{PollResult, PollState},
+    reply::{EmbeddedEvent, InReplyToDetails},
+};
+use crate::timeline::{
+    controller::ActiveCallInfo,
+    event_handler::{HandleAggregationKind, TimelineAction},
+};
+
+/// The content of an [`EventTimelineItem`][super::EventTimelineItem].
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+pub enum TimelineItemContent {
+    MsgLike(MsgLikeContent),
+
+    /// A room membership change.
+    MembershipChange(RoomMembershipChange),
+
+    /// A room member profile change.
+    ProfileChange(MemberProfileChange),
+
+    /// Another state event.
+    OtherState(OtherState),
+
+    /// A message-like event that failed to deserialize.
+    FailedToParseMessageLike {
+        /// The event `type`.
+        event_type: MessageLikeEventType,
+
+        /// The deserialization error.
+        error: Arc<serde_json::Error>,
+    },
+
+    /// A state event that failed to deserialize.
+    FailedToParseState {
+        /// The event `type`.
+        event_type: StateEventType,
+
+        /// The state key.
+        state_key: String,
+
+        /// The deserialization error.
+        error: Arc<serde_json::Error>,
+    },
+
+    /// An `m.call.invite` event
+    CallInvite,
+
+    /// An `m.rtc.notification` event
+    RtcNotification {
+        /// The intent of this notification.
+        call_intent: Option<CallIntent>,
+        /// Users who have declined this call notification
+        declined_by: Vec<OwnedUserId>,
+        /// Information about the active call, if this notification is about an
+        /// active call.
+        active_call_info: Option<ActiveCallInfo>,
+    },
+}
+
+impl TimelineItemContent {
+    /// Returns the raw Matrix event type string (e.g. `"m.room.message"`), or
+    /// `None` when the original type is not available (e.g. redacted events).
+    pub fn event_type_str(&self) -> Option<String> {
+        match self {
+            Self::MsgLike(msg) => Some(match &msg.kind {
+                MsgLikeKind::Message(_) => MessageLikeEventType::RoomMessage.to_string(),
+                MsgLikeKind::Sticker(_) => MessageLikeEventType::Sticker.to_string(),
+                MsgLikeKind::Poll(_) => MessageLikeEventType::PollStart.to_string(),
+                MsgLikeKind::Redacted => return None,
+                MsgLikeKind::UnableToDecrypt(_) => MessageLikeEventType::RoomEncrypted.to_string(),
+                MsgLikeKind::Other(other) => other.event_type().to_string(),
+                MsgLikeKind::LiveLocation(_) => StateEventType::BeaconInfo.to_string(),
+            }),
+            Self::MembershipChange(_) | Self::ProfileChange(_) => {
+                Some(StateEventType::RoomMember.to_string())
+            }
+            Self::OtherState(state) => Some(state.content().event_type().to_string()),
+            Self::FailedToParseMessageLike { event_type, .. } => Some(event_type.to_string()),
+            Self::FailedToParseState { event_type, .. } => Some(event_type.to_string()),
+            Self::CallInvite => Some(MessageLikeEventType::CallInvite.to_string()),
+            Self::RtcNotification { .. } => Some(MessageLikeEventType::RtcNotification.to_string()),
+        }
+    }
+
+    /// Create a raw [`TimelineItemContent`] for a given [`TimelineEvent`],
+    /// without providing extra information (about thread root, replied-to
+    /// information, and so on).
+    pub async fn from_event(room: &Room, timeline_event: TimelineEvent) -> Option<Self> {
+        let (utd_info, raw_event) = match timeline_event.kind {
+            TimelineEventKind::UnableToDecrypt { utd_info, event } => (Some(utd_info), event),
+            _ => (None, timeline_event.into_raw()),
+        };
+
+        let deserialized_event = raw_event.deserialize().ok()?;
+
+        let actions = TimelineAction::from_event(
+            deserialized_event,
+            &raw_event,
+            room,
+            utd_info.map(|utd_info| (utd_info, None)),
+            None,
+            None,
+            None,
+        )
+        .await;
+        match actions.as_slice() {
+            [TimelineAction::AddItem { content }] => Some(content.clone()),
+            [
+                TimelineAction::AddItem { content },
+                TimelineAction::HandleAggregation {
+                    kind: HandleAggregationKind::BeaconStop { .. },
+                    ..
+                },
+            ] => {
+                if content.is_live_location_state() {
+                    Some(content.clone())
+                } else {
+                    warn!(
+                        "Unexpected [AddItem, BeaconStop] actions with a non-live-location \
+                         AddItem; ignoring event"
+                    );
+                    None
+                }
+            }
+            // Aggregated event: only edits and beacon stop are supported at the moment.
+            [
+                TimelineAction::HandleAggregation {
+                    kind: HandleAggregationKind::BeaconStop { content, .. },
+                    ..
+                },
+            ] => Some(TimelineItemContent::MsgLike(MsgLikeContent {
+                kind: MsgLikeKind::LiveLocation(LiveLocationState::new(content.clone())),
+                thread_root: None,
+                in_reply_to: None,
+                thread_summary: None,
+            })),
+            [
+                TimelineAction::HandleAggregation {
+                    kind:
+                        HandleAggregationKind::Edit { replacement: Replacement { new_content, .. } },
+                    ..
+                },
+            ] => {
+                // Map the edit to a regular message.
+                match TimelineAction::from_content(
+                    AnyMessageLikeEventContent::RoomMessage(RoomMessageEventContent::new(
+                        new_content.msgtype.clone(),
+                    )),
+                    None,
+                    None,
+                    None,
+                ) {
+                    TimelineAction::AddItem { content } => Some(content),
+                    _ => None,
+                }
+            }
+            [] => {
+                warn!("No action for event content processing");
+                None
+            }
+            [_, _, ..] => {
+                // There is no meaningful single content to extract in that
+                // case.
+                warn!("Ignoring event that produced multiple timeline actions");
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_msglike(&self) -> Option<&MsgLikeContent> {
+        as_variant!(self, TimelineItemContent::MsgLike)
+    }
+
+    /// If `self` is of the [`MsgLike`][Self::MsgLike] variant with a
+    /// [`LiveLocation`][MsgLikeKind::LiveLocation] kind, return the inner
+    /// [`LiveLocationState`].
+    pub fn as_live_location_state(&self) -> Option<&LiveLocationState> {
+        as_variant!(self, Self::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::LiveLocation(state),
+            ..
+        }) => state)
+    }
+
+    /// Check whether this item's content is a
+    /// [`LiveLocation`][MsgLikeKind::LiveLocation].
+    pub fn is_live_location_state(&self) -> bool {
+        matches!(self, Self::MsgLike(MsgLikeContent { kind: MsgLikeKind::LiveLocation(_), .. }))
+    }
+
+    /// If `self` is of the [`MsgLike`][Self::MsgLike] variant, return the inner
+    /// [`Message`].
+    pub fn as_message(&self) -> Option<&Message> {
+        as_variant!(self, Self::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::Message(message),
+            ..
+        }) => message)
+    }
+
+    /// Check whether this item's content is a
+    /// [`Message`][MsgLikeKind::Message].
+    pub fn is_message(&self) -> bool {
+        matches!(self, Self::MsgLike(MsgLikeContent { kind: MsgLikeKind::Message(_), .. }))
+    }
+
+    /// If `self` is of the [`MsgLike`][Self::MsgLike] variant, return the inner
+    /// [`PollState`].
+    pub fn as_poll(&self) -> Option<&PollState> {
+        as_variant!(self, Self::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::Poll(poll_state),
+            ..
+        }) => poll_state)
+    }
+
+    /// Check whether this item's content is a
+    /// [`Poll`][MsgLikeKind::Poll].
+    pub fn is_poll(&self) -> bool {
+        matches!(self, Self::MsgLike(MsgLikeContent { kind: MsgLikeKind::Poll(_), .. }))
+    }
+
+    pub fn as_sticker(&self) -> Option<&Sticker> {
+        as_variant!(
+            self,
+            Self::MsgLike(MsgLikeContent {
+                kind: MsgLikeKind::Sticker(sticker),
+                ..
+            }) => sticker
+        )
+    }
+
+    /// Check whether this item's content is a
+    /// [`Sticker`][MsgLikeKind::Sticker].
+    pub fn is_sticker(&self) -> bool {
+        matches!(self, Self::MsgLike(MsgLikeContent { kind: MsgLikeKind::Sticker(_), .. }))
+    }
+
+    /// If `self` is of the [`UnableToDecrypt`][MsgLikeKind::UnableToDecrypt]
+    /// variant, return the inner [`EncryptedMessage`].
+    pub fn as_unable_to_decrypt(&self) -> Option<&EncryptedMessage> {
+        as_variant!(
+            self,
+            Self::MsgLike(MsgLikeContent {
+                kind: MsgLikeKind::UnableToDecrypt(encrypted_message),
+                ..
+            }) => encrypted_message
+        )
+    }
+
+    /// Check whether this item's content is a
+    /// [`UnableToDecrypt`][MsgLikeKind::UnableToDecrypt].
+    pub fn is_unable_to_decrypt(&self) -> bool {
+        matches!(self, Self::MsgLike(MsgLikeContent { kind: MsgLikeKind::UnableToDecrypt(_), .. }))
+    }
+
+    pub fn is_redacted(&self) -> bool {
+        matches!(self, Self::MsgLike(MsgLikeContent { kind: MsgLikeKind::Redacted, .. }))
+    }
+
+    // These constructors could also be `From` implementations, but that would
+    // allow users to call them directly, which should not be supported
+    pub(crate) fn message(
+        msgtype: MessageType,
+        mentions: Option<Mentions>,
+        thread_root: Option<OwnedEventId>,
+        in_reply_to: Option<InReplyToDetails>,
+        thread_summary: Option<ThreadSummary>,
+    ) -> Self {
+        let remove_reply_fallback =
+            if in_reply_to.is_some() { RemoveReplyFallback::Yes } else { RemoveReplyFallback::No };
+
+        Self::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::Message(Message::from_event(
+                msgtype,
+                mentions,
+                None,
+                remove_reply_fallback,
+            )),
+            thread_root,
+            in_reply_to,
+            thread_summary,
+        })
+    }
+
+    #[cfg(not(tarpaulin_include))] // debug-logging functionality
+    pub(crate) fn debug_string(&self) -> &'static str {
+        match self {
+            TimelineItemContent::MsgLike(msglike) => msglike.debug_string(),
+            TimelineItemContent::MembershipChange(_) => "a membership change",
+            TimelineItemContent::ProfileChange(_) => "a profile change",
+            TimelineItemContent::OtherState(_) => "a state event",
+            TimelineItemContent::FailedToParseMessageLike { .. }
+            | TimelineItemContent::FailedToParseState { .. } => "an event that couldn't be parsed",
+            TimelineItemContent::CallInvite => "a call invite",
+            TimelineItemContent::RtcNotification { .. } => "a call notification",
+        }
+    }
+
+    pub(crate) fn room_member(
+        user_id: OwnedUserId,
+        full_content: StateEventContentChange<RoomMemberEventContent>,
+        sender: OwnedUserId,
+    ) -> Self {
+        use ruma::events::room::member::MembershipChange as MChange;
+        match &full_content {
+            StateEventContentChange::Original { content, prev_content } => {
+                let membership_change = content.membership_change(
+                    prev_content.as_ref().map(|c| c.details()),
+                    &sender,
+                    &user_id,
+                );
+
+                if let MChange::ProfileChanged { displayname_change, avatar_url_change } =
+                    membership_change
+                {
+                    Self::ProfileChange(MemberProfileChange {
+                        user_id,
+                        displayname_change: displayname_change.map(|c| Change {
+                            new: c.new.map(ToOwned::to_owned),
+                            old: c.old.map(ToOwned::to_owned),
+                        }),
+                        avatar_url_change: avatar_url_change.map(|c| Change {
+                            new: c.new.map(ToOwned::to_owned),
+                            old: c.old.map(ToOwned::to_owned),
+                        }),
+                    })
+                } else {
+                    let change = match membership_change {
+                        MChange::None => MembershipChange::None,
+                        MChange::Error => MembershipChange::Error,
+                        MChange::Joined => MembershipChange::Joined,
+                        MChange::Left => MembershipChange::Left,
+                        MChange::Banned => MembershipChange::Banned,
+                        MChange::Unbanned => MembershipChange::Unbanned,
+                        MChange::Kicked => MembershipChange::Kicked,
+                        MChange::Invited => MembershipChange::Invited,
+                        MChange::KickedAndBanned => MembershipChange::KickedAndBanned,
+                        MChange::InvitationAccepted => MembershipChange::InvitationAccepted,
+                        MChange::InvitationRejected => MembershipChange::InvitationRejected,
+                        MChange::InvitationRevoked => MembershipChange::InvitationRevoked,
+                        MChange::Knocked => MembershipChange::Knocked,
+                        MChange::KnockAccepted => MembershipChange::KnockAccepted,
+                        MChange::KnockRetracted => MembershipChange::KnockRetracted,
+                        MChange::KnockDenied => MembershipChange::KnockDenied,
+                        MChange::ProfileChanged { .. } => unreachable!(),
+                        _ => MembershipChange::NotImplemented,
+                    };
+
+                    Self::MembershipChange(RoomMembershipChange {
+                        user_id,
+                        content: full_content,
+                        change: Some(change),
+                    })
+                }
+            }
+            StateEventContentChange::Redacted(_) => Self::MembershipChange(RoomMembershipChange {
+                user_id,
+                content: full_content,
+                change: None,
+            }),
+        }
+    }
+
+    pub(in crate::timeline) fn redact(&self, rules: &RedactionRules) -> Self {
+        match self {
+            Self::MsgLike(msglike) => TimelineItemContent::MsgLike(MsgLikeContent {
+                kind: MsgLikeKind::Redacted,
+                in_reply_to: None,
+                ..msglike.clone()
+            }),
+            Self::CallInvite | Self::RtcNotification { .. } => {
+                TimelineItemContent::MsgLike(MsgLikeContent::redacted())
+            }
+            Self::MembershipChange(ev) => Self::MembershipChange(ev.redact(rules)),
+            Self::ProfileChange(ev) => Self::ProfileChange(ev.redact()),
+            Self::OtherState(ev) => Self::OtherState(ev.redact(rules)),
+            Self::FailedToParseMessageLike { .. } | Self::FailedToParseState { .. } => self.clone(),
+        }
+    }
+
+    /// Event ID of the thread root, if this is a message in a thread.
+    pub fn thread_root(&self) -> Option<OwnedEventId> {
+        as_variant!(self, Self::MsgLike)?.thread_root.clone()
+    }
+
+    /// Get the event this message is replying to, if any.
+    pub fn in_reply_to(&self) -> Option<InReplyToDetails> {
+        as_variant!(self, Self::MsgLike)?.in_reply_to.clone()
+    }
+
+    /// The thread or reply relation of this item, rebuilt from its thread root
+    /// and reply target, if any.
+    pub(crate) fn relation(&self) -> Option<Relation<RoomMessageEventContentWithoutRelation>> {
+        if let Some(thread_root) = self.thread_root() {
+            Some(Relation::Thread(match self.in_reply_to() {
+                Some(details) => Thread::reply(thread_root, details.event_id),
+                None => Thread::plain(thread_root.clone(), thread_root),
+            }))
+        } else {
+            self.in_reply_to()
+                .map(|details| Relation::Reply(Reply::with_event_id(details.event_id)))
+        }
+    }
+
+    /// Information about the thread this item is the root for.
+    pub fn thread_summary(&self) -> Option<ThreadSummary> {
+        as_variant!(self, Self::MsgLike)?.thread_summary.clone()
+    }
+}
+
+/// Metadata about an `m.room.encrypted` event that could not be decrypted.
+#[derive(Clone, Debug)]
+pub enum EncryptedMessage {
+    /// Metadata about an event using the `m.olm.v1.curve25519-aes-sha2`
+    /// algorithm.
+    OlmV1Curve25519AesSha2 {
+        /// The Curve25519 key of the sender.
+        sender_key: String,
+    },
+    /// Metadata about an event using the `m.megolm.v1.aes-sha2` algorithm.
+    MegolmV1AesSha2 {
+        /// The Curve25519 key of the sender.
+        #[deprecated = "this field should still be sent but should not be used when received"]
+        #[doc(hidden)] // Included for Debug formatting only
+        sender_key: Option<String>,
+
+        /// The ID of the sending device.
+        #[deprecated = "this field should still be sent but should not be used when received"]
+        #[doc(hidden)] // Included for Debug formatting only
+        device_id: Option<OwnedDeviceId>,
+
+        /// The ID of the session used to encrypt the message.
+        session_id: String,
+
+        /// What we know about what caused this UTD. E.g. was this event sent
+        /// when we were not a member of this room?
+        cause: UtdCause,
+    },
+    /// No metadata because the event uses an unknown algorithm.
+    Unknown,
+}
+
+impl EncryptedMessage {
+    pub(crate) fn from_content(content: RoomEncryptedEventContent, cause: UtdCause) -> Self {
+        match content.scheme {
+            EncryptedEventScheme::OlmV1Curve25519AesSha2(s) => {
+                Self::OlmV1Curve25519AesSha2 { sender_key: s.sender_key }
+            }
+            #[allow(deprecated)]
+            EncryptedEventScheme::MegolmV1AesSha2(s) => {
+                let MegolmV1AesSha2Content { sender_key, device_id, session_id, .. } = s;
+
+                Self::MegolmV1AesSha2 { sender_key, device_id, session_id, cause }
+            }
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Return the ID of the Megolm session used to encrypt this message, if it
+    /// was received via a Megolm session.
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        match self {
+            EncryptedMessage::OlmV1Curve25519AesSha2 { .. } => None,
+            EncryptedMessage::MegolmV1AesSha2 { session_id, .. } => Some(session_id),
+            EncryptedMessage::Unknown => None,
+        }
+    }
+
+    /// Return the reason this message could not be decrypted, if it was
+    /// received via a Megolm session.
+    pub fn utd_cause(&self) -> Option<UtdCause> {
+        match self {
+            EncryptedMessage::MegolmV1AesSha2 { cause, .. } => Some(*cause),
+            EncryptedMessage::OlmV1Curve25519AesSha2 { .. } | EncryptedMessage::Unknown => None,
+        }
+    }
+}
+
+/// An `m.sticker` event.
+#[derive(Clone, Debug)]
+pub struct Sticker {
+    pub(in crate::timeline) content: StickerEventContent,
+}
+
+impl Sticker {
+    /// Get the data of this sticker.
+    pub fn content(&self) -> &StickerEventContent {
+        &self.content
+    }
+}
+
+/// An event changing a room membership.
+#[derive(Clone, Debug)]
+pub struct RoomMembershipChange {
+    pub(in crate::timeline) user_id: OwnedUserId,
+    pub(in crate::timeline) content: StateEventContentChange<RoomMemberEventContent>,
+    pub(in crate::timeline) change: Option<MembershipChange>,
+}
+
+impl RoomMembershipChange {
+    /// The ID of the user whose membership changed.
+    pub fn user_id(&self) -> &UserId {
+        &self.user_id
+    }
+
+    /// The full content of the event.
+    pub fn content(&self) -> &StateEventContentChange<RoomMemberEventContent> {
+        &self.content
+    }
+
+    /// Retrieve the member's display name from the current event, or, if
+    /// missing, from the one it replaced.
+    pub fn display_name(&self) -> Option<String> {
+        if let StateEventContentChange::Original { content, prev_content } = &self.content {
+            content
+                .displayname
+                .as_ref()
+                .or_else(|| {
+                    prev_content.as_ref().and_then(|prev_content| prev_content.displayname.as_ref())
+                })
+                .cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Retrieve the avatar URL from the current event, or, if missing, from the
+    /// one it replaced.
+    pub fn avatar_url(&self) -> Option<OwnedMxcUri> {
+        if let StateEventContentChange::Original { content, prev_content } = &self.content {
+            content
+                .avatar_url
+                .as_ref()
+                .or_else(|| {
+                    prev_content.as_ref().and_then(|prev_content| prev_content.avatar_url.as_ref())
+                })
+                .cloned()
+        } else {
+            None
+        }
+    }
+
+    /// The membership change induced by this event.
+    ///
+    /// If this returns `None`, it doesn't mean that there was no change, but
+    /// that the change could not be computed. This is currently always the case
+    /// with redacted events.
+    // FIXME: Fetch the prev_content when missing so we can compute this with
+    // redacted events?
+    pub fn change(&self) -> Option<MembershipChange> {
+        self.change
+    }
+
+    fn redact(&self, rules: &RedactionRules) -> Self {
+        Self {
+            user_id: self.user_id.clone(),
+            content: StateEventContentChange::Redacted(self.content.clone().redact(rules)),
+            change: self.change,
+        }
+    }
+}
+
+/// An enum over all the possible room membership changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MembershipChange {
+    /// No change.
+    None,
+
+    /// Must never happen.
+    Error,
+
+    /// User joined the room.
+    Joined,
+
+    /// User left the room.
+    Left,
+
+    /// User was banned.
+    Banned,
+
+    /// User was unbanned.
+    Unbanned,
+
+    /// User was kicked.
+    Kicked,
+
+    /// User was invited.
+    Invited,
+
+    /// User was kicked and banned.
+    KickedAndBanned,
+
+    /// User accepted the invite.
+    InvitationAccepted,
+
+    /// User rejected the invite.
+    InvitationRejected,
+
+    /// User had their invite revoked.
+    InvitationRevoked,
+
+    /// User knocked.
+    Knocked,
+
+    /// User had their knock accepted.
+    KnockAccepted,
+
+    /// User retracted their knock.
+    KnockRetracted,
+
+    /// User had their knock denied.
+    KnockDenied,
+
+    /// Not implemented.
+    NotImplemented,
+}
+
+/// An event changing a member's profile.
+///
+/// Note that profile changes only occur in the timeline when the user's
+/// membership is already `join`.
+#[derive(Clone, Debug)]
+pub struct MemberProfileChange {
+    pub(in crate::timeline) user_id: OwnedUserId,
+    pub(in crate::timeline) displayname_change: Option<Change<Option<String>>>,
+    pub(in crate::timeline) avatar_url_change: Option<Change<Option<OwnedMxcUri>>>,
+}
+
+impl MemberProfileChange {
+    /// The ID of the user whose profile changed.
+    pub fn user_id(&self) -> &UserId {
+        &self.user_id
+    }
+
+    /// The display name change induced by this event.
+    pub fn displayname_change(&self) -> Option<&Change<Option<String>>> {
+        self.displayname_change.as_ref()
+    }
+
+    /// The avatar URL change induced by this event.
+    pub fn avatar_url_change(&self) -> Option<&Change<Option<OwnedMxcUri>>> {
+        self.avatar_url_change.as_ref()
+    }
+
+    fn redact(&self) -> Self {
+        Self {
+            user_id: self.user_id.clone(),
+            // FIXME: This isn't actually right, the profile is reset to an
+            // empty one when the member event is redacted. This can't be
+            // implemented without further architectural changes and is a
+            // somewhat rare edge case, so it should be fine for now.
+            displayname_change: None,
+            avatar_url_change: None,
+        }
+    }
+}
+
+/// An enum over all the full state event contents that don't have their own
+/// `TimelineItemContent` variant.
+#[derive(Clone, Debug)]
+pub enum AnyOtherStateEventContentChange {
+    /// m.policy.rule.room
+    PolicyRuleRoom(StateEventContentChange<PolicyRuleRoomEventContent>),
+
+    /// m.policy.rule.server
+    PolicyRuleServer(StateEventContentChange<PolicyRuleServerEventContent>),
+
+    /// m.policy.rule.user
+    PolicyRuleUser(StateEventContentChange<PolicyRuleUserEventContent>),
+
+    /// m.room.avatar
+    RoomAvatar(StateEventContentChange<RoomAvatarEventContent>),
+
+    /// m.room.canonical_alias
+    RoomCanonicalAlias(StateEventContentChange<RoomCanonicalAliasEventContent>),
+
+    /// m.room.create
+    RoomCreate(StateEventContentChange<RoomCreateEventContent>),
+
+    /// m.room.encryption
+    RoomEncryption(StateEventContentChange<RoomEncryptionEventContent>),
+
+    /// m.room.guest_access
+    RoomGuestAccess(StateEventContentChange<RoomGuestAccessEventContent>),
+
+    /// m.room.history_visibility
+    RoomHistoryVisibility(StateEventContentChange<RoomHistoryVisibilityEventContent>),
+
+    /// m.room.join_rules
+    RoomJoinRules(StateEventContentChange<RoomJoinRulesEventContent>),
+
+    /// m.room.name
+    RoomName(StateEventContentChange<RoomNameEventContent>),
+
+    /// m.room.pinned_events
+    RoomPinnedEvents(StateEventContentChange<RoomPinnedEventsEventContent>),
+
+    /// m.room.power_levels
+    RoomPowerLevels(StateEventContentChange<RoomPowerLevelsEventContent>),
+
+    /// m.room.server_acl
+    RoomServerAcl(StateEventContentChange<RoomServerAclEventContent>),
+
+    /// m.room.third_party_invite
+    RoomThirdPartyInvite(StateEventContentChange<RoomThirdPartyInviteEventContent>),
+
+    /// m.room.tombstone
+    RoomTombstone(StateEventContentChange<RoomTombstoneEventContent>),
+
+    /// m.room.topic
+    RoomTopic(StateEventContentChange<RoomTopicEventContent>),
+
+    /// m.space.child
+    SpaceChild(StateEventContentChange<SpaceChildEventContent>),
+
+    /// m.space.parent
+    SpaceParent(StateEventContentChange<SpaceParentEventContent>),
+
+    #[doc(hidden)]
+    _Custom { event_type: String },
+}
+
+impl AnyOtherStateEventContentChange {
+    /// Create an `AnyOtherStateEventContentChange` from an
+    /// `AnyStateEventContentChange`.
+    ///
+    /// Panics if the event content does not match one of the variants.
+    // This could be a `From` implementation but we don't want it in the public
+    // API.
+    pub(crate) fn with_event_content(content: AnyStateEventContentChange) -> Self {
+        let event_type = content.event_type();
+
+        match content {
+            AnyStateEventContentChange::PolicyRuleRoom(c) => Self::PolicyRuleRoom(c),
+            AnyStateEventContentChange::PolicyRuleServer(c) => Self::PolicyRuleServer(c),
+            AnyStateEventContentChange::PolicyRuleUser(c) => Self::PolicyRuleUser(c),
+            AnyStateEventContentChange::RoomAvatar(c) => Self::RoomAvatar(c),
+            AnyStateEventContentChange::RoomCanonicalAlias(c) => Self::RoomCanonicalAlias(c),
+            AnyStateEventContentChange::RoomCreate(c) => Self::RoomCreate(c),
+            AnyStateEventContentChange::RoomEncryption(c) => Self::RoomEncryption(c),
+            AnyStateEventContentChange::RoomGuestAccess(c) => Self::RoomGuestAccess(c),
+            AnyStateEventContentChange::RoomHistoryVisibility(c) => Self::RoomHistoryVisibility(c),
+            AnyStateEventContentChange::RoomJoinRules(c) => Self::RoomJoinRules(c),
+            AnyStateEventContentChange::RoomName(c) => Self::RoomName(c),
+            AnyStateEventContentChange::RoomPinnedEvents(c) => Self::RoomPinnedEvents(c),
+            AnyStateEventContentChange::RoomPowerLevels(c) => Self::RoomPowerLevels(c),
+            AnyStateEventContentChange::RoomServerAcl(c) => Self::RoomServerAcl(c),
+            AnyStateEventContentChange::RoomThirdPartyInvite(c) => Self::RoomThirdPartyInvite(c),
+            AnyStateEventContentChange::RoomTombstone(c) => Self::RoomTombstone(c),
+            AnyStateEventContentChange::RoomTopic(c) => Self::RoomTopic(c),
+            AnyStateEventContentChange::SpaceChild(c) => Self::SpaceChild(c),
+            AnyStateEventContentChange::SpaceParent(c) => Self::SpaceParent(c),
+            AnyStateEventContentChange::RoomMember(_) => unreachable!(),
+            _ => Self::_Custom { event_type: event_type.to_string() },
+        }
+    }
+
+    /// Get the event's type, like `m.room.create`.
+    pub fn event_type(&self) -> StateEventType {
+        match self {
+            Self::PolicyRuleRoom(c) => c.event_type(),
+            Self::PolicyRuleServer(c) => c.event_type(),
+            Self::PolicyRuleUser(c) => c.event_type(),
+            Self::RoomAvatar(c) => c.event_type(),
+            Self::RoomCanonicalAlias(c) => c.event_type(),
+            Self::RoomCreate(c) => c.event_type(),
+            Self::RoomEncryption(c) => c.event_type(),
+            Self::RoomGuestAccess(c) => c.event_type(),
+            Self::RoomHistoryVisibility(c) => c.event_type(),
+            Self::RoomJoinRules(c) => c.event_type(),
+            Self::RoomName(c) => c.event_type(),
+            Self::RoomPinnedEvents(c) => c.event_type(),
+            Self::RoomPowerLevels(c) => c.event_type(),
+            Self::RoomServerAcl(c) => c.event_type(),
+            Self::RoomThirdPartyInvite(c) => c.event_type(),
+            Self::RoomTombstone(c) => c.event_type(),
+            Self::RoomTopic(c) => c.event_type(),
+            Self::SpaceChild(c) => c.event_type(),
+            Self::SpaceParent(c) => c.event_type(),
+            Self::_Custom { event_type } => event_type.as_str().into(),
+        }
+    }
+
+    fn redact(&self, rules: &RedactionRules) -> Self {
+        match self {
+            Self::PolicyRuleRoom(c) => {
+                Self::PolicyRuleRoom(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::PolicyRuleServer(c) => {
+                Self::PolicyRuleServer(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::PolicyRuleUser(c) => {
+                Self::PolicyRuleUser(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomAvatar(c) => {
+                Self::RoomAvatar(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomCanonicalAlias(c) => {
+                Self::RoomCanonicalAlias(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomCreate(c) => {
+                Self::RoomCreate(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomEncryption(c) => {
+                Self::RoomEncryption(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomGuestAccess(c) => {
+                Self::RoomGuestAccess(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomHistoryVisibility(c) => Self::RoomHistoryVisibility(
+                StateEventContentChange::Redacted(c.clone().redact(rules)),
+            ),
+            Self::RoomJoinRules(c) => {
+                Self::RoomJoinRules(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomName(c) => {
+                Self::RoomName(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomPinnedEvents(c) => {
+                Self::RoomPinnedEvents(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomPowerLevels(c) => {
+                Self::RoomPowerLevels(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomServerAcl(c) => {
+                Self::RoomServerAcl(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomThirdPartyInvite(c) => Self::RoomThirdPartyInvite(
+                StateEventContentChange::Redacted(c.clone().redact(rules)),
+            ),
+            Self::RoomTombstone(c) => {
+                Self::RoomTombstone(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::RoomTopic(c) => {
+                Self::RoomTopic(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::SpaceChild(c) => {
+                Self::SpaceChild(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::SpaceParent(c) => {
+                Self::SpaceParent(StateEventContentChange::Redacted(c.clone().redact(rules)))
+            }
+            Self::_Custom { event_type } => Self::_Custom { event_type: event_type.clone() },
+        }
+    }
+}
+
+/// A state event that doesn't have its own variant.
+#[derive(Clone, Debug)]
+pub struct OtherState {
+    pub(in crate::timeline) state_key: String,
+    pub(in crate::timeline) content: AnyOtherStateEventContentChange,
+}
+
+impl OtherState {
+    /// The state key of the event.
+    pub fn state_key(&self) -> &str {
+        &self.state_key
+    }
+
+    /// The content of the event.
+    pub fn content(&self) -> &AnyOtherStateEventContentChange {
+        &self.content
+    }
+
+    fn redact(&self, rules: &RedactionRules) -> Self {
+        Self { state_key: self.state_key.clone(), content: self.content.redact(rules) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use matrix_sdk_base::crypto::types::events::UtdCause;
+    use matrix_sdk_test::ALICE;
+    use ruma::{
+        assign,
+        events::{
+            StateEventContentChange,
+            room::member::{
+                MembershipState, PossiblyRedactedRoomMemberEventContent, RoomMemberEventContent,
+            },
+        },
+        room_version_rules::RedactionRules,
+    };
+    use strass::assert_let;
+
+    use super::{EncryptedMessage, MembershipChange, RoomMembershipChange, TimelineItemContent};
+
+    #[test]
+    fn utd_cause_only_available_for_megolm() {
+        let olm = EncryptedMessage::OlmV1Curve25519AesSha2 { sender_key: "key".to_owned() };
+        assert_eq!(olm.utd_cause(), None);
+        assert_eq!(EncryptedMessage::Unknown.utd_cause(), None);
+
+        let megolm = EncryptedMessage::MegolmV1AesSha2 {
+            sender_key: None,
+            device_id: None,
+            session_id: "session".to_owned(),
+            cause: UtdCause::SentBeforeWeJoined,
+        };
+        assert_eq!(megolm.utd_cause(), Some(UtdCause::SentBeforeWeJoined));
+    }
+
+    #[test]
+    fn redact_membership_change() {
+        let content = TimelineItemContent::MembershipChange(RoomMembershipChange {
+            user_id: ALICE.to_owned(),
+            content: StateEventContentChange::Original {
+                content: assign!(RoomMemberEventContent::new(MembershipState::Ban), {
+                    reason: Some("🤬".to_owned()),
+                }),
+                prev_content: Some(PossiblyRedactedRoomMemberEventContent::new(
+                    MembershipState::Join,
+                )),
+            },
+            change: Some(MembershipChange::Banned),
+        });
+
+        let redacted = content.redact(&RedactionRules::V11);
+        assert_let!(TimelineItemContent::MembershipChange(inner) = redacted);
+        assert_eq!(inner.change, Some(MembershipChange::Banned));
+        assert_let!(StateEventContentChange::Redacted(inner_content_redacted) = inner.content);
+        assert_eq!(inner_content_redacted.membership, MembershipState::Ban);
+    }
+}

@@ -1,0 +1,415 @@
+// A joined room's addresses: the aliases the account's homeserver keeps for
+// it and the addresses the room publishes (one main, alternatives). Rust
+// (room_addresses.rs) owns every value in RoomAddresses and every request;
+// this file lays them out and reports explicit choices. Every change opens a
+// review naming the exact address and room, and only Confirm sends it.
+// Adding and removing an address, and the published addresses, are separate
+// changes with their own outcomes. Addresses on another server are never
+// added or removed here, only published or unpublished.
+//
+// Keyboard: the search field leads. Up and Down select an address; the
+// actions below the list apply to it. Escape cancels a review, then clears
+// the search, then closes. Tab stays inside the panel.
+//
+// The panel is modal: its backdrop takes every pointer and wheel event that
+// the dialog does not.
+
+import { ListView, ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton } from "controls.slint";
+
+export struct RoomAddressEntry {
+    // A Matrix room alias, #localpart:server; never a URL. Sent back exactly
+    // with an action; `shown` is its plain-text label.
+    alias: string,
+    shown: string,
+    // Main or alternative, listed by the homeserver, and its server.
+    detail: string,
+    local: bool,
+    listed: bool,
+    main: bool,
+    alternative: bool,
+}
+
+export struct RoomAddressesPalette {
+    ink: color,
+    muted: color,
+    accent: color,
+    surface: color,
+    elevated: color,
+    hover: color,
+    divider: color,
+    error: color,
+    selection: color,
+    selection-ink: color,
+    has-selection-ink: bool,
+    focus: color,
+    scrim: color,
+}
+
+export global RoomAddresses {
+    in-out property <bool> open: false;
+    in-out property <string> room-name;
+    // The account's own homeserver: new addresses end in ":" + this.
+    in-out property <string> own-server;
+    in-out property <string> summary;
+    in-out property <[RoomAddressEntry]> rows;
+    in-out property <string> query;
+    in-out property <string> new-local;
+    // Fresh power levels: the published addresses may be changed.
+    in-out property <bool> can-publish: false;
+    // The stored published addresses use a schema Morpheus can edit.
+    in-out property <bool> publish-editable: false;
+    in-out property <bool> loading: false;
+    in-out property <bool> busy: false;
+    in-out property <string> error;
+    in-out property <string> notice;
+    // A pending receipt survives this view. Reading alone cannot settle an
+    // unanswered request. Writes stay paused; Read again remains usable.
+    in-out property <bool> unknown: false;
+    in-out property <string> uncertainty-note;
+    in-out property <bool> reviewing: false;
+    in-out property <string> review-title;
+    in-out property <[string]> review-lines;
+    in-out property <string> confirm-label;
+    // Raised by Rust when the panel closes, so its opener takes focus back.
+    in-out property <int> closed: 0;
+    // Room ID and name.
+    callback show(string, string);
+    callback filter(string);
+    // Review adding this local part on the own server.
+    callback add(string);
+    // Review a change of one address: 0 make main, 1 publish as an
+    // alternative, 2 unpublish the alternative, 3 unpublish the main
+    // address, 4 remove from the homeserver (room_addresses.rs ACTION_*).
+    callback act(string, int);
+    callback confirm();
+    callback cancel-review();
+    callback refresh();
+    callback close();
+    callback context-changed();
+}
+
+component AddressRow inherits Rectangle {
+    in property <RoomAddressEntry> entry;
+    in property <bool> current;
+    in property <float> text-scale: 1;
+    in property <RoomAddressesPalette> palette;
+    callback chosen();
+    property <bool> inked: root.current && root.palette.has-selection-ink;
+
+    background: root.current ? root.palette.selection : root.palette.elevated;
+    border-radius: StyleTokens.radius * 0.8;
+    accessible-role: list-item;
+    accessible-item-selected: root.current;
+    accessible-label: root.entry.shown + ", " + root.entry.detail;
+    TouchArea {
+        width: parent.width; height: parent.height;
+        clicked => { root.chosen(); }
+    }
+    VerticalLayout {
+        padding-left: 10px; padding-right: 10px; padding-top: 5px; padding-bottom: 5px;
+        spacing: 2px; alignment: center;
+        Text {
+            text: root.entry.shown;
+            color: root.inked ? root.palette.selection-ink : root.palette.ink;
+            font-size: 13px * root.text-scale; font-weight: 700; overflow: elide;
+        }
+        Text {
+            text: root.entry.detail;
+            color: root.inked ? root.palette.selection-ink : root.entry.main ? root.palette.accent : root.palette.muted;
+            font-size: 11px * root.text-scale; overflow: elide;
+        }
+    }
+}
+
+export component RoomAddressesPanel inherits FocusScope {
+    in property <float> text-scale: 1;
+    in property <ControlColors> button-colors;
+    in property <RoomAddressesPalette> palette;
+    property <int> current: 0;
+    property <length> row-height: 14px + 34px * root.text-scale;
+    property <length> row-gap: 4px;
+    property <int> count: RoomAddresses.rows.length;
+    property <bool> idle: !RoomAddresses.busy && !RoomAddresses.unknown && !RoomAddresses.reviewing && !RoomAddresses.loading;
+    property <bool> has-entry: root.current >= 0 && root.current < root.count;
+    // An index past the end reads as an empty entry, which enables nothing.
+    property <RoomAddressEntry> entry: RoomAddresses.rows[root.current];
+    property <bool> publishable: root.idle && root.has-entry && RoomAddresses.can-publish && RoomAddresses.publish-editable;
+
+    focus-on-tab-navigation: false;
+    init => { search-input.focus(); }
+    changed count => {
+        root.current = max(0, min(root.current, root.count - 1));
+    }
+    // A review takes the keyboard to its own Cancel; when it ends, the
+    // search field leads again.
+    property <bool> reviewing: RoomAddresses.reviewing;
+    changed reviewing => { if root.reviewing { body.content-y = 0px; } else { search-input.focus(); } }
+
+    function reveal() {
+        let top = root.current * (root.row-height + root.row-gap);
+        if top < -addresses-list.viewport-y {
+            addresses-list.viewport-y = -top;
+        } else if top + root.row-height > -addresses-list.viewport-y + addresses-list.visible-height {
+            addresses-list.viewport-y = -(top + root.row-height - addresses-list.visible-height);
+        }
+        body.reveal-row(addresses-list.absolute-position.y - body-content.absolute-position.y
+            + top + addresses-list.viewport-y, root.row-height);
+    }
+
+    capture-key-pressed(event) => {
+        if event.text == Key.Escape {
+            if RoomAddresses.busy {
+                RoomAddresses.close();
+            } else if RoomAddresses.reviewing {
+                RoomAddresses.cancel-review();
+            } else if RoomAddresses.query != "" {
+                RoomAddresses.query = "";
+                RoomAddresses.filter("");
+            } else {
+                RoomAddresses.close();
+            }
+            accept
+        } else if RoomAddresses.reviewing && (event.text == Key.PageDown || event.text == Key.PageUp
+            || event.text == Key.Home || event.text == Key.End) {
+            let step = max(1px, body.visible-height - 24px);
+            let bottom = min(0px, body.visible-height - body.content-height);
+            if event.text == Key.Home { body.content-y = 0px; }
+            else if event.text == Key.End { body.content-y = bottom; }
+            else if event.text == Key.PageDown { body.content-y = max(bottom, body.content-y - step); }
+            else { body.content-y = min(0px, body.content-y + step); }
+            accept
+        } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && close-button.has-focus {
+            done-button.focus();
+            accept
+        } else if event.text == Key.Tab && !event.modifiers.shift && done-button.has-focus {
+            close-button.focus();
+            accept
+        } else if search-input.has-focus && event.text == Key.DownArrow && root.count > 0 {
+            root.current = min(root.count - 1, root.current + 1);
+            root.reveal();
+            accept
+        } else if search-input.has-focus && event.text == Key.UpArrow && root.count > 0 {
+            root.current = max(0, root.current - 1);
+            root.reveal();
+            accept
+        } else { reject }
+    }
+
+    Rectangle {
+        background: root.palette.scrim;
+        // Clicks and the wheel stop here: nothing behind the panel moves.
+        TouchArea {
+            width: parent.width; height: parent.height;
+            scroll-event(event) => { accept }
+        }
+        Rectangle {
+            width: min(620px, parent.width - 40px);
+            height: min(680px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.palette.surface;
+            border-radius: StyleTokens.radius * 1.4;
+            border-color: root.palette.divider; border-width: StyleTokens.line-width;
+            accessible-role: groupbox;
+            accessible-label: "Addresses of " + RoomAddresses.room-name;
+            VerticalLayout {
+                padding: 18px; spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Addresses of " + RoomAddresses.room-name;
+                        color: root.palette.ink; font-size: 17px * root.text-scale; font-weight: 750;
+                        overflow: elide; horizontal-stretch: 1; min-width: 0px; vertical-alignment: center;
+                    }
+                    close-button := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Close";
+                        label: "Close the addresses of this room";
+                        activated => { RoomAddresses.close(); }
+                    }
+                }
+                body := ScrollView {
+                    min-height: 0px; vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    content-width: self.visible-width;
+                    function reveal-row(top: length, height: length) {
+                        if top < -self.content-y { self.content-y = -top; }
+                        else if top + height > -self.content-y + self.visible-height {
+                            self.content-y = -(top + height - self.visible-height);
+                        }
+                        self.content-y = max(min(0px, self.visible-height - self.content-height), min(0px, self.content-y));
+                    }
+                    body-content := VerticalLayout {
+                        width: body.visible-width; min-width: 0px;
+                        padding-right: 12px; spacing: 8px;
+                        if RoomAddresses.reviewing : VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: RoomAddresses.review-title; color: root.palette.ink;
+                                font-size: 13px * root.text-scale; font-weight: 700; wrap: word-wrap;
+                            }
+                            for line in RoomAddresses.review-lines : Text {
+                                text: line; color: root.palette.ink;
+                                font-size: 12px * root.text-scale; wrap: word-wrap;
+                            }
+                        }
+                if !RoomAddresses.reviewing : Text {
+                    text: RoomAddresses.loading ? "Reading this room's addresses…" : RoomAddresses.summary;
+                    color: root.palette.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if RoomAddresses.unknown : Text {
+                    text: RoomAddresses.uncertainty-note;
+                    color: root.palette.ink; font-size: 12px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if RoomAddresses.error != "" : Text {
+                    text: RoomAddresses.error;
+                    color: root.palette.error; font-size: 12px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                if RoomAddresses.notice != "" : Text {
+                    text: RoomAddresses.notice;
+                    color: root.palette.accent; font-size: 12px * root.text-scale; wrap: word-wrap;
+                    accessible-live-region: polite;
+                }
+                // Add an address on the account's own homeserver.
+                if !RoomAddresses.reviewing : HorizontalLayout {
+                    spacing: 6px;
+                    Text { text: "#"; color: root.palette.muted; font-size: 13px * root.text-scale; vertical-alignment: center; }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 34px * max(1, root.text-scale);
+                        background: root.palette.elevated;
+                        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                        border-width: StyleTokens.line-width;
+                        border-color: local-input.has-focus ? root.palette.focus : transparent;
+                        local-input := TextInput {
+                            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                            text <=> RoomAddresses.new-local;
+                            color: root.palette.ink;
+                            font-size: 12px * root.text-scale; vertical-alignment: center; single-line: true;
+                            enabled: root.idle;
+                            changed has-focus => { if self.has-focus { body.reveal-row(self.absolute-position.y - body-content.absolute-position.y, self.height); } }
+                            accessible-label: "Local part of a new address on " + RoomAddresses.own-server;
+                            accepted => { if root.idle && self.text != "" { RoomAddresses.add(self.text); } }
+                        }
+                    }
+                    Text { text: ":" + RoomAddresses.own-server; color: root.palette.muted; font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide; max-width: 180px * root.text-scale; }
+                    TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        changed has-focus => { if self.has-focus { body.reveal-row(self.absolute-position.y - body-content.absolute-position.y, self.height); } }
+                        text: "Add…";
+                        label: "Review adding this address on your homeserver";
+                        enabled: root.idle && RoomAddresses.new-local != "";
+                        activated => { RoomAddresses.add(RoomAddresses.new-local); }
+                    }
+                }
+                Rectangle {
+                    height: RoomAddresses.reviewing ? 0px : 34px * max(1, root.text-scale);
+                    visible: !RoomAddresses.reviewing;
+                    background: root.palette.elevated;
+                    border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                    border-width: StyleTokens.line-width;
+                    border-color: search-input.has-focus ? root.palette.focus : transparent;
+                    if RoomAddresses.query == "" : Text {
+                        x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                        text: "Search this room's addresses";
+                        color: root.palette.muted; font-size: 12px * root.text-scale; vertical-alignment: center;
+                    }
+                    search-input := TextInput {
+                        x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding;
+                        text <=> RoomAddresses.query;
+                        color: root.palette.ink;
+                        selection-background-color: root.palette.selection;
+                        selection-foreground-color: root.palette.has-selection-ink ? root.palette.selection-ink : root.palette.ink;
+                        font-size: 12px * root.text-scale; vertical-alignment: center; single-line: true;
+                        accessible-label: "Search this room's addresses; arrows select, Escape closes";
+                        changed has-focus => { if self.has-focus { body.reveal-row(self.absolute-position.y - body-content.absolute-position.y, self.height); } }
+                        edited => { root.current = 0; RoomAddresses.filter(self.text); }
+                    }
+                }
+                // Lazy: only the rows in view are instantiated. A review
+                // takes the list's room (its actions cannot run meanwhile).
+                addresses-list := ListView {
+                    height: RoomAddresses.reviewing ? 0px : min(220px, max(50px, root.count * (root.row-height + root.row-gap)));
+                    visible: !RoomAddresses.reviewing;
+                    horizontal-scrollbar-policy: always-off;
+                    accessible-role: AccessibleRole.list;
+                    accessible-label: "This room's addresses";
+                    for address[index] in RoomAddresses.rows : Rectangle {
+                        width: addresses-list.visible-width;
+                        height: root.row-height + root.row-gap;
+                        AddressRow {
+                            y: 0px; height: root.row-height;
+                            entry: address;
+                            current: index == root.current;
+                            text-scale: root.text-scale;
+                            palette: root.palette;
+                            chosen => { root.current = index; search-input.focus(); }
+                        }
+                    }
+                }
+                // The selected address's actions, each one opening a review.
+                if !RoomAddresses.reviewing : HorizontalLayout {
+                    spacing: 6px; alignment: end;
+                    TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        changed has-focus => { if self.has-focus { body.reveal-row(self.absolute-position.y - body-content.absolute-position.y, self.height); } }
+                        text: root.entry.main ? "Unpublish main…" : "Make main…";
+                        label: root.entry.main ? "Review unpublishing the main address " + root.entry.shown : "Review making " + root.entry.shown + " the main address";
+                        enabled: root.publishable;
+                        activated => { RoomAddresses.act(root.entry.alias, root.entry.main ? 3 : 0); }
+                    }
+                    TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        changed has-focus => { if self.has-focus { body.reveal-row(self.absolute-position.y - body-content.absolute-position.y, self.height); } }
+                        text: root.entry.alternative ? "Unpublish…" : "Publish…";
+                        label: root.entry.alternative ? "Review unpublishing " + root.entry.shown : "Review publishing " + root.entry.shown + " as an alternative address";
+                        enabled: root.publishable && !root.entry.main;
+                        activated => { RoomAddresses.act(root.entry.alias, root.entry.alternative ? 2 : 1); }
+                    }
+                    TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        changed has-focus => { if self.has-focus { body.reveal-row(self.absolute-position.y - body-content.absolute-position.y, self.height); } }
+                        text: "Remove…";
+                        label: "Review removing " + root.entry.shown + " from your homeserver";
+                        enabled: root.idle && root.has-entry && root.entry.local && root.entry.listed;
+                        activated => { RoomAddresses.act(root.entry.alias, 4); }
+                    }
+                }
+                    }
+                }
+                if RoomAddresses.reviewing : HorizontalLayout {
+                    spacing: 8px; alignment: end;
+                    cancel-review := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: RoomAddresses.busy ? "Close" : "Cancel";
+                        label: RoomAddresses.busy ? "Close and withdraw this address change" : "Cancel this change";
+                        init => { self.focus(); }
+                        activated => {
+                            if RoomAddresses.busy { RoomAddresses.close(); }
+                            else { RoomAddresses.cancel-review(); }
+                        }
+                    }
+                    TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        primary: true; text: RoomAddresses.busy ? "Saving…" : RoomAddresses.confirm-label;
+                        label: RoomAddresses.confirm-label + ": " + RoomAddresses.review-title;
+                        enabled: !RoomAddresses.busy && !RoomAddresses.unknown;
+                        activated => { RoomAddresses.confirm(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px; alignment: end;
+                    TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Read again";
+                        label: "Read this room's addresses again";
+                        enabled: !RoomAddresses.busy && !RoomAddresses.loading && !RoomAddresses.reviewing;
+                        activated => { RoomAddresses.refresh(); }
+                    }
+                    done-button := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                        text: "Done";
+                        label: "Done with the addresses of this room";
+                        activated => { RoomAddresses.close(); }
+                    }
+                }
+            }
+        }
+    }
+}

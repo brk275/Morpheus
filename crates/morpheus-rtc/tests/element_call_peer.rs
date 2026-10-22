@@ -1,5 +1,5 @@
 //! Opt-in MatrixRTC interop check with a real Element Call browser peer.
-//! `scripts/element_call_peer.mjs` controls the other side. No public service
+//! `scripts/element_call_stock_peer.mjs` controls the stock other side. No public service
 //! or hardware media device is involved.
 
 #![cfg(feature = "native-rtc")]
@@ -10,7 +10,8 @@ use futures_util::StreamExt;
 use matrix_sdk::{Client, ruma::api::client::uiaa};
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
 use morpheus_rtc::{
-    CallOptions, I420Buffer, InteropMode, MediaStreamKind, RtcService, VideoFrame, VideoRotation,
+    AudioFrame, CallOptions, I420Buffer, InteropMode, MediaStreamKind, Publication, RtcService,
+    VideoFrame, VideoRotation,
 };
 use serde::Deserialize;
 use tokio::time::{sleep, timeout};
@@ -63,6 +64,78 @@ fn native_video_frame(index: u32) -> VideoFrame {
         },
         rotation: VideoRotation::Deg0,
         timestamp_us: i64::from(index) * 66_667,
+    }
+}
+
+// The browser's real fake-capture microphone is 440 Hz. Only the native
+// microphone publication below supplies this distinct, phase-continuous tone.
+fn native_audio_frame(index: u32) -> AudioFrame {
+    AudioFrame {
+        data: (0..480)
+            .map(|sample| {
+                let position = u64::from(index) * 480 + sample;
+                let phase = std::f64::consts::TAU * 997.0 * position as f64 / 48_000.0;
+                (8_000.0 * phase.sin()) as i16
+            })
+            .collect(),
+        sample_rate: 48_000,
+        num_channels: 1,
+        samples_per_channel: 480,
+    }
+}
+
+// Own the task even if an existing roster/media assertion panics. Aborting
+// drops Publication (which mutes synchronously); process/namespace cleanup is
+// the outer failure boundary. A successful test also awaits and unpublishes.
+struct NativeTone {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    sender: tokio::task::JoinHandle<Publication>,
+}
+
+impl NativeTone {
+    fn start(publication: Publication) -> Self {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let sender = tokio::spawn(async move {
+            for index in 0..36_000 {
+                tokio::select! {
+                    _ = &mut stopped => return publication,
+                    result = publication.push_audio(native_audio_frame(index)) => {
+                        result.expect("Native interop microphone send failed");
+                    },
+                }
+                tokio::select! {
+                    _ = &mut stopped => return publication,
+                    _ = sleep(Duration::from_millis(10)) => {},
+                }
+            }
+            publication
+        });
+        Self {
+            stop: Some(stop),
+            sender,
+        }
+    }
+
+    async fn finish(mut self) {
+        self.stop
+            .take()
+            .expect("Native interop microphone stop missing")
+            .send(())
+            .expect("Native interop microphone stopped early");
+        let publication = timeout(Duration::from_secs(5), &mut self.sender)
+            .await
+            .expect("Native interop microphone stop timed out")
+            .expect("Native interop microphone sender panicked");
+        timeout(Duration::from_secs(5), publication.unpublish())
+            .await
+            .expect("Native interop microphone unpublish timed out")
+            .expect("Cannot unpublish native interop microphone");
+    }
+}
+
+impl Drop for NativeTone {
+    fn drop(&mut self) {
+        self.sender.abort();
     }
 }
 
@@ -303,6 +376,31 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
         .join(room_id, options)
         .await
         .expect("Morpheus cannot join Element Call-compatible slot");
+    let outgoing_audio = if let Some(root) = &stock_root {
+        let publication = rtc
+            .publish_microphone(room_id, 48_000, 1, false)
+            .await
+            .expect("Cannot publish native interop microphone");
+        assert_eq!(publication.call_info(), &call);
+        assert_eq!(publication.account_user_id(), alice.user_id);
+        // Private, exclusive marker from the actual publication's lease. The
+        // browser must match this exact join/device/backend identity, not a
+        // display name, DOM tag, or another device of the same Matrix user.
+        write_marker(
+            root.join("native-audio-owner.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "room_id": call.room_id,
+                "user_id": publication.account_user_id(),
+                "device_id": publication.account_device_id(),
+                "member_id": call.membership_id,
+                "identity": call.local_identity,
+            }))
+            .expect("Cannot encode native microphone owner"),
+        );
+        Some(NativeTone::start(publication))
+    } else {
+        None
+    };
     let outgoing_video = if stock_root.is_some() {
         let publication = rtc
             .publish_camera(room_id, 640, 360, false)
@@ -430,6 +528,9 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
     .await
     .expect("Element Call departure never reached Morpheus roster");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_departure=true");
+    if let Some(tone) = outgoing_audio {
+        tone.finish().await;
+    }
     if let Some((stop, sender)) = outgoing_video {
         stop.send(()).expect("Native interop camera stopped early");
         sender

@@ -177,11 +177,16 @@ jobs:
         with:
           # Preserve compiled dependencies when a later acceptance check fails.
           # The save guard still makes untrusted/PR executions restore-only.
+          # Older SDK extractions lack the verified downloader's receipt.
+          # The key separates both primary and fallback cache namespaces.
+          key: verified-sdk-archives-v1
           cache-on-failure: true
           save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
+      - name: Check native interface compilation before desktop dependencies
+        run: cargo check --locked -p morpheus-ui-check
       - name: Test configuration, Matrix, and RTC protocol models
         id: model-tests
         # Still fail the job below, but collect independent desktop/device
@@ -243,6 +248,8 @@ jobs:
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in-large.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-sidebar.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-space-labels.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery-thread-large.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
           if-no-files-found: error
           retention-days: 1
@@ -261,6 +268,10 @@ jobs:
           fi
       - name: Test desktop controller and call guards
         id: desktop-tests
+        # ElementHandle queries need compiler-generated element metadata even
+        # when Rust debug symbols are disabled for the hosted test build.
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
         # The independently built app can still exercise disposable fixtures
         # after a unit assertion fails. Keep that evidence and reject the
         # candidate at the final gate instead of rebuilding just to reach it.
@@ -298,6 +309,7 @@ jobs:
           cargo test --locked -p matrix-rtc-livekit --lib
           cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
           cargo test --locked -p cargo-packager-updater --lib
+          cargo test --locked -p webrtc-sys-build --lib
       - name: Test pinned SDK sticky receipt and redaction regressions
         id: sdk-receipt-tests
         # Keep collecting the independently built app's live acceptance. The

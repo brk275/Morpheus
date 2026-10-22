@@ -1,0 +1,1475 @@
+// Copyright 2023 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for that specific language governing permissions and
+// limitations under the License.
+
+use std::{
+    collections::BTreeMap,
+    ops::Deref,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use futures_util::{StreamExt as _, pin_mut};
+use itertools::Itertools;
+use matrix_sdk::{
+    Client, ClientBuildError, SlidingSyncList, SlidingSyncMode,
+    room::{PushContext, Room},
+};
+use matrix_sdk_base::{RoomState, StoreError, deserialized_responses::TimelineEvent};
+use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timeout::timeout};
+use ruma::{
+    EventId, OwnedEventId, OwnedRoomId, RoomId, UserId,
+    api::client::sync::sync_events::v5 as http,
+    assign,
+    events::{
+        AnyMessageLikeEventContent, AnyStateEvent, AnyStateEventContentChange,
+        AnySyncMessageLikeEvent, AnySyncTimelineEvent, StateEventContentChange, StateEventType,
+        TimelineEventType,
+        room::{
+            encrypted::OriginalSyncRoomEncryptedEvent,
+            join_rules::JoinRule,
+            member::{MembershipState, StrippedRoomMemberEvent},
+            message::{Relation, SyncRoomMessageEvent},
+        },
+    },
+    html::RemoveReplyFallback,
+    push::Action,
+    serde::Raw,
+    time::Instant,
+    uint,
+};
+use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::{debug, info, instrument, trace, warn};
+
+use crate::{
+    DEFAULT_SANITIZER_MODE,
+    encryption_sync_service::{EncryptionSyncPermit, EncryptionSyncService},
+    sync_service::SyncService,
+};
+
+/// What kind of process setup do we have for this notification client?
+#[derive(Clone)]
+pub enum NotificationProcessSetup {
+    /// The notification client may run on a separate process than the rest of
+    /// the app.
+    ///
+    /// For instance, this is the case on iOS, where notifications are handled
+    /// in a separate process (the Notification Service Extension, aka NSE).
+    ///
+    /// In that case, a cross-process lock will be used to coordinate writes
+    /// into the stores handled by the SDK.
+    MultipleProcesses,
+
+    /// The notification client runs in the same process as the rest of the
+    /// `Client` performing syncs.
+    ///
+    /// For instance, this is the case on Android, where a notification will
+    /// wake up the main app process.
+    ///
+    /// In that case, a smart reference to the [`SyncService`] must be provided.
+    SingleProcess { sync_service: Arc<SyncService> },
+}
+
+/// Timeouts applied by a [`NotificationClient`] while fetching the content of
+/// notifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotificationClientTimeouts {
+    /// Long-poll timeout of the sliding sync request retrieving the notified
+    /// events, i.e. how long the homeserver waits for the events to be
+    /// available before answering.
+    pub sync_poll_timeout: Duration,
+
+    /// Extra time allowed for the network round trip of the sliding sync
+    /// request retrieving the notified events, on top of
+    /// [`Self::sync_poll_timeout`].
+    pub sync_network_timeout: Duration,
+
+    /// Maximum time spent waiting for a missing room key, when an event in a
+    /// notification can't be decrypted.
+    ///
+    /// This applies to both ways of obtaining the key, so that they give up
+    /// after the same amount of time:
+    ///
+    /// - When the notification client runs the encryption sync itself, this
+    ///   bounds the time spent running it, once a minimum number of iterations
+    ///   (currently two) have been run. Decryption is attempted after each
+    ///   iteration, so this only bounds the unsuccessful case: once the
+    ///   deadline has passed, no new iteration is started.
+    /// - In a [`NotificationProcessSetup::SingleProcess`] setup where the main
+    ///   encryption sync is already running, the notification client must not
+    ///   run a second one and waits for the running one to receive the key
+    ///   instead. The wait ends as soon as a key for the room is received, so
+    ///   this only bounds the case where the key doesn't arrive.
+    ///
+    /// In both cases, the event is returned undecrypted once the deadline has
+    /// passed.
+    pub decryption_deadline: Duration,
+
+    /// Long-poll timeout of each request of the encryption sync run to obtain a
+    /// missing room key, i.e. how long the homeserver waits for a to-device
+    /// message to arrive before answering.
+    ///
+    /// Only applies when the notification client runs the encryption sync
+    /// itself. Together with [`Self::decryption_deadline`], this determines how
+    /// many iterations are run when the homeserver has nothing to return.
+    pub encryption_sync_poll_timeout: Duration,
+
+    /// Extra time allowed for the network round trip of each request of the
+    /// encryption sync, on top of [`Self::encryption_sync_poll_timeout`]. This
+    /// is an upper bound on how long a request may take.
+    pub encryption_sync_network_timeout: Duration,
+}
+
+impl Default for NotificationClientTimeouts {
+    /// Conservative defaults, kept small since a push handler might be short on
+    /// time.
+    fn default() -> Self {
+        let decryption_deadline = Duration::from_secs(6);
+
+        Self {
+            sync_poll_timeout: Duration::from_secs(1),
+            sync_network_timeout: Duration::from_secs(3),
+            decryption_deadline,
+            // Set so that the minimum number of encryption sync iterations,
+            // when the homeserver has nothing to return, use up the whole
+            // deadline and no further iteration is started.
+            encryption_sync_poll_timeout: decryption_deadline
+                / NotificationClient::MIN_DECRYPTION_ITERATIONS as u32,
+            encryption_sync_network_timeout: Duration::from_secs(4),
+        }
+    }
+}
+
+/// A client specialized for handling push notifications received over the
+/// network, for an app.
+///
+/// In particular, it takes care of running a full decryption sync, in case the
+/// event in the notification was impossible to decrypt beforehand.
+pub struct NotificationClient {
+    /// SDK client that uses an in-memory state store.
+    client: Client,
+
+    /// SDK client that uses the same state store as the caller's context.
+    parent_client: Client,
+
+    /// Is the notification client running on its own process or not?
+    process_setup: NotificationProcessSetup,
+
+    /// A mutex to serialize requests to the notifications sliding sync.
+    ///
+    /// If several notifications come in at the same time (e.g. network was
+    /// unreachable because of airplane mode or something similar), then we need
+    /// to make sure that repeated calls to `get_notification` won't cause
+    /// multiple requests with the same `conn_id` we're using for notifications.
+    /// This mutex solves this by sequentializing the requests.
+    notification_sync_mutex: AsyncMutex<()>,
+
+    /// A mutex to serialize requests to the encryption sliding sync that's used
+    /// in case we didn't have the keys to decipher an event.
+    ///
+    /// Same reasoning as [`Self::notification_sync_mutex`].
+    encryption_sync_mutex: AsyncMutex<()>,
+
+    /// Timeouts applied while fetching notifications. See
+    /// [`Self::with_timeouts`].
+    timeouts: NotificationClientTimeouts,
+}
+
+impl NotificationClient {
+    const CONNECTION_ID: &'static str = "notifications";
+    const LOCK_ID: &'static str = "notifications";
+
+    /// Minimum number of encryption sync iterations to run when an event in a
+    /// notification can't be decrypted, before
+    /// [`NotificationClientTimeouts::decryption_deadline`] is considered.
+    ///
+    /// The first iteration sends the e2ee requests and receives pending
+    /// to-device messages; the second lets the homeserver forward what those
+    /// requests triggered.
+    const MIN_DECRYPTION_ITERATIONS: usize = 2;
+
+    /// Create a new notification client.
+    pub async fn new(
+        parent_client: Client,
+        process_setup: NotificationProcessSetup,
+    ) -> Result<Self, Error> {
+        // Only create the lock id if cross process lock is needed (multiple
+        // processes)
+        let cross_process_store_config = match process_setup {
+            NotificationProcessSetup::MultipleProcesses => {
+                CrossProcessLockConfig::multi_process(Self::LOCK_ID)
+            }
+            NotificationProcessSetup::SingleProcess { .. } => CrossProcessLockConfig::SingleProcess,
+        };
+        let client = parent_client.notification_client(cross_process_store_config).await?;
+
+        Ok(NotificationClient {
+            client,
+            parent_client,
+            notification_sync_mutex: AsyncMutex::new(()),
+            encryption_sync_mutex: AsyncMutex::new(()),
+            process_setup,
+            timeouts: NotificationClientTimeouts::default(),
+        })
+    }
+
+    /// Overrides the timeouts applied while fetching notifications.
+    pub fn with_timeouts(mut self, timeouts: NotificationClientTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    /// Returns the timeouts applied while fetching notifications.
+    pub fn timeouts(&self) -> &NotificationClientTimeouts {
+        &self.timeouts
+    }
+
+    /// Fetches a room by its ID using the in-memory state store backed client.
+    /// Useful to retrieve room information after running the limited
+    /// notification client sliding sync loop.
+    pub fn get_room(&self, room_id: &RoomId) -> Option<Room> {
+        self.client.get_room(room_id)
+    }
+
+    /// Fetches the content of a notification.
+    ///
+    /// This will first try to get the notification using a short-lived sliding
+    /// sync, and if the sliding-sync can't find the event, then it'll use a
+    /// `/context` query to find the event with associated member information.
+    ///
+    /// An error result means that we couldn't resolve the notification; in that
+    /// case, a dummy notification may be displayed instead.
+    #[instrument(skip(self))]
+    pub async fn get_notification(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<NotificationStatus, Error> {
+        let status = self.get_notification_with_sliding_sync(room_id, event_id).await?;
+        match status {
+            NotificationStatus::Event(..)
+            | NotificationStatus::EventFilteredOut
+            | NotificationStatus::EventRedacted => Ok(status),
+            NotificationStatus::EventNotFound => {
+                self.get_notification_with_context(room_id, event_id).await
+            }
+        }
+    }
+
+    /// Fetches the content of several notifications.
+    ///
+    /// This will first try to get the notifications using a short-lived sliding
+    /// sync, and if the sliding-sync can't find the events, then it'll use a
+    /// `/context` query to find the events with associated member information.
+    ///
+    /// An error result at the top level means that something failed when trying
+    /// to set up the notification fetching.
+    ///
+    /// For each notification item you can also receive an error, which means
+    /// something failed when trying to fetch that particular notification
+    /// (decryption, fetching push actions, etc.); in that case, a dummy
+    /// notification may be displayed instead.
+    pub async fn get_notifications(
+        &self,
+        requests: &[NotificationItemsRequest],
+    ) -> Result<BatchNotificationFetchingResult, Error> {
+        let mut notifications = self.get_notifications_with_sliding_sync(requests).await?;
+
+        for request in requests {
+            for event_id in &request.event_ids {
+                match notifications.get_mut(event_id) {
+                    // If the notification for a given event wasn't found with
+                    // sliding sync, try with a /context for each event.
+                    Some(Ok(NotificationStatus::EventNotFound)) | None => {
+                        notifications.insert(
+                            event_id.to_owned(),
+                            self.get_notification_with_context(&request.room_id, event_id).await,
+                        );
+                    }
+
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(notifications)
+    }
+
+    /// Run an encryption sync loop, in case an event is still encrypted.
+    ///
+    /// Will return `Ok(Some)` if and only if:
+    ///
+    /// - the event was encrypted,
+    /// - we successfully ran an encryption sync or waited long enough for an
+    ///   existing encryption sync to decrypt the event.
+    ///
+    /// Otherwise, if the event was not encrypted, or couldn't be decrypted
+    /// (without causing a fatal error), will return `Ok(None)`.
+    #[instrument(skip_all)]
+    async fn retry_decryption(
+        &self,
+        room: &Room,
+        raw_event: &Raw<AnySyncTimelineEvent>,
+    ) -> Result<Option<TimelineEvent>, Error> {
+        let event: AnySyncTimelineEvent =
+            raw_event.deserialize().map_err(|_| Error::InvalidRumaEvent)?;
+
+        if !is_event_encrypted(event.event_type()) {
+            return Ok(None);
+        }
+
+        // Serialize calls to this function.
+        let _guard = self.encryption_sync_mutex.lock().await;
+
+        let push_ctx = room.push_context().await?;
+
+        let sync_permit_guard = match &self.process_setup {
+            NotificationProcessSetup::MultipleProcesses => {
+                // We're running on our own process, dedicated for
+                // notifications. In that case, create a dummy sync permit;
+                // we're guaranteed there's at most one since we've acquired the
+                // `encryption_sync_mutex' lock here.
+                let sync_permit = Arc::new(AsyncMutex::new(EncryptionSyncPermit::new()));
+                sync_permit.lock_owned().await
+            }
+
+            NotificationProcessSetup::SingleProcess { sync_service } => {
+                if let Some(permit_guard) = sync_service.try_get_encryption_sync_permit() {
+                    permit_guard
+                } else {
+                    // There's already a sync service active, thus the
+                    // encryption sync is already running elsewhere, and we must
+                    // not run a second one. As a matter of fact, if the event
+                    // was encrypted, that means we were racing against the
+                    // encryption sync: wait for it to receive the room key,
+                    // then decrypt.
+                    debug!("Encryption sync running in background, waiting for the room key");
+                    return self.wait_for_room_key(room, raw_event, push_ctx.as_ref()).await;
+                }
+            }
+        };
+
+        // Run an `EncryptionSync` loop, trying to decrypt the event after each
+        // iteration. The first one fetches SS events and sends e2ee requests;
+        // the rest let the homeserver forward events those requests triggered.
+        //
+        // Stop once the event is decrypted, or once the minimum number of
+        // iterations has run and the deadline has passed.
+
+        let encryption_sync = match EncryptionSyncService::new(
+            self.client.clone(),
+            Some((
+                self.timeouts.encryption_sync_poll_timeout,
+                self.timeouts.encryption_sync_network_timeout,
+            )),
+        )
+        .await
+        {
+            Ok(encryption_sync) => encryption_sync,
+            Err(err) => {
+                warn!("Encryption sync build error: {err:#}");
+                return Ok(None);
+            }
+        };
+
+        let deadline = Instant::now() + self.timeouts.decryption_deadline;
+        let iterations = encryption_sync.run_iterations(sync_permit_guard);
+        pin_mut!(iterations);
+
+        let mut num_iterations = 0;
+
+        loop {
+            let sync_ended = match iterations.next().await {
+                Some(Ok(())) => {
+                    num_iterations += 1;
+                    false
+                }
+
+                Some(Err(err)) => {
+                    // The room key might have been persisted before this error
+                    // was raised. Don't exit directly so that redrycption is
+                    // attempted one last time.
+                    warn!("Encryption sync error, attempting to decrypt one last time: {err:#}");
+                    true
+                }
+
+                None => {
+                    // The sync terminated, or the cross-process lock is held by
+                    // the main app, which may well have fetched the room key
+                    // itself in the meantime: attempt to decrypt one last time.
+                    trace!("Encryption sync ended, attempting to decrypt one last time");
+                    true
+                }
+            };
+
+            match try_decrypt(room, raw_event, push_ctx.as_ref()).await {
+                Ok(DecryptionAttempt::Decrypted(new_event)) => {
+                    trace!("Encryption sync managed to decrypt the event.");
+                    return Ok(Some(new_event));
+                }
+                Ok(DecryptionAttempt::MissingRoomKey) => {
+                    if sync_ended {
+                        debug!("Encryption sync ended and the room key is still missing.");
+                        return Ok(None);
+                    }
+                    if num_iterations >= Self::MIN_DECRYPTION_ITERATIONS
+                        && Instant::now() >= deadline
+                    {
+                        debug!("Deadline reached while waiting for the room key, giving up.");
+                        return Ok(None);
+                    }
+                    trace!("Still missing the room key, running another encryption sync iteration");
+                }
+                Ok(DecryptionAttempt::Unrecoverable) => return Ok(None),
+                Err(err) => {
+                    trace!("Encryption sync failed to decrypt the event: {err}");
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    /// Wait for the main encryption sync to receive the room key needed to
+    /// decrypt `raw_event`, then decrypt it.
+    ///
+    /// This is used in a [`NotificationProcessSetup::SingleProcess`] setup when
+    /// the encryption sync is already running, since the notification client
+    /// must not run a second one.
+    ///
+    /// Returns `Ok(None)` if no key for the room has been received within
+    /// [`NotificationClientTimeouts::decryption_deadline`], or if the event
+    /// can't be decrypted for another reason.
+    async fn wait_for_room_key(
+        &self,
+        room: &Room,
+        raw_event: &Raw<AnySyncTimelineEvent>,
+        push_ctx: Option<&PushContext>,
+    ) -> Result<Option<TimelineEvent>, Error> {
+        // Subscribe before the first decryption attempt, so that a key received
+        // in between can't be missed. The notification client shares its
+        // `OlmMachine` with the parent client, which the running encryption
+        // sync belongs to, so keys it receives are both reported here and
+        // usable by `try_decrypt` right away.
+        let Some(room_keys) = self.parent_client.encryption().room_keys_received_stream().await
+        else {
+            // No `OlmMachine`, hence no keys to wait for: a single attempt is
+            // all we can do.
+            return Ok(match try_decrypt(room, raw_event, push_ctx).await? {
+                DecryptionAttempt::Decrypted(event) => Some(event),
+                DecryptionAttempt::MissingRoomKey | DecryptionAttempt::Unrecoverable => None,
+            });
+        };
+        pin_mut!(room_keys);
+
+        let deadline = Instant::now() + self.timeouts.decryption_deadline;
+
+        loop {
+            match try_decrypt(room, raw_event, push_ctx).await? {
+                DecryptionAttempt::Decrypted(event) => {
+                    trace!("Waiting succeeded and event could be decrypted!");
+                    return Ok(Some(event));
+                }
+                DecryptionAttempt::Unrecoverable => return Ok(None),
+                DecryptionAttempt::MissingRoomKey => {}
+            }
+
+            // Wait for keys of this room to be received, then try again.
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    debug!("Timeout waiting for the encryption sync to receive the room key.");
+                    return Ok(None);
+                }
+
+                match timeout(room_keys.next(), remaining).await {
+                    Ok(Some(Ok(keys))) => {
+                        if keys.iter().any(|key| &*key.room_id == room.room_id()) {
+                            trace!("Received room keys for the room, retrying decryption");
+                            break;
+                        }
+                        // Keys for other rooms can't help, keep waiting.
+                    }
+                    Ok(Some(Err(_))) => {
+                        // The stream lagged behind, so we may have missed keys
+                        // for the room: retry to be on the safe side.
+                        break;
+                    }
+                    Ok(None) => {
+                        debug!("The room keys stream ended while waiting for the room key.");
+                        return Ok(None);
+                    }
+                    Err(_) => {
+                        debug!("Timeout waiting for the encryption sync to receive the room key.");
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try to run a sliding sync (without encryption) to retrieve the events
+    /// from the notification.
+    ///
+    /// An event can either be:
+    ///
+    /// - an invite event,
+    /// - or a non-invite event.
+    ///
+    /// In case it's a non-invite event, it's rather easy: we'll request
+    /// explicit state that'll be useful for building the `NotificationItem`,
+    /// and subscribe to the room which the notification relates to.
+    ///
+    /// In case it's an invite-event, it's trickier because the stripped event
+    /// may not contain the event id, so we can't just match on it. Rather, we
+    /// look at stripped room member events that may be fitting (i.e. match the
+    /// current user and are invites), and if the SDK concludes the room was in
+    /// the invited state, and we didn't find the event by id, _then_ we'll use
+    /// that stripped room member event.
+    #[instrument(skip_all)]
+    async fn try_sliding_sync(
+        &self,
+        requests: &[NotificationItemsRequest],
+    ) -> Result<BTreeMap<OwnedEventId, (OwnedRoomId, Option<RawNotificationEvent>)>, Error> {
+        const MAX_SLIDING_SYNC_ATTEMPTS: u64 = 3;
+        // Serialize all the calls to this method by taking a lock at the
+        // beginning, that will be dropped later.
+        let _guard = self.notification_sync_mutex.lock().await;
+
+        // Set up a sliding sync that only subscribes to the room that had the
+        // notification, so we can figure out the full event and associated
+        // information.
+
+        let raw_notifications = Arc::new(Mutex::new(BTreeMap::new()));
+        let handler_raw_notification = raw_notifications.clone();
+
+        let raw_invites = Arc::new(Mutex::new(BTreeMap::new()));
+        let handler_raw_invites = raw_invites.clone();
+
+        let user_id = self.client.user_id().unwrap().to_owned();
+        let room_ids = requests.iter().map(|req| req.room_id.clone()).collect::<Vec<_>>();
+
+        let requests = Arc::new(requests.iter().map(|req| (*req).clone()).collect::<Vec<_>>());
+
+        let timeline_event_handler = self.client.add_event_handler({
+            let requests = requests.clone();
+            move |raw: Raw<AnySyncTimelineEvent>| async move {
+                match &raw.get_field::<OwnedEventId>("event_id") {
+                    Ok(Some(event_id)) => {
+                        let Some(request) =
+                            &requests.iter().find(|request| request.event_ids.contains(event_id))
+                        else {
+                            return;
+                        };
+
+                        let room_id = request.room_id.clone();
+
+                        // found it! There shouldn't be a previous event before,
+                        // but if there is, that should be ok to just replace
+                        // it.
+                        handler_raw_notification.lock().unwrap().insert(
+                            event_id.to_owned(),
+                            (room_id, Some(RawNotificationEvent::Timeline(raw))),
+                        );
+                    }
+                    Ok(None) => {
+                        warn!("a sync event had no event id");
+                    }
+                    Err(err) => {
+                        warn!("failed to deserialize sync event id: {err}");
+                    }
+                }
+            }
+        });
+
+        let handler_raw_notifications = raw_notifications.clone();
+        let stripped_member_handler = self.client.add_event_handler({
+            let requests = requests.clone();
+            let room_ids: Vec<_> = room_ids.clone();
+            move |raw: Raw<StrippedRoomMemberEvent>, room: Room| async move {
+                if !room_ids.contains(&room.room_id().to_owned()) {
+                    return;
+                }
+
+                let deserialized = match raw.deserialize() {
+                    Ok(d) => d,
+                    Err(err) => {
+                        warn!("failed to deserialize raw stripped room member event: {err}");
+                        return;
+                    }
+                };
+
+                trace!("received a stripped room member event");
+
+                // Try to match the event by event_id, as it's the most precise.
+                // In theory, we shouldn't receive it, so that's a first
+                // attempt.
+                match &raw.get_field::<OwnedEventId>("event_id") {
+                    Ok(Some(event_id)) => {
+                        let request =
+                            &requests.iter().find(|request| request.event_ids.contains(event_id));
+                        if request.is_none() {
+                            return;
+                        }
+                        let room_id = request.unwrap().room_id.clone();
+
+                        // found it! There shouldn't be a previous event before,
+                        // but if there is, that should be ok to just replace
+                        // it.
+                        handler_raw_notifications.lock().unwrap().insert(
+                            event_id.to_owned(),
+                            (room_id, Some(RawNotificationEvent::Invite(raw))),
+                        );
+                        return;
+                    }
+                    Ok(None) => {
+                        warn!("a room member event had no id");
+                    }
+                    Err(err) => {
+                        warn!("failed to deserialize room member event id: {err}");
+                    }
+                }
+
+                // Try to match the event by membership and state_key for the
+                // current user.
+                if deserialized.content.membership == MembershipState::Invite
+                    && deserialized.state_key == user_id
+                {
+                    trace!("found an invite event for the current user");
+                    // This could be it! There might be several of these
+                    // following each other, so assume it's the latest one (in
+                    // sync ordering), and override a previous one if present.
+                    handler_raw_invites
+                        .lock()
+                        .unwrap()
+                        .insert(deserialized.state_key, Some(RawNotificationEvent::Invite(raw)));
+                } else {
+                    trace!("not an invite event, or not for the current user");
+                }
+            }
+        });
+
+        // Room power levels are necessary to build the push context.
+        let required_state = vec![
+            (StateEventType::RoomEncryption, "".to_owned()),
+            (StateEventType::RoomMember, "$LAZY".to_owned()),
+            (StateEventType::RoomMember, "$ME".to_owned()),
+            (StateEventType::RoomCanonicalAlias, "".to_owned()),
+            (StateEventType::RoomName, "".to_owned()),
+            (StateEventType::RoomAvatar, "".to_owned()),
+            (StateEventType::RoomPowerLevels, "".to_owned()),
+            (StateEventType::RoomJoinRules, "".to_owned()),
+            (StateEventType::CallMember, "*".to_owned()),
+            (StateEventType::RoomCreate, "".to_owned()),
+            (StateEventType::MemberHints, "".to_owned()),
+        ];
+
+        let invites = SlidingSyncList::builder("invites")
+            .sync_mode(SlidingSyncMode::new_selective().add_range(0..=16))
+            .timeline_limit(8)
+            .required_state(required_state.clone())
+            .filters(Some(assign!(http::request::ListFilters::default(), {
+                is_invite: Some(true),
+            })));
+
+        let sync = self
+            .client
+            .sliding_sync(Self::CONNECTION_ID)?
+            .poll_timeout(self.timeouts.sync_poll_timeout)
+            .network_timeout(self.timeouts.sync_network_timeout)
+            .with_account_data_extension(
+                assign!(http::request::AccountData::default(), { enabled: Some(true) }),
+            )
+            .add_list(invites)
+            .build()
+            .await?;
+
+        sync.add_room_subscriptions(
+            &room_ids.iter().map(|id| id.deref()).collect::<Vec<&RoomId>>(),
+            Some(assign!(http::request::RoomSubscription::default(), {
+                required_state,
+                timeline_limit: uint!(16)
+            })),
+            true,
+        );
+
+        let mut remaining_attempts = MAX_SLIDING_SYNC_ATTEMPTS;
+
+        let stream = sync.sync();
+        pin_mut!(stream);
+
+        // Sum the expected event count for each room
+        let expected_event_count = requests.iter().map(|req| req.event_ids.len()).sum::<usize>();
+
+        loop {
+            if stream.next().await.is_none() {
+                // Sliding sync aborted early.
+                break;
+            }
+
+            let event_count = raw_notifications.lock().unwrap().len();
+            let invite_count = raw_invites.lock().unwrap().len();
+
+            let current_attempt = 1 + MAX_SLIDING_SYNC_ATTEMPTS - remaining_attempts;
+            trace!(
+                "Attempt #{current_attempt}: \
+                Found {event_count} notification(s), \
+                {invite_count} invite event(s), \
+                expected {expected_event_count} total",
+            );
+
+            // We can stop looking once we've received the expected number of
+            // events from the sync. Since we can receive only events or invites
+            // for rooms but not both, and we're not taking into account invites
+            // from not subscribed rooms, this check should be accurate.
+            if event_count + invite_count == expected_event_count {
+                // We got the events.
+                break;
+            }
+
+            remaining_attempts -= 1;
+            warn!("There are some missing notifications, remaining attempts: {remaining_attempts}");
+            if remaining_attempts == 0 {
+                // We're out of luck.
+                break;
+            }
+        }
+
+        self.client.remove_event_handler(stripped_member_handler);
+        self.client.remove_event_handler(timeline_event_handler);
+
+        let mut notifications = raw_notifications.clone().lock().unwrap().clone();
+        let mut missing_event_ids = Vec::new();
+
+        // Create the list of missing event ids after the syncs.
+        for request in requests.iter() {
+            for event_id in &request.event_ids {
+                if !notifications.contains_key(event_id) {
+                    missing_event_ids.push((request.room_id.to_owned(), event_id.to_owned()));
+                }
+            }
+        }
+
+        // Try checking if the missing notifications could be invites.
+        for (room_id, missing_event_id) in missing_event_ids {
+            trace!("we didn't have a non-invite event, looking for invited room now");
+            if let Some(room) = self.client.get_room(&room_id) {
+                if room.state() == RoomState::Invited {
+                    if let Some((_, stripped_event)) = raw_invites.lock().unwrap().pop_first() {
+                        notifications
+                            .insert(missing_event_id, (room_id.to_owned(), stripped_event));
+                    }
+                } else {
+                    debug!("the room isn't in the invited state");
+                }
+            } else {
+                warn!(%room_id, "unknown room, can't check for invite events");
+            }
+        }
+
+        let found = if notifications.len() == expected_event_count { "" } else { "not " };
+        trace!("all notification events have{found} been found");
+
+        Ok(notifications)
+    }
+
+    pub async fn get_notification_with_sliding_sync(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<NotificationStatus, Error> {
+        info!("fetching notification event with a sliding sync");
+
+        let request = NotificationItemsRequest {
+            room_id: room_id.to_owned(),
+            event_ids: vec![event_id.to_owned()],
+        };
+
+        let mut get_notifications_result =
+            self.get_notifications_with_sliding_sync(&[request]).await?;
+
+        get_notifications_result.remove(event_id).unwrap_or(Ok(NotificationStatus::EventNotFound))
+    }
+
+    /// Given a (decrypted or not) event, figure out whether it should be
+    /// filtered out for other client-side reasons (such as the sender being
+    /// ignored, for instance), and returns the corresponding
+    /// [`NotificationStatus`].
+    async fn compute_status(
+        &self,
+        room: &Room,
+        push_actions: Option<&[Action]>,
+        raw_event: RawNotificationEvent,
+        state_events: Vec<Raw<AnyStateEvent>>,
+    ) -> Result<NotificationStatus, Error> {
+        if let Some(actions) = push_actions
+            && !actions.iter().any(|a| a.should_notify())
+        {
+            // The event shouldn't notify: return early.
+            return Ok(NotificationStatus::EventFilteredOut);
+        }
+
+        let notification_item =
+            NotificationItem::new(room, raw_event, push_actions, state_events).await?;
+
+        if self.client.is_user_ignored(notification_item.event.sender()).await {
+            Ok(NotificationStatus::EventFilteredOut)
+        } else {
+            Ok(NotificationStatus::Event(Box::new(notification_item)))
+        }
+    }
+
+    /// Get a list of full notifications, given a room id and event ids.
+    ///
+    /// This will run a small sliding sync to retrieve the content of the
+    /// events, along with extra data to form a rich notification context.
+    pub async fn get_notifications_with_sliding_sync(
+        &self,
+        requests: &[NotificationItemsRequest],
+    ) -> Result<BatchNotificationFetchingResult, Error> {
+        let raw_events = self.try_sliding_sync(requests).await?;
+
+        let mut batch_result = BatchNotificationFetchingResult::new();
+
+        for (event_id, (room_id, raw_event)) in raw_events.into_iter() {
+            // At this point it should have been added by the sync, if it's not,
+            // give up.
+            let Some(room) = self.client.get_room(&room_id) else { return Err(Error::UnknownRoom) };
+
+            let Some(raw_event) = raw_event else {
+                // The event was not found, so we can't build a notification.
+                batch_result.insert(event_id, Ok(NotificationStatus::EventNotFound));
+                continue;
+            };
+
+            let (raw_event, push_actions) = match &raw_event {
+                RawNotificationEvent::Timeline(timeline_event) => {
+                    // Check if the event is redacted first
+                    let event_for_redaction_check: AnySyncTimelineEvent =
+                        match timeline_event.deserialize() {
+                            Ok(event) => event,
+                            Err(_) => {
+                                batch_result.insert(event_id, Err(Error::InvalidRumaEvent));
+                                continue;
+                            }
+                        };
+
+                    if is_event_redacted(&event_for_redaction_check) {
+                        batch_result.insert(event_id, Ok(NotificationStatus::EventRedacted));
+                        continue;
+                    }
+
+                    // Timeline events may be encrypted, so make sure they get
+                    // decrypted first.
+                    match self.retry_decryption(&room, timeline_event).await {
+                        Ok(Some(timeline_event)) => {
+                            let push_actions = timeline_event.push_actions().map(ToOwned::to_owned);
+                            (
+                                RawNotificationEvent::Timeline(timeline_event.into_raw()),
+                                push_actions,
+                            )
+                        }
+
+                        Ok(None) => {
+                            // The event was either not encrypted in the first
+                            // place, or we couldn't decrypt it after retrying.
+                            // Use the raw event as is.
+                            match room.event_push_actions(timeline_event).await {
+                                Ok(push_actions) => (raw_event.clone(), push_actions),
+                                Err(err) => {
+                                    // Could not get push actions.
+                                    batch_result.insert(event_id, Err(err.into()));
+                                    continue;
+                                }
+                            }
+                        }
+
+                        Err(err) => {
+                            batch_result.insert(event_id, Err(err));
+                            continue;
+                        }
+                    }
+                }
+
+                RawNotificationEvent::Invite(invite_event) => {
+                    // Invite events can't be encrypted, so they should be in
+                    // clear text.
+                    match room.event_push_actions(invite_event).await {
+                        Ok(push_actions) => {
+                            (RawNotificationEvent::Invite(invite_event.clone()), push_actions)
+                        }
+                        Err(err) => {
+                            batch_result.insert(event_id, Err(err.into()));
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let notification_status_result =
+                self.compute_status(&room, push_actions.as_deref(), raw_event, Vec::new()).await;
+
+            batch_result.insert(event_id, notification_status_result);
+        }
+
+        Ok(batch_result)
+    }
+
+    /// Retrieve a notification using a `/context` query.
+    ///
+    /// This is for clients that are already running other sliding syncs in the
+    /// same process, so that most of the contextual information for the
+    /// notification should already be there. In particular, the room containing
+    /// the event MUST be known (via a sliding sync for invites, or another
+    /// sliding sync).
+    ///
+    /// An error result means that we couldn't resolve the notification; in that
+    /// case, a dummy notification may be displayed instead. A `None` result
+    /// means the notification has been filtered out by the user's push rules.
+    pub async fn get_notification_with_context(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<NotificationStatus, Error> {
+        info!("fetching notification event with a /context query");
+
+        // See above comment.
+        let Some(room) = self.parent_client.get_room(room_id) else {
+            return Err(Error::UnknownRoom);
+        };
+
+        let response = room.event_with_context(event_id, true, uint!(0), None).await?;
+
+        let mut timeline_event = response.event.ok_or(Error::ContextMissingEvent)?;
+        let state_events = response.state;
+
+        // Check if the event is redacted
+        let event_for_redaction_check: AnySyncTimelineEvent =
+            timeline_event.raw().deserialize().map_err(|_| Error::InvalidRumaEvent)?;
+
+        if is_event_redacted(&event_for_redaction_check) {
+            return Ok(NotificationStatus::EventRedacted);
+        }
+
+        if let Some(decrypted_event) = self.retry_decryption(&room, timeline_event.raw()).await? {
+            timeline_event = decrypted_event;
+        }
+
+        let push_actions = timeline_event.push_actions().map(ToOwned::to_owned);
+
+        self.compute_status(
+            &room,
+            push_actions.as_deref(),
+            RawNotificationEvent::Timeline(timeline_event.into_raw()),
+            state_events,
+        )
+        .await
+    }
+}
+
+/// The outcome of an attempt at decrypting a notified event.
+enum DecryptionAttempt {
+    /// The event could be decrypted.
+    Decrypted(TimelineEvent),
+
+    /// The event could not be decrypted because the room key is missing; it may
+    /// still arrive.
+    MissingRoomKey,
+
+    /// The event could not be decrypted, and waiting longer is unlikely to
+    /// help.
+    Unrecoverable,
+}
+
+/// Attempt to decrypt an encrypted timeline event of `room`.
+async fn try_decrypt(
+    room: &Room,
+    raw_event: &Raw<AnySyncTimelineEvent>,
+    push_ctx: Option<&PushContext>,
+) -> Result<DecryptionAttempt, matrix_sdk::Error> {
+    // Note: We specify the cast type in case the
+    // `experimental-encrypted-state-events` feature is enabled, which provides
+    // multiple cast implementations.
+    let new_event = room
+        .decrypt_event(raw_event.cast_ref_unchecked::<OriginalSyncRoomEncryptedEvent>(), push_ctx)
+        .await?;
+
+    if let matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+        utd_info, ..
+    } = &new_event.kind
+    {
+        return Ok(if utd_info.reason.is_missing_room_key() {
+            DecryptionAttempt::MissingRoomKey
+        } else {
+            debug!(
+                "Event could not be decrypted, but waiting longer is unlikely to help: {:?}",
+                utd_info.reason
+            );
+            DecryptionAttempt::Unrecoverable
+        });
+    }
+
+    Ok(DecryptionAttempt::Decrypted(new_event))
+}
+
+fn is_event_encrypted(event_type: TimelineEventType) -> bool {
+    let is_still_encrypted = matches!(event_type, TimelineEventType::RoomEncrypted);
+
+    #[cfg(feature = "unstable-msc3956")]
+    let is_still_encrypted =
+        is_still_encrypted || matches!(event_type, ruma::events::TimelineEventType::Encrypted);
+
+    is_still_encrypted
+}
+
+fn is_event_redacted(event: &AnySyncTimelineEvent) -> bool {
+    // Check if the event is a message-like event but has no original content
+    // (i.e., redacted)
+    match event {
+        AnySyncTimelineEvent::MessageLike(msg) => msg.is_redacted(),
+        _ => false,
+    }
+}
+
+#[derive(Debug)]
+pub enum NotificationStatus {
+    /// The event has been found and was not filtered out.
+    Event(Box<NotificationItem>),
+    /// The event couldn't be found in the network queries used to find it.
+    EventNotFound,
+    /// The event has been filtered out, either because of the user's push
+    /// rules, or because the user which triggered it is ignored by the current
+    /// user.
+    EventFilteredOut,
+    /// The event has been redacted and has no meaningful content.
+    EventRedacted,
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationItemsRequest {
+    pub room_id: OwnedRoomId,
+    pub event_ids: Vec<OwnedEventId>,
+}
+
+type BatchNotificationFetchingResult = BTreeMap<OwnedEventId, Result<NotificationStatus, Error>>;
+
+/// The Notification event as it was fetched from remote for the given
+/// `event_id`, represented as Raw but decrypted, thus only whether it is an
+/// invite or regular Timeline event has been determined.
+#[derive(Debug, Clone)]
+pub enum RawNotificationEvent {
+    /// The raw event for a timeline event
+    Timeline(Raw<AnySyncTimelineEvent>),
+    /// The notification contains an invitation with the given
+    /// StrippedRoomMemberEvent (in raw here)
+    Invite(Raw<StrippedRoomMemberEvent>),
+}
+
+/// The deserialized Event as it was fetched from remote for the given
+/// `event_id` and after decryption (if possible).
+#[derive(Debug)]
+pub enum NotificationEvent {
+    /// The Notification was for a TimelineEvent
+    Timeline(Box<AnySyncTimelineEvent>),
+    /// The Notification is an invite with the given stripped room event data
+    Invite(Box<StrippedRoomMemberEvent>),
+}
+
+impl NotificationEvent {
+    pub fn sender(&self) -> &UserId {
+        match self {
+            NotificationEvent::Timeline(ev) => ev.sender(),
+            NotificationEvent::Invite(ev) => &ev.sender,
+        }
+    }
+
+    /// Returns the root event id of the thread the notification event is in, if
+    /// any.
+    fn thread_id(&self) -> Option<OwnedEventId> {
+        let NotificationEvent::Timeline(sync_timeline_event) = &self else {
+            return None;
+        };
+        let AnySyncTimelineEvent::MessageLike(event) = sync_timeline_event.as_ref() else {
+            return None;
+        };
+        let content = event.original_content()?;
+        match content {
+            AnyMessageLikeEventContent::RoomMessage(content) => match content.relates_to? {
+                Relation::Thread(thread) => Some(thread.event_id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+/// A notification with its full content.
+#[derive(Debug)]
+pub struct NotificationItem {
+    /// Underlying Ruma event.
+    pub event: NotificationEvent,
+
+    /// The raw of the underlying event.
+    pub raw_event: RawNotificationEvent,
+
+    /// Display name of the sender.
+    pub sender_display_name: Option<String>,
+    /// Avatar URL of the sender.
+    pub sender_avatar_url: Option<String>,
+    /// Is the sender's name ambiguous?
+    pub is_sender_name_ambiguous: bool,
+
+    /// Room computed display name.
+    pub room_computed_display_name: String,
+    /// Room avatar URL.
+    pub room_avatar_url: Option<String>,
+    /// Room canonical alias.
+    pub room_canonical_alias: Option<String>,
+    /// Room topic.
+    pub room_topic: Option<String>,
+    /// Room join rule.
+    ///
+    /// Set to `None` if the join rule for this room is not available.
+    pub room_join_rule: Option<JoinRule>,
+    /// Is this room encrypted?
+    pub is_room_encrypted: Option<bool>,
+    /// Is this room considered a direct message?
+    pub is_direct_message_room: bool,
+    /// Numbers of members who joined the room.
+    pub joined_members_count: u64,
+    /// Number of service members in the room.
+    pub service_members: Vec<String>,
+    pub active_service_members_count: u64,
+    /// Is the room a space?
+    pub is_space: bool,
+
+    /// Is it a noisy notification? (i.e. does any push action contain a sound
+    /// action)
+    ///
+    /// It is set if and only if the push actions could be determined.
+    pub is_noisy: Option<bool>,
+    pub has_mention: Option<bool>,
+    pub thread_id: Option<OwnedEventId>,
+
+    /// The push actions for this notification (notify, sound, highlight, etc.).
+    pub actions: Option<Vec<Action>>,
+
+    /// Whether the room this notification is from is a DM or not.
+    pub room_is_dm: bool,
+}
+
+impl NotificationItem {
+    async fn new(
+        room: &Room,
+        raw_event: RawNotificationEvent,
+        push_actions: Option<&[Action]>,
+        state_events: Vec<Raw<AnyStateEvent>>,
+    ) -> Result<Self, Error> {
+        let event = match &raw_event {
+            RawNotificationEvent::Timeline(raw_event) => {
+                let mut event = raw_event.deserialize().map_err(|_| Error::InvalidRumaEvent)?;
+                if let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                    SyncRoomMessageEvent::Original(ev),
+                )) = &mut event
+                {
+                    ev.content.sanitize(DEFAULT_SANITIZER_MODE, RemoveReplyFallback::Yes);
+                }
+                NotificationEvent::Timeline(Box::new(event))
+            }
+            RawNotificationEvent::Invite(raw_event) => NotificationEvent::Invite(Box::new(
+                raw_event.deserialize().map_err(|_| Error::InvalidRumaEvent)?,
+            )),
+        };
+
+        let sender = match room.state() {
+            RoomState::Invited => room.invite_details().await?.inviter,
+            _ => room.get_member_no_sync(event.sender()).await?,
+        };
+
+        let (mut sender_display_name, mut sender_avatar_url, is_sender_name_ambiguous) =
+            match &sender {
+                Some(sender) => (
+                    sender.display_name().map(|s| s.to_owned()),
+                    sender.avatar_url().map(|s| s.to_string()),
+                    sender.name_ambiguous(),
+                ),
+                None => (None, None, false),
+            };
+
+        if sender_display_name.is_none() || sender_avatar_url.is_none() {
+            let sender_id = event.sender();
+            for ev in state_events {
+                let ev = match ev.deserialize() {
+                    Ok(ev) => ev,
+                    Err(err) => {
+                        warn!("Failed to deserialize a state event: {err}");
+                        continue;
+                    }
+                };
+                if ev.sender() != sender_id {
+                    continue;
+                }
+                if let AnyStateEventContentChange::RoomMember(StateEventContentChange::Original {
+                    content,
+                    ..
+                }) = ev.content_change()
+                {
+                    if sender_display_name.is_none() {
+                        sender_display_name = content.displayname;
+                    }
+                    if sender_avatar_url.is_none() {
+                        sender_avatar_url = content.avatar_url.map(|url| url.to_string());
+                    }
+                }
+            }
+        }
+
+        let is_noisy = push_actions.map(|actions| actions.iter().any(|a| a.sound().is_some()));
+        let has_mention = push_actions.map(|actions| actions.iter().any(|a| a.is_highlight()));
+        let thread_id = event.thread_id().clone();
+        let service_members = room
+            .service_members()
+            .unwrap_or_default()
+            .iter()
+            .map(ToString::to_string)
+            .collect_vec();
+
+        let active_service_members_count =
+            room.update_active_service_members().await?.unwrap_or_default().len() as u64;
+
+        let item = NotificationItem {
+            event,
+            raw_event,
+            sender_display_name,
+            sender_avatar_url,
+            is_sender_name_ambiguous,
+            room_computed_display_name: room.display_name().await?.to_string(),
+            room_avatar_url: room.avatar_url().map(|s| s.to_string()),
+            room_canonical_alias: room.canonical_alias().map(|c| c.to_string()),
+            room_topic: room.topic(),
+            room_join_rule: room.join_rule(),
+            is_direct_message_room: room.is_direct().await?,
+            is_room_encrypted: room
+                .latest_encryption_state()
+                .await
+                .map(|state| state.is_encrypted())
+                .ok(),
+            joined_members_count: room.joined_members_count(),
+            service_members,
+            active_service_members_count,
+            is_space: room.is_space(),
+            is_noisy,
+            has_mention,
+            thread_id,
+            actions: push_actions.map(|actions| actions.to_vec()),
+            room_is_dm: room.compute_is_dm().await?,
+        };
+
+        Ok(item)
+    }
+
+    /// Returns whether this room is public or not, based on the join rule.
+    ///
+    /// Maybe return `None` if the join rule is not available.
+    pub fn is_public(&self) -> Option<bool> {
+        self.room_join_rule.as_ref().map(|rule| matches!(rule, JoinRule::Public))
+    }
+}
+
+/// An error for the [`NotificationClient`].
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error(transparent)]
+    BuildingLocalClient(ClientBuildError),
+
+    /// The room associated to this event wasn't found.
+    #[error("unknown room for a notification")]
+    UnknownRoom,
+
+    /// The Ruma event contained within this notification couldn't be parsed.
+    #[error("invalid ruma event")]
+    InvalidRumaEvent,
+
+    /// When calling `get_notification_with_sliding_sync`, the room was missing
+    /// in the response.
+    #[error("the sliding sync response doesn't include the target room")]
+    SlidingSyncEmptyRoom,
+
+    #[error("the event was missing in the `/context` query")]
+    ContextMissingEvent,
+
+    /// An error forwarded from the client.
+    #[error(transparent)]
+    SdkError(#[from] matrix_sdk::Error),
+
+    /// An error forwarded from the underlying state store.
+    #[error(transparent)]
+    StoreError(#[from] StoreError),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use matrix_sdk_test::{ALICE, async_test, event_factory::EventFactory};
+    use ruma::{
+        api::client::sync::sync_events::v5,
+        assign, event_id,
+        events::room::{member::MembershipState, message::RedactedRoomMessageEventContent},
+        owned_event_id, owned_room_id, room_id, user_id,
+    };
+    use strass::assert_let;
+
+    use crate::notification_client::{
+        NotificationClient, NotificationItem, NotificationItemsRequest, NotificationProcessSetup,
+        NotificationStatus, RawNotificationEvent,
+    };
+
+    #[async_test]
+    async fn test_notification_item_returns_thread_id() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+        let thread_root_event_id = event_id!("$root:b.c");
+        let message = EventFactory::new()
+            .room(room_id)
+            .sender(user_id!("@sender:b.c"))
+            .text_msg("Threaded")
+            .in_thread(thread_root_event_id, event_id!("$prev:b.c"))
+            .into_raw_sync();
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        let raw_notification_event = RawNotificationEvent::Timeline(message);
+        let notification_item =
+            NotificationItem::new(&room, raw_notification_event, None, Vec::new())
+                .await
+                .expect("Could not create notification item");
+
+        assert_let!(Some(thread_id) = notification_item.thread_id);
+        assert_eq!(thread_id, thread_root_event_id);
+    }
+
+    #[async_test]
+    async fn test_try_sliding_sync_ignores_invites_for_non_subscribed_rooms() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let user_id = client.user_id().unwrap();
+        let room_id = room_id!("!a:b.c");
+        let invite = EventFactory::new()
+            .room(room_id)
+            .member(user_id)
+            .membership(MembershipState::Invite)
+            .no_event_id()
+            .into_raw_sync_state();
+        let mut room = v5::response::Room::new();
+        room.invite_state = Some(vec![invite.cast_unchecked()]);
+        let rooms = BTreeMap::from_iter([(room_id.to_owned(), room)]);
+        server
+            .mock_sliding_sync()
+            .ok(assign!(v5::Response::new("1".to_owned()), {
+                rooms: rooms,
+            }))
+            .mount()
+            .await;
+
+        let notification_client =
+            NotificationClient::new(client.clone(), NotificationProcessSetup::MultipleProcesses)
+                .await
+                .expect("Could not create a notification client");
+
+        // Check we don't receive the invite for a different room, even if it
+        // was included in the sync response
+        let event_id = owned_event_id!("$a:b.c");
+        let result = notification_client
+            .try_sliding_sync(&[NotificationItemsRequest {
+                room_id: owned_room_id!("!other:b.c"),
+                event_ids: vec![event_id.clone()],
+            }])
+            .await
+            .expect("Could not run sliding sync");
+
+        assert!(result.is_empty());
+
+        // Now try fetching the invite for the previously ignored room
+        let result = notification_client
+            .try_sliding_sync(&[NotificationItemsRequest {
+                room_id: room_id.to_owned(),
+                event_ids: vec![event_id.clone()],
+            }])
+            .await
+            .expect("Could not run sliding sync");
+
+        // Check we did receive an event
+        assert!(!result.is_empty());
+
+        // Try to assert it's the same event (since we don't have an event id)
+        // We can check its room, sender and membership state
+        let (in_room_id, event) = &result[&event_id];
+        assert_eq!(room_id, in_room_id);
+        assert_let!(Some(RawNotificationEvent::Invite(raw_invite)) = event);
+
+        let invite = raw_invite.deserialize().expect("Could not deserialize invite event");
+        assert_eq!(invite.state_key, user_id.to_string());
+        assert_eq!(invite.content.membership, MembershipState::Invite);
+    }
+
+    #[async_test]
+    async fn test_redacted_event_returns_event_redacted_status() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+
+        // Create a redacted message event (no content)
+        let event_id = owned_event_id!("$redacted:b.c");
+        let redacted_event = EventFactory::new()
+            .room(room_id)
+            .sender(user_id!("@sender:b.c"))
+            .redacted(&ALICE, RedactedRoomMessageEventContent::new())
+            .event_id(&event_id)
+            .into_raw();
+        let mut room = v5::response::Room::new();
+        room.timeline = vec![redacted_event];
+
+        let mut rooms = BTreeMap::new();
+        rooms.insert(room_id.to_owned(), room);
+
+        server
+            .mock_sliding_sync()
+            .ok(assign!(v5::Response::new("1".to_owned()), {
+                rooms: rooms,
+            }))
+            .mount()
+            .await;
+
+        let notification_client =
+            NotificationClient::new(client.clone(), NotificationProcessSetup::MultipleProcesses)
+                .await
+                .expect("Could not create a notification client");
+
+        let result: NotificationStatus = notification_client
+            .get_notification_with_sliding_sync(room_id, &event_id)
+            .await
+            .expect("Could not get notification");
+
+        match result {
+            NotificationStatus::EventRedacted => {
+                // Success - redacted event was properly detected
+            }
+            other => panic!("Expected EventRedacted, got {:?}", other),
+        }
+    }
+}

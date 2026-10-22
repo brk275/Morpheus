@@ -1,0 +1,279 @@
+# Normalized BY HAND from upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd;
+# see MORPHEUS_PATCH.md. Every workspace-inherited entry is written out from
+# the upstream workspace Cargo.toml at the same revision (member features
+# added to workspace features; optional from the member; default-features
+# from the workspace). Internal crates become git dependencies at the pinned
+# revision so the root [patch] table redirects them. UNVERIFIED: no cargo
+# normalization or resolution has been run. The upstream manifest is kept as
+# Cargo.toml.orig.
+
+[package]
+authors = ["Damir Jelić <poljar@termina.org.uk>"]
+description = "A high level Matrix client-server library."
+edition = "2024"
+keywords = ["matrix", "chat", "messaging", "ruma", "nio"]
+license = "Apache-2.0"
+name = "matrix-sdk"
+repository = "https://github.com/matrix-org/matrix-rust-sdk"
+rust-version = "1.96"
+version = "0.19.1"
+include = [".cargo/mermaid.html", "**/*.rs", "**/*.md"]
+
+[package.metadata.docs.rs]
+features = ["docsrs"]
+rustdoc-args = ["--cfg", "docsrs", "--generate-link-to-definition"]
+
+[features]
+default = ["e2e-encryption", "automatic-room-key-forwarding", "sqlite", "rustls-aws-lc-rs"]
+testing = [
+    "matrix-sdk-sqlite?/testing",
+    "matrix-sdk-indexeddb?/testing",
+    "matrix-sdk-base/testing",
+    "wiremock",
+    "matrix-sdk-test",
+    "strass",
+]
+
+e2e-encryption = [
+    "matrix-sdk-base/e2e-encryption",
+    # activate crypto-store on sqlite if given
+    "matrix-sdk-sqlite?/crypto-store",
+    # activate on indexeddb if given
+    "matrix-sdk-indexeddb?/e2e-encryption",
+]
+js = [
+    "matrix-sdk-common/js",
+    "matrix-sdk-base/js",
+]
+
+sqlite = [
+    "dep:matrix-sdk-sqlite",
+    "matrix-sdk-sqlite?/state-store",
+    "matrix-sdk-sqlite?/event-cache-store",
+    "matrix-sdk-sqlite?/media-store",
+]
+bundled-sqlite = ["sqlite", "matrix-sdk-sqlite?/bundled"]
+indexeddb = [
+    "matrix-sdk-indexeddb/state-store",
+    "matrix-sdk-indexeddb/event-cache-store",
+    "matrix-sdk-indexeddb/media-store"
+]
+# If enabled, reqwest depends on and installs aws-lc-rs as the default crypto
+# provider for rustls
+rustls-aws-lc-rs = ["reqwest/rustls"]
+
+qrcode = ["e2e-encryption", "matrix-sdk-base/qrcode"]
+automatic-room-key-forwarding = ["e2e-encryption", "matrix-sdk-base/automatic-room-key-forwarding"]
+experimental-send-custom-to-device = ["e2e-encryption", "matrix-sdk-base/experimental-send-custom-to-device"]
+
+# Enable experimental support for encrypting state events; see
+# https://github.com/matrix-org/matrix-rust-sdk/issues/5397.
+experimental-encrypted-state-events = [
+    "e2e-encryption",
+    "matrix-sdk-base/experimental-encrypted-state-events",
+    "matrix-sdk-sqlite/experimental-encrypted-state-events",
+    "matrix-sdk-test?/experimental-encrypted-state-events",
+]
+
+experimental-push-secrets = [
+    "e2e-encryption",
+    "matrix-sdk-base/experimental-push-secrets",
+    "matrix-sdk-sqlite?/experimental-push-secrets",
+    "matrix-sdk-indexeddb?/experimental-push-secrets",
+    "ruma/unstable-msc4385",
+]
+
+markdown = ["ruma/markdown"]
+socks = ["reqwest/socks"]
+local-server = ["dep:axum", "dep:rand", "dep:tower"]
+sso-login = ["local-server"]
+# Enable methods that make calls to the federation API.
+federation-api = ["ruma/federation-api-c"]
+
+uniffi = ["dep:uniffi", "matrix-sdk-base/uniffi", "dep:matrix-sdk-ffi-macros"]
+
+experimental-widgets = ["dep:urlencoding", "dep:uuid", "experimental-send-custom-to-device"]
+
+docsrs = ["e2e-encryption", "sqlite", "indexeddb", "sso-login", "qrcode", "federation-api"]
+
+# Add support for inline media galleries via msgtypes
+unstable-msc4274 = ["ruma/unstable-msc4274", "matrix-sdk-base/unstable-msc4274"]
+
+# Add support for sticky events (MSC4354), delivered over sliding sync via the
+# MSC4480 extension.
+unstable-msc4354 = ["matrix-sdk-base/unstable-msc4354"]
+
+# Add support for user status profile fields (m.status, m.call).
+unstable-msc4426 = ["matrix-sdk-base/unstable-msc4426"]
+
+experimental-search = ["matrix-sdk-search"]
+
+experimental-element-recent-emojis = ["matrix-sdk-base/experimental-element-recent-emojis"]
+
+experimental-x509-identity-verification = ["e2e-encryption", "matrix-sdk-base/experimental-x509-identity-verification"]
+
+[dependencies]
+anyhow = { version = "1.0.104", default-features = false, optional = true }
+anymap2 = { version = "0.13.0", default-features = false }
+as_variant = { version = "1.3.0", default-features = false }
+async-stream = { version = "0.3.6", default-features = false }
+async-trait = { version = "0.1.92", default-features = false }
+axum = { version = "0.8.9", optional = true }
+bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+bytesize = { version = "2.7.0", default-features = false, features = ["std"] }
+cfg-if = { version = "1.0.4", default-features = false }
+event-listener = "5.4.2"
+eyeball = { version = "0.8.8", default-features = false, features = ["tracing"] }
+eyeball-im = { version = "0.9.1", default-features = false, features = ["tracing"] }
+eyre = { version = "0.6.14", optional = true }
+futures-core = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "async-await-macro"] }
+hex = "0.4.3"
+http = { version = "1.5.0", default-features = false }
+imbl = { version = "7.0.2", default-features = false, features = ["serde"] }
+indexmap = { version = "2.14.2", default-features = false }
+itertools = { version = "0.15.0", default-features = false, features = ["use_std"] }
+js_int = "0.2.2"
+language-tags = "0.3.2"
+matrix-sdk-base = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
+matrix-sdk-common = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
+matrix-sdk-ffi-macros = { version = "0.7.0", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", optional = true }
+matrix-sdk-indexeddb = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", default-features = false, optional = true }
+matrix-sdk-search = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", optional = true }
+matrix-sdk-sqlite = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", default-features = false, optional = true }
+matrix-sdk-test = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", optional = true }
+mime = { version = "0.3.17", default-features = false }
+mime2ext = "0.1.54"
+oauth2 = { version = "5.0.0", default-features = false, features = ["timing-resistant-secret-traits"] }
+oauth2-reqwest = { version = "0.1.0-alpha.3", default-features = false }
+percent-encoding = "2.3.2"
+pin-project-lite = { version = "0.2.17", default-features = false }
+rand = { version = "0.10.2", optional = true }
+ruma = { version = "0.17.0", features = [
+    "client-api-c",
+    "compat-unset-avatar",
+    "compat-upload-signatures",
+    "compat-arbitrary-length-ids",
+    "compat-tag-info",
+    "compat-encrypted-stickers",
+    "compat-lax-room-create-deser",
+    "compat-lax-room-topic-deser",
+    "unstable-msc1763",
+    "unstable-msc3230",
+    "unstable-msc3401",
+    "unstable-msc3417",
+    "unstable-msc3488",
+    "unstable-msc3489",
+    "unstable-msc4075",
+    "unstable-msc4140",
+    "unstable-msc4143",
+    "unstable-msc4171",
+    "unstable-msc4195",
+    "unstable-msc4278",
+    "unstable-msc4286",
+    "unstable-msc4306",
+    "unstable-msc4308",
+    "unstable-msc4310",
+    "unstable-msc4388",
+    "rand",
+    "unstable-msc2448",
+    "unstable-msc3930",
+    "unstable-msc3245-v1-compat",
+    "unstable-msc4108",
+    "unstable-msc4262",
+] }
+serde = { version = "1.0.229", default-features = false, features = ["std", "rc", "derive"] }
+serde_html_form = { version = "0.4.1", default-features = false }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+sha2 = "0.11.0"
+strass = { version = "0.2.0", optional = true }
+tempfile = { version = "3.27.0", default-features = false }
+thiserror = { version = "2.0.20", default-features = false }
+tokio-stream = { version = "0.1.19", default-features = false, features = ["sync"] }
+tokio-util = "0.7.19"
+tower = { version = "0.5.3", features = ["util"], optional = true }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+uniffi = { version = "0.32.1", default-features = false, features = ["cargo-metadata"], optional = true }
+url = { version = "2.5.8", default-features = false, features = ["serde"] }
+urlencoding = { version = "2.1.3", optional = true }
+uuid = { version = "1.26.1", default-features = false, features = ["serde", "v4"], optional = true }
+vodozemac = { version = "0.11.0", features = ["insecure-pk-encryption", "experimental-session-config"] }
+zeroize = "1.9.0"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+backon = "1.6.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["stream", "gzip", "http2", "rustls-no-provider"] }
+tokio = { version = "1.53.1", default-features = false, features = ["sync", "fs", "rt", "macros"] }
+wiremock = { version = "0.6.5", default-features = false, optional = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+gloo-timers = { version = "0.4.0", default-features = false, features = ["futures"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["gzip", "http2", "rustls-no-provider"] }
+tokio = { version = "1.53.1", default-features = false, features = ["sync", "macros"] }
+
+# Dev-dependencies resolve only for workspace members; kept for completeness.
+[dev-dependencies]
+anyhow = { version = "1.0.104", default-features = false }
+assert-json-diff = { version = "2.0.2", default-features = false }
+assert_matches = { version = "1.5.0", default-features = false }
+dirs = "6.0.0"
+futures-executor = { version = "0.3.34", default-features = false, features = ["std"] }
+insta = { version = "1.48.0", features = ["json", "redactions"] }
+matrix-sdk-base = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", features = ["testing"] }
+matrix-sdk-test = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
+matrix-sdk-test-utils = { version = "0.19.1", git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
+rand = "0.10.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+serde_urlencoded = "0.7.1"
+similar-asserts = { version = "2.0.0", default-features = false }
+strass = "0.2.0"
+stream_assert = { version = "0.1.1", default-features = false }
+tokio-test = "0.4.5"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "smallvec", "fmt", "env-filter"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+ctor = "1.0.13"
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["sync", "rt-multi-thread", "macros"] }
+wiremock = { version = "0.6.5", default-features = false }
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = { version = "0.3.78", default-features = false, features = ["std"] }
+
+[[test]]
+name = "integration"
+required-features = ["testing"]
+
+# Upstream workspace lints, as normalized for vendor/matrix-sdk-ui.
+["lints"]
+
+["lints"."rust"]
+"rust_2018_idioms" = "warn"
+"semicolon_in_expressions_from_macros" = "warn"
+"unused_extern_crates" = "warn"
+"unused_import_braces" = "warn"
+"unused_qualifications" = "warn"
+"trivial_casts" = "warn"
+"trivial_numeric_casts" = "warn"
+
+["lints"."rust"."unexpected_cfgs"]
+"level" = "warn"
+"check-cfg" = ["cfg(tarpaulin_include)", "cfg(ruma_unstable_exhaustive_types)"]
+
+["lints"."clippy"]
+"assigning_clones" = "allow"
+"box_default" = "allow"
+"cloned_instead_of_copied" = "warn"
+"dbg_macro" = "warn"
+"inefficient_to_string" = "warn"
+"macro_use_imports" = "warn"
+"manual_let_else" = "warn"
+"mut_mut" = "warn"
+"needless_borrow" = "warn"
+"nonstandard_macro_braces" = "warn"
+"redundant_clone" = "warn"
+"single_range_in_vec_init" = "allow"
+"str_to_string" = "warn"
+"todo" = "warn"
+"unnecessary_semicolon" = "warn"
+"unused_async" = "warn"

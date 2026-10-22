@@ -102,8 +102,19 @@ sanitization and privacy controls before they are enabled in the interface.
 Attachment filenames are sanitized before they enter the UI. A downloaded
 attachment is decrypted for the selected account and rejects an oversized
 declared size when present. It is written only to a path selected by the user.
-The save holds account and room navigation guards through an atomic local
-replacement. Morpheus builds the media request with Ruma and downloads through
+Saves started from a message wait in the account's transfer center, one in
+memory at a time. They are bound to the account selection rather than the
+room, hold the account-switch guard through the local write, and publish only
+under a new name. Existing entries are never overwritten, including ones that
+appear after the Save dialog closes. A name conflict offers Retry with another
+destination; the dialog path is not treated as proof of overwrite consent.
+Upload admission follows the chosen order within each account and room,
+while different rooms share a bounded preparation pool. Cancellation remains
+independent of the bounded click queue. At most eight downloads run or wait;
+recent failed-download and completed-transfer histories each retain at most
+24 records across accounts. Older failures expire without removing active work.
+Morpheus builds the media request with Ruma
+and downloads through
 a dedicated HTTP client with automatic redirects disabled. Each 307/308 target
 is checked before the next request; cross-origin targets must be public-looking
 HTTPS domain names, and the Matrix access token is never forwarded to them.

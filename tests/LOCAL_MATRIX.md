@@ -28,6 +28,16 @@ tests; the servers remain bound to loopback.
 
 ## Test the Rust account manager
 
+Positive send fixtures open each joined room through the account manager's
+bounded recovery scan before enqueueing. Sync visibility alone does not cover
+a room: its queue remains paused until discovery or `recover_room_for` has
+checked the saved state. The shared `tests/support/opened_room.rs` helper mirrors
+that room-open step using a current account selection, only for fresh positive
+fixtures. It fails if the scan returns saved drafts; restart/recovery fixtures
+must adopt and inspect those scopes explicitly. Negative recovery tests
+deliberately leave newly joined rooms unscanned and still require sends there
+to be refused. Fixtures do not enable the SDK queue globally or bypass grants.
+
 Set `MORPHEUS_MATRIX_TEST_ACCOUNTS` to the **path** printed by `up`, then run:
 
 ```sh
@@ -168,10 +178,46 @@ as raw bytes. The Matrix SDK's passphrase-protected SQLite state store holds
 the drafts; the passphrase remains in the OS credential vault.
 
 Morpheus retains a queued message's encrypted draft until the room send queue
-reports server acceptance. A send failure restores unchanged text. If the app
-exits before the send result arrives, the draft is retained, but the pending
-transaction marker is currently process-local. A send that completes after
-restart can therefore leave a stale draft for the user to clear.
+reports server acceptance. A send failure restores unchanged text. Before a
+room or thread message is handed to the SDK queue, its pending record (an
+opaque ownership nonce, the draft generation and, once assigned, the exact
+transaction id) is written into the same encrypted draft row as the text, and
+a thread send also records its root in the room row's thread index. After a
+restart the records are matched only against the SDK's own queue by exact
+transaction id: matching requests are observed to their result, a request the
+queue no longer holds is shown as unconfirmed for the user to check in the
+conversation, and nothing is adopted by content or time or resent
+automatically. Every record carries the complete typed text it was created
+from, and a row a build cannot read is quarantined with its complete original
+until the user discards it, pausing that room's queue meanwhile. The draft
+fixture round-trips two room records with their text, a thread index and a
+metadata-only row, and scans the raw account data for the encoded envelope and
+its marker attribute. A second gated scenario in the same file drives real SDK
+requests behind a fixture-owned hold (an oversize raw event the homeserver
+refuses permanently, which the SDK records as a wedged head that blocks every
+later request; the client-wide queue toggle is not a hold, because the
+product's per-room resume overrides it): records durable before enqueue,
+single-use enqueue grants, stale and wrong-authority refusals, out-of-order
+cancellation, crash windows restored as unconfirmed (including a request the
+SDK persisted while the row still said enqueuing), exact adoption of a
+persisted request across a restart and a re-selection, a stale room snapshot
+refused because it would orphan an indexed thread, and a quarantined row
+pausing its room, keeping both stored columns through an edit, and resuming
+only after a discard that names exactly that original. The same scenario then
+stores, through the SDK's own draft API, readable rows with an attachment or a
+reply or edit kind: they are shown but never rewritten, and a discard reviewed
+before an attachment value or the kind changed underneath it is refused as
+stale. It also creates a room after discovery (paused and recovery-incomplete
+until its safe scan, then a send completes there) and leaves a room holding a
+persisted request and an unreadable row (skipped by discovery, not scannable
+while left, scanned on demand after rejoining, paused until the exact
+discard). Morpheus never enables the client-wide SDK queue; each room queue
+resumes only once a scan under the current selection covered that room. The
+same fixture file also opts in `morpheus-app`'s `stale_observer_tests`, which
+spawns the app's real send observer on a persisted request, revokes its
+selection by adding the second account and switching back, and proves the
+observer ends and late completions leave the departed cache untouched. None of
+these scenarios has yet been built or run.
 
 ## Test encrypted-history recovery
 

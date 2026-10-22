@@ -1,11 +1,44 @@
 # Dependency security review
 
-Reviewed 2026-10-10 against the publication Cargo lockfile. OSV queries cover
-all 1,052 registry package versions: seven maintenance notices remain and
-OpenSSL/OpenSSL-sys have no advisory matches. The patched local `lru` version
+The historical publication review on 2026-10-10 covered
+all 1,052 registry package versions and reported seven maintenance notices,
+with no OpenSSL/OpenSSL-sys advisory matches. The patched local `lru` version
 match is reviewed separately below. Version-based results do not verify
 unpublished Git revisions, local source patches, or every native library
 bundled by a dependency; source review and platform acceptance remain required.
+
+## Candidate refresh, 2026-10-18
+
+A fresh [OSV query](https://google.github.io/osv.dev/post-v1-querybatch/) covered
+all 1,126 locked registry versions, three pinned Git revisions and nine local
+crates' upstream version references. Version queries do not establish the safety
+of local patches or unreported issues; Git results depend on database coverage.
+The local SDK build-helper patch below subsequently moves one of those registry
+entries to local source while retaining its upstream version.
+
+The candidate updates **Rustls 0.23.45 to 0.23.46** for
+[session-secret debug redaction](https://rustsec.org/advisories/RUSTSEC-2026-0346.html),
+[ECH rejection handling](https://rustsec.org/advisories/RUSTSEC-2026-0347.html),
+[Brotli decompression bounds](https://rustsec.org/advisories/RUSTSEC-2026-0348.html)
+and [authenticated key-exchange hints](https://rustsec.org/advisories/RUSTSEC-2026-0349.html).
+These version matches are not evidence that Morpheus exercised every affected
+configuration. Both release archives were checked against registry checksums;
+the complete source diff was reviewed. Features, build script, licenses and
+dependency requirements are unchanged. Only the Rustls version and checksum
+change in Morpheus's lockfile. OSV returned no matches for 0.23.46 at review time.
+**Native and integration verification of this update is still pending.**
+
+The refresh also reports the existing seven maintenance notices below and new
+maintenance notices for `zbus_names`, `zvariant` and `zvariant_derive`, whose
+standalone crates are being consolidated into `zbus`. These require upstream
+migration planning, not a claim of confirmed exploitation.
+
+The locked `zip` build dependency has additional published advisory matches.
+The candidate's local [native SDK build-helper patch](../vendor/webrtc-sys-build/MORPHEUS_PATCH.md)
+replaces its extraction call and verifies pinned archive bytes before unpacking.
+Source review and guarded tests do not replace actual four-platform download,
+extraction and integration acceptance, which remains pending. Version-only ZIP
+matches remain visible; no blanket advisory suppression is added.
 
 ## Applied panic-safety backport
 
@@ -88,3 +121,16 @@ The [patch note](../vendor/matrix-rtc-core/MORPHEUS_PATCH.md) records the two
 changed source files, bounded maintenance hint, unchanged encryption/trust
 policies and required core/live tests. This source patch requires hosted
 verification; an unchanged dependency version does not establish its safety.
+
+## Optional bounded SDK response bodies, 2026-10-19
+
+The local `matrix-sdk` 0.19.1 copy (revision
+`c6ad52ecc09eaa36601f55effb0a48a533eb87dd`) gains an opt-in per-request
+response-body limit, `RequestConfig::max_response_bytes`, and the permanent
+`HttpError::ResponseTooLarge { limit }`. It uses only the already locked
+`reqwest` and `bytes` APIs: no package identity, version, feature or manifest
+changes. The default stays unlimited. The
+[patch note](../vendor/matrix-sdk/MORPHEUS_PATCH.md) lists the five changed
+source files with their upstream and current blob hashes, the wasm limitation
+and the caller seam. This source patch requires review and hosted verification
+of the SDK HTTP client tests before integration.

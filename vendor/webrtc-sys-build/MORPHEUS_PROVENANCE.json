@@ -1,0 +1,113 @@
+{
+  "upstream_crate": "webrtc-sys-build",
+  "version": "0.3.18",
+  "archive_sha256": "7d46da6b5a5cbd091fae0400f77189f4ca4807c0d9442b85838a584f28720570",
+  "source_files": [
+    {
+      "path": ".cargo_vcs_info.json",
+      "sha256": "ab294e214f923772280b11c62351f09db7d93f673dc079b6cdef0f19af65b647"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "85ec117f301079b8bd35cdbfac4527f9b0f8d9c96e1771d36da6420f408776f2"
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "9890012f12536aa0d5c538628bb66bd93c7a93dac46b5a2fef6d6d9d0013b419"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "40e4d3a5f681e0cfdfc41a436ab3b57d9b71ff60d24a9f92ef273fc5a8c964bd"
+    },
+    {
+      "path": "Cargo.toml.orig",
+      "sha256": "ffd00cc4d2884c855bd55c43e5882cbd9de995b1fee107a09c3c52ee83d21b31"
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "e02b8b422e55af010bf2a1822111c8ead949dd927da3707124b0d907a2a5161f"
+    }
+  ],
+  "upstream_release": "https://github.com/livekit/rust-sdks/releases/tag/webrtc-51ef663",
+  "tag": "webrtc-51ef663",
+  "assets": [
+    {
+      "triple": "android-arm-release",
+      "bytes": 154748853,
+      "sha256": "7814aadbf0502d0b92258460b0b0fcc01af936c3767956fdb9f1970e8685334a",
+      "asset_id": 419683134
+    },
+    {
+      "triple": "android-arm64-release",
+      "bytes": 155977458,
+      "sha256": "1ba0acad6745aea3054f0dd5a97257cd4d2fe6ac763c00197299152ec38699ba",
+      "asset_id": 419683135
+    },
+    {
+      "triple": "android-x64-release",
+      "bytes": 157745928,
+      "sha256": "e50e70d5991365304bbc457724289a393714e708cd5ce1dfa8f74375ba643001",
+      "asset_id": 419683137
+    },
+    {
+      "triple": "ios-device-arm64-release",
+      "bytes": 218533711,
+      "sha256": "797e99ad58ae758d9a1187135d704e3a3d6e1e9877cb4c8e834d809d7f7e6208",
+      "asset_id": 419683142
+    },
+    {
+      "triple": "ios-simulator-arm64-release",
+      "bytes": 219184242,
+      "sha256": "9663e560682ee5d0a4119328b9c4bae77541a6bbf8c516adc3d60ab7ea5cde94",
+      "asset_id": 419683136
+    },
+    {
+      "triple": "linux-arm64-release",
+      "bytes": 165526092,
+      "sha256": "b55ca62c28b18dc5bb720a7082ae468d78f213ca39bcccf84195f2fe58cfe713",
+      "asset_id": 419683218
+    },
+    {
+      "triple": "linux-x64-release",
+      "bytes": 149683670,
+      "sha256": "dce9d9414cd8e2cc9a471c054481851b257ad2a879112ce5be56369b4fefdaed",
+      "asset_id": 419683224
+    },
+    {
+      "triple": "mac-arm64-release",
+      "bytes": 265849959,
+      "sha256": "f9be49b9fee9cd1588da8a40c85bda21f5ea49c4ed82662dc889b1c919569a08",
+      "asset_id": 419683228
+    },
+    {
+      "triple": "mac-x64-release",
+      "bytes": 223690324,
+      "sha256": "171f1ba0866e5947e0d420ecc1c33814476e1919131b81bb87c8729d45d72127",
+      "asset_id": 419683232
+    },
+    {
+      "triple": "win-arm64-release",
+      "bytes": 108193988,
+      "sha256": "929bd9e5682549eb3d43104e59c6c561f3d429f29caefea1c227b94839e7c5b7",
+      "asset_id": 419683250
+    },
+    {
+      "triple": "win-x64-release",
+      "bytes": 110167699,
+      "sha256": "0a56a5c91b3b7b4222082b8a09388d16a802cde22d67295beb24c55700755b30",
+      "asset_id": 419683258
+    }
+  ],
+  "license": "Apache-2.0; source headers retained; license text copied from the sibling upstream webrtc-sys crate",
+  "omitted_upstream_files": [
+    "Cargo.lock",
+    "CHANGELOG.md",
+    ".cargo_vcs_info.json"
+  ],
+  "upstream_git_commit": "a4f41cdcae5214986ab4ac5a8cb8507e5cc7ee6e",
+  "modifications": [
+    "Cargo.toml adds existing sha2 0.10 dependency; root workspace/patch uses local source",
+    "src/lib.rs: verified download, safe staging/extraction, receipt and cleanup; pinned SDK tag retained",
+    "src/archive.rs, src/pins.rs and src/archive_tests.rs: original Morpheus hardening and guarded tests"
+  ]
+}

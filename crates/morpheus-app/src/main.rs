@@ -3,39 +3,91 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod account_access;
+mod account_identity;
 mod appearance;
+mod appearance_editor;
+mod attachment_workbench;
 mod attachments;
 mod audio_devices;
 #[cfg(feature = "native-calls")]
+mod call_bar;
+#[cfg(feature = "native-calls")]
 mod call_membership;
+#[cfg(feature = "native-calls")]
+mod call_recovery;
+mod call_stage;
 #[cfg(feature = "native-calls")]
 mod calls;
 mod composer_mentions;
+mod config_cli;
+mod device_sessions;
+mod draft_recovery;
 mod drafts;
+mod identity_warnings;
 mod image_previews;
 #[cfg(feature = "native-calls")]
 mod incoming_ring;
+mod invitations;
+mod kept_replies;
 mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
+mod matrix_links;
+mod member_privacy;
 mod message_metadata;
+mod message_search;
+mod metric_editor;
+mod moderation_ui;
 mod navigation;
+mod navigation_target;
+mod notification_center;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
+mod people_directory;
+mod pinned_messages;
+mod polls;
 #[cfg(debug_assertions)]
 mod preview_capture;
+mod room_activity;
+mod room_addresses;
+mod room_creation;
+mod room_leave;
+mod room_media_browser;
+mod room_organization;
+mod room_permissions;
 mod room_settings;
 mod security;
+mod sender_palette_editor;
+mod settings_search;
 mod shortcuts;
+mod space_explorer;
+mod space_management;
 mod sso;
+#[cfg(not(morpheus_timeline_acceptance))]
+mod startup_error;
+mod stickers;
+mod style_profiles;
+mod theme_studio;
+mod thread_browser;
+mod thread_history;
+// Instrumented release builds only (see build.rs); unit tests cover its pure checks.
+#[cfg(any(test, morpheus_timeline_acceptance))]
+mod timeline_acceptance;
+mod timeline_delivery;
 mod timeline_model;
+mod timeline_recovery;
+mod timeline_viewport;
+mod unread_navigation;
 mod update_controller;
 mod updater;
 mod verification;
 #[cfg(feature = "native-calls")]
 mod video_render;
+#[cfg(feature = "native-calls")]
+mod voice_rosters;
 mod voice_spaces;
+mod workspace_layout;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -47,29 +99,26 @@ use std::sync::{Arc, Mutex, atomic::Ordering};
 use std::thread;
 use std::time::Duration;
 
-use chrono::{Local, TimeZone};
 use directories::ProjectDirs;
 use morpheus_config::{
     Config, ConfigStore, Density, LoadedConfig, RoomCallMode, ThemeMode, ThemePack,
 };
 use morpheus_matrix::{
-    AccountManager, AttachmentSendUpdate, MatrixLinkTarget, MessageInfo, MessageSearchResult,
-    PublicRoomInfo, PublicRoomsQuery, TextFormat, parse_matrix_link_target,
+    AccountManager, Generation, MatrixLinkTarget, PublicRoomInfo, PublicRoomsQuery, TextFormat,
+    parse_matrix_link_target,
 };
 use slint::{Color, Model, ModelRc, SharedString, StyledText, VecModel};
 use url::Url;
 
-use crate::attachments::{UploadCommand, UploadController, mime_type_for};
 #[cfg(feature = "native-calls")]
 use crate::calls::{
     AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStartIntent, CallStatus,
+    route_degraded, route_notice, route_reply_notice, route_reply_scope, route_summary,
 };
-use crate::live::{LiveUi, RoomAction, show_error};
+use crate::live::{LiveUi, show_error};
 #[cfg(feature = "native-calls")]
 use crate::local_video::{CaptureKind, CapturePhase, CaptureSource, LocalVideoStatus};
 use crate::notifications::DesktopNotifications;
-#[cfg(feature = "native-calls")]
-use crate::video_render::VideoUpdate;
 use crate::voice_spaces::VoiceSpaces;
 
 slint::include_modules!();
@@ -108,6 +157,7 @@ fn account(name: &str, handle: &str, initials: &str, status: &str, accent: Color
         initials: initials.into(),
         status: status.into(),
         accent,
+        ..Default::default()
     }
 }
 
@@ -124,10 +174,14 @@ fn room(
             id: id.into(),
             name: name.into(),
             unread,
+            mentions: 0,
             private_room,
             voice_space: false,
             voice_local: false,
             voice_shared: false,
+            favourite: false,
+            low_priority: false,
+            marked_unread: false,
         },
         topic: topic.into(),
         messages,
@@ -163,7 +217,9 @@ fn message(
         attachment: attachment.into(),
         attachment_is_image: false,
         reaction: reaction.into(),
+        poll: PollCardData::default(),
         accent,
+        pinned: false,
     }
 }
 
@@ -614,6 +670,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_thread_composer_text("".into());
         ui.set_thread_send_pending(false);
         ui.set_room_actions_open(false);
+        room_creation::clear(ui);
         ui.set_room_action_busy(false);
         ui.set_room_action_error("".into());
         ui.set_invite_error("".into());
@@ -643,6 +700,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
                 handle: item.handle.clone(),
                 initials: item.initials.clone(),
                 accent: item.accent,
+                ..Default::default()
             }
         })
         .collect::<Vec<_>>();
@@ -669,6 +727,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
             .collect::<Vec<_>>(),
     )));
     ui.set_invitations(ModelRc::new(VecModel::from(Vec::<RoomItem>::new())));
+    ui.set_home_invitations(ModelRc::new(VecModel::from(Vec::<RoomItem>::new())));
     apply_room_sort(ui);
     ui.set_members(ModelRc::new(VecModel::from(account.members.clone())));
     ui.set_member_loading(false);
@@ -718,6 +777,25 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
 
 fn preview_event_index(event_id: &str) -> Option<usize> {
     event_id.strip_prefix("preview:")?.parse().ok()
+}
+
+/// The external-link confirmation: an http(s) link opens in the system
+/// browser only after the person confirms it in a native dialog. Anything
+/// else (a `matrix:` URI included) is never handed to the system.
+fn confirm_external_link(link: &str) {
+    if let Some(url) = safe_message_url(link) {
+        thread::spawn(move || {
+            let accepted = rfd::MessageDialog::new()
+                .set_title("Open external link?")
+                .set_description(format!("The message links to:\n\n{url}"))
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show()
+                == rfd::MessageDialogResult::Ok;
+            if accepted {
+                let _ = webbrowser::open(&url);
+            }
+        });
+    }
 }
 
 fn safe_message_url(link: &str) -> Option<String> {
@@ -770,57 +848,19 @@ fn finish_composer_submission(
 
 fn reset_attachment_view(ui: &AppWindow) {
     ui.invoke_close_image_preview();
-    // A queued upload may continue in its room after navigation. Its event
-    // loop update must not repaint the newly selected account or room.
-    ui.set_attachment_operation(ui.get_attachment_operation().wrapping_add(1));
-    ui.set_attachment_busy(false);
-    ui.set_attachment_needs_retry(false);
+    // An unfinished save keeps downloading in the account's transfer center;
+    // leaving the account stops it. Bumping the operation below keeps its
+    // late notice out of the next room.
+    // Uploads continue in their room after navigation and staged files stay
+    // with it. The workbench shows the next room's queue once the active
+    // account or room changes; nothing of this one remains meanwhile.
+    ui.set_attachment_items(ModelRc::new(VecModel::<AttachmentItem>::default()));
+    ui.set_attachment_ready_count(0);
+    ui.set_attachment_can_add(false);
     ui.set_attachment_status("".into());
     ui.set_download_operation(ui.get_download_operation().wrapping_add(1));
     ui.set_downloading_event_id("".into());
     ui.set_transfer_notice("".into());
-}
-
-fn post_upload_progress(
-    weak: &slint::Weak<AppWindow>,
-    account_id: String,
-    room_id: String,
-    operation: i32,
-    status: String,
-    needs_retry: bool,
-) {
-    let _ = weak.upgrade_in_event_loop(move |ui| {
-        if ui.get_active_account_local_id().as_str() == account_id
-            && ui.get_active_room_id().as_str() == room_id
-            && ui.get_attachment_operation() == operation
-        {
-            ui.set_attachment_status(status.into());
-            ui.set_attachment_needs_retry(needs_retry);
-        }
-    });
-}
-
-fn post_upload_completion(
-    weak: &slint::Weak<AppWindow>,
-    account_id: String,
-    room_id: String,
-    operation: i32,
-    outcome: Result<String, String>,
-) {
-    let _ = weak.upgrade_in_event_loop(move |ui| {
-        if ui.get_active_account_local_id().as_str() == account_id
-            && ui.get_active_room_id().as_str() == room_id
-            && ui.get_attachment_operation() == operation
-        {
-            ui.set_attachment_busy(false);
-            ui.set_attachment_needs_retry(false);
-            ui.set_attachment_status("".into());
-            match outcome {
-                Ok(notice) => ui.set_transfer_notice(notice.into()),
-                Err(error) => ui.set_session_error(error.into()),
-            }
-        }
-    });
 }
 
 fn switch_account(state: &mut PreviewState, index: usize) {
@@ -871,9 +911,12 @@ fn make_stress_messages() -> Vec<MessageItem> {
         .collect()
 }
 
+/// A validated `#RRGGBB` or `#RRGGBBAA` color, alpha last. Validation has
+/// already rejected anything else; an unexpected value paints black.
 fn color_from_hex(value: &str) -> Color {
-    let rgb = u32::from_str_radix(value.strip_prefix('#').unwrap_or_default(), 16).unwrap_or(0);
-    Color::from_rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+    let [red, green, blue, alpha] =
+        morpheus_config::registry::parse_hex_color(value).unwrap_or([0, 0, 0, 0xff]);
+    Color::from_argb_u8(alpha, red, green, blue)
 }
 
 fn apply_room_sort(ui: &AppWindow) {
@@ -882,6 +925,7 @@ fn apply_room_sort(ui: &AppWindow) {
 
 fn apply_notification_settings(ui: &AppWindow, config: &Config) {
     ui.set_notifications_enabled(config.notifications.enabled);
+    notification_center::apply_config(ui, config);
     ui.set_notification_sounds(config.notifications.sounds);
     ui.set_notification_show_preview(config.notifications.show_message_preview);
     ui.set_notification_highlight_words(ModelRc::new(VecModel::from(
@@ -895,24 +939,72 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 }
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
-    appearance::apply_config(ui, config);
-    appearance::apply_theme(ui, theme);
+    // While the theme studio drafts look changes, they stay shown over the
+    // accepted configuration (see theme_studio).
+    if !theme_studio::show_over_accepted(ui, config, theme) {
+        apply_appearance(ui, config, theme, true);
+    }
+    apply_behavior(ui, config);
+    style_profiles::config_applied(ui);
+}
+
+/// Accepted behavioral settings always take effect, including while a style
+/// preview owns the appearance. Preview/cancel never applies these settings.
+fn apply_behavior(ui: &AppWindow, config: &Config) {
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);
+    room_activity::apply_config(ui, config);
+    apply_notification_settings(ui, config);
+}
+
+/// Everything of `config` that shows the look of the window, and nothing that
+/// changes behavior such as shortcuts, devices or notifications. A style
+/// profile preview applies only this, with `project_editors` false so the
+/// Settings editors and their undo steps stay on the accepted configuration.
+fn apply_appearance(
+    ui: &AppWindow,
+    config: &Config,
+    theme: Option<&ThemePack>,
+    project_editors: bool,
+) {
+    appearance::apply_config(ui, config);
+    appearance::apply_theme(ui, config, theme);
+    if project_editors {
+        // After the theme, so the workspace reads the colors now shown.
+        appearance_editor::project(ui, config, theme);
+        metric_editor::project(ui, config);
+        sender_palette_editor::project(ui, config, theme);
+    }
     // The theme mode follows the window's active account: its configured
     // override, else the global appearance. Only this accepted configuration
     // replaces the remembered preferences.
-    appearance::remember_theme_preferences(config);
+    appearance::remember_theme_preferences(config, theme);
     appearance::apply_theme_mode(ui);
     ui.set_font_scale_percent(config.appearance.scale_percent.into());
-    ui.set_density_mode(match config.appearance.density {
+    let density_index = |density: Density| match density {
         Density::Compact => 0,
         Density::Comfortable => 1,
         Density::Spacious => 2,
+    };
+    ui.set_density_mode(density_index(config.appearance.density));
+    // Omitted pane densities follow the global density.
+    let layout = &config.layout;
+    ui.set_room_density_mode(density_index(
+        layout.room_density.unwrap_or(config.appearance.density),
+    ));
+    ui.set_message_density_mode(density_index(
+        layout.message_density.unwrap_or(config.appearance.density),
+    ));
+    ui.set_details_side(match layout.details_side {
+        morpheus_config::DetailsSide::Right => 0,
+        morpheus_config::DetailsSide::Left => 1,
     });
+    workspace_layout::apply_config(ui, config);
+    ui.set_direct_messages_first(layout.direct_messages_first);
+    ui.set_room_density_choice(layout.room_density.map_or(-1, density_index));
+    ui.set_message_density_choice(layout.message_density.map_or(-1, density_index));
     ui.set_sort_unread_first(config.layout.sort_unread_first);
-    apply_notification_settings(ui, config);
     apply_room_sort(ui);
     ui.set_room_list_width(config.layout.room_list_width.into());
     ui.set_details_width(config.layout.details_width.into());
@@ -937,7 +1029,15 @@ fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
 }
 
 fn apply_loaded_config(ui: &AppWindow, loaded: &LoadedConfig) {
-    apply_config(ui, &loaded.config, loaded.theme.as_ref());
+    // A previewed style profile stays while the accepted look is unchanged,
+    // as when the watcher re-reads this window's own save; any other change
+    // ends the preview here, before it is applied.
+    if style_profiles::keeps_preview(ui, loaded) {
+        apply_behavior(ui, &loaded.config);
+        style_profiles::config_applied(ui);
+    } else {
+        apply_config(ui, &loaded.config, loaded.theme.as_ref());
+    }
     ui.set_config_error("".into());
 }
 
@@ -946,15 +1046,60 @@ fn save_config_change(
     store: &ConfigStore,
     change: impl FnOnce(&mut Config),
 ) -> Option<Config> {
+    save_config_edit(ui, store, |config| {
+        change(config);
+        true
+    })
+}
+
+/// `save_config_change` for a change decided on the file as re-read: when
+/// `change` returns false, nothing is written or applied and `None` is
+/// returned without an error, so the caller tells a declined change from a
+/// failed save by what its closure recorded. Look changes made in Settings,
+/// or while the theme studio holds a draft, join that draft instead of the
+/// file; other settings are written as before.
+fn save_config_edit(
+    ui: &AppWindow,
+    store: &ConfigStore,
+    change: impl FnOnce(&mut Config) -> bool,
+) -> Option<Config> {
+    if theme_studio::routes(ui) {
+        return theme_studio::save(ui, store, change);
+    }
+    write_config_edit(ui, store, change)
+}
+
+/// `save_config_edit` straight to the file, for a change that is itself an
+/// explicit apply of a whole look (a style profile). It is never drafted.
+fn write_config_edit(
+    ui: &AppWindow,
+    store: &ConfigStore,
+    change: impl FnOnce(&mut Config) -> bool,
+) -> Option<Config> {
     // Read from disk first so an invalid external edit is never overwritten by a UI action.
     let result = (|| {
-        let mut config = store.load()?;
-        change(&mut config);
-        store.save(&config)?;
-        Ok::<_, morpheus_config::ConfigError>(config)
+        let (mut config, revision) = store.load_revision()?;
+        let before = style_profiles::previewing().then(|| config.clone());
+        if !change(&mut config) {
+            return Ok(None);
+        }
+        // A Settings change ends a style profile preview first. One that
+        // would change the look may have been computed from the preview,
+        // so it is refused rather than saved.
+        if let Some(before) = before
+            && !style_profiles::end_preview_for_save(ui, &before, &config)
+        {
+            return Ok(None);
+        }
+        // Written only over the revision the change was decided on. An edit
+        // found in between is kept and reported instead of replaced; the
+        // morpheus-config commit module states the remaining window.
+        store.commit(&config, &revision)?;
+        Ok::<_, morpheus_config::CommitError>(Some(config))
     })();
     match result {
-        Ok(config) => {
+        Ok(None) => None,
+        Ok(Some(config)) => {
             // A missing or malformed theme should leave the last valid
             // appearance active, but it must not hold back notification
             // privacy changes from a successfully saved config.
@@ -962,6 +1107,7 @@ fn save_config_change(
             shortcuts::apply_config(ui, &config);
             audio_devices::apply_config(ui, &config);
             image_previews::apply_config(ui, &config);
+            room_activity::apply_config(ui, &config);
             match store.load_theme(&config) {
                 Ok(theme) => apply_loaded_config(
                     ui,
@@ -1057,67 +1203,9 @@ fn directory_plain_text(value: &str, max_chars: usize) -> String {
     text.trim().to_owned()
 }
 
-fn search_time(timestamp_ms: u64) -> String {
-    i64::try_from(timestamp_ms)
-        .ok()
-        .and_then(|timestamp| Local.timestamp_millis_opt(timestamp).single())
-        .map(|time| time.format("%b %-d, %-I:%M %p").to_string())
-        .unwrap_or_else(|| "Unknown time".into())
-}
-
-fn search_result_item(result: MessageSearchResult) -> MessageSearchItem {
-    let body = directory_plain_text(&result.body, 500);
-    let sender = directory_plain_text(&result.sender, 100);
-    MessageSearchItem {
-        room_id: result.room_id.into(),
-        event_id: result.event_id.into(),
-        sender: if sender.is_empty() {
-            "Unknown sender".into()
-        } else {
-            sender.into()
-        },
-        time: search_time(result.timestamp_ms).into(),
-        preview: body.chars().take(150).collect::<String>().into(),
-        body: body.into(),
-    }
-}
-
-fn search_context_item(info: MessageInfo, room_id: &str) -> MessageSearchItem {
-    let body = directory_plain_text(&info.body, 500);
-    let sender = directory_plain_text(&info.sender, 100);
-    MessageSearchItem {
-        room_id: room_id.into(),
-        event_id: info.event_id.unwrap_or_default().into(),
-        sender: if sender.is_empty() {
-            "Unknown sender".into()
-        } else {
-            sender.into()
-        },
-        time: search_time(info.timestamp_ms).into(),
-        preview: body.chars().take(150).collect::<String>().into(),
-        body: body.into(),
-    }
-}
-
+/// Cancel message search and clear its results (see message_search).
 fn reset_room_search(ui: &AppWindow) {
-    ui.set_room_search_operation(ui.get_room_search_operation().wrapping_add(1));
-    ui.set_room_search_context_operation(ui.get_room_search_context_operation().wrapping_add(1));
-    ui.set_room_search_loading(false);
-    ui.set_room_search_context_loading(false);
-    ui.set_room_search_query("".into());
-    ui.set_room_search_error("".into());
-    ui.set_room_search_context_error("".into());
-    ui.set_room_search_searched(false);
-    ui.set_room_search_results(ModelRc::new(
-        VecModel::from(Vec::<MessageSearchItem>::new()),
-    ));
-    ui.set_room_search_context(ModelRc::new(
-        VecModel::from(Vec::<MessageSearchItem>::new()),
-    ));
-    ui.set_room_search_selected_event_id("".into());
-    ui.set_room_search_selected_sender("".into());
-    ui.set_room_search_selected_time("".into());
-    ui.set_room_search_selected_body("".into());
+    message_search::reset(ui);
 }
 
 fn public_room_item(room: PublicRoomInfo, route_server: &str) -> PublicRoomItem {
@@ -1151,6 +1239,58 @@ fn matrix_id_server(id: &str) -> Option<&str> {
     id.split_once(':')
         .map(|(_, server)| server)
         .filter(|server| !server.is_empty())
+}
+
+type JoinSlot = Arc<Mutex<Option<(i32, live::JoinAsked)>>>;
+
+/// The real UI withdrawal routes, shared by startup and the generated
+/// window regression. They hold only operation metadata, never a client.
+fn register_join_cancellation(ui: &AppWindow, room_join: JoinSlot, directory_join: JoinSlot) {
+    let weak = ui.as_weak();
+    ui.on_cancel_discovery_join(move || {
+        let taken = directory_join
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some((_, asked)) = taken {
+            asked.withdraw();
+        }
+        if let Some(window) = weak.upgrade() {
+            window.set_directory_join_operation(
+                window.get_directory_join_operation().wrapping_add(1),
+            );
+            window.set_directory_join_busy(false);
+            window.set_directory_joining_room_id("".into());
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_cancel_room_join(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !window.get_room_action_busy() || window.get_room_action_mode() != 1 {
+            return;
+        }
+        let taken = room_join
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some((_, asked)) = taken {
+            asked.withdraw();
+        }
+        window.set_room_action_operation(window.get_room_action_operation().wrapping_add(1));
+        window.set_room_action_busy(false);
+        window.set_room_action_error("".into());
+    });
+}
+
+/// Refuse, for good, every call bar action still waiting for the call
+/// controller (call_bar.rs). Every entry that opens a protected surface calls
+/// this synchronously before it sets its own flag, as it ends a shown link
+/// first (matrix_links::clear); page navigation does not. A no-op without
+/// native calls, where the bar registers no handler.
+pub(crate) fn withdraw_call_bar(ui: &AppWindow) {
+    slint::ComponentHandle::global::<CallBar>(ui).invoke_withdraw();
 }
 
 fn room_join_target(
@@ -1191,8 +1331,13 @@ fn room_join_target(
     }
 }
 
+// The instrumented acceptance build measures the optimized profile only.
+#[cfg(all(morpheus_timeline_acceptance, debug_assertions))]
+compile_error!("The timeline acceptance build requires the release profile");
+
 /// Development-only account and config root for disposable desktop QA. The
 /// normal application paths are unchanged when this variable is absent.
+#[cfg_attr(morpheus_timeline_acceptance, allow(dead_code))]
 fn qa_profile_root() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     #[cfg(debug_assertions)]
     {
@@ -1218,6 +1363,7 @@ fn call_status_label(status: &CallStatus) -> String {
         CallStatus::OpeningSlot { .. } => "Opening MatrixRTC room call…".into(),
         CallStatus::Starting { .. } => "Joining MatrixRTC audio…".into(),
         CallStatus::Joined { .. } => "Room call joined".into(),
+        CallStatus::Reconnecting { interruption, .. } => interruption.label(),
         CallStatus::Ending { .. } => "Leaving call…".into(),
         CallStatus::CleanupFailed { reason, .. } => {
             format!(
@@ -1227,6 +1373,9 @@ fn call_status_label(status: &CallStatus) -> String {
         }
         CallStatus::Failed { reason, .. } => {
             format!("Call failed: {}", directory_plain_text(reason, 180))
+        }
+        CallStatus::Ended { reason, .. } => {
+            format!("Call ended: {}", directory_plain_text(reason, 180))
         }
     }
 }
@@ -1238,8 +1387,10 @@ fn call_room_id(status: &CallStatus) -> Option<&str> {
         | CallStatus::Starting { room_id, .. }
         | CallStatus::Ending { room_id, .. }
         | CallStatus::CleanupFailed { room_id, .. } => Some(room_id),
-        CallStatus::Joined { call, .. } => Some(&call.room_id),
-        CallStatus::Idle | CallStatus::Failed { .. } => None,
+        CallStatus::Joined { call, .. } | CallStatus::Reconnecting { call, .. } => {
+            Some(&call.room_id)
+        }
+        CallStatus::Idle | CallStatus::Failed { .. } | CallStatus::Ended { .. } => None,
     }
 }
 
@@ -1263,53 +1414,10 @@ fn call_room_display(
 }
 
 #[cfg(feature = "native-calls")]
-fn call_participant_item(participant: morpheus_rtc::ParticipantInfo) -> CallParticipantItem {
-    use morpheus_rtc::RtcStreamKind;
-
-    let has_live = |kind| {
-        participant
-            .streams
-            .iter()
-            .any(|stream| stream.kind == kind && !stream.muted)
-    };
-    let microphone = participant
-        .streams
-        .iter()
-        .find(|stream| stream.kind == RtcStreamKind::Microphone);
-    let mut media = Vec::new();
-    if has_live(RtcStreamKind::ScreenShare) {
-        media.push("Sharing screen");
-    } else if has_live(RtcStreamKind::Camera) {
-        media.push("Camera on");
-    }
-    match microphone {
-        Some(stream) if stream.muted => media.push("Mic muted"),
-        Some(_) => media.push("Mic on"),
-        None => {}
-    }
-    let detail = if !participant.reachable {
-        "Media unavailable".to_owned()
-    } else if media.is_empty() {
-        "In call".to_owned()
-    } else {
-        media.join(" · ")
-    };
-    CallParticipantItem {
-        name: participant.user_id.into(),
-        detail: detail.into(),
-        is_local: participant.is_local,
-    }
-}
-
-#[cfg(feature = "native-calls")]
-fn clear_native_video(ui: &AppWindow) {
-    ui.set_native_video_visible(false);
-    ui.set_native_video_frame(slint::Image::default());
-    ui.set_native_video_source(SharedString::default());
-}
-
-#[cfg(feature = "native-calls")]
 fn clear_native_capture(ui: &AppWindow) {
+    // A full authoritative write of both kinds (call_bar::capture_state_applied):
+    // every pending click is superseded, and nothing is busy.
+    call_bar::capture_state_applied(false, false);
     ui.set_native_camera_active(false);
     ui.set_native_screen_active(false);
     ui.set_native_camera_busy(false);
@@ -1320,6 +1428,7 @@ fn clear_native_capture(ui: &AppWindow) {
     ui.set_native_camera_source(SharedString::default());
     ui.set_native_screen_source(SharedString::default());
     ui.set_native_capture_error(SharedString::default());
+    call_bar::capture_error_written();
     ui.set_native_camera_error(SharedString::default());
     ui.set_native_screen_error(SharedString::default());
     ui.set_native_capture_picker_open(false);
@@ -1411,6 +1520,18 @@ fn capture_sources(picker_kind: i32) -> Result<Vec<(i32, String, String)>, Strin
 
 #[cfg(feature = "native-calls")]
 fn apply_capture_status(ui: &AppWindow, status: LocalVideoStatus) {
+    // A full authoritative write of both kinds (call_bar::capture_state_applied),
+    // with the busy values it shows below: every pending click is superseded.
+    call_bar::capture_state_applied(
+        matches!(
+            &status.camera.phase,
+            CapturePhase::Starting | CapturePhase::Stopping
+        ),
+        matches!(
+            &status.screen.phase,
+            CapturePhase::Selecting | CapturePhase::Starting | CapturePhase::Stopping
+        ),
+    );
     let camera_error = match &status.camera.phase {
         CapturePhase::Failed(error) => Some(error.as_str()),
         _ => None,
@@ -1455,6 +1576,9 @@ fn ask_to_leave_call(ui: &slint::Weak<AppWindow>, calls: &CallController, action
         return false;
     }
     if let Some(ui) = ui.upgrade() {
+        matrix_links::clear(&ui);
+        thread_browser::withdraw(&ui);
+        withdraw_call_bar(&ui);
         ui.set_native_leave_unconfirmed(matches!(status, CallStatus::CleanupFailed { .. }));
         ui.set_pending_account_index(action);
         ui.set_leave_call_dialog(true);
@@ -1476,6 +1600,16 @@ fn continue_account_action(ui: &AppWindow, action: i32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `config validate` and `config schema` run first: before the screenshot
+    // preview, the updater, the startup session, the window, the account
+    // store, the credential vault, sync and media devices. They write nothing.
+    if let Some(status) = config_cli::early_dispatch() {
+        std::process::exit(status);
+    }
+    // An instrumented acceptance build refuses to start without a valid run
+    // file, so it never runs as an ordinary app. See tests/TIMELINE_10K.md.
+    #[cfg(morpheus_timeline_acceptance)]
+    let mut acceptance = timeline_acceptance::Acceptance::from_environment()?;
     // Screenshot generation uses only the in-memory offline preview. Dispatch
     // before updater, configuration, credential vault or account initialization.
     #[cfg(debug_assertions)]
@@ -1499,11 +1633,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = AppWindow::new()?;
     ui.set_login_loading(true);
     ui.show()?;
+    #[cfg(morpheus_timeline_acceptance)]
+    acceptance.mark_window_shown();
     update_session
         .lock()
         .map_err(|_| updater::UpdateError::RecoveryRequired)?
         .acknowledge_before_store()?;
+    #[cfg(not(morpheus_timeline_acceptance))]
     let qa_profile = qa_profile_root()?;
+    // The run's generated, isolated profile replaces the standard app paths.
+    #[cfg(morpheus_timeline_acceptance)]
+    let qa_profile = Some(acceptance.profile_root().to_path_buf());
     let data_dir = if let Some(root) = &qa_profile {
         root.join("data")
     } else {
@@ -1512,7 +1652,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .data_dir()
             .to_path_buf()
     };
-    let manager = Arc::new(AccountManager::open(data_dir)?);
+    #[cfg(not(morpheus_timeline_acceptance))]
+    let manager = match AccountManager::open(data_dir) {
+        Ok(manager) => Arc::new(manager),
+        Err(error) => {
+            // No account worker, sign-in callback or preview is initialized
+            // on this path. Keep the saved-account protection fail-closed.
+            ui.hide()?;
+            startup_error::show(&error)?;
+            return Err("Saved-account startup was blocked".into());
+        }
+    };
+    // A sliding run keeps the shipping automatic policy; a classic run forces
+    // the same classic /sync loop that policy falls back to.
+    #[cfg(morpheus_timeline_acceptance)]
+    let manager = Arc::new(AccountManager::open_with_sync_policy(
+        data_dir,
+        acceptance.sync_policy(),
+    )?);
     let store = if let Some(root) = &qa_profile {
         ConfigStore::at(root.join("config.toml"))
     } else {
@@ -1522,6 +1679,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // Subscribed before the startup restore below can start a sync.
+    #[cfg(morpheus_timeline_acceptance)]
+    acceptance.observe_sync(&manager, runtime.handle());
     let live = LiveUi::new(
         manager.clone(),
         runtime.handle().clone(),
@@ -1529,11 +1689,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         voice_spaces.clone(),
     );
     security::register(&ui, live.clone(), runtime.handle().clone());
-    let uploads = Arc::new(UploadController::default());
     let image_previews =
         image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
     let room_settings =
         room_settings::RoomSettingsUi::register(&ui, live.clone(), runtime.handle());
+    let room_permissions = room_permissions::RoomPermissionsUi::register(
+        &ui,
+        live.clone(),
+        runtime.handle(),
+        manager.clone(),
+    );
+    let pinned_messages =
+        pinned_messages::PinnedMessagesUi::register(&ui, live.clone(), runtime.handle());
+    let room_media = room_media_browser::RoomMediaBrowser::register(
+        &ui,
+        live.clone(),
+        runtime.handle(),
+        manager.clone(),
+    );
+    let room_activity =
+        room_activity::RoomActivityUi::register(&ui, live.clone(), store.clone(), runtime.handle());
+    let unread_navigation_ui =
+        unread_navigation::UnreadNavigationUi::register(&ui, live.clone(), runtime.handle());
+    let device_sessions =
+        device_sessions::DeviceSessionsUi::register(&ui, live.clone(), runtime.handle());
+    let member_privacy =
+        member_privacy::MemberPrivacyUi::register(&ui, live.clone(), runtime.handle());
+    let identity_warnings =
+        identity_warnings::IdentityWarningsUi::register(&ui, live.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
@@ -1571,8 +1754,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     let mut incoming_calls =
         incoming_ring::ui::IncomingUi::bind(&ui, runtime.handle(), live.clone(), calls.clone());
+    // Leave never tears down an active or ringing call of this account.
+    #[cfg(feature = "native-calls")]
+    let leave_fence: room_leave::CallFence = {
+        let calls = calls.clone();
+        let ringing = incoming_calls.ringing_in();
+        Arc::new(move |account: &str, room: &str| {
+            let active = match calls.status() {
+                CallStatus::OpeningSlot {
+                    account_id,
+                    room_id,
+                }
+                | CallStatus::Starting {
+                    account_id,
+                    room_id,
+                }
+                | CallStatus::Ending {
+                    account_id,
+                    room_id,
+                }
+                | CallStatus::CleanupFailed {
+                    account_id,
+                    room_id,
+                    ..
+                } => account_id == account && room_id == room,
+                CallStatus::Joined { account_id, call }
+                | CallStatus::Reconnecting {
+                    account_id, call, ..
+                } => account_id == account && call.room_id == room,
+                _ => false,
+            };
+            room_leave::RoomCall::of(active, ringing(account, room))
+        })
+    };
+    #[cfg(not(feature = "native-calls"))]
+    let leave_fence: room_leave::CallFence =
+        Arc::new(|_: &str, _: &str| room_leave::RoomCall::of(false, false));
+    let room_leave =
+        room_leave::RoomLeaveUi::register(&ui, live.clone(), runtime.handle(), leave_fence);
+    #[cfg(feature = "native-calls")]
+    let voice_presence =
+        voice_rosters::VoiceRosterUi::register(&ui, live.clone(), runtime.handle());
     #[cfg(feature = "native-calls")]
     let applied_audio_token = Arc::new(AtomicU64::new(0));
+    // The capture generation whose camera and screen state the window shows,
+    // written on the UI thread by the capture watcher below.
+    #[cfg(feature = "native-calls")]
+    let applied_capture_token = Arc::new(AtomicU64::new(0));
     #[cfg(feature = "native-calls")]
     {
         let calls = calls.clone();
@@ -1582,10 +1810,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let current = status.borrow_and_update().clone();
                 let connected = current.blocks_account_switch();
-                let joined = matches!(current, CallStatus::Joined { .. });
+                let joined = current.controls_available();
                 let leave_unconfirmed = matches!(current, CallStatus::CleanupFailed { .. });
                 let label = call_status_label(&current);
                 let room_id = call_room_id(&current).unwrap_or("").to_owned();
+                // The exact call this status names, read with it under the
+                // call slot's lock, for the persistent call bar.
+                let observed = calls.observe(&current).await;
                 let calls_for_ui = calls.clone();
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     if calls_for_ui.status() != current {
@@ -1604,12 +1835,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_native_call_status(label.into());
                     ui.set_native_call_room_id(room_id.into());
                     ui.set_native_call_room_display(room_display.into());
+                    // The persistent call bar shows this same fenced status,
+                    // bound to the exact call it describes.
+                    call_bar::present(&ui, call_bar::view_of(&current, observed));
                 });
                 if status.changed().await.is_err() {
                     break;
                 }
             }
         });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        // The bar's controls act only on the exact call they were shown for,
+        // with the click's own security and account context; the controller
+        // admits them under its slot's lock.
+        // Mute and Deafen also bind the window's applied audio generation,
+        // and Stop its applied capture generation.
+        let bar_live = live.clone();
+        call_bar::register(
+            &ui,
+            calls.clone(),
+            runtime.handle().clone(),
+            applied_audio_token.clone(),
+            applied_capture_token.clone(),
+            move |account_id| call_bar::live_admission(&bar_live, account_id),
+        );
     }
     #[cfg(feature = "native-calls")]
     {
@@ -1696,86 +1947,112 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     #[cfg(feature = "native-calls")]
+    call_stage::bind(&ui, runtime.handle(), calls.clone());
+    // The call page names the devices in use and the last route change, only
+    // for the call generation on screen. The watch holds only the latest
+    // report, so one for another generation means none for this one yet.
+    #[cfg(feature = "native-calls")]
     {
         let calls = calls.clone();
         let weak = ui.as_weak();
-        let applied_token = Arc::new(AtomicU64::new(0));
         runtime.spawn(async move {
-            let mut roster = calls.subscribe_roster();
+            let mut routes = calls.subscribe_audio_route();
             loop {
-                let update = roster.borrow_and_update().clone();
-                let members: Vec<_> = update
-                    .members
-                    .into_iter()
-                    .map(call_participant_item)
-                    .collect();
+                let update = routes.borrow_and_update().clone();
                 let calls_for_ui = calls.clone();
-                let applied_token = applied_token.clone();
                 let closed = weak
                     .upgrade_in_event_loop(move |ui| {
-                        let current = calls_for_ui.video_token();
-                        if update.token != current {
-                            if applied_token.load(Ordering::SeqCst) != current {
-                                ui.set_native_call_participants(ModelRc::new(VecModel::from(
-                                    Vec::<CallParticipantItem>::new(),
-                                )));
-                                applied_token.store(current, Ordering::SeqCst);
-                            }
+                        if update.token == 0 || update.token != calls_for_ui.video_token() {
+                            ui.set_native_audio_route("".into());
+                            ui.set_native_audio_route_notice("".into());
+                            ui.set_native_audio_degraded(false);
                             return;
                         }
-                        ui.set_native_call_participants(ModelRc::new(VecModel::from(members)));
-                        applied_token.store(current, Ordering::SeqCst);
+                        ui.set_native_audio_degraded(route_degraded(&update.route));
+                        ui.set_native_audio_route(route_summary(&update.route).into());
+                        ui.set_native_audio_route_notice(
+                            update.route.notice.map(route_notice).unwrap_or("").into(),
+                        );
                     })
                     .is_err();
-                if closed || roster.changed().await.is_err() {
+                if closed || routes.changed().await.is_err() {
                     break;
                 }
             }
+        });
+    }
+    // Use for this call: the saved catalog IDs (never a label or a display
+    // name) switch the call generation on screen, on this explicit click only.
+    // The reply writes the notice only while that call and this click are
+    // still current and nothing else has replaced the pending text.
+    #[cfg(feature = "native-calls")]
+    {
+        const SWITCHING: &str = "Switching this call's audio…";
+        let calls = calls.clone();
+        let weak = ui.as_weak();
+        let handle = runtime.handle().clone();
+        let clicks = Arc::new(AtomicU64::new(0));
+        ui.on_apply_audio_route_to_call(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if !ui.get_audio_devices_enabled() || ui.get_audio_devices_busy() {
+                return;
+            }
+            let click = clicks.fetch_add(1, Ordering::SeqCst) + 1;
+            // The call itself, not only its generation: a later reply may only
+            // claim a rejoin of this same call.
+            let call = calls.call_token();
+            let token = calls.video_token();
+            if token == 0 || call == 0 || !ui.get_native_call_joined() {
+                ui.set_audio_device_notice(
+                    "No call is in progress, so nothing was switched.".into(),
+                );
+                return;
+            }
+            let selection = audio_devices::selection(&ui);
+            ui.set_audio_device_notice(SWITCHING.into());
+            let calls = calls.clone();
+            let weak = weak.clone();
+            let clicks = clicks.clone();
+            handle.spawn(async move {
+                let result = calls.set_audio_route(token, selection).await;
+                let accepted = result.is_ok();
+                let text = match result {
+                    Ok(()) => "Switch requested. The call page shows which devices are in use.",
+                    Err(CallControllerError::AccountChanged) => {
+                        "The account changed, so this call's audio was not switched."
+                    }
+                    // Nothing was queued and nothing is retried.
+                    Err(CallControllerError::TimedOut(_)) => {
+                        "Switching took too long, so this call's audio was not changed. Choose Use for this call again to retry."
+                    }
+                    Err(_) => "This call cannot switch audio right now, so nothing was changed.",
+                };
+                let calls_for_ui = calls.clone();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    if clicks.load(Ordering::SeqCst) != click
+                        || ui.get_audio_device_notice().as_str() != SWITCHING
+                    {
+                        return;
+                    }
+                    // The pending text always resolves, and once the call on
+                    // screen changed, only to what is still true of this call.
+                    let scope = route_reply_scope(
+                        token,
+                        call,
+                        calls_for_ui.video_token(),
+                        calls_for_ui.call_token(),
+                    );
+                    let text = route_reply_notice(scope, accepted, text);
+                    ui.set_audio_device_notice(text.into());
+                });
+            });
         });
     }
     #[cfg(feature = "native-calls")]
     {
         let calls = calls.clone();
         let weak = ui.as_weak();
-        let applied_token = Arc::new(AtomicU64::new(0));
-        runtime.spawn(async move {
-            let mut video = calls.subscribe_video();
-            loop {
-                let update = video.borrow_and_update().clone();
-                let calls_for_ui = calls.clone();
-                let applied_token = applied_token.clone();
-                let closed = weak
-                    .upgrade_in_event_loop(move |ui| {
-                        let current = calls_for_ui.video_token();
-                        if update.token() != current {
-                            if applied_token.load(Ordering::SeqCst) != current {
-                                clear_native_video(&ui);
-                                applied_token.store(current, Ordering::SeqCst);
-                            }
-                            return;
-                        }
-                        match update {
-                            VideoUpdate::Clear { .. } => clear_native_video(&ui),
-                            VideoUpdate::Frame { pixels, source, .. } => {
-                                ui.set_native_video_frame(slint::Image::from_rgb8(pixels));
-                                ui.set_native_video_source(source.into());
-                                ui.set_native_video_visible(true);
-                            }
-                        }
-                        applied_token.store(current, Ordering::SeqCst);
-                    })
-                    .is_err();
-                if closed || video.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    #[cfg(feature = "native-calls")]
-    {
-        let calls = calls.clone();
-        let weak = ui.as_weak();
-        let applied_token = Arc::new(AtomicU64::new(0));
+        let applied_token = applied_capture_token.clone();
         runtime.spawn(async move {
             let mut capture = calls.subscribe_local_video();
             loop {
@@ -1835,6 +2112,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.as_weak(),
         runtime.handle(),
     );
+    let _room_organizer = room_organization::register(&ui, live.clone(), runtime.handle().clone());
+    let _notification_controls = notification_center::register(
+        &ui,
+        live.clone(),
+        notifications.clone(),
+        store.clone(),
+        runtime.handle(),
+    );
+    // Home invitation cards and the invitations center answer through it.
+    let _invitations = invitations::register(
+        &ui,
+        live.clone(),
+        notifications.clone(),
+        runtime.handle().clone(),
+    );
+    // One silent desktop banner per admitted incoming call of the account on
+    // screen; a click only brings the window back (incoming_ring::desktop).
+    #[cfg(feature = "native-calls")]
+    let call_banners = incoming_ring::desktop::CallBanners::start(
+        &ui,
+        runtime.handle(),
+        incoming_calls.offers(),
+        live.clone(),
+        notifications.clone(),
+    );
 
     let watch = store.watch_with_theme(Duration::from_millis(700));
     let weak = ui.as_weak();
@@ -1861,6 +2163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         shortcuts::apply_config(&ui, &config);
                         audio_devices::apply_config(&ui, &config);
                         image_previews::apply_config(&ui, &config);
+                        room_activity::apply_config(&ui, &config);
                         current_live.voice_spaces.apply_config(&config);
                         match current_store.load_theme(&config) {
                             Ok(theme) => apply_loaded_config(
@@ -2072,6 +2375,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(selected) = selected else {
                 window
                     .set_native_capture_error("Capture source changed; refresh the picker".into());
+                call_bar::capture_error_written();
                 return;
             };
             let source = match kind {
@@ -2085,7 +2389,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let label = safe_capture_label(selected.name.as_str());
+            // This click owns only its own kind's busy flag (beside any other
+            // click of that kind; call_bar::capture_owner_begin) and the
+            // shared error text it clears.
+            let owned_kind = if kind == 0 {
+                CaptureKind::Camera
+            } else {
+                CaptureKind::Screen
+            };
+            let shown = if kind == 0 {
+                window.get_native_camera_busy()
+            } else {
+                window.get_native_screen_busy()
+            };
+            let owner = call_bar::capture_owner_begin(owned_kind, shown);
             window.set_native_capture_error(SharedString::default());
+            let error_written = call_bar::capture_error_written();
             if kind == 0 {
                 window.set_native_camera_busy(true);
             } else {
@@ -2094,20 +2413,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let calls = calls.clone();
             let weak = weak.clone();
             handle.spawn(async move {
-                if let Err(error) = calls.start_video_capture(token, source, label).await {
-                    let _ = weak.upgrade_in_event_loop(move |ui| {
-                        if calls.video_token() == token {
-                            if kind == 0 {
-                                ui.set_native_camera_busy(false);
-                            } else {
-                                ui.set_native_screen_busy(false);
-                            }
-                            ui.set_native_capture_error(
-                                safe_capture_label(&error.to_string()).into(),
-                            );
+                let result = calls.start_video_capture(token, source, label).await;
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    // The click gives up its ownership whatever the outcome.
+                    let rollback = call_bar::capture_owner_end(owned_kind, owner, result.is_err());
+                    let Err(error) = result else { return };
+                    // Only for the same call generation and while no full
+                    // update arrived since the click; the busy flag goes back
+                    // to its kind's authoritative baseline once no other
+                    // click of that kind is pending; the shared error only
+                    // while no newer writer owns it.
+                    if calls.video_token() != token
+                        || rollback == call_bar::CaptureRollback::Superseded
+                    {
+                        return;
+                    }
+                    if let call_bar::CaptureRollback::Restore(busy) = rollback {
+                        if kind == 0 {
+                            ui.set_native_camera_busy(busy);
+                        } else {
+                            ui.set_native_screen_busy(busy);
                         }
-                    });
-                }
+                    }
+                    if call_bar::capture_error_unchanged_since(error_written) {
+                        ui.set_native_capture_error(safe_capture_label(&error.to_string()).into());
+                        call_bar::capture_error_written();
+                    }
+                });
             });
         });
     }
@@ -2132,7 +2464,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if token == 0 {
                 return;
             }
+            // This click owns only its own kind's busy flag (beside any other
+            // click of that kind; call_bar::capture_owner_begin) and the
+            // shared error text it clears.
+            let owned_kind = if kind == 0 {
+                CaptureKind::Camera
+            } else {
+                CaptureKind::Screen
+            };
+            let shown = if kind == 0 {
+                window.get_native_camera_busy()
+            } else {
+                window.get_native_screen_busy()
+            };
+            let owner = call_bar::capture_owner_begin(owned_kind, shown);
             window.set_native_capture_error(SharedString::default());
+            let error_written = call_bar::capture_error_written();
             if kind == 0 {
                 window.set_native_camera_busy(true);
             } else {
@@ -2141,20 +2488,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let calls = calls.clone();
             let weak = weak.clone();
             handle.spawn(async move {
-                if let Err(error) = calls.stop_video_capture(token, capture_kind).await {
-                    let _ = weak.upgrade_in_event_loop(move |ui| {
-                        if calls.video_token() == token {
-                            if kind == 0 {
-                                ui.set_native_camera_busy(false);
-                            } else {
-                                ui.set_native_screen_busy(false);
-                            }
-                            ui.set_native_capture_error(
-                                safe_capture_label(&error.to_string()).into(),
-                            );
+                let result = calls.stop_video_capture(token, capture_kind).await;
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    // The click gives up its ownership whatever the outcome.
+                    let rollback = call_bar::capture_owner_end(owned_kind, owner, result.is_err());
+                    let Err(error) = result else { return };
+                    // Only for the same call generation and while no full
+                    // update arrived since the click; the busy flag goes back
+                    // to its kind's authoritative baseline once no other
+                    // click of that kind is pending; the shared error only
+                    // while no newer writer owns it.
+                    if calls.video_token() != token
+                        || rollback == call_bar::CaptureRollback::Superseded
+                    {
+                        return;
+                    }
+                    if let call_bar::CaptureRollback::Restore(busy) = rollback {
+                        if kind == 0 {
+                            ui.set_native_camera_busy(busy);
+                        } else {
+                            ui.set_native_screen_busy(busy);
                         }
-                    });
-                }
+                    }
+                    if call_bar::capture_error_unchanged_since(error_written) {
+                        ui.set_native_capture_error(safe_capture_label(&error.to_string()).into());
+                        call_bar::capture_error_written();
+                    }
+                });
             });
         });
     }
@@ -2293,6 +2653,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = weak.upgrade() {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
+            space_explorer::clear(&ui);
+            space_management::clear(&ui);
+            room_addresses::clear(&ui);
+            matrix_links::clear(&ui);
+            thread_browser::withdraw(&ui);
+            withdraw_call_bar(&ui);
         }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
@@ -2332,6 +2698,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let room_handle = runtime.handle().clone();
     ui.on_open_room(move |room_id| {
         if let Some(ui) = weak.upgrade() {
+            room_addresses::clear(&ui);
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
         }
@@ -2345,7 +2712,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             window.invoke_cancel_room_settings();
             let navigation_epoch = room_live.invalidate_navigation();
-            reset_room_search(&window);
+            message_search::room_changed(&window, false);
             let live = room_live.clone();
             let ui = weak.clone();
             room_handle.spawn(async move {
@@ -2387,7 +2754,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if !voice_live.is_live.load(Ordering::Acquire) {
             window.invoke_open_room(room_id);
-            window.set_page(2);
+            matrix_links::clear(&window);
+            thread_browser::withdraw(&window);
+            window.invoke_navigate_page(2);
             return;
         }
         let account_id = window.get_active_account_local_id().to_string();
@@ -2407,7 +2776,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         window.invoke_cancel_room_settings();
         let navigation_epoch = voice_live.invalidate_navigation();
-        reset_room_search(&window);
+        message_search::room_changed(&window, false);
         let live = voice_live.clone();
         let weak = weak.clone();
         #[cfg(feature = "native-calls")]
@@ -2425,7 +2794,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             return;
                         }
-                        window.set_page(2);
+                        matrix_links::clear(&window);
+                        thread_browser::withdraw(&window);
+                        window.invoke_navigate_page(2);
                         #[cfg(feature = "native-calls")]
                         if !calls.status().blocks_account_switch() {
                             // Joining publishes membership in the room slot;
@@ -2601,6 +2972,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if account_id.is_empty() || room_id.is_empty() {
             return;
         }
+        // Bind the click before spawning: account IDs alone cannot detect
+        // switching away and back before the worker first polls.
+        let Some(selection) = history_live.manager.account_selection(&account_id) else {
+            return;
+        };
+        // A conversation focused on an older message pages exactly the view
+        // shown at this click, never a view loaded or shown since.
+        let focused = if window.get_conversation_focused() {
+            let Some(view) = history_live.focused_view(&room_id) else {
+                return;
+            };
+            Some(view)
+        } else {
+            None
+        };
         let operation = window.get_history_operation().wrapping_add(1);
         window.set_history_operation(operation);
         window.set_history_loading(true);
@@ -2608,12 +2994,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let live = history_live.clone();
         let weak = weak.clone();
         history_handle.spawn(async move {
-            let result = live
-                .manager
-                .paginate_backwards_for(&account_id, &room_id, 50)
-                .await;
+            let manager = &live.manager;
+            let result = if let Some(view) = &focused {
+                manager
+                    .paginate_focused_selected(&selection, view, true, 50)
+                    .await
+            } else {
+                manager
+                    .paginate_backwards_selected(&selection, &room_id, 50)
+                    .await
+            };
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
+                if !selection.is_current()
+                    || window.get_active_account_local_id().as_str() != account_id
                     || window.get_active_room_id().as_str() != room_id
                     || window.get_history_operation() != operation
                 {
@@ -2653,243 +3046,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    let weak = ui.as_weak();
-    let member_action_live = live.clone();
-    let member_action_handle = runtime.handle().clone();
-    ui.on_submit_member_action(move |kind, user_id, value| {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !member_action_live.is_live.load(Ordering::Acquire) || window.get_member_action_busy() {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        let user_id = user_id.trim().to_owned();
-        if account_id.is_empty() || room_id.is_empty() || user_id.is_empty() {
-            window.set_member_action_error("Choose a room and enter a Matrix user ID".into());
-            return;
-        }
-        let label = match kind {
-            0 => "invite",
-            1 => "kick",
-            2 => "ban",
-            3 => "unban",
-            4 => "change power for",
-            _ => return,
-        };
-        let value = value.to_string();
-        let power_level = if kind == 4 {
-            match value.trim().parse::<i64>() {
-                Ok(level) => Some(level),
-                Err(_) => {
-                    window.set_member_action_error("Enter a whole-number power level".into());
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let operation = window.get_member_action_operation().wrapping_add(1);
-        window.set_member_action_operation(operation);
-        window.set_member_action_busy(true);
-        window.set_member_action_error("".into());
-        window.set_member_action_notice("".into());
-        let navigation_epoch = member_action_live.current_navigation_epoch();
-        let live = member_action_live.clone();
-        let weak = weak.clone();
-        member_action_handle.spawn(async move {
-            // A room or account switch can invalidate the action before its
-            // Tokio task reaches the network. The core checks the account ID
-            // again while it holds the selection lock.
-            if !live.navigation_is_current(navigation_epoch) {
-                return;
-            }
-            let manager = live.manager.clone();
-            let result = match kind {
-                0 => {
-                    manager
-                        .invite_user_for(&account_id, &room_id, &user_id)
-                        .await
-                }
-                1 => {
-                    manager
-                        .kick_user_for(&account_id, &room_id, &user_id, None)
-                        .await
-                }
-                2 => {
-                    manager
-                        .ban_user_for(&account_id, &room_id, &user_id, None)
-                        .await
-                }
-                3 => {
-                    manager
-                        .unban_user_for(&account_id, &room_id, &user_id, None)
-                        .await
-                }
-                4 => {
-                    manager
-                        .set_member_power_level_for(
-                            &account_id,
-                            &room_id,
-                            &user_id,
-                            power_level.expect("parsed for power action"),
-                        )
-                        .await
-                }
-                _ => return,
-            };
-            if result.is_ok() && live.navigation_is_current(navigation_epoch) {
-                // The SDK member snapshot may still contain the previous
-                // sync state immediately after the homeserver accepts a
-                // change. Wait briefly for the target state before repainting.
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-                loop {
-                    if !live.navigation_is_current(navigation_epoch) {
-                        break;
-                    }
-                    let settled = manager
-                        .room_members_for(&account_id, &room_id)
-                        .await
-                        .ok()
-                        .is_some_and(|members| {
-                            let member = members.iter().find(|member| member.user_id == user_id);
-                            match kind {
-                                0 => member.is_some_and(|member| {
-                                    member.membership == "invite" || member.membership == "join"
-                                }),
-                                1 | 3 => member.is_none(),
-                                2 => member.is_some_and(|member| member.membership == "ban"),
-                                4 => member.is_some_and(|member| member.power_level == power_level),
-                                _ => false,
-                            }
-                        });
-                    if settled || tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                }
-                live.refresh_members_for(account_id.clone(), room_id.clone(), weak.clone(), true)
-                    .await;
-            }
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                    || window.get_member_action_operation() != operation
-                {
-                    return;
-                }
-                window.set_member_action_busy(false);
-                match result {
-                    Ok(()) => {
-                        if kind == 0 && window.get_member_invite_user_id().as_str() == user_id {
-                            window.set_member_invite_user_id("".into());
-                        }
-                        if kind != 0 && kind != 4 {
-                            window.set_member_selected_user_id("".into());
-                        }
-                        window.set_member_action_notice(
-                            format!("Room member action completed: {label} {user_id}").into(),
-                        );
-                        window.set_member_action_error("".into());
-                    }
-                    Err(error) => {
-                        window.set_member_action_error(
-                            directory_plain_text(
-                                &format!("Could not {label} {user_id}: {error}"),
-                                240,
-                            )
-                            .into(),
-                        );
-                    }
-                }
-            });
-        });
-    });
-
-    let weak = ui.as_weak();
-    let admin_live = live.clone();
-    let admin_handle = runtime.handle().clone();
-    let admin_settings = room_settings.clone();
-    ui.on_submit_room_admin(move |kind, value, _reason| {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if matches!(kind, 0 | 1) {
-            admin_settings.save_text(&window, kind, value.to_string());
-            return;
-        }
-        if kind != 2
-            || !window.get_room_admin_open()
-            || window.get_room_admin_mode() != 2
-            || !admin_live.is_live.load(Ordering::Acquire)
-            || window.get_room_admin_busy()
-        {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        if account_id.is_empty()
-            || room_id.is_empty()
-            || window.get_room_admin_account_id().as_str() != account_id
-            || window.get_room_admin_room_id().as_str() != room_id
-        {
-            window
-                .set_room_admin_error("Room or account changed. Reopen message redaction.".into());
-            return;
-        }
-        if value.is_empty() || window.get_room_admin_event_id() != value {
-            window.set_room_admin_error("Choose a message to redact".into());
-            return;
-        }
-        let value = value.to_string();
-        let operation = window.get_room_admin_operation().wrapping_add(1);
-        window.set_room_admin_operation(operation);
-        window.set_room_admin_busy(true);
-        window.set_room_admin_error("".into());
-        window.set_room_admin_notice("".into());
-        let navigation_epoch = admin_live.current_navigation_epoch();
-        let live = admin_live.clone();
-        let weak = weak.clone();
-        admin_handle.spawn(async move {
-            if !live.navigation_is_current(navigation_epoch) {
-                return;
-            }
-            let result = live
-                .manager
-                .redact_message_for(&account_id, &room_id, &value, None)
-                .await;
-            let refresh = result.is_ok() && live.navigation_is_current(navigation_epoch);
-            let error = result.err().map(|error| {
-                directory_plain_text(&format!("Could not redact message: {error}"), 240)
-            });
-            let completion_live = live.clone();
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if !window.get_room_admin_open()
-                    || window.get_room_admin_mode() != 2
-                    || !completion_live.navigation_is_current(navigation_epoch)
-                    || window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                    || window.get_room_admin_account_id().as_str() != account_id
-                    || window.get_room_admin_room_id().as_str() != room_id
-                    || window.get_room_admin_event_id().as_str() != value
-                    || window.get_room_admin_operation() != operation
-                {
-                    return;
-                }
-                window.set_room_admin_busy(false);
-                if let Some(error) = error {
-                    window.set_room_admin_error(error.into());
-                } else {
-                    window.set_room_admin_notice("Message redacted".into());
-                    window.set_room_admin_event_id("".into());
-                }
-            });
-            if refresh {
-                let _ = live.refresh(weak).await;
-            }
-        });
-    });
+    // Member actions and message redaction, each owned by what it was
+    // confirmed in (moderation_ui); the room name and topic of the shared
+    // admin callback stay with the room settings form.
+    let room_text = room_settings.clone();
+    let moderation = moderation_ui::ModerationUi::register(
+        &ui,
+        live.clone(),
+        runtime.handle(),
+        manager.clone(),
+        move |window, kind, value| room_text.save_text(window, kind, value),
+    );
 
     let weak = ui.as_weak();
     ui.on_open_discovery(move || {
@@ -2900,148 +3067,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let weak = ui.as_weak();
-    let search_live = live.clone();
-    let search_handle = runtime.handle().clone();
-    ui.on_query_room_messages(move || {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !search_live.is_live.load(Ordering::Acquire) {
-            window.set_room_search_error("Sign in to search messages".into());
-            return;
-        }
-        if window.get_room_search_loading() {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        if account_id.is_empty() || room_id.is_empty() {
-            window.set_room_search_error("Choose a Matrix room first".into());
-            return;
-        }
-        let query = window.get_room_search_query().trim().to_owned();
-        if query.is_empty() {
-            window.set_room_search_error("Enter a word or phrase to search".into());
-            return;
-        }
-        let operation = window.get_room_search_operation().wrapping_add(1);
-        window.set_room_search_operation(operation);
-        window.set_room_search_context_operation(
-            window.get_room_search_context_operation().wrapping_add(1),
-        );
-        window.set_room_search_loading(true);
-        window.set_room_search_searched(false);
-        window.set_room_search_error("".into());
-        window.set_room_search_context_error("".into());
-        window.set_room_search_context_loading(false);
-        window.set_room_search_selected_event_id("".into());
-        window.set_room_search_selected_sender("".into());
-        window.set_room_search_selected_time("".into());
-        window.set_room_search_selected_body("".into());
-        window.set_room_search_results(ModelRc::new(VecModel::from(
-            Vec::<MessageSearchItem>::new(),
-        )));
-        window.set_room_search_context(ModelRc::new(VecModel::from(
-            Vec::<MessageSearchItem>::new(),
-        )));
-        let manager = search_live.manager.clone();
-        let weak = weak.clone();
-        search_handle.spawn(async move {
-            let result = tokio::time::timeout(
-                Duration::from_secs(30),
-                manager.search_messages_for(&account_id, &room_id, &query, 25, 0),
-            )
-            .await
-            .map_err(|_| "Message search timed out".to_owned())
-            .and_then(|result| result.map_err(|error| error.to_string()));
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                    || window.get_room_search_operation() != operation
-                    || !window.get_live_session()
-                {
-                    return;
-                }
-                window.set_room_search_loading(false);
-                window.set_room_search_searched(true);
-                match result {
-                    Ok(results) => window.set_room_search_results(ModelRc::new(VecModel::from(
-                        results
-                            .into_iter()
-                            .map(search_result_item)
-                            .collect::<Vec<_>>(),
-                    ))),
-                    Err(error) => {
-                        window.set_room_search_error(directory_plain_text(&error, 220).into())
-                    }
-                }
-            });
-        });
-    });
-
-    let weak = ui.as_weak();
-    let context_live = live.clone();
-    let context_handle = runtime.handle().clone();
-    ui.on_open_search_result(move |event_id| {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !context_live.is_live.load(Ordering::Acquire) {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        if account_id.is_empty()
-            || room_id.is_empty()
-            || !window
-                .get_room_search_results()
-                .iter()
-                .any(|result| result.room_id.as_str() == room_id && result.event_id == event_id)
-        {
-            return;
-        }
-        let event_id = event_id.to_string();
-        let operation = window.get_room_search_context_operation().wrapping_add(1);
-        window.set_room_search_context_operation(operation);
-        window.set_room_search_context_loading(true);
-        window.set_room_search_context_error("".into());
-        window.set_room_search_context(ModelRc::new(VecModel::from(
-            Vec::<MessageSearchItem>::new(),
-        )));
-        let manager = context_live.manager.clone();
-        let weak = weak.clone();
-        context_handle.spawn(async move {
-            let result = tokio::time::timeout(
-                Duration::from_secs(30),
-                manager.search_result_context_for(&account_id, &room_id, &event_id, 3),
-            )
-            .await
-            .map_err(|_| "Message context timed out".to_owned())
-            .and_then(|result| result.map_err(|error| error.to_string()));
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                    || window.get_room_search_selected_event_id().as_str() != event_id
-                    || window.get_room_search_context_operation() != operation
-                    || !window.get_live_session()
-                {
-                    return;
-                }
-                window.set_room_search_context_loading(false);
-                match result {
-                    Ok(context) => window.set_room_search_context(ModelRc::new(VecModel::from(
-                        context
-                            .into_iter()
-                            .map(|message| search_context_item(message, &room_id))
-                            .collect::<Vec<_>>(),
-                    ))),
-                    Err(error) => window
-                        .set_room_search_context_error(directory_plain_text(&error, 220).into()),
-                }
-            });
-        });
-    });
+    message_search::register(&ui, live.clone(), runtime.handle().clone());
+    space_explorer::register(&ui, live.clone(), runtime.handle().clone());
+    room_creation::register(&ui, live.clone(), runtime.handle().clone());
+    matrix_links::register(&ui, live.clone(), runtime.handle().clone());
+    space_management::register(&ui, live.clone(), runtime.handle().clone());
+    room_addresses::register(&ui, live.clone(), runtime.handle().clone());
+    thread_history::register(&ui, live.clone(), runtime.handle().clone());
+    thread_browser::register(&ui, live.clone(), runtime.handle().clone());
+    account_identity::register(&ui, live.clone(), runtime.handle().clone());
+    people_directory::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let directory_live = live.clone();
@@ -3132,11 +3167,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
+    // A directory join has no Cancel button, but leaving its page or
+    // replacing it with a protected modal still withdraws this exact owner.
+    let directory_join: JoinSlot = Arc::default();
+    let room_join: JoinSlot = Arc::default();
+    register_join_cancellation(&ui, room_join.clone(), directory_join.clone());
     let weak = ui.as_weak();
     let directory_live = live.clone();
     let directory_handle = runtime.handle().clone();
+    let directory_slot = directory_join.clone();
     ui.on_join_discovery_target(
-        move |input, canonical_alias, route_server, display_name, is_space| {
+        move |input, canonical_alias, route_server, _display_name, _is_space| {
             let Some(window) = weak.upgrade() else {
                 return;
             };
@@ -3147,11 +3188,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if window.get_directory_join_busy() {
                 return;
             }
-            let account_id = window.get_active_account_local_id().to_string();
-            if account_id.is_empty() {
-                window.set_directory_join_error("Choose a Matrix account first".into());
+            if !window.get_discovery_context_allowed()
+                || window.get_page() != 3
+                || window.get_room_actions_open()
+                || space_explorer::is_open(&window)
+                || directory_live.security_gate.blocked()
+            {
                 return;
             }
+            // A complete Matrix user ID opens Start a conversation for that
+            // person; nothing is joined or created from here.
+            if let Some(user) = morpheus_matrix::exact_user_id(&input) {
+                window.invoke_open_people(user.into());
+                return;
+            }
+            let account_id = window.get_active_account_local_id().to_string();
+            // The exact account shown at the click: an account switch before
+            // the request is sent cancels it, and a switch back never revives it.
+            let Some(selection) = directory_live
+                .manager
+                .account_selection(&account_id)
+                .filter(morpheus_matrix::AccountSelection::is_current)
+            else {
+                window.set_directory_join_error("Choose a Matrix account first".into());
+                return;
+            };
             let target = match room_join_target(&input, &canonical_alias, &route_server) {
                 Ok(target) => target,
                 Err(error) => {
@@ -3159,32 +3220,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
+            // The navigation and security generations at this click.
+            let asked = directory_live.join_asked();
             let operation = window.get_directory_join_operation().wrapping_add(1);
+            let previous = directory_slot
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .replace((operation, asked.clone()));
+            if let Some((_, previous)) = previous {
+                previous.withdraw();
+            }
             window.set_directory_join_operation(operation);
             window.set_directory_join_error("".into());
             window.set_directory_join_busy(true);
             window.set_directory_joining_room_id(input.clone());
-            let space_hint = (!display_name.is_empty()).then_some(is_space);
+            // Whether it is a Space is read from sync once it is joined, not
+            // from the directory's display fields.
             let live = directory_live.clone();
             let weak = weak.clone();
+            let directory_slot = directory_slot.clone();
             directory_handle.spawn(async move {
+                // This caller bound includes SDK metadata setup as well as
+                // the final POST. Its classification follows SDK admission,
+                // which cannot establish that bytes reached the wire.
                 let result = tokio::time::timeout(
                     Duration::from_secs(60),
-                    live.join_matrix_target(
-                        &account_id,
-                        &target,
-                        space_hint,
-                        &display_name,
-                        weak.clone(),
-                    ),
+                    live.join_target_for(&selection, &target, &asked, weak.clone()),
                 )
                 .await
-                .map_err(|_| {
-                    "Join timed out. It may have completed; refresh your rooms before retrying."
-                        .to_owned()
-                })
-                .and_then(|result| result.map_err(|error| error.to_string()));
+                .map_err(|_| asked.expired().to_string())
+                .and_then(|result| result.map(|_| ()).map_err(|error| error.to_string()));
                 let _ = weak.upgrade_in_event_loop(move |window| {
+                    let mut slot = directory_slot
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if slot.as_ref().is_some_and(|(owner, _)| *owner == operation) {
+                        *slot = None;
+                    }
+                    drop(slot);
                     if window.get_active_account_local_id().as_str() != account_id
                         || window.get_directory_join_operation() != operation
                     {
@@ -3196,7 +3269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(()) => {
                             window.set_directory_join_input("".into());
                             if window.get_page() == 3 {
-                                window.set_page(0);
+                                window.invoke_navigate_page(0);
                             }
                         }
                         Err(error) => window.set_directory_join_error(error.into()),
@@ -3209,10 +3282,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let action_live = live.clone();
     let action_handle = runtime.handle().clone();
+    let join_slot = room_join.clone();
     ui.on_submit_room_action(move |mode, input| {
         let Some(window) = weak.upgrade() else {
             return;
         };
+        // Create room and Create Space use the planned, single-send creation
+        // and its owned open (room_creation.rs); only Join stays here.
+        if mode == 0 || mode == 2 {
+            room_creation::submit(&window, &action_live, &action_handle);
+            return;
+        }
+        if mode != 1 {
+            return;
+        }
         if !action_live.is_live.load(Ordering::Acquire) {
             window.set_room_action_error("Sign in to a Matrix account first".into());
             return;
@@ -3220,12 +3303,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if window.get_room_action_busy() {
             return;
         }
-        let action = match mode {
-            0 => Some(RoomAction::CreatePrivate),
-            1 => None,
-            2 => Some(RoomAction::CreateSpace),
-            _ => return,
-        };
+        if !window.get_discovery_context_allowed()
+            || !window.get_room_actions_open()
+            || space_explorer::is_open(&window)
+            || action_live.security_gate.blocked()
+        {
+            return;
+        }
+        // Joining by a user's Matrix ID means talking to them: open Start a
+        // conversation for that exact person instead of failing.
+        if let Some(user) = morpheus_matrix::exact_user_id(&input) {
+            window.set_room_actions_open(false);
+            window.invoke_open_people(user.into());
+            return;
+        }
         let account_id = window.get_active_account_local_id().to_string();
         if account_id.is_empty() {
             window.set_room_action_error("Choose a Matrix account first".into());
@@ -3238,19 +3329,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let live = action_live.clone();
         let weak = weak.clone();
         let submitted = input.to_string();
+        // A join is bound to the exact account shown at the click, and to
+        // the navigation and security generations at it.
+        let selection = action_live
+            .manager
+            .account_selection(&account_id)
+            .filter(morpheus_matrix::AccountSelection::is_current);
+        let asked = action_live.join_asked();
+        *join_slot.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some((operation, asked.clone()));
+        let join_slot = join_slot.clone();
         action_handle.spawn(async move {
-            let result = match action {
-                Some(action) => live
-                    .run_room_action(&account_id, action, &submitted, weak.clone())
+            let result = match (room_join_target(&submitted, "", ""), selection) {
+                (Ok(target), Some(selection)) => live
+                    .join_target_for(&selection, &target, &asked, weak.clone())
                     .await
+                    .map(|_| ())
                     .map_err(|error| error.to_string()),
-                None => match room_join_target(&submitted, "", "") {
-                    Ok(target) => live
-                        .join_matrix_target(&account_id, &target, None, "", weak.clone())
-                        .await
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error),
-                },
+                (Ok(_), None) => Err(morpheus_matrix::JoinError::AccountChanged.to_string()),
+                (Err(error), _) => Err(error),
             };
             let _ = weak.upgrade_in_event_loop(move |window| {
                 if window.get_active_account_local_id().as_str() != account_id
@@ -3258,56 +3355,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     return;
                 }
+                let mut slot = join_slot.lock().unwrap_or_else(|error| error.into_inner());
+                if slot.as_ref().is_some_and(|(owner, _)| *owner == operation) {
+                    *slot = None;
+                }
+                drop(slot);
                 window.set_room_action_busy(false);
                 match result {
                     Ok(()) => {
                         window.set_room_actions_open(false);
                         window.set_room_action_input("".into());
-                        window.set_page(0);
+                        window.invoke_navigate_page(0);
                     }
                     Err(error) => window.set_room_action_error(error.into()),
-                }
-            });
-        });
-    });
-
-    let weak = ui.as_weak();
-    let invite_live = live.clone();
-    let invite_handle = runtime.handle().clone();
-    ui.on_respond_invite(move |room_id, accept| {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !invite_live.is_live.load(Ordering::Acquire) {
-            window.set_invite_error("Sign in to respond to invitations".into());
-            return;
-        }
-        if window.get_room_action_busy() {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        if account_id.is_empty() {
-            return;
-        }
-        let operation = window.get_room_action_operation().wrapping_add(1);
-        window.set_room_action_operation(operation);
-        window.set_room_action_busy(true);
-        window.set_invite_error("".into());
-        let live = invite_live.clone();
-        let weak = weak.clone();
-        invite_handle.spawn(async move {
-            let result = live
-                .respond_to_invite(&account_id, &room_id, accept, weak.clone())
-                .await;
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
-                    || window.get_room_action_operation() != operation
-                {
-                    return;
-                }
-                window.set_room_action_busy(false);
-                if let Err(error) = result {
-                    window.set_invite_error(error.to_string().into());
                 }
             });
         });
@@ -3354,275 +3414,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let composer_ui =
         composer_mentions::ui::ComposerUi::install(&ui, live.clone(), runtime.handle().clone());
+    // Callbacks own the controller; picker state ends with its selection.
+    let _stickers = stickers::register(&ui, live.clone(), runtime.handle().clone());
+    polls::register(&ui, live.clone(), runtime.handle().clone());
 
-    let weak = ui.as_weak();
-    let attach_live = live.clone();
-    let attach_uploads = uploads.clone();
-    let attach_handle = runtime.handle().clone();
-    ui.on_attach_file(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        if !attach_live.is_live.load(Ordering::Acquire)
-            || ui.get_active_room_id().is_empty()
-            || ui.get_composer_mode() != 0
-            || ui.get_attachment_busy()
-        {
-            return;
-        }
-        let account_id = ui.get_active_account_local_id().to_string();
-        let room_id = ui.get_active_room_id().to_string();
-        // The system picker runs modally on the Slint UI thread, which is
-        // required by macOS AppKit. Network and file reads stay on Tokio.
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Choose an attachment")
-            .pick_file()
-        else {
-            return;
-        };
-        if ui.get_active_account_local_id().as_str() != account_id
-            || ui.get_active_room_id().as_str() != room_id
-        {
-            return;
-        }
-        let filename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "attachment".into());
-        let mime_type = mime_type_for(&path);
-        let operation = ui.get_attachment_operation().wrapping_add(1);
-        ui.set_attachment_operation(operation);
-        ui.set_attachment_busy(true);
-        ui.set_attachment_status(format!("Preparing {filename}…").into());
-        ui.set_transfer_notice("".into());
-        let mut commands = attach_uploads.begin(operation);
-        let live = attach_live.clone();
-        let weak = weak.clone();
-        let uploads = attach_uploads.clone();
-        attach_handle.spawn(async move {
-            let result = live
-                .send_attachment(&account_id, &room_id, path, &mime_type)
-                .await;
-            let mut queued = match result {
-                Ok(queued) => queued,
-                Err(error) => {
-                    uploads.finish(operation);
-                    post_upload_completion(
-                        &weak,
-                        account_id,
-                        room_id,
-                        operation,
-                        Err(format!("Could not attach {filename}: {error}")),
-                    );
-                    return;
-                }
-            };
-            loop {
-                tokio::select! {
-                    biased;
-                    command = commands.recv() => match command {
-                        Some(UploadCommand::Cancel) => match queued.abort().await {
-                            Ok(true) => {
-                                uploads.finish(operation);
-                                post_upload_completion(
-                                    &weak, account_id, room_id, operation,
-                                    Ok(format!("Cancelled {filename}")),
-                                );
-                                return;
-                            }
-                            Ok(false) => {
-                                uploads.finish(operation);
-                                post_upload_completion(
-                                    &weak, account_id, room_id, operation,
-                                    Ok(format!("{filename} was already sent")),
-                                );
-                                return;
-                            }
-                            Err(error) => post_upload_progress(
-                                &weak, account_id.clone(), room_id.clone(), operation,
-                                format!("Could not cancel {filename}: {error}"), true,
-                            ),
-                        },
-                        Some(UploadCommand::Retry) => match queued.retry_wedged().await {
-                            Ok(()) => post_upload_progress(
-                                &weak, account_id.clone(), room_id.clone(), operation,
-                                format!("Retrying {filename}…"), false,
-                            ),
-                            Err(error) => post_upload_progress(
-                                &weak, account_id.clone(), room_id.clone(), operation,
-                                format!("Could not retry {filename}: {error}"), true,
-                            ),
-                        },
-                        None => return,
-                    },
-                    update = queued.next_update() => match update {
-                        AttachmentSendUpdate::Progress { current, total } => {
-                            let percent = if total == 0 { 0 } else { current.min(total) * 100 / total };
-                            post_upload_progress(
-                                &weak,
-                                account_id.clone(),
-                                room_id.clone(),
-                                operation,
-                                format!("Uploading {filename} · {percent}%"),
-                                false,
-                            );
-                        }
-                        AttachmentSendUpdate::Sent { .. } => {
-                            uploads.finish(operation);
-                            post_upload_completion(
-                                &weak,
-                                account_id,
-                                room_id,
-                                operation,
-                                Ok(format!("Sent {filename}")),
-                            );
-                            return;
-                        }
-                        AttachmentSendUpdate::Retained { recoverable } => {
-                            let status = if recoverable {
-                                format!("{filename} is queued; waiting to retry…")
-                            } else {
-                                format!("{filename} send paused; retry or cancel this upload")
-                            };
-                            post_upload_progress(
-                                &weak, account_id.clone(), room_id.clone(), operation,
-                                status, !recoverable,
-                            );
-                        }
-                        AttachmentSendUpdate::Cancelled => {
-                            uploads.finish(operation);
-                            post_upload_completion(
-                                &weak, account_id, room_id, operation,
-                                Ok(format!("Cancelled {filename}")),
-                            );
-                            return;
-                        }
-                        AttachmentSendUpdate::Unknown => {
-                            uploads.finish(operation);
-                            post_upload_completion(
-                                &weak,
-                                account_id,
-                                room_id,
-                                operation,
-                                Err(format!("Could not confirm {filename}; the queued upload may still send. Check the room before another upload")),
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-    });
-
-    let weak = ui.as_weak();
-    let cancel_uploads = uploads.clone();
-    ui.on_cancel_attachment(move || {
-        if let Some(ui) = weak.upgrade() {
-            if ui.get_attachment_busy() && cancel_uploads.cancel(ui.get_attachment_operation()) {
-                ui.set_attachment_status("Cancelling attachment…".into());
-            }
-        }
-    });
-
-    let weak = ui.as_weak();
-    let retry_uploads = uploads.clone();
-    ui.on_retry_attachment(move || {
-        if let Some(ui) = weak.upgrade() {
-            if ui.get_attachment_busy()
-                && ui.get_attachment_needs_retry()
-                && retry_uploads.retry(ui.get_attachment_operation())
-            {
-                ui.set_attachment_status("Retrying queued attachment…".into());
-                ui.set_attachment_needs_retry(false);
-            }
-        }
-    });
-
-    let weak = ui.as_weak();
-    let save_live = live.clone();
-    let save_handle = runtime.handle().clone();
-    ui.on_save_attachment(move |event_id, filename| {
-        let Some(ui) = weak.upgrade() else { return };
-        if !save_live.is_live.load(Ordering::Acquire)
-            || event_id.is_empty()
-            || !ui.get_downloading_event_id().is_empty()
-        {
-            return;
-        }
-        let account_id = ui.get_active_account_local_id().to_string();
-        let room_id = ui.get_active_room_id().to_string();
-        let event_id = event_id.to_string();
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Save attachment")
-            .set_file_name(filename.to_string())
-            .save_file()
-        else {
-            return;
-        };
-        if ui.get_active_account_local_id().as_str() != account_id
-            || ui.get_active_room_id().as_str() != room_id
-        {
-            return;
-        }
-        let operation = ui.get_download_operation().wrapping_add(1);
-        ui.set_download_operation(operation);
-        ui.set_downloading_event_id(event_id.clone().into());
-        ui.set_transfer_notice("Downloading and decrypting attachment…".into());
-        let live = save_live.clone();
-        let weak = weak.clone();
-        save_handle.spawn(async move {
-            let result = async {
-                let downloaded = live
-                    .download_attachment(&account_id, &room_id, &event_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                // The final account and room guard is held through the local
-                // write, so navigation cannot race the plaintext save.
-                live.save_download_to(&account_id, &room_id, path, downloaded.bytes)
-                    .await
-                    .map_err(|error| error.to_string())
-            }
-            .await;
-            let _ = weak.upgrade_in_event_loop(move |ui| {
-                if ui.get_active_account_local_id().as_str() != account_id
-                    || ui.get_active_room_id().as_str() != room_id
-                    || ui.get_download_operation() != operation
-                    || ui.get_downloading_event_id().as_str() != event_id
-                {
-                    return;
-                }
-                ui.set_downloading_event_id("".into());
-                match result {
-                    Ok(path) => {
-                        let name = path.file_name().unwrap_or_default().to_string_lossy();
-                        ui.set_transfer_notice(format!("Saved {name}").into());
-                    }
-                    Err(error) => {
-                        ui.set_transfer_notice("".into());
-                        ui.set_session_error(format!("Could not save attachment: {error}").into());
-                    }
-                }
-            });
-        });
-    });
+    // Its callbacks hold the attachment workbench for the window's lifetime.
+    let _attachments =
+        attachment_workbench::Workbench::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let send_state = state.clone();
     let send_live = live.clone();
     let send_handle = runtime.handle().clone();
     let send_composers = composer_ui.clone();
+    let link_weak = ui.as_weak();
+    let link_live = live.clone();
+    let link_handle = runtime.handle().clone();
     ui.on_open_message_link(move |link| {
-        if let Some(url) = safe_message_url(link.as_str()) {
-            thread::spawn(move || {
-                let accepted = rfd::MessageDialog::new()
-                    .set_title("Open external link?")
-                    .set_description(format!("The message links to:\n\n{url}"))
-                    .set_buttons(rfd::MessageButtons::OkCancel)
-                    .show()
-                    == rfd::MessageDialogResult::Ok;
-                if accepted {
-                    let _ = webbrowser::open(&url);
-                }
-            });
+        // A Matrix link opens inside Morpheus and never reaches the browser
+        // by itself; any other link keeps the external-link confirmation.
+        if let Some(window) = link_weak.upgrade()
+            && matrix_links::open(&window, &link_live, &link_handle, link.as_str())
+        {
+            return;
         }
+        confirm_external_link(link.as_str());
     });
     ui.on_send_message(move |body| {
         let submitted_text = body.to_string();
@@ -3648,6 +3464,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_composer_operation(operation);
         ui.set_composer_busy(true);
         if send_live.is_live.load(Ordering::Acquire) {
+            // A sent message appears in the live conversation.
+            ui.invoke_return_to_live();
             send_composers.send(&ui, &send_live, &send_handle, false);
             return;
         }
@@ -3804,14 +3622,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let draft = thread_live.composed_draft(&account_id, &room_id, Some(&event_id));
             ui.set_thread_composer_text(draft.body.into());
             ui.set_thread_markdown(draft.format == TextFormat::Markdown);
-            ui.set_thread_send_pending(thread_live.thread_send_pending(
-                &account_id,
-                &room_id,
-                &event_id,
-            ));
-            if ui.get_thread_send_pending() {
+            let summary = thread_live.pending_summary(&account_id, &room_id, Some(&event_id));
+            let items = thread_live.pending_items(&account_id, &room_id, Some(&event_id));
+            draft_recovery::publish_thread(&ui, &summary, &items);
+            if summary.unconfirmed {
                 ui.set_transfer_notice(
-                    "Thread reply is queued or unconfirmed; it may still send".into(),
+                    "A reply here may not have finished sending before Morpheus closed. Check the thread, then choose.".into(),
+                );
+            } else if summary.quarantined || summary.read_only {
+                ui.set_transfer_notice(
+                    "Saved send status for this thread needs review before replying.".into(),
+                );
+            } else if summary.count > 0 {
+                ui.set_transfer_notice(
+                    "A thread reply is still waiting to send; it may still send".into(),
                 );
             }
             let live = thread_live.clone();
@@ -3853,6 +3677,197 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let live = close_live.clone();
         let generation = live.begin_thread_request();
         close_handle.spawn(async move { live.clear_thread_if_current(generation).await });
+    });
+
+    // Saved-send controls act on the exact record, selection and edit
+    // revision the user clicked on, all captured synchronously here; every
+    // later step re-checks them before changing anything.
+    let weak = ui.as_weak();
+    let pending_live = live.clone();
+    let pending_handle = runtime.handle().clone();
+    ui.on_cancel_pending_send(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !pending_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = pending_live.account_selection(&scope.account) else {
+            return;
+        };
+        let Some(target) = pending_live.request_target(&scope, &nonce) else {
+            return;
+        };
+        let live = pending_live.clone();
+        let weak = weak.clone();
+        pending_handle.spawn(async move {
+            live.cancel_pending_send(selection, scope, target, weak)
+                .await
+        });
+    });
+    let weak = ui.as_weak();
+    let retry_live = live.clone();
+    let retry_handle = runtime.handle().clone();
+    ui.on_retry_pending_send(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !retry_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = retry_live.account_selection(&scope.account) else {
+            return;
+        };
+        let Some(target) = retry_live.request_target(&scope, &nonce) else {
+            return;
+        };
+        let live = retry_live.clone();
+        let weak = weak.clone();
+        retry_handle.spawn(async move {
+            live.retry_pending_send(selection, scope, target, weak)
+                .await
+        });
+    });
+    let weak = ui.as_weak();
+    let review_live = live.clone();
+    let review_handle = runtime.handle().clone();
+    ui.on_review_unconfirmed_send(move |threaded, key, sent| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !review_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = review_live.account_selection(&scope.account) else {
+            return;
+        };
+        let live = review_live.clone();
+        let weak = weak.clone();
+        review_handle.spawn(async move {
+            live.review_unconfirmed_send(selection, scope, nonce, sent, weak)
+                .await
+        });
+    });
+    let weak = ui.as_weak();
+    let restore_live = live.clone();
+    let restore_handle = runtime.handle().clone();
+    ui.on_restore_record_text(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !restore_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = restore_live.account_selection(&scope.account) else {
+            return;
+        };
+        let empty = if threaded {
+            ui.get_thread_composer_text().is_empty()
+        } else {
+            ui.get_composer_text().is_empty()
+        };
+        let Some(revision) =
+            restore_live.scoped_revision(&scope.account, &scope.room, scope.thread())
+        else {
+            return;
+        };
+        if !empty {
+            ui.set_transfer_notice(
+                "Clear the composer first; saved text never replaces what you typed.".into(),
+            );
+            return;
+        }
+        let live = restore_live.clone();
+        let weak = weak.clone();
+        restore_handle.spawn(async move {
+            live.restore_record_text(selection, scope, nonce, revision, weak)
+                .await
+        });
+    });
+    let weak = ui.as_weak();
+    let copy_live = live.clone();
+    ui.on_copy_record_text(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !copy_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(text) = copy_live.record_text(&scope, &nonce) else {
+            return;
+        };
+        let copied = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text.body))
+            .is_ok();
+        ui.set_transfer_notice(
+            if copied {
+                "Message text copied to the system clipboard."
+            } else {
+                "Could not access the clipboard. Use Restore text with an empty composer instead."
+            }
+            .into(),
+        );
+    });
+    let weak = ui.as_weak();
+    let discard_live = live.clone();
+    let discard_handle = runtime.handle().clone();
+    ui.on_discard_record_text(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !discard_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = discard_live.account_selection(&scope.account) else {
+            return;
+        };
+        let live = discard_live.clone();
+        let weak = weak.clone();
+        discard_handle
+            .spawn(async move { live.discard_kept_text(selection, scope, nonce, weak).await });
+    });
+    let weak = ui.as_weak();
+    let unreadable_live = live.clone();
+    let unreadable_handle = runtime.handle().clone();
+    ui.on_discard_unreadable_status(move |threaded| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !unreadable_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(selection) = unreadable_live.account_selection(&scope.account) else {
+            return;
+        };
+        let live = unreadable_live.clone();
+        let weak = weak.clone();
+        unreadable_handle
+            .spawn(async move { live.discard_unreadable_status(selection, scope, weak).await });
     });
 
     let weak = ui.as_weak();
@@ -3906,6 +3921,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     let add_calls = calls.clone();
     ui.on_add_account(move || {
+        if weak.upgrade().is_some_and(|ui| room_leave::is_open(&ui)) {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            room_addresses::clear(&ui);
+        }
         if let Some(window) = weak.upgrade()
             && security::block_account_change(&window, &add_security_gate)
         {
@@ -3916,6 +3937,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         if let Some(ui) = weak.upgrade() {
+            matrix_links::clear(&ui);
+            thread_browser::withdraw(&ui);
+            withdraw_call_bar(&ui);
+            ui.invoke_withdraw_verification();
             ui.set_login_error("".into());
             ui.set_show_sign_in(true);
         }
@@ -4253,11 +4278,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             drop(transition);
             match result {
                 Ok(result) => {
+                    room_addresses::forget_account(&account_id);
                     if let Err(error) = live.voice_spaces.clear_logged_out_account(&account_id) {
                         show_error(&ui, format!("Could not remove local voice labels: {error}"));
                     }
                     live.voice_spaces.forget_account(&account_id).await;
                     live.forget_account_drafts(&account_id);
+                    room_permissions::forget_account(&account_id);
+                    // A successful logout only: invitation answers, listings
+                    // and notices of this account are forgotten too.
+                    invitations::forget_account(&account_id);
+                    unread_navigation::forget_account(&account_id);
+                    room_leave::forget_account(&account_id);
+                    room_creation::forget_account(&account_id);
+                    room_settings::forget_access_account(&account_id);
+                    space_management::forget_account(&account_id);
+                    live.forget_removed_account_joins(&account_id);
                     live.clear_feed().await;
                     live.account_detached(ui.clone()).await;
                     let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -4289,6 +4325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !logout_live.is_live.load(Ordering::Acquire) {
             if window.get_call_connected() {
                 window.set_pending_account_index(-3);
+                withdraw_call_bar(&window);
                 window.set_leave_call_dialog(true);
             } else {
                 window.set_show_sign_in(true);
@@ -4321,6 +4358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !resume_live.is_live.load(Ordering::Acquire) {
             // The offline call preview has no Matrix account or destructive work.
             if let Some(window) = weak.upgrade() {
+                withdraw_call_bar(&window);
                 window.set_show_sign_in(true);
             }
             return;
@@ -4387,6 +4425,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let setting_store = store.clone();
     appearance::install_callbacks(&ui, &store);
+    workspace_layout::register_live(&ui, &store, &live);
+    appearance_editor::register(&ui, &store);
+    metric_editor::register(&ui, &store);
+    sender_palette_editor::register(&ui, &store);
+    style_profiles::register(&ui, &store);
+    theme_studio::register(&ui, &store);
+    appearance::register_room_hook(&ui);
+    settings_search::register(&ui);
     ui.on_choose_theme(move |index| {
         if let Some(ui) = weak.upgrade() {
             let theme = match index {
@@ -4605,9 +4651,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    #[cfg(morpheus_timeline_acceptance)]
+    let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
     let ui_result = ui.run();
+    device_sessions.shutdown(&ui);
+    member_privacy.shutdown(&ui);
+    identity_warnings.shutdown(&ui);
+    pinned_messages.shutdown(&ui);
+    room_media.shutdown(&ui);
+    room_activity.shutdown(&ui);
+    // Before any wait below: no unread-mark write that was not handed over
+    // yet can start while main waits on other cleanup.
+    unread_navigation_ui.shutdown(&ui);
+    room_permissions.shutdown(&ui);
     room_settings.shutdown(&ui);
+    room_leave.shutdown(&ui);
+    moderation.shutdown();
     image_previews.shutdown(&ui);
+    #[cfg(feature = "native-calls")]
+    voice_presence.shutdown(&ui);
+    // Before the incoming worker and notifications: no call banner outlives
+    // them, and those the platform can withdraw are withdrawn.
+    #[cfg(feature = "native-calls")]
+    call_banners.shutdown();
     #[cfg(feature = "native-calls")]
     incoming_calls.shutdown();
     notifications.shutdown();
@@ -4642,6 +4708,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Could not save drafts during shutdown: {error}");
         return Err(Box::new(error));
     }
+    #[cfg(morpheus_timeline_acceptance)]
+    acceptance.finish()?;
     Ok(())
 }
 
@@ -4748,22 +4816,7 @@ mod discovery_tests {
         );
         assert_eq!(directory_plain_text(&"a".repeat(500), 120).len(), 120);
     }
-
-    #[test]
-    fn search_result_display_sanitizes_untrusted_text_without_changing_ids() {
-        let item = search_result_item(MessageSearchResult {
-            room_id: "!room:example.org".into(),
-            event_id: "$event:example.org".into(),
-            sender: "@alice\u{202e}:example.org".into(),
-            body: format!("Hello\n\u{200b}world {}", "x".repeat(600)),
-            timestamp_ms: 0,
-            relevance_score: 1.0,
-        });
-        assert_eq!(item.room_id.as_str(), "!room:example.org");
-        assert_eq!(item.event_id.as_str(), "$event:example.org");
-        assert_eq!(item.sender.as_str(), "@alice :example.org");
-        assert!(item.body.as_str().starts_with("Hello  world"));
-        assert!(item.body.as_str().chars().count() <= 500);
-        assert!(item.preview.as_str().chars().count() <= 150);
-    }
 }
+
+#[cfg(test)]
+mod webp_complexity_tests;

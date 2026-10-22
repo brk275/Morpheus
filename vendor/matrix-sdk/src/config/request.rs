@@ -1,0 +1,308 @@
+// Copyright 2021 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::{
+    fmt::{self, Debug},
+    num::NonZeroUsize,
+    time::Duration,
+};
+
+use matrix_sdk_common::debug::DebugStructExt;
+
+use crate::http_client::DEFAULT_REQUEST_TIMEOUT;
+
+/// Configuration for requests the `Client` makes.
+///
+/// This sets how often and for how long a request should be repeated. As well
+/// as how long a successful request is allowed to take.
+///
+/// By default requests are retried indefinitely and use no timeout.
+///
+/// # Examples
+///
+/// ```
+/// use matrix_sdk::config::RequestConfig;
+/// use std::time::Duration;
+///
+/// // This sets makes requests fail after a single send request and sets the timeout to 30s
+/// let request_config = RequestConfig::new()
+///     .disable_retry()
+///     .timeout(Duration::from_secs(30));
+/// ```
+#[derive(Copy, Clone)]
+pub struct RequestConfig {
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) read_timeout: Option<Duration>,
+    pub(crate) retry_limit: Option<usize>,
+    pub(crate) max_retry_time: Option<Duration>,
+    pub(crate) max_concurrent_requests: Option<NonZeroUsize>,
+    pub(crate) force_auth: bool,
+    pub(crate) skip_auth: bool,
+    // Morpheus patch: a mutation can refuse authentication refresh and replay.
+    pub(crate) disable_auth_refresh: bool,
+    // Morpheus patch: optional per-request response body limit; see
+    // `RequestConfig::max_response_bytes`.
+    pub(crate) max_response_bytes: Option<u64>,
+}
+
+#[cfg(not(tarpaulin_include))]
+impl Debug for RequestConfig {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            timeout,
+            read_timeout,
+            retry_limit,
+            max_retry_time: retry_timeout,
+            force_auth,
+            max_concurrent_requests,
+            skip_auth: skip_optional_auth,
+            disable_auth_refresh,
+            max_response_bytes,
+        } = self;
+
+        let mut res = fmt.debug_struct("RequestConfig");
+        res.field("timeout", timeout)
+            .maybe_field("read_timeout", read_timeout)
+            .maybe_field("retry_limit", retry_limit)
+            .maybe_field("max_retry_time", retry_timeout)
+            .maybe_field("max_concurrent_requests", max_concurrent_requests)
+            .maybe_field("max_response_bytes", max_response_bytes);
+
+        if *force_auth {
+            res.field("force_auth", &true);
+        }
+
+        if *skip_optional_auth {
+            res.field("skip_optional_auth", &true);
+        }
+
+        if *disable_auth_refresh {
+            res.field("disable_auth_refresh", &true);
+        }
+
+        res.finish()
+    }
+}
+
+impl Default for RequestConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            read_timeout: None,
+            retry_limit: Default::default(),
+            max_retry_time: Default::default(),
+            max_concurrent_requests: Default::default(),
+            force_auth: false,
+            skip_auth: false,
+            disable_auth_refresh: false,
+            max_response_bytes: None,
+        }
+    }
+}
+
+impl RequestConfig {
+    /// Create a new default `RequestConfig`.
+    #[must_use]
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    /// Create a new `RequestConfig` with default values, except the retry limit
+    /// which is set to 3.
+    #[must_use]
+    pub fn short_retry() -> Self {
+        Self::default().retry_limit(3)
+    }
+
+    /// This is a convince method to disable the retries of a request. Setting
+    /// the `retry_limit` to `0` has the same effect.
+    #[must_use]
+    pub fn disable_retry(mut self) -> Self {
+        self.retry_limit = Some(0);
+        self
+    }
+
+    /// Return an unknown-token response without automatically refreshing
+    /// authentication, replaying this request, or broadcasting an unknown-token
+    /// session change for it.
+    ///
+    /// This is separate from [`Self::disable_retry`]: ordinary HTTP retries and
+    /// authentication refresh are independent. Combine the two when a mutation
+    /// must be sent at most once. The original error is returned so the caller
+    /// can report an unconfirmed outcome and require an explicit new attempt.
+    ///
+    /// The default is `false`, preserving the client's authentication refresh
+    /// policy. This does not disable authentication on the original request or
+    /// prevent another request from refreshing the session. The SDK still marks
+    /// the rejected access token as expired.
+    #[must_use]
+    pub fn disable_auth_refresh(mut self) -> Self {
+        self.disable_auth_refresh = true;
+        self
+    }
+
+    /// The number of times a request should be retried. The default is no
+    /// limit.
+    #[must_use]
+    pub fn retry_limit(mut self, retry_limit: usize) -> Self {
+        self.retry_limit = Some(retry_limit);
+        self
+    }
+
+    /// The total limit of request that are pending or run concurrently. Any
+    /// additional request beyond that number will be waiting until another
+    /// concurrent requests finished. Requests are queued fairly.
+    #[must_use]
+    pub fn max_concurrent_requests(mut self, limit: Option<NonZeroUsize>) -> Self {
+        self.max_concurrent_requests = limit;
+        self
+    }
+
+    /// Set the timeout duration for all HTTP requests.
+    #[must_use]
+    pub fn timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.timeout = timeout.into();
+        self
+    }
+
+    /// Set the read timeout duration for all HTTP requests.
+    ///
+    /// The timeout applies to each read operation, and resets after a
+    /// successful read. This is more appropriate for detecting stalled
+    /// connections when the size isn’t known beforehand.
+    ///
+    /// **IMPORTANT**: note this value can only be applied when the HTTP client
+    /// is instantiated, it won't have any effect on a per-request basis.
+    #[must_use]
+    pub fn read_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.read_timeout = timeout.into();
+        self
+    }
+
+    /// Set a time limit for how long a request should be retried. The default
+    /// is that there isn't a limit, meaning requests are retried forever.
+    ///
+    /// This is a time-based variant of the [`RequestConfig::retry_limit`]
+    /// method.
+    #[must_use]
+    pub fn max_retry_time(mut self, retry_timeout: Duration) -> Self {
+        self.max_retry_time = Some(retry_timeout);
+        self
+    }
+
+    /// Force sending authorization even if the endpoint does not require it.
+    /// Default is only sending authorization if it is required.
+    #[must_use]
+    pub fn force_auth(mut self) -> Self {
+        self.force_auth = true;
+        self
+    }
+
+    /// Skip sending authorization headers even if the endpoint requires it.
+    ///
+    /// Default is to send authorization headers if the endpoint accepts or
+    /// requires it.
+    ///
+    /// This is useful for endpoints that may optionally accept authorization
+    /// but don't require it.
+    ///
+    /// Note: [`RequestConfig::force_auth`] takes precedence. If force auth is
+    /// set, this value will be ignored.
+    #[must_use]
+    pub fn skip_auth(mut self) -> Self {
+        self.skip_auth = true;
+        self
+    }
+
+    /// Refuse a response body larger than `limit` bytes for the requests
+    /// using this configuration.
+    ///
+    /// A response that declares a larger length is refused before its body
+    /// is read. Otherwise the body is counted as it arrives, after any
+    /// content decoding, and the response is dropped as soon as it would
+    /// exceed the limit. The accumulated body has at most `limit` bytes;
+    /// transport/decoder buffers and the current incoming chunk are additional.
+    /// This is not a bound on total process memory. The
+    /// request then fails with
+    /// [`HttpError::ResponseTooLarge`](crate::HttpError::ResponseTooLarge),
+    /// which is never retried.
+    ///
+    /// The default, `None`, reads response bodies of any size, so media and
+    /// sync requests are unaffected unless a caller sets a limit.
+    ///
+    /// On wasm, the declared length is refused before reading, but a body
+    /// without one is checked only after the browser has read it.
+    #[must_use]
+    pub fn max_response_bytes(mut self, limit: impl Into<Option<u64>>) -> Self {
+        self.max_response_bytes = limit.into();
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::RequestConfig;
+
+    #[test]
+    fn smoketest() {
+        let cfg = RequestConfig::new()
+            .force_auth()
+            .max_retry_time(Duration::from_secs(32))
+            .retry_limit(4)
+            .timeout(Duration::from_secs(600))
+            .read_timeout(Duration::from_secs(10));
+
+        assert!(cfg.force_auth);
+        assert_eq!(cfg.retry_limit, Some(4));
+        assert_eq!(cfg.max_retry_time, Some(Duration::from_secs(32)));
+        assert_eq!(cfg.timeout, Some(Duration::from_secs(600)));
+        assert_eq!(cfg.read_timeout, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn testing_retry_settings() {
+        let mut cfg = RequestConfig::new();
+        assert_eq!(cfg.retry_limit, None);
+        cfg = cfg.retry_limit(10);
+        assert_eq!(cfg.retry_limit, Some(10));
+        cfg = cfg.disable_retry();
+        assert_eq!(cfg.retry_limit, Some(0));
+
+        let cfg = RequestConfig::short_retry();
+        assert_eq!(cfg.retry_limit, Some(3));
+    }
+
+    #[test]
+    fn authentication_refresh_is_disabled_only_when_chosen() {
+        assert!(!RequestConfig::new().disable_auth_refresh);
+        let config = RequestConfig::new().disable_retry().disable_auth_refresh();
+        assert!(config.disable_auth_refresh);
+        assert_eq!(config.retry_limit, Some(0));
+        assert!(format!("{config:?}").contains("disable_auth_refresh: true"));
+        assert!(!format!("{:?}", RequestConfig::new()).contains("disable_auth_refresh"));
+    }
+
+    #[test]
+    fn response_limit_is_opt_in() {
+        // Default: unlimited, so existing callers read bodies of any size.
+        assert_eq!(RequestConfig::new().max_response_bytes, None);
+        let cfg = RequestConfig::short_retry().max_response_bytes(8_u64 * 1024 * 1024);
+        assert_eq!(cfg.max_response_bytes, Some(8 * 1024 * 1024));
+        // The other settings are kept.
+        assert_eq!(cfg.retry_limit, Some(3));
+        assert_eq!(cfg.max_response_bytes(None).max_response_bytes, None);
+    }
+}

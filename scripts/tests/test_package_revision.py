@@ -125,7 +125,7 @@ class PackageSourceScopeTests(unittest.TestCase):
                         workflow.index("Verify exact reviewed source checkout"))
         self.assertLess(workflow.index("Verify exact reviewed source checkout"),
                         workflow.index("Install pinned Rust toolchain"))
-        self.assertIn("--ignore-gitleaks-allow", workflow)
+        # Actual scanner suppression resistance is covered by HistoryScannerTests.
         self.assertNotIn("pull_request_target", workflow)
         self.assertNotIn("upload-artifact", workflow)
 
