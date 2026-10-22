@@ -33,6 +33,11 @@ unchanged. Rechecks detect link churn; a change racing fchmod can only be
 reported after the mutation. An already tight linked file is left alone.
 Output is one JSON line of fixed tokens and counts, never a name or path.
 
+The explicit --runtime-inputs mode applies the same walk to the five fixed
+Autotools data trees after exact package installation. It changes no owner or
+content, follows no symlink, and preserves the original count ceiling. The
+notice mode and its default paths stay unchanged.
+
 This trusts the official hosted image as it is before candidate code runs.
 Tightening permissions is not a repair for a tampered host. Importing this
 module changes nothing.
@@ -56,6 +61,9 @@ OS_RELEASE_LIMIT = 16 * 1024
 ROOT = "/"
 # Fixed names beneath /usr/share and the stage each one reports.
 TREES = (("doc", "doc"), ("common-licenses", "common_licenses"))
+# Exact /usr/share subtrees containing the pinned runtime-build macro inputs.
+RUNTIME_TREES = (("aclocal-1.16", "runtime"), ("aclocal", "runtime"),
+                 ("autoconf", "runtime"), ("automake-1.16", "runtime"), ("libtool", "runtime"))
 WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
 # Directory levels in each tree, counting the tree root itself as 1.
 MAX_DEPTH = 32
@@ -65,7 +73,7 @@ MAX_SECONDS = 90.0
 MAX_COUNT = MAX_ENTRIES + 3
 
 # Statuses are hardened, surveyed, refused (guard only) and failed.
-STAGES = ("guard", "ancestors", "share", "doc", "common_licenses", "census", "links", "complete")
+STAGES = ("guard", "ancestors", "share", "doc", "common_licenses", "runtime", "census", "links", "complete")
 GUARD_REASONS = ("arguments", "platform", "hosted", "image", "arch", "release", "root")
 # hardlink: a writable file has an alias outside both trees, or one the census
 # could not find. link_churn: a census-checked link set changed while running.
@@ -170,12 +178,14 @@ class Walk:
     """
 
     def __init__(self, fix, *, root=ROOT, owner=0, depth=MAX_DEPTH, entries=MAX_ENTRIES,
-                 seconds=MAX_SECONDS, clock=time.monotonic):
+                 seconds=MAX_SECONDS, clock=time.monotonic, runtime=False):
         self.fix = fix
         self.root = root
         self.owner = owner
         self.depth = depth
-        self.entries = entries
+        self.trees = RUNTIME_TREES if runtime else TREES
+        # Five tree roots add three unlisted entries; keep MAX_COUNT unchanged.
+        self.entries = entries - 3 if runtime else entries
         self.clock = clock
         self.deadline = clock() + seconds
         self.listed = 0
@@ -219,7 +229,7 @@ class Walk:
             # Nobody else can rename or replace a tree once this is tight.
             self.settle(share, info)
             trees = []
-            for name, stage in TREES:
+            for name, stage in self.trees:
                 self.stage = stage
                 tree, info = self.directory(share, name, opened)
                 if info.st_dev != self.device:
@@ -485,8 +495,12 @@ def public(report):
 def main(argv=None):
     arguments = sys.argv[1:] if argv is None else argv
     try:
-        reason = "arguments" if arguments else guard_reason()
-        report = result("refused", "guard", reason) if reason else Walk(True).report()
+        runtime = arguments == ["--runtime-inputs"]
+        reason = "arguments" if arguments and not runtime else guard_reason()
+        if reason:
+            report = result("refused", "guard", reason)
+        else:
+            report = Walk(True, runtime=True).report() if runtime else Walk(True).report()
     except Exception:
         report = result("failed", "guard", "internal")
     valid = public(report)

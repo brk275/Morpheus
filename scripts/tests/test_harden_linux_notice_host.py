@@ -233,6 +233,56 @@ class SyntheticTreeTests(unittest.TestCase):
     def assert_failed(self, report, stage, reason):
         self.assertEqual((report["status"], report["stage"], report["reason"]), ("failed", stage, reason))
 
+    def runtime_host(self):
+        root = self.host()
+        for name, _ in H.RUNTIME_TREES:
+            tree = root / "usr/share" / name
+            tree.mkdir()
+            (tree / "macro.m4").write_bytes(b"synthetic pinned macro\n")
+            os.chmod(tree, 0o777)
+            os.chmod(tree / "macro.m4", 0o666)
+        return root
+
+    def test_runtime_mode_tightens_only_the_five_fixed_trees_and_preserves_data(self):
+        self.assertEqual({name for name, _ in H.RUNTIME_TREES},
+                         {"aclocal-1.16", "aclocal", "autoconf", "automake-1.16", "libtool"})
+        root = self.runtime_host()
+        before = snapshot(root)
+        report = self.walk(root, runtime=True)
+        self.assertEqual(report["status"], "hardened")
+        after = snapshot(root)
+        for name, value in before.items():
+            selected = name == "usr/share" or any(
+                name == "usr/share/" + tree or name.startswith("usr/share/" + tree + "/")
+                for tree, _ in H.RUNTIME_TREES)
+            expected = (value[0], value[1] & ~0o022, *value[2:]) if selected else value
+            self.assertEqual(after[name], expected, name)
+        self.assertEqual(self.walk(root, runtime=True)["tightened"], 0)
+
+    def test_runtime_mode_refuses_symlinks_other_owners_and_outside_hardlinks(self):
+        for failure in ("symlink", "owner", "hardlink"):
+            with self.subTest(failure=failure):
+                root = self.runtime_host()
+                tree = root / "usr/share/aclocal-1.16"
+                macro = tree / "macro.m4"
+                if failure == "symlink":
+                    macro.unlink()
+                    tree.rmdir()
+                    os.symlink("unrelated", tree)
+                    report = self.walk(root, runtime=True)
+                    self.assert_failed(report, "runtime", "symlink")
+                elif failure == "owner":
+                    with patched_stat({"macro.m4": lambda value: changed(value, st_uid=self.uid + 1)}):
+                        report = self.walk(root, runtime=True)
+                    self.assert_failed(report, "runtime", "owner")
+                    self.assertEqual(mode(root, "usr/share/aclocal-1.16/macro.m4"), 0o666)
+                else:
+                    outside = root / "usr/share/unrelated/alias"
+                    os.link(macro, outside)
+                    report = self.walk(root, runtime=True)
+                    self.assert_failed(report, "census", "hardlink")
+                    self.assertEqual(mode(root, "usr/share/unrelated/alias"), 0o666)
+
     def test_hardens_only_the_notice_trees_and_keeps_every_entry(self):
         before = snapshot(self.root)
         with recorded_opens() as opens:
@@ -702,6 +752,24 @@ class MainTests(unittest.TestCase):
             self.assertEqual(self.run_main(), (0, hardened))
         walk.assert_called_once_with(True)
 
+    def test_runtime_mode_still_requires_the_host_guard_and_has_no_path_argument(self):
+        hardened = H.result("hardened", "complete", None, counts(directories=6, tightened=6))
+        with mock.patch.object(H, "guard_reason", return_value=None) as guard, mock.patch.object(H, "Walk") as walk:
+            walk.return_value.report.return_value = hardened
+            self.assertEqual(self.run_main(["--runtime-inputs"]), (0, hardened))
+            guard.assert_called_once_with()
+            walk.assert_called_once_with(True, runtime=True)
+        for arguments in (["--runtime-inputs", "/tmp"], ["--runtime-inputs=/tmp"],
+                          ["--runtime-inputs", "--runtime-inputs"]):
+            with self.subTest(arguments=arguments), mock.patch.object(H, "guard_reason") as guard, \
+                    mock.patch.object(H, "Walk") as walk:
+                self.assertEqual(self.run_main(arguments), (1, H.result("refused", "guard", "arguments")))
+                guard.assert_not_called()
+                walk.assert_not_called()
+        with mock.patch.object(H, "guard_reason", return_value="hosted"), mock.patch.object(H, "Walk") as walk:
+            self.assertEqual(self.run_main(["--runtime-inputs"]), (1, H.result("refused", "guard", "hosted")))
+            walk.assert_not_called()
+
     def test_failed_or_malformed_reports_exit_nonzero_with_fixed_output(self):
         limit = H.MAX_COUNT
         failed = H.result("failed", "census", "hardlink", counts(
@@ -832,8 +900,8 @@ class WorkflowTests(unittest.TestCase):
         body = text.split("\n  " + name + ":\n", 1)[1]
         return text, body.split("\n  " + following + ":\n", 1)[0] if following else body
 
-    def assert_hardener_is_the_first_python(self, text, job):
-        self.assertEqual(text.count(COMMAND), 1)
+    def assert_hardener_is_the_first_python(self, text, job, expected=1):
+        self.assertEqual(text.count(COMMAND), expected)
         start = job.index(COMMAND)
         self.assertLess(job.index("actions/checkout@"), start)
         self.assertEqual(job.index("python3"), start + COMMAND.index("python3"))
@@ -853,9 +921,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("persist-credentials: false", helpers)
         self.assertLess(helpers.index(COMMAND), helpers.index("python3 -m unittest discover -s scripts/tests"))
 
+    def test_runtime_permission_step_uses_the_same_immutable_bootstrap_before_hash_verification(self):
+        _, package = self.job("package-qa.yml", "package")
+        start = package.index("            stage=runtime_permissions\n")
+        end = package.index("            stage=verify\n", start)
+        step = package[start:end]
+        self.assertIn('git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |', step)
+        self.assertIn("/usr/bin/python3 -I -B - --runtime-inputs >&3", step)
+        self.assertLess(package.index("stage=install_consistency"), start)
+        self.assertNotIn("chown", step)
+        self.assertNotIn("chmod", step)
+
     def test_linux_package_job_hardens_before_any_checkout_code(self):
         text, package = self.job("package-qa.yml", "package")
-        self.assert_hardener_is_the_first_python(text, package)
+        self.assert_hardener_is_the_first_python(text, package, expected=2)
         start = package.index(COMMAND)
         step = package[package.rindex("      - name:", 0, start):start]
         self.assertIn("        if: runner.os == 'Linux'\n", step)
