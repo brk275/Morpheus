@@ -43,3 +43,15 @@ run on this macOS host timed out before its first frame after the initial
 format fix; session/callback diagnostics and encrypted camera delivery are
 still required before a beta. Retest these changes when updating either
 vendored crate, then remove the local patch when upstream fixes cover it.
+
+## Additional bundled registry-library notices
+
+Native audio attachment playback uses unmodified `symphonia-core` and
+`symphonia-bundle-mp3` 0.6.1 (MPL-2.0), with only MP3 enabled and default
+features off. These are registry packages, not local patches. Their exact
+archive checksums remain in `Cargo.lock`; corresponding upstream source is
+`pdeljanov/Symphonia` commit `ee35874b571a35a9a6e15d3bc9a3aaf8f11fbeee`.
+The complete [MPL-2.0 license](../licenses/Symphonia-MPL-2.0.txt) and
+[source notice](../licenses/Symphonia-NOTICE.txt) are included as package
+resources and referenced in About. The small WAV reader is Morpheus code;
+no Symphonia generic metadata/artwork or RIFF package is enabled.

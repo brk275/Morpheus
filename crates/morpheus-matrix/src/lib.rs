@@ -11,8 +11,9 @@ use authentication::{PendingSso, StoredSession};
 
 mod media;
 pub use media::{
-    AttachmentKind, AttachmentMetadata, AttachmentSendUpdate, DownloadedAttachment,
-    ImagePreviewDownload, MAX_ATTACHMENT_BYTES, MAX_IMAGE_PREVIEW_BYTES, QueuedAttachment,
+    AttachmentKind, AttachmentMetadata, AttachmentSendUpdate, AudioPlaybackDownload,
+    DownloadedAttachment, ImagePreviewDownload, MAX_ATTACHMENT_BYTES, MAX_AUDIO_PLAYBACK_BYTES,
+    MAX_IMAGE_PREVIEW_BYTES, QueuedAttachment,
 };
 mod room_activity;
 mod unread_navigation;
@@ -485,6 +486,9 @@ pub struct MessageInfo {
     /// Display hint only; preview download revalidates the actual event kind.
     #[serde(default)]
     pub attachment_is_image: bool,
+    /// Display hint only; playback revalidates the real audio event and MIME.
+    #[serde(default)]
+    pub attachment_is_audio: bool,
     /// Bounded poll state from the SDK's aggregation; `body` then holds a
     /// plain "Poll: question" line for search, replies and fallbacks.
     #[serde(default)]
@@ -3587,6 +3591,7 @@ mod message_presentation_tests {
             rich_accessible: None,
             attachment_name: None,
             attachment_is_image: false,
+            attachment_is_audio: false,
             poll: None,
             reply_preview: None,
             reaction_summary: String::new(),
@@ -4400,6 +4405,8 @@ fn message_info_for(item: &TimelineItem, own_user_id: Option<&UserId>) -> Option
         attachment_is_image: message
             .is_some_and(|message| matches!(message.msgtype(), MessageType::Image(_)))
             || content.is_sticker(),
+        attachment_is_audio: message
+            .is_some_and(|message| matches!(message.msgtype(), MessageType::Audio(_))),
         poll,
         reply_preview,
         reaction_summary: event

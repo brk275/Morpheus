@@ -8,7 +8,7 @@ build = "build.rs"
 
 [features]
 default = []
-native-calls = ["dep:morpheus-rtc"]
+native-calls = ["dep:morpheus-rtc", "dep:symphonia-core", "dep:symphonia-bundle-mp3"]
 
 [dependencies]
 slint = { version = "=1.18.1", features = ["unstable-fontique-011"] }
@@ -36,6 +36,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"
 url = "2"
 webbrowser = "=1.2.4"
 zeroize = "=1.9.1"
+# Only the direct MP3 reader/decoder: no metadata, artwork, RIFF or other codec.
+symphonia-core = { version = "=0.6.1", default-features = false, optional = true }
+symphonia-bundle-mp3 = { version = "=0.6.1", default-features = false, features = ["mp3"], optional = true }
 
 [build-dependencies]
 slint-build = "=1.18.1"

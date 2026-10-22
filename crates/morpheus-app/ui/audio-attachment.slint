@@ -1,0 +1,85 @@
+import { TextAction } from "controls.slint";
+import { StyleTokens } from "style-tokens.slint";
+
+// Explicit playback only; Save keeps its existing action and admission.
+export component AudioAttachment inherits Rectangle {
+    in property <string> title;
+    in property <bool> active;
+    in property <bool> playing;
+    in property <bool> loading;
+    in property <bool> enabled;
+    in property <bool> save-enabled;
+    in property <string> position: "0:00";
+    in property <string> duration: "—";
+    in property <string> status;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    callback play(); callback stop(); callback save();
+    // Like the poll card: include actual wrapped text, action minimums,
+    // padding and gaps, rather than estimating a row from the font scale.
+    height: content.preferred-height;
+    min-width: 0px;
+    vertical-stretch: 0;
+    property <length> inset: max(StyleTokens.line-width, min(10px, StyleTokens.control-padding));
+    property <length> gap: max(StyleTokens.line-width, 5px * root.text-scale);
+    property <length> button-padding: 2 * StyleTokens.control-padding * root.text-scale;
+    property <length> play-width: max(32px, play-measure.preferred-width + root.button-padding);
+    property <length> stop-width: max(32px, stop-measure.preferred-width + root.button-padding);
+    property <length> save-width: max(32px, save-measure.preferred-width + root.button-padding);
+    // The available width comes from the pane, never from these controls'
+    // preferred width. Font/padding/state changes can reflow without a loop
+    // or replacing Play/Save, so an already focused action keeps its identity.
+    property <bool> stacked: max(0px, root.width - 2 * root.inset)
+        < root.play-width + root.save-width + root.gap
+            + (root.active ? root.stop-width + root.gap : 0px);
+    border-radius: StyleTokens.radius * 0.9;
+    border-width: StyleTokens.line-width; border-color: root.outline; background: root.surface;
+    accessible-role: groupbox; accessible-label: "Audio attachment " + root.title;
+    // Unwrapped text measurements share TextAction's font and inherited
+    // family. Invisible, outside layout: no extra buttons or focus targets.
+    play-measure := Text { visible: false; text: play-control.text; font-size: 12px * root.text-scale; }
+    stop-measure := Text { visible: false; text: "Stop"; font-size: 12px * root.text-scale; }
+    save-measure := Text { visible: false; text: "Save"; font-size: 12px * root.text-scale; }
+    content := VerticalLayout {
+        padding: root.inset; spacing: root.gap;
+        HorizontalLayout {
+            spacing: root.gap;
+            name := Text { text: root.title; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; min-width: 0px; horizontal-stretch: 1; }
+            Text { text: root.active ? root.position + " / " + root.duration : "—"; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; wrap: word-wrap; min-width: 0px; }
+        }
+        GridLayout {
+            spacing: root.gap;
+            play-control := TextAction {
+                row: 0; col: 0;
+                preferred-width: root.play-width; preferred-height: self.min-height;
+                text: root.loading ? "Loading…" : root.playing ? "Pause" : "Play";
+                label: (root.playing ? "Pause audio " : "Play audio ") + root.title;
+                enabled: root.enabled && !root.loading; wrap-caption: true;
+                ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
+                activated => { root.play(); }
+            }
+            if root.active : TextAction {
+                row: root.stacked ? 1 : 0; col: root.stacked ? 0 : 1;
+                preferred-width: root.stop-width; preferred-height: self.min-height;
+                text: "Stop"; label: "Stop audio and release it from memory"; wrap-caption: true;
+                ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
+                activated => { root.stop(); if root.enabled { play-control.focus(); } }
+            }
+            TextAction {
+                row: root.stacked ? (root.active ? 2 : 1) : 0;
+                col: root.stacked ? 0 : (root.active ? 2 : 1);
+                preferred-width: root.save-width; preferred-height: self.min-height;
+                text: "Save"; label: "Save attachment " + root.title; enabled: root.save-enabled; wrap-caption: true;
+                ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale; activated => { root.save(); }
+            }
+        }
+        hint := Text {
+            text: root.active && root.status != "" ? root.status : root.enabled ? "MP3 or PCM/float WAV · loads only when you play" : "Playback unavailable here · Save remains available";
+            color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; min-width: 0px;
+        }
+    }
+}

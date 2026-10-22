@@ -1,5 +1,7 @@
 use super::*;
 
+// Normalize checkout newlines before the source guards select function bodies.
+
 /// One unread-mark receipt per account and exact room, reserved before the
 /// write: a second change of the room waits, and the bound is enforced
 /// where receipts are made.
@@ -68,7 +70,7 @@ fn only_a_missing_answer_keeps_a_flag_receipt() {
 /// a close never forgets them, so an Unknown is kept there.
 #[test]
 fn flag_receipts_are_forgotten_only_by_complete_removal_or_logout() {
-    let live = include_str!("../live.rs");
+    let live = include_str!("../live.rs").replace("\r\n", "\n");
     let drafts = live
         .split("pub fn forget_account_drafts")
         .nth(1)
@@ -79,8 +81,8 @@ fn flag_receipts_are_forgotten_only_by_complete_removal_or_logout() {
         "not the draft cleanup"
     );
     assert!(!live.contains("unread_navigation::forget_account"));
-    let main = include_str!("../main.rs");
-    let access = include_str!("../account_access.rs");
+    let main = include_str!("../main.rs").replace("\r\n", "\n");
+    let access = include_str!("../account_access.rs").replace("\r\n", "\n");
     // Exactly one call in each, after its success point, next to room
     // permissions' cleanup, with no other arm or function in between.
     let removal = |source: &str, call: &str, after: &str| -> String {
@@ -95,12 +97,12 @@ fn flag_receipts_are_forgotten_only_by_complete_removal_or_logout() {
         arm.to_owned()
     };
     removal(
-        main,
+        &main,
         "unread_navigation::forget_account(&account_id)",
         "Ok(result) => {",
     );
     let complete = removal(
-        access,
+        &access,
         "crate::unread_navigation::forget_account(&id)",
         "if result.complete {",
     );
@@ -113,7 +115,7 @@ fn flag_receipts_are_forgotten_only_by_complete_removal_or_logout() {
 /// generation, never a newly taken one.
 #[test]
 fn a_held_jump_is_withdrawn_and_never_readopts_an_epoch() {
-    let window = include_str!("../../ui/app-window.slint");
+    let window = include_str!("../../ui/app-window.slint").replace("\r\n", "\n");
     let (_, handler) = window
         .split_once("changed unread-jump-allowed => {")
         .unwrap();
@@ -168,7 +170,7 @@ fn a_held_jump_is_withdrawn_and_never_readopts_an_epoch() {
         .count();
     assert!(links > 20);
     assert_eq!(links, paired, "every link withdrawal also ends a held jump");
-    let matrix_links = include_str!("../matrix_links.rs");
+    let matrix_links = include_str!("../matrix_links.rs").replace("\r\n", "\n");
     let (_, clear) = matrix_links
         .split_once("pub(crate) fn clear(ui: &AppWindow) {")
         .unwrap();
@@ -189,7 +191,7 @@ fn a_held_jump_is_withdrawn_and_never_readopts_an_epoch() {
     // The actual Thread browser and Leave entries: a visible owner refuses
     // first, before any peer is cleared, then the held jump ends before the
     // entry's own flag changes.
-    let threads = include_str!("../thread_browser.rs");
+    let threads = include_str!("../thread_browser.rs").replace("\r\n", "\n");
     let (_, show) = threads
         .split_once("fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {")
         .unwrap();
@@ -207,7 +209,7 @@ fn a_held_jump_is_withdrawn_and_never_readopts_an_epoch() {
         .unwrap();
     let entry = entry.split(';').next().unwrap();
     assert!(entry.contains("!RoomLeave.view.open") && !entry.contains("MatrixLink.open"));
-    let leave = include_str!("../room_leave.rs");
+    let leave = include_str!("../room_leave.rs").replace("\r\n", "\n");
     let (_, start) = leave
         .split_once("fn start(self: &Arc<Self>, ui: &AppWindow) {")
         .unwrap();
@@ -218,7 +220,7 @@ fn a_held_jump_is_withdrawn_and_never_readopts_an_epoch() {
     let peers = start.find("crate::thread_browser::clear(ui);").unwrap();
     let flag = start.find("open: true,").unwrap();
     assert!(refuse < jump && jump < peers && peers < flag);
-    let source = include_str!("../unread_navigation.rs");
+    let source = include_str!("../unread_navigation.rs").replace("\r\n", "\n");
     let production = source.split("#[cfg(test)]").next().unwrap();
     let (_, shown) = production.split_once("fn still_shown(").unwrap();
     let shown = shown.split("\n    }").next().unwrap();
@@ -382,7 +384,7 @@ fn marker_readmission_ends_with_its_watch_scope() {
 /// takes the fence before anything is spawned.
 #[test]
 fn the_flag_clear_keeps_the_click_time_fence() {
-    let source = include_str!("../unread_navigation.rs");
+    let source = include_str!("../unread_navigation.rs").replace("\r\n", "\n");
     let production = source.split("#[cfg(test)]").next().unwrap();
     let (_, clear) = production
         .split_once("pub(crate) async fn clear_mark_for_read(")
@@ -411,7 +413,7 @@ fn the_flag_clear_keeps_the_click_time_fence() {
             .count(),
         1
     );
-    let activity = include_str!("../room_activity/mod.rs");
+    let activity = include_str!("../room_activity/mod.rs").replace("\r\n", "\n");
     let (_, mark) = activity
         .split_once("fn mark_read(self: &Arc<Self>")
         .unwrap();
@@ -449,7 +451,7 @@ fn the_flag_clear_keeps_the_click_time_fence() {
 /// yet handed over, before main waits on any other cleanup.
 #[test]
 fn a_mark_survives_a_room_switch_and_shutdown_retires_it_first() {
-    let source = include_str!("../unread_navigation.rs");
+    let source = include_str!("../unread_navigation.rs").replace("\r\n", "\n");
     let production = source.split("#[cfg(test)]").next().unwrap();
     let (_, reset) = production
         .split_once("fn reset(&self, ui: &AppWindow) {")
@@ -463,7 +465,7 @@ fn a_mark_survives_a_room_switch_and_shutdown_retires_it_first() {
     let shutdown = shutdown.split("\n    }\n").next().unwrap();
     assert!(shutdown.contains("state.stopping = true"));
     assert!(shutdown.contains("cancellation.cancel()"));
-    let main = include_str!("../main.rs");
+    let main = include_str!("../main.rs").replace("\r\n", "\n");
     let (_, after_run) = main.split_once("let ui_result = ui.run();").unwrap();
     let stop = after_run
         .find("unread_navigation_ui.shutdown(&ui);")
@@ -492,7 +494,7 @@ fn the_divider_is_the_placed_row_or_none() {
     ] {
         assert_eq!(divider_row(unplaced), "");
     }
-    let window = include_str!("../../ui/app-window.slint");
+    let window = include_str!("../../ui/app-window.slint").replace("\r\n", "\n");
     let (_, divider) = window.split_once("<bool> divider-above:").unwrap();
     let divider = divider.split(';').next().unwrap();
     let exact = "message.event-id == UnreadNavigation.first-unread-event-id";
@@ -508,7 +510,7 @@ fn the_divider_is_the_placed_row_or_none() {
     ] {
         assert!(scope.contains(term), "{term}");
     }
-    let source = include_str!("../unread_navigation.rs");
+    let source = include_str!("../unread_navigation.rs").replace("\r\n", "\n");
     let production = source.split("#[cfg(test)]").next().unwrap();
     let (_, scroll) = production.split_once("fn scroll_after(").unwrap();
     let scroll = scroll.split("\n    }\n").next().unwrap();

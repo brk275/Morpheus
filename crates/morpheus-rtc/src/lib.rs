@@ -24,7 +24,7 @@ mod audio_device;
 #[cfg(feature = "device-audio")]
 mod ring_audio;
 #[cfg(feature = "device-audio")]
-pub use ring_audio::{RingAudioAuthority, RingAudioError, RingPlayback};
+pub use ring_audio::{PcmPlayback, RingAudioAuthority, RingAudioError, RingPlayback};
 #[cfg(all(feature = "device-screen", target_os = "linux"))]
 mod linux_portal;
 #[cfg(feature = "native-rtc")]

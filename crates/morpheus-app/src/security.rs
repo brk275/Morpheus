@@ -473,6 +473,11 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             return CloseRequestResponse::KeepWindowShown;
         }
         let response = close_response(&close_gate);
+        if response != CloseRequestResponse::KeepWindowShown
+            && let Some(window) = close_weak.upgrade()
+        {
+            window.invoke_stop_attachment_audio();
+        }
         if response == CloseRequestResponse::KeepWindowShown
             && let Some(window) = close_weak.upgrade()
         {

@@ -53,6 +53,8 @@ use crate::{AccountManager, MatrixCoreError, QueuedSendOutcome, Result, account_
 pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 /// Explicit native image previews have a smaller input budget than Save.
 pub const MAX_IMAGE_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
+/// Explicit audio playback is memory-only and smaller than Save.
+pub const MAX_AUDIO_PLAYBACK_BYTES: usize = 16 * 1024 * 1024;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(300);
 /// Bound on asking a homeserver for its upload limit.
 const UPLOAD_LIMIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -107,6 +109,23 @@ pub struct ImagePreviewDownload {
 impl ImagePreviewDownload {
     pub fn into_plaintext(self) -> Result<DownloadedAttachment> {
         let bytes = decrypt_media(self.source, self.ciphertext, MAX_IMAGE_PREVIEW_BYTES)?;
+        Ok(DownloadedAttachment {
+            metadata: self.metadata,
+            bytes,
+        })
+    }
+}
+
+/// Opaque bounded audio input. Decryption stays on the caller's single owner
+/// worker; no plaintext cache, detached blocking SDK job or URL/key reaches UI.
+pub struct AudioPlaybackDownload {
+    metadata: AttachmentMetadata,
+    source: MediaSource,
+    ciphertext: Vec<u8>,
+}
+impl AudioPlaybackDownload {
+    pub fn into_plaintext(self) -> Result<DownloadedAttachment> {
+        let bytes = decrypt_media(self.source, self.ciphertext, MAX_AUDIO_PLAYBACK_BYTES)?;
         Ok(DownloadedAttachment {
             metadata: self.metadata,
             bytes,
@@ -516,6 +535,82 @@ impl AccountManager {
         })
     }
 
+    /// Explicit selected audio playback. Same redirect/authentication policy as
+    /// other media, without the SDK cache. Room encryption must be known and the
+    /// encrypted-preview preference must allow both encrypted rooms and events.
+    pub async fn download_audio_playback_for(
+        &self,
+        selection: &crate::AccountSelection,
+        room_id: &str,
+        event_id: &str,
+        allow_encrypted: bool,
+    ) -> Result<AudioPlaybackDownload> {
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let room = {
+            let state = selection
+                .guard(self.state.lock())
+                .await
+                .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+            if !self.attachment_selection_is_current(selection)
+                || state.active_account_id.as_deref() != Some(selection.account_id())
+            {
+                return Err(MatrixCoreError::SelectedAccountChanged);
+            }
+            account_room(&state, selection.account_id(), room_id)?
+        };
+        let encryption = selection
+            .guard(room.latest_encryption_state())
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?
+            .map_err(|_| MatrixCoreError::InvalidMedia("Cannot check room encryption".into()))?;
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        if encryption.is_unknown() {
+            return Err(MatrixCoreError::InvalidMedia(
+                "Cannot check room encryption".into(),
+            ));
+        }
+        // Do not fetch the event or any media for a room whose policy refuses it.
+        if encryption.is_encrypted() && !allow_encrypted {
+            return Err(MatrixCoreError::InvalidMedia(
+                "Encrypted media previews are disabled".into(),
+            ));
+        }
+        let resolved = selection
+            .guard(resolve_attachment(&room, event_id))
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)??;
+        validate_audio_metadata(
+            &resolved.metadata,
+            encryption.is_encrypted(),
+            resolved.event_was_encrypted,
+            allow_encrypted,
+        )?;
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let client = room.client();
+        let ciphertext = selection
+            .guard(fetch_bounded_media(
+                &client,
+                &resolved.source,
+                MAX_AUDIO_PLAYBACK_BYTES,
+            ))
+            .await
+            .ok_or(MatrixCoreError::SelectedAccountChanged)??;
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(AudioPlaybackDownload {
+            metadata: resolved.metadata,
+            source: resolved.source,
+            ciphertext,
+        })
+    }
+
     async fn assert_active(&self, expected_account_id: &str) -> Result<()> {
         if self
             .state
@@ -745,6 +840,39 @@ fn validate_preview_metadata(
     }
     if let Some(size) = metadata.declared_size {
         check_size_limit(size, MAX_IMAGE_PREVIEW_BYTES)?;
+    }
+    Ok(())
+}
+
+fn validate_audio_metadata(
+    metadata: &AttachmentMetadata,
+    encrypted_room: bool,
+    encrypted_event: bool,
+    allow_encrypted: bool,
+) -> Result<()> {
+    if metadata.kind != AttachmentKind::Audio
+        || !matches!(
+            metadata.mime_type.as_str(),
+            "audio/mpeg"
+                | "audio/mp3"
+                | "audio/wav"
+                | "audio/x-wav"
+                | "audio/wave"
+                | "audio/vnd.wave"
+        )
+    {
+        return Err(MatrixCoreError::InvalidMedia(
+            "Playback supports MP3 and PCM/float WAV audio messages only; Save remains available"
+                .into(),
+        ));
+    }
+    if (encrypted_room || encrypted_event || metadata.encrypted) && !allow_encrypted {
+        return Err(MatrixCoreError::InvalidMedia(
+            "Encrypted media previews are disabled".into(),
+        ));
+    }
+    if let Some(size) = metadata.declared_size {
+        check_size_limit(size, MAX_AUDIO_PLAYBACK_BYTES)?;
     }
     Ok(())
 }
@@ -1785,5 +1913,93 @@ mod preview_tests {
             check_size_limit(MAX_IMAGE_PREVIEW_BYTES as u64 + 1, MAX_IMAGE_PREVIEW_BYTES).is_err()
         );
         assert!(check_size(MAX_IMAGE_PREVIEW_BYTES as u64 + 1).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod audio_playback_admission_tests {
+    use super::*;
+    #[tokio::test]
+    async fn audio_rejects_foreign_and_revoked_aba_selection_before_client_or_media_access() {
+        let root =
+            std::env::temp_dir().join(format!("morpheus-audio-admission-{}", uuid::Uuid::new_v4()));
+        let manager = AccountManager::open(&root).unwrap();
+        manager.selections.replace(Some("synthetic-account"));
+        manager.state.lock().await.active_account_id = Some("synthetic-account".into());
+        let original = manager.account_selection("synthetic-account").unwrap();
+        manager.selections.replace(Some("other-account"));
+        manager.selections.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager
+                .download_audio_playback_for(
+                    &original,
+                    "!fixture:example.org",
+                    "$fixture:example.org",
+                    true
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        let foreign = crate::account_selection::Selections::default();
+        foreign.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager
+                .download_audio_playback_for(
+                    &foreign.for_account("synthetic-account").unwrap(),
+                    "!fixture:example.org",
+                    "$fixture:example.org",
+                    true
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        {
+            let current = manager.account_selection("synthetic-account").unwrap();
+            let locked = manager.state.lock().await;
+            let waiting = manager.download_audio_playback_for(
+                &current,
+                "!fixture:example.org",
+                "$fixture:example.org",
+                true,
+            );
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            manager.selections.replace(Some("other-account"));
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), waiting)
+                    .await
+                    .unwrap(),
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            drop(locked);
+        }
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_requires_typed_kind_mime_size_and_all_encryption_signals() {
+        let mut m = AttachmentMetadata {
+            event_id: "$fixture:example.org".into(),
+            filename: "fixture.mp3".into(),
+            mime_type: "audio/mpeg".into(),
+            declared_size: Some(128),
+            kind: AttachmentKind::Audio,
+            encrypted: false,
+        };
+        assert!(validate_audio_metadata(&m, false, false, false).is_ok());
+        assert!(validate_audio_metadata(&m, true, false, false).is_err());
+        assert!(validate_audio_metadata(&m, false, true, false).is_err());
+        m.encrypted = true;
+        assert!(validate_audio_metadata(&m, false, false, false).is_err());
+        assert!(validate_audio_metadata(&m, true, true, true).is_ok());
+        m.mime_type = "audio/ogg".into();
+        assert!(validate_audio_metadata(&m, false, false, true).is_err());
+        m.mime_type = "audio/wav".into();
+        m.kind = AttachmentKind::File;
+        assert!(validate_audio_metadata(&m, false, false, true).is_err());
+        m.kind = AttachmentKind::Audio;
+        m.declared_size = Some(MAX_AUDIO_PLAYBACK_BYTES as u64 + 1);
+        assert!(validate_audio_metadata(&m, false, false, true).is_err());
     }
 }

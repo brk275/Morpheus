@@ -113,14 +113,27 @@ class PackageSmokeTests(unittest.TestCase):
             (root / "themes").mkdir(parents=True)
             (root / "LICENSE").write_bytes(b"Original license\n")
             (root / "themes/aurora.toml").write_bytes(b"name = 'Aurora'\n")
+            (root / "licenses").mkdir()
+            for name in ("Symphonia-MPL-2.0.txt", "Symphonia-NOTICE.txt"):
+                (root / "licenses" / name).write_bytes(b"Required source license\n")
             installed = Path(temp) / "installed"
             installed.mkdir()
             (installed / "LICENSE").write_bytes(b"Original license\r\n")
             (installed / "aurora.toml").write_bytes(b"name = 'Aurora'\r\n")
+            for name in ("Symphonia-MPL-2.0.txt", "Symphonia-NOTICE.txt"):
+                (installed / name).write_bytes(b"Required source license\r\n")
             with patch.object(package_smoke, "ROOT", root):
                 package_smoke.check_resources(installed)
                 (installed / "LICENSE").write_bytes(b"Wrong license\n")
                 with self.assertRaisesRegex(RuntimeError, "LICENSE"):
+                    package_smoke.check_resources(installed)
+                (installed / "LICENSE").write_bytes(b"Original license\n")
+                (installed / "Symphonia-MPL-2.0.txt").unlink()
+                with self.assertRaisesRegex(RuntimeError, "Symphonia-MPL-2.0"):
+                    package_smoke.check_resources(installed)
+                (installed / "Symphonia-MPL-2.0.txt").write_bytes(b"Required source license\n")
+                (installed / "Symphonia-NOTICE.txt").write_bytes(b"Wrong source notice\n")
+                with self.assertRaisesRegex(RuntimeError, "Symphonia-NOTICE"):
                     package_smoke.check_resources(installed)
 
     def test_nsis_last_option_keeps_destination_unquoted(self):

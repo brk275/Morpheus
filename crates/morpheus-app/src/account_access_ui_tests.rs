@@ -5573,6 +5573,9 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     crate::thread_browser::tests::assert_thread_browser_panel(&ui, &live, &runtime).await;
     phase.set(92);
     assert_responsive_header(&ui).await;
+    assert_inline_audio_card_layout().await;
+    ui.window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
     #[cfg(feature = "native-calls")]
     crate::incoming_ring::ui::assert_answered_call_withdraws_leave(&ui).await;
     #[cfg(feature = "native-calls")]
@@ -8357,6 +8360,32 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
     assert_eq!(control_extents(ui, COPY_LABEL).len(), 3);
     assert_eq!(control_extents(ui, RESTORE_LABEL).len(), 3);
     assert!(control_extents(ui, DISCARD_UNREADABLE_LABEL).is_empty());
+    // Room statuses sit above their own action rows at the default text size.
+    // These are the generated text/button bounds, not the enclosing strip.
+    let before_geometry_scale = ui.get_font_scale_percent();
+    ui.set_font_scale_percent(100);
+    settle(ui).await;
+    for (index, label) in [
+        (0, CANCEL_LABEL),
+        (1, KEEP_LABEL),
+        (2, "Discard this kept text"),
+    ] {
+        let item = ui.get_composer_pending_items().row_data(index).unwrap();
+        let caption = format!("{}: “{}”", item.status, item.preview);
+        let status = control_bounds(ui, &caption);
+        let action = button_bounds(ui, label);
+        assert_eq!(status.len(), 1, "one actual room status for this record");
+        assert_eq!(action.len(), 1, "one exact action for this record");
+        assert!(inside_window(ui, status[0]) && inside_window(ui, action[0]));
+        assert!(
+            status[0].bottom <= action[0].top + 0.5,
+            "room saved-send status must not overlap its action row: status={:?}, action={:?}",
+            status[0],
+            action[0]
+        );
+    }
+    ui.set_font_scale_percent(before_geometry_scale);
+    settle(ui).await;
     ui.set_composer_text("typing something newer".into());
     settle(ui).await;
     assert!(
@@ -8473,6 +8502,53 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
         thread_reviews.borrow().as_slice(),
         [(true, unconfirmed.as_key().to_owned(), true)]
     );
+    // The full unreadable-status notice wraps above Discard in the same narrow
+    // thread at200%. Focus reveals its action without covering the composer.
+    let before_notice_width = ui.get_details_width();
+    ui.set_details_width(200);
+    draft_recovery::publish_thread(ui, &blocked, &[]);
+    settle(ui).await;
+    let notice = control_bounds(ui, ui.get_thread_blocked_notice().as_str());
+    let discard = button_bounds(ui, DISCARD_UNREADABLE_LABEL);
+    assert_eq!(notice.len(), 1, "one actual wrapped thread notice");
+    assert_eq!(discard.len(), 1, "one explicit unreadable-status action");
+    let caption = control_bounds(ui, "Discard unreadable saved status");
+    assert_eq!(caption.len(), 1, "one complete wrapped action caption");
+    assert!(
+        discard[0].bottom > discard[0].top && bounds_within(caption[0], discard[0]),
+        "Discard's actual button contains its complete wrapped caption: action={:?}, caption={:?}",
+        discard[0],
+        caption[0]
+    );
+    assert!(
+        notice[0].bottom <= discard[0].top + 0.5,
+        "thread notice must not overlap Discard: notice={:?}, action={:?}",
+        notice[0],
+        discard[0]
+    );
+    tab_to_control(ui, DISCARD_UNREADABLE_LABEL);
+    settle(ui).await;
+    let discard = button_bounds(ui, DISCARD_UNREADABLE_LABEL)[0];
+    let composer = control_bounds(ui, "Reply in thread started by @jules:example.org");
+    assert_eq!(composer.len(), 1);
+    assert!(
+        inside_window(ui, discard)
+            && inside_window(ui, composer[0])
+            && discard.bottom <= composer[0].top + 0.5,
+        "focused Discard and the thread composer stay separate: action={discard:?}, composer={:?}",
+        composer[0]
+    );
+    key(ui, Key::Return);
+    assert_eq!(
+        discards.borrow().as_slice(),
+        [false, true],
+        "the action keeps the thread routing bit"
+    );
+    // Restore the original two-record projection before its existing bounded
+    // eight-record, keyboard reachability and minimum-window checks.
+    draft_recovery::publish_thread(ui, &thread_summary, &items[1..]);
+    ui.set_details_width(before_notice_width);
+    settle(ui).await;
     assert_bounded_strip_with_eight_records(ui).await;
     // The layout must honor the supported window minimum with the same
     // large text and saved pane widths; content cannot move the pane outside it.
@@ -11564,6 +11640,221 @@ async fn assert_responsive_header(ui: &AppWindow) {
     ui.set_show_sign_in(sign_in);
     ui.invoke_focus_composer(false);
     settle(ui).await;
+}
+
+/// A bounded subcase of the existing responsive-layout phase, using the
+/// same generated UI/backend/event loop. This stand-in window registers no
+/// LiveUi/media owner, so keyboard actions cannot download or open a device.
+async fn assert_inline_audio_card_layout() {
+    use slint::private_unstable_api::re_exports::AccessibleStringProperty;
+    use std::{cell::Cell, ops::ControlFlow, rc::Rc};
+    const TITLE: &str = "Synthetic recording with a long attachment title.wav";
+    const EVENT: &str = "$audio-layout:example.org";
+    const STATUS: &str = "Playing in memory. This synthetic status wraps in a narrow pane without covering any playback action.";
+    let ui = AppWindow::new().unwrap();
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_show_sign_in(false);
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("audio-layout".into());
+    ui.set_active_room_id("!audio-layout:example.org".into());
+    ui.set_active_room_name("Synthetic audio layout".into());
+    ui.set_native_call_enabled(true);
+    ui.set_show_side_panel(false);
+    ui.show().unwrap();
+    ui.window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
+    let tokens = ui.global::<crate::StyleTokens>();
+    let saved_padding = tokens.get_control_padding();
+    let played = Rc::new(Cell::new(0));
+    let saved = Rc::new(Cell::new(0));
+    let stopped = Rc::new(Cell::new(0));
+    let thread = Rc::new(Cell::new(false));
+    let count = played.clone();
+    let expected = thread.clone();
+    let weak = ui.as_weak();
+    ui.on_play_attachment_audio(move |event, in_thread| {
+        assert_eq!(event.as_str(), EVENT);
+        assert_eq!(in_thread, expected.get());
+        count.set(count.get() + 1);
+        let ui = weak.upgrade().unwrap();
+        ui.set_attachment_audio_playing(!ui.get_attachment_audio_playing());
+    });
+    let count = saved.clone();
+    ui.on_save_attachment(move |event, filename| {
+        assert_eq!(event.as_str(), EVENT);
+        assert_eq!(filename.as_str(), TITLE);
+        count.set(count.get() + 1);
+    });
+    let count = stopped.clone();
+    let weak = ui.as_weak();
+    ui.on_stop_attachment_audio(move || {
+        count.set(count.get() + 1);
+        let ui = weak.upgrade().unwrap();
+        ui.set_attachment_audio_event("".into());
+        ui.set_attachment_audio_playing(false);
+        ui.set_attachment_audio_loading(false);
+    });
+    let row = || MessageItem {
+        event_id: EVENT.into(),
+        attachment: TITLE.into(),
+        attachment_is_audio: true,
+        ..MessageItem::default()
+    };
+    ui.set_messages(ModelRc::new(VecModel::from(vec![row()])));
+    settle(&ui).await;
+    settle(&ui).await;
+    ui.set_attachment_audio_event(EVENT.into());
+    ui.set_attachment_audio_thread(false);
+    ui.set_attachment_audio_playing(true);
+    ui.set_attachment_audio_position("1:02".into());
+    ui.set_attachment_audio_duration("2:40".into());
+    ui.set_attachment_audio_status(STATUS.into());
+    tokens.set_control_padding(12.0);
+    ui.set_font_scale_percent(100);
+    settle(&ui).await;
+    let play_label = format!("Play audio {TITLE}");
+    let pause_label = format!("Pause audio {TITLE}");
+    let save_label = format!("Save attachment {TITLE}");
+    let stop_label = "Stop audio and release it from memory";
+    let geometry = |stacked: bool| {
+        assert!(ui.get_viewport_seek_allowed() && !ui.get_settings_reveal_protected());
+        let cards = control_bounds(&ui, &format!("Audio attachment {TITLE}"));
+        assert_eq!(cards.len(), 1);
+        let card = cards[0];
+        assert!(inside_window(&ui, card));
+        let mut buttons = Vec::new();
+        for (label, caption) in [
+            (&pause_label[..], "Pause"),
+            (stop_label, "Stop"),
+            (&save_label[..], "Save"),
+        ] {
+            let found = button_bounds(&ui, label);
+            assert_eq!(found.len(), 1, "one actual audio action: {label}");
+            let bounds = found[0];
+            assert!(inside_window(&ui, bounds) && bounds_within(bounds, card));
+            let action = control_with_label(&ui, label);
+            let mut captions = Vec::new();
+            action.visit_descendants(|item| {
+                if item
+                    .accessible_string_property(AccessibleStringProperty::Label)
+                    .as_deref()
+                    == Some(caption)
+                {
+                    captions.push(item_bounds(item));
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            assert_eq!(captions.len(), 1, "one caption in its actual action");
+            assert!(
+                captions[0].right > captions[0].left
+                    && captions[0].bottom > captions[0].top
+                    && bounds_within(captions[0], bounds),
+                "wrapped caption fits its actual button"
+            );
+            buttons.push(bounds);
+        }
+        for a in 0..buttons.len() {
+            for b in a + 1..buttons.len() {
+                let (a, b) = (buttons[a], buttons[b]);
+                assert!(
+                    a.right <= b.left + 0.5
+                        || b.right <= a.left + 0.5
+                        || a.bottom <= b.top + 0.5
+                        || b.bottom <= a.top + 0.5,
+                    "audio actions never overlap"
+                );
+            }
+        }
+        if stacked {
+            assert!(
+                buttons[0].bottom <= buttons[1].top + 0.5
+                    && buttons[1].bottom <= buttons[2].top + 0.5
+            );
+        } else {
+            assert!(
+                (buttons[0].top - buttons[1].top).abs() < 1.0
+                    && (buttons[0].top - buttons[2].top).abs() < 1.0,
+                "default actions stay compact on one row"
+            );
+        }
+        for text in ["1:02 / 2:40", STATUS] {
+            let found = control_bounds(&ui, text);
+            assert_eq!(found.len(), 1, "one audio time/status");
+            assert!(
+                found[0].right > found[0].left
+                    && found[0].bottom > found[0].top
+                    && bounds_within(found[0], card),
+                "time/status stay inside the content-sized card"
+            );
+        }
+    };
+    geometry(false);
+    request_bridge_focus(&ui, &pause_label);
+    key(&ui, Key::Tab);
+    settle(&ui).await;
+    assert!(focused_control_has_label(&ui, stop_label));
+    key(&ui, Key::Tab);
+    settle(&ui).await;
+    assert!(focused_control_has_label(&ui, &save_label));
+    request_bridge_focus(&ui, &pause_label);
+    key(&ui, Key::Return);
+    settle(&ui).await;
+    assert_eq!(played.get(), 1);
+    assert!(focused_control_has_label(&ui, &play_label));
+    ui.window().set_size(slint::PhysicalSize::new(640, 900));
+    ui.set_font_scale_percent(200);
+    tokens.set_control_padding(24.0);
+    settle(&ui).await;
+    settle(&ui).await;
+    assert!(
+        focused_control_has_label(&ui, &play_label),
+        "responsive reflow keeps the same focused Play"
+    );
+    key(&ui, Key::Space);
+    settle(&ui).await;
+    assert_eq!(played.get(), 2);
+    geometry(true);
+    // The minimum valid details pane uses the same production card. All three
+    // actions and long status remain within the actual pane at200%/24px padding.
+    thread.set(true);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_details_width(200);
+    ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    ui.set_thread_root_id("$audio-root:example.org".into());
+    ui.invoke_show_thread_panel();
+    ui.set_thread_messages(ModelRc::new(VecModel::from(vec![row()])));
+    settle(&ui).await;
+    settle(&ui).await;
+    ui.set_attachment_audio_event(EVENT.into());
+    ui.set_attachment_audio_thread(true);
+    ui.set_attachment_audio_playing(true);
+    ui.set_attachment_audio_position("1:02".into());
+    ui.set_attachment_audio_duration("2:40".into());
+    ui.set_attachment_audio_status(STATUS.into());
+    settle(&ui).await;
+    geometry(true);
+    let pane = control_bounds(&ui, "Conversation details");
+    assert_eq!(pane.len(), 1);
+    let card = control_bounds(&ui, &format!("Audio attachment {TITLE}"));
+    assert!(bounds_within(card[0], pane[0]));
+    request_bridge_focus(&ui, &save_label);
+    key(&ui, Key::Space);
+    settle(&ui).await;
+    assert_eq!(saved.get(), 1);
+    assert_eq!(played.get(), 2);
+    stopped.set(0);
+    request_bridge_focus(&ui, stop_label);
+    key(&ui, Key::Return);
+    settle(&ui).await;
+    assert_eq!(stopped.get(), 1);
+    assert!(button_bounds(&ui, stop_label).is_empty());
+    assert!(
+        focused_control_has_label(&ui, &play_label),
+        "Stop restores Play after its conditional action disappears"
+    );
+    tokens.set_control_padding(saved_padding);
+    ui.hide().unwrap();
 }
 
 /// Phase 86: identity-change warnings. First the row and details through

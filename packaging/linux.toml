@@ -22,3 +22,6 @@ depends = [
 
 [deb.files]
 "LICENSE" = "usr/share/doc/morpheus/copyright"
+
+"licenses/Symphonia-MPL-2.0.txt" = "usr/share/doc/morpheus/Symphonia-MPL-2.0.txt"
+"licenses/Symphonia-NOTICE.txt" = "usr/share/doc/morpheus/Symphonia-NOTICE.txt"

@@ -364,11 +364,34 @@ fn place(
     target: &Path,
     placement: Placement,
 ) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if placement == Placement::Replace {
+        return replace_staged(staging, target);
+    }
     let placed = match placement {
         Placement::Replace => staging.persist(target).map(drop),
         Placement::CreateNew => staging.persist_noclobber(target).map(drop),
     };
     placed.map_err(|error| error.error)
+}
+
+/// Windows' legacy replacing move rejects an open destination, including a
+/// bounded read by our watcher. Rust's pinned `fs::rename` handles that case
+/// with FileRenameInfoEx and POSIX replacement semantics. Readers retain the
+/// old file while subsequent opens see the new one. No permission is relaxed:
+/// readonly targets and handles that deny delete sharing still fail.
+#[cfg(windows)]
+fn replace_staged(mut staging: tempfile::NamedTempFile, target: &Path) -> std::io::Result<()> {
+    // Apply the same normal attributes as tempfile::persist before the move.
+    // This second TempPath never owns cleanup: the original NamedTempFile
+    // remains armed on every attribute/rename error, without a keep/rename gap.
+    let mut attributes = tempfile::TempPath::try_from_path(staging.path())?;
+    attributes.disable_cleanup(true);
+    attributes.keep().map_err(|error| error.error)?;
+    fs::rename(staging.path(), target)?;
+    // Only a successful move disarms cleanup of the old staging name.
+    staging.disable_cleanup(true);
+    Ok(())
 }
 
 /// This process's claim on one path in [`PUBLISHING`], released on drop.
@@ -586,6 +609,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("config.toml");
         fs::write(&target, "kept").unwrap();
+        #[cfg(windows)]
+        let _reader = fs::File::open(&target).unwrap();
         let mut staging = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
         staging.write_all(b"new").unwrap();
 
@@ -594,6 +619,117 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
         assert_eq!(names(directory.path()), ["config.toml"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_replacement_keeps_open_readers_on_the_original_revision() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = store.load_or_create().unwrap();
+        let (_, revision) = store.load_revision().unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let mut reader = fs::File::open(store.path()).unwrap();
+        config.geometry.corner_radius = 3;
+
+        store.commit(&config, &revision).unwrap();
+
+        assert_eq!(store.load().unwrap(), config);
+        let mut still_readable = Vec::new();
+        reader.read_to_end(&mut still_readable).unwrap();
+        assert_eq!(still_readable, before, "the old handle keeps the old file");
+        assert_eq!(names(directory.path()), ["config.toml", "config.toml.lock"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_replacement_refuses_a_reader_that_does_not_share_delete() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = store.load_or_create().unwrap();
+        let (_, revision) = store.load_revision().unwrap();
+        let before = fs::read(store.path()).unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately no FILE_SHARE_DELETE.
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0001 | 0x0002)
+            .open(store.path())
+            .unwrap();
+        config.geometry.corner_radius = 3;
+        let mut attempted = false;
+        let result = store.publish_placed(
+            &config,
+            Some(&revision),
+            Duration::ZERO,
+            |_| {},
+            |staging, target, placement| {
+                attempted = true;
+                assert_eq!(placement, Placement::Replace);
+                place(staging, target, placement)
+            },
+        );
+
+        drop(reader);
+        assert!(
+            attempted,
+            "reach the real placement, not an earlier I/O failure"
+        );
+        assert!(matches!(
+            result,
+            Err(CommitError::Config(ConfigError::Io(_)))
+        ));
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+        assert_eq!(names(directory.path()), ["config.toml", "config.toml.lock"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_replacement_refuses_a_readonly_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = store.load_or_create().unwrap();
+        let (_, revision) = store.load_revision().unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let mut permissions = fs::metadata(store.path()).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(store.path(), permissions.clone()).unwrap();
+        config.geometry.corner_radius = 3;
+        let mut attempted = false;
+        let result = store.publish_placed(
+            &config,
+            Some(&revision),
+            Duration::ZERO,
+            |_| {},
+            |staging, target, placement| {
+                attempted = true;
+                assert_eq!(placement, Placement::Replace);
+                place(staging, target, placement)
+            },
+        );
+        let retained = fs::read(store.path()).unwrap();
+        let still_readonly = fs::metadata(store.path()).unwrap().permissions().readonly();
+        // Restore our synthetic file for owned TempDir cleanup before assertions.
+        permissions.set_readonly(false);
+        fs::set_permissions(store.path(), permissions).unwrap();
+
+        assert!(
+            attempted,
+            "reach the real placement, not an earlier I/O failure"
+        );
+        assert!(matches!(
+            result,
+            Err(CommitError::Config(ConfigError::Io(_)))
+        ));
+        assert!(
+            still_readonly,
+            "replacement never clears the target's readonly bit"
+        );
+        assert_eq!(retained, before);
+        assert_eq!(names(directory.path()), ["config.toml", "config.toml.lock"]);
     }
 
     #[test]

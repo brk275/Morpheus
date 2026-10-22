@@ -1138,7 +1138,8 @@ pub(crate) mod tests {
         assert!(capture_error_unchanged_since(error));
         capture_error_written();
         assert!(!capture_error_unchanged_since(error));
-        let source = include_str!("call_bar.rs");
+        // Source guards compare the same function boundaries in LF and CRLF checkouts.
+        let source = include_str!("call_bar.rs").replace("\r\n", "\n");
         // Everything up to the first top-level test item (the hand-off
         // identities after finish()); send()'s indented test hooks stay in.
         let production = source.split("\n#[cfg(test)]\n").next().unwrap();
@@ -1155,7 +1156,7 @@ pub(crate) mod tests {
             !production.contains("busy_before"),
             "never the click's own value"
         );
-        let main = include_str!("main.rs");
+        let main = include_str!("main.rs").replace("\r\n", "\n");
         for writer in [
             "fn clear_native_capture(ui: &AppWindow) {",
             "fn apply_capture_status(ui: &AppWindow, status: LocalVideoStatus) {",
@@ -1184,7 +1185,7 @@ pub(crate) mod tests {
     /// changes, and the bar stays available in ordinary Settings.
     #[test]
     fn settings_entries_withdraw_the_bar_before_their_state_changes() {
-        let privacy = include_str!("member_privacy.rs");
+        let privacy = include_str!("member_privacy.rs").replace("\r\n", "\n");
         for entry in ["fn review_unignore(", "fn confirm_unignore("] {
             let (_, body) = privacy.split_once(entry).unwrap();
             let body = body.split("\n    fn ").next().unwrap();
@@ -1192,14 +1193,14 @@ pub(crate) mod tests {
             let paint = body.find("self.paint_panel(ui);").unwrap();
             assert!(withdraw < paint, "{entry}");
         }
-        let shortcuts = include_str!("shortcuts.rs");
+        let shortcuts = include_str!("shortcuts.rs").replace("\r\n", "\n");
         let (_, record) = shortcuts.split_once("ui.on_shortcut_record(").unwrap();
         let withdraw = record.find("crate::withdraw_call_bar(&ui);").unwrap();
         let set = record
             .find("ui.set_shortcut_recording(action.name().into());")
             .unwrap();
         assert!(withdraw < set);
-        let window = include_str!("../ui/app-window.slint");
+        let window = include_str!("../ui/app-window.slint").replace("\r\n", "\n");
         let (_, protected) = window
             .split_once("out property <bool> call-bar-protected:")
             .unwrap();
@@ -1218,7 +1219,7 @@ pub(crate) mod tests {
         // The thread browser: in the list, and its real entry withdraws the
         // bar synchronously before its state changes.
         assert!(protected.contains("ThreadBrowser.open"));
-        let browser = include_str!("thread_browser.rs");
+        let browser = include_str!("thread_browser.rs").replace("\r\n", "\n");
         let (_, show) = browser
             .split_once("fn show(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {")
             .unwrap();
@@ -1230,7 +1231,7 @@ pub(crate) mod tests {
         // bar after its own admission (a refused start changes nothing) and
         // before its view opens.
         assert!(protected.contains("RoomLeave.view.open"));
-        let leave = include_str!("room_leave.rs");
+        let leave = include_str!("room_leave.rs").replace("\r\n", "\n");
         let (_, start) = leave
             .split_once("fn start(self: &Arc<Self>, ui: &AppWindow) {")
             .unwrap();
@@ -1245,7 +1246,7 @@ pub(crate) mod tests {
         // too. Their real current-scope/window refusal precedes withdrawal,
         // and withdrawal precedes either details or inspector flag changes.
         assert!(protected.contains("IdentityWarnings.open"));
-        let identity = include_str!("identity_warnings.rs");
+        let identity = include_str!("identity_warnings.rs").replace("\r\n", "\n");
         let (_, show) = identity.split_once("    fn show_details(").unwrap();
         let show = show.split("\n    fn view_member(").next().unwrap();
         let refused = show.find("ui.get_identity_warnings_allowed()").unwrap();

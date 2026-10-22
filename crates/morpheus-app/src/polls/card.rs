@@ -118,6 +118,7 @@ mod tests {
             rich_accessible: None,
             attachment_name: None,
             attachment_is_image: false,
+            attachment_is_audio: false,
             poll: Some(poll),
             reply_preview: None,
             reaction_summary: String::new(),

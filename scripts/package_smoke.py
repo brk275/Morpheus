@@ -69,7 +69,9 @@ def artifact(dist, suffix):
 
 
 def check_resources(root):
-    for name, source in [("LICENSE", ROOT / "LICENSE"), ("aurora.toml", ROOT / "themes/aurora.toml")]:
+    for name, source in [("LICENSE", ROOT / "LICENSE"), ("aurora.toml", ROOT / "themes/aurora.toml"),
+                         ("Symphonia-MPL-2.0.txt", ROOT / "licenses/Symphonia-MPL-2.0.txt"),
+                         ("Symphonia-NOTICE.txt", ROOT / "licenses/Symphonia-NOTICE.txt")]:
         expected = source.read_bytes().replace(b"\r\n", b"\n")
         candidates = [p for p in root.rglob(name) if p.is_file()]
         require(any(p.read_bytes().replace(b"\r\n", b"\n") == expected for p in candidates),
@@ -994,6 +996,7 @@ def linux_smoke(dist, formats):
                    "-v", f"{ROOT / 'scripts'}:/qa/scripts:ro", "-v", f"{dist}:/qa/dist:ro",
                    "-v", f"{ROOT / 'Packager.toml'}:/qa/Packager.toml:ro",
                    "-v", f"{ROOT / 'LICENSE'}:/qa/LICENSE:ro", "-v", f"{ROOT / 'themes'}:/qa/themes:ro",
+                   "-v", f"{ROOT / 'licenses'}:/qa/licenses:ro",
                    image, "bash", "-euc", "apt-get update\napt-get install -y --no-install-recommends python3 ca-certificates\n"
                    f"python3 /qa/scripts/package_smoke.py --linux-container {kind}"]
         run_owned_container(command)

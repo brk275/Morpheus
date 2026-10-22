@@ -1290,6 +1290,19 @@ impl CallController {
             && self.ringing_generation() == generation
     }
 
+    /// Immutable lock-free callback authority. The existing request epoch
+    /// retires playback synchronously before transition waits; the call/update
+    /// reservation covers opening/joining/cleanup and never adopts a later call.
+    pub(crate) fn attachment_audio_authority(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let shared = self.shared.clone();
+        let generation = self.ringing_generation();
+        Arc::new(move || {
+            shared.update_activity.idle()
+                && shared.next_token.load(Ordering::Acquire) == generation.0
+                && shared.ring_request.allowed(generation.1)
+        })
+    }
+
     pub fn status(&self) -> CallStatus {
         self.shared.status.borrow().clone()
     }
@@ -2005,7 +2018,21 @@ struct CallWorker {
 
 impl CallWorker {
     async fn run(mut self) {
-        let setup = self.setup().await;
+        // The existing call reservation has already revoked every prior
+        // attachment lease. Do not open any native call media until its actual
+        // download/decoder/output owner releases; failure follows normal setup
+        // cleanup, with no SDK join or microphone open entered here.
+        let released = tokio::select! {
+            biased;
+            _ = &mut self.cancel => Err(CallControllerError::Cancelled),
+            _ = self.selection.revoked() => Err(CallControllerError::AccountChanged),
+            _ = accepted_cancelled(self.accepted.as_ref()) => Err(CallControllerError::IncomingOfferUnavailable),
+            released = crate::audio_attachments::wait_for_release() => if released { Ok(()) } else { Err(CallControllerError::TimedOut("releasing attachment audio")) },
+        };
+        let setup = match released {
+            Ok(()) => self.setup().await,
+            Err(error) => Err(error),
+        };
         let (mut rtc, info) = match setup {
             Ok(joined) => joined,
             Err(error) => {
@@ -3461,6 +3488,33 @@ async fn ensure_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn attachment_audio_authority_ends_before_a_queued_or_opening_call_and_never_revives() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let controller = CallController::new(manager, UpdateActivity::default());
+        let old = controller.attachment_audio_authority();
+        assert!(old());
+        let queued = controller.reserve_ringing_request().unwrap();
+        assert!(!old());
+        drop(queued);
+        assert!(!old(), "completed request must not revive old audio");
+        let next = controller.attachment_audio_authority();
+        assert!(next());
+        let (token, done) = controller
+            .shared
+            .reserve_open_slot("fixture", "!fixture:example.org")
+            .await
+            .unwrap();
+        assert!(
+            !next(),
+            "native media has not opened but the reservation already excludes attachment output"
+        );
+        controller.shared.finish_open_slot(token).await;
+        done.send_replace(true);
+        assert!(!next(), "call completion must not adopt the old lease");
+        assert!((controller.attachment_audio_authority())());
+    }
 
     #[test]
     fn worker_future_remains_send_with_owned_incoming_offer() {

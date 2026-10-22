@@ -1,3 +1,4 @@
+import { AudioAttachment } from "audio-attachment.slint";
 import { AboutSlint, Button, ListView, Palette, ScrollView, SpinBox } from "std-widgets.slint";
 import { CallParticipantItem, CallStage, CallTileItem } from "call-stage.slint";
 import { MessageSearchItem, MessageSearchPanel } from "message-search.slint";
@@ -369,6 +370,7 @@ export struct MessageItem {
     reply-to: string,
     attachment: string,
     attachment-is-image: bool,
+    attachment-is-audio: bool,
     reaction: string,
     // Native poll card state; `present` is false for every other message.
     poll: PollCardData,
@@ -1203,14 +1205,17 @@ component PendingSendStrip inherits ScrollView {
     if root.blocked-notice != "" : Rectangle {
         height: notice.height + 4px + discard-status.height;
         notice := Text {
-            width: parent.width; height: self.preferred-height;
+            // This block includes the action below; center-by-default geometry
+            // would move the wrapped notice into that action's reserved space.
+            y: 0px; width: parent.width; height: self.preferred-height;
             text: root.blocked-notice; color: root.muted; font-size: 12px * root.text-scale;
             wrap: word-wrap; accessible-live-region: polite;
         }
         discard-status := TextAction {
             y: notice.height + 4px;
             width: root.narrow ? parent.width : min(parent.width, self.preferred-width);
-            height: self.preferred-height;
+            // Outside a layout, honor TextAction's actual wrapped-caption minimum.
+            height: self.min-height;
             wrap-caption: root.narrow;
             text: "Discard unreadable saved status"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
@@ -1224,7 +1229,8 @@ component PendingSendStrip inherits ScrollView {
     for item in root.items : Rectangle {
         height: record-status.height + 4px + record-actions.height;
         record-status := Text {
-            width: parent.width; height: self.preferred-height;
+            // Keep status above its actions rather than centered in their row.
+            y: 0px; width: parent.width; height: self.preferred-height;
             text: item.status + (item.preview != "" ? ": “" + item.preview + "”" : "");
             color: root.muted; font-size: 12px * root.text-scale;
             wrap: word-wrap; accessible-live-region: polite;
@@ -4182,12 +4188,14 @@ export component AppWindow inherits Window {
     // their visible state. A changed handler is only a deferred fallback;
     // a leave-and-return in one event batch must still retire the old view.
     public function withdraw-verification() {
+        root.stop-attachment-audio();
         root.sas-compared = false;
         root.sas-emoji = "";
         root.sas-decimals = "";
         root.verification-protected();
     }
     public function navigate-page(next: int) {
+        if next != root.page { root.stop-attachment-audio(); }
         if next != 1 {
             root.cancel-settings-reveal();
             root.settings-controls-mounted = false;
@@ -4509,6 +4517,23 @@ export component AppWindow inherits Window {
     callback attachment-action(int, int);
     callback attachment-context-changed();
     callback save-attachment(string, string);
+    callback play-attachment-audio(string, bool);
+    callback stop-attachment-audio();
+    callback attachment-audio-tick();
+    callback attachment-audio-context-changed();
+    in-out property <string> attachment-audio-event;
+    in-out property <bool> attachment-audio-thread: false;
+    in-out property <bool> attachment-audio-loading: false;
+    in-out property <bool> attachment-audio-playing: false;
+    in-out property <string> attachment-audio-position: "0:00";
+    in-out property <string> attachment-audio-duration: "—";
+    in-out property <string> attachment-audio-status;
+    property <string> attachment-audio-context: "" + root.page + "\n" + root.active-account-local-id + "\n" + root.active-room-id + "\n" + root.thread-root-id
+        + "\n" + (root.conversation-focused ? "1" : "0") + (root.show-side-panel ? "1" : "0") + root.side-panel-tab
+        + (root.viewport-seek-allowed && !root.settings-reveal-protected ? "1" : "0") + (root.image-previews-encrypted-enabled ? "1" : "0");
+    changed attachment-audio-context => { root.attachment-audio-context-changed(); }
+    Timer { interval: 100ms; running: root.attachment-audio-event != ""; triggered => { root.attachment-audio-tick(); } }
+
     callback cancel-attachment-save();
     callback preview-image-attachment(string, string);
     callback close-image-preview();
@@ -4719,24 +4744,24 @@ export component AppWindow inherits Window {
     // Presentation only: show the thread tab of the side panel.
     public function show-thread-panel() {
         root.navigate-page(0);
-        root.show-side-panel = true;
+        root.stop-attachment-audio(); root.show-side-panel = true;
         root.details-reveal-open = true;
-        root.side-panel-tab = 1;
+        root.stop-attachment-audio(); root.side-panel-tab = 1;
     }
     // Presentation only: show the pinned-messages tab of the side panel.
     public function show-pinned-panel() {
         if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
         root.navigate-page(0);
-        root.show-side-panel = true;
+        root.stop-attachment-audio(); root.show-side-panel = true;
         root.details-reveal-open = true;
-        root.side-panel-tab = 3;
+        root.stop-attachment-audio(); root.side-panel-tab = 3;
     }
     callback focus-room-search();
     focus-room-search => {
         root.navigate-page(0);
-        root.show-side-panel = true;
+        root.stop-attachment-audio(); root.show-side-panel = true;
         root.details-reveal-open = true;
-        root.side-panel-tab = 2;
+        root.stop-attachment-audio(); root.side-panel-tab = 2;
         root.search-focus-request += 1;
     }
     // Keyboard shortcut destinations that need this window's own elements.
@@ -4749,9 +4774,9 @@ export component AppWindow inherits Window {
     // Presentation only, like show-thread-panel.
     public function show-members-panel() {
         root.navigate-page(0);
-        root.show-side-panel = true;
+        root.stop-attachment-audio(); root.show-side-panel = true;
         root.details-reveal-open = true;
-        root.side-panel-tab = 0;
+        root.stop-attachment-audio(); root.side-panel-tab = 0;
     }
     // Presentation only: show the transfers tab of the side panel and focus
     // its heading.
@@ -4759,9 +4784,9 @@ export component AppWindow inherits Window {
         root.transfer-focus-request += 1;
         root.transfer-focus-pending = true;
         root.navigate-page(0);
-        root.show-side-panel = true;
+        root.stop-attachment-audio(); root.show-side-panel = true;
         root.details-reveal-open = true;
-        root.side-panel-tab = 4;
+        root.stop-attachment-audio(); root.side-panel-tab = 4;
     }
     // Presentation only: show the media tab of the side panel and focus its
     // search. Close gives the panel back as it was, without editing the
@@ -4776,14 +4801,14 @@ export component AppWindow inherits Window {
             RoomMedia.focus-request += 1;
         }
         root.navigate-page(0);
-        root.show-side-panel = true;
+        root.stop-attachment-audio(); root.show-side-panel = true;
         root.details-reveal-open = true;
-        root.side-panel-tab = 5;
+        root.stop-attachment-audio(); root.side-panel-tab = 5;
     }
     function close-room-media() {
-        root.side-panel-tab = root.room-media-return-tab;
+        root.stop-attachment-audio(); root.side-panel-tab = root.room-media-return-tab;
         root.details-reveal-open = root.room-media-return-reveal;
-        root.show-side-panel = root.room-media-return-shown;
+        root.stop-attachment-audio(); root.show-side-panel = root.room-media-return-shown;
         root.focus-composer(false);
     }
     // Opens the menu and focuses its trigger; each entry keeps its own
@@ -5121,8 +5146,8 @@ export component AppWindow inherits Window {
             root.open-room-settings();
         } else if slot == 2 {
             if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
-            root.show-side-panel = true;
-            root.side-panel-tab = 3;
+            root.stop-attachment-audio(); root.show-side-panel = true;
+            root.stop-attachment-audio(); root.side-panel-tab = 3;
         } else if slot == 3 {
             if !RoomLeave.view.open { ThreadBrowser.show(); }
         } else if slot == 4 {
@@ -5752,7 +5777,7 @@ export component AppWindow inherits Window {
 
     // A picker snapshot never survives a change of account or Space.
     changed image-previews-encrypted-enabled => {
-        if !root.image-previews-encrypted-enabled { root.cancel-room-settings(); }
+        if !root.image-previews-encrypted-enabled { root.stop-attachment-audio(); root.cancel-room-settings(); }
     }
     changed room-admin-open => {
         if !root.room-admin-open { root.cancel-room-settings(); root.moderation-context-changed(2); }
@@ -5766,15 +5791,15 @@ export component AppWindow inherits Window {
         MemberPrivacy.close-inspector();
         root.moderation-context-changed(0);
         root.details-reveal-open = false;
-        root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); ThreadBrowser.context-changed(); }
+        root.cancel-room-settings(); root.close-image-preview(); root.stop-attachment-audio(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); ThreadBrowser.context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {
         MemberPrivacy.close-inspector();
         root.moderation-context-changed(0);
-        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); root.attachment-context-changed(); RoomOrganizationState.active-room-changed();
+        root.cancel-room-settings(); root.close-image-preview(); root.stop-attachment-audio(); root.mention-context-changed(); root.attachment-context-changed(); RoomOrganizationState.active-room-changed();
         root.appearance-room-changed(); ThreadBrowser.context-changed(); }
     changed thread-root-id => {
-        root.close-image-preview(); root.mention-context-changed();
+        root.close-image-preview(); root.stop-attachment-audio(); root.mention-context-changed();
         // A page request for the previous thread can no longer publish here.
         root.thread-history-operation += 1; root.thread-history-loading = false;
         root.thread-history-at-start = false; root.thread-history-error = "";
@@ -7662,6 +7687,18 @@ export component AppWindow inherits Window {
                                         text-scale: root.text-scale;
                                         corner: StyleTokens.radius * 0.9;
                                     }
+                                    if message.attachment-is-audio && message.event-id != "" : AudioAttachment {
+                                        width: min(440px, max(0px, message-content.width - (message-row.columns ? message-row.action-width + 8px : 0px)));
+                                        title: message.attachment; active: root.attachment-audio-event == message.event-id && !root.attachment-audio-thread;
+                                        playing: self.active && root.attachment-audio-playing; loading: self.active && root.attachment-audio-loading;
+                                        position: root.attachment-audio-position; duration: root.attachment-audio-duration; status: root.attachment-audio-status;
+                                        enabled: root.live-session && root.native-call-enabled && !root.call-connected && !root.native-call-request-pending && !root.incoming-call-answering && root.viewport-seek-allowed && !root.settings-reveal-protected;
+                                        save-enabled: root.live-session && message.event-id != root.downloading-event-id;
+                                        ink: root.ink; muted: root.muted; surface: root.panel; hover: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                        play => { root.play-attachment-audio(message.event-id, false); }
+                                        stop => { root.stop-attachment-audio(); }
+                                        save => { root.save-attachment(message.event-id, message.attachment); }
+                                    }
                                     if message.attachment-is-image && message.event-id != "" : ActionRect {
                                         // The natural heights of the picture glyph (icon size) and of
                                         // the two text lines (font and text size), plus the 11 px
@@ -7686,7 +7723,7 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                     }
-                                    if message.attachment != "" : Rectangle {
+                                    if message.attachment != "" && !message.attachment-is-audio : Rectangle {
                                         width: min(440px, max(0px, message-content.width - (message-row.columns ? message-row.action-width + 8px : 0px)));
                                         height: 58px + StyleTokens.icon-button-growth;
                                         border-radius: StyleTokens.radius * 0.9;
@@ -7769,8 +7806,8 @@ export component AppWindow inherits Window {
                                         root.thread-composer-text = "";
                                         root.thread-send-pending = false;
                                         root.thread-messages = [];
-                                        root.side-panel-tab = 1;
-                                        root.show-side-panel = true;
+                                        root.stop-attachment-audio(); root.side-panel-tab = 1;
+                                        root.stop-attachment-audio(); root.show-side-panel = true;
                                         root.open-thread(message.event-id, message.sender, message.body);
                                     }
                                 }
@@ -11043,6 +11080,7 @@ export component AppWindow inherits Window {
                         Text { text: "About"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Morpheus is an open-source Matrix desktop client."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Interface powered by Slint · slint.dev"; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        if root.native-call-enabled : Text { text: "Audio decoding: Symphonia 0.6.1 · MPL-2.0. License and source notices are included with Morpheus. Source: github.com/pdeljanov/Symphonia/tree/ee35874b571a35a9a6e15d3bc9a3aaf8f11fbeee"; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         AboutSlint { }
                     }
                 }
@@ -11408,7 +11446,7 @@ export component AppWindow inherits Window {
                             label: "Show members";
                             accessible-checkable: true;
                             accessible-checked: root.side-panel-tab == 0;
-                            activated => { root.side-panel-tab = 0; }
+                            activated => { root.stop-attachment-audio(); root.side-panel-tab = 0; }
                             HorizontalLayout {
                                 alignment: center; spacing: 6px;
                                 VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "members"; ink: root.side-panel-tab == 0 ? root.ink : root.muted; } }
@@ -11422,7 +11460,7 @@ export component AppWindow inherits Window {
                             label: "Show thread";
                             accessible-checkable: true;
                             accessible-checked: root.side-panel-tab == 1;
-                            activated => { root.side-panel-tab = 1; }
+                            activated => { root.stop-attachment-audio(); root.side-panel-tab = 1; }
                             HorizontalLayout {
                                 alignment: center; spacing: 6px;
                                 VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "thread"; ink: root.side-panel-tab == 1 ? root.ink : root.muted; } }
@@ -11437,7 +11475,7 @@ export component AppWindow inherits Window {
                             accessible-checkable: true;
                             accessible-checked: root.side-panel-tab == 2;
                             enabled: root.live-session;
-                            activated => { root.side-panel-tab = 2; }
+                            activated => { root.stop-attachment-audio(); root.side-panel-tab = 2; }
                             HorizontalLayout {
                                 alignment: center; spacing: 6px;
                                 VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "search"; ink: root.side-panel-tab == 2 ? root.ink : root.muted; } }
@@ -11455,7 +11493,7 @@ export component AppWindow inherits Window {
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
                                 if !root.pinned-pane-visible { root.pinned-focus-pending = true; }
-                                root.side-panel-tab = 3;
+                                root.stop-attachment-audio(); root.side-panel-tab = 3;
                             }
                             HorizontalLayout {
                                 alignment: center; spacing: 6px;
@@ -11472,7 +11510,7 @@ export component AppWindow inherits Window {
                             accessible-checkable: true;
                             accessible-checked: root.side-panel-tab == 4;
                             enabled: root.live-session;
-                            activated => { root.side-panel-tab = 4; }
+                            activated => { root.stop-attachment-audio(); root.side-panel-tab = 4; }
                             HorizontalLayout {
                                 alignment: center; spacing: 6px;
                                 VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "files"; ink: root.side-panel-tab == 4 ? root.ink : root.muted; } }
@@ -11783,13 +11821,14 @@ export component AppWindow inherits Window {
                         if root.room-search-selected-thread-root != "" && root.room-search-selected-thread-root == root.thread-root-id : IconAction {
                             width: 28px; height: 28px; icon: "←"; label: "Back to search results";
                             ink: root.muted; surface: transparent; hover-surface: root.hover;
-                            activated => { root.side-panel-tab = 2; }
+                            activated => { root.stop-attachment-audio(); root.side-panel-tab = 2; }
                         }
                         Text { text: "Thread"; color: root.ink; font-size: 17px * root.text-scale; font-weight: 750; horizontal-stretch: 1; vertical-alignment: center; }
                         if root.thread-root-id != "" : IconAction {
                             width: 28px; height: 28px; icon: "close"; label: "Close thread";
                             ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             activated => {
+                                root.stop-attachment-audio();
                                 root.thread-root-id = "";
                                 root.thread-root-is-own = false;
                                 root.thread-root-palette-index = 0;
@@ -12083,6 +12122,17 @@ export component AppWindow inherits Window {
                                     }
                                     // The window's token-drawn action: control radius, padding,
                                     // line and focus widths and control states apply.
+                                    if reply.attachment-is-audio && reply.event-id != "" : AudioAttachment {
+                                        title: reply.attachment; active: root.attachment-audio-event == reply.event-id && root.attachment-audio-thread;
+                                        playing: self.active && root.attachment-audio-playing; loading: self.active && root.attachment-audio-loading;
+                                        position: root.attachment-audio-position; duration: root.attachment-audio-duration; status: root.attachment-audio-status;
+                                        enabled: root.live-session && root.native-call-enabled && !root.call-connected && !root.native-call-request-pending && !root.incoming-call-answering && root.viewport-seek-allowed && !root.settings-reveal-protected;
+                                        save-enabled: root.live-session && reply.event-id != root.downloading-event-id;
+                                        ink: root.ink; muted: root.muted; surface: root.elevated; hover: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                        play => { root.play-attachment-audio(reply.event-id, true); }
+                                        stop => { root.stop-attachment-audio(); }
+                                        save => { root.save-attachment(reply.event-id, reply.attachment); }
+                                    }
                                     if reply.attachment-is-image && reply.event-id != "" : HorizontalLayout {
                                         alignment: start;
                                         TextAction {

@@ -1065,13 +1065,15 @@ class Acceptance:
             label += "-late-join"
         self.run(label, args, extra=env, test=True, pid_namespace=True)
 
+    # These native App commands compile the same generated UI test binary.
+    # ElementHandle metadata must not depend on a caller step's environment.
     def app_recovery(self, fixture: Path):
         self.run(
             APP_RECOVERY_LABEL,
             ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
              "--bin", "morpheus-app", "--", "--exact", *APP_RECOVERY_TESTS,
              "--nocapture", "--test-threads=1"],
-            extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
+            extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture), "SLINT_EMIT_DEBUG_INFO": "1"},
             test=True, pid_namespace=True,
         )
 
@@ -1081,7 +1083,7 @@ class Acceptance:
             ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
              "--bin", "morpheus-app", APP_TIMELINE_CASE, "--", "--exact",
              "--nocapture", "--test-threads=1"],
-            extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
+            extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture), "SLINT_EMIT_DEBUG_INFO": "1"},
             # The existing account harness has a 20-second bound before the
             # live scenario's 420-second bound. Preserve time for both plus
             # process startup; final credential scanning has its own reserve.
@@ -1166,7 +1168,8 @@ class Acceptance:
                      "--bin", "morpheus-app", RING_TEST, "--", "--ignored", "--exact", "--show-output",
                      "--test-threads=1"],
                     extra={"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture),
-                           "MORPHEUS_RING_TEST_MODE": mode, "MORPHEUS_RING_TEST_TARGET": target},
+                           "MORPHEUS_RING_TEST_MODE": mode, "MORPHEUS_RING_TEST_TARGET": target,
+                           "SLINT_EMIT_DEBUG_INFO": "1"},
                     ring_case=(mode, target), seconds=300, pid_namespace=True,
                 )
             self.group((label,), case)

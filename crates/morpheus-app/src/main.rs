@@ -8,6 +8,7 @@ mod appearance;
 mod appearance_editor;
 mod attachment_workbench;
 mod attachments;
+mod audio_attachments;
 mod audio_devices;
 #[cfg(feature = "native-calls")]
 mod call_bar;
@@ -216,6 +217,7 @@ fn message(
         reply_to: reply_to.into(),
         attachment: attachment.into(),
         attachment_is_image: false,
+        attachment_is_audio: false,
         reaction: reaction.into(),
         poll: PollCardData::default(),
         accent,
@@ -848,6 +850,7 @@ fn finish_composer_submission(
 
 fn reset_attachment_view(ui: &AppWindow) {
     ui.invoke_close_image_preview();
+    ui.invoke_stop_attachment_audio();
     // An unfinished save keeps downloading in the account's transfer center;
     // leaving the account stops it. Bumping the operation below keeps its
     // late notice out of the next room.
@@ -1008,6 +1011,9 @@ fn apply_appearance(
     apply_room_sort(ui);
     ui.set_room_list_width(config.layout.room_list_width.into());
     ui.set_details_width(config.layout.details_width.into());
+    if ui.get_show_side_panel() != config.layout.show_member_panel {
+        ui.invoke_stop_attachment_audio();
+    }
     ui.set_show_side_panel(config.layout.show_member_panel);
     if let Some(theme) = theme {
         let colors = &theme.colors;
@@ -1734,6 +1740,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager.clone(),
         update_activity.clone(),
     ));
+    let attachment_audio = audio_attachments::AudioAttachments::register(
+        &ui,
+        live.clone(),
+        runtime.handle().clone(),
+        #[cfg(feature = "native-calls")]
+        calls.clone(),
+    );
     #[cfg(feature = "native-calls")]
     let access_calls = calls.clone();
     let account_access = account_access::AccountAccessUi::register(
@@ -2653,6 +2666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = weak.upgrade() {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
+            ui.invoke_stop_attachment_audio();
             space_explorer::clear(&ui);
             space_management::clear(&ui);
             room_addresses::clear(&ui);
@@ -2701,6 +2715,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             room_addresses::clear(&ui);
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
+            ui.invoke_stop_attachment_audio();
         }
         if room_live.is_live.load(Ordering::Acquire) {
             let Some(window) = weak.upgrade() else {
@@ -4322,6 +4337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         window.invoke_cancel_room_settings();
         window.invoke_close_image_preview();
+        window.invoke_stop_attachment_audio();
         if !logout_live.is_live.load(Ordering::Acquire) {
             if window.get_call_connected() {
                 window.set_pending_account_index(-3);
@@ -4668,6 +4684,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     room_leave.shutdown(&ui);
     moderation.shutdown();
     image_previews.shutdown(&ui);
+    attachment_audio.shutdown(&ui);
     #[cfg(feature = "native-calls")]
     voice_presence.shutdown(&ui);
     // Before the incoming worker and notifications: no call banner outlives
@@ -4697,6 +4714,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "native-calls"))]
         updates.shutdown().await
     });
+    if !runtime.block_on(audio_attachments::wait_for_release()) {
+        eprintln!("Attachment audio worker did not confirm release before shutdown");
+    }
     let draft_result = runtime.block_on(live.flush_drafts());
     runtime.block_on(manager.stop());
     if let Err(error) = update_result {

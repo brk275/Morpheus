@@ -255,6 +255,7 @@ pub fn apply_config(ui: &AppWindow, config: &Config) {
         // Runs synchronously on the UI thread for each Settings save and each
         // observed valid file reload. Disabling/re-enabling never revives work.
         ui.invoke_close_image_preview();
+        ui.invoke_stop_attachment_audio();
         if !enabled {
             ui.invoke_cancel_room_settings();
         }
@@ -641,6 +642,7 @@ impl Opener {
             return;
         };
         let controller = &self.controller;
+        ui.invoke_stop_attachment_audio();
         controller.cancel();
         clear(ui);
         let id = controller

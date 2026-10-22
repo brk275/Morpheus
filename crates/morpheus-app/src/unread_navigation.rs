@@ -459,6 +459,9 @@ impl UnreadNavigationUi {
         let weak = ui.as_weak();
         global.on_withdraw_jump(move || {
             if let Some(ui) = weak.upgrade() {
+                // The same admitted protected entries retire audio before their
+                // visible flags change, even if they close in this event batch.
+                ui.invoke_stop_attachment_audio();
                 this.withdraw_jump(&ui);
             }
         });

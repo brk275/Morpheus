@@ -10,7 +10,7 @@ out-dir = "dist"
 binaries-dir = "target/release"
 before-packaging-command = "cargo build --release --locked -p morpheus-app --features native-calls"
 icons = ["assets/icon.png", "assets/icon.icns", "assets/icon.ico"]
-resources = ["themes/aurora.toml", "LICENSE"]
+resources = ["themes/aurora.toml", "LICENSE", "licenses/Symphonia-MPL-2.0.txt", "licenses/Symphonia-NOTICE.txt"]
 
 [macos]
 info-plist-path = "packaging/macos/Info.plist"

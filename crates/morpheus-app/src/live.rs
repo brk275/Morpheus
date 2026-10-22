@@ -1095,6 +1095,29 @@ impl LiveUi {
         navigation
     }
 
+    pub(crate) fn attachment_audio_lease(
+        &self,
+        thread: bool,
+    ) -> crate::audio_attachments::ViewLease {
+        let navigation_at = self.navigation_epoch.load(Ordering::Acquire);
+        let security_at = self.security_gate.ringing_generation();
+        let generation = if thread {
+            self.thread_generation.clone()
+        } else {
+            self.generation.clone()
+        };
+        let generation_at = generation.load(Ordering::Acquire);
+        crate::audio_attachments::ViewLease {
+            live: self.is_live.clone(),
+            navigation: self.navigation_epoch.clone(),
+            navigation_at,
+            generation,
+            generation_at,
+            gate: self.security_gate.clone(),
+            security_at,
+        }
+    }
+
     pub(crate) fn current_navigation_epoch(&self) -> u64 {
         self.navigation_epoch.load(Ordering::Acquire)
     }
@@ -5839,6 +5862,7 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
         reply_to: info.reply_preview.as_deref().unwrap_or("").into(),
         attachment: info.attachment_name.as_deref().unwrap_or("").into(),
         attachment_is_image: info.attachment_is_image,
+        attachment_is_audio: info.attachment_is_audio,
         reaction: info.reaction_summary.as_str().into(),
         poll: crate::polls::poll_card(info),
         accent: accent(&info.sender),
@@ -6036,6 +6060,7 @@ mod member_tests {
             rich_accessible: Some("Visible bold text".into()),
             attachment_name: None,
             attachment_is_image: false,
+            attachment_is_audio: false,
             poll: None,
             reply_preview: None,
             reaction_summary: String::new(),

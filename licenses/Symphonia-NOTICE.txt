@@ -1,0 +1,8 @@
+Symphonia 0.6.1: symphonia-core and symphonia-bundle-mp3 only.
+Copyright (c) 2019-2026 The Project Symphonia Developers.
+Licensed under the Mozilla Public License, v. 2.0; see Symphonia-MPL-2.0.txt.
+These library sources are unmodified.
+Corresponding library source: https://github.com/pdeljanov/Symphonia/tree/ee35874b571a35a9a6e15d3bc9a3aaf8f11fbeee
+Package source paths: symphonia-core/ and symphonia-bundle-mp3/.
+The exact crates.io archives and checksums are pinned in Cargo.lock.
+This notice is additional to Morpheus's AGPL license and other required dependency notices.

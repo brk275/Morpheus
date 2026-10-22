@@ -261,6 +261,7 @@ pub(crate) mod tests {
             body,
             attachment_name: None,
             attachment_is_image: false,
+            attachment_is_audio: false,
             poll: None,
             reply_preview: None,
             reaction_summary: String::new(),

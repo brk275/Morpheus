@@ -892,7 +892,7 @@ mod tests {
                 .as_deref(),
             Some(r#"{"org.example.n":1.10,"unread":false}"#)
         );
-        let source = include_str!("unread_navigation.rs");
+        let source = include_str!("unread_navigation.rs").replace("\r\n", "\n");
         let production = source.split("#[cfg(test)]").next().unwrap();
         let (_, writer) = production
             .split_once("pub async fn set_marked_unread_selected(")
@@ -923,7 +923,7 @@ mod tests {
         }
         // After the hand-off only an account change ends the wait; closing
         // the view does not turn a sent write into Unknown.
-        let source = include_str!("unread_navigation.rs");
+        let source = include_str!("unread_navigation.rs").replace("\r\n", "\n");
         let production = source.split("#[cfg(test)]").next().unwrap();
         let (_, handed) = production
             .split_once("// The last checks before the hand-off.")
@@ -1248,43 +1248,48 @@ mod tests {
     /// longer through the reveal that looked only for the marker's own item.
     #[test]
     fn placing_is_local_and_a_reply_in_a_thread_is_never_paged_for() {
-        let source = include_str!("unread_navigation.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-        let (_, placing) = production
-            .split_once("/// The first item's own ID")
-            .unwrap();
-        let (_, position) = production
-            .split_once("pub async fn unread_position_selected(")
-            .unwrap();
-        let position = position.split("\n    }\n").next().unwrap();
-        let requests = [
-            "paginate",
-            ".send(",
-            "timeline_builder",
-            ".timeline(",
-            "member",
-            "keys",
-        ];
-        for text in [placing, position] {
-            for request in requests {
-                assert!(!text.contains(request), "{request}");
+        let source = include_str!("unread_navigation.rs").replace("\r\n", "\n");
+        // Git's Windows checkout may use CRLF. Check the same production
+        // boundaries and every assertion under both checkout representations.
+        for source in [source.clone(), source.replace('\n', "\r\n")] {
+            let source = source.replace("\r\n", "\n");
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            let (_, placing) = production
+                .split_once("/// The first item's own ID")
+                .unwrap();
+            let (_, position) = production
+                .split_once("pub async fn unread_position_selected(")
+                .unwrap();
+            let position = position.split("\n    }\n").next().unwrap();
+            let requests = [
+                "paginate",
+                ".send(",
+                "timeline_builder",
+                ".timeline(",
+                "member",
+                "keys",
+            ];
+            for text in [placing, position] {
+                for request in requests {
+                    assert!(!text.contains(request), "{request}");
+                }
             }
-        }
-        assert!(placing.contains("let own = room.own_user_id();"));
-        assert!(placing.contains("own: event.sender() == own,"));
-        let (_, jump) = production
-            .split_once("pub async fn jump_to_fully_read_selected(")
-            .unwrap();
-        let jump = jump.split("\n    }\n").next().unwrap();
-        assert!(!jump.contains("reveal_event_selected"));
-        let page = jump.find("self.jump_page(").unwrap();
-        for before in [
-            "UnreadPosition::ThreadNotLoaded => return Ok(UnreadJump::InThread)",
-            "UnreadPosition::Unplaceable => return Ok(UnreadJump::Unplaceable)",
-            "UnreadPosition::Placed { first: None } => return Ok(UnreadJump::NothingNewer)",
-            "if start_reached {",
-        ] {
-            assert!(jump.find(before).unwrap() < page, "{before}");
+            assert!(placing.contains("let own = room.own_user_id();"));
+            assert!(placing.contains("own: event.sender() == own,"));
+            let (_, jump) = production
+                .split_once("pub async fn jump_to_fully_read_selected(")
+                .unwrap();
+            let jump = jump.split("\n    }\n").next().unwrap();
+            assert!(!jump.contains("reveal_event_selected"));
+            let page = jump.find("self.jump_page(").unwrap();
+            for before in [
+                "UnreadPosition::ThreadNotLoaded => return Ok(UnreadJump::InThread)",
+                "UnreadPosition::Unplaceable => return Ok(UnreadJump::Unplaceable)",
+                "UnreadPosition::Placed { first: None } => return Ok(UnreadJump::NothingNewer)",
+                "if start_reached {",
+            ] {
+                assert!(jump.find(before).unwrap() < page, "{before}");
+            }
         }
     }
 }

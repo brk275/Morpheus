@@ -496,7 +496,8 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             self.assertEqual(args[1], ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
                                       "--bin", "morpheus-app", acceptance_module.APP_TIMELINE_CASE,
                                       "--", "--exact", "--nocapture", "--test-threads=1"])
-            self.assertEqual(options, {"extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
+            self.assertEqual(options, {"extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture),
+                                                "SLINT_EMIT_DEBUG_INFO": "1"},
                                        "seconds": 480, "test": True, "pid_namespace": True})
 
     def test_live_ui_case_remains_required_in_full_and_timeline_profiles(self):
@@ -1368,7 +1369,8 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
                                     *("live::stale_observer_tests::" + name for name in self.cases),
                                     "--nocapture", "--test-threads=1"])
             self.assertEqual(run.call_args.kwargs, {
-                "extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(Path(folder) / "fixture.json")},
+                "extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(Path(folder) / "fixture.json"),
+                          "SLINT_EMIT_DEBUG_INFO": "1"},
                 "test": True, "pid_namespace": True,
             })
 
@@ -2067,7 +2069,8 @@ class OutgoingRingTests(unittest.TestCase):
                 ])
                 self.assertEqual(invocation.kwargs, {
                     "extra": {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture.resolve()),
-                              "MORPHEUS_RING_TEST_MODE": mode, "MORPHEUS_RING_TEST_TARGET": target},
+                              "MORPHEUS_RING_TEST_MODE": mode, "MORPHEUS_RING_TEST_TARGET": target,
+                              "SLINT_EMIT_DEBUG_INFO": "1"},
                     "ring_case": case, "seconds": 300, "pid_namespace": True,
                 })
 
@@ -2565,11 +2568,12 @@ class ScopedContinuationTests(unittest.TestCase):
     def test_private_environment_is_forwarded_to_same_existing_namespace_contract(self):
         with tempfile.TemporaryDirectory() as folder:
             runner = Acceptance(Path(folder), "scanner")
-            runner.env.update({"DBUS_SESSION_BUS_ADDRESS": "private-bus", "HOME": "private-home"})
+            runner.env.update({"DBUS_SESSION_BUS_ADDRESS": "private-bus", "HOME": "private-home",
+                               "SLINT_EMIT_DEBUG_INFO": "0"})
             output = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n"
             with self.contained_child(runner, output, returncode=0) as (visible, command, popen, _, _, _):
                 runner.run("local_rtc", ["cargo-test"], test=True, pid_namespace=True,
-                           extra={"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": "private-fixture"})
+                           extra={"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": "private-fixture", "SLINT_EMIT_DEBUG_INFO": "1"})
             target, directory, environment = command.call_args.args
             self.assertEqual(target, ["cargo-test"])
             self.assertEqual(directory.parent, runner.root)
@@ -2577,6 +2581,8 @@ class ScopedContinuationTests(unittest.TestCase):
             self.assertEqual(environment["HOME"], "private-home")
             self.assertEqual(environment["XDG_DATA_HOME"], runner.env["XDG_DATA_HOME"])
             self.assertEqual(environment["MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS"], "private-fixture")
+            self.assertEqual(environment["SLINT_EMIT_DEBUG_INFO"], "1")
+            self.assertEqual(popen.call_args.kwargs["env"]["SLINT_EMIT_DEBUG_INFO"], "1")
             self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
             self.assertNotIn("private", visible.getvalue())
