@@ -283,6 +283,30 @@ jobs:
             exit "$result"
           }
           trap finish EXIT
+          download_pinned_runtime_deb() {
+            local output="$1" bytes="$2" url="$3" attempt result
+            # Retry only interrupted transfers. HTTP, certificate, local-write
+            # and checksum/size failures must still stop the provisioning gate.
+            for attempt in 1 2 3; do
+              if /usr/bin/curl --disable --fail --silent --show-error --location --max-redirs 3 \
+                --noproxy '*' --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 \
+                --max-filesize "$bytes" "$url" --output "$output"; then
+                return 0
+              else
+                result=$?
+              fi
+              case "$result" in
+                18|28|52|55|56) ;;
+                *) return "$result" ;;
+              esac
+              if [[ "$attempt" == 3 ]]; then
+                return "$result"
+              fi
+              # A retry always begins empty; partial bytes are never resumed.
+              /usr/bin/rm -f -- "$output"
+              /bin/sleep 2
+            done
+          }
           {
             [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
             git show --no-ext-diff --no-textconv "$GITHUB_SHA:packaging/linux/runtime-build-host.json" > "$private/runtime-host.json"
@@ -291,9 +315,7 @@ jobs:
             stage=download
             while IFS=$'\t' read -r file bytes digest url; do
               input=$((input + 1))
-              /usr/bin/curl --disable --fail --silent --show-error --location --max-redirs 3 \
-                --noproxy '*' --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 \
-                --max-filesize "$bytes" "$url" --output "$private/debs/$file"
+              download_pinned_runtime_deb "$private/debs/$file" "$bytes" "$url"
               test "$(/usr/bin/stat --format='%s' "$private/debs/$file")" = "$bytes"
               printf '%s  %s\n' "$digest" "$private/debs/$file" | /usr/bin/sha256sum --check --status
             done <<'PINNED_RUNTIME_HOST_DEBS'
