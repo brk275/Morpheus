@@ -2873,7 +2873,7 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     slint::spawn_local(async move {
         let started = std::time::Instant::now();
         let phase = std::rc::Rc::new(AccountUiProgress::new(started));
-        // The original fourteen-scenario budget now covers 47 transitions,
+        // The original fourteen-scenario budget now covers 54 transitions,
         // including the thread browser and room leave. Keep a finite three-minute
         // whole budget and a separate phase cap that catches one stall sooner.
         let outcome = tokio::select! {
@@ -3015,7 +3015,11 @@ fn exercise_startup_recovery() {
 /// window opacity rollback and persistence, single-paint translucency, every
 /// search target reaching a real control, and bounded results at the smallest
 /// window with 200% text.
-async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std::path::Path) {
+async fn assert_appearance_workspace_and_search(
+    ui: &AppWindow,
+    directory: &std::path::Path,
+    phase: &AccountUiProgress,
+) {
     use i_slint_backend_testing::ElementHandle;
     use morpheus_config::{ConfigStore, registry};
 
@@ -3284,6 +3288,9 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     assert!(store.load().unwrap().window.opacity_percent < 50);
     ui.invoke_set_window_opacity(100);
     settle(ui).await;
+
+    // Editor and opacity checks are complete; bound the search scenario separately.
+    phase.set(95);
 
     // Every search target reaches a real, enabled control; none changes a
     // setting or runs an action.
@@ -3590,6 +3597,9 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     ui.set_settings_search_query("".into());
     ui.invoke_settings_search("".into());
     settle(ui).await;
+
+    // Search semantics are complete; bound responsive destination geometry separately.
+    phase.set(96);
 
     // Lengths keep their px unit; the unitless sender weight shows none.
     let weight = match ui.get_sender_font_weight() {
@@ -5478,7 +5488,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     phase.set(8);
     assert_message_role_precedence_and_thread_metadata(&ui).await;
     phase.set(9);
-    assert_appearance_workspace_and_search(&ui, directory.path()).await;
+    assert_appearance_workspace_and_search(&ui, directory.path(), phase.as_ref()).await;
     phase.set(10);
     assert_metric_workspace_and_extremes(&ui, directory.path()).await;
     phase.set(11);
