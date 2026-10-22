@@ -138,7 +138,8 @@ jobs:
     concurrency:
       group: native-${{ github.sha }}-${{ matrix.os }}
       cancel-in-progress: false
-    timeout-minutes: 90
+    # Intel cold native graphs need room to compile; test deadlines stay fixed.
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 150 || 90 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
