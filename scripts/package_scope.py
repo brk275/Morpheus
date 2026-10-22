@@ -10,7 +10,9 @@ else:
     from package_revision import select_revision
 
 
-def package_matrix(platform, linux_formats, appimage_updates=False, appimage_capture=False):
+def package_matrix(platform, linux_formats, appimage_updates=False, appimage_capture=False, source_bundle=False):
+    if source_bundle and (platform != "linux" or linux_formats != "appimage" or appimage_updates or appimage_capture):
+        raise ValueError("Source evidence requires Linux/AppImage alone and excludes capture/update QA")
     if appimage_capture and (platform != "linux" or linux_formats != "appimage" or appimage_updates):
         raise ValueError("Installed capture QA requires Linux/AppImage alone and excludes update QA")
     if appimage_updates and (platform not in {"linux", "all"} or linux_formats != "appimage"):
@@ -41,8 +43,12 @@ def main():
     capture_input = os.environ.get("APPIMAGE_CAPTURE", "false")
     if capture_input not in {"true", "false"}:
         raise ValueError("AppImage capture selection must be an explicit boolean")
+    source_input = os.environ.get("SOURCE_BUNDLE", "false")
+    if source_input not in {"true", "false"}:
+        raise ValueError("Source bundle selection must be an explicit boolean")
     matrix = package_matrix(
-        os.environ["PACKAGE_PLATFORM"], os.environ["LINUX_FORMATS"], update_input == "true", capture_input == "true"
+        os.environ["PACKAGE_PLATFORM"], os.environ["LINUX_FORMATS"], update_input == "true", capture_input == "true",
+        source_input == "true"
     )
     # Resolve/validate before emitting any runner or cache outputs. Only a
     # complete commit ID is accepted; branches and abbreviated refs can move.
@@ -51,7 +57,8 @@ def main():
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write("matrix=" + json.dumps(matrix) + "\n")
         output.write("source_revision=" + source_revision + "\n")
-        output.write("cache_write=" + ("true" if source_revision == workflow_revision else "false") + "\n")
+        output.write("cache_write=" + ("true" if source_revision == workflow_revision and source_input == "false" else "false") + "\n")
+        output.write("source_bundle=" + source_input + "\n")
 
 
 if __name__ == "__main__":

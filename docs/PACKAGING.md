@@ -37,6 +37,108 @@ SDK downloader from legacy extraction caches. Select only the
 affected platforms and check active runs first. QA installers remain on the
 runner; signing, licensing and installed-package release gates still apply.
 
+## Preparing corresponding source evidence
+
+An explicit source-only path prepares the committed Rust workspace, local
+patches and every source listed in its `Cargo.lock`. The bundle builder creates
+no installer, runs no dependency hooks, performs no downloads and changes no release gate.
+The ordinary `--check` and package commands keep their existing behavior.
+
+The permanent **Package validation** workflow has an explicit `source_bundle`
+input, off by default. Select `platform=linux`, `linux_formats=appimage`,
+`source_bundle=true`, `appimage_capture=false` and `appimage_updates=false`.
+Optionally provide the complete reviewed `source_revision`. Other combinations
+fail selection. The source-only job runs after the same independent selected
+source/history scan and holds the candidate's Linux concurrency lock. It
+installs pinned Rust and the reviewed scanner; it never starts native builds,
+installer preparation, capture, updates, uploads or shared-cache writes.
+
+On the fresh worker, the production acquisition helper runs pinned Cargo
+`fetch --locked` with a new private Cargo home and a separate working directory.
+It permits only the three reviewed Git pins and the locked crates.io registry,
+discards ambient credentials/configuration, authenticates every archive checksum
+and locates mirrors by raw pinned-commit identity. This fetch does not run
+dependency build scripts or procedural macros. Its owned namespace stops before
+the workflow invokes the genuine outer `scripts/package.py` source command,
+which owns a separate canonical namespace. No nested privilege workaround is
+used. An always-run finalizer checks the source/tree, bundle/manifest hashes and
+counts, scans segregated diagnostics and deletes the source caches, private plan
+and output. Only its closed hash/count/cleanup result enters public logs; the
+bundle remains unpublished and source-content/license review remains open.
+The selected source must include the source-bundle helpers. Unexpected source
+origins, ambient ancestor Cargo configuration or incomplete caches fail closed.
+
+After source and dependency review, use a fresh standard hosted Ubuntu 24.04
+worker for the public repository's manual `main` context. Bind
+`MORPHEUS_PACKAGE_SOURCE_REVISION` to the complete reviewed commit ID and use the
+same checked-out source identity as package validation. Prepare the inputs on
+that worker through separately reviewed acquisition, such as the existing
+locked Cargo fetch. Never acquire or execute dependencies on the owner's PC.
+The bundle builder itself reads preexisting inputs only.
+
+Create a private JSON input plan (`0600`) with exactly these fields:
+
+```json
+{
+  "schema": 1,
+  "registry_cache": "/home/runner/.cargo/registry/cache/index.crates.io-example",
+  "git_mirrors": {
+    "git+https://github.com/element-hq/matrix-rust-rtc?tag=v0.5.0-rc.2#53880ef1ef66b62df555ce71ccd1d6c85b813596": "/home/runner/source-inputs/rtc.git",
+    "git+https://github.com/jplatte/const_panic?rev=e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f#e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f": "/home/runner/source-inputs/const-panic.git",
+    "git+https://github.com/matrix-org/matrix-rust-sdk?rev=c6ad52ecc09eaa36601f55effb0a48a533eb87dd#c6ad52ecc09eaa36601f55effb0a48a533eb87dd": "/home/runner/source-inputs/matrix-sdk.git"
+  }
+}
+```
+
+The cache directory name and mirror locations are examples, not download
+endpoints. Supply actual canonical, owned, non-writable-by-other-users paths.
+Use the **exact** Git source strings in the selected revision's lockfile; every
+Git source must have one complete local repository or bare mirror containing
+its pinned commit. Every registry package must have its original
+`name-version.crate` in the cache. Missing inputs, unknown source types,
+unresolved workspace package identities, submodules and unsafe or dangling
+source links stop preparation. No dependency may silently disappear.
+
+Create an empty private output directory (`0700`) outside the checkout, then
+invoke the existing packaging entry point explicitly:
+
+```sh
+python3 -I -B scripts/package.py --formats appimage --gitleaks /reviewed/gitleaks \
+  --source-bundle-inputs /home/runner/source-inputs/plan.json \
+  --source-bundle-output /home/runner/morpheus-source-export
+```
+
+The existing PID namespace, owned-process cleanup, log scanning and source
+identity guards apply. Git reads only raw commit, tree and blob objects with
+hooks, replacement objects, external diff/textconv and lazy fetching disabled;
+global/system Git configuration and inherited `GIT_`/`SSH_` overrides are
+discarded. No checkout occurs. Export attributes cannot omit or substitute
+files. Internal Git symlinks are recorded and validated; registry links are
+rejected. Inputs, paths, entry counts, expanded data, command output and command
+lifetimes are bounded. The outer owner retains a bundle only after namespace
+cleanup, log scanning and private temporary-tree deletion succeed.
+
+`morpheus-corresponding-source.tar.gz` contains the complete committed workspace
+archive, each authenticated Git tree archive, the original checksummed registry
+archives, `MANIFEST.json` and `BUILDING.txt`. The manifest binds the source commit
+and tree, every workspace/Git file's mode and hashes, lockfile hash, exact
+dependency archive identities, package manifest locations, declared licenses
+and candidate license-text hashes. It includes all locked packages, including
+platform-specific entries. Published crate development metadata may name files
+excluded from publication; the published root identity and complete original
+archive are retained. This does not attest that unpublished development inputs
+are available. Paths to local caches and Git configuration are not exported.
+
+The receipt and manifest always state `distribution_ready=false`. The manifest
+also states `license_compliance_verified=false`. SPDX declarations and candidate notices
+do not establish compliance. Native/prebuilt build inputs, system packages,
+compiler/runtime sources and exceptions, generated preferred source forms,
+relinking/install information, full license obligations and source-content
+review/scanning remain explicit unresolved requirements. The archive is
+qualified Rust/workspace source evidence, not an offline rebuild guarantee or
+approval to distribute. This mode neither uploads the bundle nor authorizes
+installer publication, signing or updates.
+
 ## Unsigned package validation
 
 The Windows job prepares [verified NSIS tools](../packaging/windows/NSIS_TOOLS.md)

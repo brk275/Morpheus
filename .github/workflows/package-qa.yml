@@ -32,6 +32,12 @@ on:
         required: true
         default: false
 
+      source_bundle:
+        description: Prepare and remove private Rust/workspace source evidence only (Linux/AppImage; no installer)
+        type: boolean
+        required: true
+        default: false
+
 permissions:
   contents: read
 
@@ -57,6 +63,7 @@ jobs:
       matrix: ${{ steps.scope.outputs.matrix }}
       source_revision: ${{ steps.scope.outputs.source_revision }}
       cache_write: ${{ steps.scope.outputs.cache_write }}
+      source_bundle: ${{ steps.scope.outputs.source_bundle }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -69,6 +76,7 @@ jobs:
           LINUX_FORMATS: ${{ inputs.linux_formats }}
           APPIMAGE_UPDATES: ${{ inputs.appimage_updates }}
           APPIMAGE_CAPTURE: ${{ inputs.appimage_capture }}
+          SOURCE_BUNDLE: ${{ inputs.source_bundle }}
         shell: bash
         run: |
           set -euo pipefail
@@ -135,7 +143,7 @@ jobs:
   package:
     name: Package validation (${{ matrix.label }})
     needs: scope
-    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.id == github.event.repository.owner.id
+    if: needs.scope.outputs.source_bundle != 'true' && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.id == github.event.repository.owner.id
     runs-on: ${{ matrix.os }}
     # CI and packaging for the same platform/candidate share this lock.
     concurrency:
@@ -401,3 +409,95 @@ jobs:
           /usr/bin/python3 packaging/linux/package_appimage.py --gitleaks "$MORPHEUS_QA_GITLEAKS"
       # Installers deliberately stay on the ephemeral runner. Public artifact
       # uploads and releases require the separate release acceptance gates.
+
+  source_bundle:
+    name: Private corresponding source evidence (Linux)
+    needs: scope
+    if: needs.scope.outputs.source_bundle == 'true' && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.id == github.event.repository.owner.id
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: native-${{ needs.scope.outputs.source_revision }}-ubuntu-24.04
+      cancel-in-progress: false
+    timeout-minutes: 80
+    env:
+      MORPHEUS_PACKAGE_SOURCE_REVISION: ${{ needs.scope.outputs.source_revision }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.scope.outputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact reviewed source checkout
+        run: /usr/bin/python3 -I -B scripts/package_revision.py --verify-checkout .
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
+        with:
+          toolchain: 1.99.0
+      - name: Prepare pinned source QA scanner
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          scanner_root="$RUNNER_TEMP/morpheus-source-scanner.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          mkdir "$scanner_root"
+          printf 'MORPHEUS_SOURCE_SCANNER_ROOT=%s\n' "$scanner_root" >> "$GITHUB_ENV"
+          archive="$scanner_root/gitleaks.tar.gz"
+          /usr/bin/curl --disable --fail --silent --show-error --location --max-redirs 3 \
+            --noproxy '*' --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 --max-filesize 33554432 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | /usr/bin/sha256sum --check --status
+          /usr/bin/tar -xzf "$archive" -C "$scanner_root" --no-same-owner --no-same-permissions gitleaks
+          echo "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509  $scanner_root/gitleaks" | /usr/bin/sha256sum --check --status
+          chmod 500 "$scanner_root/gitleaks"
+      - name: Acquire exact locked source inputs without builds
+        timeout-minutes: 27
+        run: /usr/bin/python3 -I -B packaging/linux/source_bundle_qa.py --prepare
+      - name: Run the genuine outer source packaging command
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          # Acquisition has already stopped its own PID namespace. This is the
+          # real outer route, which creates and owns its canonical namespace.
+          RUNNER_TEMP="$MORPHEUS_SOURCE_QA_ROOT/canonical-temp" \
+            /usr/bin/python3 -I -B scripts/package.py --formats appimage \
+            --gitleaks "$MORPHEUS_SOURCE_SCANNER_ROOT/gitleaks" \
+            --source-bundle-inputs "$MORPHEUS_SOURCE_QA_ROOT/plan.json" \
+            --source-bundle-output "$MORPHEUS_SOURCE_QA_ROOT/output" \
+            > "$MORPHEUS_SOURCE_QA_ROOT/logs/package.log" 2>&1
+      - name: Verify source identity and remove all private source inputs and output
+        if: always()
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${MORPHEUS_SOURCE_QA_ROOT:-}" ]]; then
+            printf 'MORPHEUS_SOURCE_QA {"passed":false,"stage":"not_prepared","cleanup_passed":true}\n'
+            exit 1
+          fi
+          /usr/bin/python3 -I -B packaging/linux/source_bundle_qa.py \
+            --finish "$MORPHEUS_SOURCE_QA_ROOT" --gitleaks "$MORPHEUS_SOURCE_SCANNER_ROOT/gitleaks"
+      - name: Remove the private source scanner
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -B - <<'CLEANUP_SCANNER'
+          import os, pathlib, shutil, stat
+          value = os.environ.get("MORPHEUS_SOURCE_SCANNER_ROOT")
+          if value:
+              root = pathlib.Path(value)
+              expected = pathlib.Path(os.environ["RUNNER_TEMP"]) / ("morpheus-source-scanner." + os.environ["GITHUB_RUN_ID"] + "." + os.environ["GITHUB_RUN_ATTEMPT"])
+              assert root == expected and root.resolve(strict=True) == root
+              info = root.lstat()
+              assert stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and info.st_mode & 0o077 == 0
+              assert shutil.rmtree.avoids_symlink_attacks
+              shutil.rmtree(root)
+              assert not root.exists()
+          CLEANUP_SCANNER
+      # No installer, build cache, source artifact upload or publication. Source
+      # content/license compliance and all release gates remain unresolved.

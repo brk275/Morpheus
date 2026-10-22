@@ -50,29 +50,55 @@ class FakeSelector:
 
 class ProcessTests(unittest.TestCase):
     def invoke(self, root, *, stdout=b"okay", stderr=b"private", limit=4096, binary=False,
-               timeout=10, status=0, cleanup_error=None, interrupt=False, progress=None):
+               timeout=10, status=0, cleanup_error=None, interrupt=False, progress=None,
+               stdin_bytes=None, stderr_limit=8 * 1024 * 1024):
         process = SimpleNamespace(pid=42, returncode=None, stdout=FakePipe(81), stderr=FakePipe(82))
         chunks = {81: [stdout, b""], 82: [stderr, b""]}
         runner = M.OwnedRunner(root / "logs", progress=progress)
         selector = FakeSelector()
+        received_input = []
+        def spawn(*args, **kwargs):
+            if stdin_bytes is not None:
+                received_input.append(kwargs["stdin"].read())
+            return process
         if interrupt:
             selector.select = mock.Mock(side_effect=KeyboardInterrupt)
         with mock.patch.object(M.containment, "assert_contained"), \
                 mock.patch.object(M.containment, "status", return_value=status) as observed, \
                 mock.patch.object(M.containment, "stop_owned", side_effect=cleanup_error) as stopped, \
                 mock.patch.object(M.selectors, "DefaultSelector", return_value=selector), \
-                mock.patch.object(M.subprocess, "Popen", return_value=process) as spawned, \
+                mock.patch.object(M.subprocess, "Popen", side_effect=spawn) as spawned, \
                 mock.patch.object(M.os, "set_blocking"), \
                 mock.patch.object(M.os, "read", side_effect=lambda fd, size: chunks[fd].pop(0)):
             try:
                 return runner.run("fixture", ["/usr/bin/unused"], cwd=root, env={}, timeout=timeout,
-                                  output_limit=limit, binary_output=binary)
+                                  output_limit=limit, binary_output=binary,
+                                  stdin_bytes=stdin_bytes, stderr_limit=stderr_limit)
             finally:
                 self.assertEqual(stopped.call_count, 1)
                 self.assertIsNone(process.returncode)
                 self.assertTrue(process.stdout.closed and process.stderr.closed)
                 self.assertTrue(spawned.call_args.kwargs["start_new_session"])
                 self.assertEqual(spawned.call_args.kwargs["umask"], 0o077)
+                if stdin_bytes is not None:
+                    self.assertEqual(received_input, [stdin_bytes])
+                    self.assertTrue(spawned.call_args.kwargs["stdin"].closed)
+
+    def test_private_bounded_input_and_source_stderr_limit_preserve_owned_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.invoke(Path(directory), stdin_bytes=b"a" * 40 + b"\n"), b"okay")
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(M.CommandFailure) as caught:
+            self.invoke(Path(directory), stdin_bytes=b"fixture", stderr_limit=1)
+        self.assertEqual(caught.exception.reason, "output")
+
+    def test_invalid_input_is_rejected_before_process_creation(self):
+        for value in ("not bytes", b"x" * 65537):
+            with tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(M.containment, "assert_contained"), \
+                    mock.patch.object(M.subprocess, "Popen") as spawned, self.assertRaises(M.CommandFailure):
+                M.OwnedRunner(Path(directory) / "logs").run("source-objects", ["/usr/bin/git"],
+                    cwd=directory, env={}, timeout=1, output_limit=1, stdin_bytes=value)
+            spawned.assert_not_called()
 
     def test_success_private_output_and_group_cleanup_before_return(self):
         with tempfile.TemporaryDirectory() as directory:

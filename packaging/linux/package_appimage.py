@@ -582,6 +582,91 @@ def remove_qa_image(output, identity):
     path.unlink()
 
 
+def source_bundle_mode(args):
+    """Explicit source evidence only; ordinary package/check/capture routes stay separate."""
+    import corresponding_source as sources
+    if (args.check_readiness or args.inside or args.cleanup or args.cargo or args.qa_output
+            or args.update_build_plan or args.source_bundle_inputs is None):
+        raise PackageFailure("configuration")
+    public_hosted_environment(os.environ)
+    environment = controlled_environment(os.environ)
+    try:
+        verify_checkout(ROOT, expected_revision(os.environ))
+    except SourceRevisionError:
+        raise PackageFailure("identity") from None
+    if args.source_bundle_inside is not None:
+        if args.source_bundle_output is not None or args.gitleaks:
+            raise PackageFailure("configuration")
+        containment.assert_contained()
+        root = client.private_directory(args.source_bundle_inside)
+        # This fixed plan was copied by the outer owner before namespace entry.
+        if args.source_bundle_inputs != root / "source-inputs.json":
+            raise PackageFailure("configuration")
+        receipt = sources.build(OwnedRunner(root / "source-command-logs"), root, ROOT,
+                                expected_revision(os.environ),
+                                owned_tool("/usr/bin/git", root_owned=True),
+                                environment, args.source_bundle_inputs)
+        private_receipt(root / "source-receipt.json", receipt)
+        return
+    if args.source_bundle_output is None or not args.gitleaks:
+        raise PackageFailure("configuration")
+    output = sources.output_directory(args.source_bundle_output, ROOT)
+    inputs = sources.read_owned(args.source_bundle_inputs, 65536, private=True)
+    scanner = owned_tool(args.gitleaks)
+    data = None
+    receipt = None
+    with tempfile.TemporaryDirectory(prefix="morpheus-source-bundle-", dir=os.environ.get("RUNNER_TEMP")) as temporary:
+        root = Path(temporary).resolve()
+        root.chmod(0o700)
+        client.write_new(root / "source-inputs.json", inputs)
+        containment.containment_check(root / "source-probe")
+        command = containment.namespace_command(
+            [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
+             "--source-bundle-inside", str(root),
+             "--source-bundle-inputs", str(root / "source-inputs.json")],
+            root / "source-namespace", environment)
+        process = None
+        descriptor = os.open(root / "source-namespace.log",
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as log:
+                process = subprocess.Popen(command, cwd=ROOT, env=environment,
+                                           stdin=subprocess.DEVNULL, stdout=log,
+                                           stderr=subprocess.STDOUT, start_new_session=True)
+            if containment.wait_owned(process, 1800):
+                raise PackageFailure("output")
+        finally:
+            try:
+                if process is not None:
+                    containment.stop_owned(process)
+            finally:
+                scan_private_logs(root, scanner)
+        receipt = sources.unique_json(sources.read_owned(root / "source-receipt.json", 32768, private=True))
+        expected_fields = {"schema", "source_revision", "source_tree", "bundle_sha256", "manifest_sha256",
+                           "registry_packages", "git_sources", "locked_packages", "distribution_ready",
+                           "unresolved_release_requirements"}
+        sources.require(type(receipt) is dict and set(receipt) == expected_fields
+                        and type(receipt["schema"]) is int and receipt["schema"] == 1
+                        and receipt["source_revision"] == expected_revision(os.environ)
+                        and type(receipt["source_tree"]) is str and sources.OID.fullmatch(receipt["source_tree"])
+                        and receipt["distribution_ready"] is False
+                        and receipt["unresolved_release_requirements"] == list(sources.UNRESOLVED), "identity")
+        for key in ("bundle_sha256", "manifest_sha256"):
+            sources.require(type(receipt[key]) is str and sources.HASH.fullmatch(receipt[key]), "identity")
+        for key in ("registry_packages", "git_sources", "locked_packages"):
+            sources.require(type(receipt[key]) is int and 0 <= receipt[key] <= 4096, "identity")
+        data = sources.read_owned(root / sources.BUNDLE_NAME, sources.MAX_BUNDLE, private=True)
+        sources.require(sources.digest(data) == receipt["bundle_sha256"], "identity")
+    # The namespace, child groups, log scan and temporary tree have completed
+    # before any source artifact can leave the private owner root.
+    handed = sources.publish(output, data, receipt)
+    try:
+        print(json.dumps({"check": "corresponding_source_bundle", **receipt}, sort_keys=True), flush=True)
+    except BaseException:
+        sources.remove_published(output, handed)
+        raise
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-readiness", action="store_true")
@@ -591,7 +676,15 @@ def main(argv=None):
     parser.add_argument("--cleanup", type=Path)
     parser.add_argument("--update-build-plan", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--qa-output", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--source-bundle-inputs", type=Path,
+                        help="Explicit offline registry-cache/Git-mirror plan; no downloads or hooks")
+    parser.add_argument("--source-bundle-output", type=Path,
+                        help="Existing empty private output directory for source evidence only")
+    parser.add_argument("--source-bundle-inside", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if any(value is not None for value in
+           (args.source_bundle_inputs, args.source_bundle_output, args.source_bundle_inside)):
+        return source_bundle_mode(args)
     # Source enablement is required before any download or build. It does not
     # attest that this candidate has passed actual installed capture.
     require_readiness()

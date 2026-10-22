@@ -49,7 +49,7 @@ def preflight_deb_authors(config, formats=None, platform=sys.platform):
         raise ValueError("DEB maintainer requires an owner-approved public Name <email> author")
 
 
-def linux_appimage(formats, scanner):
+def linux_appimage(formats, scanner, *, source_bundle=None):
     """Keep an explicit AppImage-only QA route; never redefine default/all/DEB."""
     if formats is None or [value.strip().lower() for value in formats.split(",")] != ["appimage"]:
         raise ValueError("Linux fixed-client packaging requires explicit --formats appimage; DEB/default/all remain unsupported")
@@ -59,9 +59,14 @@ def linux_appimage(formats, scanner):
         raise ValueError("Package unsigned first; signing and update acceptance remain separate gates")
     # Replace this controller so canonical __main__ retains its SIGTERM handler
     # as well as public/manual/source/namespace/scanner/installed-capture gates.
-    return os.execv(sys.executable, [sys.executable, "-I", "-B",
-                    str(ROOT / "packaging/linux/package_appimage.py"), "--gitleaks", scanner,
-                    "--qa-output", str(ROOT / "dist")])
+    command = [sys.executable, "-I", "-B",
+               str(ROOT / "packaging/linux/package_appimage.py"), "--gitleaks", scanner]
+    if source_bundle is None:
+        command += ["--qa-output", str(ROOT / "dist")]
+    else:
+        inputs, output = source_bundle
+        command += ["--source-bundle-inputs", str(inputs), "--source-bundle-output", str(output)]
+    return os.execv(sys.executable, command)
 
 
 def main():
@@ -69,7 +74,17 @@ def main():
     parser.add_argument("--formats", help="Cargo Packager formats, such as deb,appimage")
     parser.add_argument("--check", action="store_true", help="Validate configuration without building")
     parser.add_argument("--gitleaks", help="Reviewed scanner for explicit Linux AppImage QA")
+    parser.add_argument("--source-bundle-inputs", type=Path,
+                        help="Explicit offline Cargo source-input plan; source bundle only, no installer")
+    parser.add_argument("--source-bundle-output", type=Path,
+                        help="Existing empty private directory outside the checkout for source evidence")
     args = parser.parse_args()
+    if args.source_bundle_inputs is not None or args.source_bundle_output is not None:
+        if (args.check or not sys.platform.startswith("linux")
+                or args.source_bundle_inputs is None or args.source_bundle_output is None):
+            raise ValueError("Source evidence requires both explicit paths and Linux/AppImage; --check stays separate")
+        return linux_appimage(args.formats, args.gitleaks,
+                              source_bundle=(args.source_bundle_inputs, args.source_bundle_output))
     config = package_config()
     if args.check:
         print(f"Package configuration is valid for {sys.platform}")
