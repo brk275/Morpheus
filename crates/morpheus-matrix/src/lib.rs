@@ -1605,7 +1605,7 @@ impl AccountManager {
         let client = if let Some(loaded) = state.loaded.remove(id) {
             // Drain any in-flight token write before deleting the credential.
             // Otherwise a late session refresh could recreate it after logout.
-            loaded.stop_token_persistence().await;
+            loaded.stop_owned_tasks().await;
             Some(loaded.client.clone())
         } else {
             match load_secret(id, self._access_lock.clone()).await {
@@ -3207,7 +3207,7 @@ impl AccountManager {
         // Whole-manager shutdown is an awaited vault-write boundary. An
         // immediately reopened profile must not race a dropped token watcher.
         for loaded in state.loaded.values() {
-            loaded.stop_token_persistence().await;
+            loaded.stop_owned_tasks().await;
         }
         // A subsequent selection restores from the persistent cache and
         // starts a new token watcher; stopped watchers are never reused.
@@ -3438,6 +3438,20 @@ impl LoadedAccount {
                 task: token_task,
             })),
         }
+    }
+
+    async fn stop_owned_tasks(&self) {
+        self.e2ee.stop().await;
+        self.stop_token_persistence().await;
+    }
+
+    async fn try_stop_owned_tasks(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            self.e2ee.stop().await;
+            self.try_stop_token_persistence(timeout).await
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn stop_token_persistence(&self) {
