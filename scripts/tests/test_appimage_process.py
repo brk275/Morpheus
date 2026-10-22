@@ -51,7 +51,7 @@ class FakeSelector:
 class ProcessTests(unittest.TestCase):
     def invoke(self, root, *, stdout=b"okay", stderr=b"private", limit=4096, binary=False,
                timeout=10, status=0, cleanup_error=None, interrupt=False, progress=None,
-               stdin_bytes=None, stderr_limit=8 * 1024 * 1024):
+               stdin_bytes=None, stderr_limit=8 * 1024 * 1024, expected_status=(0,)):
         process = SimpleNamespace(pid=42, returncode=None, stdout=FakePipe(81), stderr=FakePipe(82))
         chunks = {81: [stdout, b""], 82: [stderr, b""]}
         runner = M.OwnedRunner(root / "logs", progress=progress)
@@ -73,7 +73,7 @@ class ProcessTests(unittest.TestCase):
             try:
                 return runner.run("fixture", ["/usr/bin/unused"], cwd=root, env={}, timeout=timeout,
                                   output_limit=limit, binary_output=binary,
-                                  stdin_bytes=stdin_bytes, stderr_limit=stderr_limit)
+                                  stdin_bytes=stdin_bytes, stderr_limit=stderr_limit, expected_status=expected_status)
             finally:
                 self.assertEqual(stopped.call_count, 1)
                 self.assertIsNone(process.returncode)
@@ -90,6 +90,18 @@ class ProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(M.CommandFailure) as caught:
             self.invoke(Path(directory), stdin_bytes=b"fixture", stderr_limit=1)
         self.assertEqual(caught.exception.reason, "output")
+
+    def test_admitted_curl_exit_drains_before_status_parsing_without_false_failure(self):
+        progress = SimpleNamespace(command=mock.Mock(), failed=mock.Mock(), cleanup=mock.Mock())
+        frame = b"\nMORPHEUS_INPUT_STATUS:503:22\n"
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(self.invoke(Path(directory), stdout=frame, binary=True, status=22,
+                                         expected_status=(0, 22), progress=progress), frame)
+        progress.failed.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(M.CommandFailure) as caught:
+            self.invoke(Path(directory), stdout=frame, binary=True, status=22, expected_status=(0, 22),
+                        cleanup_error=RuntimeError("private cleanup failure"))
+        self.assertEqual(caught.exception.reason, "cleanup")
 
     def test_invalid_input_is_rejected_before_process_creation(self):
         for value in ("not bytes", b"x" * 65537):
@@ -208,6 +220,7 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
             self.assertEqual(call.kwargs, {
                 "url": P.client.tool_download_url(pin), "maximum": pin["size"], "expected_size": pin["size"],
                 "expected_sha256": pin["sha256"], "root": Path("/private"), "environment": {},
+                "stage": "download-linuxdeploy" if pin["cache_name"] == "linuxdeploy-x86_64.AppImage" else "download-appimage-plugin",
             })
 
     def test_invalid_origin_size_or_digest_never_accepted(self):
@@ -370,6 +383,123 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
                 mock.patch.dict(P.os.environ, {"MORPHEUS_APPIMAGE_READY": "1"}), self.assertRaises(P.PackageFailure) as error:
             P.require_readiness()
         self.assertEqual(error.exception.reason, "not_ready")
+
+
+class PackageInputTests(unittest.TestCase):
+    payload = b"pinned asset"
+    url = "https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/assets/602438599"
+
+    def frame(self, payload=b"", *, http=200, code=0):
+        return payload + ("\nMORPHEUS_INPUT_STATUS:%03d:%d\n" % (http, code)).encode()
+
+    def invoke(self, replies, **changes):
+        import hashlib
+        runner = SimpleNamespace(run=mock.Mock(side_effect=replies))
+        arguments = dict(url=self.url, maximum=64, expected_size=len(self.payload),
+                         expected_sha256=hashlib.sha256(self.payload).hexdigest(),
+                         root=Path("/private"), environment={}, stage="download-linuxdeploy")
+        arguments.update(changes)
+        with mock.patch.object(M.time, "sleep") as delayed:
+            try:
+                result = M.download_package_input(runner, **arguments)
+                return result, runner, delayed
+            finally:
+                self.last_runner, self.last_delay = runner, delayed
+
+    def test_numeric_envelope_is_removed_before_original_pin_verification(self):
+        result, runner, delayed = self.invoke([self.frame(self.payload)])
+        self.assertEqual(result, self.payload)
+        argv = runner.run.call_args.args[1]
+        self.assertEqual(runner.run.call_args.args[0], "download-linuxdeploy")
+        self.assertEqual(argv[-1], self.url)
+        for option, value in (("--proto", "=https"), ("--proto-redir", "=https"),
+                              ("--noproxy", "*"), ("--max-redirs", "3"), ("--max-filesize", "64"),
+                              ("--write-out", M.PACKAGE_INPUT_FRAME)):
+            self.assertEqual(argv[argv.index(option) + 1], value)
+        headers = [argv[index + 1] for index, item in enumerate(argv) if item == "--header"]
+        self.assertEqual(headers, ["Accept: application/octet-stream", "Cache-Control: no-cache"])
+        self.assertTrue(runner.run.call_args.kwargs["binary_output"])
+        self.assertEqual(runner.run.call_args.kwargs["output_limit"], 64 + M.PACKAGE_INPUT_FRAME_LIMIT)
+        self.assertGreater(runner.run.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(runner.run.call_args.kwargs["timeout"], 125)
+        self.assertIn(22, runner.run.call_args.kwargs["expected_status"])
+        delayed.assert_not_called()
+
+    def test_partial_transfers_restart_with_fresh_bounded_payload(self):
+        for code in (18, 28, 52, 55, 56):
+            with self.subTest(code=code):
+                result, runner, delayed = self.invoke([
+                    self.frame(b"discard partial", http=200, code=code), self.frame(self.payload)])
+                self.assertEqual(result, self.payload)
+                self.assertEqual(runner.run.call_count, 2)
+                delayed.assert_called_once_with(1.0)
+                self.assertTrue(all(call.kwargs["output_limit"] == 128 for call in runner.run.call_args_list))
+
+    def test_transient_http_has_at_most_three_attempts_with_one_total_budget(self):
+        for http in (408, 500, 502, 503, 504):
+            with self.subTest(http=http):
+                result, runner, delayed = self.invoke([
+                    self.frame(http=http, code=22), self.frame(http=http, code=22), self.frame(self.payload)])
+                self.assertEqual(result, self.payload)
+                self.assertEqual(runner.run.call_count, 3)
+                self.assertEqual(delayed.call_args_list, [mock.call(1.0), mock.call(2.0)])
+        with self.assertRaises(M.PackageDownloadFailure) as caught:
+            self.invoke([self.frame(http=503, code=22)] * 3)
+        self.assertEqual(caught.exception.reason, "http_unavailable")
+        self.assertEqual(self.last_runner.run.call_count, 3)
+        with mock.patch.object(M.time, "monotonic", side_effect=[0, 0, 0, 125]), \
+                self.assertRaises(M.CommandFailure) as caught:
+            self.invoke([self.frame(http=503, code=22)])
+        self.assertEqual(caught.exception.reason, "deadline")
+        self.assertEqual(self.last_runner.run.call_count, 1)
+        self.last_delay.assert_not_called()
+
+    def test_permanent_http_tls_and_rate_limits_never_retry_or_echo_body(self):
+        for http, code, reason in ((403, 22, "http_forbidden"), (404, 22, "http_not_found"),
+                                   (429, 22, "http_rate_limited"), (401, 22, "http_rejected"),
+                                   (0, 35, "download_tls"), (0, 51, "download_tls"), (0, 60, "download_tls")):
+            with self.subTest(http=http, code=code), self.assertRaises(M.PackageDownloadFailure) as caught:
+                self.invoke([self.frame(b"private reflected server body", http=http, code=code)])
+            self.assertEqual(caught.exception.reason, reason)
+            self.assertNotIn("private", str(caught.exception))
+            self.assertEqual(self.last_runner.run.call_count, 1)
+            self.last_delay.assert_not_called()
+
+    def test_bad_frame_hash_size_or_misleading_status_is_never_retried(self):
+        for output in (self.payload, self.frame(self.payload)[:-1], self.frame(b"wrong"),
+                       self.frame(self.payload, http=403), self.frame(self.payload, http=0),
+                       self.frame(self.payload, http=999), self.frame(self.payload, code=99),
+                       self.frame(self.frame(self.payload))):
+            with self.subTest(output=output[-40:]), self.assertRaises(M.CommandFailure):
+                self.invoke([output])
+            self.assertEqual(self.last_runner.run.call_count, 1)
+            self.last_delay.assert_not_called()
+        with self.assertRaises(M.CommandFailure):
+            self.invoke([self.frame(self.payload)], expected_size=len(self.payload) - 1)
+        self.assertEqual(self.last_runner.run.call_count, 1)
+        self.last_delay.assert_not_called()
+
+    def test_invalid_contract_starts_no_command(self):
+        for changes in ({"url": "http://github.com/x"}, {"url": "https://user:private@github.com/x"},
+                        {"url": "https://github.com/x?private=x"}, {"url": "https://github.com:bad/x"},
+                        {"url": "https://localhost/x"}, {"url": "https://api.github.com/user"},
+                        {"stage": "private-token"}, {"maximum": True}, {"maximum": 0},
+                        {"maximum": 64 * 1024 * 1024}, {"expected_size": True}, {"expected_size": 65},
+                        {"expected_sha256": None}, {"expected_sha256": "private"}):
+            with self.subTest(changes=changes), self.assertRaises(M.CommandFailure):
+                self.invoke([], **changes)
+            self.last_runner.run.assert_not_called()
+
+    def test_owned_failures_and_interrupts_are_never_retried(self):
+        for error in [M.CommandFailure(reason) for reason in ("cleanup", "output", "deadline", "pipe", "input", "exit")]:
+            with self.subTest(reason=error.reason), self.assertRaises(M.CommandFailure) as caught:
+                self.invoke([error])
+            self.assertIs(caught.exception, error)
+            self.assertEqual(self.last_runner.run.call_count, 1)
+            self.last_delay.assert_not_called()
+        with self.assertRaises(KeyboardInterrupt):
+            self.invoke([KeyboardInterrupt()])
+        self.assertEqual(self.last_runner.run.call_count, 1)
 
 
 class OuterNamespaceTests(unittest.TestCase):

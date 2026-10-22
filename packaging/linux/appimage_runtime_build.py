@@ -20,7 +20,7 @@ import tarfile
 import time
 
 import appimage_client as client
-from appimage_process import download
+from appimage_process import download_package_input as download
 
 
 MANIFEST_SHA256 = "5076f809b2813bf241eed7997c7a5e809c4b8f7d6eb2f009adc7d778e23f065d"
@@ -247,7 +247,7 @@ def prepare(runner, root, environment):
         if deadline - time.monotonic() < 125:
             fail("deadline")
         archives[key] = download(runner, url=pin["url"], maximum=pin["size"], expected_size=pin["size"],
-                                 expected_sha256=pin["sha256"], root=work, environment=env)
+                                 expected_sha256=pin["sha256"], root=work, environment=env, stage="download-runtime-" + key)
         extract(archives[key], source / key, pin)
     patches = {}
     for name, pin in spec["patches"].items():
