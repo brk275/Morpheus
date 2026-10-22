@@ -128,7 +128,7 @@ def source_path(value):
             and not any(ord(c) < 32 or ord(c) == 127 for c in value)
             and "\\" not in value, "path")
     path = PurePosixPath(value)
-    require(not path.is_absolute() and str(path) == value
+    require(path.parts and not path.is_absolute() and str(path) == value
             and not any(part in {"", ".", "..", ".git"} for part in path.parts), "path")
     return value
 

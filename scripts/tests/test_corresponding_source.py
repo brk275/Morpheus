@@ -102,6 +102,8 @@ class SourceTests(unittest.TestCase):
             S.registry_contents(crate(good), {"name": "fixture", "version": "1.0.0", "checksum": "0" * 64}, S.Budget())
 
     def test_git_links_are_preserved_only_when_the_resolved_graph_exists_inside(self):
+        with self.assertRaises(S.SourceFailure):
+            S.source_path(".")
         entries = {"LICENSE": {"mode": "100644"}, "docs/link": {"mode": "120000"}}
         S.check_links(entries, {"LICENSE": b"license", "docs/link": b"../LICENSE"})
         for target in (b"../../escape", b"/absolute", b"../missing", b"link", b"../LICENSE/../LICENSE"):
