@@ -377,25 +377,44 @@ jobs:
             stage=verify
             /usr/bin/timeout --kill-after=10s 120s /usr/bin/python3 -I -B - "$private/runtime-host.json" <<'VERIFY_RUNTIME_HOST'
           import hashlib, json, os, pathlib, stat, subprocess, sys
-          manifest = pathlib.Path(sys.argv[1]).read_bytes()
-          assert hashlib.sha256(manifest).hexdigest() == "f5a8b93d2d6d670e66c085184fe49135bf7634530838d9fdfed7d7e0390b6656"
-          spec = json.loads(manifest)
-          assert len(spec["packages"]) == 18 and len(spec["files"]) == 634
-          names = [pin["package"] for pin in spec["packages"]]
-          query = subprocess.run(["/usr/bin/dpkg-query", "-W", "--showformat=${Package}\t${Version}\t${db:Status-Status}\n", *names],
-                                 capture_output=True, timeout=20, check=True, env={"PATH":"/usr/bin:/bin", "LC_ALL":"C"})
-          assert not query.stderr
-          lines = query.stdout.decode("ascii").splitlines()
-          assert len(lines) == len(names) and set(lines) == {pin["package"]+"\t"+pin["version"]+"\tinstalled" for pin in spec["packages"]}
-          for name, pin in spec["files"].items():
-              path = pathlib.Path(name).resolve(strict=True)
-              for part in (path, *path.parents):
-                  details = part.stat()
-                  assert details.st_uid == 0 and details.st_mode & 0o022 == 0
-              info = path.stat()
-              assert stat.S_ISREG(info.st_mode) and info.st_size == pin["bytes"]
-              with path.open("rb") as stream:
-                  assert hashlib.file_digest(stream, "sha256").hexdigest() == pin["sha256"]
+          check = "metadata"
+          input_index = 0
+          try:
+              manifest = pathlib.Path(sys.argv[1]).read_bytes()
+              assert hashlib.sha256(manifest).hexdigest() == "f5a8b93d2d6d670e66c085184fe49135bf7634530838d9fdfed7d7e0390b6656"
+              spec = json.loads(manifest)
+              assert len(spec["packages"]) == 18 and len(spec["files"]) == 634
+              names = [pin["package"] for pin in spec["packages"]]
+              check = "package_query"
+              query = subprocess.run(["/usr/bin/dpkg-query", "-W", "--showformat=${Package}\t${Version}\t${db:Status-Status}\n", *names],
+                                     capture_output=True, timeout=20, check=True, env={"PATH":"/usr/bin:/bin", "LC_ALL":"C"})
+              check = "package_query_output"
+              assert not query.stderr
+              lines = query.stdout.decode("ascii").splitlines()
+              check = "package_set"
+              assert len(lines) == len(names) and set(lines) == {pin["package"]+"\t"+pin["version"]+"\tinstalled" for pin in spec["packages"]}
+              for name, pin in spec["files"].items():
+                  input_index += 1
+                  check = "file_resolve"
+                  path = pathlib.Path(name).resolve(strict=True)
+                  for part in (path, *path.parents):
+                      check = "owned_ancestor"
+                      details = part.stat()
+                      assert details.st_uid == 0 and details.st_mode & 0o022 == 0
+                  check = "file_shape"
+                  info = path.stat()
+                  assert stat.S_ISREG(info.st_mode) and info.st_size == pin["bytes"]
+                  check = "file_digest"
+                  with path.open("rb") as stream:
+                      assert hashlib.file_digest(stream, "sha256").hexdigest() == pin["sha256"]
+          except (AssertionError, OSError, ValueError, subprocess.SubprocessError):
+              if check == "package_set":
+                  input_index = next((index for index, pin in enumerate(spec["packages"], 1)
+                                      if pin["package"] + "\t" + pin["version"] + "\tinstalled" not in lines), 0)
+              # Only fixed categories and source-manifest indices cross the log boundary.
+              record = {"passed": False, "check": check, "input": input_index}
+              os.write(3, ("MORPHEUS_RUNTIME_HOST_VERIFY " + json.dumps(record, sort_keys=True) + "\n").encode("ascii"))
+              raise SystemExit(1)
           VERIFY_RUNTIME_HOST
           } >> "$private/provision.log" 2>&1
       - name: Install pinned Rust toolchain
