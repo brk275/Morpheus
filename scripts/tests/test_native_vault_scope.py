@@ -11,6 +11,14 @@ class NativeVaultScopeTests(unittest.TestCase):
             {"os": "macos-15-intel", "label": "macos-x64", "arch": "x86_64"},
         ])
 
+    def test_each_mac_architecture_can_be_selected_without_repeating_the_other(self):
+        for choice, position in (("macos-arm64", 0), ("macos-x64", 1)):
+            with self.subTest(choice=choice):
+                self.assertEqual(select(choice)["include"], [select("macos")["include"][position]])
+                first = select(choice)
+                first["include"][0]["os"] = "unreviewed"
+                self.assertEqual(select(choice)["include"], [select("macos")["include"][position]])
+
     def test_windows_does_not_select_another_platform(self):
         self.assertEqual(select("windows")["include"], [
             {"os": "windows-2025", "label": "windows-x64", "arch": "x86_64"},

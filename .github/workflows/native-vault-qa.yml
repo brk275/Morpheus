@@ -8,7 +8,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [macos, windows, all]
+        options: [macos, macos-arm64, macos-x64, windows, all]
 
 permissions:
   contents: read
