@@ -191,6 +191,21 @@ class ToolTests(unittest.TestCase):
             with self.assertRaises(C.PackageFailure):
                 runtime.verify_embedded(image, original)
 
+    def test_zlib_release_mirror_preserves_the_original_source_pin(self):
+        runtime = load("appimage_runtime_build")
+        pin = runtime.manifest()["archives"]["zlib"]
+        url = "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz"
+        self.assertEqual(pin["url"], url)
+        self.assertEqual(pin["size"], 1502830)
+        self.assertEqual(pin["sha256"], "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16")
+        self.assertEqual(pin["filename"], "zlib-1.3.2.tar.gz")
+        self.assertEqual(pin["prefix"], "zlib-1.3.2")
+        data = (ROOT / "packaging/linux/runtime-build.json").read_bytes()
+        # Even another HTTPS URL must fail the exact manifest identity gate.
+        with mock.patch.object(C, "read_regular", return_value=data.replace(url.encode(), b"https://unreviewed.invalid/source")), \
+                self.assertRaises(C.PackageFailure):
+            runtime.manifest()
+
     def test_runtime_archive_map_rejects_partial_or_linked_sources_before_writes(self):
         runtime = load("appimage_runtime_build")
 

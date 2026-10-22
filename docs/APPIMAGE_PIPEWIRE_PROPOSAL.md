@@ -76,6 +76,13 @@ size/SHA256-pinned source archives in `runtime-build.json`: type2-runtime
 fedfad51, Squashfuse 0.5.2, musl 1.2.4, libfuse 3.15.0, zlib 1.3.2, zstd 1.5.6 and
 mimalloc 2.1.7. The original upstream Docker/Alpine recipe is not executed.
 
+The zlib archive comes from its [upstream GitHub release](https://github.com/madler/zlib/releases/tag/v1.3.2),
+which the [zlib home page](https://zlib.net/) identifies as the project repository.
+Its 1,502,830-byte archive and SHA256 remain identical to the original source pin;
+only the download location changes. The previous endpoint returned a short HTTP
+200 response on some hosted runners. That response failed the size/hash gate.
+There is no mutable latest-version lookup, unchecked fallback or integrity retry.
+
 The private prefix is fresh and outside the checkout. Exact packaged GCC13,
 binutils, patch, Autotools, Meson, Ninja and pkgconf versions from 18 fixed Ubuntu
 DEBs and 634 tool/header/library hashes are checked against
