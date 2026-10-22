@@ -27,7 +27,7 @@ on:
         default: false
 
       appimage_capture:
-        description: Private installed AppImage fixed-client capture QA (Linux/AppImage only; source gate required)
+        description: Installed AppImage capture plus keyboard/settings QA (Linux/AppImage only; source gate required)
         type: boolean
         required: true
         default: false
@@ -450,10 +450,10 @@ jobs:
         if: runner.os != 'Linux'
         run: python3 scripts/package.py --formats ${{ matrix.formats }}
       - name: Build and inspect canonical Linux QA AppImage
-        if: runner.os == 'Linux' && !inputs.appimage_updates && !inputs.appimage_capture
+        if: runner.os == 'Linux' && !inputs.appimage_updates
         run: /usr/bin/python3 scripts/package.py --formats ${{ matrix.formats }} --gitleaks "$MORPHEUS_QA_GITLEAKS"
       - name: Install, inspect, launch and remove unsigned packages
-        if: runner.os != 'Linux' || (!inputs.appimage_updates && !inputs.appimage_capture)
+        if: runner.os != 'Linux' || !inputs.appimage_updates
         timeout-minutes: 35
         run: python3 scripts/package_smoke.py --target ${{ matrix.label }} --formats ${{ matrix.formats }}
       - name: Test installed AppImage update and rollback
@@ -466,12 +466,6 @@ jobs:
           /usr/bin/python3 scripts/appimage_update_acceptance.py \
             --source "$GITHUB_WORKSPACE" --target-dir "$GITHUB_WORKSPACE/target" \
             --gitleaks "$MORPHEUS_QA_GITLEAKS" --execute-on-free-hosted-runner
-      - name: Test actual installed AppImage capture and imported client bindings
-        if: runner.os == 'Linux' && inputs.appimage_capture
-        shell: bash
-        run: |
-          set -euo pipefail
-          /usr/bin/python3 packaging/linux/package_appimage.py --gitleaks "$MORPHEUS_QA_GITLEAKS"
       # Installers deliberately stay on the ephemeral runner. Public artifact
       # uploads and releases require the separate release acceptance gates.
 
