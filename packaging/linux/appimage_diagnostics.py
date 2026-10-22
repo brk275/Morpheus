@@ -14,6 +14,7 @@ import tempfile
 
 COMMANDS = frozenset((
     "none", "unknown", "cargo-version", "packager-version", "download", "native-build", "package", "extract", "update-metadata",
+    "runtime-musl-build", "runtime-musl-install",
     "tool-version", "distro-patch", "configure", "client-build", "inventory-elf", "inventory-owner", "inventory-package",
     "inventory-elf-client", "inventory-elf-dependency", "inventory-elf-deployed",
     "source-head", "source-clean", "source-archive",

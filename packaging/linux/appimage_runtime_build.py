@@ -273,8 +273,11 @@ def prepare(runner, root, environment):
     flags = "-Os -fPIC -ffunction-sections -fdata-sections " + shlex.quote("-ffile-prefix-map=" + str(work) + "=/usr/src/morpheus-runtime")
     env.update(CC=tools["gcc-13"], AR=tools["ar"], RANLIB=tools["ranlib"], CFLAGS=flags)
     run("configure", [str(source / "musl/configure"), "--prefix=" + str(prefix), "--syslibdir=" + str(prefix / "lib"), "--disable-shared", "--enable-gcc-wrapper"], cwd=source / "musl")
-    run("client-build", [tools["make"], "-j2"], cwd=source / "musl", budget=300)
-    run("client-build", [tools["make"], "install"], cwd=source / "musl")
+    # musl echoes thousands of full compiler commands by default. Suppress
+    # make's recipe echo, keeping compiler warnings/errors and the original
+    # per-stream limits, exit checks, deadlines and owned-child cleanup.
+    run("runtime-musl-build", [tools["make"], "-s", "-j2"], cwd=source / "musl", budget=300)
+    run("runtime-musl-install", [tools["make"], "-s", "install"], cwd=source / "musl")
     # The source's only Linux UAPI include is closed to these13 pinned
     # declaration headers. No host glibc include/search directory is added.
     for destination, original in spec["kernel_headers"].items():

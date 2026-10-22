@@ -270,6 +270,77 @@ class ToolTests(unittest.TestCase):
                         with self.assertRaises(C.PackageFailure):
                             runtime.host_inputs(run, hashlib.sha256(data).hexdigest(), uapi_paths=[allowed])
 
+    def test_musl_quiet_commands_keep_bounds_and_preserve_fixed_failures(self):
+        # Mock commands only; this fixture never executes a compiler or make.
+        runtime = load("appimage_runtime_build")
+        diagnostics = load("appimage_diagnostics")
+        from appimage_process import CommandFailure
+        original_read = C.read_regular
+        tools = ("gcc-13", "make", "ar", "ranlib", "strip", "readelf", "patch",
+                 "meson", "ninja", "autoreconf", "pkg-config")
+        for failed_stage, reason in (("runtime-musl-build", "output"),
+                                     ("runtime-musl-install", "exit"),
+                                     ("runtime-musl-install", "output")):
+            with self.subTest(stage=failed_stage, reason=reason), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder).resolve()
+                recipe = root / "recipe"
+                recipe.mkdir(mode=0o700)
+                binaries = root / "tools"
+                binaries.mkdir(mode=0o700)
+                for name in tools:
+                    (binaries / name).write_bytes(b"inert tool identity fixture")
+                host = {"files": {str(binaries / name): {} for name in tools}}
+                spec = runtime.manifest()
+                spec["archives"] = {}
+                spec["kernel_headers"] = {}
+                for key in ("musl", "squashfuse", "zlib"):
+                    spec[key + "_patched_files"] = {}
+                progress = diagnostics.Progress(root)
+                progress.wrapper("build")
+                calls = []
+                failure = CommandFailure(reason)
+
+                def read(path, bound):
+                    if Path(path).name == "runtime-build-host.json":
+                        return json.dumps(host).encode()
+                    return original_read(path, bound)
+
+                def command(stage, argv, *, cwd, env, timeout, output_limit):
+                    calls.append((stage, argv, cwd, env, timeout, output_limit))
+                    progress.command(stage)
+                    if stage == failed_stage:
+                        progress.failed(failure)
+                        raise failure
+                    return b"fixed command fixture"
+
+                runner = mock.Mock()
+                runner.run.side_effect = command
+                with mock.patch.object(C, "require_build_platform"), \
+                        mock.patch.object(C, "read_regular", side_effect=read), \
+                        mock.patch.object(C.R, "trusted_tool", side_effect=lambda name: str(binaries / name)), \
+                        mock.patch.object(runtime, "manifest", return_value=spec), \
+                        mock.patch.object(runtime, "host_inputs", return_value={}), \
+                        mock.patch.object(runtime, "download", side_effect=AssertionError("no fixture downloads")), \
+                        self.assertRaises(CommandFailure) as error:
+                    runtime.prepare(runner, recipe, {"LD_PRELOAD": "/private/foreign.so"})
+                self.assertIs(error.exception, failure)
+                musl = [call for call in calls if call[0].startswith("runtime-musl-")]
+                expected = [("runtime-musl-build", [str(binaries / "make"), "-s", "-j2"], 300)]
+                if failed_stage == "runtime-musl-install":
+                    expected.append(("runtime-musl-install", [str(binaries / "make"), "-s", "install"], 120))
+                self.assertEqual(len(musl), len(expected))
+                for (label, argv, cwd, env, timeout, bound), (wanted, arguments, budget) in zip(musl, expected):
+                    self.assertEqual((label, argv, cwd), (wanted, arguments, recipe / "runtime-source-build/source/musl"))
+                    self.assertGreater(timeout, 0)
+                    self.assertLessEqual(timeout, budget)
+                    self.assertEqual(bound, 1024 * 1024)
+                    self.assertEqual(env["PATH"], "/usr/bin:/bin")
+                    self.assertNotIn("LD_PRELOAD", env)
+                self.assertEqual(calls[-1][0], failed_stage)
+                self.assertTrue(diagnostics.valid_record(progress.value))
+                self.assertEqual(progress.value["failure"]["command_stage"], failed_stage)
+                self.assertEqual(progress.value["failure"]["reason"], "command_" + reason)
+
     def test_source_rejection_precedes_any_command(self):
         callback = mock.Mock(side_effect=AssertionError("native work forbidden"))
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(C, "require_build_platform"), self.assertRaises(C.PackageFailure):
