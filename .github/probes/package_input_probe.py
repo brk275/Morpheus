@@ -14,19 +14,29 @@ def child(source, root):
     try:
         progress.wrapper("build")
         environment = P.controlled_environment(os.environ)
-        # These are the actual packaging caller's first six pinned downloads.
-        payloads, archives, patch = P.download_inputs(runner, root, environment)
-        del payloads, archives, patch
-        count = 6
-        # Fetch only: never extract, install, execute or compile downloaded bytes.
-        for key, pin in P.runtime_builder.manifest()["archives"].items():
-            value = P.runtime_builder.download(runner, url=pin["url"], maximum=pin["size"],
-                expected_size=pin["size"], expected_sha256=pin["sha256"], root=root,
-                environment=environment, stage="download-runtime-" + key)
-            del value
-            count += 1
-        if count != 13:
-            raise P.PackageFailure("identity")
+        pin = P.runtime_builder.manifest()["archives"]["zlib"]
+        class InspectedRunner(P.OwnedRunner):
+            def run(self, stage, argv, **options):
+                output = super().run(stage, argv, **options)
+                # Capture fixed metadata only, after the real owned-group drain.
+                match = P.download.__globals__["PACKAGE_INPUT_STATUS"].search(output)
+                payload = output[:match.start()] if match else b""
+                facts = {"frame": match is not None, "http": 0, "curl": 0,
+                         "received_bytes": len(payload), "size_matches": False, "digest_matches": False}
+                if match is not None:
+                    http, code = (int(item) for item in match.groups())
+                    facts.update(http=http if 0 <= http <= 599 else 0,
+                                 curl=code if 0 <= code <= 99 else 0,
+                                 size_matches=len(payload) == pin["size"],
+                                 digest_matches=hashlib.sha256(payload).hexdigest() == pin["sha256"])
+                P.private_receipt(root / "transport.json", facts)
+                return output  # Original bytes enter the unchanged production validator.
+        runner = InspectedRunner(root / "inspected-commands", progress=progress)
+        value = P.runtime_builder.download(runner, url=pin["url"], maximum=pin["size"],
+            expected_size=pin["size"], expected_sha256=pin["sha256"], root=root,
+            environment=environment, stage="download-runtime-zlib")
+        del value
+        count = 1
         progress.wrapper("complete")
         progress.cleanup(True)
         P.private_receipt(root / "passed.json", {"source": SOURCE, "inputs": count, "passed": True})
@@ -106,9 +116,9 @@ def parent(source, scanner):
         info = receipt.lstat()
         if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_nlink != 1
                 or info.st_uid != os.getuid() or not 0 < info.st_size <= 1024
-                or json.loads(receipt.read_bytes()) != {"source":SOURCE, "inputs":13, "passed":True}):
+                or json.loads(receipt.read_bytes()) != {"source":SOURCE, "inputs":1, "passed":True}):
             raise RuntimeError("receipt")
-        facts.update(passed=True, inputs=13)
+        facts.update(passed=True, inputs=1)
     except BaseException:
         facts["passed"] = False
     finally:
@@ -121,6 +131,20 @@ def parent(source, scanner):
         try:
             scan(root, scanner)
             facts["scanned"] = True
+            transport = root / "transport.json"
+            if transport.exists():
+                info = transport.lstat()
+                if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_nlink != 1
+                        or info.st_uid != os.getuid() or not 0 < info.st_size <= 1024):
+                    raise RuntimeError("transport")
+                value = json.loads(transport.read_bytes())
+                if (type(value) is not dict or set(value) != {"frame", "http", "curl", "received_bytes", "size_matches", "digest_matches"}
+                        or any(type(value[key]) is not bool for key in ("frame", "size_matches", "digest_matches"))
+                        or any(type(value[key]) is not int for key in ("http", "curl", "received_bytes"))
+                        or not 0 <= value["http"] <= 599 or not 0 <= value["curl"] <= 99
+                        or not 0 <= value["received_bytes"] <= 64 * 1024 * 1024):
+                    raise RuntimeError("transport")
+                facts["transport"] = value
             if not facts["passed"]:
                 facts["failure"] = diagnostics.public_failure(root, scan_passed=True,
                     outer_cleanup="passed" if owned_cleanup else "failed", outer_reason="namespace_exit")
