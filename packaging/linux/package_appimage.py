@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "scripts"))
 import appimage_client as client
 import appimage_runtime_build as runtime_builder
-from appimage_process import OwnedRunner, download
+from appimage_process import OwnedRunner, download_package_input as download
 import appimage_diagnostics as diagnostics
 import element_process_namespace as containment
 from package import package_config
@@ -121,14 +121,15 @@ def download_inputs(runner, root, environment):
     for pin in client.pinned_tools():
         payloads[pin["cache_name"]] = download(
             runner, url=client.tool_download_url(pin), maximum=pin["size"], expected_size=pin["size"],
-            expected_sha256=pin["sha256"], root=root, environment=environment)
+            expected_sha256=pin["sha256"], root=root, environment=environment,
+            stage="download-linuxdeploy" if pin["cache_name"] == "linuxdeploy-x86_64.AppImage" else "download-appimage-plugin")
     archives = {}
     for key, (name, digest, maximum) in client.R.ARCHIVES.items():
         archives[key] = download(runner, url=client.R.BASE_URL + name, maximum=maximum,
-                                 expected_sha256=digest, root=root, environment=environment)
+                                 expected_sha256=digest, root=root, environment=environment, stage="download-pipewire-" + key)
     patch = download(runner, url="https://github.com/PipeWire/pipewire/commit/" + client.R.COMMIT + ".patch",
                      maximum=32768, expected_sha256=client.R.UPSTREAM_PATCH_SHA256,
-                     root=root, environment=environment)
+                     root=root, environment=environment, stage="download-pipewire-patch")
     return payloads, archives, patch
 
 

@@ -191,3 +191,119 @@ def download(runner, *, url, maximum, root, environment, expected_size=None, exp
             or (expected_sha256 is not None and hashlib.sha256(output).hexdigest() != expected_sha256)):
         raise CommandFailure("input")
     return output
+
+
+# Package inputs have a fixed status envelope. The native client downloader
+# above keeps its existing command contract and source verification.
+PACKAGE_INPUT_STAGES = frozenset((
+    "download", "download-linuxdeploy", "download-appimage-plugin",
+    "download-pipewire-dsc", "download-pipewire-original", "download-pipewire-debian", "download-pipewire-patch",
+    "download-runtime-fuse", "download-runtime-mimalloc", "download-runtime-musl", "download-runtime-runtime",
+    "download-runtime-squashfuse", "download-runtime-zlib", "download-runtime-zstd"))
+PACKAGE_INPUT_REASONS = frozenset((
+    "http_forbidden", "http_not_found", "http_rate_limited", "http_unavailable", "http_rejected",
+    "download_transport", "download_tls"))
+PACKAGE_INPUT_FRAME = "\nMORPHEUS_INPUT_STATUS:%{http_code}:%{exitcode}\n"
+PACKAGE_INPUT_FRAME_LIMIT = 64
+PACKAGE_INPUT_STATUS = re.compile(rb"\nMORPHEUS_INPUT_STATUS:([0-9]{3}):([0-9]{1,2})\n\Z")
+
+
+class PackageDownloadFailure(CommandFailure):
+    def __init__(self, reason):
+        super().__init__("exit")
+        self.reason = reason if type(reason) is str and reason in PACKAGE_INPUT_REASONS else "input"
+
+
+def download_package_input(runner, *, url, maximum, root, environment,
+                           expected_size=None, expected_sha256=None, stage="download"):
+    """Fetch a pinned package input with bounded, credential-free retries.
+
+    Curl appends constant numeric status to its binary stdout; nothing reaches
+    the text log. Parse that final envelope, discard failed/partial bytes, and
+    verify the original size/digest before returning a successful payload.
+    Up to three attempts share a 125-second command budget. Mandatory owned
+    group cleanup still completes before return, including after a deadline.
+    """
+    import hashlib
+    from urllib.parse import urlsplit
+    try:
+        parsed = urlsplit(url)
+        api_asset = parsed.hostname == "api.github.com"
+        valid_url = (type(url) is str and parsed.scheme == "https"
+                     and parsed.username is None and parsed.password is None
+                     and parsed.hostname in {"github.com", "api.github.com", "archive.ubuntu.com", "zlib.net"}
+                     and parsed.port in (None, 443) and not parsed.fragment and not parsed.query
+                     and (parsed.hostname != "zlib.net" or parsed.path == "/fossils/zlib-1.3.2.tar.gz")
+                     and (not api_asset or re.fullmatch(
+                         r"/repos/(?:linuxdeploy/linuxdeploy|linuxdeploy/linuxdeploy-plugin-appimage|"
+                         r"AppImage/type2-runtime)/releases/assets/[1-9][0-9]{0,19}", parsed.path)))
+    except (TypeError, ValueError):
+        raise CommandFailure("input") from None
+    if (not valid_url or type(maximum) is not int
+            or not 1 <= maximum <= 64 * 1024 * 1024 - PACKAGE_INPUT_FRAME_LIMIT
+            or type(stage) is not str or stage not in PACKAGE_INPUT_STAGES
+            or type(expected_sha256) is not str or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            or (expected_size is not None and
+                (type(expected_size) is not int or not 1 <= expected_size <= maximum))):
+        raise CommandFailure("input")
+    headers = (["--header", "Accept: application/octet-stream", "--header", "Cache-Control: no-cache"]
+               if api_asset else [])
+    deadline = time.monotonic() + 125
+    transport = {18, 28, 52, 55, 56}
+    transient_http = {408, 500, 502, 503, 504}
+    # Normal curl failures return their final fixed status envelope. Other
+    # exits and all ownership/deadline/output/cleanup failures stay fatal in
+    # OwnedRunner, before retry policy can consume any bytes.
+    statuses = (0, 18, 22, 28, 35, 51, 52, 55, 56, 60)
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            raise CommandFailure("deadline")
+        curl_seconds = min(120.0, remaining - 1.0)
+        output = runner.run(stage, ["/usr/bin/curl", "--disable", "--fail", "--silent", "--show-error",
+                            "--location", "--max-redirs", "3", "--noproxy", "*", "--proto", "=https", "--proto-redir", "=https",
+                            "--connect-timeout", "10", "--max-time", format(curl_seconds, ".3f"),
+                            "--max-filesize", str(maximum), "--write-out", PACKAGE_INPUT_FRAME, *headers, url],
+                            cwd=root, env=environment, timeout=remaining,
+                            output_limit=maximum + PACKAGE_INPUT_FRAME_LIMIT, binary_output=True,
+                            expected_status=statuses)
+        match = PACKAGE_INPUT_STATUS.search(output)
+        if time.monotonic() >= deadline:
+            raise CommandFailure("deadline")
+        if match is None or len(output) > maximum + PACKAGE_INPUT_FRAME_LIMIT:
+            raise CommandFailure("input")
+        http, code = (int(value) for value in match.groups())
+        if code not in statuses or (http != 0 and not 100 <= http <= 599):
+            raise CommandFailure("input")
+        payload = output[:match.start()]
+        if code == 0:
+            if (not 200 <= http < 300 or len(payload) > maximum
+                    or (expected_size is not None and len(payload) != expected_size)
+                    or hashlib.sha256(payload).hexdigest() != expected_sha256):
+                raise CommandFailure("input")
+            return payload
+        if code in {35, 51, 60}:
+            reason, retry = "download_tls", False
+        elif http in {403, 404, 429}:
+            # Curl may retain an HTTP status while a transfer times out.
+            # A permanent HTTP refusal must not become a transport retry.
+            reason = {403: "http_forbidden", 404: "http_not_found", 429: "http_rate_limited"}[http]
+            retry = False
+        elif code == 22:
+            if http < 400:
+                raise CommandFailure("input")
+            reason = "http_unavailable" if http in transient_http else "http_rejected"
+            retry = http in transient_http
+        elif code in transport:
+            reason, retry = "download_transport", True
+        else:
+            raise CommandFailure("input")
+        if not retry or attempt == 2:
+            raise PackageDownloadFailure(reason)
+        # Do not retry forbidden/not-found/rate-limited requests, TLS failures,
+        # corrupt payloads or command ownership failures.
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            raise CommandFailure("deadline")
+        time.sleep(min(float(attempt + 1), remaining - 1.0))
+    raise CommandFailure("input")

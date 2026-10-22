@@ -131,6 +131,27 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(result["inner_cleanup"], "failed")
             self.assertNotIn("private", json.dumps(result))
 
+    def test_package_download_facts_are_closed_and_require_a_successful_scan(self):
+        self.assertTrue(C.PACKAGE_INPUT_STAGES <= D.COMMANDS)
+        for reason in C.PACKAGE_INPUT_REASONS:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                progress = D.Progress(root)
+                progress.wrapper("build")
+                progress.command("download-linuxdeploy")
+                error = C.PackageDownloadFailure(reason)
+                error.args = ("private reflected body and signed URL",)
+                progress.failed(error)
+                progress.command("cleanup-env")
+                progress.failed(RuntimeError("private later error"))
+                self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+                record = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertEqual(record["failure"]["reason"], "command_" + reason)
+                self.assertEqual(record["failure"]["command_stage"], "download-linuxdeploy")
+                self.assertNotIn("private", json.dumps(record))
+        self.assertEqual(C.PackageDownloadFailure("private").reason, "input")
+
     def test_fixed_schema_matches_peer_and_command_source(self):
         import appimage_capture as capture
         self.assertEqual(D.PEER_FACTS, set(capture.FACTS))
