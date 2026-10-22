@@ -181,7 +181,9 @@ class ScopeTests(unittest.TestCase):
                      "packaging/linux/appimage_capture_worker.py",
                      "packaging/linux/appimage_diagnostics.py",
                      "packaging/linux/appimage_notices.py",
-                     "packaging/linux/appimage_process.py"):
+                     "packaging/linux/appimage_process.py",
+                     "packaging/linux/corresponding_source.py",
+                     "packaging/linux/source_bundle_qa.py"):
             with self.subTest(path=path):
                 self.assertFalse(classify([path])["native"])
                 self.assertEqual(classify([path, "crates/morpheus-rtc/src/linux_portal.rs"])

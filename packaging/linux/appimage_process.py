@@ -14,6 +14,7 @@ import re
 import selectors
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,12 +50,16 @@ class OwnedRunner:
         containment.assert_contained()
 
     def run(self, stage, argv, *, cwd, env, timeout, output_limit,
-            binary_output=False, expected_status=(0,)):
+            binary_output=False, expected_status=(0,), stdin_bytes=None,
+            stderr_limit=8 * 1024 * 1024):
         self.assert_containment()
         if (not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", stage)
                 or not argv or not all(isinstance(value, str) and "\0" not in value for value in argv)
                 or not argv[0].startswith("/")
-                or not 0 < timeout <= 3600 or not 0 <= output_limit <= 64 * 1024 * 1024):
+                or not 0 < timeout <= 3600 or not 0 <= output_limit <= 64 * 1024 * 1024
+                or type(stderr_limit) is not int or not 0 <= stderr_limit <= 8 * 1024 * 1024
+                or (stdin_bytes is not None and
+                    (type(stdin_bytes) is not bytes or len(stdin_bytes) > 65536))):
             raise CommandFailure("input")
         self.last_stage = stage
         if self.progress is not None:
@@ -73,12 +78,20 @@ class OwnedRunner:
         failed = None
         code = None
         cleanup_failed = False
+        input_file = None
         deadline = time.monotonic() + timeout
         try:
+            if stdin_bytes is not None:
+                # Raw Git object queries only. A regular private input file
+                # avoids a producer thread/pipe and cannot outlive this owner.
+                input_file = tempfile.TemporaryFile(dir=self.log_root)
+                full_write(input_file, stdin_bytes)
+                input_file.seek(0)
             for path in (stdout_path, stderr_path):
                 descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 descriptors.append(os.fdopen(descriptor, "wb", buffering=0))
-            process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+            process = subprocess.Popen(argv, cwd=cwd, env=env,
+                                       stdin=input_file if input_file is not None else subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        start_new_session=True, umask=0o077)
             for stream, kind in ((process.stdout, "stdout"), (process.stderr, "stderr")):
@@ -104,7 +117,7 @@ class OwnedRunner:
                             full_write(descriptors[0], chunk)
                     else:
                         stderr_size += len(chunk)
-                        if stderr_size > 8 * 1024 * 1024:
+                        if stderr_size > stderr_limit:
                             raise CommandFailure("output")
                         full_write(descriptors[1], chunk)
                 if code is None:
@@ -135,6 +148,8 @@ class OwnedRunner:
             selector.close()
             for output in descriptors:
                 output.close()
+            if input_file is not None:
+                input_file.close()
         if cleanup_failed and self.progress is not None:
             try:
                 self.progress.cleanup(False)

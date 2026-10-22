@@ -43,7 +43,7 @@ WAYLAND_UNRELATED_THEME_INPUTS = {
     "themes/paper.toml",
     "themes/terminal.toml",
 }
-# These Python drivers run only in explicitly selected installed-AppImage QA.
+# These Python drivers run only in explicitly selected Linux package/source QA.
 # Ordinary native CI cannot exercise them; its always-on helper suite covers
 # their pure/mocked contracts. Unknown package inputs still select Linux.
 MANUAL_LINUX_PACKAGE_INPUTS = {
@@ -53,6 +53,8 @@ MANUAL_LINUX_PACKAGE_INPUTS = {
     "packaging/linux/appimage_diagnostics.py",
     "packaging/linux/appimage_notices.py",
     "packaging/linux/appimage_process.py",
+    "packaging/linux/corresponding_source.py",
+    "packaging/linux/source_bundle_qa.py",
 }
 # The isolated OS-vault fixture is ignored by ordinary CI. Its exact manual
 # workflow runs all contracts and native phases on selected Mac/Windows runners.

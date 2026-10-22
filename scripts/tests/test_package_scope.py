@@ -1,6 +1,12 @@
+import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 from scripts.package_scope import package_matrix
+from scripts import package_scope
 
 
 class PackageScopeTests(unittest.TestCase):
@@ -45,6 +51,34 @@ class PackageScopeTests(unittest.TestCase):
                                            ("linux", "appimage", True)):
             with self.subTest(platform=platform, formats=formats, updates=updates), self.assertRaises(ValueError):
                 package_matrix(platform, formats, updates, True)
+
+    def test_source_evidence_is_explicit_linux_only_without_installer_modes(self):
+        self.assertEqual(package_matrix("linux", "appimage", source_bundle=True)["include"],
+                         [{"os": "ubuntu-24.04", "label": "linux-x64", "formats": "appimage"}])
+        for platform, formats, updates, capture in (("all", "appimage", False, False),
+                ("windows", "appimage", False, False), ("macos", "appimage", False, False),
+                ("linux", "both", False, False), ("linux", "deb", False, False),
+                ("linux", "appimage", True, False), ("linux", "appimage", False, True)):
+            with self.subTest(platform=platform, formats=formats, updates=updates, capture=capture), self.assertRaises(ValueError):
+                package_matrix(platform, formats, updates, capture, True)
+
+    def test_source_selection_emits_no_shared_cache_write_and_rejects_untyped_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "outputs"
+            environment = {"GITHUB_OUTPUT": str(output), "GITHUB_SHA": "a" * 40,
+                "PACKAGE_PLATFORM": "linux", "LINUX_FORMATS": "appimage", "APPIMAGE_UPDATES": "false",
+                "APPIMAGE_CAPTURE": "false", "SOURCE_BUNDLE": "true"}
+            with mock.patch.dict(os.environ, environment, clear=True):
+                package_scope.main()
+            fields = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(fields["cache_write"], "false")
+            self.assertEqual(fields["source_bundle"], "true")
+            self.assertEqual(json.loads(fields["matrix"])["include"][0]["os"], "ubuntu-24.04")
+            output.unlink()
+            environment["SOURCE_BUNDLE"] = "yes"
+            with mock.patch.dict(os.environ, environment, clear=True), self.assertRaises(ValueError):
+                package_scope.main()
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":
