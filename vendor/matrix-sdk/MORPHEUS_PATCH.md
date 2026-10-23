@@ -551,7 +551,7 @@ DM routing set. It requires a joined peer, returns fixed typed refusals for
 empty methods, self identities and ineligible rooms, and does not invite,
 create a room, send verification events or grant trust during preparation.
 The private-field, non-cloneable prepared value is consumed by `send()`, which
-synchronously rechecks the exact joined DM routing before the existing room
+synchronously rechecks the exact joined DM routing (not fresh peer membership) before the existing room
 send and normal crypto request registration for its returned event ID.
 This split lets the caller check account/view/security admission after all
 preparation waits and immediately before SDK handoff. A send error or a
@@ -569,7 +569,8 @@ manual `verify()` or automatic SAS confirmation is introduced.
 
 Provenance remains the pinned upstream revision recorded in
 `MORPHEUS_PROVENANCE.json`; its original file hashes are unchanged. The local
-changes are `identities/users.rs`, `identities/mod.rs` and the existing
+changes are `identities/users.rs`, `identities/mod.rs`, the read-only
+`verification/sas.rs::flow_id` accessor delegating to the existing inner flow ID, and the existing
 `tests/integration/encryption/verification.rs`. The added regression uses the
 existing synthetic MatrixMockServer to exercise exact-room send/cache binding,
 preparation without send, no creation/invitation, invited-peer refusal and a

@@ -11,7 +11,7 @@ use std::{
 use matrix_sdk::{
     Client, Room, RoomState,
     encryption::{
-        identities::MasterPubkey,
+        identities::{MasterPubkey, PreparedRoomVerification},
         verification::{SasState, SasVerification, VerificationRequest},
     },
     ruma::{
@@ -225,6 +225,7 @@ struct Session {
     own: OwnedUserId,
     target: PeerVerificationTarget,
     request: VerificationRequest,
+    flow_id: String,
     initial_master: Option<MasterPubkey>,
     opened: Instant,
     operation: tokio::sync::Mutex<()>,
@@ -234,6 +235,16 @@ struct Session {
 }
 #[derive(Clone)]
 pub struct PeerVerificationSession(Arc<Session>);
+
+/// Whether an explicit request sent a new event or continued an existing flow.
+pub enum PeerVerificationRequest {
+    Sent(PeerVerificationSession),
+    AlreadyOpen(PeerVerificationSession),
+}
+enum PreparedPeer {
+    Existing(PeerVerificationSession),
+    Send(PreparedRoomVerification, MasterPubkey),
+}
 
 fn context_matches(
     own: &UserId,
@@ -251,23 +262,59 @@ fn context_matches(
         && own != target.user_id
         && room == Some(target.room_id.as_ref())
 }
-fn binding(own: &UserId, target: &PeerVerificationTarget, request: &VerificationRequest) -> bool {
-    context_matches(
-        own,
-        target,
-        request.own_user_id(),
-        request.other_user_id(),
-        request.room_id(),
+fn flow_context_matches(
+    expected: (&UserId, &PeerVerificationTarget, &str),
+    observed: (&UserId, &UserId, Option<&RoomId>, &str),
+    self_verification: bool,
+    passive: bool,
+) -> bool {
+    expected.2 == observed.3
+        && context_matches(
+            expected.0,
+            expected.1,
+            observed.0,
+            observed.1,
+            observed.2,
+            self_verification,
+            passive,
+        )
+}
+fn binding(
+    own: &UserId,
+    target: &PeerVerificationTarget,
+    flow: &str,
+    request: &VerificationRequest,
+) -> bool {
+    flow_context_matches(
+        (own, target, flow),
+        (
+            request.own_user_id(),
+            request.other_user_id(),
+            request.room_id(),
+            request.flow_id(),
+        ),
         request.is_self_verification(),
         request.is_passive(),
     )
 }
-fn sas_binding(own: &UserId, target: &PeerVerificationTarget, sas: &SasVerification) -> bool {
-    !sas.is_self_verification()
-        && sas.started_from_request()
-        && sas.own_user_id() == own
-        && sas.other_user_id() == target.user_id
-        && sas.room_id() == Some(target.room_id.as_ref())
+fn sas_binding(
+    own: &UserId,
+    target: &PeerVerificationTarget,
+    flow: &str,
+    sas: &SasVerification,
+) -> bool {
+    sas.started_from_request()
+        && flow_context_matches(
+            (own, target, flow),
+            (
+                sas.own_user_id(),
+                sas.other_user_id(),
+                sas.room_id(),
+                sas.flow_id(),
+            ),
+            sas.is_self_verification(),
+            false,
+        )
 }
 
 impl AccountManager {
@@ -293,7 +340,7 @@ impl AccountManager {
                     .get_verification_request(&record.target.user_id, &record.flow_id)
                     .await;
                 if let Some(request) = request
-                    && binding(&scoped.own, &record.target, &request)
+                    && binding(&scoped.own, &record.target, &record.flow_id, &request)
                     && !request.we_started()
                     && scoped
                         .loaded
@@ -363,7 +410,7 @@ impl AccountManager {
                 .ok_or(Error::Gone)
         })
         .await?;
-        if !binding(&scoped.own, target, &request) {
+        if !binding(&scoped.own, target, flow, &request) {
             return Err(Error::Gone);
         }
         let initial_master = guarded(selection, cancellation, REQUEST_TIMEOUT, async {
@@ -384,6 +431,7 @@ impl AccountManager {
             own: scoped.own,
             target: target.clone(),
             request,
+            flow_id: flow.to_owned(),
             initial_master,
             opened,
             operation: tokio::sync::Mutex::new(()),
@@ -400,36 +448,59 @@ impl AccountManager {
         target: &PeerVerificationTarget,
         admitted: &(dyn Fn() -> bool + Send + Sync),
         acknowledged_uncertain: bool,
-    ) -> Result<PeerVerificationSession> {
+    ) -> Result<PeerVerificationRequest> {
         let scoped = self.verification_scope(selection, cancellation).await?;
         if target.user_id == scoped.own {
             return Err(Error::Unavailable);
         }
         let (mut reservation, records) =
             Reservation::reserve(&scoped.loaded.peer_verifications, acknowledged_uncertain)?;
-        for record in records
-            .iter()
-            .rev()
-            .filter(|record| record.target.user_id == target.user_id)
-        {
-            match self
-                .open_peer_verification_selected(
-                    selection,
-                    cancellation,
-                    &record.target,
-                    &record.flow_id,
-                )
-                .await
+        // One total deadline for every duplicate lookup, session/identity read
+        // and membership preparation. Nothing in this scope sends a step.
+        let prepared = guarded(selection, cancellation, REQUEST_TIMEOUT, async {
+            for record in records
+                .iter()
+                .rev()
+                .filter(|record| record.target.user_id == target.user_id)
             {
-                Ok(session) if session.info().await?.flow.is_open() => {
-                    reservation.settle(None, false);
-                    return Ok(session);
+                let known = guarded(selection, cancellation, LOCAL_TIMEOUT, async {
+                    Ok(scoped
+                        .loaded
+                        .client
+                        .encryption()
+                        .get_verification_request(&record.target.user_id, &record.flow_id)
+                        .await)
+                })
+                .await?;
+                if let Some(request) = known
+                    && snapshot(&request).is_open()
+                    && (!binding(&scoped.own, &record.target, &record.flow_id, &request)
+                        || !scoped
+                            .loaded
+                            .client
+                            .get_room(&record.target.room_id)
+                            .is_some_and(|room| room.state() == RoomState::Joined))
+                {
+                    // A passive or no-longer-joined flow must not be silently
+                    // superseded by creating another flow for this same peer.
+                    return Err(Error::RequestInProgress);
                 }
-                Err(Error::Gone) | Ok(_) => {}
-                Err(error) => return Err(error),
+                match self
+                    .open_peer_verification_selected(
+                        selection,
+                        cancellation,
+                        &record.target,
+                        &record.flow_id,
+                    )
+                    .await
+                {
+                    Ok(session) if session.info().await?.flow.is_open() => {
+                        return Ok(PreparedPeer::Existing(session));
+                    }
+                    Err(Error::Gone) | Ok(_) => {}
+                    Err(error) => return Err(error),
+                }
             }
-        }
-        let (prepared, initial_master) = guarded(selection, cancellation, REQUEST_TIMEOUT, async {
             let identity = scoped
                 .loaded
                 .client
@@ -446,9 +517,16 @@ impl AccountManager {
                 )
                 .await
                 .map_err(|_| Error::Unavailable)?;
-            Ok((prepared, Some(master)))
+            Ok(PreparedPeer::Send(prepared, master))
         })
         .await?;
+        let (prepared, initial_master) = match prepared {
+            PreparedPeer::Existing(session) => {
+                reservation.settle(None, false);
+                return Ok(PeerVerificationRequest::AlreadyOpen(session));
+            }
+            PreparedPeer::Send(prepared, master) => (prepared, Some(master)),
+        };
         reservation.handed = true;
         let request = match dispatch(
             selection,
@@ -465,7 +543,7 @@ impl AccountManager {
                 return Err(error);
             }
         };
-        if !binding(&scoped.own, target, &request) {
+        if !binding(&scoped.own, target, request.flow_id(), &request) {
             reservation.settle(None, true);
             return Err(Error::Unknown);
         }
@@ -477,18 +555,21 @@ impl AccountManager {
             }),
             false,
         );
-        Ok(PeerVerificationSession(Arc::new(Session {
-            client: scoped.loaded.client.clone(),
-            selection: selection.clone(),
-            cancellation: cancellation.clone(),
-            own: scoped.own,
-            target: target.clone(),
-            request,
-            initial_master,
-            opened: Instant::now(),
-            operation: tokio::sync::Mutex::new(()),
-            sas: tokio::sync::Mutex::new(None),
-        })))
+        Ok(PeerVerificationRequest::Sent(PeerVerificationSession(
+            Arc::new(Session {
+                client: scoped.loaded.client.clone(),
+                selection: selection.clone(),
+                cancellation: cancellation.clone(),
+                own: scoped.own,
+                target: target.clone(),
+                flow_id: request.flow_id().to_owned(),
+                request,
+                initial_master,
+                opened: Instant::now(),
+                operation: tokio::sync::Mutex::new(()),
+                sas: tokio::sync::Mutex::new(None),
+            }),
+        )))
     }
 }
 
@@ -497,7 +578,7 @@ impl PeerVerificationSession {
         &self.0.target
     }
     pub fn flow_id(&self) -> &str {
-        self.0.request.flow_id()
+        &self.0.flow_id
     }
     fn check(&self) -> Result<()> {
         crate::own_verification::scope_error(&self.0.selection, &self.0.cancellation)?;
@@ -505,7 +586,7 @@ impl PeerVerificationSession {
             return Err(Error::Gone);
         }
         if self.0.client.user_id() != Some(self.0.own.as_ref())
-            || !binding(&self.0.own, &self.0.target, &self.0.request)
+            || !binding(&self.0.own, &self.0.target, self.flow_id(), &self.0.request)
             || !self
                 .0
                 .client
@@ -544,7 +625,7 @@ impl PeerVerificationSession {
                         .get_verification(&self.0.target.user_id, self.flow_id())
                         .await;
                     if let Some(sas) = found.and_then(|value| value.sas()) {
-                        if !sas_binding(&self.0.own, &self.0.target, &sas) {
+                        if !sas_binding(&self.0.own, &self.0.target, self.flow_id(), &sas) {
                             return Err(Error::Gone);
                         }
                         *held = Some(sas);
@@ -626,7 +707,7 @@ impl PeerVerificationSession {
         )
         .await?;
         let Some(sas) = started else { return Ok(false) };
-        if !sas_binding(&self.0.own, &self.0.target, &sas) {
+        if !sas_binding(&self.0.own, &self.0.target, self.flow_id(), &sas) {
             return Err(Error::Unknown);
         }
         guarded(
@@ -830,6 +911,27 @@ mod tests {
         ));
         assert!(PeerVerificationTarget::parse("not-a-user", room.as_str()).is_err());
         assert!(PeerVerificationTarget::parse(peer.as_str(), "not-a-room").is_err());
+    }
+
+    #[test]
+    fn same_peer_and_room_cannot_substitute_another_request_or_sas_flow() {
+        let own = user_id!("@alice:example.org");
+        let peer = user_id!("@bob:example.org");
+        let room = room_id!("!dm:example.org");
+        let target = PeerVerificationTarget::parse(peer.as_str(), room.as_str()).unwrap();
+        let expected = (own, &target, "$first-request");
+        assert!(flow_context_matches(
+            expected,
+            (own, peer, Some(room), "$first-request"),
+            false,
+            false
+        ));
+        assert!(!flow_context_matches(
+            expected,
+            (own, peer, Some(room), "$second-request"),
+            false,
+            false
+        ));
     }
 
     #[test]

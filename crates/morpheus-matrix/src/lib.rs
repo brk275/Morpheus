@@ -188,8 +188,8 @@ pub use account_recovery::{
 };
 mod peer_verification;
 pub use peer_verification::{
-    MAX_PEER_REQUESTS, PeerVerificationInfo, PeerVerificationOutcome, PeerVerificationSession,
-    PeerVerificationTarget, PendingPeerVerifications,
+    MAX_PEER_REQUESTS, PeerVerificationInfo, PeerVerificationOutcome, PeerVerificationRequest,
+    PeerVerificationSession, PeerVerificationTarget, PendingPeerVerifications,
 };
 
 mod own_verification;

@@ -336,7 +336,7 @@ async fn test_request_user_identity() {
 /// It reads first, consumes a prepared request once, and stores the returned
 /// event under the exact peer/room in the ordinary crypto verification cache.
 #[async_test]
-async fn explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_dm() {
+async fn test_explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_dm() {
     use matrix_sdk::encryption::identities::RequestVerificationError;
     use matrix_sdk_test::{JoinedRoomBuilder, event_factory::EventFactory};
     use ruma::{
@@ -413,18 +413,18 @@ async fn explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_d
         .expect(0)
         .mount(&server)
         .await;
-    assert_matches!(
+    assert!(matches!(
         identity
             .prepare_verification_in_room_with_methods(chosen, vec![])
             .await,
         Err(RequestVerificationError::EmptyMethods)
-    );
-    assert_matches!(
+    ));
+    assert!(matches!(
         own.prepare_verification_in_room_with_methods(chosen, vec![VerificationMethod::SasV1])
             .await,
         Err(RequestVerificationError::NotOtherIdentity)
-    );
-    assert_matches!(
+    ));
+    assert!(matches!(
         identity
             .prepare_verification_in_room_with_methods(
                 room_id!("!absent:example.org"),
@@ -432,7 +432,7 @@ async fn explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_d
             )
             .await,
         Err(RequestVerificationError::NotJoinedDirectRoom)
-    );
+    ));
 
     let members = |room, membership| {
         let factory = EventFactory::new().room(room);
@@ -461,7 +461,7 @@ async fn explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_d
         .expect(1)
         .mount(&server)
         .await;
-    assert_matches!(
+    assert!(matches!(
         identity
             .prepare_verification_in_room_with_methods(
                 invited_peer,
@@ -469,7 +469,7 @@ async fn explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_d
             )
             .await,
         Err(RequestVerificationError::NotJoinedDirectRoom)
-    );
+    ));
     Mock::given(method("GET"))
         .and(path_regex(format!(
             "^/_matrix/client/v3/rooms/{chosen}/members$"
@@ -538,8 +538,8 @@ async fn explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_d
             );
         })
         .await;
-    assert_matches!(
+    assert!(matches!(
         stale.send().await,
         Err(RequestVerificationError::NotJoinedDirectRoom)
-    );
+    ));
 }

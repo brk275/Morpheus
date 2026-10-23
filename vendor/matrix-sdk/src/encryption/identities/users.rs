@@ -83,8 +83,9 @@ impl PreparedRoomVerification {
         let CryptoUserIdentity::Other(identity) = &self.identity.inner else {
             return Err(RequestVerificationError::NotOtherIdentity);
         };
-        // Synchronous recheck before the SDK send: no first-DM selection and
-        // no asynchronous membership lookup between this check and handoff.
+        // Synchronous recheck of joined DM routing before the SDK send. This
+        // does not re-read peer membership; that was checked in preparation.
+        // No first-DM selection, invite or room creation occurs here.
         if !self
             .identity
             .client
