@@ -528,7 +528,18 @@ jobs:
         # final outcome gate still rejects failed SDK unit regressions.
         continue-on-error: true
         shell: bash
-        run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
+        run: |
+          set -euo pipefail
+          cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # The SDK macro generates the exact test name. Cargo accepts an
+            # empty filter, so require its presence before executing it.
+            export RUST_LOG=warn
+            peer_case=encryption::verification::test_explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_dm
+            cargo test --locked -p matrix-sdk --test integration --features testing,e2e-encryption -- --list > "$RUNNER_TEMP/morpheus-peer-sas-sdk-tests.txt"
+            grep -Fqx -- "$peer_case: test" "$RUNNER_TEMP/morpheus-peer-sas-sdk-tests.txt"
+            cargo test --locked -p matrix-sdk --test integration --features testing,e2e-encryption "$peer_case" -- --exact
+          fi
       - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
         id: matrix-tests
         if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'matrix')
