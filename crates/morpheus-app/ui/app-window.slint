@@ -3381,6 +3381,9 @@ component TimelineRecoveryNotice inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
+    // Presentation only. Rust closes real selection/draft/task/config/native
+    // authority before setting this; queued callbacks are still gated there.
+    in property <bool> application-closing: false;
     title: "Morpheus";
     preferred-width: 1310px;
     preferred-height: 820px;
@@ -6030,6 +6033,7 @@ export component AppWindow inherits Window {
     background: root.window-translucent ? transparent : canvas;
 
     shortcut-scope := FocusScope {
+    visible: !root.application-closing;
     width: parent.width;
     height: parent.height;
     focus-on-tab-navigation: false;
@@ -15306,6 +15310,15 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    if root.application-closing : Rectangle {
+        background: root.dialog-surface;
+        VerticalLayout {
+            padding: 32px; spacing: 18px; alignment: center;
+            Text { text: "Closing Morpheus"; color: root.ink; font-size: 22px; horizontal-alignment: center; }
+            Text { text: root.update-status; color: root.ink; wrap: word-wrap; horizontal-alignment: center; }
         }
     }
 

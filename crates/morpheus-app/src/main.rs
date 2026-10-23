@@ -88,6 +88,8 @@ mod video_render;
 #[cfg(feature = "native-calls")]
 mod voice_rosters;
 mod voice_spaces;
+#[cfg(all(windows, feature = "native-calls"))]
+mod windows_audio;
 mod workspace_layout;
 
 use std::cell::RefCell;
@@ -1729,6 +1731,8 @@ fn run_application(
     let ui = AppWindow::new()?;
     ui.set_login_loading(true);
     ui.show()?;
+    #[cfg(all(windows, feature = "native-calls"))]
+    let wasapi_ui = windows_audio::attach()?;
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.mark_window_shown();
     update_session
@@ -1784,6 +1788,7 @@ fn run_application(
         ui.as_weak(),
         voice_spaces.clone(),
     );
+    #[cfg(not(all(windows, feature = "native-calls")))]
     security::register(&ui, live.clone(), runtime.handle().clone());
     let image_previews =
         image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
@@ -1824,6 +1829,8 @@ fn run_application(
         live.security_gate.clone(),
         Arc::new(move || update_accounts.account_access_busy()),
     );
+    #[cfg(all(windows, feature = "native-calls"))]
+    security::register(&ui, live.clone(), runtime.handle().clone(), updates.clone());
     let update_ui_task = updates.bind_ui(&ui);
     #[cfg(feature = "native-calls")]
     let calls = Arc::new(CallController::new(
@@ -3809,7 +3816,7 @@ fn run_application(
         };
         let live = pending_live.clone();
         let weak = weak.clone();
-        pending_handle.spawn(async move {
+        pending_live.spawn_draft_work(&pending_handle, async move {
             live.cancel_pending_send(selection, scope, target, weak)
                 .await
         });
@@ -3836,7 +3843,7 @@ fn run_application(
         };
         let live = retry_live.clone();
         let weak = weak.clone();
-        retry_handle.spawn(async move {
+        retry_live.spawn_draft_work(&retry_handle, async move {
             live.retry_pending_send(selection, scope, target, weak)
                 .await
         });
@@ -3860,7 +3867,7 @@ fn run_application(
         };
         let live = review_live.clone();
         let weak = weak.clone();
-        review_handle.spawn(async move {
+        review_live.spawn_draft_work(&review_handle, async move {
             live.review_unconfirmed_send(selection, scope, nonce, sent, weak)
                 .await
         });
@@ -3900,7 +3907,7 @@ fn run_application(
         }
         let live = restore_live.clone();
         let weak = weak.clone();
-        restore_handle.spawn(async move {
+        restore_live.spawn_draft_work(&restore_handle, async move {
             live.restore_record_text(selection, scope, nonce, revision, weak)
                 .await
         });
@@ -3952,8 +3959,9 @@ fn run_application(
         };
         let live = discard_live.clone();
         let weak = weak.clone();
-        discard_handle
-            .spawn(async move { live.discard_kept_text(selection, scope, nonce, weak).await });
+        discard_live.spawn_draft_work(&discard_handle, async move {
+            live.discard_kept_text(selection, scope, nonce, weak).await
+        });
     });
     let weak = ui.as_weak();
     let unreadable_live = live.clone();
@@ -3971,8 +3979,9 @@ fn run_application(
         };
         let live = unreadable_live.clone();
         let weak = weak.clone();
-        unreadable_handle
-            .spawn(async move { live.discard_unreadable_status(selection, scope, weak).await });
+        unreadable_live.spawn_draft_work(&unreadable_handle, async move {
+            live.discard_unreadable_status(selection, scope, weak).await
+        });
     });
 
     let weak = ui.as_weak();
@@ -4759,95 +4768,218 @@ fn run_application(
 
     #[cfg(morpheus_timeline_acceptance)]
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
-    let ui_result = ui.run();
-    device_sessions.shutdown(&ui);
-    member_privacy.shutdown(&ui);
-    identity_warnings.shutdown(&ui);
-    pinned_messages.shutdown(&ui);
-    room_media.shutdown(&ui);
-    room_activity.shutdown(&ui);
-    // Before any wait below: no unread-mark write that was not handed over
-    // yet can start while main waits on other cleanup.
-    unread_navigation_ui.shutdown(&ui);
-    room_permissions.shutdown(&ui);
-    room_settings.shutdown(&ui);
-    room_leave.shutdown(&ui);
-    moderation.shutdown();
-    image_previews.shutdown(&ui);
-    attachment_audio.shutdown(&ui);
-    #[cfg(feature = "native-calls")]
-    voice_presence.shutdown(&ui);
-    // Before the incoming worker and notifications: no call banner outlives
-    // them, and those the platform can withdraw are withdrawn.
-    #[cfg(feature = "native-calls")]
-    call_banners.shutdown();
-    #[cfg(feature = "native-calls")]
-    incoming_calls.shutdown();
-    notifications.shutdown();
-    update_ui_task.abort();
-    let (update_result, call_result) = runtime.block_on(async {
-        let _ = update_ui_task.await;
-        // A cancelled download may still be waiting for its bounded network
-        // timeout. Stop call capture concurrently, never after that wait.
+    // UI revocation stays on its actual thread; mandatory async cleanup may
+    // run on the existing runtime while Windows keeps the origin STA pumping.
+    let cleanup_ui = ui.clone_strong();
+    let cleanup = move || {
+        #[cfg(all(windows, feature = "native-calls"))]
+        live.security_gate.begin_shutdown(None);
+        live.close_action_admission();
+        store.close_write_admission();
+        style_profiles::close_application_admission();
+        cleanup_ui.set_application_closing(true);
+        cleanup_ui.set_update_status("Closing Morpheus. Saving drafts and releasing audio…".into());
         #[cfg(feature = "native-calls")]
-        {
-            let (update_result, call_result, ()) = tokio::join!(
-                updates.shutdown(),
-                calls.end_call(),
-                incoming_calls.finish()
-            );
-            let call_result = call_result.map_err(|_| ShutdownFailure::NativeCall);
-            if call_result.is_err() {
-                eprintln!("Could not confirm native call shutdown.");
+        audio_devices::shutdown_discovery();
+        device_sessions.shutdown(&cleanup_ui);
+        member_privacy.shutdown(&cleanup_ui);
+        identity_warnings.shutdown(&cleanup_ui);
+        pinned_messages.shutdown(&cleanup_ui);
+        room_media.shutdown(&cleanup_ui);
+        room_activity.shutdown(&cleanup_ui);
+        // Before any wait below: no unread-mark write that was not handed over
+        // yet can start while main waits on other cleanup.
+        unread_navigation_ui.shutdown(&cleanup_ui);
+        room_permissions.shutdown(&cleanup_ui);
+        room_settings.shutdown(&cleanup_ui);
+        room_leave.shutdown(&cleanup_ui);
+        moderation.shutdown();
+        image_previews.shutdown(&cleanup_ui);
+        attachment_audio.shutdown(&cleanup_ui);
+        #[cfg(feature = "native-calls")]
+        voice_presence.shutdown(&cleanup_ui);
+        // Before the incoming worker and notifications: no call banner outlives
+        // them, and those the platform can withdraw are withdrawn.
+        #[cfg(feature = "native-calls")]
+        call_banners.shutdown();
+        #[cfg(feature = "native-calls")]
+        incoming_calls.shutdown();
+        notifications.shutdown();
+        update_ui_task.abort();
+        async move {
+            let (update_result, call_result) = async {
+                let _ = update_ui_task.await;
+                // A cancelled download may still be waiting for its bounded network
+                // timeout. Stop call capture concurrently, never after that wait.
+                #[cfg(feature = "native-calls")]
+                {
+                    let (update_result, call_result, ()) = tokio::join!(
+                        updates.shutdown(),
+                        calls.end_call(),
+                        incoming_calls.finish()
+                    );
+                    let call_result = call_result.map_err(|_| ShutdownFailure::NativeCall);
+                    if call_result.is_err() {
+                        eprintln!("Could not confirm native call shutdown.");
+                    }
+                    (update_result, call_result)
+                }
+                #[cfg(not(feature = "native-calls"))]
+                (updates.shutdown().await, Ok::<(), ShutdownFailure>(()))
             }
-            (update_result, call_result)
+            .await;
+            #[cfg(feature = "native-calls")]
+            let ring_result = morpheus_rtc::wait_for_ring_audio_release().await;
+            #[cfg(feature = "native-calls")]
+            if let Err(error) = ring_result {
+                // Incoming UI shutdown revoked authority first. Still finish the other
+                // cleanup paths, then return the typed actual-worker release failure.
+                eprintln!("Could not release incoming sound during shutdown: {error}");
+            }
+            #[cfg(feature = "native-calls")]
+            let device_open_result = morpheus_rtc::wait_for_audio_device_release().await;
+            #[cfg(feature = "native-calls")]
+            if let Err(error) = device_open_result {
+                // Preserve this independent join failure while all remaining cleanup
+                // completes; call cleanup failures are also returned below.
+                eprintln!("Could not release audio device opener during shutdown: {error}");
+            }
+            let audio_result = audio_attachments::wait_for_release().await;
+            if let Err(error) = audio_result {
+                // Still flush drafts and stop the manager; failure is returned below.
+                eprintln!("Could not release attachment audio during shutdown: {error}");
+            }
+            #[cfg(feature = "native-calls")]
+            let discovery_result = audio_devices::wait_for_discovery_release().await;
+            #[cfg(all(feature = "native-calls", target_os = "macos"))]
+            let backend_result = Some(
+                morpheus_rtc::wait_for_all_coreaudio_release()
+                    .await
+                    .map_err(|_| ShutdownFailure::AudioBackend),
+            );
+            #[cfg(all(feature = "native-calls", target_os = "linux"))]
+            let backend_result = Some(
+                morpheus_rtc::wait_for_all_alsa_release()
+                    .await
+                    .map_err(|_| ShutdownFailure::AudioBackend),
+            );
+            // Windows' actual native result is returned separately by its UI
+            // apartment coordinator. This tuple slot carries only Mac/ALSA.
+            #[cfg(all(
+                feature = "native-calls",
+                not(any(target_os = "macos", target_os = "linux"))
+            ))]
+            let backend_result: Option<Result<(), ShutdownFailure>> = None;
+            #[cfg(all(
+                feature = "native-calls",
+                any(target_os = "macos", target_os = "linux")
+            ))]
+            if matches!(backend_result, Some(Err(_))) {
+                eprintln!("Could not confirm native audio backend shutdown.");
+            }
+            // Selection/task/edit admission was closed synchronously on the
+            // UI thread. Actual admitted handles must finish before the final
+            // writer sweep, while loaded account stores remain available.
+            let appearance_result = style_profiles::wait_for_appearance_release().await;
+            let draft_task_result = live.drain_draft_work().await;
+            let config_drain_result = loop {
+                match store.write_shutdown_confirmed() {
+                    Ok(true) => break Ok(()),
+                    Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                    Err(error) => break Err(error),
+                }
+            };
+            let draft_result = live.flush_drafts().await;
+            manager.stop().await;
+            let update_result = update_result.map_err(|_| ShutdownFailure::UpdateWorker);
+            if update_result.is_err() {
+                // Keep diagnostics static and return failure only after all cleanup.
+                eprintln!("Could not confirm update worker shutdown.");
+            }
+            #[cfg(feature = "native-calls")]
+            {
+                (
+                    update_result,
+                    call_result,
+                    ring_result,
+                    device_open_result,
+                    audio_result,
+                    draft_result,
+                    discovery_result,
+                    backend_result,
+                    draft_task_result,
+                    config_drain_result,
+                    appearance_result,
+                )
+            }
+            #[cfg(not(feature = "native-calls"))]
+            {
+                (
+                    update_result,
+                    call_result,
+                    audio_result,
+                    draft_result,
+                    draft_task_result,
+                    config_drain_result,
+                    appearance_result,
+                )
+            }
         }
-        #[cfg(not(feature = "native-calls"))]
-        (updates.shutdown().await, Ok::<(), ShutdownFailure>(()))
-    });
-    #[cfg(feature = "native-calls")]
-    let ring_result = runtime.block_on(morpheus_rtc::wait_for_ring_audio_release());
-    #[cfg(feature = "native-calls")]
-    if let Err(error) = ring_result {
-        // Incoming UI shutdown revoked authority first. Still finish the other
-        // cleanup paths, then return the typed actual-worker release failure.
-        eprintln!("Could not release incoming sound during shutdown: {error}");
-    }
-    #[cfg(feature = "native-calls")]
-    let device_open_result = runtime.block_on(morpheus_rtc::wait_for_audio_device_release());
-    #[cfg(feature = "native-calls")]
-    if let Err(error) = device_open_result {
-        // Preserve this independent join failure while all remaining cleanup
-        // completes; call cleanup failures are also returned below.
-        eprintln!("Could not release audio device opener during shutdown: {error}");
-    }
-    let audio_result = runtime.block_on(audio_attachments::wait_for_release());
-    if let Err(error) = audio_result {
-        // Still flush drafts and stop the manager; failure is returned below.
-        eprintln!("Could not release attachment audio during shutdown: {error}");
-    }
-    #[cfg(all(feature = "native-calls", target_os = "macos"))]
-    let backend_result = runtime
-        .block_on(morpheus_rtc::wait_for_all_coreaudio_release())
-        .map_err(|_| ShutdownFailure::AudioBackend);
-    #[cfg(all(feature = "native-calls", target_os = "linux"))]
-    let backend_result = runtime
-        .block_on(morpheus_rtc::wait_for_all_alsa_release())
-        .map_err(|_| ShutdownFailure::AudioBackend);
-    #[cfg(all(
-        feature = "native-calls",
-        any(target_os = "macos", target_os = "linux")
-    ))]
-    if backend_result.is_err() {
-        eprintln!("Could not confirm native audio backend shutdown.");
-    }
-    let draft_result = runtime.block_on(live.flush_drafts());
-    runtime.block_on(manager.stop());
-    let update_result = update_result.map_err(|_| ShutdownFailure::UpdateWorker);
-    if update_result.is_err() {
-        // Keep diagnostics static and return failure only after all cleanup.
-        eprintln!("Could not confirm update worker shutdown.");
-    }
+    };
+    #[cfg(all(windows, feature = "native-calls"))]
+    let (
+        ui_result,
+        (
+            update_result,
+            call_result,
+            ring_result,
+            device_open_result,
+            audio_result,
+            draft_result,
+            discovery_result,
+            backend_result,
+            draft_task_result,
+            config_drain_result,
+            appearance_result,
+        ),
+        wasapi_result,
+    ) = windows_audio::run(&ui, wasapi_ui, &runtime, cleanup)?;
+    #[cfg(all(not(windows), feature = "native-calls"))]
+    let (
+        ui_result,
+        (
+            update_result,
+            call_result,
+            ring_result,
+            device_open_result,
+            audio_result,
+            draft_result,
+            discovery_result,
+            backend_result,
+            draft_task_result,
+            config_drain_result,
+            appearance_result,
+        ),
+    ) = {
+        let result = ui.run();
+        (result, runtime.block_on(cleanup()))
+    };
+    #[cfg(not(feature = "native-calls"))]
+    let (
+        ui_result,
+        (
+            update_result,
+            call_result,
+            audio_result,
+            draft_result,
+            draft_task_result,
+            config_drain_result,
+            appearance_result,
+        ),
+    ) = {
+        let result = ui.run();
+        (result, runtime.block_on(cleanup()))
+    };
     ui_result?;
     if let Err(error) = draft_result {
         eprintln!("Could not save drafts during shutdown: {error}");
@@ -4861,15 +4993,21 @@ fn run_application(
     // UI, draft, attachment, device-opening and ringing errors retain their
     // precedence. Failed call cleanup or an update drain must also prevent a
     // successful ordinary-shutdown result.
-    #[cfg(all(
-        feature = "native-calls",
-        any(target_os = "macos", target_os = "linux")
-    ))]
-    backend_result?;
+    #[cfg(feature = "native-calls")]
+    if let Some(result) = backend_result {
+        result?;
+    }
     call_result?;
     update_result?;
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.finish()?;
+    draft_task_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    config_drain_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    appearance_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    #[cfg(feature = "native-calls")]
+    discovery_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    #[cfg(all(windows, feature = "native-calls"))]
+    wasapi_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     Ok(())
 }
 

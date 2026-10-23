@@ -255,7 +255,8 @@ pub(crate) fn spawn_observer(
     transaction_id: String,
     mut queued: QueuedMessage,
 ) {
-    tokio::spawn(async move {
+    let owner = live.clone();
+    owner.spawn_draft_work(&tokio::runtime::Handle::current(), async move {
         loop {
             let update = tokio::select! {
                 _ = selection.revoked() => return,

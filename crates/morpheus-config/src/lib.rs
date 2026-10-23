@@ -2122,6 +2122,15 @@ pub fn validate_shortcuts(values: &BTreeMap<String, String>) -> Result<(), Confi
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     path: PathBuf,
+    // Clones used by this application share terminal write admission. Reads,
+    // diagnostics and an independent ConfigStore opened by another process
+    // retain their existing behavior.
+    write_admission: std::sync::Arc<ConfigWriteAdmission>,
+}
+#[derive(Debug, Default)]
+struct ConfigWriteAdmission {
+    closed: std::sync::atomic::AtomicBool,
+    active: std::sync::RwLock<()>,
 }
 
 impl ConfigStore {
@@ -2132,7 +2141,37 @@ impl ConfigStore {
     }
 
     pub fn at(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            write_admission: std::sync::Arc::default(),
+        }
+    }
+
+    /// Close all cloned application writers without waiting on filesystem I/O
+    /// on the UI thread. An already admitted writer keeps its real read guard.
+    pub fn close_write_admission(&self) {
+        self.write_admission
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    /// A real exclusive barrier, not an active-count snapshot. With terminal
+    /// admission closed, it proves every admitted synchronous publish scope
+    /// has returned (including its stage/place/flush and original errors).
+    pub fn write_shutdown_confirmed(&self) -> Result<bool, CommitError> {
+        if !self
+            .write_admission
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        match self.write_admission.active.try_write() {
+            Ok(_exclusive) => Ok(true),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(CommitError::Config(
+                ConfigError::Invalid("Settings writer completion could not be confirmed.".into()),
+            )),
+        }
     }
 
     pub fn path(&self) -> &Path {

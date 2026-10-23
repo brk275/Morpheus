@@ -909,6 +909,21 @@ mod platform_impl {
     );
 
     /// The default host for the current compilation target platform.
+    impl Stream {
+        /// Request WASAPI close without blocking the UI/runtime. Other selected
+        /// backends keep their own Drop contract and cannot supply this receipt.
+        pub fn request_wasapi_close(self) -> Option<crate::WasapiCloseTicket> {
+            match self.0 {
+                StreamInner::Wasapi(stream) => Some(stream.request_wasapi_close()),
+                #[allow(unreachable_patterns)]
+                other => {
+                    drop(other);
+                    None
+                }
+            }
+        }
+    }
+
     pub fn default_host() -> Host {
         WasapiHost::new()
             .expect("the default host should always be available")

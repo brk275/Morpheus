@@ -255,6 +255,8 @@ pub enum RingAudioReleaseError {
     OutputOwnerUnconfirmed,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     NativeClose,
+    #[cfg(windows)]
+    NativeBackend,
 }
 impl std::fmt::Display for RingAudioReleaseError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -269,6 +271,8 @@ impl std::fmt::Display for RingAudioReleaseError {
             Self::OutputOwnerUnconfirmed => {
                 "the previous output worker release could not be confirmed"
             }
+            #[cfg(windows)]
+            Self::NativeBackend => "Windows native output retirement could not be confirmed",
         })
     }
 }
@@ -472,7 +476,12 @@ fn run_ring_worker(
 /// bounded observation then requires the retained actual ringtone worker/TLS
 /// join; cancellation/timeout never detach it or release its output guards.
 pub async fn wait_for_ring_audio_release() -> Result<(), RingAudioReleaseError> {
-    RING_WORKERS.wait(RING_RELEASE_WAIT).await
+    RING_WORKERS.wait(RING_RELEASE_WAIT).await?;
+    #[cfg(windows)]
+    crate::audio_device::wait_for_native_audio_release(RING_RELEASE_WAIT)
+        .await
+        .map_err(|_| RingAudioReleaseError::NativeBackend)?;
+    Ok(())
 }
 
 /// Drop only revokes callback authority; it never waits on an OS driver. The
@@ -681,15 +690,116 @@ fn output_config(
     }
     selected.ok_or(RingAudioError::Unavailable)
 }
+#[cfg(windows)]
+struct NativeOutputStream {
+    stream: Option<cpal::Stream>,
+    run: Arc<Run>,
+}
+#[cfg(windows)]
+impl std::ops::Deref for NativeOutputStream {
+    type Target = cpal::Stream;
+    fn deref(&self) -> &cpal::Stream {
+        self.stream.as_ref().expect("retained output proxy")
+    }
+}
+#[cfg(windows)]
+impl Drop for NativeOutputStream {
+    fn drop(&mut self) {
+        self.run.stopped.store(true, Ordering::Release);
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        let Some(ticket) = stream.request_wasapi_close() else {
+            // Shipping Windows selects WASAPI. A different compiled host has
+            // no WASAPI receipt and must never be represented as confirmed.
+            self.run.status.store(3, Ordering::Release);
+            loop {
+                thread::park();
+            }
+        };
+        loop {
+            match ticket.observe() {
+                cpal::WasapiCloseObservation::Released(result) => {
+                    if result.is_err() {
+                        self.run.status.store(3, Ordering::Release);
+                    }
+                    return;
+                }
+                cpal::WasapiCloseObservation::Retained(_) => {
+                    self.run.status.store(3, Ordering::Release);
+                }
+                cpal::WasapiCloseObservation::Pending => {}
+            }
+            thread::park_timeout(Duration::from_millis(10));
+        }
+    }
+}
+#[cfg(windows)]
+fn own_output_stream(stream: cpal::Stream, run: Arc<Run>) -> NativeOutputStream {
+    NativeOutputStream {
+        stream: Some(stream),
+        run,
+    }
+}
+#[cfg(not(windows))]
+fn own_output_stream(stream: cpal::Stream, _run: Arc<Run>) -> cpal::Stream {
+    stream
+}
+
+/// This guard is created only on the already retained application output
+/// owner. It is declared before local Device/Stream values so their drop first
+/// requests retirement, including every format/build/play error and unwind.
+/// Its outer ring/PCM permit stays retained until real backend joins complete.
+#[cfg(windows)]
+struct NativeOutputDrain(Arc<Run>);
+#[cfg(windows)]
+impl Drop for NativeOutputDrain {
+    fn drop(&mut self) {
+        loop {
+            match cpal::observe_wasapi_retiring() {
+                cpal::WasapiCloseObservation::Released(result) => {
+                    if result.is_err() {
+                        self.0.status.store(3, Ordering::Release);
+                    }
+                    return;
+                }
+                cpal::WasapiCloseObservation::Retained(_) => {
+                    self.0.status.store(3, Ordering::Release);
+                }
+                cpal::WasapiCloseObservation::Pending => {}
+            }
+            // No UI/Tokio thread waits here. The caller's bounded observation
+            // can fail while the actual application worker/permit stays owned.
+            thread::park_timeout(Duration::from_millis(10));
+        }
+    }
+}
+
 fn play(run: &Arc<Run>, selected: Option<&str>) -> Result<(), RingAudioError> {
+    #[cfg(windows)]
+    {
+        let authority = run.clone();
+        return cpal::with_wasapi_open_authority(Arc::new(move || authority.active()), || {
+            play_on_owner(run, selected)
+        });
+    }
+    #[cfg(not(windows))]
+    play_on_owner(run, selected)
+}
+fn play_on_owner(run: &Arc<Run>, selected: Option<&str>) -> Result<(), RingAudioError> {
+    #[cfg(windows)]
+    let _native_drain = NativeOutputDrain(run.clone());
     let device = speaker(run, selected)?;
     let config = output_config(run, &device)?;
-    let stream = entered(run, || match config.sample_format() {
-        SampleFormat::F32 => stream::<f32>(&device, &config, run.clone()),
-        SampleFormat::I16 => stream::<i16>(&device, &config, run.clone()),
-        SampleFormat::U16 => stream::<u16>(&device, &config, run.clone()),
-        _ => Err(RingAudioError::Unavailable),
-    })?;
+    let stream = own_output_stream(
+        entered(run, || match config.sample_format() {
+            SampleFormat::F32 => stream::<f32>(&device, &config, run.clone()),
+            SampleFormat::I16 => stream::<i16>(&device, &config, run.clone()),
+            SampleFormat::U16 => stream::<u16>(&device, &config, run.clone()),
+            _ => Err(RingAudioError::Unavailable),
+        })?,
+        run.clone(),
+    );
     entered(run, || {
         stream.play().map_err(|_| RingAudioError::Unavailable)
     })?;
@@ -1437,6 +1547,8 @@ impl PcmPlayback {
         let producer = PCM_NATIVE_OWNERS.admit(&self.native_identity, &self.run)?;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let _permit = Permit::take().ok_or(RingAudioError::Busy)?;
+        #[cfg(windows)]
+        let _native_drain = NativeOutputDrain(self.run.clone());
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let result = {
             if !self.run.active() {
@@ -1445,7 +1557,16 @@ impl PcmPlayback {
             self.total
                 .store((samples.len() / count) as u64, Ordering::Release);
             self.rate.store(rate, Ordering::Release);
-            self.open_pcm(samples, rate, channels)
+            #[cfg(windows)]
+            let result = {
+                let authority = self.run.clone();
+                cpal::with_wasapi_open_authority(Arc::new(move || authority.active()), || {
+                    self.open_pcm(samples, rate, channels)
+                })
+            };
+            #[cfg(not(windows))]
+            let result = self.open_pcm(samples, rate, channels);
+            result
         };
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let result = if self.run.active() {
@@ -1479,33 +1600,36 @@ impl PcmPlayback {
         let device = speaker(&self.run, None)?;
         let config = output_config(&self.run, &device)?;
         let samples = Arc::new(samples);
-        let stream = entered(&self.run, || match config.sample_format() {
-            SampleFormat::F32 => pcm_stream::<f32>(
-                &device,
-                &config,
-                self.clone(),
-                samples.clone(),
-                rate,
-                channels,
-            ),
-            SampleFormat::I16 => pcm_stream::<i16>(
-                &device,
-                &config,
-                self.clone(),
-                samples.clone(),
-                rate,
-                channels,
-            ),
-            SampleFormat::U16 => pcm_stream::<u16>(
-                &device,
-                &config,
-                self.clone(),
-                samples.clone(),
-                rate,
-                channels,
-            ),
-            _ => Err(RingAudioError::Unavailable),
-        })?;
+        let stream = own_output_stream(
+            entered(&self.run, || match config.sample_format() {
+                SampleFormat::F32 => pcm_stream::<f32>(
+                    &device,
+                    &config,
+                    self.clone(),
+                    samples.clone(),
+                    rate,
+                    channels,
+                ),
+                SampleFormat::I16 => pcm_stream::<i16>(
+                    &device,
+                    &config,
+                    self.clone(),
+                    samples.clone(),
+                    rate,
+                    channels,
+                ),
+                SampleFormat::U16 => pcm_stream::<u16>(
+                    &device,
+                    &config,
+                    self.clone(),
+                    samples.clone(),
+                    rate,
+                    channels,
+                ),
+                _ => Err(RingAudioError::Unavailable),
+            })?,
+            self.run.clone(),
+        );
         entered(&self.run, || {
             stream.play().map_err(|_| RingAudioError::Unavailable)
         })?;

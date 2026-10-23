@@ -592,6 +592,27 @@ impl UpdateController {
 
     /// Bind explicit UI actions and return the status observer. Abort/await only
     /// this observer after the window closes; controller.shutdown must be drained.
+    /// Admit quit while holding the actual controller reservation. A global
+    /// RestartPending snapshot cannot authorize another or stale holder.
+    #[cfg(all(windows, feature = "native-calls"))]
+    pub(crate) fn request_windows_shutdown(&self) -> bool {
+        if (self.shared.account_access_busy)() || !crate::windows_audio::coordinator_available() {
+            return false;
+        }
+        let admission = {
+            let Ok(inner) = self.shared.inner.lock() else {
+                return false;
+            };
+            self.shared
+                .security
+                .admit_shutdown(inner.restart_lease.as_ref())
+        };
+        let Some(admission) = admission else {
+            return false;
+        };
+        crate::windows_audio::request_admitted_shutdown(admission)
+    }
+
     pub fn bind_ui(&self, ui: &AppWindow) -> JoinHandle<()> {
         apply_snapshot(ui, self);
         let controller = self.clone();
@@ -762,6 +783,13 @@ fn apply_snapshot(ui: &AppWindow, controller: &UpdateController) {
         // This terminal phase is published only after helper readiness. The
         // normal main shutdown path drains workers/stores before releasing the
         // lifetime lock; no process::exit or UI-owned session is permitted.
+        #[cfg(all(windows, feature = "native-calls"))]
+        if !controller.request_windows_shutdown() {
+            ui.set_update_status(
+                "Wait for the account or security operation before restarting Morpheus.".into(),
+            );
+        }
+        #[cfg(not(all(windows, feature = "native-calls")))]
         if slint::quit_event_loop().is_err() {
             ui.set_update_status(
                 "Update preparation is complete. Close Morpheus to finish restarting.".into(),

@@ -271,6 +271,7 @@ features = [
     "Win32_System_Variant",
     "Win32_Media_Multimedia",
     "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
 ]
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-core]

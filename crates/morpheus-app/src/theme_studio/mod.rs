@@ -94,6 +94,16 @@ fn with<R>(update: impl FnOnce(&mut Studio) -> R) -> R {
     STUDIO.with(|studio| update(&mut studio.borrow_mut()))
 }
 
+/// Withdraw the exact UI-owned file/config capabilities before cleanup yields.
+pub(crate) fn close_file_admission() {
+    APPLY_RETRY.with(slint::Timer::stop);
+    with(|studio| {
+        studio.store = None;
+        studio.retry = None;
+    });
+    packs::close_file_admission();
+}
+
 pub(crate) fn register(ui: &AppWindow, store: &ConfigStore) {
     // A new settings context: work captured for an earlier one is stale.
     scope::invalidate();

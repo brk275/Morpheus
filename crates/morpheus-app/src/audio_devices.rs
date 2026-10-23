@@ -54,6 +54,154 @@ impl Drop for DiscoveryRequest {
     }
 }
 
+#[cfg(feature = "native-calls")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiscoveryReleaseError {
+    TimedOut,
+    WorkerPanicked,
+    SupervisorFailed,
+}
+#[cfg(feature = "native-calls")]
+impl std::fmt::Display for DiscoveryReleaseError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::TimedOut => "Audio discovery release is still pending.",
+            Self::WorkerPanicked => "Audio discovery worker failed.",
+            Self::SupervisorFailed => "Audio discovery ownership could not be confirmed.",
+        })
+    }
+}
+#[cfg(feature = "native-calls")]
+impl std::error::Error for DiscoveryReleaseError {}
+#[cfg(feature = "native-calls")]
+type CatalogResult = Result<morpheus_rtc::AudioDeviceCatalog, morpheus_rtc::MediaError>;
+#[cfg(feature = "native-calls")]
+struct DiscoveryOwner {
+    supervisor: Option<std::thread::JoinHandle<()>>,
+    result: Arc<std::sync::Mutex<Option<Result<CatalogResult, DiscoveryReleaseError>>>>,
+    _request: DiscoveryRequest,
+    failure: Option<DiscoveryReleaseError>,
+}
+#[cfg(feature = "native-calls")]
+static DISCOVERY_OWNER: std::sync::Mutex<Option<DiscoveryOwner>> = std::sync::Mutex::new(None);
+#[cfg(feature = "native-calls")]
+static DISCOVERY_CLOSED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "native-calls")]
+fn poll_discovery() -> Option<Result<Option<CatalogResult>, DiscoveryReleaseError>> {
+    let mut stored = DISCOVERY_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(owner) = stored.as_mut() else {
+        return Some(Ok(None));
+    };
+    if let Some(error) = owner.failure {
+        return Some(Err(error));
+    }
+    let Some(supervisor) = owner.supervisor.as_ref() else {
+        return Some(Err(DiscoveryReleaseError::SupervisorFailed));
+    };
+    if !supervisor.is_finished() {
+        return None;
+    }
+    let result = owner.supervisor.take().unwrap().join();
+    if result.is_err() {
+        owner.failure = Some(DiscoveryReleaseError::SupervisorFailed);
+        return Some(Err(DiscoveryReleaseError::SupervisorFailed));
+    }
+    let observed = owner
+        .result
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    match observed {
+        Some(Ok(catalog)) => {
+            *stored = None;
+            Some(Ok(Some(catalog)))
+        }
+        Some(Err(error)) => {
+            owner.failure = Some(error);
+            Some(Err(error))
+        }
+        None => {
+            owner.failure = Some(DiscoveryReleaseError::SupervisorFailed);
+            Some(Err(DiscoveryReleaseError::SupervisorFailed))
+        }
+    }
+}
+#[cfg(feature = "native-calls")]
+fn start_discovery(
+    request: DiscoveryRequest,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), DiscoveryReleaseError> {
+    start_discovery_with(request, ready, morpheus_rtc::audio_devices)
+}
+#[cfg(feature = "native-calls")]
+fn start_discovery_with(
+    request: DiscoveryRequest,
+    ready: tokio::sync::oneshot::Sender<()>,
+    query: impl FnOnce() -> CatalogResult + Send + 'static,
+) -> Result<(), DiscoveryReleaseError> {
+    let mut stored = DISCOVERY_OWNER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if stored.is_some() || DISCOVERY_CLOSED.load(Ordering::Acquire) {
+        return Err(DiscoveryReleaseError::SupervisorFailed);
+    }
+    let result = Arc::new(std::sync::Mutex::new(None));
+    let completed = result.clone();
+    let (start, admitted) = std::sync::mpsc::sync_channel(1);
+    let supervisor = std::thread::Builder::new()
+        .name("morpheus-device-catalog-join".into())
+        .spawn(move || {
+            if admitted.recv().is_err() {
+                return;
+            }
+            let actual = std::thread::Builder::new()
+                .name("morpheus-audio-devices".into())
+                .spawn(query);
+            let result = match actual {
+                Ok(actual) => actual
+                    .join()
+                    .map_err(|_| DiscoveryReleaseError::WorkerPanicked),
+                Err(_) => Err(DiscoveryReleaseError::SupervisorFailed),
+            };
+            *completed.lock().unwrap_or_else(|error| error.into_inner()) = Some(result);
+            // Only a unit notification crosses here. The actual worker's TLS was
+            // joined, and the supervisor handle remains owned until poll joins it.
+            let _ = ready.send(());
+        })
+        .map_err(|_| DiscoveryReleaseError::SupervisorFailed)?;
+    *stored = Some(DiscoveryOwner {
+        supervisor: Some(supervisor),
+        result,
+        _request: request,
+        failure: None,
+    });
+    start
+        .send(())
+        .map_err(|_| DiscoveryReleaseError::SupervisorFailed)
+}
+#[cfg(feature = "native-calls")]
+pub(crate) fn shutdown_discovery() {
+    DISCOVERY_CLOSED.store(true, Ordering::Release);
+}
+#[cfg(feature = "native-calls")]
+pub(crate) async fn wait_for_discovery_release() -> Result<(), DiscoveryReleaseError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match poll_discovery() {
+            Some(Ok(_)) => return Ok(()),
+            Some(Err(error)) => return Err(error),
+            None => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DiscoveryReleaseError::TimedOut);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Choice {
     id: Option<String>,
@@ -246,13 +394,18 @@ pub fn register(ui: &AppWindow, store: ConfigStore, handle: &tokio::runtime::Han
 fn register_discovery(ui: &AppWindow, handle: &tokio::runtime::Handle) {
     use std::time::Duration;
 
-    // A timed-out backend query remains single-flight until its OS thread
-    // actually returns. Detached queries never hold Tokio shutdown open.
+    // A timed-out query keeps its actual worker and supervisor handles. The
+    // single-flight guard releases only after both real joins, including TLS.
     let requests = Arc::new(DiscoveryRequests::default());
     let weak = ui.as_weak();
     let handle = handle.clone();
     ui.on_refresh_audio_devices(move || {
         let Some(ui) = weak.upgrade() else { return };
+        if DISCOVERY_CLOSED.load(Ordering::Acquire) { return; }
+        if matches!(poll_discovery(), Some(Err(_))) {
+            ui.set_audio_device_notice("Audio discovery did not release safely. New discovery is blocked.".into());
+            return;
+        }
         let Some(guard) = requests.begin() else {
             ui.set_audio_device_notice(
                 "The previous device query is still waiting for the operating system.".into(),
@@ -263,13 +416,7 @@ fn register_discovery(ui: &AppWindow, handle: &tokio::runtime::Handle) {
         ui.set_audio_devices_busy(true);
         ui.set_audio_device_notice("Looking for microphones and speakers…".into());
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if std::thread::Builder::new()
-            .name("morpheus-audio-devices".into())
-            .spawn(move || {
-                let _guard = guard;
-                let _ = tx.send(morpheus_rtc::audio_devices());
-            })
-            .is_err()
+        if start_discovery(guard, tx).is_err()
         {
             ui.set_audio_devices_busy(false);
             ui.set_audio_device_notice("Could not start device discovery.".into());
@@ -278,9 +425,19 @@ fn register_discovery(ui: &AppWindow, handle: &tokio::runtime::Handle) {
         let weak = weak.clone();
         let requests = requests.clone();
         handle.spawn(async move {
-            let result = tokio::time::timeout(Duration::from_secs(20), rx).await;
+            let result = tokio::time::timeout(Duration::from_secs(20), async move {
+                rx.await.map_err(|_| DiscoveryReleaseError::SupervisorFailed)?;
+                loop {
+                    match poll_discovery() {
+                        Some(Ok(Some(catalog))) => return Ok(catalog),
+                        Some(Ok(None)) => return Err(DiscoveryReleaseError::SupervisorFailed),
+                        Some(Err(error)) => return Err(error),
+                        None => tokio::time::sleep(Duration::from_millis(10)).await,
+                    }
+                }
+            }).await;
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                if !requests.is_current(request) {
+                if DISCOVERY_CLOSED.load(Ordering::Acquire) || !requests.is_current(request) {
                     return;
                 }
                 ui.set_audio_devices_busy(false);
@@ -321,6 +478,59 @@ fn register_discovery(ui: &AppWindow, handle: &tokio::runtime::Handle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "native-calls")]
+    #[test]
+    fn discovery_result_and_single_flight_wait_for_the_real_worker_tls_join() {
+        use std::time::{Duration, Instant};
+        struct Held(std::sync::mpsc::Receiver<()>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                let _ = self.0.recv();
+            }
+        }
+        thread_local! { static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) }; }
+        let requests = Arc::new(DiscoveryRequests::default());
+        let request = requests.begin().expect("reserve synthetic catalogue");
+        let (release, held) = std::sync::mpsc::channel();
+        let (body, returned) = std::sync::mpsc::sync_channel(1);
+        let (ready, mut received) = tokio::sync::oneshot::channel();
+        let started = start_discovery_with(request, ready, move || {
+            HELD.with(|slot| *slot.borrow_mut() = Some(Held(held)));
+            let _ = body.send(());
+            Ok(morpheus_rtc::AudioDeviceCatalog::default())
+        });
+        let observation = (|| -> Result<_, &'static str> {
+            if started.is_err() {
+                return Err("synthetic discovery did not start");
+            }
+            returned
+                .recv_timeout(Duration::from_secs(3))
+                .map_err(|_| "synthetic worker body pending")?;
+            Ok((
+                matches!(
+                    received.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                requests.begin().is_none(),
+                poll_discovery().is_none(),
+            ))
+        })();
+        // Actual retained worker/supervisor cleanup precedes every assertion.
+        let _ = release.send(());
+        let until = Instant::now() + Duration::from_secs(3);
+        let retired = loop {
+            match poll_discovery() {
+                None if Instant::now() < until => {
+                    std::thread::park_timeout(Duration::from_millis(5))
+                }
+                result => break result,
+            }
+        };
+        assert!(matches!(observation, Ok((true, true, true))));
+        assert!(matches!(retired, Some(Ok(Some(Ok(_))))));
+        assert!(requests.begin().is_some());
+    }
 
     #[test]
     fn duplicate_names_keep_identity_across_enumeration_order() {

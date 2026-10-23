@@ -5,7 +5,7 @@ use std::{
     mem,
     os::windows::ffi::OsStringExt,
     ptr, slice,
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -22,7 +22,7 @@ use windows::{
     core::{Interface, GUID},
     Win32::{
         Devices::Properties,
-        Foundation::{ERROR_TIMEOUT, PROPERTYKEY},
+        Foundation::PROPERTYKEY,
         Media::{Audio, Audio::IAudioRenderClient, KernelStreaming, Multimedia},
         System::{
             Com,
@@ -35,7 +35,7 @@ use windows::{
 
 use super::stream::{AudioClientFlow, DefaultDeviceMonitor, OwnedEvent, Stream, StreamInner};
 pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
-use crate::{host::com, traits::DeviceTrait};
+use crate::traits::DeviceTrait;
 
 // PKEY_AudioEndpoint properties not yet in windows-rs
 
@@ -53,27 +53,217 @@ const PKEY_AUDIOENDPOINT_JACKSUBTYPE: PROPERTYKEY = PROPERTYKEY {
 
 const DEFAULT_FLAGS: u32 = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 
-/// Wrapper because of that stupid decision to remove `Send` and `Sync` from raw pointers.
-#[derive(Clone)]
-struct IAudioClientWrapper(Audio::IAudioClient);
-unsafe impl Send for IAudioClientWrapper {}
-unsafe impl Sync for IAudioClientWrapper {}
-
-/// Distinguishes how a `Device` was obtained so streams know which activation path to use.
-#[derive(Clone, Debug)]
+/// Copied endpoint identity; no native interface or apartment is shared.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum DeviceHandle {
     DefaultOutput,
     DefaultInput,
-    Specific(Audio::IMMDevice),
+    Specific { id: String, flow: i32 },
 }
 
-/// An opaque type that identifies an end point.
 #[derive(Clone)]
 pub struct Device {
     device: DeviceHandle,
-    /// We cache an uninitialized `IAudioClient` so that we can call functions from it without
-    /// having to create/destroy audio clients all the time.
-    future_audio_client: Arc<Mutex<Option<IAudioClientWrapper>>>, // TODO: add NonZero around the ptr
+    pending: Arc<Mutex<Option<Prepared>>>,
+}
+impl Device {
+    fn new(device: DeviceHandle) -> Self {
+        Self {
+            device,
+            pending: Arc::new(Mutex::new(None)),
+        }
+    }
+    fn prepare(&self) -> Result<(), Error> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| backend_error("Device request lock failed"))?;
+        if pending.is_none() {
+            *pending = Some(Prepared::new(self.device.clone())?);
+        }
+        Ok(())
+    }
+    fn query<T: Send + 'static>(
+        &self,
+        query: impl FnOnce(&NativeDevice) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        self.prepare()?;
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| backend_error("Device request lock failed"))?;
+        pending
+            .as_ref()
+            .ok_or_else(|| backend_error("Device owner was retired"))?
+            .query(query)
+    }
+    fn take_prepared(&self) -> Result<Prepared, Error> {
+        self.prepare()?;
+        self.pending
+            .lock()
+            .map_err(|_| backend_error("Device request lock failed"))?
+            .take()
+            .ok_or_else(|| backend_error("Device owner was retired"))
+    }
+    pub fn description(&self) -> Result<DeviceDescription, Error> {
+        let descriptor = self.device.clone();
+        super::owner::query(move || NativeDevice::metadata_description(descriptor))
+    }
+    fn id(&self) -> Result<DeviceId, Error> {
+        match &self.device {
+            DeviceHandle::Specific { id, .. } => {
+                Ok(DeviceId::new(crate::platform::HostId::Wasapi, id.clone()))
+            }
+            _ => {
+                let descriptor = self.device.clone();
+                super::owner::query(move || NativeDevice::metadata_id(descriptor))
+            }
+        }
+    }
+    pub(crate) fn data_flow(&self) -> Audio::EDataFlow {
+        match &self.device {
+            DeviceHandle::DefaultOutput => Audio::eRender,
+            DeviceHandle::DefaultInput => Audio::eCapture,
+            DeviceHandle::Specific { flow, .. } => Audio::EDataFlow(*flow),
+        }
+    }
+    pub fn supported_input_configs(&self) -> Result<SupportedInputConfigs, Error> {
+        self.query(NativeDevice::supported_input_configs)
+    }
+    pub fn supported_output_configs(&self) -> Result<SupportedOutputConfigs, Error> {
+        self.query(NativeDevice::supported_output_configs)
+    }
+    pub fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
+        self.query(NativeDevice::default_input_config)
+    }
+    pub fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
+        self.query(NativeDevice::default_output_config)
+    }
+
+    /// Resolve only in the caller's ALREADY initialized COM apartment. No
+    /// temporary COM lease, cached STA interface, or owner reference is exposed.
+    #[deprecated(
+        note = "Requires an already initialized caller COM apartment; no interface is transferred from the audio owner"
+    )]
+    pub fn immdevice(&self) -> Option<Audio::IMMDevice> {
+        let mut kind = Com::APTTYPE::default();
+        let mut qualifier = Com::APTTYPEQUALIFIER::default();
+        unsafe {
+            Com::CoGetApartmentType(&mut kind, &mut qualifier).ok()?;
+        }
+        resolve_device(&self.device).ok()
+    }
+}
+fn backend_error(message: &'static str) -> Error {
+    Error::with_message(ErrorKind::StreamInvalidated, message)
+}
+
+type NativeRequest = Box<dyn FnOnce(&NativeDevice, &super::owner::Control) -> bool + Send>;
+pub(crate) struct Prepared {
+    requests: std::sync::mpsc::SyncSender<NativeRequest>,
+    control: super::owner::Control,
+    retire_on_drop: bool,
+}
+impl Prepared {
+    fn new(descriptor: DeviceHandle) -> Result<Self, Error> {
+        let (requests, received) = std::sync::mpsc::sync_channel::<NativeRequest>(1);
+        let control = super::owner::spawn(super::owner::Kind::Stream, move |control| {
+            let apartment = super::apartment::Sta::new()?;
+            let mut device =
+                std::mem::ManuallyDrop::new(NativeDevice::new(descriptor, Some(control.clone())));
+            while control.active() {
+                match received.try_recv() {
+                    Ok(request) => {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            request(&device, &control)
+                        }));
+                        match result {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(_) => control
+                                .retain_failure(super::owner::WasapiCloseError::WorkerPanicked),
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if super::apartment::wait(
+                            &[control.event().handle()],
+                            Duration::from_millis(20),
+                        )
+                        .is_err()
+                        {
+                            control.retain_failure(super::owner::WasapiCloseError::Apartment);
+                        }
+                    }
+                }
+            }
+            // No callback/stream reference remains before the transfer origin
+            // is released; this exact STA then exits before the actual TLS join.
+            control.request_close();
+            let device = unsafe { std::mem::ManuallyDrop::take(&mut device) };
+            device.finish();
+            drop(apartment);
+            Ok(())
+        })?;
+        Ok(Self {
+            requests,
+            control,
+            retire_on_drop: true,
+        })
+    }
+    fn query<T: Send + 'static>(
+        &self,
+        query: impl FnOnce(&NativeDevice) -> Result<T, Error> + Send + 'static,
+    ) -> Result<T, Error> {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        self.submit(Box::new(move |device, _| {
+            let result = query(device);
+            let _ = send.send(result);
+            true
+        }))?;
+        receive
+            .recv()
+            .map_err(|_| backend_error("Device owner did not return its query"))?
+    }
+    fn submit(&self, request: NativeRequest) -> Result<(), Error> {
+        if !self.control.active() {
+            return Err(backend_error("Device owner is retiring"));
+        }
+        self.requests
+            .try_send(request)
+            .map_err(|_| backend_error("Device owner request is busy"))?;
+        self.control.event().signal().map_err(Error::from)
+    }
+    pub(crate) fn run(mut self, request: NativeRequest) -> Result<super::owner::Control, Error> {
+        self.submit(request)?;
+        self.retire_on_drop = false;
+        Ok(self.control.clone())
+    }
+}
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        if self.retire_on_drop {
+            self.control.request_close();
+        }
+    }
+}
+
+struct NativeBuild {
+    client: Option<Audio::IAudioClient>,
+    event: Option<OwnedEvent>,
+}
+impl Drop for NativeBuild {
+    fn drop(&mut self) {
+        drop(self.client.take());
+        drop(self.event.take());
+    }
+}
+
+pub(crate) struct NativeDevice {
+    device: DeviceHandle,
+    future_audio_client: std::cell::RefCell<Option<Audio::IAudioClient>>,
+    capture_origin: std::cell::RefCell<Option<super::activation::CaptureLease>>,
+    control: Option<super::owner::Control>,
 }
 
 impl DeviceTrait for Device {
@@ -125,10 +315,16 @@ impl DeviceTrait for Device {
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
         E: FnMut(Error) + Send + 'static,
     {
-        let stream_inner = self.build_input_stream_raw_inner(config, sample_format, timeout)?;
+        let prepared = self.take_prepared()?;
         let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
-        let monitor = self.default_device_monitor()?;
-        let stream = Stream::new_input(stream_inner, data_callback, error_callback, monitor)?;
+        let stream = Stream::new_input(
+            prepared,
+            config,
+            sample_format,
+            timeout,
+            data_callback,
+            error_callback,
+        )?;
         stream.signal_ready();
         Ok(stream)
     }
@@ -148,17 +344,19 @@ impl DeviceTrait for Device {
         // Keep `playback` monotonic: an underrun can saturate `buffered` to zero, pulling
         // `playback` backward.
         let data_callback = crate::host::monotonic_output_callback(data_callback);
-        let stream_inner = self.build_output_stream_raw_inner(config, sample_format, timeout)?;
+        let prepared = self.take_prepared()?;
         let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
-        let monitor = self.default_device_monitor()?;
-        let stream = Stream::new_output(stream_inner, data_callback, error_callback, monitor)?;
+        let stream = Stream::new_output(
+            prepared,
+            config,
+            sample_format,
+            timeout,
+            data_callback,
+            error_callback,
+        )?;
         stream.signal_ready();
         Ok(stream)
     }
-}
-
-struct Endpoint {
-    endpoint: Audio::IMMEndpoint,
 }
 
 // Use RAII to make sure CoTaskMemFree is called when we are responsible for freeing.
@@ -170,18 +368,6 @@ impl Drop for WaveFormatExPtr {
             Com::CoTaskMemFree(Some(self.0 as *mut _));
         }
     }
-}
-
-unsafe fn immendpoint_from_immdevice(device: Audio::IMMDevice) -> Audio::IMMEndpoint {
-    device
-        .cast::<Audio::IMMEndpoint>()
-        .expect("could not query IMMDevice interface for IMMEndpoint")
-}
-
-unsafe fn data_flow_from_immendpoint(endpoint: &Audio::IMMEndpoint) -> Audio::EDataFlow {
-    endpoint
-        .GetDataFlow()
-        .expect("could not get endpoint data_flow")
 }
 
 // Given the audio client and format, returns whether the audio engine supports it natively in
@@ -294,13 +480,6 @@ unsafe fn format_from_waveformatex_ptr(
     Some(format)
 }
 
-unsafe impl Send for Device {}
-unsafe impl Sync for Device {}
-
-/// Maps PKEY_AudioEndpoint_JackSubType GUID to InterfaceType.
-///
-/// The JackSubType property contains a KS node type GUID string from Ksmedia.h
-/// that specifies the physical connector type.
 fn jacksubtype_to_interface_type(guid_str: &str) -> Option<InterfaceType> {
     let guid_upper = guid_str.to_uppercase();
     let typ = match guid_upper.as_str() {
@@ -347,67 +526,7 @@ fn enumerator_to_interface_type(enumerator: &str) -> Option<InterfaceType> {
 /// Used for virtual default-device GUIDs (`DEVINTERFACE_AUDIO_RENDER`/`DEVINTERFACE_AUDIO_CAPTURE`)
 /// so that the Windows audio engine automatically reroutes the stream when the system default
 /// device changes.
-unsafe fn activate_audio_interface_sync(
-    device_interface_path: windows::core::PWSTR,
-    activation_timeout: Option<Duration>,
-) -> windows::core::Result<Audio::IAudioClient> {
-    use windows::core::IUnknown;
-
-    #[windows::core::implement(Audio::IActivateAudioInterfaceCompletionHandler)]
-    struct CompletionHandler(std::sync::mpsc::Sender<windows::core::Result<IUnknown>>);
-
-    fn retrieve_result(
-        operation: &Audio::IActivateAudioInterfaceAsyncOperation,
-    ) -> windows::core::Result<IUnknown> {
-        let mut result = windows::core::HRESULT::default();
-        let mut interface: Option<IUnknown> = None;
-        unsafe {
-            operation.GetActivateResult(&mut result, &mut interface)?;
-        }
-        result.ok()?;
-        interface.ok_or_else(|| {
-            windows::core::Error::new(
-                Audio::AUDCLNT_E_DEVICE_INVALIDATED,
-                "audio interface not available after activation",
-            )
-        })
-    }
-
-    impl Audio::IActivateAudioInterfaceCompletionHandler_Impl for CompletionHandler_Impl {
-        fn ActivateCompleted(
-            &self,
-            operation: windows::core::Ref<'_, Audio::IActivateAudioInterfaceAsyncOperation>,
-        ) -> windows::core::Result<()> {
-            let result = operation.ok().and_then(retrieve_result);
-            let _ = self.0.send(result);
-            Ok(())
-        }
-    }
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let handler: Audio::IActivateAudioInterfaceCompletionHandler = CompletionHandler(tx).into();
-    Audio::ActivateAudioInterfaceAsync(
-        device_interface_path,
-        &Audio::IAudioClient::IID,
-        None,
-        &handler,
-    )?;
-    // If a timeout was given use it; otherwise block until Windows calls ActivateCompleted.
-    // `handler` holds the sender and remains live on the stack, so `recv` cannot fail.
-    let result = if let Some(dur) = activation_timeout {
-        rx.recv_timeout(dur).map_err(|_| {
-            windows::core::Error::new(
-                ERROR_TIMEOUT.to_hresult(),
-                "timeout waiting for audio interface activation",
-            )
-        })?
-    } else {
-        rx.recv().expect("activation channel closed; this is a bug")
-    };
-    result?.cast()
-}
-
-impl Device {
+impl NativeDevice {
     pub fn description(&self) -> Result<DeviceDescription, Error> {
         let device = self.immdevice().ok_or_else(|| {
             Error::with_message(ErrorKind::DeviceNotAvailable, "Default device not found")
@@ -502,97 +621,93 @@ impl Device {
         })?;
         unsafe {
             match device.GetId() {
-                Ok(pwstr) => match pwstr.to_string() {
-                    Ok(id_str) => Ok(DeviceId::new(crate::platform::HostId::Wasapi, id_str)),
-                    Err(e) => Err(Error::with_message(
-                        ErrorKind::BackendError,
-                        format!("Failed to convert device ID to string: {e}"),
-                    )),
-                },
+                Ok(pwstr) => {
+                    let _id = ComString(pwstr);
+                    match pwstr.to_string() {
+                        Ok(id_str) => Ok(DeviceId::new(crate::platform::HostId::Wasapi, id_str)),
+                        Err(e) => Err(Error::with_message(
+                            ErrorKind::BackendError,
+                            format!("Failed to convert device ID to string: {e}"),
+                        )),
+                    }
+                }
                 Err(e) => Err(Error::from(e)),
             }
         }
     }
 
-    fn from_immdevice(device: Audio::IMMDevice) -> Self {
-        Device {
-            device: DeviceHandle::Specific(device),
-            future_audio_client: Arc::new(Mutex::new(None)),
+    fn new(device: DeviceHandle, control: Option<super::owner::Control>) -> Self {
+        Self {
+            device,
+            control,
+            future_audio_client: std::cell::RefCell::new(None),
+            capture_origin: std::cell::RefCell::new(None),
         }
     }
-
-    fn default_output() -> Self {
-        Device {
-            device: DeviceHandle::DefaultOutput,
-            future_audio_client: Arc::new(Mutex::new(None)),
-        }
+    fn metadata_description(device: DeviceHandle) -> Result<DeviceDescription, Error> {
+        Self::new(device, None).description()
     }
-
-    fn default_input() -> Self {
-        Device {
-            device: DeviceHandle::DefaultInput,
-            future_audio_client: Arc::new(Mutex::new(None)),
-        }
+    fn metadata_id(device: DeviceHandle) -> Result<DeviceId, Error> {
+        Self::new(device, None).id()
     }
-
-    /// Returns the underlying `IMMDevice`, resolving the current one for default devices.
-    pub fn immdevice(&self) -> Option<Audio::IMMDevice> {
-        match &self.device {
-            DeviceHandle::DefaultOutput => current_default_endpoint(Audio::eRender),
-            DeviceHandle::DefaultInput => current_default_endpoint(Audio::eCapture),
-            DeviceHandle::Specific(device) => Some(device.clone()),
+    fn immdevice(&self) -> Option<Audio::IMMDevice> {
+        resolve_device(&self.device).ok()
+    }
+    fn finish(self) {
+        drop(self.future_audio_client.into_inner());
+        if let Some(origin) = self.capture_origin.into_inner() {
+            origin.close();
         }
     }
 
     /// Creates a `DefaultDeviceMonitor` for default-device streams, or `None` for specific devices.
-    fn default_device_monitor(&self) -> Result<Option<DefaultDeviceMonitor>, Error> {
+    pub(crate) fn default_device_monitor(&self) -> Result<Option<DefaultDeviceMonitor>, Error> {
         let flow = match &self.device {
             DeviceHandle::DefaultOutput => Audio::eRender,
             DeviceHandle::DefaultInput => Audio::eCapture,
-            DeviceHandle::Specific(_) => return Ok(None),
+            DeviceHandle::Specific { .. } => return Ok(None),
         };
-        let enumerator = get_enumerator().0.clone();
-        DefaultDeviceMonitor::new(enumerator, flow).map(Some)
+        let enumerator = get_enumerator()?;
+        DefaultDeviceMonitor::new(
+            enumerator,
+            flow,
+            self.control
+                .as_ref()
+                .ok_or_else(|| backend_error("Missing stream owner"))?,
+        )
+        .map(Some)
     }
 
-    /// Ensures that `future_audio_client` contains a `Some` and returns a locked mutex to it.
     fn ensure_future_audio_client(
         &self,
         activation_timeout: Option<Duration>,
-    ) -> Result<MutexGuard<'_, Option<IAudioClientWrapper>>, Error> {
-        let mut lock = self.future_audio_client.lock().map_err(|_| {
-            Error::with_message(ErrorKind::StreamInvalidated, "Stream lock poisoned")
-        })?;
-        if lock.is_some() {
-            return Ok(lock);
-        }
-
-        let audio_client: Audio::IAudioClient = unsafe {
-            match &self.device {
+    ) -> Result<std::cell::RefMut<'_, Option<Audio::IAudioClient>>, Error> {
+        if self.future_audio_client.borrow().is_none() {
+            let control = self
+                .control
+                .as_ref()
+                .ok_or_else(|| backend_error("Missing audio owner"))?;
+            if !control.active() {
+                return Err(backend_error("Audio activation was cancelled"));
+            }
+            let client = match &self.device {
                 DeviceHandle::DefaultOutput => {
-                    let path = Com::StringFromIID(&Audio::DEVINTERFACE_AUDIO_RENDER)
-                        .map_err(Error::from)?;
-                    let _guard = ComString(path);
-                    activate_audio_interface_sync(path, activation_timeout).map_err(Error::from)?
+                    super::activation::render(control, activation_timeout)?
                 }
                 DeviceHandle::DefaultInput => {
-                    let path = Com::StringFromIID(&Audio::DEVINTERFACE_AUDIO_CAPTURE)
-                        .map_err(Error::from)?;
-                    let _guard = ComString(path);
-                    activate_audio_interface_sync(path, activation_timeout).map_err(Error::from)?
+                    let (client, origin) = super::activation::CaptureLease::acquire(control)?;
+                    *self.capture_origin.borrow_mut() = Some(origin);
+                    client
                 }
-                DeviceHandle::Specific(device) => {
-                    // can fail if the device has been disconnected since we enumerated it, or if
-                    // the device doesn't support playback for some reason
-                    device
+                DeviceHandle::Specific { .. } => unsafe {
+                    resolve_device(&self.device)?
                         .Activate(Com::CLSCTX_ALL, None)
                         .map_err(Error::from)?
-                }
-            }
-        };
-
-        *lock = Some(IAudioClientWrapper(audio_client));
-        Ok(lock)
+                },
+            };
+            *self.future_audio_client.borrow_mut() = Some(client);
+        }
+        Ok(self.future_audio_client.borrow_mut())
     }
 
     /// Returns an uninitialized `IAudioClient`.
@@ -602,7 +717,9 @@ impl Device {
     ) -> Result<Audio::IAudioClient, Error> {
         let mut lock = self.ensure_future_audio_client(activation_timeout)?;
         // ensure_future_audio_client always sets the Option to Some before returning Ok.
-        Ok(lock.take().unwrap().0)
+        Ok(lock
+            .take()
+            .ok_or_else(|| backend_error("Audio client was retired"))?)
     }
 
     // There is no way to query the list of all formats that are supported by the
@@ -618,14 +735,15 @@ impl Device {
     // number supported.
     fn supported_formats(&self) -> Result<SupportedInputConfigs, Error> {
         // initializing COM because we call `CoTaskMemFree` to release the format.
-        com::com_initialized();
 
         // Retrieve the `IAudioClient`.
         let lock = self
             .ensure_future_audio_client(None)
             .context("Failed to get audio client")?;
         // ensure_future_audio_client always sets the Option to Some before returning Ok.
-        let client = &lock.as_ref().unwrap().0;
+        let client = lock
+            .as_ref()
+            .ok_or_else(|| backend_error("Audio client was retired"))?;
 
         unsafe {
             // Retrieve the pointer to the default WAVEFORMATEX.
@@ -752,13 +870,14 @@ impl Device {
     // One format is guaranteed to be supported, the one returned by `GetMixFormat`.
     fn default_format(&self) -> Result<SupportedStreamConfig, Error> {
         // initializing COM because we call `CoTaskMemFree`
-        com::com_initialized();
 
         let lock = self
             .ensure_future_audio_client(None)
             .context("Failed to get audio client")?;
         // ensure_future_audio_client always sets the Option to Some before returning Ok.
-        let client = &lock.as_ref().unwrap().0;
+        let client = lock
+            .as_ref()
+            .ok_or_else(|| backend_error("Audio client was retired"))?;
 
         unsafe {
             let format_ptr = client
@@ -796,10 +915,7 @@ impl Device {
         match &self.device {
             DeviceHandle::DefaultOutput => Audio::eRender,
             DeviceHandle::DefaultInput => Audio::eCapture,
-            DeviceHandle::Specific(device) => {
-                let endpoint = Endpoint::from(device.clone());
-                endpoint.data_flow()
-            }
+            DeviceHandle::Specific { flow, .. } => Audio::EDataFlow(*flow),
         }
     }
 
@@ -832,16 +948,30 @@ impl Device {
         sample_format: SampleFormat,
         activation_timeout: Option<Duration>,
     ) -> Result<StreamInner, Error> {
+        if !self
+            .control
+            .as_ref()
+            .is_some_and(super::owner::Control::active)
+        {
+            return Err(backend_error("Audio construction was cancelled"));
+        }
         crate::validate_stream_config(&config)?;
         unsafe {
             // Making sure that COM is initialized.
             // It's not actually sure that this is required, but when in doubt do it.
-            com::com_initialized();
 
             // Obtaining a `IAudioClient`.
             let audio_client = self
                 .build_audioclient(activation_timeout)
                 .context("Failed to build audio client")?;
+            let mut native_build = NativeBuild {
+                client: Some(audio_client),
+                event: None,
+            };
+            let audio_client = native_build
+                .client
+                .as_ref()
+                .ok_or_else(|| backend_error("Audio client missing"))?;
 
             // No further range validation: IAudioClient::Initialize accepts any positive duration
             // in shared mode. The callback period is always GetDevicePeriod() regardless of what
@@ -889,7 +1019,11 @@ impl Device {
                 shared_mode_period_frames(&audio_client, config.sample_rate, max_frames_in_buffer);
 
             // Creating the event that will be signalled whenever we need to submit some samples.
-            let event = OwnedEvent::new().context("Failed to create event")?;
+            native_build.event = Some(OwnedEvent::new().context("Failed to create event")?);
+            let event = native_build
+                .event
+                .as_ref()
+                .ok_or_else(|| backend_error("Audio event missing"))?;
 
             audio_client
                 .SetEventHandle(event.handle())
@@ -916,10 +1050,16 @@ impl Device {
             };
 
             Ok(StreamInner {
-                audio_client,
+                audio_client: native_build
+                    .client
+                    .take()
+                    .ok_or_else(|| backend_error("Audio client missing"))?,
                 audio_clock,
                 client_flow,
-                event,
+                event: native_build
+                    .event
+                    .take()
+                    .ok_or_else(|| backend_error("Audio event missing"))?,
                 playing: false,
                 max_frames_in_buffer,
                 period_frames,
@@ -927,6 +1067,7 @@ impl Device {
                 config,
                 sample_format,
                 stream_latency,
+                cleanup_failure: std::cell::Cell::new(None),
             })
         }
     }
@@ -937,16 +1078,30 @@ impl Device {
         sample_format: SampleFormat,
         activation_timeout: Option<Duration>,
     ) -> Result<StreamInner, Error> {
+        if !self
+            .control
+            .as_ref()
+            .is_some_and(super::owner::Control::active)
+        {
+            return Err(backend_error("Audio construction was cancelled"));
+        }
         crate::validate_stream_config(&config)?;
         unsafe {
             // Making sure that COM is initialized.
             // It's not actually sure that this is required, but when in doubt do it.
-            com::com_initialized();
 
             // Obtaining a `IAudioClient`.
             let audio_client = self
                 .build_audioclient(activation_timeout)
                 .context("Failed to build audio client")?;
+            let mut native_build = NativeBuild {
+                client: Some(audio_client),
+                event: None,
+            };
+            let audio_client = native_build
+                .client
+                .as_ref()
+                .ok_or_else(|| backend_error("Audio client missing"))?;
 
             // No further range validation: IAudioClient::Initialize accepts any positive duration
             // in shared mode. The callback period is always GetDevicePeriod() regardless of what
@@ -982,7 +1137,11 @@ impl Device {
             };
 
             // Creating the event that will be signalled whenever we need to submit some samples.
-            let event = OwnedEvent::new().context("Failed to create event")?;
+            native_build.event = Some(OwnedEvent::new().context("Failed to create event")?);
+            let event = native_build
+                .event
+                .as_ref()
+                .ok_or_else(|| backend_error("Audio event missing"))?;
 
             audio_client
                 .SetEventHandle(event.handle())
@@ -1017,10 +1176,16 @@ impl Device {
             };
 
             Ok(StreamInner {
-                audio_client,
+                audio_client: native_build
+                    .client
+                    .take()
+                    .ok_or_else(|| backend_error("Audio client missing"))?,
                 audio_clock,
                 client_flow,
-                event,
+                event: native_build
+                    .event
+                    .take()
+                    .ok_or_else(|| backend_error("Audio event missing"))?,
                 playing: false,
                 max_frames_in_buffer,
                 period_frames,
@@ -1028,81 +1193,21 @@ impl Device {
                 config,
                 sample_format,
                 stream_latency,
+                cleanup_failure: std::cell::Cell::new(None),
             })
         }
     }
 }
 
-/// Compares the endpoint IDs of two `IMMDevice` objects.
-///
-/// # Safety
-///
-/// Both devices must be valid, live `IMMDevice` COM objects.
-unsafe fn endpoint_ids_equal(a: &Audio::IMMDevice, b: &Audio::IMMDevice) -> bool {
-    let id_a = a.GetId().expect("cpal: GetId failure");
-    let id_b = b.GetId().expect("cpal: GetId failure");
-    let _ga = ComString(id_a);
-    let _gb = ComString(id_b);
-    let mut off = 0isize;
-    loop {
-        let wa = *id_a.0.offset(off);
-        let wb = *id_b.0.offset(off);
-        if wa != wb {
-            return false;
-        }
-        if wa == 0 {
-            return true;
-        }
-        off += 1;
-    }
-}
-
-/// Hashes the endpoint ID of an `IMMDevice` into `state` without allocating.
-///
-/// # Safety
-/// `device` must be a valid, live `IMMDevice` COM object.
-unsafe fn hash_endpoint_id<H: std::hash::Hasher>(device: &Audio::IMMDevice, state: &mut H) {
-    let id = device.GetId().expect("cpal: GetId failure");
-    let _g = ComString(id);
-    let mut off = 0isize;
-    loop {
-        let w = *id.0.offset(off);
-        if w == 0 {
-            break;
-        }
-        w.hash(state);
-        off += 1;
-    }
-}
-
-// Equality and hashing use stable identifiers only.
 impl PartialEq for Device {
-    fn eq(&self, other: &Device) -> bool {
-        match (&self.device, &other.device) {
-            (DeviceHandle::DefaultOutput, DeviceHandle::DefaultOutput)
-            | (DeviceHandle::DefaultInput, DeviceHandle::DefaultInput) => true,
-            (DeviceHandle::Specific(a), DeviceHandle::Specific(b)) => {
-                // SAFETY: both IMMDevice handles are valid for the lifetime of their Device.
-                unsafe { endpoint_ids_equal(a, b) }
-            }
-            _ => false,
-        }
+    fn eq(&self, other: &Self) -> bool {
+        self.device == other.device
     }
 }
-
 impl Eq for Device {}
-
 impl std::hash::Hash for Device {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match &self.device {
-            DeviceHandle::DefaultOutput | DeviceHandle::DefaultInput => {
-                mem::discriminant(&self.device).hash(state);
-            }
-            DeviceHandle::Specific(device) => {
-                // SAFETY: the IMMDevice handle is valid for the Device's lifetime.
-                unsafe { hash_endpoint_id(device, state) }
-            }
-        }
+        self.device.hash(state);
     }
 }
 
@@ -1122,58 +1227,37 @@ impl fmt::Debug for Device {
     }
 }
 
-impl From<Audio::IMMDevice> for Endpoint {
-    fn from(device: Audio::IMMDevice) -> Self {
-        unsafe {
-            let endpoint = immendpoint_from_immdevice(device);
-            Endpoint { endpoint }
+fn get_enumerator() -> Result<Audio::IMMDeviceEnumerator, Error> {
+    unsafe {
+        Com::CoCreateInstance(&Audio::MMDeviceEnumerator, None, Com::CLSCTX_ALL)
+            .map_err(Error::from)
+    }
+}
+fn resolve_device(descriptor: &DeviceHandle) -> Result<Audio::IMMDevice, Error> {
+    let enumerator = get_enumerator()?;
+    unsafe {
+        match descriptor {
+            DeviceHandle::DefaultOutput => {
+                enumerator.GetDefaultAudioEndpoint(Audio::eRender, Audio::eConsole)
+            }
+            DeviceHandle::DefaultInput => {
+                enumerator.GetDefaultAudioEndpoint(Audio::eCapture, Audio::eConsole)
+            }
+            DeviceHandle::Specific { id, .. } => {
+                let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+                enumerator.GetDevice(windows::core::PCWSTR(wide.as_ptr()))
+            }
         }
+        .map_err(Error::from)
     }
 }
-
-impl Endpoint {
-    fn data_flow(&self) -> Audio::EDataFlow {
-        unsafe { data_flow_from_immendpoint(&self.endpoint) }
-    }
-}
-
-static ENUMERATOR: OnceLock<Enumerator> = OnceLock::new();
-
-/// Returns the current default audio endpoint for `flow`, or `None` if none exists.
-///
-/// Shared by [`Device::immdevice`] and the stream-side `get_current_default` helper to
-/// avoid duplicating the `GetDefaultAudioEndpoint` call.
 pub(super) fn current_default_endpoint(flow: Audio::EDataFlow) -> Option<Audio::IMMDevice> {
-    // Ensure COM is initialised on this thread — callers include notification callbacks on
-    // threads that may not have called CoInitialize themselves.
-    com::com_initialized();
-    // SAFETY: `get_enumerator()` is a thread-safe singleton initialised at first use.
     unsafe {
         get_enumerator()
-            .0
+            .ok()?
             .GetDefaultAudioEndpoint(flow, Audio::eConsole)
             .ok()
     }
-}
-
-fn get_enumerator() -> &'static Enumerator {
-    ENUMERATOR.get_or_init(|| {
-        // COM initialization is thread local, but we only need to have COM initialized in the
-        // thread we create the objects in
-        com::com_initialized();
-
-        // building the devices enumerator object
-        unsafe {
-            let enumerator = Com::CoCreateInstance::<_, Audio::IMMDeviceEnumerator>(
-                &Audio::MMDeviceEnumerator,
-                None,
-                Com::CLSCTX_ALL,
-            )
-            .unwrap();
-
-            Enumerator(enumerator)
-        }
-    })
 }
 
 // Helper function to query a DWORD property from a WASAPI device property store
@@ -1237,74 +1321,67 @@ unsafe fn get_property_string(
     result
 }
 
-/// Send/Sync wrapper around `IMMDeviceEnumerator`.
-struct Enumerator(Audio::IMMDeviceEnumerator);
-
-unsafe impl Send for Enumerator {}
-unsafe impl Sync for Enumerator {}
-
-/// WASAPI implementation for `Devices`.
+/// Catalogue contains copied identities only, never apartment-bound objects.
 pub struct Devices {
-    collection: Audio::IMMDeviceCollection,
-    total_count: u32,
-    next_item: u32,
+    devices: std::vec::IntoIter<Device>,
 }
-
 impl Devices {
     pub fn new() -> Result<Self, Error> {
-        unsafe {
-            // can fail because of wrong parameters (should never happen) or out of memory
-            let collection = get_enumerator()
-                .0
-                .EnumAudioEndpoints(Audio::eAll, Audio::DEVICE_STATE_ACTIVE)
-                .context("Failed to enumerate audio endpoints")?;
-
-            let count = collection
-                .GetCount()
-                .context("Failed to get device count")?;
-
-            Ok(Self {
-                collection,
-                total_count: count,
-                next_item: 0,
-            })
-        }
+        let descriptors = super::owner::query(|| unsafe {
+            let collection =
+                get_enumerator()?.EnumAudioEndpoints(Audio::eAll, Audio::DEVICE_STATE_ACTIVE)?;
+            let count = collection.GetCount()?;
+            if count > 512 {
+                return Err(backend_error("Too many audio endpoints"));
+            }
+            let mut descriptors = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let device = collection.Item(index)?;
+                let id = device.GetId()?;
+                let _id = ComString(id);
+                let text = id.to_string().map_err(Error::from)?;
+                if text.is_empty() || text.encode_utf16().count() > 16384 || text.contains('\0') {
+                    return Err(backend_error("Invalid audio endpoint identity"));
+                }
+                let endpoint: Audio::IMMEndpoint = device.cast()?;
+                let flow = endpoint.GetDataFlow()?;
+                if flow != Audio::eCapture && flow != Audio::eRender {
+                    return Err(backend_error("Unknown audio endpoint direction"));
+                }
+                descriptors.push(DeviceHandle::Specific {
+                    id: text,
+                    flow: flow.0,
+                });
+            }
+            Ok(descriptors)
+        })?;
+        Ok(Self {
+            devices: descriptors
+                .into_iter()
+                .map(Device::new)
+                .collect::<Vec<_>>()
+                .into_iter(),
+        })
     }
 }
-
-unsafe impl Send for Devices {}
-unsafe impl Sync for Devices {}
-
 impl Iterator for Devices {
     type Item = Device;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next_item >= self.total_count {
-            return None;
-        }
-
-        unsafe {
-            let device = self.collection.Item(self.next_item).unwrap();
-            self.next_item += 1;
-            Some(Self::Item::from_immdevice(device))
-        }
+    fn next(&mut self) -> Option<Device> {
+        self.devices.next()
     }
-
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let num = self.total_count - self.next_item;
-        let num = num as usize;
-        (num, Some(num))
+        self.devices.size_hint()
     }
 }
-
 pub fn default_input_device() -> Option<Device> {
-    // Detect if a default input device exists before creating a `Device` for it.
-    current_default_endpoint(Audio::eCapture).map(|_| Device::default_input())
+    super::owner::query(|| Ok(current_default_endpoint(Audio::eCapture).is_some()))
+        .ok()?
+        .then(|| Device::new(DeviceHandle::DefaultInput))
 }
-
 pub fn default_output_device() -> Option<Device> {
-    // Detect if a default output device exists before creating a `Device` for it.
-    current_default_endpoint(Audio::eRender).map(|_| Device::default_output())
+    super::owner::query(|| Ok(current_default_endpoint(Audio::eRender).is_some()))
+        .ok()?
+        .then(|| Device::new(DeviceHandle::DefaultOutput))
 }
 
 impl From<Audio::EDataFlow> for DeviceDirection {

@@ -93,6 +93,13 @@ fn with<R>(update: impl FnOnce(&mut State) -> R) -> R {
     STATE.with(|state| update(&mut state.borrow_mut()))
 }
 
+pub(super) fn close_file_admission() {
+    with(|state| {
+        state.store = None;
+        state.preview = None;
+    });
+}
+
 pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
     with(|state| state.store = Some(store.clone()));
     let weak = ui.as_weak();
@@ -168,7 +175,7 @@ fn import(ui: &AppWindow) {
         return;
     }
     let Some(permit) = DialogPermit::acquire() else {
-        message(ui, "A file dialog is already open.", true);
+        message(ui, DialogPermit::unavailable_message(), true);
         return;
     };
     // Captured before the dialog opens: its answer belongs to this account,
@@ -177,9 +184,12 @@ fn import(ui: &AppWindow) {
     ui.set_studio_pack_busy(true);
     let weak = ui.as_weak();
     let dialog_scope = opened.clone();
-    let spawned = std::thread::Builder::new()
-        .name("morpheus-theme-pack-import".into())
-        .spawn(move || {
+    let failure_ui = ui.as_weak();
+    let failure_scope = opened.clone();
+    let worker_owner = permit.clone();
+    let spawned = worker_owner.spawn(
+        "morpheus-theme-pack-import",
+        move || {
             // macOS runs the panel on the main thread for this worker.
             let chosen = rfd::FileDialog::new()
                 .set_title("Import a theme pack")
@@ -191,12 +201,21 @@ fn import(ui: &AppWindow) {
                 chosen.map(|path| import_theme_pack(&path).map_err(|error| error.to_string()));
             drop(permit);
             let _ = weak.upgrade_in_event_loop(move |ui| finish_import(&ui, dialog_scope, result));
-        });
+        },
+        move || {
+            let _ = failure_ui.upgrade_in_event_loop(move |ui| {
+                failed_import_start(&ui, &failure_scope);
+            });
+        },
+    );
     if spawned.is_err() {
-        scope::finish_dialog(ui, &opened);
-        ui.set_studio_pack_busy(false);
-        message(ui, "The file dialog could not open.", true);
+        failed_import_start(ui, &opened);
     }
+}
+fn failed_import_start(ui: &AppWindow, opened: &Scope) {
+    scope::finish_dialog(ui, opened);
+    ui.set_studio_pack_busy(false);
+    message(ui, "The file dialog could not open.", true);
 }
 
 /// The import dialog opened in `opened` returned. Its answer starts a
@@ -499,7 +518,7 @@ fn export(ui: &AppWindow) {
         }
     };
     let Some(permit) = DialogPermit::acquire() else {
-        message(ui, "A file dialog is already open.", true);
+        message(ui, DialogPermit::unavailable_message(), true);
         return;
     };
     // Captured before the dialog opens; the write is admitted only in this
@@ -514,9 +533,12 @@ fn export(ui: &AppWindow) {
         .and_then(|dirs| dirs.document_dir().map(std::path::Path::to_path_buf));
     let weak = ui.as_weak();
     let dialog_scope = opened.clone();
-    let spawned = std::thread::Builder::new()
-        .name("morpheus-theme-pack-export".into())
-        .spawn(move || {
+    let failure_ui = ui.as_weak();
+    let failure_scope = opened.clone();
+    let worker_owner = permit.clone();
+    let spawned = worker_owner.spawn(
+        "morpheus-theme-pack-export",
+        move || {
             let mut dialog = rfd::FileDialog::new()
                 .set_title("Export theme pack")
                 .add_filter("Morpheus theme pack", &["toml"])
@@ -531,12 +553,21 @@ fn export(ui: &AppWindow) {
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 finish_export(&ui, dialog_scope, name, pack, chosen, permit);
             });
-        });
+        },
+        move || {
+            let _ = failure_ui.upgrade_in_event_loop(move |ui| {
+                failed_export_start(&ui, &failure_scope);
+            });
+        },
+    );
     if spawned.is_err() {
-        scope::finish_dialog(ui, &opened);
-        ui.set_studio_pack_busy(false);
-        message(ui, "The file dialog could not open.", true);
+        failed_export_start(ui, &opened);
     }
+}
+fn failed_export_start(ui: &AppWindow, opened: &Scope) {
+    scope::finish_dialog(ui, opened);
+    ui.set_studio_pack_busy(false);
+    message(ui, "The file dialog could not open.", true);
 }
 
 /// The export dialog opened in `opened` returned with `chosen`. This is the
@@ -589,23 +620,35 @@ fn finish_export(
     with(|state| state.writing = Some(opened.clone()));
     let display = display_name(&pack);
     let weak = ui.as_weak();
-    let spawned = std::thread::Builder::new()
-        .name("morpheus-theme-pack-write".into())
-        .spawn(move || {
+    let failure_ui = ui.as_weak();
+    let failure_scope = opened.clone();
+    let worker_owner = permit.clone();
+    let spawned = worker_owner.spawn(
+        "morpheus-theme-pack-write",
+        move || {
             let result = export_theme_pack(&pack, &path).map_err(|error| error.to_string());
             drop(permit);
             let _ =
                 weak.upgrade_in_event_loop(move |ui| finish_write(&ui, opened, display, result));
-        });
+        },
+        move || {
+            let _ = failure_ui.upgrade_in_event_loop(move |ui| {
+                failed_write_start(&ui, &failure_scope);
+            });
+        },
+    );
     if spawned.is_err() {
-        with(|state| state.writing = None);
-        ui.set_studio_pack_busy(false);
-        message(
-            ui,
-            "The theme pack export could not start. Nothing was written.",
-            true,
-        );
+        failed_write_start(ui, &opened);
     }
+}
+fn failed_write_start(ui: &AppWindow, _opened: &Scope) {
+    with(|state| state.writing = None);
+    ui.set_studio_pack_busy(false);
+    message(
+        ui,
+        "The theme pack export could not start. Nothing was written.",
+        true,
+    );
 }
 
 /// The admitted export of `admitted` ended. It is reported once, in place

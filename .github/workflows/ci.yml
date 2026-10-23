@@ -490,6 +490,10 @@ jobs:
               ;;
             Windows)
               cpal_tests=(
+                host::wasapi::owner::tests::native_owner_receipt_waits_for_actual_worker_tls_and_supervisor_join
+                host::wasapi::owner::tests::finite_native_owner_capacity_is_refusal_and_not_a_release_receipt
+                host::wasapi::stream::tests::capture_empty_success_never_admits_data_and_bounds_nonempty_packets
+                host::wasapi::stream::tests::capture_silence_uses_owned_equilibrium_and_keeps_signed_24_conversion
                 host::wasapi::stream::tests::command_event_caller_can_signal_after_worker_owner_retires
                 host::wasapi::stream::tests::command_event_worker_can_wait_after_caller_owner_retires
                 host::wasapi::stream::tests::owned_event_is_not_retained_by_a_failed_later_construction_step

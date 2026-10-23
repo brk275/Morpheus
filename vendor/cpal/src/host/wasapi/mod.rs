@@ -15,6 +15,17 @@ pub use self::device::{
 pub use self::stream::Stream;
 use crate::{traits::HostTrait, Error, ErrorKind};
 
+mod activation;
+mod apartment;
+mod owner;
+pub use activation::WasapiUiContext;
+pub use owner::with_wasapi_open_authority;
+pub use owner::{
+    begin_shutdown as begin_wasapi_shutdown, observe_retiring as observe_wasapi_retiring,
+    observe_shutdown as observe_wasapi_shutdown,
+};
+pub use owner::{WasapiCloseError, WasapiCloseObservation, WasapiCloseTicket};
+
 mod device;
 mod stream;
 

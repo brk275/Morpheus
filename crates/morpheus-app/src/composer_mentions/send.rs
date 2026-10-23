@@ -82,6 +82,9 @@ fn send_scope(submission: &Submission) -> SendScope {
 
 impl ComposerUi {
     pub fn send(&self, window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, threaded: bool) {
+        if live.action_admission_closed() {
+            return;
+        }
         let submission = match self.snapshot(window, live, threaded) {
             Ok(value) => value,
             Err(_) => {
@@ -166,7 +169,9 @@ impl ComposerUi {
         let owner = self.clone();
         let live = live.clone();
         let weak = window.as_weak();
-        runtime.spawn(async move {
+        let task_owner = live.clone();
+        let refused_lease = lease.clone();
+        let admitted = task_owner.spawn_draft_work(runtime, async move {
             let selection = submission.selection.clone();
             let fail = |message: &'static str, release: bool| {
                 let shown = submission.clone();
@@ -353,6 +358,12 @@ impl ComposerUi {
                 if terminal { break; }
             }
         });
+        if !admitted {
+            self.release_send(&refused_lease);
+            if !threaded {
+                window.set_composer_busy(false);
+            }
+        }
     }
 }
 

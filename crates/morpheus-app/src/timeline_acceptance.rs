@@ -778,6 +778,13 @@ impl Acceptance {
                 if passed { "passed" } else { "failed" }
             );
             result.set(Some(passed));
+            #[cfg(all(windows, feature = "native-calls"))]
+            if !crate::windows_audio::request_shutdown(&context.live.security_gate, None) {
+                context
+                    .ui
+                    .set_update_status("Security cleanup blocks closing Morpheus.".into());
+            }
+            #[cfg(not(all(windows, feature = "native-calls")))]
             let _ = slint::quit_event_loop();
         })?;
         Ok(Running { outcome, done })

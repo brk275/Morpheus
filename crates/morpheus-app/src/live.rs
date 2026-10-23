@@ -798,6 +798,103 @@ struct RevealOwner<'a> {
     admitted: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+/// Actual draft/send task ownership for this application session. Terminal
+/// admission and task registration share one mutex; no task can appear after
+/// close/drain. Completion is the retained JoinHandle's actual poll receipt,
+/// never a delivered UI result, lease/count snapshot or `is_finished` hint.
+#[derive(Default)]
+struct DraftWork {
+    closed: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    failed: bool,
+}
+impl DraftWork {
+    fn spawn(
+        &mut self,
+        runtime: &Handle,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let _ = self.poll();
+        if self.closed || self.failed {
+            return false;
+        }
+        self.tasks.push(runtime.spawn(task));
+        true
+    }
+
+    fn poll(&mut self) -> Option<Result<(), DraftDrainError>> {
+        use std::future::Future;
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut index = 0;
+        while index < self.tasks.len() {
+            match std::pin::Pin::new(&mut self.tasks[index]).poll(&mut context) {
+                std::task::Poll::Ready(result) => {
+                    self.failed |= result.is_err();
+                    drop(self.tasks.swap_remove(index));
+                }
+                std::task::Poll::Pending => index += 1,
+            }
+        }
+        self.tasks.is_empty().then_some(if self.failed {
+            Err(DraftDrainError)
+        } else {
+            Ok(())
+        })
+    }
+}
+#[cfg(test)]
+mod draft_work_shutdown_tests {
+    use super::*;
+    #[test]
+    fn terminal_task_close_keeps_the_actual_entered_task_until_join_receipt() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut work = DraftWork::default();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let (started, beginning) = tokio::sync::oneshot::channel();
+            let admitted = work.spawn(runtime.handle(), async move {
+                let _ = started.send(());
+                let _ = released.await;
+            });
+            let entered = tokio::time::timeout(Duration::from_secs(3), beginning).await;
+            work.closed = true;
+            let polled = work.poll();
+            let refused = !work.spawn(runtime.handle(), async {});
+            let _ = release.send(());
+            let cleanup = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(result) = work.poll() {
+                        return result;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            if cleanup.is_err() {
+                std::mem::forget(work);
+                panic!("Actual draft task cleanup remained unproved");
+            }
+            assert!(admitted);
+            assert!(matches!(entered, Ok(Ok(()))));
+            assert!(polled.is_none());
+            assert!(refused);
+            assert!(matches!(cleanup, Ok(Ok(()))));
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DraftDrainError;
+impl std::fmt::Display for DraftDrainError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("Draft/send task completion could not be confirmed.")
+    }
+}
+impl std::error::Error for DraftDrainError {}
+
 pub struct LiveUi {
     pub manager: Arc<AccountManager>,
     pub(crate) voice_spaces: Arc<VoiceSpaces>,
@@ -806,7 +903,8 @@ pub struct LiveUi {
     /// Joins whose outcome no UI may still show (see JoinOutcomes).
     join_outcomes: JoinOutcomes,
     drafts: Arc<DraftStore>,
-    draft_write_tx: mpsc::Sender<()>,
+    draft_write_tx: std::sync::Mutex<Option<mpsc::Sender<()>>>,
+    draft_work: std::sync::Mutex<DraftWork>,
     generation: Arc<AtomicU64>,
     recovery_notices: Arc<crate::timeline_recovery::Notices>,
     render_epoch: Arc<AtomicU64>,
@@ -1004,7 +1102,7 @@ impl LiveUi {
         let drafts = Arc::new(DraftStore::default());
         let draft_worker_store = drafts.clone();
         let draft_worker_manager = manager.clone();
-        runtime.spawn(async move {
+        let draft_writer = runtime.spawn(async move {
             let mut error_reported = false;
             while draft_write_rx.recv().await.is_some() {
                 // A single bounded worker coalesces typing bursts. Account
@@ -1059,7 +1157,11 @@ impl LiveUi {
             security_gate: Arc::new(crate::security::SecurityGate::default()),
             join_outcomes: JoinOutcomes::default(),
             drafts,
-            draft_write_tx,
+            draft_write_tx: std::sync::Mutex::new(Some(draft_write_tx)),
+            draft_work: std::sync::Mutex::new(DraftWork {
+                tasks: vec![draft_writer],
+                ..DraftWork::default()
+            }),
             generation: Arc::new(AtomicU64::new(0)),
             recovery_notices,
             render_epoch: Arc::new(AtomicU64::new(0)),
@@ -1083,6 +1185,64 @@ impl LiveUi {
             #[cfg(test)]
             pauses: TestPauses::default(),
         })
+    }
+
+    /// Permanent application action boundary, called synchronously on the UI
+    /// thread before it yields. Loaded stores stay owned for the admitted work
+    /// drain and final stable flush; resumable manager.stop remains distinct.
+    pub(crate) fn close_action_admission(&self) {
+        let mut work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        work.closed = true;
+        self.manager.close_selection_admission();
+        // This is the only sender. The existing writer finishes an entered
+        // write, observes EOF, processes its last dirty sweep and exits.
+        self.draft_write_tx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
+    pub(crate) fn action_admission_closed(&self) -> bool {
+        self.draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+    }
+
+    pub(crate) fn spawn_draft_work(
+        &self,
+        runtime: &Handle,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let mut work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        work.spawn(runtime, task)
+    }
+
+    /// No timeout drops/takes the sole task handles. The UI keeps pumping;
+    /// an entered store operation must actually return before stable flush.
+    pub(crate) async fn drain_draft_work(&self) -> Result<(), DraftDrainError> {
+        loop {
+            let result = {
+                let mut work = self
+                    .draft_work
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if !work.closed {
+                    return Err(DraftDrainError);
+                }
+                work.poll()
+            };
+            if let Some(result) = result {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Cancel queued presentation work as soon as the user requests a new
@@ -1176,6 +1336,13 @@ impl LiveUi {
         thread: Option<&str>,
         text: ComposeText,
     ) -> Result<(), MatrixCoreError> {
+        let work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if work.closed {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
         if !account.is_empty() && !room.is_empty() {
             self.drafts
                 .set_composed_scoped(account, room, thread, text)?;
@@ -1194,6 +1361,13 @@ impl LiveUi {
     }
 
     pub fn remember_draft(&self, account_id: &str, room_id: &str, body: &str) {
+        let work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if work.closed {
+            return;
+        }
         if !account_id.is_empty() && !room_id.is_empty() {
             self.drafts.set(account_id, room_id, body);
             self.queue_draft_write();
@@ -1201,12 +1375,26 @@ impl LiveUi {
     }
 
     pub fn remember_markdown(&self, account_id: &str, room_id: &str, enabled: bool) {
+        let work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if work.closed {
+            return;
+        }
         if !account_id.is_empty() && !room_id.is_empty() {
             self.drafts.set_markdown(account_id, room_id, enabled);
         }
     }
 
     pub fn remember_thread_draft(&self, account_id: &str, room_id: &str, root: &str, body: &str) {
+        let work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if work.closed {
+            return;
+        }
         if !account_id.is_empty() && !room_id.is_empty() && !root.is_empty() {
             self.drafts
                 .set_scoped(account_id, room_id, Some(root), body);
@@ -1260,6 +1448,9 @@ impl LiveUi {
     /// The current selection for an account, captured synchronously at the
     /// user's action so every later step can be checked against it.
     pub fn account_selection(&self, account: &str) -> Option<AccountSelection> {
+        if self.action_admission_closed() {
+            return None;
+        }
         self.manager.account_selection(account)
     }
 
@@ -2135,14 +2326,23 @@ impl LiveUi {
                 room: draft.room_id,
                 thread: draft.thread_root,
             };
-            self.drafts.seed_recovered(
-                &scope.account,
-                &scope.room,
-                scope.thread(),
-                draft.restored,
-                &attached,
-                epoch,
-            );
+            {
+                let work = self
+                    .draft_work
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if work.closed {
+                    return;
+                }
+                self.drafts.seed_recovered(
+                    &scope.account,
+                    &scope.room,
+                    scope.thread(),
+                    draft.restored,
+                    &attached,
+                    epoch,
+                );
+            }
             for send in draft.sends {
                 if let (Some(queued), Some(transaction_id)) = (send.queued, send.transaction_id) {
                     draft_recovery::spawn_observer(
@@ -2191,7 +2391,14 @@ impl LiveUi {
     fn queue_draft_write(&self) {
         // One queued signal is enough: the worker scans the latest dirty
         // cache, coalescing fast typing without creating a task per keypress.
-        let _ = self.draft_write_tx.try_send(());
+        if let Some(sender) = self
+            .draft_write_tx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            let _ = sender.try_send(());
+        }
     }
 
     pub async fn restore(self: &Arc<Self>, ui: Weak<AppWindow>) {

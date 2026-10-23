@@ -32,12 +32,20 @@ const SECURITY_IDLE: u8 = 0;
 const SECURITY_BUSY: u8 = 1;
 const SECURITY_KEY_PENDING: u8 = 2;
 const SECURITY_RESTART_PENDING: u8 = 3;
+const SECURITY_SHUTDOWN: u8 = 5;
 const SECURITY_ACCOUNT_ACCESS: u8 = 4;
 
 /// Mirrors the account-sensitive UI state across the asynchronous transition
 /// lock. A queued account switch must recheck this after it acquires the lock.
 #[derive(Default)]
-pub(crate) struct SecurityGate(AtomicU8, AtomicU64);
+pub(crate) struct SecurityGate(
+    AtomicU8,
+    AtomicU64,
+    // A restart reservation is an actual retained Rust owner, not a state
+    // snapshot or generation another controller can reuse. Never held across
+    // async work; updater callers take their own inner lock before this lock.
+    std::sync::Mutex<Option<std::sync::Weak<()>>>,
+);
 
 impl SecurityGate {
     pub(crate) fn try_account_access(self: &Arc<Self>) -> Option<AccountAccessLease> {
@@ -56,6 +64,58 @@ impl SecurityGate {
     }
     pub(crate) fn blocked(&self) -> bool {
         self.0.load(Ordering::Acquire) != SECURITY_IDLE
+    }
+    /// Atomically close ordinary admission BEFORE the UI yields to another
+    /// event. Busy recovery, unsaved keys and credential owners always refuse.
+    /// Existing restart/account/recovery lease Drop cannot reset this state.
+    #[cfg(all(windows, feature = "native-calls"))]
+    pub(crate) fn begin_shutdown(&self, restart: Option<&RestartLease>) -> bool {
+        let Ok(owner) = self.2.lock() else {
+            return false;
+        };
+        loop {
+            let current = self.0.load(Ordering::Acquire);
+            if current == SECURITY_SHUTDOWN {
+                return true;
+            }
+            if current == SECURITY_RESTART_PENDING {
+                let Some(restart) = restart else {
+                    return false;
+                };
+                if !std::ptr::eq(self, Arc::as_ptr(&restart.gate))
+                    || !owner
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade)
+                        .is_some_and(|identity| Arc::ptr_eq(&identity, &restart.identity))
+                {
+                    return false;
+                }
+            } else if current != SECURITY_IDLE {
+                return false;
+            }
+            if self
+                .0
+                .compare_exchange(
+                    current,
+                    SECURITY_SHUTDOWN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.advance_ring_epoch();
+                return true;
+            }
+        }
+    }
+
+    #[cfg(all(windows, feature = "native-calls"))]
+    pub(crate) fn admit_shutdown(
+        &self,
+        restart: Option<&RestartLease>,
+    ) -> Option<ShutdownAdmission<'_>> {
+        self.begin_shutdown(restart)
+            .then_some(ShutdownAdmission { _gate: self })
     }
 
     fn begin(&self) -> bool {
@@ -130,6 +190,8 @@ impl SecurityGate {
     /// Recovery uses the same CAS before spawning work, so neither operation
     /// can slip between a status check and the other's reservation.
     pub(crate) fn try_restart(self: &Arc<Self>) -> Option<RestartLease> {
+        let mut owner = self.2.lock().ok()?;
+        let identity = Arc::new(());
         self.0
             .compare_exchange(
                 SECURITY_IDLE,
@@ -137,15 +199,27 @@ impl SecurityGate {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .ok()
-            .map(|_| {
-                self.advance_ring_epoch();
-                RestartLease(self.clone())
-            })
+            .ok()?;
+        self.advance_ring_epoch();
+        *owner = Some(Arc::downgrade(&identity));
+        Some(RestartLease {
+            gate: self.clone(),
+            identity,
+        })
     }
 }
 
-pub(crate) struct RestartLease(Arc<SecurityGate>);
+/// Produced only by the actual gate reducer; no caller can forge an owned
+/// Pending reservation from a snapshot. Dropping it never reopens admission.
+#[cfg(all(windows, feature = "native-calls"))]
+pub(crate) struct ShutdownAdmission<'a> {
+    _gate: &'a SecurityGate,
+}
+
+pub(crate) struct RestartLease {
+    gate: Arc<SecurityGate>,
+    identity: Arc<()>,
+}
 
 pub(crate) struct AccountAccessLease(Arc<SecurityGate>);
 impl Drop for AccountAccessLease {
@@ -161,7 +235,19 @@ impl Drop for AccountAccessLease {
 
 impl Drop for RestartLease {
     fn drop(&mut self) {
-        let _ = self.0.0.compare_exchange(
+        let Ok(mut owner) = self.gate.2.lock() else {
+            return;
+        };
+        if !owner
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|identity| Arc::ptr_eq(&identity, &self.identity))
+        {
+            return;
+        }
+        *owner = None;
+        // A terminal shutdown reservation survives this owner's Drop.
+        let _ = self.gate.0.compare_exchange(
             SECURITY_RESTART_PENDING,
             SECURITY_IDLE,
             Ordering::AcqRel,
@@ -173,7 +259,7 @@ impl Drop for RestartLease {
 fn close_response(gate: &SecurityGate) -> CloseRequestResponse {
     if matches!(
         gate.0.load(Ordering::Acquire),
-        SECURITY_BUSY | SECURITY_KEY_PENDING | SECURITY_ACCOUNT_ACCESS
+        SECURITY_BUSY | SECURITY_KEY_PENDING | SECURITY_ACCOUNT_ACCESS | SECURITY_SHUTDOWN
     ) {
         CloseRequestResponse::KeepWindowShown
     } else {
@@ -428,6 +514,10 @@ fn set_outcome(ui: &AppWindow, text: &str, is_error: bool) {
 /// before this account can be left. The guard runs before navigation is
 /// invalidated or an account transition is spawned.
 pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool {
+    if gate.0.load(Ordering::Acquire) == SECURITY_SHUTDOWN {
+        ui.set_account_access_notice("Morpheus is closing. Wait for cleanup to finish.".into());
+        return true;
+    }
     if gate.0.load(Ordering::Acquire) == SECURITY_ACCOUNT_ACCESS {
         ui.set_account_access_notice("Wait for the account operation to finish.".into());
         return true;
@@ -457,7 +547,13 @@ pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool 
     false
 }
 
-pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
+pub(crate) fn register(
+    ui: &AppWindow,
+    live: Arc<LiveUi>,
+    handle: Handle,
+    #[cfg(all(windows, feature = "native-calls"))]
+    updates: crate::update_controller::UpdateController,
+) {
     crate::verification::register(ui, live.clone(), handle.clone());
     let close_gate = live.security_gate.clone();
     let close_manager = live.manager.clone();
@@ -481,7 +577,9 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if response == CloseRequestResponse::KeepWindowShown
             && let Some(window) = close_weak.upgrade()
         {
-            if close_gate.0.load(Ordering::Acquire) == SECURITY_ACCOUNT_ACCESS {
+            if close_gate.0.load(Ordering::Acquire) == SECURITY_SHUTDOWN {
+                window.set_update_status("Morpheus is closing. Wait for cleanup to finish.".into());
+            } else if close_gate.0.load(Ordering::Acquire) == SECURITY_ACCOUNT_ACCESS {
                 window.set_account_access_notice(
                     "Wait for the account operation to finish before closing Morpheus.".into(),
                 );
@@ -496,6 +594,17 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                     "Save this key and choose ‘I saved this key’ before closing Morpheus.".into(),
                 );
             }
+        }
+        #[cfg(all(windows, feature = "native-calls"))]
+        if response != CloseRequestResponse::KeepWindowShown {
+            if !updates.request_windows_shutdown()
+                && let Some(window) = close_weak.upgrade()
+            {
+                window.set_security_notice(
+                    "Wait for the account or security operation before closing Morpheus.".into(),
+                );
+            }
+            return CloseRequestResponse::KeepWindowShown;
         }
         response
     });
@@ -834,6 +943,59 @@ mod tests {
             backup: BackupStatus::Enabling,
         });
         assert_eq!(incomplete, ("Verified", "Incomplete", "Enabling", false));
+    }
+
+    #[cfg(all(windows, feature = "native-calls"))]
+    #[test]
+    fn shutdown_gate_stays_closed_after_restart_owner_and_async_cleanup_release() {
+        let gate = Arc::new(SecurityGate::default());
+        let epoch = gate.ringing_generation();
+        let restart = gate.try_restart().expect("ordinary restart reservation");
+        let admitted = gate.begin_shutdown(Some(&restart));
+        drop(restart);
+        gate.reset();
+        assert!(admitted);
+        assert!(gate.blocked());
+        assert!(!gate.ringing_allowed(epoch));
+        assert!(gate.try_account_access().is_none());
+        assert!(gate.try_restart().is_none());
+        assert!(!gate.begin());
+    }
+
+    #[cfg(all(windows, feature = "native-calls"))]
+    #[test]
+    fn restart_shutdown_requires_the_exact_retained_reservation() {
+        let gate = Arc::new(SecurityGate::default());
+        let foreign = Arc::new(SecurityGate::default());
+        let restart = gate.try_restart().expect("restart owner");
+        let other = foreign.try_restart().expect("foreign owner");
+        assert!(!gate.begin_shutdown(None));
+        assert!(!gate.begin_shutdown(Some(&other)));
+        assert_eq!(gate.0.load(Ordering::Acquire), SECURITY_RESTART_PENDING);
+        drop(other);
+        assert!(gate.begin_shutdown(Some(&restart)));
+        drop(restart);
+        assert_eq!(gate.0.load(Ordering::Acquire), SECURITY_SHUTDOWN);
+        assert!(gate.begin_shutdown(None));
+        assert!(gate.try_restart().is_none());
+    }
+
+    #[cfg(all(windows, feature = "native-calls"))]
+    #[test]
+    fn shutdown_admission_never_retires_recovery_key_or_credential_owner() {
+        let gate = Arc::new(SecurityGate::default());
+        assert!(gate.begin());
+        assert!(!gate.begin_shutdown(None));
+        gate.key_pending();
+        assert!(!gate.begin_shutdown(None));
+        assert_eq!(gate.0.load(Ordering::Acquire), SECURITY_KEY_PENDING);
+        gate.acknowledge_key();
+        let account = gate.try_account_access().expect("credential owner");
+        assert!(!gate.begin_shutdown(None));
+        assert_eq!(gate.0.load(Ordering::Acquire), SECURITY_ACCOUNT_ACCESS);
+        drop(account);
+        assert!(gate.begin_shutdown(None));
+        assert!(gate.blocked());
     }
 
     #[test]

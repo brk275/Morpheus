@@ -67,6 +67,7 @@ impl Scope {
 /// file dialog is open. Pure, so the fence rules are unit tested here.
 #[derive(Debug, Default)]
 pub(crate) struct Scopes {
+    closed: bool,
     epoch: u64,
     /// `None` before the first observation.
     observed: Option<String>,
@@ -78,6 +79,11 @@ pub(crate) struct Scopes {
 }
 
 impl Scopes {
+    fn close(&mut self) {
+        self.closed = true;
+        self.invalidate();
+    }
+
     /// Record the active account. Any change starts a new epoch and drops
     /// the open dialog's claim.
     pub(crate) fn observe(&mut self, account: &str) {
@@ -141,7 +147,7 @@ impl Scopes {
             .room
             .as_ref()
             .is_none_or(|(epoch, captured)| *epoch == self.room_epoch && captured == room);
-        scope.epoch == self.epoch && scope.account == account && room_current
+        !self.closed && scope.epoch == self.epoch && scope.account == account && room_current
     }
 
     /// The dialog opened in `scope` returned. Releases its slot and says
@@ -182,6 +188,11 @@ pub(crate) fn observe(ui: &AppWindow) {
         scopes.observe(&account);
         scopes.observe_room(&room);
     });
+}
+
+/// Permanently retire this application session, including queued answers.
+pub(crate) fn close() {
+    with(Scopes::close);
 }
 
 /// A new settings context.
@@ -227,6 +238,19 @@ pub(crate) fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_close_invalidates_queued_answers_and_cannot_be_reopened() {
+        let mut scopes = Scopes::default();
+        let old = scopes.begin_dialog("account");
+        scopes.close();
+        assert!(!scopes.finish_dialog(&old, "account", "room"));
+        scopes.invalidate();
+        let later = scopes.begin_dialog("account");
+        assert!(!scopes.finish_dialog(&later, "account", "room"));
+        let later = scopes.capture_room("account", "room");
+        assert!(!scopes.current(&later, "account", "room"));
+    }
 
     #[test]
     fn a_to_b_to_a_ends_a_dialog_and_a_scope() {

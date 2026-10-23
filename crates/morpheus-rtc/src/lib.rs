@@ -317,3 +317,5 @@ pub use alsa_close::{
     AlsaBackendCloseError, close_retired_alsa_on_owned_worker, wait_for_all_alsa_release,
     wait_for_retired_alsa_release,
 };
+#[cfg(all(windows, feature = "device-audio"))]
+pub use cpal::{WasapiCloseError, WasapiCloseObservation, WasapiUiContext, begin_wasapi_shutdown};

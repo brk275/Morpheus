@@ -73,6 +73,8 @@ pub enum AudioDeviceReleaseError {
     SupervisorFailed,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     NativeClose,
+    #[cfg(windows)]
+    NativeBackend(cpal::WasapiCloseError),
 }
 impl std::fmt::Display for AudioDeviceReleaseError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -84,6 +86,8 @@ impl std::fmt::Display for AudioDeviceReleaseError {
             Self::NativeClose => "CoreAudio native cleanup failed and remains owned",
             #[cfg(target_os = "linux")]
             Self::NativeClose => "ALSA native cleanup failed and remains owned",
+            #[cfg(windows)]
+            Self::NativeBackend(_) => "Windows native audio retirement could not be confirmed",
         })
     }
 }
@@ -144,7 +148,33 @@ fn poll_device_open_owner(
 /// Caller cancellation cannot detach it. Call cleanup/rejoin and shutdown must
 /// consume this result before reporting release or releasing the call lease.
 pub async fn wait_for_audio_device_release() -> Result<(), AudioDeviceReleaseError> {
-    wait_for_device_release(DEVICE_RELEASE_TIMEOUT).await
+    wait_for_device_release(DEVICE_RELEASE_TIMEOUT).await?;
+    #[cfg(windows)]
+    wait_for_native_audio_release(DEVICE_RELEASE_TIMEOUT).await?;
+    Ok(())
+}
+#[cfg(windows)]
+pub(crate) async fn wait_for_native_audio_release(
+    bound: Duration,
+) -> Result<(), AudioDeviceReleaseError> {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        match cpal::observe_wasapi_retiring() {
+            cpal::WasapiCloseObservation::Released(result) => {
+                return result.map_err(AudioDeviceReleaseError::NativeBackend);
+            }
+            cpal::WasapiCloseObservation::Retained(error) => {
+                return Err(AudioDeviceReleaseError::NativeBackend(error));
+            }
+            cpal::WasapiCloseObservation::Pending => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AudioDeviceReleaseError::NativeBackend(
+                cpal::WasapiCloseError::TimedOut,
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 async fn wait_for_device_release(bound: Duration) -> Result<(), AudioDeviceReleaseError> {
     let until = tokio::time::Instant::now() + bound;
@@ -1849,6 +1879,23 @@ fn run_device_open<T: Send + 'static>(
         if !gate.active() {
             return Err(MediaError::CallEnded);
         }
+        #[cfg(windows)]
+        {
+            let call = controls.clone();
+            let waiting = Arc::downgrade(&handoff);
+            let completed = handoff.completed.clone();
+            cpal::with_wasapi_open_authority(
+                Arc::new(move || {
+                    call.is_authorized()
+                        && (completed.handed_off.load(Ordering::Acquire)
+                            || waiting
+                                .upgrade()
+                                .is_some_and(|handoff| handoff.waiting.load(Ordering::Acquire)))
+                }),
+                || open(&gate),
+            )
+        }
+        #[cfg(not(windows))]
         open(&gate)
     }));
     let panicked = opened.is_err();
@@ -1942,6 +1989,12 @@ async fn open_with_supervisor<T: Send + 'static>(
             _ = controls.cancelled() => return Err(MediaError::CallEnded),
             released = wait_for_audio_device_release() => released.map_err(|error| MediaError::Device(error.to_string()))?,
         }
+    }
+    #[cfg(windows)]
+    tokio::select! {
+        biased;
+        _ = controls.cancelled() => return Err(MediaError::CallEnded),
+        released = wait_for_native_audio_release(DEVICE_RELEASE_TIMEOUT) => released.map_err(|error| MediaError::Device(error.to_string()))?,
     }
     let completed = Arc::new(OpenCompletion::default());
     let (ready, received) = tokio::sync::oneshot::channel();

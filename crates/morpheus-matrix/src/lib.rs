@@ -1156,6 +1156,7 @@ impl Drop for LoadedAccount {
 }
 
 struct State {
+    action_admission_closed: Arc<std::sync::atomic::AtomicBool>,
     registry: Registry,
     active_account_id: Option<String>,
     access: account_access::AccessFence,
@@ -1176,6 +1177,7 @@ struct SyncTask {
 /// after constructing the UI so a locked/unavailable keyring can be handled
 /// without losing access to the account picker.
 pub struct AccountManager {
+    action_admission_closed: Arc<std::sync::atomic::AtomicBool>,
     data_dir: PathBuf,
     _access_lock: Arc<fs::File>,
     access_instance: Uuid,
@@ -1212,7 +1214,9 @@ impl AccountManager {
         authentication::cleanup_pending_stores(&data_dir, &registry)?;
         let (active_tx, _) = watch::channel(None);
         let (sync_tx, _) = watch::channel(SyncStatus::Stopped);
+        let action_admission_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Ok(Self {
+            action_admission_closed: action_admission_closed.clone(),
             data_dir,
             _access_lock: Arc::new(access_lock),
             access_instance: Uuid::new_v4(),
@@ -1220,6 +1224,7 @@ impl AccountManager {
             access_worker: Arc::new(tokio::sync::Semaphore::new(1)),
             sync_policy,
             state: Mutex::new(State {
+                action_admission_closed,
                 registry,
                 active_account_id: None,
                 access,
@@ -3197,6 +3202,16 @@ impl AccountManager {
         Ok(())
     }
 
+    /// End application selection admission synchronously while retaining all
+    /// loaded stores for admitted send/draft ownership drain and final flush.
+    /// `stop` remains resumable when this distinct terminal method was not used.
+    /// Revocation alone never claims completion of already entered SDK work.
+    pub fn close_selection_admission(&self) {
+        self.action_admission_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.selections.close();
+    }
+
     pub async fn stop(&self) {
         let mut state = self.state.lock().await;
         self.selections.replace(None);
@@ -3267,6 +3282,12 @@ impl AccountManager {
 
     async fn active_loaded(&self) -> Result<Arc<LoadedAccount>> {
         let state = self.state.lock().await;
+        if state
+            .action_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
         let id = state
             .active_account_id
             .as_ref()
@@ -3675,6 +3696,12 @@ fn selected_loaded_for<'a>(
 }
 
 fn selected_loaded(state: &State) -> Result<&Arc<LoadedAccount>> {
+    if state
+        .action_admission_closed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(MatrixCoreError::SelectedAccountChanged);
+    }
     let id = state
         .active_account_id
         .as_ref()

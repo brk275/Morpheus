@@ -170,6 +170,8 @@ pub enum CommitError {
     /// settings at that moment. `commit` does not wait for it.
     #[error("another Morpheus window or task is saving settings right now; nothing was written")]
     Busy,
+    #[error("Morpheus is closing; no new settings were written")]
+    Closing,
     #[error(transparent)]
     Config(#[from] ConfigError),
 }
@@ -180,6 +182,10 @@ impl CommitError {
     pub(crate) fn into_config_error(self) -> ConfigError {
         match self {
             Self::Config(error) => error,
+            Self::Closing => ConfigError::Io(std::io::Error::new(
+                ErrorKind::WouldBlock,
+                Self::Closing.to_string(),
+            )),
             Self::Busy => ConfigError::Io(std::io::Error::new(
                 ErrorKind::WouldBlock,
                 Self::Busy.to_string(),
@@ -276,6 +282,23 @@ impl ConfigStore {
         before_publish: impl FnOnce(&Path),
         place: impl FnOnce(tempfile::NamedTempFile, &Path, Placement) -> std::io::Result<()>,
     ) -> Result<ConfigRevision, CommitError> {
+        let _admission = self
+            .write_admission
+            .active
+            .try_read()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => CommitError::Busy,
+                std::sync::TryLockError::Poisoned(_) => CommitError::Config(ConfigError::Invalid(
+                    "Settings writer admission could not be confirmed.".into(),
+                )),
+            })?;
+        if self
+            .write_admission
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(CommitError::Closing);
+        }
         // A contended UI commit returns Busy before validation, encoding or
         // staging I/O. Its draft stays with the caller; after contention clears,
         // the same draft must still pass the ordinary validation below.
@@ -513,6 +536,55 @@ fn open_lock_file(path: &Path) -> std::io::Result<fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_close_drains_an_entered_real_publish_and_refuses_clone_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let writer = store.clone();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("morpheus-config-close-regression".into())
+            .spawn(move || {
+                writer.commit_with(&Config::default(), &ConfigRevision::absent(), |_| {
+                    let _ = entered.send(());
+                    let _ = released.recv_timeout(Duration::from_secs(5));
+                })
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(_) => panic!("No config regression worker was created"),
+        };
+        let entered = entering.recv_timeout(Duration::from_secs(3));
+        store.close_write_admission();
+        let during = store.write_shutdown_confirmed();
+        let refused = store
+            .clone()
+            .commit(&Config::default(), &ConfigRevision::absent());
+        let _ = release.send(());
+        let limit = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() && Instant::now() < limit {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if !worker.is_finished() {
+            // Keep both actual writer identity and its temporary directory on
+            // uncertainty; do not drop the only handle or its live file tree.
+            std::mem::forget(worker);
+            std::mem::forget(directory);
+            panic!("Config publish worker cleanup remained unproved");
+        }
+        let joined = worker.join();
+        let after = store.write_shutdown_confirmed();
+        let loaded = store.load();
+        // Every assertion follows the actual owned writer/TLS join.
+        assert!(entered.is_ok());
+        assert!(matches!(during, Ok(false)));
+        assert!(matches!(refused, Err(CommitError::Closing)));
+        assert!(matches!(joined, Ok(Ok(_))));
+        assert!(matches!(after, Ok(true)));
+        assert!(loaded.is_ok());
+    }
 
     fn names(directory: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(directory)

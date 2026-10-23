@@ -1,27 +1,23 @@
 use std::{
-    mem,
     ops::ControlFlow,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr, slice,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{channel, Receiver, Sender},
+        mpsc::Receiver,
         Arc,
     },
-    thread::{self, JoinHandle},
     time::Duration,
 };
 
 use windows::Win32::{
-    Foundation::{self, PROPERTYKEY, WAIT_OBJECT_0},
+    Foundation::{self, PROPERTYKEY},
     Media::Audio,
-    System::{Performance, SystemServices, Threading},
+    System::{Performance, Threading},
 };
 
 use crate::{
-    host::{
-        emit_error, equilibrium::fill_equilibrium, latch::Latch, try_emit_error, ErrorCallbackArc,
-    },
+    host::{emit_error, equilibrium::fill_equilibrium, try_emit_error, ErrorCallbackArc},
     traits::StreamTrait,
     Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
     OutputCallbackInfo, OutputStreamTimestamp, ResultExt, SampleFormat, SampleRate, StreamConfig,
@@ -42,167 +38,163 @@ impl OwnedEvent {
         Ok(Self(unsafe { OwnedHandle::from_raw_handle(event.0) }))
     }
 
+    pub(crate) fn signal(&self) -> windows::core::Result<()> {
+        unsafe { Threading::SetEvent(self.handle()) }
+    }
+
     pub(crate) fn handle(&self) -> Foundation::HANDLE {
         Foundation::HANDLE(self.0.as_raw_handle())
     }
 }
 
-/// Returns the current default audio endpoint for `flow`, or `None` if none exists.
-///
-/// Used by `OnDeviceStateChanged` and `OnDeviceRemoved` to cover the edge case where the
-/// default device becomes unavailable with no replacement: in that situation Windows does
-/// not fire `OnDefaultDeviceChanged`, so these callbacks must signal the run loop instead.
-/// When a replacement *does* exist this returns `Some` and we skip signalling, letting
-/// `OnDefaultDeviceChanged` fire as the sole notifier and avoiding a double wakeup.
-fn get_current_default(flow: Audio::EDataFlow) -> Option<Audio::IMMDevice> {
-    super::device::current_default_endpoint(flow)
-}
-
-/// Fires a Windows auto-reset event when the system default audio device changes.
+/// Registration and both native references belong to the native stream STA.
+/// The callback owns only copied flags and an actual shared event owner.
 pub(crate) struct DefaultDeviceMonitor {
-    enumerator: Audio::IMMDeviceEnumerator,
-    client: Audio::IMMNotificationClient,
-    event: Foundation::HANDLE,
-    pub(crate) flow: Audio::EDataFlow,
-    pub(crate) pending_device_changed: Arc<AtomicBool>,
+    enumerator: std::mem::ManuallyDrop<Audio::IMMDeviceEnumerator>,
+    client: std::mem::ManuallyDrop<Audio::IMMNotificationClient>,
+    event: Arc<OwnedEvent>,
+    flow: Audio::EDataFlow,
+    active: Arc<AtomicBool>,
+    default_changed: Arc<AtomicBool>,
+    unavailable: Arc<AtomicBool>,
+    registered: bool,
 }
-
-// SAFETY: `IMMDeviceEnumerator` and `IMMNotificationClient` are COM objects used only for
-// register/unregister (in new/drop) and `SetEvent` (from the Windows notification thread).
-// All of these are thread-safe operations on Windows.
-unsafe impl Send for DefaultDeviceMonitor {}
-unsafe impl Sync for DefaultDeviceMonitor {}
-
 impl DefaultDeviceMonitor {
     pub fn new(
         enumerator: Audio::IMMDeviceEnumerator,
         flow: Audio::EDataFlow,
+        control: &super::owner::Control,
     ) -> Result<Self, Error> {
-        let event =
-            unsafe { Threading::CreateEventW(None, false, false, None).map_err(Error::from)? };
-
-        let pending_device_changed = Arc::new(AtomicBool::new(false));
+        let event = Arc::new(OwnedEvent::new().map_err(Error::from)?);
+        let active = Arc::new(AtomicBool::new(true));
+        let default_changed = Arc::new(AtomicBool::new(false));
+        let unavailable = Arc::new(AtomicBool::new(false));
         let client: Audio::IMMNotificationClient = DefaultDeviceNotificationImpl {
             flow,
-            event,
-            pending_device_changed: pending_device_changed.clone(),
+            event: event.clone(),
+            active: active.clone(),
+            default_changed: default_changed.clone(),
+            unavailable: unavailable.clone(),
         }
         .into();
-
-        unsafe {
-            enumerator
-                .RegisterEndpointNotificationCallback(&client)
-                .map_err(Error::from)?;
-        }
-
-        Ok(Self {
-            enumerator,
-            client,
+        let monitor = Self {
+            enumerator: std::mem::ManuallyDrop::new(enumerator),
+            client: std::mem::ManuallyDrop::new(client),
             event,
             flow,
-            pending_device_changed,
-        })
+            active,
+            default_changed,
+            unavailable,
+            registered: true,
+        };
+        let status = unsafe {
+            (windows::core::Interface::vtable(&*monitor.enumerator)
+                .RegisterEndpointNotificationCallback)(
+                windows::core::Interface::as_raw(&*monitor.enumerator),
+                windows::core::Interface::as_raw(&*monitor.client),
+            )
+        };
+        if status.0 != 0 {
+            monitor.active.store(false, Ordering::Release);
+            // Unknown registration output cannot justify destroying a possibly
+            // retained callback. Keep this complete allocation on its STA.
+            control.retain_failure(super::owner::WasapiCloseError::Notification);
+        }
+        Ok(monitor)
+    }
+    fn retire(&mut self, control: &super::owner::Control) {
+        self.active.store(false, Ordering::Release);
+        let status = unsafe {
+            (windows::core::Interface::vtable(&*self.enumerator)
+                .UnregisterEndpointNotificationCallback)(
+                windows::core::Interface::as_raw(&*self.enumerator),
+                windows::core::Interface::as_raw(&*self.client),
+            )
+        };
+        if status.0 != 0 {
+            control.retain_failure(super::owner::WasapiCloseError::Notification);
+        }
+        // Exact documented unregister permission outside callbacks, followed
+        // by normal COM final Release, not a claim to join an OS callback thread.
+        self.registered = false;
+    }
+    fn changed(&self) -> bool {
+        if self.default_changed.swap(false, Ordering::AcqRel) {
+            return true;
+        }
+        self.unavailable.swap(false, Ordering::AcqRel)
+            && super::device::current_default_endpoint(self.flow).is_none()
     }
 }
-
 impl Drop for DefaultDeviceMonitor {
     fn drop(&mut self) {
-        // Ensure COM is initialised on this thread before making COM calls. Drop can run on
-        // any thread (e.g. the audio run thread), which may not have called CoInitialize.
-        crate::host::com::com_initialized();
-        unsafe {
-            // Synchronous: waits for any in-progress IMMNotificationClient callback to finish
-            // before returning. Notification callbacks must not invoke the user error callback:
-            // if the user dropped the Stream in response, this call would deadlock waiting for
-            // the in-progress callback. Instead, callbacks set `pending_device_changed` and
-            // the audio thread delivers the error on its next iteration.
-            //
-            // Only close the event handle on success; if unregister fails the callback may
-            // still hold a reference and could later call SetEvent on a closed/reused handle.
-            if self
-                .enumerator
-                .UnregisterEndpointNotificationCallback(&self.client)
-                .is_ok()
-            {
-                let _ = Foundation::CloseHandle(self.event);
+        if self.registered {
+            // Unexpected unwind cannot free a possibly registered callback.
+            // Outer request catch retains the actual STA and reports failure.
+            std::mem::forget(self.event.clone());
+        } else {
+            unsafe {
+                std::mem::ManuallyDrop::drop(&mut self.client);
+                std::mem::ManuallyDrop::drop(&mut self.enumerator);
             }
         }
     }
 }
-
 #[windows::core::implement(Audio::IMMNotificationClient)]
 struct DefaultDeviceNotificationImpl {
     flow: Audio::EDataFlow,
-    event: Foundation::HANDLE,
-    pending_device_changed: Arc<AtomicBool>,
+    event: Arc<OwnedEvent>,
+    active: Arc<AtomicBool>,
+    default_changed: Arc<AtomicBool>,
+    unavailable: Arc<AtomicBool>,
 }
-
+impl DefaultDeviceNotificationImpl {
+    fn changed(&self, default: bool) -> windows::core::Result<()> {
+        if self.active.load(Ordering::Acquire) {
+            if default {
+                self.default_changed.store(true, Ordering::Release);
+            } else {
+                self.unavailable.store(true, Ordering::Release);
+            }
+            self.event.signal()?;
+        }
+        Ok(())
+    }
+}
 impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
     fn OnDefaultDeviceChanged(
         &self,
         flow: Audio::EDataFlow,
         role: Audio::ERole,
-        _pwstrdefaultdeviceid: &windows::core::PCWSTR,
+        _id: &windows::core::PCWSTR,
     ) -> windows::core::Result<()> {
         if flow == self.flow && role == Audio::eConsole {
-            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor, which
-            // outlives all uses of this HANDLE copy.
-            unsafe {
-                if Threading::SetEvent(self.event).is_err() {
-                    self.pending_device_changed.store(true, Ordering::Relaxed);
-                }
-            }
+            self.changed(true)?;
         }
         Ok(())
     }
-
     fn OnDeviceStateChanged(
         &self,
-        _pwstrdeviceid: &windows::core::PCWSTR,
-        dwnewstate: Audio::DEVICE_STATE,
+        _id: &windows::core::PCWSTR,
+        state: Audio::DEVICE_STATE,
     ) -> windows::core::Result<()> {
-        // `DEVICE_STATE_UNPLUGGED`: physical jack disconnected; endpoint still exists in the
-        // collection but produces no audio. `OnDeviceRemoved` does *not* fire for this state.
-        // `DEVICE_STATE_NOTPRESENT`: hardware absent; endpoint may persist as a ghost record.
-        // `DEVICE_STATE_DISABLED`: device was manually disabled by the user.
-        //
-        // Only signal when there is no replacement default; if one exists `OnDefaultDeviceChanged`
-        // will fire instead, avoiding a double wakeup.
-        let is_unavailable = dwnewstate == Audio::DEVICE_STATE_DISABLED
-            || dwnewstate == Audio::DEVICE_STATE_NOTPRESENT
-            || dwnewstate == Audio::DEVICE_STATE_UNPLUGGED;
-        if is_unavailable && get_current_default(self.flow).is_none() {
-            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor.
-            unsafe {
-                if Threading::SetEvent(self.event).is_err() {
-                    self.pending_device_changed.store(true, Ordering::Relaxed);
-                }
-            }
+        if state == Audio::DEVICE_STATE_DISABLED
+            || state == Audio::DEVICE_STATE_NOTPRESENT
+            || state == Audio::DEVICE_STATE_UNPLUGGED
+        {
+            self.changed(false)?;
         }
         Ok(())
     }
-
-    fn OnDeviceAdded(&self, _pwstrdeviceid: &windows::core::PCWSTR) -> windows::core::Result<()> {
+    fn OnDeviceAdded(&self, _id: &windows::core::PCWSTR) -> windows::core::Result<()> {
         Ok(())
     }
-
-    fn OnDeviceRemoved(&self, _pwstrdeviceid: &windows::core::PCWSTR) -> windows::core::Result<()> {
-        // Only signal when there is no replacement default; if one exists `OnDefaultDeviceChanged`
-        // will fire instead, avoiding a double wakeup.
-        if get_current_default(self.flow).is_none() {
-            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor.
-            unsafe {
-                if Threading::SetEvent(self.event).is_err() {
-                    self.pending_device_changed.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-        Ok(())
+    fn OnDeviceRemoved(&self, _id: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        self.changed(false)
     }
-
     fn OnPropertyValueChanged(
         &self,
-        _pwstrdeviceid: &windows::core::PCWSTR,
+        _id: &windows::core::PCWSTR,
         _key: &PROPERTYKEY,
     ) -> windows::core::Result<()> {
         Ok(())
@@ -210,82 +202,23 @@ impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
 }
 
 pub struct Stream {
-    /// The high-priority audio processing thread calling callbacks.
-    /// Option used for moving out in destructor.
-    ///
-    /// TODO: Actually set the thread priority.
-    thread: Option<JoinHandle<()>>,
-
-    // Commands processed by the `run()` method that is currently running.
-    // `pending_scheduled_event` must be signalled whenever a command is added here, so that it
-    // will get picked up.
-    commands: Sender<Command>,
-
-    // This event is signalled after a new entry is added to `commands`, so that the `run()`
-    // method can be notified.
+    commands: std::sync::mpsc::SyncSender<Command>,
     pending_scheduled_event: Arc<OwnedEvent>,
-
-    // Callback size in frames.
+    control: Option<super::owner::Control>,
     period_frames: FrameCount,
-
-    // QueryPerformanceFrequency result, cached at construction (constant for the system lifetime).
     qpc_frequency: u64,
-
-    // Present for default-device streams. Dropped after the run thread joins, ensuring the
-    // HANDLE is not waited on when it is closed.
-    _default_device_monitor: Option<DefaultDeviceMonitor>,
-
-    // Latch that ensures no callbacks fire before the caller receives the `Stream` handle.
-    latch: Latch,
+    ready: Arc<AtomicBool>,
 }
-
-// SAFETY: the command event is shared through an owned Windows handle.
-// All fields of Stream retain their existing Send implementations:
-// - JoinHandle<()> is Send
-// - Sender<Command> is Send
-// - Arc<OwnedEvent> uses OwnedHandle, which is Send
-// - Latch is Send
-// - DefaultDeviceMonitor retains its separate, existing Send implementation
-// See: https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createeventa
-unsafe impl Send for Stream {}
-
-// SAFETY: the command event remains owned during concurrent signaling/waiting.
-// All fields of Stream retain their existing Sync implementations:
-// - JoinHandle<()> is Sync
-// - Sender<Command> is Sync (uses internal synchronization)
-// - Arc<OwnedEvent> uses OwnedHandle, which is Sync
-// - Latch is Sync
-// - DefaultDeviceMonitor retains its separate, existing Sync implementation
-// Event ownership does not establish COM apartment or notification-retirement safety.
-unsafe impl Sync for Stream {}
-
-// Compile-time assertion that Stream is Send and Sync
 crate::assert_stream_send!(Stream);
 crate::assert_stream_sync!(Stream);
-
 struct RunContext {
-    // Streams that have been created in this event loop.
     stream: StreamInner,
-
-    // Handles corresponding to the `event` field of each element of `voices`. Must always be in
-    // sync with `voices`, except that the first element is always `pending_scheduled_event`.
     handles: Vec<Foundation::HANDLE>,
-
     commands: Receiver<Command>,
-
-    // Set by a device-change notification callback when SetEvent fails.
-    pending_device_changed: Option<Arc<AtomicBool>>,
-
-    // Set when this stream tracks the default device, rather than a pinned one.
-    default_device_flow: Option<Audio::EDataFlow>,
-
-    // Retained with the Stream caller: neither side closes a handle still
-    // used for signaling or waiting by the other, including self-drop.
+    monitor: Option<DefaultDeviceMonitor>,
+    control: super::owner::Control,
     _pending_scheduled_event: Arc<OwnedEvent>,
 }
-
-// Once we start running the eventloop, the RunContext will not be moved.
-unsafe impl Send for RunContext {}
 
 pub enum Command {
     PlayStream,
@@ -303,9 +236,10 @@ pub enum AudioClientFlow {
 }
 
 pub struct StreamInner {
-    pub audio_client: Audio::IAudioClient,
-    pub audio_clock: Audio::IAudioClock,
     pub client_flow: AudioClientFlow,
+    pub audio_clock: Audio::IAudioClock,
+    pub audio_client: Audio::IAudioClient,
+    pub(crate) cleanup_failure: std::cell::Cell<Option<super::owner::WasapiCloseError>>,
     // Event that is signalled by WASAPI whenever audio data must be written.
     pub(crate) event: OwnedEvent,
     // True if the stream is currently playing. False if paused.
@@ -324,192 +258,203 @@ pub struct StreamInner {
     pub stream_latency: Duration,
 }
 
+#[derive(Clone, Copy)]
+struct BuildInfo {
+    period_frames: FrameCount,
+    qpc_frequency: u64,
+}
 impl Stream {
     pub(crate) fn new_input<D>(
-        stream_inner: StreamInner,
+        prepared: super::device::Prepared,
+        config: StreamConfig,
+        sample_format: SampleFormat,
+        timeout: Option<Duration>,
         mut data_callback: D,
         error_callback: ErrorCallbackArc,
-        default_device_monitor: Option<DefaultDeviceMonitor>,
-    ) -> Result<Stream, Error>
+    ) -> Result<Self, Error>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
     {
-        let pending_scheduled_event =
-            Arc::new(OwnedEvent::new().expect("cpal: could not create input stream event"));
-        let (tx, rx) = channel();
-
-        let period_frames = stream_inner.period_frames;
-        let mut qpc_frequency: i64 = 0;
-        unsafe {
-            Performance::QueryPerformanceFrequency(&mut qpc_frequency)
-                .expect("QueryPerformanceFrequency failed");
-            debug_assert_ne!(qpc_frequency, 0, "QueryPerformanceFrequency returned zero");
-        }
-
-        let mut handles = vec![
-            pending_scheduled_event.handle(),
-            stream_inner.event.handle(),
-        ];
-        if let Some(ref monitor) = default_device_monitor {
-            handles.push(monitor.event);
-        }
-
-        let pending_device_changed = default_device_monitor
-            .as_ref()
-            .map(|m| m.pending_device_changed.clone());
-        let default_device_flow = default_device_monitor.as_ref().map(|m| m.flow);
-        let run_context = RunContext {
-            handles,
-            stream: stream_inner,
-            commands: rx,
-            pending_device_changed,
-            default_device_flow,
-            _pending_scheduled_event: Arc::clone(&pending_scheduled_event),
-        };
-
-        // The latch is released just before the `Stream` is returned so the worker cannot fire any
-        // callbacks before the caller has the handle.
-        let mut latch = Latch::new();
-        let waiter = latch.waiter();
-
-        let thread = thread::Builder::new()
-            .name("cpal_wasapi_in".to_owned())
-            .spawn(move || {
-                waiter.wait();
-                run_input(run_context, &mut data_callback, &error_callback)
-            })
-            .map_err(|e| {
-                Error::with_message(
-                    ErrorKind::ResourceExhausted,
-                    format!("Failed to create audio thread: {e}"),
-                )
-            })?;
-
-        latch.add_thread(thread.thread().clone());
-        let stream = Stream {
-            thread: Some(thread),
-            commands: tx,
-            pending_scheduled_event,
-            period_frames,
-            qpc_frequency: qpc_frequency as u64,
-            _default_device_monitor: default_device_monitor,
-            latch,
-        };
-        Ok(stream)
+        Self::build(
+            prepared,
+            move |device| device.build_input_stream_raw_inner(config, sample_format, timeout),
+            move |context| run_input(context, &mut data_callback, &error_callback),
+        )
     }
-
     pub(crate) fn new_output<D>(
-        stream_inner: StreamInner,
+        prepared: super::device::Prepared,
+        config: StreamConfig,
+        sample_format: SampleFormat,
+        timeout: Option<Duration>,
         mut data_callback: D,
         error_callback: ErrorCallbackArc,
-        default_device_monitor: Option<DefaultDeviceMonitor>,
-    ) -> Result<Stream, Error>
+    ) -> Result<Self, Error>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
     {
-        let pending_scheduled_event =
-            Arc::new(OwnedEvent::new().expect("cpal: could not create output stream event"));
-        let (tx, rx) = channel();
-
-        let period_frames = stream_inner.period_frames;
-        let mut qpc_frequency: i64 = 0;
-        unsafe {
-            Performance::QueryPerformanceFrequency(&mut qpc_frequency)
-                .expect("QueryPerformanceFrequency failed");
-            debug_assert_ne!(qpc_frequency, 0, "QueryPerformanceFrequency returned zero");
-        }
-
-        let mut handles = vec![
-            pending_scheduled_event.handle(),
-            stream_inner.event.handle(),
-        ];
-        if let Some(ref monitor) = default_device_monitor {
-            handles.push(monitor.event);
-        }
-
-        let pending_device_changed = default_device_monitor
-            .as_ref()
-            .map(|m| m.pending_device_changed.clone());
-        let default_device_flow = default_device_monitor.as_ref().map(|m| m.flow);
-        let run_context = RunContext {
-            handles,
-            stream: stream_inner,
-            commands: rx,
-            pending_device_changed,
-            default_device_flow,
-            _pending_scheduled_event: Arc::clone(&pending_scheduled_event),
-        };
-
-        // The latch is released just before the `Stream` is returned so the worker cannot fire any
-        // callbacks before the caller has the handle.
-        let mut latch = Latch::new();
-        let waiter = latch.waiter();
-
-        let thread = thread::Builder::new()
-            .name("cpal_wasapi_out".to_owned())
-            .spawn(move || {
-                waiter.wait();
-                run_output(run_context, &mut data_callback, &error_callback)
-            })
-            .map_err(|e| {
-                Error::with_message(
-                    ErrorKind::ResourceExhausted,
-                    format!("Failed to create audio thread: {e}"),
+        Self::build(
+            prepared,
+            move |device| device.build_output_stream_raw_inner(config, sample_format, timeout),
+            move |context| run_output(context, &mut data_callback, &error_callback),
+        )
+    }
+    fn build(
+        prepared: super::device::Prepared,
+        factory: impl FnOnce(&super::device::NativeDevice) -> Result<StreamInner, Error>
+            + Send
+            + 'static,
+        run: impl FnOnce(&mut RunContext) + Send + 'static,
+    ) -> Result<Self, Error> {
+        let (commands, received) = std::sync::mpsc::sync_channel(1);
+        let (published, observed) = std::sync::mpsc::sync_channel(1);
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_on_owner = ready.clone();
+        let control = prepared.run(Box::new(move |device, control| {
+            let inner = match factory(device) {
+                Ok(inner) => inner,
+                Err(error) => {
+                    control.request_close();
+                    let _ = published.send(Err(error));
+                    return false;
+                }
+            };
+            let monitor = match device.default_device_monitor() {
+                Ok(monitor) => monitor,
+                Err(error) => {
+                    control.request_close();
+                    let _ = published.send(Err(error));
+                    return false;
+                }
+            };
+            let mut frequency = 0;
+            if unsafe { Performance::QueryPerformanceFrequency(&mut frequency) }.is_err()
+                || frequency <= 0
+            {
+                // This is before Start; retire any registration explicitly.
+                let mut monitor = monitor;
+                if let Some(monitor) = monitor.as_mut() {
+                    monitor.retire(control);
+                }
+                control.request_close();
+                let _ = published.send(Err(Error::with_message(
+                    ErrorKind::BackendError,
+                    "Audio performance clock unavailable",
+                )));
+                return false;
+            }
+            let pending_event = control.event();
+            let mut handles = vec![pending_event.handle(), inner.event.handle()];
+            if let Some(monitor) = monitor.as_ref() {
+                handles.push(monitor.event.handle());
+            }
+            let info = BuildInfo {
+                period_frames: inner.period_frames,
+                qpc_frequency: frequency as u64,
+            };
+            let mut context = std::mem::ManuallyDrop::new(RunContext {
+                stream: inner,
+                handles,
+                commands: received,
+                monitor,
+                control: control.clone(),
+                _pending_scheduled_event: pending_event,
+            });
+            if published.send(Ok(info)).is_err() {
+                control.request_close();
+            }
+            while !ready_on_owner.load(Ordering::Acquire) && control.active() {
+                if super::apartment::wait(&[control.event().handle()], Duration::from_millis(20))
+                    .is_err()
+                {
+                    control.retain_failure(super::owner::WasapiCloseError::Apartment);
+                }
+            }
+            if control.active() {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut context)))
+                    .is_err()
+                {
+                    control.failure(super::owner::WasapiCloseError::WorkerPanicked);
+                }
+            }
+            // Revocation precedes all native retirement. The owner-local
+            // retention container survives every uncertain stop/unregister.
+            control.request_close();
+            if let Some(monitor) = context.monitor.as_ref() {
+                monitor.active.store(false, Ordering::Release);
+            }
+            if let Some(failure) = context.stream.cleanup_failure.get() {
+                control.retain_failure(failure);
+            }
+            let status = unsafe {
+                (windows::core::Interface::vtable(&context.stream.audio_client).Stop)(
+                    windows::core::Interface::as_raw(&context.stream.audio_client),
                 )
-            })?;
-
-        latch.add_thread(thread.thread().clone());
-        let stream = Stream {
-            thread: Some(thread),
-            commands: tx,
-            pending_scheduled_event,
-            period_frames,
-            qpc_frequency: qpc_frequency as u64,
-            _default_device_monitor: default_device_monitor,
-            latch,
-        };
-        Ok(stream)
-    }
-
-    /// Releases the latch so the worker thread can begin processing audio callbacks.
-    pub(crate) fn signal_ready(&self) {
-        self.latch.release();
-    }
-
-    fn push_command(&self, command: Command) -> Result<(), Error> {
-        let invalidated = || {
+            };
+            if status.0 != 0 && status.0 != 1 {
+                control.retain_failure(super::owner::WasapiCloseError::Stop);
+            }
+            context.stream.playing = false;
+            if let Some(monitor) = context.monitor.as_mut() {
+                monitor.retire(control);
+            }
+            // Declared field order releases services, clock and client before
+            // audio event. No interface escapes this actual native worker.
+            drop(unsafe { std::mem::ManuallyDrop::take(&mut context) });
+            false
+        }))?;
+        let info = observed.recv().map_err(|_| {
             Error::with_message(
                 ErrorKind::StreamInvalidated,
-                "Stream command channel closed",
+                "Audio construction did not complete",
             )
-        };
-        self.commands.send(command).map_err(|_| invalidated())?;
-        unsafe {
-            // This Stream retains its own event owner even if the receiver
-            // exits between send() and SetEvent(). Worker retirement cannot
-            // close or recycle the handle while this call is in progress.
-            Threading::SetEvent(self.pending_scheduled_event.handle())
-                .map_err(|_| invalidated())?;
+        })??;
+        Ok(Self {
+            commands,
+            pending_scheduled_event: control.event(),
+            control: Some(control),
+            period_frames: info.period_frames,
+            qpc_frequency: info.qpc_frequency,
+            ready,
+        })
+    }
+    pub(crate) fn signal_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+        let _ = self.pending_scheduled_event.signal();
+    }
+    fn push_command(&self, command: Command) -> Result<(), Error> {
+        if self
+            .control
+            .as_ref()
+            .is_some_and(|control| !control.active())
+        {
+            return Err(ErrorKind::StreamInvalidated.into());
         }
-        Ok(())
+        self.commands.try_send(command).map_err(|_| {
+            Error::with_message(
+                ErrorKind::DeviceBusy,
+                "Audio command is pending or the owner has retired",
+            )
+        })?;
+        self.pending_scheduled_event.signal().map_err(Error::from)
+    }
+    /// Nonblocking retirement request. Actual worker/TLS and supervisor joins,
+    /// plus native/origin retirement, must be observed through this ticket.
+    pub fn request_wasapi_close(self) -> super::owner::WasapiCloseTicket {
+        let ticket = self.control.as_ref().expect("native Stream owner").ticket();
+        ticket.request();
+        drop(self);
+        ticket
     }
 }
-
 impl Drop for Stream {
     fn drop(&mut self) {
-        // Release the latch in case the stream is dropped before signal_ready() was called.
         self.signal_ready();
-
-        let _ = self.push_command(Command::Terminate);
-        if let Some(handle) = self.thread.take() {
-            // Prevent self-join: Terminate was sent; the thread exits after the current callback
-            // returns. RunContext retains the command event through that exit,
-            // while Stream retains it through the caller's final signaling.
-            // The last actual owner closes it after both uses have ended.
-            if handle.thread().id() != std::thread::current().id() {
-                let _ = handle.join();
-            }
+        if let Some(control) = self.control.as_ref() {
+            control.request_close();
         }
+        // Compatibility signal for receivers, with independent atomic close
+        // authority so a full command queue never blocks retirement.
+        let _ = self.push_command(Command::Terminate);
     }
 }
 
@@ -547,8 +492,15 @@ impl StreamTrait for Stream {
 // Process any pending commands that are queued within the `RunContext`.
 // Returns `true` if the loop should continue running, `false` if it should terminate.
 fn process_commands(run_context: &mut RunContext) -> Result<bool, Error> {
-    // Process the pending commands.
+    // Independent close/account authority wins over even an already queued
+    // Play. No future Start is authorized by a stale command-channel entry.
+    if !run_context.control.active() {
+        return Ok(false);
+    }
     for command in run_context.commands.try_iter() {
+        if !run_context.control.active() {
+            return Ok(false);
+        }
         match command {
             Command::PlayStream => unsafe {
                 if !run_context.stream.playing {
@@ -562,11 +514,20 @@ fn process_commands(run_context: &mut RunContext) -> Result<bool, Error> {
             },
             Command::PauseStream => unsafe {
                 if run_context.stream.playing {
-                    run_context
-                        .stream
-                        .audio_client
-                        .Stop()
-                        .context("Failed to stop audio client")?;
+                    let status =
+                        (windows::core::Interface::vtable(&run_context.stream.audio_client).Stop)(
+                            windows::core::Interface::as_raw(&run_context.stream.audio_client),
+                        );
+                    if status.0 != 0 && status.0 != 1 {
+                        run_context
+                            .stream
+                            .cleanup_failure
+                            .set(Some(super::owner::WasapiCloseError::Stop));
+                        return Err(Error::with_message(
+                            ErrorKind::StreamInvalidated,
+                            "Audio stop could not be confirmed",
+                        ));
+                    }
                     run_context.stream.playing = false;
                 }
             },
@@ -587,24 +548,13 @@ fn process_commands(run_context: &mut RunContext) -> Result<bool, Error> {
 // next event might be some command submitted by the user (the first handle) or
 // might indicate that one of the streams is ready to deliver or receive audio.
 fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Error> {
-    debug_assert!(handles.len() <= SystemServices::MAXIMUM_WAIT_OBJECTS as usize);
-    let result = unsafe {
-        Threading::WaitForMultipleObjectsEx(
-            handles,
-            false,               // Don't wait for all, just wait for the first
-            Threading::INFINITE, // TODO: allow setting a timeout
-            false,               // irrelevant parameter here
-        )
-    };
-    if result == Foundation::WAIT_FAILED {
-        return Err(Error::with_message(
-            ErrorKind::StreamInvalidated,
-            "Failed to wait for audio event",
-        ));
+    loop {
+        if let Some(index) = super::apartment::wait(handles, Duration::from_millis(50))
+            .map_err(|kind| Error::with_message(ErrorKind::StreamInvalidated, kind.to_string()))?
+        {
+            return Ok(index);
+        }
     }
-    // Notifying the corresponding task handler.
-    let handle_idx = (result.0 - WAIT_OBJECT_0.0) as usize;
-    Ok(handle_idx)
 }
 
 // Get the number of available frames that are available for writing/reading.
@@ -619,8 +569,109 @@ fn get_available_frames(stream: &StreamInner) -> Result<FrameCount, Error> {
     }
 }
 
+// One initialized, aligned native-owner scratch allocation handles silent and
+// 24-in-32 input packets. Native metadata cannot request an unbounded buffer.
+const MAX_CAPTURE_PACKET_BYTES: usize = 64 * 1024 * 1024;
+struct CaptureScratch {
+    words: Vec<u64>,
+    maximum_frames: FrameCount,
+    bytes_per_frame: usize,
+    sample_format: SampleFormat,
+}
+impl CaptureScratch {
+    fn new(
+        maximum_frames: FrameCount,
+        bytes_per_frame: u16,
+        sample_format: SampleFormat,
+    ) -> Result<Self, Error> {
+        let bytes_per_frame = usize::from(bytes_per_frame);
+        let supported = matches!(
+            sample_format,
+            SampleFormat::U8
+                | SampleFormat::I16
+                | SampleFormat::I24
+                | SampleFormat::I32
+                | SampleFormat::I64
+                | SampleFormat::F32
+                | SampleFormat::F64
+        );
+        let byte_count = (maximum_frames as usize)
+            .checked_mul(bytes_per_frame)
+            .filter(|bytes| *bytes > 0 && *bytes <= MAX_CAPTURE_PACKET_BYTES)
+            .ok_or_else(|| Self::invalid("Capture buffer exceeds the owned packet bound"))?;
+        if !supported || bytes_per_frame == 0 || bytes_per_frame % sample_format.sample_size() != 0
+        {
+            return Err(Self::invalid("Capture frame format is not supported"));
+        }
+        let word_count = byte_count.div_ceil(size_of::<u64>());
+        let mut words = Vec::new();
+        words.try_reserve_exact(word_count).map_err(|_| {
+            Error::with_message(ErrorKind::ResourceExhausted, "Capture scratch unavailable")
+        })?;
+        words.resize(word_count, 0);
+        Ok(Self {
+            words,
+            maximum_frames,
+            bytes_per_frame,
+            sample_format,
+        })
+    }
+    fn invalid(message: &'static str) -> Error {
+        Error::with_message(ErrorKind::StreamInvalidated, message)
+    }
+    /// The caller retains the nonzero GetBuffer acquisition through callback
+    /// completion and keeps this scratch alive and unchanged while Data is used.
+    /// A non-silent pointer must address the negotiated valid native packet.
+    unsafe fn packet(
+        &mut self,
+        native: *const u8,
+        frames: FrameCount,
+        flags: u32,
+    ) -> Result<Option<Data>, Error> {
+        // AUDCLNT_S_BUFFER_EMPTY is a successful HRESULT whose data and
+        // timestamp outputs are untouched. Never inspect them or form Data.
+        if frames == 0 {
+            return Ok(None);
+        }
+        if frames > self.maximum_frames {
+            return Err(Self::invalid(
+                "Capture packet exceeds the negotiated buffer",
+            ));
+        }
+        let byte_count = (frames as usize)
+            .checked_mul(self.bytes_per_frame)
+            .filter(|bytes| *bytes <= MAX_CAPTURE_PACKET_BYTES)
+            .ok_or_else(|| Self::invalid("Capture packet exceeds the owned packet bound"))?;
+        let samples = byte_count / self.sample_format.sample_size();
+        let data = if flags & Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+            // SILENT means ignore native payload, including a null or
+            // unaligned value. u64 storage provides all admitted alignments.
+            let owned = slice::from_raw_parts_mut(self.words.as_mut_ptr().cast::<u8>(), byte_count);
+            fill_equilibrium(owned, self.sample_format);
+            self.words.as_mut_ptr().cast()
+        } else {
+            if native.is_null() || (native as usize) % self.sample_format.sample_size() != 0 {
+                return Err(Self::invalid("Capture packet data is not aligned"));
+            }
+            if self.sample_format == SampleFormat::I24 {
+                // Preserve WASAPI's signed 24-in-32 arithmetic conversion.
+                let source = slice::from_raw_parts(native.cast::<i32>(), samples);
+                let owned =
+                    slice::from_raw_parts_mut(self.words.as_mut_ptr().cast::<i32>(), samples);
+                for (destination, source) in owned.iter_mut().zip(source) {
+                    *destination = *source >> 8;
+                }
+                self.words.as_mut_ptr().cast()
+            } else {
+                native.cast_mut().cast()
+            }
+        };
+        Ok(Some(Data::from_parts(data, samples, self.sample_format)))
+    }
+}
+
 fn run_input(
-    mut run_ctxt: RunContext,
+    run_ctxt: &mut RunContext,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
     error_callback: &ErrorCallbackArc,
 ) {
@@ -633,19 +684,26 @@ fn run_input(
     }
 
     let stream = &run_ctxt.stream;
-    let scratch_len = if stream.sample_format == SampleFormat::I24 {
-        stream.max_frames_in_buffer as usize * stream.bytes_per_frame as usize / size_of::<i32>()
-    } else {
-        // The scratch buffer won't be used in this case.
-        0 // Vec::with_capacity(0) does not allocate.
+    let mut scratch = match CaptureScratch::new(
+        stream.max_frames_in_buffer,
+        stream.bytes_per_frame,
+        stream.sample_format,
+    ) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            emit_error(error_callback, error);
+            return;
+        }
     };
-    let mut scratch_buffer = vec![0; scratch_len].into_boxed_slice();
 
     loop {
-        match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
+        match process_commands_and_await_signal(run_ctxt, error_callback) {
             ControlFlow::Break(()) => break,
             ControlFlow::Continue(false) => continue,
             ControlFlow::Continue(true) => {}
+        }
+        if !run_ctxt.control.active() {
+            break;
         }
         let capture_client = match run_ctxt.stream.client_flow {
             AudioClientFlow::Capture { ref capture_client } => capture_client.clone(),
@@ -653,10 +711,11 @@ fn run_input(
         };
         if let Err(err) = process_input(
             &run_ctxt.stream,
+            &run_ctxt.control,
             capture_client,
             data_callback,
             error_callback,
-            &mut scratch_buffer,
+            &mut scratch,
         ) {
             emit_error(error_callback, err);
             break;
@@ -665,7 +724,7 @@ fn run_input(
 }
 
 fn run_output(
-    mut run_ctxt: RunContext,
+    run_ctxt: &mut RunContext,
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
     error_callback: &ErrorCallbackArc,
 ) {
@@ -700,10 +759,13 @@ fn run_output(
     let mut frames_written: u64 = 0;
 
     loop {
-        match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
+        match process_commands_and_await_signal(run_ctxt, error_callback) {
             ControlFlow::Break(()) => break,
             ControlFlow::Continue(false) => continue,
             ControlFlow::Continue(true) => {}
+        }
+        if !run_ctxt.control.active() {
+            break;
         }
         let render_client = match run_ctxt.stream.client_flow {
             AudioClientFlow::Render { ref render_client } => render_client.clone(),
@@ -711,6 +773,7 @@ fn run_output(
         };
         if let Err(err) = process_output(
             &run_ctxt.stream,
+            &run_ctxt.control,
             render_client,
             data_callback,
             clock_frequency,
@@ -740,7 +803,7 @@ fn boost_current_thread_priority(
 
 // WASAPI never rebinds the IAudioClient, so report what's actually true instead of DeviceChanged.
 fn default_device_change_error(flow: Option<Audio::EDataFlow>) -> Error {
-    match flow.and_then(get_current_default) {
+    match flow.and_then(super::device::current_default_endpoint) {
         None => ErrorKind::DeviceNotAvailable.into(),
         Some(_) => ErrorKind::StreamInvalidated.into(),
     }
@@ -760,11 +823,14 @@ fn process_commands_and_await_signal(
         }
     };
 
-    if let Some(ref flag) = run_context.pending_device_changed {
-        if flag.swap(false, Ordering::Relaxed) {
+    if !run_context.control.active() {
+        return ControlFlow::Break(());
+    }
+    if let Some(monitor) = run_context.monitor.as_ref() {
+        if monitor.changed() {
             emit_error(
                 error_callback,
-                default_device_change_error(run_context.default_device_flow),
+                default_device_change_error(Some(monitor.flow)),
             );
         }
     }
@@ -783,51 +849,133 @@ fn process_commands_and_await_signal(
     // Continue(true)  = audio event fired, proceed to process audio this iteration.
     // Continue(false) = command or device-change event, loop around and wait again.
     if handle_idx >= 2 {
-        emit_error(
-            error_callback,
-            default_device_change_error(run_context.default_device_flow),
-        );
+        if let Some(monitor) = run_context.monitor.as_ref() {
+            if monitor.changed() {
+                emit_error(
+                    error_callback,
+                    default_device_change_error(Some(monitor.flow)),
+                );
+            }
+        }
         return ControlFlow::Continue(false);
     }
     ControlFlow::Continue(handle_idx != 0)
 }
 
+struct CaptureBuffer<'a> {
+    client: &'a Audio::IAudioCaptureClient,
+    frames: u32,
+    released: bool,
+    failed: &'a std::cell::Cell<Option<super::owner::WasapiCloseError>>,
+}
+impl CaptureBuffer<'_> {
+    fn release(&mut self) -> Result<(), Error> {
+        self.released = true; // no uncertain native retry in Drop
+        let status = unsafe {
+            (windows::core::Interface::vtable(self.client).ReleaseBuffer)(
+                windows::core::Interface::as_raw(self.client),
+                self.frames,
+            )
+        };
+        if status.0 != 0 {
+            self.failed
+                .set(Some(super::owner::WasapiCloseError::BufferRelease));
+            return Err(Error::with_message(
+                ErrorKind::StreamInvalidated,
+                "Capture buffer retirement could not be confirmed",
+            ));
+        }
+        Ok(())
+    }
+}
+impl Drop for CaptureBuffer<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.release();
+        }
+    }
+}
+struct RenderBuffer<'a> {
+    client: &'a Audio::IAudioRenderClient,
+    frames: u32,
+    released: bool,
+    failed: &'a std::cell::Cell<Option<super::owner::WasapiCloseError>>,
+}
+impl RenderBuffer<'_> {
+    fn release(&mut self) -> Result<(), Error> {
+        self.released = true;
+        let status = unsafe {
+            (windows::core::Interface::vtable(self.client).ReleaseBuffer)(
+                windows::core::Interface::as_raw(self.client),
+                self.frames,
+                0,
+            )
+        };
+        if status.0 != 0 {
+            self.failed
+                .set(Some(super::owner::WasapiCloseError::BufferRelease));
+            return Err(Error::with_message(
+                ErrorKind::StreamInvalidated,
+                "Render buffer retirement could not be confirmed",
+            ));
+        }
+        Ok(())
+    }
+}
+impl Drop for RenderBuffer<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.release();
+        }
+    }
+}
+
 // The loop for processing pending input data.
 fn process_input(
     stream: &StreamInner,
+    control: &super::owner::Control,
     capture_client: Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
     error_callback: &ErrorCallbackArc,
-    scratch_buffer: &mut [i32],
+    scratch: &mut CaptureScratch,
 ) -> Result<(), Error> {
     unsafe {
         // Get the available data in the shared buffer.
-        let mut buffer: *mut u8 = ptr::null_mut();
-        let mut flags = mem::MaybeUninit::uninit();
         loop {
+            if !control.active() {
+                return Ok(());
+            }
             let mut frames_available = match capture_client.GetNextPacketSize() {
                 Ok(0) => return Ok(()),
                 Ok(f) => f,
                 Err(err) => return Err(Error::from(err)),
             };
+            let mut buffer: *mut u8 = ptr::null_mut();
+            let mut flags = 0;
             let mut qpc_position: u64 = 0;
             let mut device_position: u64 = 0;
             let result = capture_client.GetBuffer(
                 &mut buffer,
                 &mut frames_available,
-                flags.as_mut_ptr(),
+                &mut flags,
                 Some(&mut device_position),
                 Some(&mut qpc_position),
             );
 
-            match result {
-                // TODO: Can this happen?
-                Err(e) if e.code() == Audio::AUDCLNT_S_BUFFER_EMPTY => continue,
-                Err(e) => return Err(Error::from(e)),
-                Ok(_) => (),
+            result.map_err(Error::from)?;
+            // The wrapper maps all successful HRESULTs to Ok, including
+            // AUDCLNT_S_BUFFER_EMPTY. For zero frames the SDK permits no
+            // ReleaseBuffer; data/timestamp outputs must not be admitted.
+            if frames_available == 0 {
+                return Ok(());
             }
 
-            let flags = flags.assume_init();
+            let mut acquired = CaptureBuffer {
+                client: &capture_client,
+                frames: frames_available,
+                released: false,
+                failed: &stream.cleanup_failure,
+            };
             // The discontinuity flag is undefined on the first GetBuffer after Start,
             // where device_position is still 0.
             if device_position != 0
@@ -836,39 +984,21 @@ fn process_input(
                 let _ = try_emit_error(error_callback, ErrorKind::Xrun.into());
             }
 
-            debug_assert!(!buffer.is_null());
-
-            let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
-            let data = if stream.sample_format == SampleFormat::I24 {
-                // WASAPI stores i24 in the upper bits
-                let source_data =
-                    slice::from_raw_parts(buffer.cast(), byte_count / size_of::<i32>());
-                // use a scratch buffer since the capture buffer isn't meant to be written
-                let dst = &mut scratch_buffer[..source_data.len()];
-                dst.copy_from_slice(source_data);
-                for sample in dst.iter_mut() {
-                    // On signed integers, >> is an arithmetic shift,
-                    // which ensures the correct upper bits get shifted in
-                    *sample >>= 8;
-                }
-
-                dst.as_mut_ptr().cast()
-            } else {
-                buffer.cast()
-            };
-
-            let len = byte_count / stream.sample_format.sample_size();
-            let data = Data::from_parts(data, len, stream.sample_format);
+            // Every nonzero packet is already guarded: invalid metadata,
+            // timestamp errors and callback unwinds still release it once.
+            let data = scratch
+                .packet(buffer, frames_available, flags)?
+                .ok_or_else(|| CaptureScratch::invalid("Capture packet unexpectedly empty"))?;
 
             // The `qpc_position` is in 100 nanosecond units. Convert it to nanoseconds.
             let timestamp = input_timestamp(stream, qpc_position)?;
             let info = InputCallbackInfo { timestamp };
-            data_callback(&data, &info);
+            if control.active() {
+                data_callback(&data, &info);
+            }
 
             // Release the buffer.
-            capture_client
-                .ReleaseBuffer(frames_available)
-                .context("Failed to release capture buffer")?;
+            acquired.release()?;
         }
     }
 }
@@ -876,6 +1006,7 @@ fn process_input(
 // The loop for writing output data.
 fn process_output(
     stream: &StreamInner,
+    control: &super::owner::Control,
     render_client: Audio::IAudioRenderClient,
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
     clock_frequency: u64,
@@ -889,6 +1020,12 @@ fn process_output(
 
     unsafe {
         let buffer = render_client.GetBuffer(frames_available)?;
+        let mut acquired = RenderBuffer {
+            client: &render_client,
+            frames: frames_available,
+            released: false,
+            failed: &stream.cleanup_failure,
+        };
 
         debug_assert!(!buffer.is_null());
 
@@ -902,7 +1039,9 @@ fn process_output(
         let sample_rate = stream.config.sample_rate;
         let timestamp = output_timestamp(stream, sample_rate, clock_frequency, *frames_written)?;
         let info = OutputCallbackInfo { timestamp };
-        data_callback(&mut data, &info);
+        if control.active() {
+            data_callback(&mut data, &info);
+        }
 
         if stream.sample_format == SampleFormat::I24 {
             // WASAPI stores i24 in the upper bits
@@ -916,7 +1055,7 @@ fn process_output(
             }
         }
 
-        render_client.ReleaseBuffer(frames_available, 0)?;
+        acquired.release()?;
 
         *frames_written += frames_available as u64;
     }
@@ -997,8 +1136,8 @@ fn output_timestamp(
 #[cfg(test)]
 mod tests {
     use super::{Command, OwnedEvent, Stream};
-    use crate::host::latch::Latch;
-    use std::sync::mpsc::{channel, Receiver};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::{sync_channel, Receiver};
     use std::sync::{Arc, Weak};
     use windows::Win32::{
         Foundation::WAIT_OBJECT_0,
@@ -1011,20 +1150,103 @@ mod tests {
     ) -> windows::core::Result<(Stream, Receiver<Command>, Arc<OwnedEvent>)> {
         let pending_scheduled_event = Arc::new(OwnedEvent::new()?);
         let worker_owner = Arc::clone(&pending_scheduled_event);
-        let (commands, receiver) = channel();
+        let (commands, receiver) = sync_channel(1);
         Ok((
             Stream {
-                thread: None,
                 commands,
                 pending_scheduled_event,
                 period_frames: 1,
                 qpc_frequency: 1,
-                _default_device_monitor: None,
-                latch: Latch::new(),
+                control: None,
+                ready: Arc::new(AtomicBool::new(false)),
             },
             receiver,
             worker_owner,
         ))
+    }
+
+    #[test]
+    fn capture_empty_success_never_admits_data_and_bounds_nonempty_packets() {
+        use super::CaptureScratch;
+        use crate::SampleFormat;
+        let mut scratch = CaptureScratch::new(2, 4, SampleFormat::F32).unwrap();
+        assert!(windows::Win32::Media::Audio::AUDCLNT_S_BUFFER_EMPTY
+            .ok()
+            .is_ok());
+        // Deliberately unusable pointer/flags: an empty success has no packet.
+        let empty = unsafe { scratch.packet(std::ptr::null(), 0, u32::MAX) }.unwrap();
+        assert!(empty.is_none());
+        assert!(unsafe { scratch.packet(std::ptr::null(), 3, 0) }.is_err());
+        assert!(unsafe { scratch.packet(std::ptr::null(), 1, 0) }.is_err());
+        let aligned = [0u64; 1];
+        let unaligned = unsafe { aligned.as_ptr().cast::<u8>().add(1) };
+        assert!(unsafe { scratch.packet(unaligned, 1, 0) }.is_err());
+        assert!(CaptureScratch::new(u32::MAX, u16::MAX, SampleFormat::F64).is_err());
+        assert!(CaptureScratch::new(1, 3, SampleFormat::F32).is_err());
+    }
+
+    #[test]
+    fn capture_silence_uses_owned_equilibrium_and_keeps_signed_24_conversion() {
+        use super::CaptureScratch;
+        use crate::SampleFormat;
+        let silent = windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32;
+        for format in [
+            SampleFormat::U8,
+            SampleFormat::I16,
+            SampleFormat::I24,
+            SampleFormat::I32,
+            SampleFormat::I64,
+            SampleFormat::F32,
+            SampleFormat::F64,
+        ] {
+            let size = format.sample_size();
+            let mut scratch = CaptureScratch::new(2, size as u16, format).unwrap();
+            // Dirty the real owned storage first, so zero initialization alone
+            // cannot masquerade as per-packet SILENT handling.
+            scratch.words.fill(u64::MAX);
+            let data = unsafe { scratch.packet(std::ptr::null(), 2, silent) }
+                .unwrap()
+                .unwrap();
+            let equilibrium = if format == SampleFormat::U8 { 0x80 } else { 0 };
+            assert_eq!(data.bytes(), vec![equilibrium; 2 * size]);
+            let pointer = data.bytes().as_ptr() as usize;
+            assert_eq!(pointer % size, 0);
+            let mut arbitrary = [0x7fu8; 17];
+            let data = unsafe { scratch.packet(arbitrary.as_mut_ptr().add(1), 2, silent) }
+                .unwrap()
+                .unwrap();
+            assert_eq!(data.bytes(), vec![equilibrium; 2 * size]);
+            assert_eq!(arbitrary, [0x7f; 17]);
+        }
+        let native = [i32::MIN, -256, 0, 0x7fff_ff00];
+        let mut scratch = CaptureScratch::new(4, 4, SampleFormat::I24).unwrap();
+        let data = unsafe { scratch.packet(native.as_ptr().cast(), 4, 0) }
+            .unwrap()
+            .unwrap();
+        let converted: Vec<i32> = data
+            .bytes()
+            .chunks_exact(4)
+            .map(|sample| i32::from_ne_bytes(sample.try_into().unwrap()))
+            .collect();
+        assert_eq!(converted, vec![-8_388_608, -1, 0, 8_388_607]);
+        assert_eq!(native, [i32::MIN, -256, 0, 0x7fff_ff00]);
+        let samples = [0x1234i16, -2];
+        let mut scratch = CaptureScratch::new(2, 2, SampleFormat::I16).unwrap();
+        // Timestamp uncertainty does not invalidate otherwise valid samples;
+        // this decoder does not construct or certify a timestamp.
+        let data = unsafe {
+            scratch.packet(
+                samples.as_ptr().cast(),
+                2,
+                windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32,
+            )
+        }
+        .unwrap()
+        .unwrap();
+        assert_eq!(data.bytes().as_ptr(), samples.as_ptr().cast::<u8>());
+        assert_eq!(data.bytes(), unsafe {
+            std::slice::from_raw_parts(samples.as_ptr().cast::<u8>(), 4)
+        });
     }
 
     #[test]
