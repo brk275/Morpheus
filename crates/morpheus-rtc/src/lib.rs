@@ -42,8 +42,9 @@ mod video_device;
 
 #[cfg(feature = "device-audio")]
 pub use audio_device::{
-    AudioControls, AudioDevice, AudioDeviceCatalog, AudioDeviceSelection, AudioOutput, AudioResume,
-    AudioRoute, AudioState, DeviceRoute, MicrophoneCapture, RouteNotice, audio_devices,
+    AudioControls, AudioDevice, AudioDeviceCatalog, AudioDeviceReleaseError, AudioDeviceSelection,
+    AudioOutput, AudioResume, AudioRoute, AudioState, DeviceRoute, MicrophoneCapture, RouteNotice,
+    audio_devices, wait_for_audio_device_release,
 };
 #[cfg(feature = "native-rtc")]
 pub use matrix_rtc_call_sdk::CallEvent as RtcCallEvent;

@@ -4752,6 +4752,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "native-calls"))]
         updates.shutdown().await
     });
+    #[cfg(feature = "native-calls")]
+    let device_open_result = runtime.block_on(morpheus_rtc::wait_for_audio_device_release());
+    #[cfg(feature = "native-calls")]
+    if let Err(error) = device_open_result {
+        // Call shutdown errors above are diagnostic-only. An unjoined native
+        // opener additionally prevents successful quit after remaining cleanup.
+        eprintln!("Could not release audio device opener during shutdown: {error}");
+    }
     let audio_result = runtime.block_on(audio_attachments::wait_for_release());
     if let Err(error) = audio_result {
         // Still flush drafts and stop the manager; failure is returned below.
@@ -4769,6 +4777,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(Box::new(error));
     }
     audio_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    #[cfg(feature = "native-calls")]
+    device_open_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.finish()?;
     Ok(())

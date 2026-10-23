@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -26,15 +26,190 @@ const CHUNK_SAMPLES_PER_CHANNEL: usize = 480; // 10 ms
 const MAX_OUTPUT_BUFFER_SAMPLES: usize = SAMPLE_RATE as usize; // 500 ms stereo
 const MAX_REMOTE_STREAMS: usize = 64;
 const REMOTE_FRAME_CHANNEL_CAPACITY: usize = 128;
-// A hung platform device open must not accumulate one blocked thread per
-// retry, or keep Tokio's blocking pool alive when the app quits.
+// One actual device opener (including unclaimed-result destruction and TLS)
+// remains fenced until its retained supervisor has joined it. No native result
+// is put in a Tokio channel: cancellation there must never drop a stream on a
+// runtime worker. CPAL's own backend disposal remains a separate contract.
 static DEVICE_OPEN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static DEVICE_OPEN_OWNER: Mutex<Option<DeviceOpenOwner>> = Mutex::new(None);
+const DEVICE_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
 
-struct DeviceOpenGuard;
-
+struct DeviceOpenGuard {
+    release_allowed: bool,
+}
 impl Drop for DeviceOpenGuard {
     fn drop(&mut self) {
-        DEVICE_OPEN_IN_PROGRESS.store(false, Ordering::SeqCst);
+        if self.release_allowed {
+            DEVICE_OPEN_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioDeviceReleaseError {
+    TimedOut,
+    WorkerPanicked,
+    SupervisorFailed,
+}
+impl std::fmt::Display for AudioDeviceReleaseError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::TimedOut => "audio device opener release was not confirmed before the deadline",
+            Self::WorkerPanicked => "audio device opener panicked during startup or release",
+            Self::SupervisorFailed => "audio device opener ownership could not be confirmed",
+        })
+    }
+}
+impl std::error::Error for AudioDeviceReleaseError {}
+#[derive(Default)]
+struct OpenCompletion {
+    result: Mutex<Option<Result<(), AudioDeviceReleaseError>>>,
+    handed_off: AtomicBool,
+}
+impl OpenCompletion {
+    fn finish(&self, result: Result<(), AudioDeviceReleaseError>) {
+        let mut stored = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        if stored.is_none() {
+            *stored = Some(result);
+        }
+    }
+    fn result(&self) -> Option<Result<(), AudioDeviceReleaseError>> {
+        *self.result.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+struct DeviceOpenOwner {
+    supervisor: Option<std::thread::JoinHandle<()>>,
+    completed: Arc<OpenCompletion>,
+}
+fn poll_device_open_owner(
+    owner: &mut Option<DeviceOpenOwner>,
+) -> Option<Result<(), AudioDeviceReleaseError>> {
+    let Some(active) = owner.as_mut() else {
+        return Some(Ok(()));
+    };
+    if let Some(Err(error)) = active.completed.result() {
+        return Some(Err(error));
+    }
+    let Some(supervisor) = active.supervisor.as_ref() else {
+        return Some(Err(AudioDeviceReleaseError::SupervisorFailed));
+    };
+    if !supervisor.is_finished() {
+        return None;
+    }
+    // Only the fixed join protocol ran on a successful supervisor. The actual
+    // opener and any unclaimed native value were already joined through TLS.
+    // The final std supervisor epilogue has no hard OS scheduling guarantee.
+    let joined = active
+        .supervisor
+        .take()
+        .expect("retained device supervisor")
+        .join();
+    if joined.is_err() || active.completed.result() != Some(Ok(())) {
+        active
+            .completed
+            .finish(Err(AudioDeviceReleaseError::SupervisorFailed));
+        return Some(Err(AudioDeviceReleaseError::SupervisorFailed));
+    }
+    *owner = None;
+    Some(Ok(()))
+}
+/// Observe the actual retained opener, including cancelled/late result cleanup.
+/// Caller cancellation cannot detach it. Call cleanup/rejoin and shutdown must
+/// consume this result before reporting release or releasing the call lease.
+pub async fn wait_for_audio_device_release() -> Result<(), AudioDeviceReleaseError> {
+    wait_for_device_release(DEVICE_RELEASE_TIMEOUT).await
+}
+async fn wait_for_device_release(bound: Duration) -> Result<(), AudioDeviceReleaseError> {
+    let until = tokio::time::Instant::now() + bound;
+    loop {
+        let released = poll_device_open_owner(
+            &mut DEVICE_OPEN_OWNER.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        if let Some(result) = released {
+            return result;
+        }
+        if tokio::time::Instant::now() >= until {
+            return Err(AudioDeviceReleaseError::TimedOut);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+struct OpenValue<T> {
+    value: Option<Result<T, MediaError>>,
+    retired: bool,
+    taken: bool,
+}
+struct OpenHandoff<T> {
+    value: Mutex<OpenValue<T>>,
+    changed: Condvar,
+    ready: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    waiting: AtomicBool,
+    completed: Arc<OpenCompletion>,
+}
+impl<T> OpenHandoff<T> {
+    fn new(completed: Arc<OpenCompletion>, ready: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self {
+            value: Mutex::new(OpenValue {
+                value: None,
+                retired: false,
+                taken: false,
+            }),
+            changed: Condvar::new(),
+            ready: Mutex::new(Some(ready)),
+            waiting: AtomicBool::new(true),
+            completed,
+        }
+    }
+    fn signal_ready(&self) -> bool {
+        self.ready
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some_and(|ready| ready.send(()).is_ok())
+    }
+    fn failed_start(&self) {
+        let mut state = self.value.lock().unwrap_or_else(|e| e.into_inner());
+        // A failed actual-thread creation has no native T. Preserve the
+        // original spawn error while the retained unit sender prevents a
+        // receiver-close race before the supervisor can publish that error.
+        state.value = Some(Err(MediaError::Device(
+            "could not start audio device setup".into(),
+        )));
+        if !self.signal_ready() {
+            state.retired = true;
+            self.waiting.store(false, Ordering::Release);
+        }
+    }
+    fn retire(&self) {
+        self.waiting.store(false, Ordering::Release);
+        self.value.lock().unwrap_or_else(|e| e.into_inner()).retired = true;
+        self.changed.notify_all();
+    }
+    fn take(&self, controls: &AudioControls) -> Result<T, MediaError> {
+        let mut handoff = self.value.lock().unwrap_or_else(|e| e.into_inner());
+        if handoff.retired || !self.waiting.load(Ordering::Acquire) || !controls.is_authorized() {
+            handoff.retired = true;
+            self.waiting.store(false, Ordering::Release);
+            self.changed.notify_all();
+            return Err(MediaError::CallEnded);
+        }
+        let Some(value) = handoff.value.take() else {
+            return Err(MediaError::Device("audio device setup task failed".into()));
+        };
+        // No await or fallible operation follows transfer to the caller. Until
+        // this exact take, only the actual native opener may destroy the value.
+        handoff.taken = true;
+        self.completed.handed_off.store(true, Ordering::Release);
+        self.changed.notify_all();
+        value
+    }
+}
+struct OpenObserver<T> {
+    handoff: Arc<OpenHandoff<T>>,
+    ready: tokio::sync::oneshot::Receiver<()>,
+}
+impl<T> Drop for OpenObserver<T> {
+    fn drop(&mut self) {
+        self.handoff.retire();
     }
 }
 
@@ -1607,84 +1782,209 @@ fn reconnect_open_fits(now: tokio::time::Instant, deadline: tokio::time::Instant
     now + DEVICE_OPEN_TIMEOUT <= deadline
 }
 
-/// What a device-open thread checks before and after every OS step: the
-/// controls still authorize audio, and the async owner still waits for the
-/// result (a timed-out or cancelled open drops its receiver).
-struct OpenGate<'a, T> {
+/// Original call authority plus the async observer's live request. A dropped or
+/// timed-out observer permanently retires later prepare/start steps, even when
+/// the native open already entered must finish on its retained owner thread.
+struct OpenGate<'a> {
     controls: &'a AudioControls,
-    reply: &'a tokio::sync::oneshot::Sender<Result<T, MediaError>>,
+    waiting: &'a AtomicBool,
 }
-
-impl<T> OpenGate<'_, T> {
+impl OpenGate<'_> {
     fn active(&self) -> bool {
-        self.controls.is_authorized() && !self.reply.is_closed()
+        self.controls.is_authorized() && self.waiting.load(Ordering::Acquire)
+    }
+}
+fn run_device_open<T: Send + 'static>(
+    controls: AudioControls,
+    handoff: Arc<OpenHandoff<T>>,
+    open: impl FnOnce(&OpenGate<'_>) -> Result<T, MediaError>,
+) -> Result<(), AudioDeviceReleaseError> {
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let gate = OpenGate {
+            controls: &controls,
+            waiting: &handoff.waiting,
+        };
+        if !gate.active() {
+            return Err(MediaError::CallEnded);
+        }
+        open(&gate)
+    }));
+    let panicked = opened.is_err();
+    let result =
+        opened.unwrap_or_else(|_| Err(MediaError::Device("audio device setup task failed".into())));
+    let mut state = handoff.value.lock().unwrap_or_else(|e| e.into_inner());
+    state.value = Some(result);
+    if !handoff.signal_ready() {
+        state.retired = true;
+        handoff.waiting.store(false, Ordering::Release);
+    }
+    loop {
+        if state.taken {
+            return if panicked {
+                Err(AudioDeviceReleaseError::WorkerPanicked)
+            } else {
+                Ok(())
+            };
+        }
+        if state.retired || !handoff.waiting.load(Ordering::Acquire) || !controls.is_authorized() {
+            state.retired = true;
+            let unclaimed = state.value.take();
+            drop(state);
+            // A stream/pair never crosses the unit-only readiness channel.
+            // Late results and receiver cancellation destroy it here, outside
+            // every mutex, before the supervisor can join this thread's TLS.
+            drop(unclaimed);
+            return if panicked {
+                Err(AudioDeviceReleaseError::WorkerPanicked)
+            } else {
+                Ok(())
+            };
+        }
+        state = handoff
+            .changed
+            .wait_timeout(state, Duration::from_millis(20))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
 }
 
-/// Open audio devices on their own thread, one open at a time in the
-/// process. CoreAudio can block inside AudioUnitSetProperty (for example while
-/// macOS resolves device permissions); on a Tokio worker that would starve the
-/// call's roster and remote video, so the OS work runs on a detached thread
-/// and the wait is bounded, letting the call leave cleanly. An open that is
-/// already in progress is reported, never waited for or retried here.
+/// Open devices on one retained native owner. Its supervisor is published
+/// before the actual worker may exist, and the global fence clears only after
+/// real join/TLS completion. Native open/drop already entered is non-preemptible;
+/// waits stay bounded and failed ownership remains fenced. This does not prove
+/// CPAL's detached backend monitors or native disposal status.
 async fn open_on_device_thread<T: Send + 'static>(
     controls: &AudioControls,
-    open: impl FnOnce(&OpenGate<'_, T>) -> Result<T, MediaError> + Send + 'static,
+    open: impl FnOnce(&OpenGate<'_>) -> Result<T, MediaError> + Send + 'static,
 ) -> Result<T, MediaError> {
-    if DEVICE_OPEN_IN_PROGRESS
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Err(MediaError::Device(
-            "audio device setup is still in progress".into(),
-        ));
-    }
-    let opening_guard = DeviceOpenGuard;
-    controls.ensure_authorized()?;
-    let opening_controls = controls.clone();
-    let (device_tx, device_rx) = tokio::sync::oneshot::channel();
-    let opened = std::thread::Builder::new()
-        .name("morpheus-audio-open".into())
-        .spawn(move || {
-            let opening = opening_guard;
-            // Receiver drop is only one stop signal. Leave and account
-            // revocation must also win while the async owner retains this
-            // receiver and is suspended in another media branch.
-            let result = {
-                let gate = OpenGate {
-                    controls: &opening_controls,
-                    reply: &device_tx,
-                };
-                open(&gate)
-            };
-            // An open nobody waits for is closed while the flag is still
-            // held. Otherwise the flag is released before the reply, so the
-            // owner's next open (the other device of the same switch) does
-            // not find it still held.
-            if device_tx.is_closed() {
-                drop(result);
-                drop(opening);
-            } else {
-                drop(opening);
-                let _ = device_tx.send(result);
-            }
-        });
-    if opened.is_err() {
-        // The captured opening guard also drops on thread-spawn failure.
-        return Err(MediaError::Device(
-            "could not start audio device setup".into(),
-        ));
-    }
-    // The OS thread is deliberately detached. If CoreAudio never returns,
-    // Tokio shutdown and the rest of the call UI still make progress.
-    let received = tokio::select! {
-        biased;
-        _ = controls.cancelled() => return Err(MediaError::CallEnded),
-        received = tokio::time::timeout(DEVICE_OPEN_TIMEOUT, device_rx) => received,
+    open_with_supervisor(controls, open, |supervise| {
+        std::thread::Builder::new()
+            .name("morpheus-audio-open-owner".into())
+            .spawn(supervise)
+    })
+    .await
+}
+async fn open_with_supervisor<T: Send + 'static>(
+    controls: &AudioControls,
+    open: impl FnOnce(&OpenGate<'_>) -> Result<T, MediaError> + Send + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>> + Send,
+) -> Result<T, MediaError> {
+    // Sequential microphone/speaker opens must not lose a route merely because
+    // a successfully handed-off previous result is finishing its joined tail.
+    // A genuinely pending/retired opener still fails busy, never starts a pool.
+    let finishing = {
+        let mut owner = DEVICE_OPEN_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+        match poll_device_open_owner(&mut owner) {
+            Some(Ok(())) => false,
+            Some(Err(error)) => return Err(MediaError::Device(error.to_string())),
+            None => owner
+                .as_ref()
+                .is_some_and(|active| active.completed.handed_off.load(Ordering::Acquire)),
+        }
     };
-    received
-        .map_err(|_| MediaError::Device("audio device initialization timed out".into()))?
-        .map_err(|_| MediaError::Device("audio device setup task failed".into()))?
+    if finishing {
+        tokio::select! {
+            biased;
+            _ = controls.cancelled() => return Err(MediaError::CallEnded),
+            released = wait_for_audio_device_release() => released.map_err(|error| MediaError::Device(error.to_string()))?,
+        }
+    }
+    let completed = Arc::new(OpenCompletion::default());
+    let (ready, received) = tokio::sync::oneshot::channel();
+    let handoff = Arc::new(OpenHandoff::new(completed.clone(), ready));
+    let mut observer = OpenObserver {
+        handoff: handoff.clone(),
+        ready: received,
+    };
+    {
+        let mut owner = DEVICE_OPEN_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+        match poll_device_open_owner(&mut owner) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Err(MediaError::Device(error.to_string())),
+            None => {
+                return Err(MediaError::Device(
+                    "audio device setup is still in progress".into(),
+                ));
+            }
+        }
+        if DEVICE_OPEN_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(MediaError::Device(
+                "audio device setup is still in progress".into(),
+            ));
+        }
+        let guard = DeviceOpenGuard {
+            release_allowed: true,
+        };
+        controls.ensure_authorized()?;
+        let opening_controls = controls.clone();
+        let (start, admitted) = std::sync::mpsc::sync_channel(1);
+        let finished = completed.clone();
+        let supervisor = spawn(Box::new(move || {
+            let mut guard = guard;
+            // On failure/drop before publication, no actual worker exists.
+            if admitted.recv().is_err() {
+                finished.finish(Ok(()));
+                return;
+            }
+            guard.release_allowed = false;
+            let worker_handoff = handoff.clone();
+            let opened = std::thread::Builder::new()
+                .name("morpheus-audio-open".into())
+                .spawn(move || run_device_open(opening_controls, worker_handoff, open));
+            match opened {
+                Err(_) => {
+                    // No actual worker exists. Publish the original spawn
+                    // error with the retained unit sender; no native T exists.
+                    handoff.failed_start();
+                    guard.release_allowed = true;
+                    finished.finish(Ok(()));
+                }
+                Ok(actual) => match actual.join() {
+                    Ok(Ok(())) => {
+                        guard.release_allowed = true;
+                        finished.finish(Ok(()));
+                    }
+                    Ok(Err(error)) => {
+                        finished.finish(Err(error));
+                    }
+                    Err(_) => {
+                        // Keep a failed fence. If the fixed protocol panicked
+                        // with an unclaimed result, only this retained native
+                        // supervisor destroys it, never a Tokio observer Drop.
+                        finished.finish(Err(AudioDeviceReleaseError::WorkerPanicked));
+                        handoff.retire();
+                        let orphan = handoff
+                            .value
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .value
+                            .take();
+                        drop(orphan);
+                    }
+                },
+            }
+        }))
+        .map_err(|_| MediaError::Device("could not start audio device setup".into()))?;
+        *owner = Some(DeviceOpenOwner {
+            supervisor: Some(supervisor),
+            completed: completed.clone(),
+        });
+        if start.send(()).is_err() {
+            completed.finish(Err(AudioDeviceReleaseError::SupervisorFailed));
+        }
+    }
+    tokio::select! {
+        biased;
+        _ = controls.cancelled() => Err(MediaError::CallEnded),
+        received = tokio::time::timeout(DEVICE_OPEN_TIMEOUT, &mut observer.ready) => {
+            received.map_err(|_| MediaError::Device("audio device initialization timed out".into()))?
+                .map_err(|_| MediaError::Device("audio device setup task failed".into()))?;
+            observer.handoff.take(controls)
+        },
+    }
 }
 
 /// A fresh join's first microphone and speaker: `start` (the chosen route),
@@ -2558,6 +2858,298 @@ mod tests {
             ),
             allowed,
         )
+    }
+
+    struct OpenTlsHold {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Drop for OpenTlsHold {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+        }
+    }
+    std::thread_local! {
+        static OPEN_TLS_HOLD: std::cell::RefCell<Option<OpenTlsHold>> = const { std::cell::RefCell::new(None) };
+    }
+    struct OpenDropRecord(std::sync::mpsc::SyncSender<std::thread::ThreadId>);
+    impl Drop for OpenDropRecord {
+        fn drop(&mut self) {
+            let _ = self.0.send(std::thread::current().id());
+        }
+    }
+    #[tokio::test]
+    async fn actual_opener_stays_owned_through_late_result_tls_and_sequential_handoff() {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+        let controls = guarded_controls(|| true);
+        let entered = Arc::new(AtomicBool::new(false));
+        let body = entered.clone();
+        let failed = open_with_supervisor(
+            &controls,
+            move |_| {
+                body.store(true, Ordering::Release);
+                Ok(())
+            },
+            |_supervisor| {
+                Err(std::io::Error::other(
+                    "synthetic supervisor creation failure",
+                ))
+            },
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(MediaError::Device(message)) if message == "could not start audio device setup")
+        );
+        assert!(!entered.load(Ordering::Acquire));
+        assert!(!DEVICE_OPEN_IN_PROGRESS.load(Ordering::SeqCst));
+        assert!(DEVICE_OPEN_OWNER.lock().unwrap().is_none());
+
+        // Retain the supervisor before its start gate is consumed, cancel the
+        // whole async owner, then admit it. No native constructor may run.
+        let (admit_supervisor, supervisor_admitted) = std::sync::mpsc::channel();
+        let entered = Arc::new(AtomicBool::new(false));
+        let body = entered.clone();
+        let mut cancelled_before_native = Box::pin(open_with_supervisor(
+            &controls,
+            move |_| {
+                body.store(true, Ordering::Release);
+                Ok(())
+            },
+            move |supervise| {
+                Ok(std::thread::spawn(move || {
+                    supervisor_admitted
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                    supervise();
+                }))
+            },
+        ));
+        assert!(
+            cancelled_before_native
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(
+            DEVICE_OPEN_OWNER
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .supervisor
+                .is_some()
+        );
+        drop(cancelled_before_native);
+        admit_supervisor.send(()).unwrap();
+        assert_eq!(wait_for_audio_device_release().await, Ok(()));
+        assert!(!entered.load(Ordering::Acquire));
+        assert!(!DEVICE_OPEN_IN_PROGRESS.load(Ordering::SeqCst));
+
+        let (opened, entered_open) = std::sync::mpsc::sync_channel(1);
+        let (allow_open, continue_open) = std::sync::mpsc::channel();
+        let (dropped, saw_drop) = std::sync::mpsc::sync_channel(1);
+        let (in_tls, tls_entered) = std::sync::mpsc::sync_channel(1);
+        let (release_tls, tls_release) = std::sync::mpsc::channel();
+        let mut opening = Box::pin(open_on_device_thread(&controls, move |_| {
+            OPEN_TLS_HOLD.with(|tls| {
+                *tls.borrow_mut() = Some(OpenTlsHold {
+                    entered: in_tls,
+                    release: tls_release,
+                })
+            });
+            let result = OpenDropRecord(dropped);
+            opened.send(std::thread::current().id()).unwrap();
+            continue_open.recv_timeout(Duration::from_secs(2)).unwrap();
+            Ok(result)
+        }));
+        assert!(
+            opening
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let actual_thread = entered_open.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Drop the whole suspended future, not just the cancellation signal.
+        // The actual result is late and its destructor must stay off Tokio.
+        drop(opening);
+        allow_open.send(()).unwrap();
+        assert_eq!(
+            saw_drop.recv_timeout(Duration::from_secs(2)).unwrap(),
+            actual_thread
+        );
+        assert_ne!(actual_thread, std::thread::current().id());
+        tls_entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(DEVICE_OPEN_IN_PROGRESS.load(Ordering::SeqCst));
+        assert_eq!(
+            wait_for_device_release(Duration::from_millis(20)).await,
+            Err(AudioDeviceReleaseError::TimedOut)
+        );
+        assert!(
+            matches!(open_on_device_thread(&controls, |_| Ok(())).await, Err(MediaError::Device(message)) if message == "audio device setup is still in progress")
+        );
+        assert!(
+            DEVICE_OPEN_OWNER
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .supervisor
+                .is_some()
+        );
+        release_tls.send(()).unwrap();
+        assert_eq!(wait_for_audio_device_release().await, Ok(()));
+        assert!(!DEVICE_OPEN_IN_PROGRESS.load(Ordering::SeqCst));
+
+        let (in_tls, tls_entered) = std::sync::mpsc::sync_channel(1);
+        let (release_tls, tls_release) = std::sync::mpsc::channel();
+        assert_eq!(
+            open_on_device_thread(&controls, move |_| {
+                OPEN_TLS_HOLD.with(|tls| {
+                    *tls.borrow_mut() = Some(OpenTlsHold {
+                        entered: in_tls,
+                        release: tls_release,
+                    })
+                });
+                Ok(1)
+            })
+            .await
+            .unwrap(),
+            1
+        );
+        tls_entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second_entered = Arc::new(AtomicBool::new(false));
+        let second = second_entered.clone();
+        let mut next = Box::pin(open_on_device_thread(&controls, move |_| {
+            second.store(true, Ordering::Release);
+            Ok(2)
+        }));
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(!second_entered.load(Ordering::Acquire));
+        release_tls.send(()).unwrap();
+        assert_eq!(next.await.unwrap(), 2);
+        assert_eq!(wait_for_audio_device_release().await, Ok(()));
+        assert!(DEVICE_OPEN_OWNER.lock().unwrap().is_none());
+        assert!(!DEVICE_OPEN_IN_PROGRESS.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn a_ready_unit_does_not_move_unclaimed_native_results_into_tokio() {
+        let controls = guarded_controls(|| true);
+        let completion = Arc::new(OpenCompletion::default());
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let handoff = Arc::new(OpenHandoff::new(completion, ready));
+        let mut observer = OpenObserver {
+            handoff: handoff.clone(),
+            ready: received,
+        };
+        let (dropped, saw_drop) = std::sync::mpsc::sync_channel(1);
+        let native = std::thread::spawn(move || {
+            run_device_open(controls, handoff, |_| Ok(OpenDropRecord(dropped)))
+        });
+        tokio::time::timeout(Duration::from_secs(2), &mut observer.ready)
+            .await
+            .unwrap()
+            .unwrap();
+        // Even after readiness is delivered, receiver Drop cannot destroy T.
+        drop(observer);
+        let drop_thread = saw_drop.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(drop_thread, native.thread().id());
+        assert_ne!(drop_thread, std::thread::current().id());
+        assert_eq!(native.join().unwrap(), Ok(()));
+    }
+    #[tokio::test]
+    async fn failed_actual_spawn_keeps_original_error_without_native_value_channel() {
+        let controls = guarded_controls(|| true);
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let completion = Arc::new(OpenCompletion::default());
+        let handoff = Arc::new(OpenHandoff::<()>::new(completion, ready));
+        let mut observer = OpenObserver {
+            handoff: handoff.clone(),
+            ready: received,
+        };
+        let supervisor = std::thread::spawn(move || handoff.failed_start());
+        tokio::time::timeout(Duration::from_secs(2), &mut observer.ready)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(observer.handoff.take(&controls), Err(MediaError::Device(message)) if message == "could not start audio device setup")
+        );
+        supervisor.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn caught_opener_panic_preserves_startup_error_and_does_not_prove_release() {
+        let controls = guarded_controls(|| true);
+        let completion = Arc::new(OpenCompletion::default());
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let handoff = Arc::new(OpenHandoff::<()>::new(completion.clone(), ready));
+        let mut observer = OpenObserver {
+            handoff: handoff.clone(),
+            ready: received,
+        };
+        let worker_controls = controls.clone();
+        let native = std::thread::spawn(move || {
+            run_device_open(worker_controls, handoff, |_| {
+                panic!("synthetic native opener panic")
+            })
+        });
+        tokio::time::timeout(Duration::from_secs(2), &mut observer.ready)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(observer.handoff.take(&controls), Err(MediaError::Device(message)) if message == "audio device setup task failed")
+        );
+        assert_eq!(
+            native.join().unwrap(),
+            Err(AudioDeviceReleaseError::WorkerPanicked)
+        );
+        completion.finish(Err(AudioDeviceReleaseError::WorkerPanicked));
+        let supervisor = std::thread::spawn(|| ());
+        let mut retained = Some(DeviceOpenOwner {
+            supervisor: Some(supervisor),
+            completed: completion,
+        });
+        assert_eq!(
+            poll_device_open_owner(&mut retained),
+            Some(Err(AudioDeviceReleaseError::WorkerPanicked))
+        );
+        assert!(retained.as_ref().unwrap().supervisor.is_some());
+        retained.take().unwrap().supervisor.unwrap().join().unwrap();
+    }
+    #[test]
+    fn missing_supervisor_completion_stays_failed_instead_of_releasing_the_owner() {
+        let completed = Arc::new(OpenCompletion::default());
+        let supervisor = std::thread::spawn(|| ());
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while !supervisor.is_finished() {
+            assert!(
+                std::time::Instant::now() < until,
+                "synthetic supervisor did not finish"
+            );
+            std::thread::yield_now();
+        }
+        let mut retained = Some(DeviceOpenOwner {
+            supervisor: Some(supervisor),
+            completed,
+        });
+        assert_eq!(
+            poll_device_open_owner(&mut retained),
+            Some(Err(AudioDeviceReleaseError::SupervisorFailed))
+        );
+        assert_eq!(
+            poll_device_open_owner(&mut retained),
+            Some(Err(AudioDeviceReleaseError::SupervisorFailed))
+        );
+        assert!(retained.is_some());
     }
 
     #[tokio::test]

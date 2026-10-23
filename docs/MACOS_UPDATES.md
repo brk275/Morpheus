@@ -165,6 +165,9 @@ the actual download/decoder/output worker, including its thread-local teardown,
 before reporting release. A bounded wait retains pending or failed ownership;
 its typed error is returned after draft flushing and account-manager shutdown,
 so an unconfirmed attachment release cannot produce a successful main result.
+Call device opening similarly retains its native worker and waits for actual
+join before releasing call/update exclusion; unconfirmed opener shutdown is
+returned after draft and account cleanup.
 That application-worker join proves return of the public stream destructor,
 while backend monitor joining, native stop/dispose success, device quiescence
 and actual normal AppWindow shutdown remain independent open gates. The original

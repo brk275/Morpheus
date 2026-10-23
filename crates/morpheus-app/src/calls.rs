@@ -1742,6 +1742,17 @@ impl CallController {
     /// worker has ended. The caller must present a warning that the server may
     /// still show a membership; this does not retry or confirm server leave.
     pub async fn abandon_failed_leave(&self) -> Result<(), CallControllerError> {
+        self.abandon_failed_leave_after_opener(morpheus_rtc::wait_for_audio_device_release())
+            .await
+    }
+
+    // Keep the actual opener wait at the same lease-release boundary. The
+    // private future parameter permits a held/failed receipt regression without
+    // opening a device or mutating RTC's retained global owner in app tests.
+    async fn abandon_failed_leave_after_opener(
+        &self,
+        opener: impl Future<Output = Result<(), morpheus_rtc::AudioDeviceReleaseError>>,
+    ) -> Result<(), CallControllerError> {
         let (token, mut done) = {
             let slot = self.shared.slot.lock().await;
             match &*slot {
@@ -1751,6 +1762,11 @@ impl CallController {
             }
         };
         let _ = wait_cleanup_done(&mut done).await?;
+        // A server-leave acknowledgement cannot abandon an unjoined native
+        // opener or its late result. Keep the shared call/update lease held.
+        opener
+            .await
+            .map_err(|error| CallControllerError::Cleanup(error.to_string()))?;
         // No other call can start while this slot is blocked, so any live
         // UI generation (including a rejoin's) belongs to this call.
         if self.shared.active_audio_token.load(Ordering::SeqCst) != 0
@@ -1825,7 +1841,7 @@ async fn wait_cleanup_done(
     .map_err(|_| CallControllerError::TimedOut("waiting for call worker"))?
 }
 
-// Read by the detached audio opener as well as the async call owner. Account
+// Read by the retained native audio opener as well as the async call owner. Account
 // and sync invalidation must not wait for the owner's next select-loop poll.
 // A transient sync loss is handled by the separate transmission gate at every
 // push (and the worker's pause); only the end of sticky sync revokes capture.
@@ -2482,6 +2498,12 @@ impl CallWorker {
                     cause.message()
                 ));
                 break (CallOutcome::Failed(error.to_string()), Ok(()));
+            }
+            // The cancelled audio future may have owned a pending native open.
+            // No new membership/media generation can treat its guard as joined.
+            if let Err(error) = morpheus_rtc::wait_for_audio_device_release().await {
+                let reason = error.to_string();
+                break (CallOutcome::Failed(reason.clone()), Err(reason));
             }
             // A pending invitation named the lost membership; it is never resent.
             let invitation_interrupted = std::mem::take(&mut invitation_pending);
@@ -3216,7 +3238,17 @@ impl CallWorker {
     }
 
     async fn finish_with(&mut self, cleanup: Result<(), String>, outcome: CallOutcome) {
+        // Revoke the old media generation before waiting for its native owner.
         self.shared.clear_media(self.token, self.presentation);
+        // A failed earlier cleanup already retains this lease and its original
+        // error. Successful call cleanup additionally requires actual opener
+        // completion; a timeout cannot publish Idle or release update exclusion.
+        let cleanup = match cleanup {
+            Ok(()) => morpheus_rtc::wait_for_audio_device_release()
+                .await
+                .map_err(|error| error.to_string()),
+            Err(original) => Err(original),
+        };
         {
             let mut slot = self.shared.slot.lock().await;
             let done = match &*slot {
@@ -3737,6 +3769,66 @@ mod tests {
         controller.abandon_failed_leave().await.unwrap();
         assert!(!controller.status().blocks_account_switch());
         assert!(controller.shared.update_activity.try_install().is_ok());
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_cannot_release_update_exclusion_without_actual_opener_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let activity = UpdateActivity::default();
+        let controller = CallController::new(manager, activity.clone());
+        let (_done, done) = watch::channel(Some(Err("server leave failed".into())));
+        controller.shared.reserve_update_lease().unwrap();
+        *controller.shared.slot.lock().await = CallSlot::CleanupFailed { token: 7, done };
+        controller
+            .shared
+            .status
+            .send_replace(CallStatus::CleanupFailed {
+                account_id: "account-a".into(),
+                room_id: "!room-a:example.org".into(),
+                reason: "server leave failed".into(),
+            });
+        let (release, released) = oneshot::channel();
+        let mut acknowledgement = Box::pin(
+            controller.abandon_failed_leave_after_opener(async { released.await.unwrap() }),
+        );
+        assert!(futures_util::poll!(acknowledgement.as_mut()).is_pending());
+        assert!(matches!(
+            activity.try_install(),
+            Err(UpdateError::CallActive)
+        ));
+        // Dropping the UI's wait cannot publish Idle or release the existing
+        // lease. The RTC owner is independently retained, never in this future.
+        drop(acknowledgement);
+        drop(release);
+        assert!(controller.status().blocks_account_switch());
+        assert!(matches!(
+            activity.try_install(),
+            Err(UpdateError::CallActive)
+        ));
+        for error in [
+            morpheus_rtc::AudioDeviceReleaseError::TimedOut,
+            morpheus_rtc::AudioDeviceReleaseError::WorkerPanicked,
+            morpheus_rtc::AudioDeviceReleaseError::SupervisorFailed,
+        ] {
+            assert!(matches!(
+                controller.abandon_failed_leave_after_opener(async { Err(error) }).await,
+                Err(CallControllerError::Cleanup(reason)) if reason == error.to_string()
+            ));
+            assert!(controller.status().blocks_account_switch());
+            assert!(matches!(
+                activity.try_install(),
+                Err(UpdateError::CallActive)
+            ));
+        }
+        // The server-leave warning is still an explicit acknowledgement: only
+        // actual local completion allows its existing path to clear the lease.
+        controller
+            .abandon_failed_leave_after_opener(async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(matches!(controller.status(), CallStatus::Idle));
+        assert!(activity.try_install().is_ok());
     }
 
     #[tokio::test]
