@@ -512,7 +512,7 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                  "vendor/cpal/LICENSE": b"Fixture CPAL license\n",
                  "vendor/cpal/OWNED_COREAUDIO.md": b"Fixture exact local patch provenance\n",
                  "vendor/cpal/OWNED_ALSA.md": b"Fixture exact ALSA patch provenance\n",
-                 "vendor/alsa/Cargo.toml": b'[package]\nname = "alsa"\nversion = "0.11.0"\nlicense = "Apache-2.0 OR MIT"\n',
+                 "vendor/alsa/Cargo.toml": b'[package]\nname = "alsa"\nversion = "0.11.0"\nlicense = "Apache-2.0/MIT"\n',
                  "vendor/alsa/Cargo.toml.orig": b"Fixture preserved upstream manifest\n",
                  "vendor/alsa/LICENSE-APACHE": b"Fixture ALSA Apache license\n",
                  "vendor/alsa/LICENSE-MIT": b"Fixture ALSA MIT license\n",
@@ -585,7 +585,7 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
         self.assertIn(b"Fixture exact ALSA patch provenance", contents[native_notices.TEXT])
         alsa = next(item for item in parsed["locked_packages"] if item["name"] == "alsa")
         self.assertEqual(alsa["source"], "committed-workspace")
-        self.assertEqual(alsa["declared_license"], "Apache-2.0 OR MIT")
+        self.assertEqual(alsa["declared_license"], "Apache-2.0/MIT")
         self.assertTrue({"vendor/alsa/LICENSE-APACHE", "vendor/alsa/LICENSE-MIT"}.issubset(
             {item["source_path"] for item in alsa["license_texts"]}))
         self.assertIn({"source_path": "vendor/cpal/OWNED_ALSA.md",
