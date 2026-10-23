@@ -555,10 +555,17 @@ export component TokenSelect inherits Rectangle {
                                 : row.has-hover ? root.row-hover : transparent;
                             accessible-role: list-item;
                             accessible-label: value;
+                            accessible-enabled: root.enabled;
                             accessible-item-selectable: true;
                             accessible-item-selected: index == root.current-index;
                             accessible-item-index: index;
                             accessible-item-count: root.model.length;
+                            accessible-action-default => {
+                                if root.enabled {
+                                    root.choose(index);
+                                    popup.close();
+                                }
+                            }
                             Text {
                                 x: StyleTokens.input-padding;
                                 width: max(0px, parent.width - 2 * StyleTokens.input-padding);

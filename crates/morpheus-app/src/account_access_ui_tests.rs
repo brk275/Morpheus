@@ -4922,9 +4922,41 @@ async fn assert_live_preview(ui: &AppWindow) {
 /// The themed select keeps ComboBox's keyboard contract: Up and Down choose
 /// directly, Return opens the list without choosing, keys in the list choose
 /// live, Escape closes it with focus back on the select, and a disabled
-/// select ignores keys.
+/// select ignores keys and late accessibility actions. Options expose an actual
+/// default action that chooses and closes without applying a customization.
 async fn assert_themed_select(ui: &AppWindow) {
-    use std::{cell::RefCell, rc::Rc};
+    use slint::private_unstable_api::re_exports::{
+        AccessibilityAction, AccessibleStringProperty, ItemRc, SupportedAccessibilityAction,
+        WindowInner,
+    };
+    use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
+
+    // Read the actual generated popup item, not a callback or a source string.
+    fn popup_option(ui: &AppWindow, label: &str) -> ItemRc {
+        let window = WindowInner::from_pub(ui.window());
+        let popup_root = {
+            let popups = window.active_popups();
+            assert_eq!(popups.len(), 1, "the select owns one open list");
+            ItemRc::new_root(popups[0].component.clone())
+        };
+        let mut options = Vec::new();
+        let _ = popup_root.visit_descendants(|item| {
+            if item
+                .accessible_string_property(AccessibleStringProperty::Label)
+                .as_deref()
+                == Some(label)
+                && item
+                    .accessible_string_property(AccessibleStringProperty::ItemSelectable)
+                    .as_deref()
+                    == Some("true")
+            {
+                options.push(item.clone());
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        assert_eq!(options.len(), 1, "the requested option is unique");
+        options.pop().unwrap()
+    }
 
     let chosen = Rc::new(RefCell::new(Vec::<String>::new()));
     let record = chosen.clone();
@@ -5008,8 +5040,67 @@ async fn assert_themed_select(ui: &AppWindow) {
     ui.set_font_scale_percent(previous_scale);
     settle(ui).await;
 
+    // An assistive client can choose a real customization option after
+    // expanding its named combobox. Choosing a reset section never resets it.
+    let previous_section = ui.get_studio_reset_index();
+    let pending = ui.get_studio_pending();
+    ui.set_studio_reset_index(0);
+    assert!(crate::settings_search::reveal(ui, "appearance.studio"));
+    settle(ui).await;
+    let section = "Section to reset";
+    control_with_label(ui, section).accessible_action(&AccessibilityAction::Expand);
+    settle(ui).await;
+    let option = popup_option(ui, "Shapes and spacing");
+    assert!(
+        option
+            .supported_accessibility_actions()
+            .contains(SupportedAccessibilityAction::Default)
+    );
+    assert_eq!(
+        option
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("true")
+    );
+    option.accessible_action(&AccessibilityAction::Default);
+    settle(ui).await;
+    assert_eq!(ui.get_studio_reset_index(), 2);
+    assert_eq!(
+        ui.get_studio_pending(),
+        pending,
+        "selection applies nothing"
+    );
+    assert!(
+        WindowInner::from_pub(ui.window())
+            .active_popups()
+            .is_empty()
+    );
+    assert!(focused_control_has_label(ui, section), "focus returns");
+    ui.set_studio_reset_index(previous_section);
+
+    // Keep an actual popup item across disabling/closing. A late AT action
+    // must obey the same enabled guard and cannot change a call preference.
+    assert!(crate::settings_search::reveal(ui, "media.audio_devices"));
+    settle(ui).await;
+    control_with_label(ui, label).accessible_action(&AccessibilityAction::Expand);
+    settle(ui).await;
+    let stale = popup_option(ui, "System default");
+    let before = chosen.borrow().len();
     ui.set_audio_devices_busy(true);
     settle(ui).await;
+    assert_eq!(
+        stale
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("false")
+    );
+    stale.accessible_action(&AccessibilityAction::Default);
+    settle(ui).await;
+    assert_eq!(
+        chosen.borrow().len(),
+        before,
+        "disabled AT action is refused"
+    );
     key(ui, Key::UpArrow);
     assert_eq!(ui.get_audio_microphone_index(), 1, "disabled");
     assert_eq!(switched.get(), 0, "choosing never switches the call");
