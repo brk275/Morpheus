@@ -452,7 +452,14 @@ class PreparationTests(unittest.TestCase):
                                          "runtime": {"sha256": "c" * 64}, "sources": {}, "patches": {}})
             self.assertEqual(set(prepared["components"]), {"morpheus-app", N.client.SONAME, "libsample.so.1"})
             resolver.assert_called_once_with("libsample.so.1")
-            self.assertEqual(len(prepared["notices"]), 6)
+            self.assertEqual(set(prepared["notices"]), {
+                N.NOTICE_ROOT + "/" + name for name in (
+                    "libsample1_amd64.copyright", "common-MIT", "Morpheus-LICENSE",
+                    "CPAL-0.18.2-LICENSE", "CPAL-0.18.2-PATCH.md",
+                    "ALSA-0.11.0-PATCH.md", "ALSA-0.11.0-LICENSE-APACHE",
+                    "ALSA-0.11.0-LICENSE-MIT",
+                )
+            } | {N.client.NOTICE_DIR + "/COPYING"})
             for path, destination in config["appimage"]["files"].items():
                 self.assertEqual(N.digest(Path(path).read_bytes()), prepared["notices"][destination])
             self.assertNotIn(str(root), str(prepared))
