@@ -165,7 +165,11 @@ fn bundle_identity_binds_plist_resources_file_modes_and_internal_links() {
 #[test]
 fn real_unsigned_producer_roundtrips_exact_link_modes_through_native_reader_and_backup_copy() {
     let root = tempfile::tempdir().unwrap();
-    let app = root.path().join("Morpheus.app");
+    // TempDir keeps cleanup ownership. Resolve only this owned fixture root:
+    // macOS temporary paths may contain aliases, while the real notice reader
+    // deliberately refuses every symlink ancestor of its evidence inputs.
+    let physical_root = root.path().canonicalize().unwrap();
+    let app = physical_root.join("Morpheus.app");
     let identity = PackageMetadata::embedded().unwrap();
     bundle(&app, &identity);
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -225,7 +229,7 @@ fn real_unsigned_producer_roundtrips_exact_link_modes_through_native_reader_and_
             "generated-preferred-source-forms", "relinking-and-installation-information",
             "legal-distribution-approval"]
     });
-    let notices = root.path().join("notices");
+    let notices = physical_root.join("notices");
     fs::DirBuilder::new().mode(0o700).create(&notices).unwrap();
     for (name, bytes) in [
         ("THIRD-PARTY-NOTICES.txt", text.to_vec()),
@@ -250,7 +254,7 @@ fn real_unsigned_producer_roundtrips_exact_link_modes_through_native_reader_and_
         cargo_packager_updater::macos_archive::restore_owned_symlink_mode(&path, mode).unwrap();
     }
     let expected = tree_hash(&app).unwrap();
-    let archive = root.path().join("Morpheus.app.tar.gz");
+    let archive = physical_root.join("Morpheus.app.tar.gz");
     // Only the reviewed producer runs on synthetic fixture data, on the fresh
     // Mac runner. The inert Mach-O bytes are never executed or installed.
     let produced = Command::new("python3")
@@ -285,7 +289,7 @@ fn real_unsigned_producer_roundtrips_exact_link_modes_through_native_reader_and_
     assert_eq!(receipt["bundle_sha256"].as_str(), Some(expected.as_str()));
     assert_eq!(receipt["signed"], false);
     let bytes = fs::read(&archive).unwrap();
-    let destination = root.path().join("extracted");
+    let destination = physical_root.join("extracted");
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&destination)
@@ -295,7 +299,7 @@ fn real_unsigned_producer_roundtrips_exact_link_modes_through_native_reader_and_
             .unwrap();
     assert_eq!(bundle_metadata(&unpacked).unwrap(), identity);
     assert_eq!(tree_hash(&unpacked).unwrap(), expected);
-    let backup = root.path().join("backup.app");
+    let backup = physical_root.join("backup.app");
     copy_bundle(&unpacked, &backup).unwrap();
     assert_eq!(tree_hash(&backup).unwrap(), expected);
     assert_eq!(tree_hash(&app).unwrap(), expected);
