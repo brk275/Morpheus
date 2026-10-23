@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn explicit_target_keeps_current_machine_and_imports_prepared_empty_export() {
+    async fn test_explicit_target_keeps_current_machine_and_imports_prepared_empty_export() {
         let client = logged_in_client(None).await;
         let encryption = client.encryption();
         let snapshot = encryption.prepare_room_key_export().await.unwrap();
