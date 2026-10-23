@@ -7,6 +7,7 @@ import struct
 import tarfile
 import os
 import re
+import sys
 from unittest import mock
 import unittest
 from pathlib import Path
@@ -591,6 +592,16 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises((ValueError, RuntimeError)):
                 native_notices.prepare_bytes(*build(**options), revision, platform="win32", version="0.1.0")
 
+    def test_private_windows_source_export_refuses_drives_ads_devices_and_prefix_aliases(self):
+        seen={}
+        self.assertEqual(native_notices.portable_source_name("vendor/cpal/LICENSE",seen,windows=True),
+                         "vendor/cpal/LICENSE")
+        for name in ("C:/outside", "file:stream", "dir/NUL.txt", "dir/COM1", "dir/end.", "dir/end ", "dir/a?b"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                native_notices.portable_source_name(name,{},windows=True)
+        with self.assertRaises(ValueError):native_notices.portable_source_name("Vendor/other",seen,windows=True)
+        with self.assertRaises(ValueError):native_notices.portable_source_name("/".join(["p"]*33),{},windows=True)
+
     def test_changed_bundle_raw_commit_tree_or_legacy_identity_is_rejected(self):
         source, files, manifest, revision, build = self.evidence()
         for mutation in ("legacy", "raw_commit", "tree"):
@@ -658,6 +669,17 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
             self.assertEqual(selected["CARGO_NET_GIT_FETCH_WITH_CLI"],"false")
             self.assertNotIn("/personal",selected["PATH"])
 
+    def test_pinned_windows_tools_use_explicit_rustup_without_requiring_posix_home(self):
+        from scripts import native_notice_source as acquisition
+        with mock.patch.object(acquisition, "os", type("Windows",(),{"name":"nt"})()), \
+                mock.patch.object(acquisition.sys,"platform","win32"), \
+                mock.patch.object(acquisition.platform,"machine",return_value="AMD64"), \
+                mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)):
+            cargo,rustc,git,rustup=acquisition.tools({"RUSTUP_HOME":"/pinned/rustup","ProgramFiles":"/programs"})
+        self.assertEqual(cargo.name,"cargo.exe");self.assertEqual(rustc.name,"rustc.exe")
+        self.assertEqual(rustup,Path("/pinned/rustup"))
+        self.assertIn("1.99.0-x86_64-pc-windows-msvc",str(cargo))
+
     def test_source_origin_policy_matches_existing_linux_route_without_importing_it_on_windows(self):
         from scripts import native_notice_source as acquisition
         self.assertEqual(len(acquisition.PINS),3)
@@ -669,6 +691,37 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
         self.assertEqual(len(acquisition.source_inputs(files)),3)
         foreign = dict(files);foreign["app/Cargo.toml"] += b'[dependencies]\nforeign = {git = "https://example.org/repo", rev = "a"}\n'
         with self.assertRaises(ValueError):acquisition.source_inputs(foreign)
+
+
+class NativeNoticeCommandOwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform in {"darwin","win32"},"native retained command route")
+    def test_separate_raw_streams_and_output_overrun_stop_before_observation(self):
+        from scripts import native_notice_source as acquisition
+        for overflow in (False,True):
+            with self.subTest(overflow=overflow), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary).resolve()
+                for name in ("logs","temp"):(root/name).mkdir(mode=0o700)
+                environment={key:os.environ[key] for key in ("SystemRoot","WINDIR") if key in os.environ}
+                environment.update(HOME=str(root),USERPROFILE=str(root),PATH=str(Path(sys.executable).resolve().parent))
+                commands=acquisition.Commands(root,environment)
+                program='import os; os.write(1,b"x"*4097); os.write(2,b"stderr")' if overflow else \
+                        'import os; os.write(1,b"raw-git-object"); os.write(2,b"independent-stderr")'
+                # File/ACL admission is covered separately; this actual retained
+                # child case isolates raw pipe bounds, process cleanup and EOF.
+                with mock.patch.object(acquisition,"checked",side_effect=lambda path,**kwargs:Path(path)):
+                    if overflow:
+                        with self.assertRaises(ValueError):
+                            commands.run("fixture",[str(Path(sys.executable).resolve()),"-I","-B","-c",program],
+                                cwd=root,env=environment,timeout=10,output_limit=4096)
+                    else:
+                        data=commands.run("fixture",[str(Path(sys.executable).resolve()),"-I","-B","-c",program],
+                            cwd=root,env=environment,timeout=10,output_limit=4096)
+                        self.assertEqual(data,b"raw-git-object")
+                        self.assertEqual((root/"logs/00001.err").read_bytes(),b"independent-stderr")
+                self.assertFalse(commands.cleanup_failed)
+                self.assertFalse(commands.retained)
+                self.assertEqual(commands.logs_complete,not overflow)
+                self.assertLessEqual((root/"logs/00001.out").stat().st_size,4096)
 
 
 class NativeNoticeWindowsOwnershipTests(unittest.TestCase):

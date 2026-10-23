@@ -1,4 +1,10 @@
-"""An explicit, offline source archive for a reviewed Linux package revision.
+"""An explicit, offline source archive for a reviewed Morpheus revision.
+
+Linux retains its namespace-contained caller. The separate native notice caller
+supplies owned Mac/Windows inputs; no build or transport is added to this helper.
+Git identity schema 2 includes the bounded raw commit object so later consumers
+can independently authenticate commit-to-tree membership. Outer/receipt schemas
+and historical evidence are not rewritten.
 
 This records the complete committed workspace and every Cargo.lock source, not
 legal compliance or permission to distribute a binary. Nothing is checked out,

@@ -68,7 +68,7 @@ def write_new(path, data):
 
 
 def guard(environment, system=sys.platform):
-    require(system in {"darwin", "win32"})
+    require(system in {"darwin", "win32"} and sys.version_info >= (3,12))
     for key, value in {"GITHUB_ACTIONS":"true", "RUNNER_ENVIRONMENT":"github-hosted",
             "GITHUB_REPOSITORY":"brk275/Morpheus", "GITHUB_REF":"refs/heads/main",
             "GITHUB_EVENT_NAME":"workflow_dispatch", "GITHUB_ACTOR":"brk275", "GITHUB_TRIGGERING_ACTOR":"brk275",
@@ -123,7 +123,10 @@ def tools(environment):
     host = {("darwin", "arm64"):"aarch64-apple-darwin", ("darwin", "x86_64"):"x86_64-apple-darwin",
             ("win32", "AMD64"):"x86_64-pc-windows-msvc"}.get((sys.platform, platform.machine()))
     require(host is not None)
-    home = Path(environment.get("RUSTUP_HOME", str(Path(environment.get("USERPROFILE", environment["HOME"])) / ".rustup")))
+    original_home = environment.get("USERPROFILE") if os.name == "nt" else environment.get("HOME")
+    rustup_value = environment.get("RUSTUP_HOME")
+    require(bool(rustup_value) or bool(original_home))
+    home = Path(rustup_value) if rustup_value else Path(original_home)/".rustup"
     rustup = checked(home, directory=True)
     suffix = ".exe" if os.name == "nt" else ""
     directory = rustup / ("toolchains/1.99.0-" + host) / "bin"
@@ -164,68 +167,106 @@ class Commands:
     def __init__(self, root, environment):
         self.root, self.environment = root, environment
         self.logs = root/"logs"; self.sequence = 0; self.cleanup_failed = False
-        self.retained = []; self.bytes = 0; self.deadline = time.monotonic() + 1800
+        self.retained = []; self.bytes = 0; self.logs_complete = True; self.deadline = time.monotonic() + 1800
 
     def run(self, stage, command, *, cwd, env, timeout, output_limit, stderr_limit=65536, log_root=None,
             expected_status=(0,), binary_output=False, stdin_bytes=None):
         require(self.sequence < 16000 and 0 < timeout <= 1200 and 0 < output_limit <= 128*1024**2
                 and 0 < stderr_limit <= 8*1024**2)
         checked(Path(command[0])); checked(cwd, directory=True)
-        timeout = min(timeout, self.deadline - time.monotonic())
-        require(timeout > 0)
+        timeout = min(timeout, self.deadline - time.monotonic()); require(timeout > 0)
         self.sequence += 1
-        output, errors = ((self.logs if log_root is None else log_root)/(str(self.sequence).zfill(5) + suffix) for suffix in (".out", ".err"))
+        output, errors = ((self.logs if log_root is None else log_root)/(str(self.sequence).zfill(5) + suffix)
+                          for suffix in (".out", ".err"))
         process = job = handle = None
         status = None
-        try:
-            with contextlib.ExitStack() as stack:
-                out = stack.enter_context(output.open("xb")); err = stack.enter_context(errors.open("xb"))
-                input_stream = None
-                if stdin_bytes is not None:
-                    require(type(stdin_bytes) is bytes and len(stdin_bytes) <= 1024*1024)
-                    input_stream = stack.enter_context(tempfile.TemporaryFile(dir=self.root/"temp"))
-                    input_stream.write(stdin_bytes); input_stream.seek(0)
-                if os.name != "nt": os.fchmod(out.fileno(),0o600); os.fchmod(err.fileno(),0o600)
-                if os.name == "nt":
-                    if __package__: from .run_windows_capture_acceptance import WindowsJob
-                    else: from run_windows_capture_acceptance import WindowsJob
-                    job = WindowsJob()
-                    handle = job.spawn(list(map(str,command)), env, out, cwd=cwd, stderr_stream=err, stdin_stream=input_stream)
-                else:
-                    process = subprocess.Popen(list(map(str,command)), cwd=cwd, env=env, stdin=subprocess.DEVNULL if input_stream is None else input_stream,
-                        stdout=out, stderr=err, start_new_session=True)
-            deadline = time.monotonic() + timeout
-            while True:
-                require(output.stat().st_size <= output_limit and errors.stat().st_size <= stderr_limit)
-                if os.name == "nt":
-                    outcome = job.kernel.WaitForSingleObject(handle, 0)
-                    require(outcome in (0,258))
-                    if outcome == 0:
-                        status = job.wait(handle, 0); break
-                else:
-                    if __package__: from . import package_smoke as smoke
-                    else: import package_smoke as smoke
-                    status = smoke.process_status(process)  # WNOWAIT, not poll/reap.
-                    if status is not None: break
-                require(time.monotonic() < deadline)
-                time.sleep(.025)
-        finally:
+        with contextlib.ExitStack() as stack:
+            destinations = [stack.enter_context(path.open("xb")) for path in (output,errors)]
+            readers, writers = [], []
+            counts, eof, limits = [0,0], [False,False], [output_limit,stderr_limit]
+            for destination in destinations:
+                if os.name != "nt": os.fchmod(destination.fileno(),0o600)
+                reader,writer=os.pipe()
+                try:
+                    # CPython >=3.12 supports nonblocking anonymous pipes on
+                    # Windows; failure is refusal before any child is created.
+                    os.set_blocking(reader,False)
+                    readers.append(stack.enter_context(os.fdopen(reader,"rb",buffering=0)));reader=None
+                    writers.append(stack.enter_context(os.fdopen(writer,"wb",buffering=0)));writer=None
+                finally:
+                    if reader is not None:os.close(reader)
+                    if writer is not None:os.close(writer)
+            input_stream = None
+            if stdin_bytes is not None:
+                require(type(stdin_bytes) is bytes and len(stdin_bytes) <= 1024*1024)
+                input_stream=stack.enter_context(tempfile.TemporaryFile(dir=self.root/"temp"))
+                input_stream.write(stdin_bytes);input_stream.seek(0)
+            def collect():
+                progress=False
+                for index,reader in enumerate(readers):
+                    if eof[index]:continue
+                    try:data=os.read(reader.fileno(),65536)
+                    except BlockingIOError:continue
+                    if not data:eof[index]=True;continue
+                    progress=True
+                    remaining=limits[index]-counts[index]
+                    destinations[index].write(data[:remaining]);counts[index]+=min(len(data),remaining)
+                    if len(data)>remaining:
+                        self.logs_complete=False
+                        raise ValueError("Native source command output bound exceeded")
+                return progress
             try:
-                if job is not None: job.close()
-                if process is not None:
-                    if __package__: from .macos_package_ui import stop_group
-                    else: from macos_package_ui import stop_group
-                    stop_group(process)
-            except BaseException:
-                self.cleanup_failed = True
-                self.retained.append((process,job))
-                raise
+                if os.name == "nt":
+                    if __package__:from .run_windows_capture_acceptance import WindowsJob
+                    else:from run_windows_capture_acceptance import WindowsJob
+                    job=WindowsJob()
+                    handle=job.spawn(list(map(str,command)),env,writers[0],cwd=cwd,
+                                     stderr_stream=writers[1],stdin_stream=input_stream)
+                else:
+                    process=subprocess.Popen(list(map(str,command)),cwd=cwd,env=env,
+                        stdin=subprocess.DEVNULL if input_stream is None else input_stream,
+                        stdout=writers[0],stderr=writers[1],start_new_session=True)
+                for writer in writers:writer.close()  # Only child copies remain.
+                deadline=time.monotonic()+timeout
+                while True:
+                    progress=collect()
+                    if os.name=="nt":
+                        outcome=job.kernel.WaitForSingleObject(handle,0);require(outcome in (0,258))
+                        if outcome==0:status=job.wait(handle,0);break
+                    else:
+                        if __package__:from . import package_smoke as smoke
+                        else:import package_smoke as smoke
+                        status=smoke.process_status(process)  # Exact unreaped child.
+                        if status is not None:break
+                    require(time.monotonic()<deadline)
+                    if not progress:time.sleep(.005)
+            finally:
+                # Close parent writers even on a failed suspended creation.
+                for writer in writers:writer.close()
+                try:
+                    if job is not None:job.close()
+                    if process is not None:
+                        if __package__:from .macos_package_ui import stop_group
+                        else:from macos_package_ui import stop_group
+                        stop_group(process)
+                except BaseException:
+                    self.cleanup_failed=True;self.retained.append((process,job));raise
+                finally:
+                    # Retained process cleanup precedes the EOF receipt. Never
+                    # scan a capped prefix as a complete raw command log.
+                    drain_deadline=time.monotonic()+2
+                    try:
+                        while not all(eof):
+                            progress=collect()
+                            if not progress:
+                                require(time.monotonic()<drain_deadline);time.sleep(.005)
+                    except BaseException:
+                        self.logs_complete=False;raise
+                    finally:
+                        for destination in destinations:destination.flush();os.fsync(destination.fileno())
         require(status in expected_status)
-        data = S.read_owned(output, output_limit, private=True) if output.stat().st_size else b""
-        error_bytes = errors.stat().st_size
-        require(error_bytes <= stderr_limit)
-        self.bytes += len(data) + error_bytes
-        require(self.bytes <= 4*1024**3)
+        data=S.read_owned(output,output_limit,private=True) if counts[0] else b""
+        self.bytes+=sum(counts);require(self.bytes<=4*1024**3)
         return data
 
     def scan(self, scanner):
@@ -298,8 +339,9 @@ def fetch_export(root, files, identity):
     """Copy authenticated source data only; Cargo never reads ambient checkout files."""
     target = root/"fetch-source";target.mkdir(mode=0o700)
     require(set(files) == set(identity["files"]))
+    names={}
     for name,data in sorted(files.items()):
-        S.source_path(name)
+        N.portable_source_name(name,names)
         entry=identity["files"][name]
         # Current supported workspace is regular-only. Do not invent Windows
         # symlink creation or follow a repository-provided link during fetch.
@@ -347,9 +389,10 @@ def prepare(environment, scanner):
         try:commands.scan(scanner);scanned=True
         finally:
             write_new(root/"state.json",json.dumps({"schema":1,"source_revision":revision,
-                "prepared":success,"logs_scanned":scanned,"owned_processes_stopped":not commands.cleanup_failed,
+                "prepared":success,"logs_scanned":scanned,"logs_complete":commands.logs_complete,
+                "owned_processes_stopped":not commands.cleanup_failed,
                 "distribution_ready":False},sort_keys=True).encode()+b"\n")
-    require(success and scanned and not commands.cleanup_failed)
+    require(success and scanned and commands.logs_complete and not commands.cleanup_failed)
     print(json.dumps({"check":"native_notice_sources","prepared":True,"distribution_ready":False},sort_keys=True))
 
 
@@ -361,9 +404,10 @@ def finish(environment, scanner):
     marker=S.unique_json(S.read_owned(root/"owner.json",4096,private=True)); info=root.lstat()
     require(marker=={"schema":1,"device":info.st_dev,"inode":info.st_ino,"source_revision":R.expected_revision(environment)})
     state=S.unique_json(S.read_owned(root/"state.json",4096,private=True))
-    require(set(state)=={"schema","source_revision","prepared","logs_scanned","owned_processes_stopped","distribution_ready"}
+    require(set(state)=={"schema","source_revision","prepared","logs_scanned","logs_complete","owned_processes_stopped","distribution_ready"}
         and state["schema"]==1 and state["source_revision"]==R.expected_revision(environment)
-        and state["owned_processes_stopped"] is True and state["distribution_ready"] is False)
+        and state["owned_processes_stopped"] is True and state["logs_complete"] is True
+        and state["distribution_ready"] is False)
     scanner=checked(scanner);require(S.digest(N.read_regular(scanner,32*1024**2))==SCANNERS[(sys.platform,platform.machine())])
     cargo,rustc,git,rustup=tools(environment)
     commands=Commands(root,environment_for_acquisition(environment,root,cargo,rustc,git,rustup))

@@ -6,6 +6,7 @@ permission to distribute. Native SDK, relinking and legal acceptance remain open
 from __future__ import annotations
 
 import hashlib
+import functools
 import importlib.util
 import io
 import json
@@ -42,6 +43,7 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+@functools.lru_cache(maxsize=1)
 def catalogue():
     # Fixed reviewed helper path, never a module from an input archive or PYTHONPATH.
     path = ROOT / "packaging/linux/corresponding_source.py"
@@ -72,6 +74,21 @@ def read_regular(path, maximum, *, allow_empty=False):
     require(stamp(before) == stamp(opened) == stamp(after) and len(data) == before.st_size)
     return data
 
+
+
+def portable_source_name(name, seen, *, windows=os.name == "nt"):
+    """Validate a workspace filesystem name, unlike archive-only data references."""
+    catalogue().source_path(name)
+    parts=PurePosixPath(name).parts
+    require(len(parts)<=32)
+    if not windows: return name
+    for index,part in enumerate(parts,1):
+        require(part.isascii() and len(part)<=255 and not any(c in part for c in '<>:"\\|?*') and not part.endswith((" ","."))
+                and not re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?",part,re.I))
+        prefix="/".join(parts[:index]);key=prefix.casefold()
+        require(key not in seen or seen[key]==prefix)
+        seen[key]=prefix;require(len(seen)<=MAX_FILES)
+    return name
 
 def archive_files(source, data, maximum, *, links=False, file_limit=MAX_FILE):
     """Bounded archive-as-data. No extraction, executable loading or member import."""
@@ -167,7 +184,9 @@ def prepare_bytes(bundle, receipt_bytes, revision, *, platform, version, working
         else:
             from package_revision import versioned_source_bytes, UPDATE_VERSION
         root = Path(working)
+        names={}
         for path, expected in files.items():
+            portable_source_name(path,names)
             require(identity["files"][path]["mode"] != "120000")
             if UPDATE_VERSION.fullmatch(version):
                 expected = versioned_source_bytes(path, expected, version)

@@ -815,8 +815,12 @@ modified checkout manifests cannot select fetch origins. No build script,
 proc macro, source archive program or dependency setup runs during acquisition.
 Registry archives must match every Cargo.lock checksum; Git source objects and
 all tree/blob identities are authenticated. Raw stdout is separate from stderr,
-with retained process-group or Windows Job ownership and bounded stop/drain.
-Windows roots have a protected inheritable current-user/System ACL; reparse,
+with nonblocking bounded raw pipes, retained process-group or Windows Job
+ownership, stop/drain and a final EOF receipt. Output overruns are failures; a
+capped prefix is never called a complete raw log and is retained on failure.
+Windows private fetch exports additionally refuse drive/ADS, device/reserved,
+case-prefix aliases, non-ASCII names and depths beyond 32; the current source tree
+fits this explicit portable subset. Roots have a protected inheritable current-user/System ACL; reparse,
 remote-volume, foreign-writer and unstable-file inputs are refused. Linux retains
 its existing namespace acquisition and packaging route.
 
