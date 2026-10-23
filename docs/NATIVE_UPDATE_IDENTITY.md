@@ -3,7 +3,11 @@
 Native packages use a closed, immutable protocol 2 identity containing product,
 version, architecture and persistence cohort. Mac and Windows store it in a
 read-only executable section; Linux binds the same fields to its AppImage footer.
-A package producer parses these records as data without launching the executable.
+Mac and Windows package producers parse these records as data without launching
+the executable. The Linux producer invokes the reviewed, just-built binary
+with its early metadata-only command, before UI, account storage or the
+credential vault is opened. It appends the validated metadata to the AppImage
+before the complete artifact is signed; preparing the footer does not sign it.
 
 Protocol 2 separates helpers with the reviewed ordinary-shutdown handoff guards
 from legacy helpers. A running installation uses its installed helper to apply
