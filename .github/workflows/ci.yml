@@ -501,12 +501,13 @@ jobs:
               ;;
             *) echo "Unsupported CPAL synthetic-test platform." >&2; exit 1 ;;
           esac
+          # The selected RTC feature makes optional CPAL reachable in the resolver graph.
           # Cargo accepts a filter matching zero tests. Require every exact case
           # to be present before executing it, so cfg/name drift cannot pass.
-          cargo test --locked -p cpal --lib -- --list > "$RUNNER_TEMP/morpheus-cpal-tests.txt"
+          cargo test --locked -p morpheus-rtc -p cpal --features morpheus-rtc/native-devices --lib -- --list > "$RUNNER_TEMP/morpheus-cpal-tests.txt"
           for cpal_test in "${cpal_tests[@]}"; do
             grep -Fqx -- "$cpal_test: test" "$RUNNER_TEMP/morpheus-cpal-tests.txt"
-            cargo test --locked -p cpal --lib "$cpal_test" -- --exact
+            cargo test --locked -p morpheus-rtc -p cpal --features morpheus-rtc/native-devices --lib "$cpal_test" -- --exact
           done
       - name: Test pinned SDK sticky receipt and redaction regressions
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'sdk')
