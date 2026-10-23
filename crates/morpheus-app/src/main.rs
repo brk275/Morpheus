@@ -4389,6 +4389,12 @@ fn run_application(
                 Ok(pause) => pause,
                 Err(error) => { show_error(&ui, error.to_string()); return; }
             };
+            // The paused account cannot mint new views. A UI acknowledgement
+            // proves its actual Session was dropped before any store effect.
+            if let Err(error) = peer_verification::withdraw_paused_account(ui.clone(), account_id.clone()).await {
+                show_error(&ui, error.to_string());
+                return;
+            }
             if let Err(error) = verification_pause.drain().await {
                 show_error(&ui, error.to_string());
                 return;

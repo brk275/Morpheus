@@ -420,6 +420,10 @@ impl AccountAccessUi {
                         // A failed drain retains the pause and sole task handles.
                         let mut verification_pause = access.live.pause_verification_work(&id)
                             .map_err(|error| MatrixCoreError::Io(std::io::Error::other(error)))?;
+                        // Paused admission prevents recreation while the UI
+                        // drops the actual matching peer Session, then tasks.
+                        crate::peer_verification::withdraw_paused_account(access.ui.clone(), id.clone()).await
+                            .map_err(|error| MatrixCoreError::Io(std::io::Error::other(error)))?;
                         verification_pause.drain().await
                             .map_err(|error| MatrixCoreError::Io(std::io::Error::other(error)))?;
                         if access.generation.load(Ordering::Acquire) != generation
