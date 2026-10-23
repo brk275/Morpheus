@@ -3,6 +3,7 @@
 mod linux_native_pipewire;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=MORPHEUS_PACKAGE_FORMAT");
     #[cfg(target_os = "linux")]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
         && std::env::var_os("CARGO_FEATURE_NATIVE_CALLS").is_some()
@@ -10,7 +11,8 @@ fn main() {
         linux_native_pipewire::configure("bins");
     }
     let timeline_acceptance = timeline_acceptance_build();
-    persistence_fingerprint(timeline_acceptance);
+    let persistence = persistence_fingerprint(timeline_acceptance);
+    write_update_identity(&persistence);
     slint_build::compile("ui/app-window.slint").expect("failed to compile Morpheus UI");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
         && std::env::var_os("CARGO_FEATURE_NATIVE_CALLS").is_some()
@@ -49,7 +51,7 @@ fn timeline_acceptance_build() -> bool {
 // Conservative rollback cohort: source and locked dependencies that can write
 // account/config data must match. App version alone is intentionally excluded.
 // Changing these inputs requires a separately validated migration release.
-fn persistence_fingerprint(timeline_acceptance: bool) {
+fn persistence_fingerprint(timeline_acceptance: bool) -> String {
     use sha2::{Digest, Sha256};
     use std::{fs, path::Path};
     fn hash_tree(path: &Path, root: &Path, hash: &mut Sha256) {
@@ -142,8 +144,35 @@ fn persistence_fingerprint(timeline_acceptance: bool) {
             }
         }
     }
-    println!(
-        "cargo:rustc-env=MORPHEUS_PERSISTENCE_COHORT={:x}",
-        hash.finalize()
+    let persistence = format!("{:x}", hash.finalize());
+    println!("cargo:rustc-env=MORPHEUS_PERSISTENCE_COHORT={persistence}");
+    persistence
+}
+
+// One immutable v1 record for native executable sections on Mac and Windows.
+// No runtime file or user setting can select a persistence cohort. Keep the
+// existing cohort calculation above byte-for-byte equivalent.
+fn write_update_identity(persistence: &str) {
+    use std::{fs, path::PathBuf};
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    assert!(!version.is_empty() && version.len() <= 128);
+    assert!(
+        version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
     );
+    assert!(matches!(
+        arch.as_str(),
+        "aarch64" | "x86_64" | "x86" | "arm"
+    ));
+    assert!(persistence.len() == 64 && persistence.bytes().all(|b| b.is_ascii_hexdigit()));
+    // All interpolated scalars passed the closed ASCII checks above, so they
+    // cannot inject JSON quoting, escapes or additional fields.
+    let identity = format!(
+        "{{\"protocol\":1,\"product\":\"io.github.brk275.morpheus\",\"version\":\"{version}\",\"arch\":\"{arch}\",\"persistence\":\"{persistence}\"}}"
+    );
+    let output =
+        PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("morpheus-update-identity.json");
+    fs::write(output, identity).unwrap();
 }

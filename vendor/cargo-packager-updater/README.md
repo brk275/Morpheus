@@ -28,6 +28,28 @@ Local changes (October 10, 2026):
   unreachable. macOS recovery, Windows launch/error handling, and persistent
   AppImage rollback must be implemented and verified before enabling them.
 
+Additional source-only Mac transaction support:
+
+- `macos_archive` reuses this crate's already pinned macOS `tar` and `flate2`
+  dependencies. It extracts only a bounded, single `Morpheus.app` tree into an
+  empty private staging directory, with no generic `unpack`, filesystem special
+  entries, hard links, external links, duplicate aliases or shared-writable
+  regular-file/directory modes.
+  Raw tar iteration rejects PAX/GNU extension records rather than allocating
+  attacker-sized metadata; release packages must use the accepted normal paths.
+- Ordinary symbolic-link permissions are preserved exactly, including Darwin's
+  normal `0777` mode; special bits and hardlinked links are rejected. Extraction
+  and the application's backup copy share a checked Darwin `lchmod` wrapper,
+  which changes the owned link itself without following its target and verifies
+  its inode, owner and restored mode. The public SDK's `lchmod(3)`/`sys/stat.h`
+  establish this API and its `uint16_t mode_t` ABI; unsupported filesystems fail
+  closed. Regular-file and directory permission restrictions are unchanged.
+- Callers must verify the exact archive signature before calling this parser.
+  The parser neither installs nor executes. `Update::install` and every retained
+  upstream platform installer remain unconditionally blocked as above.
+- Native bundle transaction/recovery and executable-section identity live in
+  the application crate; installed macOS acceptance and activation remain open.
+
 The original upstream documentation below describes its API, not an approved
 Morpheus release configuration. Its HTTP examples are rejected by this patch.
 

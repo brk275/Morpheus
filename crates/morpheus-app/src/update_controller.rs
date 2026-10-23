@@ -509,8 +509,6 @@ impl UpdateController {
             && option_env!("MORPHEUS_UPDATE_PUBLIC_KEY").is_some_and(|value| !value.is_empty());
         let disabled = if !configured {
             Some(UpdateError::NotConfigured.into())
-        } else if !cfg!(target_os = "linux") {
-            Some(UpdateError::InstallNotValidated.into())
         } else {
             #[cfg(target_os = "linux")]
             {
@@ -520,7 +518,31 @@ impl UpdateController {
                     Err(_) => Some(ControllerError::WorkerFailed),
                 }
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            {
+                if !crate::updater::macos_installation_validated() {
+                    Some(UpdateError::InstallNotValidated.into())
+                } else {
+                    match startup.lock() {
+                        Ok(session) if session.macapp.is_some() => None,
+                        Ok(_) => Some(UpdateError::UnsupportedPackage.into()),
+                        Err(_) => Some(ControllerError::WorkerFailed),
+                    }
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                if !crate::updater::windows_installation_validated() {
+                    Some(UpdateError::InstallNotValidated.into())
+                } else {
+                    match startup.lock() {
+                        Ok(session) if session.windows.is_some() => None,
+                        Ok(_) => Some(UpdateError::UnsupportedPackage.into()),
+                        Err(_) => Some(ControllerError::WorkerFailed),
+                    }
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
             {
                 Some(UpdateError::InstallNotValidated.into())
             }
@@ -802,7 +824,37 @@ fn prepare_and_handoff(staged: &mut StagedUpdate, shared: &Shared) -> Result<(),
             .launch_supervisor()?;
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut startup = shared
+            .startup
+            .lock()
+            .map_err(|_| ControllerError::WorkerFailed)?;
+        let session = startup
+            .macapp
+            .as_mut()
+            .ok_or(UpdateError::InstallNotValidated)?;
+        staged
+            .prepare_macos_restart(&shared.activity, session)?
+            .launch_supervisor()?;
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut startup = shared
+            .startup
+            .lock()
+            .map_err(|_| ControllerError::WorkerFailed)?;
+        let session = startup
+            .windows
+            .as_mut()
+            .ok_or(UpdateError::UnsupportedPackage)?;
+        staged
+            .prepare_windows_restart(&shared.activity, session)?
+            .launch_supervisor()?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (staged, shared);
         Err(UpdateError::InstallNotValidated.into())
@@ -1040,6 +1092,10 @@ mod tests {
                 startup: Arc::new(Mutex::new(StartupSession {
                     #[cfg(target_os = "linux")]
                     appimage: None,
+                    #[cfg(target_os = "macos")]
+                    macapp: None,
+                    #[cfg(target_os = "windows")]
+                    windows: None,
                     restarted: false,
                 })),
                 activity: UpdateActivity::default(),
@@ -1108,6 +1164,10 @@ mod tests {
         let startup = Arc::new(Mutex::new(StartupSession {
             #[cfg(target_os = "linux")]
             appimage: None,
+            #[cfg(target_os = "macos")]
+            macapp: None,
+            #[cfg(target_os = "windows")]
+            windows: None,
             restarted: false,
         }));
         let controller = UpdateController::new(

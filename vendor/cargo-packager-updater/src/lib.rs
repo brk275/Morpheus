@@ -139,14 +139,14 @@
 use base64::Engine;
 use cargo_packager_utils::current_exe::current_exe;
 use http::{
-    header::{ACCEPT, USER_AGENT},
     HeaderName,
+    header::{ACCEPT, USER_AGENT},
 };
 use minisign_verify::{PublicKey, Signature};
 use percent_encoding::{AsciiSet, CONTROLS};
 use reqwest::{
-    header::{HeaderMap, HeaderValue},
     StatusCode,
+    header::{HeaderMap, HeaderValue},
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -162,6 +162,9 @@ use url::Url;
 mod custom_serialization;
 mod error;
 mod security;
+
+#[cfg(target_os = "macos")]
+pub mod macos_archive;
 
 pub use crate::error::*;
 pub use http;
@@ -236,6 +239,10 @@ pub struct Config {
 pub enum UpdateFormat {
     /// The NSIS installer (.exe).
     Nsis,
+    /// Morpheus bounded signed data envelope for a marked per-user NSIS install.
+    /// This is not an executable NSIS installer and the generic install stays blocked.
+    #[serde(rename = "windows-payload-v1")]
+    WindowsPayloadV1,
     /// The Microsoft Software Installer (.msi) through WiX Toolset.
     Wix,
     /// The Linux AppImage package (.AppImage).
@@ -251,6 +258,7 @@ impl std::fmt::Display for UpdateFormat {
             "{}",
             match self {
                 UpdateFormat::Nsis => "nsis",
+                UpdateFormat::WindowsPayloadV1 => "windows-payload-v1",
                 UpdateFormat::Wix => "wix",
                 UpdateFormat::AppImage => "appimage",
                 UpdateFormat::App => "app",

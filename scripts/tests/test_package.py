@@ -1,13 +1,120 @@
 import tempfile
+import gzip
+import hashlib
+import io
+import json
+import struct
+import tarfile
 import os
+import re
 from unittest import mock
 import unittest
 from pathlib import Path
 
-from scripts.package import package_config, preflight_deb_authors, linux_appimage
+from scripts.package import package_config, preflight_deb_authors, linux_appimage, macos_update_formats
+from scripts import prepare_macos_update as mac_update
+from scripts import prepare_windows_update
 
 
 class PackageConfigTests(unittest.TestCase):
+    def test_windows_initial_installer_never_executes_legacy_registry_maintenance(self):
+        template = (Path(__file__).resolve().parents[2] / "packaging/windows/morpheus-installer.nsi").read_text()
+        for expression in [r"(?mi)^\s*(?:ExecWait|ExecShell|EnumRegKey)\b",
+                           r"(?mi)^\s*ReadRegStr[^\n]*UninstallString",
+                           r"(?mi)^\s*Delete\s+\$(?:R\d|\d)\b"]:
+            self.assertNotRegex(template, expression)
+        for removed in ["PageReinstall", "RestorePreviousInstallLocation", "FindProcess", "KillProcess", "preinstall_section"]:
+            self.assertNotIn(removed, template)
+        admission = template.split("Function MorpheusRequireFreshDestination\n", 1)[1].split("FunctionEnd", 1)[0]
+        checks = re.findall(r"!insertmacro MorpheusRejectRegisteredInstallation (0x[0-9A-Fa-f]+) (0x[0-9A-Fa-f]+)", admission)
+        self.assertEqual(checks, [("0x80000001", "0x101"), ("0x80000001", "0x201"),
+                                  ("0x80000002", "0x101"), ("0x80000002", "0x201")])
+        self.assertNotIn("${MANUPRODUCTKEY}", admission)
+        self.assertNotIn("!define MUI_LANGDLL_REGISTRY_", template)
+        self.assertIn("kernel32::GetDriveTypeW(w r0)i.r1", admission)
+        self.assertIn("IntCmp $1 3 +2", admission)
+        self.assertIn("morpheus_existing_destination:", admission)
+        self.assertIn("Abort", admission.split("morpheus_existing_destination:", 1)[1])
+        install = template.split("Section Install\n", 1)[1].split("SectionEnd", 1)[0]
+        before, after = install.split("!insertmacro MorpheusAcquireLifetimeLock", 1)
+        self.assertIn("Call MorpheusRequireFreshDestination", before)
+        self.assertLess(after.index("Call MorpheusRequireFreshDestination"), after.index("SetOutPath"))
+        self.assertNotIn("SetOutPath", before)
+        self.assertLess(after.index("SetOutPath"), after.index('File "${MAINBINARYSRCPATH}"'))
+        uninstall = template.split("Section Uninstall\n", 1)[1].split("SectionEnd", 1)[0]
+        self.assertLess(uninstall.index("!insertmacro MorpheusAcquireLifetimeLock"), uninstall.index('Delete "$INSTDIR'))
+
+    def windows_fixture(self, root):
+        project = Path(__file__).resolve().parents[2]
+        for relative in ["packaging/windows/update-contract.json", "packaging/windows/morpheus-installer.nsi"]:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((project / relative).read_bytes())
+        identity = {"protocol": 1, "product": "io.github.brk275.morpheus", "version": "0.1.0",
+                    "arch": "x86_64", "persistence": "a" * 64}
+        native = bytearray(8192)
+        native[:2] = b"MZ"
+        struct.pack_into("<I", native, 60, 128)
+        native[128:132] = b"PE\0\0"
+        struct.pack_into("<HH", native, 132, 0x8664, 1)
+        struct.pack_into("<HH", native, 148, 240, 2)
+        struct.pack_into("<H", native, 152, 0x20B)
+        struct.pack_into("<H", native, 220, 2)
+        encoded = prepare_windows_update.canonical(identity)
+        native[392:400] = b".mrphupd"
+        struct.pack_into("<I", native, 400, len(encoded))
+        struct.pack_into("<II", native, 408, 4096, 4096)
+        struct.pack_into("<I", native, 428, 0x40000040)
+        native[4096:4096 + len(encoded)] = encoded
+        for name in prepare_windows_update.FILES:
+            path = root / ("target/release/morpheus-app.exe" if name == "morpheus-app.exe" else name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(native if name == "morpheus-app.exe" else b"synthetic resource")
+        config = package_config(platform="win32")
+        return config, identity
+
+    def test_windows_producer_binds_complete_ledger_without_local_paths_or_installer_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, identity = self.windows_fixture(root)
+            # The normal Cargo artifact may be a hardlink from deps. Only the
+            # inert producer accepts that input; native installed files do not.
+            os.link(root / "target/release/morpheus-app.exe", root / "target/release/cargo-output-alias.exe")
+            output = root / "owned-output"
+            output.mkdir()
+            configured, payload = prepare_windows_update.prepare(config, root, output)
+            marker = json.loads((output / "morpheus-install.json").read_bytes())
+            self.assertEqual(marker["identity"], identity)
+            self.assertEqual([entry["path"] for entry in marker["files"]], list(prepare_windows_update.FILES))
+            self.assertEqual(marker["uninstaller_contract"], prepare_windows_update.CONTRACT_SHA256)
+            self.assertNotIn("before-packaging-command", configured)
+            self.assertEqual(configured["nsis"]["installMode"], "currentUser")
+            self.assertEqual(configured["windows"], {"allowDowngrades": False})
+            data = payload.read_bytes()
+            self.assertTrue(data.startswith(prepare_windows_update.MAGIC))
+            self.assertNotIn(str(root).encode(), data)
+            self.assertNotIn("uninstall.exe", [entry["path"] for entry in marker["files"]])
+            self.assertLessEqual(len(data), prepare_windows_update.MAX_BYTES)
+
+    def test_windows_producer_rejects_contract_resource_and_pe_drift_before_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, _ = self.windows_fixture(root)
+            output = root / "owned-output"
+            output.mkdir()
+            for changed in [{**config, "resources": ["../profile"]}, {**config, "nsis": {"preinstallSection": "untrusted"}},
+                            {**config, "windows": {"signCommand": "untrusted"}}, {**config, "deepLinkProtocols": ["custom"]}]:
+                with self.assertRaises(ValueError):
+                    prepare_windows_update.prepare(changed, root, output)
+                self.assertEqual(list(output.iterdir()), [])
+            binary = root / "target/release/morpheus-app.exe"
+            data = bytearray(binary.read_bytes())
+            struct.pack_into("<I", data, 428, 0xC0000040)
+            binary.write_bytes(data)
+            with self.assertRaises(ValueError):
+                prepare_windows_update.prepare(config, root, output)
+            self.assertEqual(list(output.iterdir()), [])
+
     def test_missing_deb_maintainer_fails_before_build_but_other_formats_do_not(self):
         for formats in [None, "deb", "deb,appimage", "all", "default"]:
             with self.subTest(formats=formats), self.assertRaises(ValueError):
@@ -62,6 +169,193 @@ class PackageConfigTests(unittest.TestCase):
             (root / "packaging/linux.toml").write_text('before-packaging-command = "unexpected"\n')
             with self.assertRaises(ValueError):
                 package_config(root, "linux")
+
+
+@unittest.skipUnless(os.name == "posix", "Mac payload files use POSIX ownership and mode contracts")
+class MacUpdatePayloadTests(unittest.TestCase):
+    @staticmethod
+    def fixture(root, arch):
+        source = root / "source"
+        source.mkdir()
+        for relative in mac_update.RESOURCES.values():
+            path = source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(("fixture-resource:" + relative).encode("ascii"))
+        purpose = (b'<plist version="1.0"><dict><key>NSCameraUsageDescription</key>'
+                   b'<string>Fixture camera purpose.</string><key>NSMicrophoneUsageDescription</key>'
+                   b'<string>Fixture microphone purpose.</string><key>NSScreenCaptureUsageDescription</key>'
+                   b'<string>Fixture screen purpose.</string></dict></plist>')
+        (source / "packaging/macos").mkdir(parents=True)
+        (source / "packaging/macos/Info.plist").write_bytes(purpose)
+        app = root / "Morpheus.app"
+        for relative in ["Contents/MacOS", "Contents/Resources"]:
+            (app / relative).mkdir(parents=True, exist_ok=True)
+        identity = {"protocol": 1, "product": mac_update.PRODUCT, "version": "0.2.0",
+                    "arch": arch, "persistence": "a" * 64}
+        encoded = json.dumps(identity, separators=(",", ":")).encode("ascii")
+        # Inert Mach-O/identity bytes only, never an executable fixture launch.
+        native = bytearray(512 + len(encoded))
+        cpu = {"aarch64": 0x0100000c, "x86_64": 0x01000007}[arch]
+        for offset, value in [(0, 0xfeedfacf), (4, cpu), (12, 2), (16, 1), (20, 152),
+                              (32, 0x19), (36, 152), (92, 5), (96, 1)]:
+            struct.pack_into("<I", native, offset, value)
+        native[40:46] = b"__TEXT"
+        struct.pack_into("<Q", native, 80, len(native))
+        native[104:118] = b"__morpheus_upd"
+        native[120:126] = b"__TEXT"
+        struct.pack_into("<Q", native, 144, len(encoded))
+        struct.pack_into("<I", native, 152, 512)
+        native[512:] = encoded
+        executable = app / mac_update.EXECUTABLE
+        executable.write_bytes(native)
+        executable.chmod(0o700)
+        identity_xml = (f'<key>CFBundleIdentifier</key><string>{mac_update.PRODUCT}</string>'
+                        '<key>CFBundleExecutable</key><string>morpheus-app</string>'
+                        '<key>CFBundleShortVersionString</key><string>0.2.0</string>'
+                        '<key>CFBundlePackageType</key><string>APPL</string>'
+                        '<key>CSResourcesFileMapped</key><true/>').encode("ascii")
+        (app / "Contents/Info.plist").write_bytes(purpose.replace(b"</dict>", identity_xml + b"</dict>"))
+        for name, relative in mac_update.RESOURCES.items():
+            (app / "Contents/Resources" / name).write_bytes((source / relative).read_bytes())
+        return source, app, root / mac_update.ARCHIVE_NAME
+
+    def test_mac_selection_retains_exact_one_app_build_and_refuses_other_platforms_or_signing(self):
+        config = package_config(platform="darwin")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for formats in [None, "default", "all", "dmg", "app,dmg", "dmg,app"]:
+                self.assertEqual(macos_update_formats(config, formats), "app,dmg")
+            self.assertEqual(macos_update_formats(config, "app"), "app")
+            for formats in ["nsis", "deb", "appimage", "dmg,nsis", "dmg,dmg", "", "all,dmg"]:
+                with self.subTest(formats=formats), self.assertRaises(ValueError):
+                    macos_update_formats(config, formats)
+            for field in ["identifier", "product-name", "resources"]:
+                altered = dict(config)
+                altered.pop(field)
+                with self.assertRaises(ValueError):
+                    macos_update_formats(altered, "dmg")
+        for key in ["CARGO_PACKAGER_SIGN_PRIVATE_KEY", "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD"]:
+            with mock.patch.dict(os.environ, {key: "fixture-not-a-key"}, clear=True), self.assertRaises(ValueError):
+                macos_update_formats(config, "dmg")
+
+    def test_real_producer_keeps_complete_bundle_bytes_modes_links_and_native_identity(self):
+        for arch in ["aarch64", "x86_64"]:
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                root = Path(temp)
+                source, app, output = self.fixture(root, arch)
+                license = app / "Contents/Resources/LICENSE"
+                license.chmod(0o444)
+                (app / "Contents/Resources/license-link").symlink_to("LICENSE")
+                before = mac_update._snapshot(app)
+                receipt = mac_update.prepare_update(app, output, version="0.2.0", arch=arch, root=source)
+                self.assertEqual(mac_update._snapshot(app), before)
+                self.assertEqual(receipt["bundle_sha256"], before["tree_sha256"])
+                self.assertEqual(receipt["sha256"], hashlib.sha256(output.read_bytes()).hexdigest())
+                self.assertEqual(receipt["bytes"], output.stat().st_size)
+                self.assertFalse(receipt["signed"])
+                with tarfile.open(output, "r:gz") as archive:
+                    entries = archive.getmembers()
+                    self.assertEqual(len(entries), receipt["entries"])
+                    self.assertEqual({item.type for item in entries}, {tarfile.REGTYPE, tarfile.DIRTYPE, tarfile.SYMTYPE})
+                    for record in before["records"]:
+                        member = archive.getmember("Morpheus.app/" + record["path"])
+                        self.assertEqual(member.mode, record["mode"])
+                        if record["kind"] == "file":
+                            self.assertEqual(archive.extractfile(member).read(), (app / record["path"]).read_bytes())
+                        elif record["kind"] == "link":
+                            self.assertEqual(member.linkname, record["target"])
+                # The raw format contains only concrete USTAR entries; no
+                # tar library unpack/extraction or candidate launch is used.
+                raw = gzip.decompress(output.read_bytes())
+                offset = 0
+                while any(raw[offset:offset + 512]):
+                    header = raw[offset:offset + 512]
+                    self.assertEqual(header[257:263], b"ustar\0")
+                    self.assertIn(header[156:157], [b"0", b"5", b"2"])
+                    size = int(header[124:136].strip(b"\0 ") or b"0", 8)
+                    offset += 512 + ((size + 511) // 512) * 512
+                self.assertFalse(any(raw[offset:]))
+                self.assertFalse(list(root.glob(".morpheus-mac-update-*.tmp")))
+
+    def test_existing_output_resource_mismatch_and_nested_plist_never_replace_anything(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, {}, clear=True):
+            root = Path(temp)
+            source, app, output = self.fixture(root, "aarch64")
+            original = mac_update._snapshot(app)
+            output.write_bytes(b"retained earlier signing input")
+            with self.assertRaises(ValueError):
+                mac_update.prepare_update(app, output, version="0.2.0", arch="aarch64", root=source)
+            self.assertEqual(output.read_bytes(), b"retained earlier signing input")
+            output.unlink()
+            (app / "Contents/Resources/LICENSE").write_bytes(b"changed required notice")
+            with self.assertRaises(ValueError):
+                mac_update.prepare_update(app, output, version="0.2.0", arch="aarch64", root=source)
+            self.assertFalse(output.exists())
+            (app / "Contents/Resources/LICENSE").write_bytes((source / "LICENSE").read_bytes())
+            plist = app / "Contents/Info.plist"
+            original_plist = plist.read_bytes()
+            body = original_plist.split(b"<dict>", 1)[1].rsplit(b"</dict>", 1)[0]
+            plist.write_bytes(b'<plist version="1.0"><dict><key>nested</key><dict>' + body + b'</dict></dict></plist>')
+            with self.assertRaises(ValueError):
+                mac_update.prepare_update(app, output, version="0.2.0", arch="aarch64", root=source)
+            self.assertFalse(output.exists())
+            plist.write_bytes(original_plist)
+            self.assertEqual(mac_update._snapshot(app), original)
+
+    def test_separately_validated_plist_is_bound_to_exact_snapshot_bytes(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, {}, clear=True):
+            root = Path(temp)
+            source, app, output = self.fixture(root, "aarch64")
+            plist = app / "Contents/Info.plist"
+            valid = plist.read_bytes()
+            # A same-size, same-inode invalid version is present in the initial
+            # tree. A substituted validation read must not authorize those bytes.
+            invalid = valid.replace(b"<string>0.2.0</string>", b"<string>9.2.0</string>")
+            self.assertNotEqual(invalid, valid)
+            self.assertEqual(len(invalid), len(valid))
+            plist.write_bytes(invalid)
+            before = mac_update._snapshot(app)
+            original_read = mac_update._read
+
+            def substitute_validation_read(path, limit):
+                return valid if path == plist else original_read(path, limit)
+
+            with mock.patch.object(mac_update, "_read", side_effect=substitute_validation_read), self.assertRaises(ValueError):
+                mac_update.prepare_update(app, output, version="0.2.0", arch="aarch64", root=source)
+            self.assertEqual(mac_update._snapshot(app), before)
+            self.assertFalse(output.exists())
+            self.assertFalse(list(root.glob(".morpheus-mac-update-*.tmp")))
+
+    def test_unsafe_links_extensions_and_output_bounds_fail_without_bundle_changes(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(os.environ, {}, clear=True):
+            root = Path(temp)
+            source, app, output = self.fixture(root, "x86_64")
+            sentinel = root / "sentinel"
+            sentinel.write_bytes(b"keep outside")
+            escape = app / "Contents/Resources/escape"
+            escape.symlink_to(sentinel)
+            with self.assertRaises(ValueError):
+                mac_update.prepare_update(app, output, version="0.2.0", arch="x86_64", root=source)
+            self.assertEqual(sentinel.read_bytes(), b"keep outside")
+            escape.unlink()
+            long = app / "Contents/Resources" / ("a" * 200)
+            long.mkdir()
+            with self.assertRaises(ValueError):
+                mac_update.prepare_update(app, output, version="0.2.0", arch="x86_64", root=source)
+            long.rmdir()
+            before = mac_update._snapshot(app)
+            with mock.patch.object(mac_update, "MAX_EXPANDED_BYTES", 2048), self.assertRaises(ValueError):
+                mac_update.prepare_update(app, output, version="0.2.0", arch="x86_64", root=source)
+            self.assertEqual(mac_update._snapshot(app), before)
+            self.assertFalse(output.exists())
+            self.assertFalse(list(root.glob(".morpheus-mac-update-*.tmp")))
+        target = io.BytesIO()
+        writer = mac_update._BoundedWriter(target, 4)
+        writer.write(b"123")
+        with self.assertRaises(ValueError):
+            writer.write(b"45")
+        self.assertEqual(target.getvalue(), b"123")
+
 
 
 if __name__ == "__main__":
