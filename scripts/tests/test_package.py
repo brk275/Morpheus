@@ -650,6 +650,17 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
 
 
 class NativeSourceAcquisitionTests(unittest.TestCase):
+    def test_isolated_file_entry_loads_only_reviewed_siblings_outside_the_checkout(self):
+        import subprocess
+        scripts=Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            result=subprocess.run([sys.executable,"-I","-B",str(scripts/"native_notice_source.py"),"--help"],
+                cwd=temporary,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10,check=False)
+        self.assertEqual(result.returncode,0,result.stderr.decode("utf-8","replace"))
+        self.assertIn(b"--prepare",result.stdout)
+        self.assertIn(b"--finish",result.stdout)
+        self.assertLessEqual(len(result.stdout)+len(result.stderr),16384)
+
     def test_fresh_environment_strips_credentials_proxies_and_configs(self):
         from scripts import native_notice_source as acquisition
         with tempfile.TemporaryDirectory() as temporary:
@@ -697,8 +708,8 @@ class NativeNoticeCommandOwnershipTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform in {"darwin","win32"},"native retained command route")
     def test_separate_raw_streams_and_output_overrun_stop_before_observation(self):
         from scripts import native_notice_source as acquisition
-        for overflow in (False,True):
-            with self.subTest(overflow=overflow), tempfile.TemporaryDirectory() as temporary:
+        for overflow,binary in ((False,False),(True,False),(False,True),(True,True)):
+            with self.subTest(overflow=overflow,binary=binary), tempfile.TemporaryDirectory() as temporary:
                 root=Path(temporary).resolve()
                 for name in ("logs","temp"):(root/name).mkdir(mode=0o700)
                 environment={key:os.environ[key] for key in ("SystemRoot","WINDIR") if key in os.environ}
@@ -712,16 +723,21 @@ class NativeNoticeCommandOwnershipTests(unittest.TestCase):
                     if overflow:
                         with self.assertRaises(ValueError):
                             commands.run("fixture",[str(Path(sys.executable).resolve()),"-I","-B","-c",program],
-                                cwd=root,env=environment,timeout=10,output_limit=4096)
+                                cwd=root,env=environment,timeout=10,output_limit=4096,binary_output=binary)
                     else:
                         data=commands.run("fixture",[str(Path(sys.executable).resolve()),"-I","-B","-c",program],
-                            cwd=root,env=environment,timeout=10,output_limit=4096)
+                            cwd=root,env=environment,timeout=10,output_limit=4096,binary_output=binary)
                         self.assertEqual(data,b"raw-git-object")
                         self.assertEqual((root/"logs/00001.err").read_bytes(),b"independent-stderr")
                 self.assertFalse(commands.cleanup_failed)
                 self.assertFalse(commands.retained)
                 self.assertEqual(commands.logs_complete,not overflow)
-                self.assertLessEqual((root/"logs/00001.out").stat().st_size,4096)
+                if binary:
+                    self.assertFalse((root/"logs/00001.out").exists())
+                    self.assertEqual(list((root/"temp").iterdir()),[])
+                else:
+                    self.assertLessEqual((root/"logs/00001.out").stat().st_size,4096)
+                self.assertIn((root/"logs/00001.err"),list((root/"logs").iterdir()))
 
 
 class NativeNoticeWindowsOwnershipTests(unittest.TestCase):

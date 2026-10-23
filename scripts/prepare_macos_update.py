@@ -20,6 +20,12 @@ import tarfile
 import tempfile
 
 
+# Isolated direct-file execution omits the script directory from sys.path.
+# Admit only these reviewed file-relative sibling helpers, never cwd/PYTHONPATH
+# or a path supplied by an archive, manifest, environment or command argument.
+if not __package__ and sys.flags.isolated:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_EXPANDED_BYTES = 1024 * 1024 * 1024
 MAX_ENTRIES = 32_768

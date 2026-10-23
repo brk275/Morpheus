@@ -19,6 +19,12 @@ import sys
 import tempfile
 import time
 
+# Isolated direct-file execution omits the script directory from sys.path.
+# Admit only these reviewed file-relative sibling helpers, never cwd/PYTHONPATH
+# or a path supplied by an archive, manifest, environment or command argument.
+if not __package__ and sys.flags.isolated:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 if __package__:
     from . import native_notices as N
     from . import package_revision as R
@@ -180,8 +186,16 @@ class Commands:
                           for suffix in (".out", ".err"))
         process = job = handle = None
         status = None
+        data = b""
         with contextlib.ExitStack() as stack:
-            destinations = [stack.enter_context(path.open("xb")) for path in (output,errors)]
+            # Raw object stdout is source data, not a diagnostic log. Keep it
+            # on one owned temporary descriptor and close/delete it on every
+            # outcome. Complete stderr and ordinary stdout remain scan inputs.
+            destinations = [
+                stack.enter_context(tempfile.TemporaryFile(dir=self.root/"temp"))
+                if binary_output else stack.enter_context(output.open("xb")),
+                stack.enter_context(errors.open("xb")),
+            ]
             readers, writers = [], []
             counts, eof, limits = [0,0], [False,False], [output_limit,stderr_limit]
             for destination in destinations:
@@ -264,8 +278,15 @@ class Commands:
                         self.logs_complete=False;raise
                     finally:
                         for destination in destinations:destination.flush();os.fsync(destination.fileno())
+            if binary_output:
+                # The owned child/group/Job and its pipes have already drained.
+                # Read by the retained descriptor, never by a replaceable name.
+                destinations[0].seek(0)
+                data=destinations[0].read(output_limit+1)
+                require(len(data)==counts[0] and len(data)<=output_limit)
         require(status in expected_status)
-        data=S.read_owned(output,output_limit,private=True) if counts[0] else b""
+        if not binary_output:
+            data=S.read_owned(output,output_limit,private=True) if counts[0] else b""
         self.bytes+=sum(counts);require(self.bytes<=4*1024**3)
         return data
 

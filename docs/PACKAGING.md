@@ -816,8 +816,12 @@ proc macro, source archive program or dependency setup runs during acquisition.
 Registry archives must match every Cargo.lock checksum; Git source objects and
 all tree/blob identities are authenticated. Raw stdout is separate from stderr,
 with nonblocking bounded raw pipes, retained process-group or Windows Job
-ownership, stop/drain and a final EOF receipt. Output overruns are failures; a
-capped prefix is never called a complete raw log and is retained on failure.
+ownership, stop/drain and a final EOF receipt. Raw Git object stdout is held only
+on a bounded private temporary descriptor, read after the actual command cleanup,
+and deleted on every outcome; it is source data rather than a diagnostic log.
+Complete stderr and ordinary diagnostic stdout stay in the default scan. Source
+content publication remains separately unverified. Output overruns are failures;
+a capped prefix is never called a complete raw log and is retained on failure.
 Windows private fetch exports additionally refuse drive/ADS, device/reserved,
 case-prefix aliases, non-ASCII names and depths beyond 32; the current source tree
 fits this explicit portable subset. Roots have a protected inheritable
