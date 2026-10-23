@@ -80,7 +80,10 @@ def guard(environment, system=sys.platform):
             "GITHUB_EVENT_NAME":"workflow_dispatch", "GITHUB_ACTOR":"brk275", "GITHUB_TRIGGERING_ACTOR":"brk275",
             "RUNNER_OS":"macOS" if system == "darwin" else "Windows"}.items():
         require(environment.get(key) == value)
-    require(environment.get("ImageOS") in ({"macos15", "macos26"} if system == "darwin" else {"win25", "win25-vs2026"}))
+    # main deliberately snapshots os.environ. CPython uppercases every key on
+    # Windows; the plain dict no longer has os.environ's case-insensitive lookup.
+    image_key = "ImageOS" if system == "darwin" else "IMAGEOS"
+    require(environment.get(image_key) in ({"macos15", "macos26"} if system == "darwin" else {"win25", "win25-vs2026"}))
     event = S.unique_json(N.read_regular(Path(environment["GITHUB_EVENT_PATH"]), 1024 * 1024))
     owner = event.get("repository", {}).get("owner", {}).get("id")
     inputs = event.get("inputs", {})
@@ -138,7 +141,7 @@ def tools(environment):
     directory = rustup / ("toolchains/1.99.0-" + host) / "bin"
     cargo, rustc = (checked(directory / (name + suffix)) for name in ("cargo", "rustc"))
     if os.name == "nt":
-        program = Path(environment["ProgramFiles"])
+        program = Path(environment["PROGRAMFILES"])
         git = checked(program / "Git/cmd/git.exe")
     else:
         git = checked(Path("/usr/bin/git"))
@@ -148,14 +151,16 @@ def tools(environment):
 def environment_for_acquisition(environment, root, cargo, rustc, git, rustup):
     # An allowlist rather than a credential-name blocklist. No inherited Cargo,
     # SSH, proxy, signing, account, loader, wrapper or credential-provider state.
+    system_key = "SYSTEMROOT" if os.name == "nt" else "SystemRoot"
+    image_key = "IMAGEOS" if os.name == "nt" else "ImageOS"
     result = {key: value for key, value in environment.items() if key in {
-        "SystemRoot", "WINDIR", "RUNNER_TEMP", "GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "RUNNER_OS", "ImageOS",
+        system_key, "WINDIR", "RUNNER_TEMP", "GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "RUNNER_OS", image_key,
         "GITHUB_REPOSITORY", "GITHUB_REF", "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SHA",
         "GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR", "MORPHEUS_PACKAGE_SOURCE_REVISION"}}
     result = S.clean_git_environment(result)
     paths = [str(cargo.parent), str(git.parent)]
     if os.name == "nt":
-        system = checked(Path(environment["SystemRoot"]) / "System32", directory=True)
+        system = checked(Path(environment[system_key]) / "System32", directory=True)
         paths.append(str(system))
     else:
         paths += ["/usr/bin", "/bin"]

@@ -707,10 +707,74 @@ class NativeSourceAcquisitionTests(unittest.TestCase):
                 mock.patch.object(acquisition.sys,"platform","win32"), \
                 mock.patch.object(acquisition.platform,"machine",return_value="AMD64"), \
                 mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)):
-            cargo,rustc,git,rustup=acquisition.tools({"RUSTUP_HOME":"/pinned/rustup","ProgramFiles":"/programs"})
+            cargo,rustc,git,rustup=acquisition.tools({"RUSTUP_HOME":"/pinned/rustup","PROGRAMFILES":"/programs"})
         self.assertEqual(cargo.name,"cargo.exe");self.assertEqual(rustc.name,"rustc.exe")
         self.assertEqual(rustup,Path("/pinned/rustup"))
         self.assertIn("1.99.0-x86_64-pc-windows-msvc",str(cargo))
+        self.assertEqual(git,Path("/programs/Git/cmd/git.exe"))
+
+    def test_copied_windows_environment_preserves_actual_host_guard_and_system_directory(self):
+        from scripts import native_notice_source as acquisition
+        # dict(os.environ) on Windows contains uppercase keys, unlike the old
+        # mixed-case mock. Use the real guard and allowlist with that exact shape.
+        event = {"repository":{"owner":{"id":42},"private":False},"sender":{"id":42},
+                 "inputs":{"platform":"windows","linux_formats":"appimage",
+                           "appimage_updates":"false","appimage_capture":"false",
+                           "source_bundle":"false","native_updates":"false"}}
+        inherited = {"GITHUB_ACTIONS":"true","RUNNER_ENVIRONMENT":"github-hosted",
+            "GITHUB_REPOSITORY":"brk275/Morpheus","GITHUB_REF":"refs/heads/main",
+            "GITHUB_EVENT_NAME":"workflow_dispatch","GITHUB_ACTOR":"brk275",
+            "GITHUB_TRIGGERING_ACTOR":"brk275","RUNNER_OS":"Windows","IMAGEOS":"win25",
+            "GITHUB_EVENT_PATH":"/fixture/event.json","SYSTEMROOT":"/windows","WINDIR":"/windows",
+            "RUNNER_TEMP":"/runner/temp","PROGRAMFILES":"/programs","USERPROFILE":"/old/profile",
+            "GITHUB_TOKEN":"private","HTTPS_PROXY":"private","RUSTFLAGS":"--cfg injected"}
+        with mock.patch.object(acquisition.platform,"machine",return_value="AMD64"), \
+                mock.patch.object(acquisition.N,"read_regular",return_value=json.dumps(event).encode()):
+            acquisition.guard(inherited,system="win32")
+            for image in ("win22",None):
+                rejected = dict(inherited)
+                if image is None: rejected.pop("IMAGEOS")
+                else: rejected["IMAGEOS"] = image
+                with self.assertRaises(ValueError): acquisition.guard(rejected,system="win32")
+        with mock.patch.object(acquisition,"os",type("Windows",(),{"name":"nt","pathsep":";"})()), \
+                mock.patch.object(acquisition,"checked",side_effect=lambda value,**kwargs:Path(value)) as checked:
+            root = Path("/private/source")
+            selected = acquisition.environment_for_acquisition(inherited,root,Path("/pinned/bin/cargo.exe"),
+                Path("/pinned/bin/rustc.exe"),Path("/programs/Git/cmd/git.exe"),Path("/pinned/rustup"))
+        checked.assert_called_once_with(Path("/windows/System32"),directory=True)
+        self.assertEqual(selected["SYSTEMROOT"],"/windows")
+        self.assertEqual(selected["IMAGEOS"],"win25")
+        self.assertEqual(selected["WINDIR"],"/windows")
+        self.assertEqual(selected["PATH"],";".join(str(Path(value)) for value in
+            ("/pinned/bin","/programs/Git/cmd","/windows/System32")))
+        self.assertEqual(selected["USERPROFILE"],str(root/"home"))
+        for name in ("SystemRoot","ImageOS","PROGRAMFILES","GITHUB_TOKEN","HTTPS_PROXY","RUSTFLAGS"):
+            self.assertNotIn(name,selected)
+
+    def test_unix_host_environment_keeps_case_sensitive_image_and_system_names(self):
+        from scripts import native_notice_source as acquisition
+        event = {"repository":{"owner":{"id":42},"private":False},"sender":{"id":42},
+                 "inputs":{"platform":"macos","linux_formats":"appimage",
+                           "appimage_updates":"false","appimage_capture":"false",
+                           "source_bundle":"false","native_updates":"false"}}
+        inherited = {"GITHUB_ACTIONS":"true","RUNNER_ENVIRONMENT":"github-hosted",
+            "GITHUB_REPOSITORY":"brk275/Morpheus","GITHUB_REF":"refs/heads/main",
+            "GITHUB_EVENT_NAME":"workflow_dispatch","GITHUB_ACTOR":"brk275",
+            "GITHUB_TRIGGERING_ACTOR":"brk275","RUNNER_OS":"macOS","ImageOS":"macos15",
+            "GITHUB_EVENT_PATH":"/fixture/event.json","SystemRoot":"/original-system",
+            "SYSTEMROOT":"/foreign-system","IMAGEOS":"win25"}
+        with mock.patch.object(acquisition.platform,"machine",return_value="x86_64"), \
+                mock.patch.object(acquisition.N,"read_regular",return_value=json.dumps(event).encode()):
+            acquisition.guard(inherited,system="darwin")
+            with self.assertRaises(ValueError):
+                acquisition.guard({key:value for key,value in inherited.items() if key != "ImageOS"},system="darwin")
+        with mock.patch.object(acquisition,"os",type("Unix",(),{"name":"posix","pathsep":":"})()):
+            selected = acquisition.environment_for_acquisition(inherited,Path("/private/source"),Path("/pinned/bin/cargo"),
+                Path("/pinned/bin/rustc"),Path("/usr/bin/git"),Path("/pinned/rustup"))
+        self.assertEqual(selected["ImageOS"],"macos15")
+        self.assertEqual(selected["SystemRoot"],"/original-system")
+        self.assertNotIn("IMAGEOS",selected)
+        self.assertNotIn("SYSTEMROOT",selected)
 
     def test_source_origin_policy_matches_existing_linux_route_without_importing_it_on_windows(self):
         from scripts import native_notice_source as acquisition
