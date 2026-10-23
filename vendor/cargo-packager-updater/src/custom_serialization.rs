@@ -29,6 +29,7 @@ impl<'de> Deserialize<'de> for UpdateFormat {
         let variant = match lower.as_str() {
             "nsis" => UpdateFormat::Nsis,
             "windows-payload-v1" => UpdateFormat::WindowsPayloadV1,
+            "windows-payload-v2" => UpdateFormat::WindowsPayloadV2,
             "wix" => UpdateFormat::Wix,
             "app" => UpdateFormat::App,
             "appimage" => UpdateFormat::AppImage,

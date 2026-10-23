@@ -29,12 +29,13 @@ import time
 import tomllib
 
 if __package__:
-    from . import macos_package_ui as owned, package as packaging
+    from . import macos_package_ui as owned, package as packaging, native_notices as notices
     from . import package_smoke as smoke, prepare_macos_update as payload
     from .package_revision import expected_revision, verify_checkout, versioned_source_bytes, verify_versioned_export
 else:
     import macos_package_ui as owned
     import package as packaging
+    import native_notices as notices
     import package_smoke as smoke
     import prepare_macos_update as payload
     from package_revision import expected_revision, verify_checkout, versioned_source_bytes, verify_versioned_export
@@ -385,7 +386,7 @@ def app_versions(source):
     return match[1] + "-updateqa.1", match[1] + "-updateqa.2"
 
 
-def build_bundle(commands, source, target, version, nonce, index):
+def build_bundle(commands, source, target, version, nonce, index, notice_bundle, notice_receipt, revision):
     artifact = private_new(commands.root / f"package-{index}")
     config = packaging.package_config(source, platform="darwin")
     require(config["before-packaging-command"]
@@ -394,6 +395,11 @@ def build_bundle(commands, source, target, version, nonce, index):
                                "entitlements": "packaging/macos/entitlements.plist"})
     config.update({"version": version, "out-dir": str(artifact), "binaries-dir": str(target / "release")})
     formats = packaging.macos_update_formats(config, "app")
+    notice_dir = private_new(commands.root / f"notices-{index}")
+    notice_contents = notices.prepare(notice_bundle, notice_receipt, notice_dir,
+                                     revision=revision, platform="darwin", version=version, working=source)
+    config["resources"] = list(config["resources"]) + [
+        {"src": str(notice_dir / name), "target": name} for name in notices.NAMES]
     # Exactly one existing before-packaging build for this version. DMG/UI QA
     # remains unchanged and separate; this route retains its actual .app bytes.
     commands.run(["cargo", "packager", "--release", "--config", json.dumps(config), "--formats", formats],
@@ -401,7 +407,7 @@ def build_bundle(commands, source, target, version, nonce, index):
                  seconds=3300)
     arch = {"arm64": "aarch64", "x86_64": "x86_64"}[platform.machine()]
     receipt = payload.prepare_update(artifact / "Morpheus.app", artifact / "Morpheus.app.tar.gz",
-                                     version=version, arch=arch, root=source)
+                                     version=version, arch=arch, root=source, notice_contents=notice_contents)
     metadata = payload.binary_identity(payload._read(artifact / "Morpheus.app" / APP, payload.MAX_ARCHIVE_BYTES), version, arch)
     require(receipt["bundle_sha256"] == payload._snapshot(artifact / "Morpheus.app")["tree_sha256"]
             and receipt["persistence"] == metadata["persistence"])
@@ -614,6 +620,8 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--target-dir", type=Path, required=True)
     parser.add_argument("--gitleaks", type=Path, required=True)
+    parser.add_argument("--native-source-bundle", type=Path, required=True)
+    parser.add_argument("--native-source-receipt", type=Path, required=True)
     args = parser.parse_args()
     report = {"schema": 1, "check": "installed_macos_transaction_synthetic", "status": "failed", "stage": "preflight",
               "checks": {}, "normal_ui_shutdown": False, "actual_old_parent_exit": False,
@@ -648,7 +656,8 @@ def main():
         built = []
         for index, (export, version) in enumerate(zip(exports, versions), 1):
             report["stage"] = "build_old" if index == 1 else "build_new"
-            built.append(build_bundle(commands, export, target, version, nonce, index))
+            built.append(build_bundle(commands, export, target, version, nonce, index,
+                                      args.native_source_bundle, args.native_source_receipt, revision))
         old, old_receipt, old_identity = built[0]
         new, new_receipt, new_identity = built[1]
         require(old_identity["persistence"] == new_identity["persistence"]

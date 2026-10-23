@@ -94,7 +94,7 @@ def macos_update_formats(config, formats=None):
     return "app,dmg" if "dmg" in selected else "app"
 
 
-def prepare_macos_payload(config, output):
+def prepare_macos_payload(config, output, notice_contents):
     if __package__:
         from .prepare_macos_update import RESOURCES, prepare_update
     else:
@@ -108,9 +108,68 @@ def prepare_macos_payload(config, output):
         raise ValueError("Mac update payload requires a supported native Mac architecture")
     output = output.resolve(strict=True)
     receipt = prepare_update(output / "Morpheus.app", output / "Morpheus.app.tar.gz",
-                             version=config["version"], arch=arch, root=ROOT)
+                             version=config["version"], arch=arch, root=ROOT, notice_contents=notice_contents)
     print("MORPHEUS_MAC_UPDATE " + json.dumps(receipt, sort_keys=True))
     return receipt
+
+
+def native_package(config, args):
+    """Stage exact source notices before the one ordinary native package build."""
+    if __package__:
+        from . import native_notices as notices
+        from .package_revision import expected_revision
+    else:
+        import native_notices as notices
+        from package_revision import expected_revision
+    if args.native_source_bundle is None or args.native_source_receipt is None:
+        raise ValueError("Mac/Windows packages require explicit candidate-bound source bundle and receipt")
+    if any(name in os.environ for name in ("CARGO_PACKAGER_SIGN_PRIVATE_KEY", "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD")):
+        raise ValueError("Prepare unsigned packages and data payloads before separate signing acceptance")
+    if sys.platform == "win32" and args.formats != "nsis":
+        raise ValueError("Windows marked packages require explicit --formats nsis")
+    formats = macos_update_formats(config, args.formats) if sys.platform == "darwin" else None
+    output = ROOT / config.get("out-dir", "dist")
+    final_names = (*notices.NAMES, "Morpheus.app.tar.gz" if sys.platform == "darwin" else "Morpheus.windows-payload-v2.bin")
+    if any((output / name).exists() or (output / name).is_symlink() for name in final_names):
+        raise ValueError("Preserve previous native payload/notices before packaging; no output is overwritten")
+    (ROOT / "target").mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="native-notices-", dir=ROOT / "target") as temporary:
+        directory = Path(temporary)
+        contents = notices.prepare(args.native_source_bundle, args.native_source_receipt, directory,
+                                   revision=expected_revision(os.environ), platform=sys.platform,
+                                   version=config["version"], working=ROOT)
+        if sys.platform == "win32":
+            if __package__:
+                from .prepare_windows_update import prepare
+            else:
+                from prepare_windows_update import prepare
+            environment = {**os.environ, "MORPHEUS_PACKAGE_FORMAT": "nsis-payload-v2"}
+            subprocess.run(["cargo", "build", "--release", "--locked", "-p", "morpheus-app", "--features", "native-calls"],
+                           check=True, cwd=ROOT, env=environment)
+            with tempfile.TemporaryDirectory(prefix="windows-payload-", dir=ROOT / "target") as payload_dir:
+                prepared, payload = prepare(config, ROOT, Path(payload_dir), notice_contents=contents)
+                subprocess.run(["cargo", "packager", "--release", "--config", json.dumps(prepared), "--formats", "nsis"],
+                               check=True, cwd=ROOT, env=environment)
+                output.mkdir(parents=True, exist_ok=True)
+                with (output / payload.name).open("xb") as destination, payload.open("rb") as source:
+                    while chunk := source.read(65536):
+                        destination.write(chunk)
+                    destination.flush(); os.fsync(destination.fileno())
+        else:
+            prepared = dict(config)
+            prepared["resources"] = list(config["resources"]) + [
+                {"src": str(directory / name), "target": name} for name in notices.NAMES]
+            subprocess.run(["cargo", "packager", "--release", "--config", json.dumps(prepared), "--formats", formats],
+                           check=True, cwd=ROOT)
+            prepare_macos_payload(config, output, contents)
+        # Keep exact generated comparison data beside private QA artifacts, never upload.
+        for name in notices.NAMES:
+            with (output / name).open("xb") as stream:
+                if os.name != "nt": os.fchmod(stream.fileno(), 0o644)
+                stream.write(contents[name]); stream.flush(); os.fsync(stream.fileno())
+        print("MORPHEUS_NATIVE_NOTICES " + json.dumps({"schema": 1,
+              "files": {name: {"bytes": len(contents[name]), "sha256": notices.digest(contents[name])}
+                        for name in notices.NAMES}, "distribution_ready": False}, sort_keys=True))
 
 
 def main():
@@ -122,9 +181,12 @@ def main():
                         help="Explicit offline Cargo source-input plan; source bundle only, no installer")
     parser.add_argument("--source-bundle-output", type=Path,
                         help="Existing empty private directory outside the checkout for source evidence")
+    parser.add_argument("--native-source-bundle", type=Path, help="Authenticated existing corresponding-source archive for Mac/Windows notices")
+    parser.add_argument("--native-source-receipt", type=Path, help="Matching private source archive receipt; no fetch or legal acceptance")
     args = parser.parse_args()
     if args.source_bundle_inputs is not None or args.source_bundle_output is not None:
         if (args.check or not sys.platform.startswith("linux")
+                or args.native_source_bundle is not None or args.native_source_receipt is not None
                 or args.source_bundle_inputs is None or args.source_bundle_output is None):
             raise ValueError("Source evidence requires both explicit paths and Linux/AppImage; --check stays separate")
         return linux_appimage(args.formats, args.gitleaks,
@@ -134,73 +196,13 @@ def main():
         print(f"Package configuration is valid for {sys.platform}")
         return
     preflight_deb_authors(config, args.formats)
-    macos_formats = macos_update_formats(config, args.formats) if sys.platform == "darwin" else None
     if sys.platform.startswith("linux"):
+        if args.native_source_bundle is not None or args.native_source_receipt is not None:
+            raise ValueError("Native notice inputs are for Mac/Windows only; Linux retains its existing source route")
         return linux_appimage(args.formats, args.gitleaks)
-    if sys.platform == "win32":
-        if args.formats != "nsis":
-            raise ValueError("Windows marked packages require explicit --formats nsis")
-        if any(name in os.environ for name in ("CARGO_PACKAGER_SIGN_PRIVATE_KEY", "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD")):
-            raise ValueError("Sign the final Windows data payload separately after installed update acceptance")
-        if __package__:
-            from .prepare_windows_update import prepare
-        else:
-            from prepare_windows_update import prepare
-        # The same existing build, once. Packager must not rebuild an unmarked
-        # executable after hashing the marker and complete update payload.
-        environment = {**os.environ, "MORPHEUS_PACKAGE_FORMAT": "nsis-payload-v1"}
-        subprocess.run(["cargo", "build", "--release", "--locked", "-p", "morpheus-app", "--features", "native-calls"],
-                       check=True, cwd=ROOT, env=environment)
-        with tempfile.TemporaryDirectory(prefix="windows-payload-", dir=ROOT / "target") as temporary:
-            config, payload = prepare(config, ROOT, Path(temporary))
-            command = ["cargo", "packager", "--release", "--config", json.dumps(config), "--formats", "nsis"]
-            subprocess.run(command, check=True, cwd=ROOT, env=environment)
-            output = ROOT / config.get("out-dir", "dist")
-            output.mkdir(parents=True, exist_ok=True)
-            # No upload/release is performed. The final bounded data envelope
-            # is the only Windows updater signing input, never setup.exe.
-            with (output / payload.name).open("xb") as destination, payload.open("rb") as source:
-                while chunk := source.read(65536):
-                    destination.write(chunk)
-                destination.flush()
-                os.fsync(destination.fileno())
-        return
-    if sys.platform.startswith("linux") and os.environ.get("CARGO_PACKAGER_SIGN_PRIVATE_KEY"):
-        raise ValueError("Package unsigned first, prepare AppImage metadata, then use the official Cargo Packager signer on the final artifact")
-    output = ROOT / config.get("out-dir", "dist")
-    if sys.platform == "darwin":
-        update_output = output / "Morpheus.app.tar.gz"
-        if update_output.exists() or update_output.is_symlink():
-            raise ValueError("Preserve or remove the previous Mac update input before packaging; it will not be overwritten")
-    before = {
-        path: (path.stat().st_mtime_ns, path.stat().st_size, path.stat().st_ino)
-        for path in output.rglob("*.AppImage")
-    } if sys.platform.startswith("linux") else {}
-    # Cargo Packager 0.11.8 accepts inline JSON. Passing an argv item avoids
-    # shell interpolation and keeps resource paths relative to the repo root.
-    command = ["cargo", "packager", "--release", "--config", json.dumps(config)]
-    if macos_formats is not None:
-        command.extend(["--formats", macos_formats])
-    elif args.formats:
-        command.extend(["--formats", args.formats])
-    subprocess.run(command, check=True, cwd=ROOT)
-    if sys.platform == "darwin":
-        prepare_macos_payload(config, output)
-    if sys.platform.startswith("linux"):
-        if __package__:
-            from .prepare_appimage_update import binary_metadata, prepare_appimage
-        else:
-            from prepare_appimage_update import binary_metadata, prepare_appimage
-
-        changed = [
-            path for path in output.rglob("*.AppImage")
-            if before.get(path) != (path.stat().st_mtime_ns, path.stat().st_size, path.stat().st_ino)
-        ]
-        if changed:
-            metadata = binary_metadata(ROOT / config.get("binaries-dir", "target/release") / "morpheus-app")
-            for artifact in changed:
-                prepare_appimage(artifact, metadata)
-            print(f"Prepared compatibility metadata for {len(changed)} unsigned AppImage package(s)")
+    if sys.platform not in {"darwin", "win32"}:
+        raise ValueError("Unsupported native package platform")
+    return native_package(config, args)
 
 
 if __name__ == "__main__":

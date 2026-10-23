@@ -374,6 +374,11 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(identity["commit"], revision)
         self.assertEqual(identity["tree"], tree)
         self.assertFalse(identity["git_attributes_applied"])
+        self.assertEqual(identity["git_identity_schema"], 2)
+        raw_commit = bytes.fromhex(identity["commit_object_hex"])
+        self.assertLessEqual(len(raw_commit), 1024 * 1024)
+        self.assertEqual(S.object_id("commit", raw_commit), identity["commit"])
+        self.assertEqual(raw_commit.split(b"\n", 1)[0], ("tree " + identity["tree"]).encode("ascii"))
         self.assertEqual(files, {"README": blob})
         with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
             self.assertEqual(archive.extractfile("README").read(), blob)

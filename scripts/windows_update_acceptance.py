@@ -23,12 +23,13 @@ import time
 import tomllib
 
 if __package__:
-    from . import package as package
+    from . import package as package, native_notices as notices
     from . import package_revision as revision
     from . import prepare_windows_update as producer
     from . import run_windows_capture_acceptance as capture
 else:
     import package
+    import native_notices as notices
     import package_revision as revision
     import prepare_windows_update as producer
     import run_windows_capture_acceptance as capture
@@ -242,10 +243,13 @@ def instrumented_entry(data, nonce):
     return identity
 
 
-def build(commands, source, archive, version, nonce, label, cargo):
+def build(commands, source, archive, version, nonce, label, cargo, notice_bundle, notice_receipt, reviewed):
     exported,proof = export_source(commands,source,archive,version,label)
+    notice_dir=commands.root/(label+"-notices"); notice_dir.mkdir(mode=0o700)
+    notice_contents=notices.prepare(notice_bundle,notice_receipt,notice_dir,revision=reviewed,
+                                    platform="win32",version=version,working=exported)
     target = commands.root/"native-target"
-    environment = {"MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD":nonce,"MORPHEUS_PACKAGE_FORMAT":"nsis-payload-v1"}
+    environment = {"MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD":nonce,"MORPHEUS_PACKAGE_FORMAT":"nsis-payload-v2"}
     commands.run([cargo,"build","--release","--locked","-p","morpheus-app","--features","native-calls",
         "--target-dir",target],environment=environment,cwd=exported,seconds=3600)
     require(revision.verify_versioned_export(exported,archive,version) == proof)
@@ -256,7 +260,7 @@ def build(commands, source, archive, version, nonce, label, cargo):
     config = package.package_config(exported,"win32")
     config.update(version=version,**{"out-dir":str(output)})
     stage = commands.root/(label+"-producer"); stage.mkdir()
-    prepared,payload = producer.prepare(config,exported,stage)
+    prepared,payload = producer.prepare(config,exported,stage,notice_contents=notice_contents)
     commands.run([cargo,"packager","--release","--formats","nsis","--config",json.dumps(prepared)],
         environment=environment,cwd=exported,seconds=900)
     setups = list(output.glob("*.exe")); require(len(setups)==1)
@@ -552,8 +556,8 @@ def execute(args):
         archive=read(archive_path,revision.MAX_EXPORT_BYTES)
         config=tomllib.loads((source/"crates/morpheus-app/Cargo.toml").read_text())
         version=config["package"]["version"].split("-",1)[0]
-        stage="build-old"; old=build(commands,source,archive,version+"-updateqa.1",nonce,"old",cargo)
-        stage="build-new"; new=build(commands,source,archive,version+"-updateqa.2",nonce,"new",cargo)
+        stage="build-old"; old=build(commands,source,archive,version+"-updateqa.1",nonce,"old",cargo,args.native_source_bundle,args.native_source_receipt,reviewed)
+        stage="build-new"; new=build(commands,source,archive,version+"-updateqa.2",nonce,"new",cargo,args.native_source_bundle,args.native_source_receipt,reviewed)
         require({k:v for k,v in old["identity"].items() if k!="version"}
                 =={k:v for k,v in new["identity"].items() if k!="version"})
         stage="signing"; key=root/"fixture.key"
@@ -605,6 +609,8 @@ def execute(args):
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source",type=Path,required=True)
+    parser.add_argument("--native-source-bundle",type=Path,required=True)
+    parser.add_argument("--native-source-receipt",type=Path,required=True)
     parser.add_argument("--gitleaks",type=Path,required=True)
     parser.add_argument("--gitleaks-sha256",required=True,help="Exact independently reviewed host scanner SHA256")
     parser.add_argument("--execute-on-free-hosted-runner",action="store_true")

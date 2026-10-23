@@ -1352,7 +1352,7 @@ pub(super) fn early_dispatch() -> Result<bool, UpdateError> {
             .starts_with("--morpheus-windows-update-")
     });
     if reserved
-        && (option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis-payload-v1")
+        && (option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis-payload-v2")
             || !INSTALLATION_VALIDATED)
     {
         return Err(UpdateError::InstallNotValidated);
@@ -1401,7 +1401,7 @@ pub(super) fn begin_startup() -> Result<(Option<WindowsSession>, bool), UpdateEr
 fn begin_startup_with_validation(
     validated: bool,
 ) -> Result<(Option<WindowsSession>, bool), UpdateError> {
-    if option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis-payload-v1") {
+    if option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis-payload-v2") {
         return Ok((None, false));
     }
     let executable = std::env::current_exe().map_err(|_| UpdateError::UnsupportedPackage)?;

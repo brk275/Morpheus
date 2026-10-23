@@ -8,7 +8,7 @@ of installed upgrade acceptance or authorization to publish installers.
 
 The initial/manual package remains NSIS, current user only. The ordinary Windows
 package command builds the existing Rust target once with
-`MORPHEUS_PACKAGE_FORMAT=nsis-payload-v1`. It reads the native, immutable
+`MORPHEUS_PACKAGE_FORMAT=nsis-payload-v2`. It reads the native, immutable
 `.mrphupd` PE section, generates `morpheus-install.json`, and includes that marker
 as an explicit installed resource. The template and exact resource contract are
 pinned by `update-contract.json`. Legacy packages and loose executables remain
@@ -38,9 +38,9 @@ remain unchanged. App launching releases the installer lock first.
 
 ## Signed data payload
 
-The updater format is `windows-payload-v1`, distinct from `nsis`. Its bytes are
-the magic `MORPHEUS-WINDOWS-PAYLOAD-V1\n`, a little-endian u32 marker length, the
-strict JSON marker, and the five file bodies in ledger order. The whole envelope
+The updater format is `windows-payload-v2`, distinct from `nsis`. Its bytes are
+the magic `MORPHEUS-WINDOWS-PAYLOAD-V2\n`, a little-endian u32 marker length, the
+strict JSON marker, and the seven file bodies in ledger order. The whole envelope
 is limited to 512 MiB; the marker is limited to 16 KiB. It contains no local
 paths, registry snapshot, user identity or installer executable. Use the official
 signer on the final envelope separately; the producer does not sign or upload.
@@ -53,12 +53,39 @@ generic executable-installer method remains blocked. Discovery, download,
 staging and restart preparation retain official signature checks over the exact
 retained staged bytes.
 
-The payload changes the app, theme, three license resources and marker. The
+The payload changes the app, theme, the original three license resources, two
+candidate-bound third-party notice files and marker. The
 original NSIS uninstaller remains valid because this contract fixes its complete
 resource, shortcut, registration and scope behavior. Its **actual bytes** are
 hashed separately in the private journal and retained in the complete backup.
 Changing that contract, resources or installer customization requires a new
 reviewed manual installation; a version-only claim is insufficient.
+
+## Versioned notice ledger transition
+
+Marker schema 2 and `windows-payload-v2` bind the exact seven paths in
+`update-contract.json`; its canonical SHA-256 is
+`f76b4492cc3281c91c5ec703c39f69d732aa892427dbff5aa8d3f4b335bd02b6`.
+The two added resources are exactly `licenses/THIRD-PARTY-NOTICES.txt` and
+`licenses/THIRD-PARTY-NOTICES.json`. NSIS receives those exact explicit resources;
+no wildcard or optional arbitrary resource is admitted. The original template
+bytes remain pinned; its generated resource File/Delete ledger now has seven
+entries and the marker. The native parser, producer and contract change together.
+
+V1's five-resource payload and schema-1 install marker are **not** reinterpreted.
+The feed enum retains V1 as a distinct, unsupported legacy format; the V2 helper
+refuses its marker/journal input before applying or recovering it. A matching old
+helper remains responsible for an old unfinished transaction. Moving an old
+installation to this new uninstall/resource contract requires a separately
+reviewed manual installation; migration and actual installed acceptance remain
+open. Journal/request schemas whose semantics did not change retain their
+version. No old installed-helper compatibility is claimed.
+
+Notices are generated before packaging from authenticated corresponding-source
+inputs. They include exact locked source license/NOTICE bytes and local patch
+provenance, including Slint attribution. They do not prove a chosen license
+route, native SDK/static-link obligations, relinking rights or permission to
+publish an installer; those release gates remain false.
 
 ## Handoff and recovery
 

@@ -243,6 +243,9 @@ pub enum UpdateFormat {
     /// This is not an executable NSIS installer and the generic install stays blocked.
     #[serde(rename = "windows-payload-v1")]
     WindowsPayloadV1,
+    /// Fixed seven-file notice-bearing Windows data payload; legacy v1 stays distinct.
+    #[serde(rename = "windows-payload-v2")]
+    WindowsPayloadV2,
     /// The Microsoft Software Installer (.msi) through WiX Toolset.
     Wix,
     /// The Linux AppImage package (.AppImage).
@@ -259,6 +262,7 @@ impl std::fmt::Display for UpdateFormat {
             match self {
                 UpdateFormat::Nsis => "nsis",
                 UpdateFormat::WindowsPayloadV1 => "windows-payload-v1",
+                UpdateFormat::WindowsPayloadV2 => "windows-payload-v2",
                 UpdateFormat::Wix => "wix",
                 UpdateFormat::AppImage => "appimage",
                 UpdateFormat::App => "app",

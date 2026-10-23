@@ -12,12 +12,13 @@ from pathlib import Path
 import stat
 import struct
 
-MAGIC = b"MORPHEUS-WINDOWS-PAYLOAD-V1\n"
+MAGIC = b"MORPHEUS-WINDOWS-PAYLOAD-V2\n"
 MAX_BYTES = 512 * 1024 * 1024
 MARKER_LIMIT = 16 * 1024
 FILES = ("LICENSE", "licenses/Symphonia-MPL-2.0.txt", "licenses/Symphonia-NOTICE.txt",
-         "morpheus-app.exe", "themes/aurora.toml")
-CONTRACT_SHA256 = "3f45a065d910b1b8aa889bb4d74dfec33682c23bcfee2dc69d66ed5ce9382a9d"
+         "morpheus-app.exe", "themes/aurora.toml",
+         "licenses/THIRD-PARTY-NOTICES.txt", "licenses/THIRD-PARTY-NOTICES.json")
+CONTRACT_SHA256 = "f76b4492cc3281c91c5ec703c39f69d732aa892427dbff5aa8d3f4b335bd02b6"
 
 
 def require(condition, message):
@@ -93,7 +94,7 @@ def pe_identity(data):
     return identity
 
 
-def prepare(config, root, directory):
+def prepare(config, root, directory, *, notice_contents):
     """After the ordinary marked cargo build, before the one NSIS invocation."""
     root, directory = Path(root), Path(directory)
     require(directory.is_dir() and not any(directory.iterdir()), "Expected empty owned producer directory")
@@ -112,15 +113,23 @@ def prepare(config, root, directory):
             "Windows installer template changed")
     binary_dir = config.get("binaries-dir", "target/release")
     require(binary_dir == "target/release", "Unsupported binary directory")
+    if __package__:
+        from . import native_notices as notices
+    else:
+        import native_notices as notices
+    notices.verify_bytes(notice_contents, platform="win32", version=config["version"],
+                         lock=read_regular(root / "Cargo.lock", 4 * 1024 * 1024))
     contents = {}
     remaining = MAX_BYTES - len(MAGIC) - 4 - MARKER_LIMIT
     for name in FILES:
         source = root / ("target/release/morpheus-app.exe" if name == "morpheus-app.exe" else name)
-        contents[name] = read_regular(source, remaining, cargo_binary=name == "morpheus-app.exe")
+        contents[name] = (notice_contents[Path(name).name] if name.startswith("licenses/THIRD-PARTY-NOTICES.")
+                          else read_regular(source, remaining, cargo_binary=name == "morpheus-app.exe"))
+        require(0 < len(contents[name]) <= remaining, "Windows resource exceeds payload bound")
         remaining -= len(contents[name])
     identity = pe_identity(contents["morpheus-app.exe"])
     require(identity["version"] == config.get("version"), "Package and native versions differ")
-    marker = canonical({"schema": 1, "identity": identity, "uninstaller_contract": CONTRACT_SHA256,
+    marker = canonical({"schema": 2, "identity": identity, "uninstaller_contract": CONTRACT_SHA256,
                         "files": [{"path": name, "bytes": len(contents[name]),
                                    "sha256": hashlib.sha256(contents[name]).hexdigest()} for name in FILES]})
     require(0 < len(marker) <= MARKER_LIMIT and sum(map(len, contents.values())) + len(marker) + len(MAGIC) + 4 <= MAX_BYTES,
@@ -130,7 +139,7 @@ def prepare(config, root, directory):
         stream.write(marker)
         stream.flush()
         os.fsync(stream.fileno())
-    payload = directory / "Morpheus.windows-payload-v1.bin"
+    payload = directory / "Morpheus.windows-payload-v2.bin"
     with payload.open("xb") as stream:
         stream.write(MAGIC)
         stream.write(struct.pack("<I", len(marker)))
@@ -142,7 +151,14 @@ def prepare(config, root, directory):
     result = dict(config)
     result.pop("before-packaging-command", None)  # The exact ordinary build just finished.
     # A target path is explicit; no absolute producer path enters the installed marker.
-    result["resources"] = list(config["resources"]) + [{"src": str(marker_path), "target": "morpheus-install.json"}]
+    result["resources"] = list(config["resources"])
+    for name in notices.NAMES:
+        notice_path = directory / name
+        with notice_path.open("xb") as stream:
+            if os.name != "nt": os.fchmod(stream.fileno(), 0o644)
+            stream.write(notice_contents[name]); stream.flush(); os.fsync(stream.fileno())
+        result["resources"].append({"src": str(notice_path), "target": "licenses/" + name})
+    result["resources"].append({"src": str(marker_path), "target": "morpheus-install.json"})
     result["nsis"] = {"template": str(template), "installMode": "currentUser"}
     result["windows"] = {"allowDowngrades": False}
     result["publisher"] = "Morpheus"
