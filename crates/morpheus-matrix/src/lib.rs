@@ -186,6 +186,12 @@ pub use account_recovery::{
     AccountRecoveryError, AccountRecoveryResult, CrossSigningKeys, EnabledRecovery,
     RecoveryOverview, RecoveryProgress, SetupConfirmation,
 };
+mod peer_verification;
+pub use peer_verification::{
+    MAX_PEER_REQUESTS, PeerVerificationInfo, PeerVerificationOutcome, PeerVerificationRequest,
+    PeerVerificationSession, PeerVerificationTarget, PendingPeerVerifications,
+};
+
 mod own_verification;
 pub use own_verification::{
     MAX_PENDING_VERIFICATIONS, MAX_VERIFICATION_DEVICE_NAME_CHARS, OwnVerification,
@@ -1143,6 +1149,7 @@ struct LoadedAccount {
     /// belongs to this exact loaded account. A late completion can update
     /// only its captured book, never a replacement loaded account's book.
     verification_book: Arc<own_verification::VerificationBook>,
+    peer_verifications: Arc<peer_verification::PeerVerificationBook>,
     token_task: Mutex<Option<SyncTask>>,
     notification_handler_registered: Mutex<bool>,
 }
@@ -3363,6 +3370,8 @@ impl LoadedAccount {
         let e2ee = account_recovery::E2eeReadiness::of(&client);
         let (incoming_verification_tx, _) = watch::channel(Vec::<VerificationInfo>::new());
         let verification_book = Arc::new(own_verification::VerificationBook::default());
+        let peer_verifications = Arc::new(peer_verification::PeerVerificationBook::default());
+        peer_verification::register(&client, peer_verifications.clone());
         if let Some(own_user_id) = client.user_id().map(ToOwned::to_owned) {
             let incoming_tx = incoming_verification_tx.clone();
             let book = verification_book.clone();
@@ -3453,6 +3462,7 @@ impl LoadedAccount {
             recovery_ready: watch::channel(false).0,
             incoming_verification_tx,
             verification_book,
+            peer_verifications,
             notification_handler_registered: Mutex::new(false),
             token_task: Mutex::new(Some(SyncTask {
                 shutdown: Some(shutdown),

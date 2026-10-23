@@ -19,12 +19,12 @@ use matrix_sdk_base::{
     crypto::{CryptoStoreError, UserIdentity as CryptoUserIdentity, types::MasterPubkey},
 };
 use ruma::{
-    OwnedUserId, UserId,
+    OwnedUserId, RoomId, UserId,
     events::{key::verification::VerificationMethod, room::message::RoomMessageEventContent},
 };
 
 use super::{ManualVerifyError, RequestVerificationError};
-use crate::{Client, encryption::verification::VerificationRequest};
+use crate::{Client, Room, encryption::verification::VerificationRequest};
 
 /// Updates about [`UserIdentity`]s which got received over the `/keys/query`
 /// endpoint.
@@ -58,6 +58,56 @@ impl IdentityUpdates {
             .collect();
 
         Self { new, changed }
+    }
+}
+
+/// A read-only prepared verification for one explicit, already joined DM.
+///
+/// The identity, client, room and methods cannot be substituted after preparation.
+/// This value is intentionally neither cloneable nor serializable. Sending it
+/// consumes it. A caller must obtain its own final admission before `send`.
+/// The DM flag describes routing, not exclusive or private room membership.
+pub struct PreparedRoomVerification {
+    identity: UserIdentity,
+    room: Room,
+    methods: Vec<VerificationMethod>,
+}
+
+impl PreparedRoomVerification {
+    /// Send once to the prepared room and register the exact returned event in
+    /// the SDK crypto machine. Never creates a room or invites anyone.
+    ///
+    /// A cancellation or transport error after this handoff may leave a sent
+    /// request. The caller must not infer that nothing was sent or replay it.
+    pub async fn send(self) -> Result<VerificationRequest, RequestVerificationError> {
+        let CryptoUserIdentity::Other(identity) = &self.identity.inner else {
+            return Err(RequestVerificationError::NotOtherIdentity);
+        };
+        // Synchronous recheck of joined DM routing before the SDK send. This
+        // does not re-read peer membership; that was checked in preparation.
+        // No first-DM selection, invite or room creation occurs here.
+        if !self
+            .identity
+            .client
+            .get_dm_rooms(identity.user_id())
+            .any(|room| room.room_id() == self.room.room_id())
+        {
+            return Err(RequestVerificationError::NotJoinedDirectRoom);
+        }
+        let content = identity.verification_request_content(Some(self.methods.clone()));
+        let result = self
+            .room
+            .send(RoomMessageEventContent::new(content))
+            .await?;
+        let verification = identity.request_verification(
+            self.room.room_id(),
+            &result.response.event_id,
+            Some(self.methods),
+        );
+        Ok(VerificationRequest {
+            inner: verification,
+            client: self.identity.client,
+        })
     }
 }
 
@@ -247,6 +297,43 @@ impl UserIdentity {
     ) -> Result<VerificationRequest, RequestVerificationError> {
         assert!(!methods.is_empty(), "The list of verification methods can't be non-empty");
         self.request_verification_impl(Some(methods)).await
+    }
+
+    /// Prepare verification in exactly one existing joined direct room.
+    ///
+    /// This only reads membership. It does not send, create a DM, invite a user,
+    /// or grant trust. The room must belong to this identity's client, be in
+    /// its joined DM routing set for this exact peer, and contain a joined peer.
+    /// The DM flag alone does not prove exclusive or private membership.
+    pub async fn prepare_verification_in_room_with_methods(
+        &self,
+        room_id: &RoomId,
+        methods: Vec<VerificationMethod>,
+    ) -> Result<PreparedRoomVerification, RequestVerificationError> {
+        if methods.is_empty() {
+            return Err(RequestVerificationError::EmptyMethods);
+        }
+        let CryptoUserIdentity::Other(identity) = &self.inner else {
+            return Err(RequestVerificationError::NotOtherIdentity);
+        };
+        let room = self
+            .client
+            .get_dm_rooms(identity.user_id())
+            .find(|room| room.room_id() == room_id)
+            .ok_or(RequestVerificationError::NotJoinedDirectRoom)?;
+        if !room
+            .members(RoomMemberships::JOIN)
+            .await?
+            .iter()
+            .any(|member| member.user_id() == identity.user_id())
+        {
+            return Err(RequestVerificationError::NotJoinedDirectRoom);
+        }
+        Ok(PreparedRoomVerification {
+            identity: self.clone(),
+            room,
+            methods,
+        })
     }
 
     async fn request_verification_impl(

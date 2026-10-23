@@ -16,7 +16,7 @@ Selected regressions do not establish every feature interaction or installed beh
 | Multiple accounts | Separate sessions, encryption stores, drafts and vault entries; bottom-left switcher; inactive sync and send queues pause. | Installed switching and real sign-in across supported platforms. |
 | Account protection | One optional local app password for switching and startup restore; password change/disable; direct removal with durable cleanup retries. | Installed interaction and screen-reader acceptance. |
 | Sign-in | Password, system-browser SSO/OIDC, session restore and vaulted refresh tokens. | Real provider/browser handoff in installed apps. |
-| Encryption | Encrypted messages/media, device verification, key backup and recovery controls. | Revised verification completion UI, failed-recovery behavior and cross-platform recovery acceptance. |
+| Encryption | Encrypted messages/media, own-device verification, key backup and recovery controls. [Other-person SAS](PEER_VERIFICATION.md) is prepared in source. | Peer SAS SDK/controller/native UI checks, revised verification completion UI, failed-recovery behavior and cross-platform recovery acceptance. |
 
 Two-homeserver isolation, restart and removal have disposable-account test
 coverage. Fresh [native-vault run 39838186967](https://github.com/brk275/Morpheus/actions/runs/39838186967)
