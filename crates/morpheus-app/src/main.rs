@@ -45,6 +45,7 @@ mod notification_center;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
+mod peer_verification;
 mod people_directory;
 mod pinned_messages;
 mod polls;
@@ -1788,6 +1789,8 @@ fn run_application(
         ui.as_weak(),
         voice_spaces.clone(),
     );
+    let peer_verification_ui =
+        peer_verification::PeerVerificationUi::register(&ui, live.clone(), runtime.handle());
     #[cfg(not(all(windows, feature = "native-calls")))]
     security::register(&ui, live.clone(), runtime.handle().clone());
     let image_previews =
@@ -4437,6 +4440,9 @@ fn run_application(
         window.invoke_cancel_room_settings();
         window.invoke_close_image_preview();
         window.invoke_stop_attachment_audio();
+        // Drop the already-visible SDK session before any logout work. The
+        // mandatory post-pause UI acknowledgement below closes recreation.
+        window.invoke_withdraw_verification();
         if !logout_live.is_live.load(Ordering::Acquire) {
             if window.get_call_connected() {
                 window.set_pending_account_index(-3);
@@ -4775,6 +4781,8 @@ fn run_application(
         #[cfg(all(windows, feature = "native-calls"))]
         live.security_gate.begin_shutdown(None);
         live.close_action_admission();
+        // Actual UI-owned SDK sessions go before any async task/store drain.
+        peer_verification_ui.shutdown(&cleanup_ui);
         store.close_write_admission();
         style_profiles::close_application_admission();
         cleanup_ui.set_application_closing(true);
