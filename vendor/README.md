@@ -6,6 +6,7 @@ provenance and regression tests when updating a dependency.
 
 | Crate | Purpose | Provenance |
 | --- | --- | --- |
+| cpal 0.18.2 | Retained macOS native audio owners and checked close; Windows event ownership; Linux close-on-exec wake descriptors | [Patch notes and exact upstream archive](cpal/OWNED_COREAUDIO.md) |
 | lru 0.16.4 | Backport panic-safe cache removal | [Patch notes](lru/MORPHEUS_PATCH.md) |
 | image-webp 0.2.4 | Bound lossless entropy-tree complexity before group allocation | [Patch notes](image-webp/MORPHEUS_PATCH.md) |
 | matrix-rtc-livekit | Secure authorization and media endpoints | [Patch notes](matrix-rtc-livekit/README.md) |
@@ -18,6 +19,33 @@ provenance and regression tests when updating a dependency.
 | webrtc-sys-build 0.3.18 | Verify pinned archive downloads and constrain native SDK extraction | [Patch notes](webrtc-sys-build/MORPHEUS_PATCH.md) |
 | cargo-packager-updater 0.2.3 | HTTPS and bounded signed-update staging; installation disabled pending recovery checks | [Patch notes](cargo-packager-updater/README.md) |
 | nokhwa 0.10.11 / nokhwa-bindings-macos 0.2.4 | Correct and bound native macOS capture | Details below |
+
+## CPAL source and verification boundary
+
+`cpal` 0.18.2 is an explicit workspace library member and a local
+`[patch.crates-io]` dependency. Its original crates.io archive has SHA256
+`6f02e8d0327b42d3e2e4ab2119af397344eb9fc54a34bf0ddeaa1277af8681f1`
+and records upstream commit `e1612d5d98152f8dc2a62e1b51ef7cbf4f7f26b7`.
+The complete Apache-2.0 [license](cpal/LICENSE), original source and hardware
+examples/tests, `Cargo.toml.orig` and upstream lockfile stay preserved.
+The managed normalized manifest excludes only upstream example declarations
+and their four unused dev-tool dependencies; the root lock governs builds.
+
+The existing native CI vendor step selects exact synthetic CPAL library cases
+for each runner, checking each case exists before running it. Linux verifies
+close-on-exec wake pipes, Windows verifies owned command-event lifetimes, and
+Macs verify callback admission and retained owner/TLS joins. These cases do not
+open devices and do not establish real-device or complete backend acceptance.
+Windows COM/notification retirement and checked ALSA PCM disposal remain open;
+Mac checked API completion does not prove every internal Apple thread ended.
+
+The corresponding-source exporter includes all committed CPAL bytes and records
+its local manifest, license candidate hash and build interface through its
+existing workspace/path traversal. Linux AppImage notices copy the authenticated
+Apache license and patch provenance. This addition does not complete broader
+Rust/native licensing, SDK source or relinking requirements. Mac/Windows fixed
+installer-resource ledgers still need their own complete notice integration.
+No source-only review or synthetic pass authorizes distribution or installation.
 
 ## Nokhwa macOS camera patch
 

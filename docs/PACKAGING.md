@@ -106,6 +106,25 @@ readiness. Adoption of this workflow/scope/docs change needs only its affected
 existing helper checks; actual installed runs remain an explicit later reviewed
 selection after the native application candidate is stable.
 
+## Vendored CPAL source and notices
+
+The workspace uses the reviewed same-version CPAL 0.18.2 patch documented in
+[`vendor/cpal/OWNED_COREAUDIO.md`](../vendor/cpal/OWNED_COREAUDIO.md). The complete
+committed vendor tree, including its Apache-2.0 license, original manifest,
+upstream lock, examples and preserved hardware tests, enters `workspace.tar.gz`
+through the existing source export. Its local package record binds the declared
+license, candidate license-text hashes and build-script identity; the original
+registry archive SHA256 is recorded in the patch provenance.
+
+The Linux AppImage inventory also copies the hash-verified CPAL license and
+patch provenance as immutable notices and verifies their deployed hashes.
+Broader Rust/static notices, SDK/system/compiler sources, relinking and license
+obligations remain release gates. Mac/Windows fixed resource ledgers are not
+expanded by this Linux notice addition. Synthetic CPAL CI selects only named
+library cases and does not replace actual call/leave/rejoin, attachment handoff,
+backend disposal, installed-package or device acceptance. Distribution and
+installation approval remain unchanged.
+
 ## Preparing corresponding source evidence
 
 An explicit source-only path prepares the committed Rust workspace, local

@@ -470,6 +470,42 @@ jobs:
           cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
           cargo test --locked -p cargo-packager-updater --lib
           cargo test --locked -p webrtc-sys-build --lib
+          # These exact library cases use synthetic buffers/owners or unnamed
+          # kernel events/pipes. Never run CPAL's preserved device hardware tests.
+          case "$RUNNER_OS" in
+            Linux)
+              cpal_tests=(
+                host::alsa::trigger_pipe_is_close_on_exec_and_still_wakes_the_worker
+              )
+              ;;
+            Windows)
+              cpal_tests=(
+                host::wasapi::stream::tests::command_event_caller_can_signal_after_worker_owner_retires
+                host::wasapi::stream::tests::command_event_worker_can_wait_after_caller_owner_retires
+                host::wasapi::stream::tests::owned_event_is_not_retained_by_a_failed_later_construction_step
+                host::wasapi::stream::tests::owned_event_is_not_retained_by_a_construction_unwind
+              )
+              ;;
+            macOS)
+              cpal_tests=(
+                host::coreaudio::macos::callback_gate::tests::stale_generation_cannot_revoke_or_fail_current_callback
+                host::coreaudio::macos::callback_gate::tests::admitted_error_revokes_exact_generation_before_return
+                host::coreaudio::macos::callback_gate::tests::twenty_four_bit_storage_and_unsigned_midpoint_are_four_bytes
+                host::coreaudio::macos::callback_gate::tests::empty_null_output_does_not_construct_or_invoke_user_data
+                host::coreaudio::macos::callback_gate::tests::caught_panic_and_callback_body_are_retained_until_off_callback_release
+                host::coreaudio::macos::owned::tests::close_request_revokes_published_callback_and_blocks_later_native_construction
+                host::coreaudio::macos::owned::tests::pending_real_owner_tls_keeps_actual_join_and_replacement_fence
+              )
+              ;;
+            *) echo "Unsupported CPAL synthetic-test platform." >&2; exit 1 ;;
+          esac
+          # Cargo accepts a filter matching zero tests. Require every exact case
+          # to be present before executing it, so cfg/name drift cannot pass.
+          cargo test --locked -p cpal --lib -- --list > "$RUNNER_TEMP/morpheus-cpal-tests.txt"
+          for cpal_test in "${cpal_tests[@]}"; do
+            grep -Fqx -- "$cpal_test: test" "$RUNNER_TEMP/morpheus-cpal-tests.txt"
+            cargo test --locked -p cpal --lib "$cpal_test" -- --exact
+          done
       - name: Test pinned SDK sticky receipt and redaction regressions
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'sdk')
         id: sdk-receipt-tests

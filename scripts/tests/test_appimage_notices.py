@@ -332,6 +332,49 @@ class DeploymentTests(unittest.TestCase):
 
 
 class PreparationTests(unittest.TestCase):
+    @staticmethod
+    def cpal_source(project):
+        source = project / "vendor/cpal"
+        source.mkdir(parents=True)
+        for name in ("LICENSE", "OWNED_COREAUDIO.md"):
+            (source / name).write_bytes((ROOT / "vendor/cpal" / name).read_bytes())
+        return source
+
+    def test_cpal_notices_authenticate_license_and_copy_exact_provenance(self):
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as checkout:
+            root = Path(folder).resolve(); project = Path(checkout).resolve()
+            source = self.cpal_source(project)
+            config = {"appimage": {"files": {}}}; notices = {}
+            with mock.patch.object(N.client, "ROOT", project):
+                N.cpal_notices(root, config, notices)
+            self.assertEqual(len(notices), 2)
+            self.assertEqual(N.digest((source / "LICENSE").read_bytes()), N.CPAL_LICENSE_SHA256)
+            for path, destination in config["appimage"]["files"].items():
+                self.assertEqual(N.digest(Path(path).read_bytes()), notices[destination])
+            copied = {Path(path).name: Path(path).read_bytes() for path in config["appimage"]["files"]}
+            self.assertEqual(copied["CPAL-0.18.2-PATCH.md"], (source / "OWNED_COREAUDIO.md").read_bytes())
+            (source / "OWNED_COREAUDIO.md").write_bytes(b"later source mutation")
+            self.assertNotIn(b"later source mutation", copied.values())
+
+    def test_cpal_notice_wrong_license_or_nonregular_input_fails_before_staging(self):
+        for mutation in ("license", "symlink", "missing"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as checkout:
+                root = Path(folder).resolve(); project = Path(checkout).resolve()
+                source = self.cpal_source(project)
+                if mutation == "license":
+                    (source / "LICENSE").write_bytes(b"not the pinned Apache license")
+                elif mutation == "symlink":
+                    (source / "OWNED_COREAUDIO.md").unlink()
+                    (source / "OWNED_COREAUDIO.md").symlink_to(source / "LICENSE")
+                else:
+                    (source / "OWNED_COREAUDIO.md").unlink()
+                config = {"appimage": {"files": {}}}; notices = {}
+                with mock.patch.object(N.client, "ROOT", project), self.assertRaises(N.InventoryFailure):
+                    N.cpal_notices(root, config, notices)
+                self.assertEqual(config["appimage"]["files"], {})
+                self.assertEqual(notices, {})
+                self.assertEqual(list(root.iterdir()), [])
+
     def test_absent_usrmerge_alias_is_expected_but_owner_metadata_is_exact(self):
         runner = mock.Mock()
         runner.run.side_effect = [
@@ -366,6 +409,7 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as checkout:
             root = Path(folder).resolve(); project = Path(checkout).resolve()
             (project / "LICENSE").write_bytes(b"Morpheus original code license")
+            self.cpal_source(project)
             stage = root / "stage"; stage.mkdir()
             (stage / "COPYING").write_bytes(b"PipeWire license")
             binary = root / "binary"
@@ -392,7 +436,7 @@ class PreparationTests(unittest.TestCase):
                                          "runtime": {"sha256": "c" * 64}, "sources": {}, "patches": {}})
             self.assertEqual(set(prepared["components"]), {"morpheus-app", N.client.SONAME, "libsample.so.1"})
             resolver.assert_called_once_with("libsample.so.1")
-            self.assertEqual(len(prepared["notices"]), 4)
+            self.assertEqual(len(prepared["notices"]), 6)
             for path, destination in config["appimage"]["files"].items():
                 self.assertEqual(N.digest(Path(path).read_bytes()), prepared["notices"][destination])
             self.assertNotIn(str(root), str(prepared))
@@ -401,6 +445,7 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as checkout:
             root = Path(folder).resolve(); project = Path(checkout).resolve()
             (project / "LICENSE").write_bytes(b"Morpheus original code license")
+            self.cpal_source(project)
             stage = root / "stage"; stage.mkdir()
             binary = root / "binary"; binary.write_bytes(elf_bytes(b"main"))
             pipewire = stage / N.client.SONAME; pipewire.write_bytes(elf_bytes(b"pipewire"))
