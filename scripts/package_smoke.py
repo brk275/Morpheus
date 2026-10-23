@@ -68,7 +68,7 @@ def artifact(dist, suffix):
     return path
 
 
-def check_resources(root):
+def check_resources(root, dist=None):
     for name, source in [("LICENSE", ROOT / "LICENSE"), ("aurora.toml", ROOT / "themes/aurora.toml"),
                          ("Symphonia-MPL-2.0.txt", ROOT / "licenses/Symphonia-MPL-2.0.txt"),
                          ("Symphonia-NOTICE.txt", ROOT / "licenses/Symphonia-NOTICE.txt")]:
@@ -76,6 +76,20 @@ def check_resources(root):
         candidates = [p for p in root.rglob(name) if p.is_file()]
         require(any(p.read_bytes().replace(b"\r\n", b"\n") == expected for p in candidates),
                 f"Installed {name} is absent or differs from the source")
+    if sys.platform in {"darwin", "win32"}:
+        if __package__:
+            from . import native_notices as notices
+            from .package_revision import expected_revision
+        else:
+            import native_notices as notices
+            from package_revision import expected_revision
+        require(dist is not None, "Native notice comparison data is required")
+        expected = notices.read_files(Path(dist))
+        actual = notices.read_files(Path(root) if sys.platform == "darwin" else Path(root) / "licenses")
+        require(actual == expected, "Installed third-party notices differ from candidate outputs")
+        notices.verify_bytes(actual, revision=expected_revision(os.environ), platform=sys.platform,
+                             version=package_version(), lock=(ROOT / "Cargo.lock").read_bytes())
+        record("installed_candidate_third_party_notices", distribution_ready=False)
     record("installed_license_and_theme")
 
 
@@ -413,7 +427,7 @@ def macos_smoke(dist, expected_arch):
                 require(bool(info.get(key, "").strip()), f"Missing permission purpose string: {key}")
             executable = contents / "MacOS" / BINARY
             require(output(["lipo", "-archs", str(executable)]).split() == [expected_arch], "Wrong installed Mach-O architecture")
-            check_resources(contents / "Resources")
+            check_resources(contents / "Resources", dist)
             record("dmg_installed_bundle_metadata", architecture=expected_arch, identifier=IDENTIFIER)
             macos_installed_launches(executable, work)
             shutil.rmtree(installed)
@@ -579,7 +593,7 @@ def windows_smoke(dist):
         try:
             executable = installed / f"{BINARY}.exe"
             check_windows_binary(executable)
-            check_resources(installed)
+            check_resources(installed, dist)
             entries = uninstall_registry()
             require(len(entries) == 1 and entries[0]["DisplayName"] == PRODUCT
                     and entries[0]["DisplayVersion"] == package_version()

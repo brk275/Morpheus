@@ -483,9 +483,11 @@ jobs:
       - name: Prepare verified Windows NSIS tools
         if: runner.os == 'Windows'
         run: python3 scripts/windows_package_tools.py
-      - name: Prepare pinned native update scanner and private target
-        if: needs.scope.outputs.native_updates == 'true'
+      - name: Prepare pinned native notice and update scanner
+        if: runner.os != 'Linux'
         timeout-minutes: 3
+        env:
+          MORPHEUS_NATIVE_UPDATES_SELECTED: ${{ needs.scope.outputs.native_updates }}
         shell: bash
         run: |
           python3 -I -B - <<'NATIVE_UPDATE_SCANNER'
@@ -562,7 +564,7 @@ jobs:
               scanner.chmod(0o500)
               with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
                   output.write("MORPHEUS_NATIVE_QA_SCANNER=" + str(scanner) + "\n")
-                  if sys.platform == "darwin":
+                  if sys.platform == "darwin" and os.environ.get("MORPHEUS_NATIVE_UPDATES_SELECTED") == "true":
                       target = pathlib.Path(tempfile.mkdtemp(prefix="morpheus-mac-update-target-", dir=temporary))
                       target.chmod(0o700)
                       output.write("MORPHEUS_MAC_UPDATE_TARGET=" + str(target) + "\n")
@@ -571,6 +573,11 @@ jobs:
               print('Native update scanner preparation failed; raw diagnostics withheld.', file=sys.stderr)
               raise SystemExit(1) from None
           NATIVE_UPDATE_SCANNER
+      - name: Prepare candidate-bound portable source notice inputs
+        if: runner.os != 'Linux'
+        timeout-minutes: 35
+        shell: bash
+        run: python3 -I -B scripts/native_notice_source.py --prepare --gitleaks "$MORPHEUS_NATIVE_QA_SCANNER"
       - name: Verify synthetic installed Mac update transactions
         if: needs.scope.outputs.native_updates == 'true' && runner.os == 'macOS'
         shell: bash
@@ -578,6 +585,7 @@ jobs:
           set -euo pipefail
           python3 scripts/macos_update_acceptance.py \
             --source "$GITHUB_WORKSPACE" --target-dir "$MORPHEUS_MAC_UPDATE_TARGET" \
+            --native-source-bundle "$MORPHEUS_NATIVE_SOURCE_BUNDLE" --native-source-receipt "$MORPHEUS_NATIVE_SOURCE_RECEIPT" \
             --gitleaks "$MORPHEUS_NATIVE_QA_SCANNER" --execute-on-free-hosted-runner
       - name: Verify synthetic installed Windows update transactions
         if: needs.scope.outputs.native_updates == 'true' && runner.os == 'Windows'
@@ -585,11 +593,13 @@ jobs:
         run: |
           python3 scripts/windows_update_acceptance.py `
             --source "$env:GITHUB_WORKSPACE" --gitleaks "$env:MORPHEUS_NATIVE_QA_SCANNER" `
+            --native-source-bundle "$env:MORPHEUS_NATIVE_SOURCE_BUNDLE" --native-source-receipt "$env:MORPHEUS_NATIVE_SOURCE_RECEIPT" `
             --gitleaks-sha256 "17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c" --execute-on-free-hosted-runner
           if ($LASTEXITCODE -ne 0) { throw 'Synthetic installed Windows update acceptance failed' }
       - name: Build unsigned QA package
         if: runner.os != 'Linux' && needs.scope.outputs.native_updates != 'true'
-        run: python3 scripts/package.py --formats ${{ matrix.formats }}
+        shell: bash
+        run: python3 scripts/package.py --formats ${{ matrix.formats }} --native-source-bundle "$MORPHEUS_NATIVE_SOURCE_BUNDLE" --native-source-receipt "$MORPHEUS_NATIVE_SOURCE_RECEIPT"
       - name: Build and inspect canonical Linux QA AppImage
         if: runner.os == 'Linux' && !inputs.appimage_updates
         run: /usr/bin/python3 scripts/package.py --formats ${{ matrix.formats }} --gitleaks "$MORPHEUS_QA_GITLEAKS"
@@ -607,6 +617,11 @@ jobs:
           /usr/bin/python3 scripts/appimage_update_acceptance.py \
             --source "$GITHUB_WORKSPACE" --target-dir "$GITHUB_WORKSPACE/target" \
             --gitleaks "$MORPHEUS_QA_GITLEAKS" --execute-on-free-hosted-runner
+      - name: Scan and remove owned native notice source inputs
+        if: always() && runner.os != 'Linux' && env.MORPHEUS_NATIVE_SOURCE_ROOT != ''
+        timeout-minutes: 5
+        shell: bash
+        run: python3 -I -B scripts/native_notice_source.py --finish --gitleaks "$MORPHEUS_NATIVE_QA_SCANNER"
       # Installers deliberately stay on the ephemeral runner. Public artifact
       # uploads and releases require the separate release acceptance gates.
 

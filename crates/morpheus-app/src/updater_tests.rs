@@ -30,7 +30,7 @@ fn rejects_formats_before_download_or_install() {
     let current = Version::parse("0.1.0").unwrap();
     for (kind, accepted) in [
         (PackageKind::MacApp, UpdateFormat::App),
-        (PackageKind::WindowsNsis, UpdateFormat::WindowsPayloadV1),
+        (PackageKind::WindowsNsis, UpdateFormat::WindowsPayloadV2),
         (PackageKind::LinuxAppImage, UpdateFormat::AppImage),
     ] {
         validate_candidate(&signed_update(accepted), &current, kind).unwrap();
@@ -38,6 +38,7 @@ fn rejects_formats_before_download_or_install() {
             UpdateFormat::App,
             UpdateFormat::Nsis,
             UpdateFormat::WindowsPayloadV1,
+            UpdateFormat::WindowsPayloadV2,
             UpdateFormat::Wix,
             UpdateFormat::AppImage,
         ] {

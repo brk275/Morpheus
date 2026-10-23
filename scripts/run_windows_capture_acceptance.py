@@ -255,7 +255,7 @@ class WindowsJob:
             code = ctypes.get_last_error(); kernel.CloseHandle(self.job); self.job = None
             raise Failure("job_setup", code, "job_configure")
 
-    def spawn(self, command, environment, log, *, stdin_stream=None, cwd=None):
+    def spawn(self, command, environment, log, *, stdin_stream=None, cwd=None, stderr_stream=None):
         import msvcrt
         from ctypes import wintypes as w
         directory = REPO
@@ -289,13 +289,13 @@ class WindowsJob:
             with (open(os.devnull, "rb") if stdin_stream is None
                   else contextlib.nullcontext(stdin_stream)) as input_stream:
                 current = self.kernel.GetCurrentProcess()
-                for stream in (input_stream, log):
+                for stream in ((input_stream, log) if stderr_stream is None else (input_stream, log, stderr_stream)):
                     duplicate = w.HANDLE()
                     if not self.kernel.DuplicateHandle(current, msvcrt.get_osfhandle(stream.fileno()),
                             current, ctypes.byref(duplicate), 0, True, 2):  # DUPLICATE_SAME_ACCESS
                         raise Failure("process_start", ctypes.get_last_error(), "handle_duplicate")
                     duplicates.append(duplicate.value)
-                startup.stdin, startup.stdout, startup.stderr = duplicates[0], duplicates[1], duplicates[1]
+                startup.stdin, startup.stdout, startup.stderr = duplicates[0], duplicates[1], duplicates[1 if stderr_stream is None else 2]
                 created = self.kernel.CreateProcessW(executable, command_line, None, None, True,
                     0x4 | 0x400 | 0x08000000, env_block, str(directory), ctypes.byref(startup), ctypes.byref(process))
                 if not created:

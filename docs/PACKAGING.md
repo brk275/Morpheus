@@ -119,8 +119,8 @@ registry archive SHA256 is recorded in the patch provenance.
 The Linux AppImage inventory also copies the hash-verified CPAL license and
 patch provenance as immutable notices and verifies their deployed hashes.
 Broader Rust/static notices, SDK/system/compiler sources, relinking and license
-obligations remain release gates. Mac/Windows fixed resource ledgers are not
-expanded by this Linux notice addition. Synthetic CPAL CI selects only named
+obligations remain release gates. Mac/Windows use the separate candidate-bound
+notice pair and versioned resource contract described below. Synthetic CPAL CI selects only named
 library cases and does not replace actual call/leave/rejoin, attachment handoff,
 backend disposal, installed-package or device acceptance. Distribution and
 installation approval remain unchanged.
@@ -801,3 +801,68 @@ separate gates. Passing this route alone must not enable installation or mark th
 beta ready. Shared build/main/updater source changes also require ordinary native
 compilation on Apple Silicon, Intel Mac, Windows and Linux; the instrumented
 installed transaction scenarios require both native Mac labels.
+
+
+## Candidate-bound Mac and Windows third-party notices
+
+The existing explicit package QA job prepares a Rust/workspace corresponding-source
+archive and receipt on each affected fresh standard Mac/Windows runner before a
+package build. `scripts/native_notice_source.py --prepare --gitleaks <pinned-tool>`
+uses a new private HOME/CARGO_HOME, the already pinned Rust toolchain, and only
+`cargo fetch --locked` against an exact private regular-file export of the
+authenticated workspace for the existing public locked origins. Untracked or
+modified checkout manifests cannot select fetch origins. No build script,
+proc macro, source archive program or dependency setup runs during acquisition.
+Registry archives must match every Cargo.lock checksum; Git source objects and
+all tree/blob identities are authenticated. Raw stdout is separate from stderr,
+with retained process-group or Windows Job ownership and bounded stop/drain.
+Windows roots have a protected inheritable current-user/System ACL; reparse,
+remote-volume, foreign-writer and unstable-file inputs are refused. Linux retains
+its existing namespace acquisition and packaging route.
+
+The portable reader requires Git identity schema 2: the bounded raw commit object
+must hash to the pinned commit and contain the exact authenticated tree header.
+The outer archive/receipt schema remains 1; old readers accepted additive source
+identity fields, but new notice generation refuses legacy evidence lacking this
+proof. Existing immutable evidence is not rewritten. Source revision, the whole
+committed workspace, root lock, local patches and every locked registry/Git archive
+are bound before any notice or package payload is published. The two existing
+`-updateqa.1`/`.2` exports may change only the original app-version fields; all
+other source bytes and their identities remain exact. Both synthetic versions
+share the same source archive and original-lock evidence, and bind their actual
+version-only lock hash separately.
+
+The actual package resource pair is exactly:
+
+- `THIRD-PARTY-NOTICES.txt`: readable exact source license/NOTICE text, factual
+  Slint attribution, package references and local patch provenance (including CPAL).
+- `THIRD-PARTY-NOTICES.json`: immutable source/archive/lock/version/platform and
+  per-text byte-offset, length and SHA-256 inventory; no commands or URLs to execute.
+
+Mac installs the pair in `Contents/Resources`; Windows installs it under
+`licenses/`, using its reviewed fixed seven-resource V2 payload/marker contract.
+The original Mac app/DMG build and single Windows NSIS build remain. The full
+signed Mac bundle and Windows payload hashes cover these bytes. Package smoke
+requires both installed files to equal the exact generated pair and verifies their
+source/version/platform/lock identity. Existing install, signature, rollback,
+source/relink and update activation gates stay in force. V1 Windows markers and
+payloads are not silently upgraded or reinterpreted; see
+[Windows transition](../packaging/windows/UPDATES.md).
+
+Direct native packaging requires both explicit local inputs:
+`--native-source-bundle <archive> --native-source-receipt <receipt>`.
+The permanent job supplies them to ordinary packaging and the existing two-version
+installed-update drivers. The always-step scans and removes only its own exact
+private source tree after the command cleanup receipt; an unproved process stop,
+scan or ownership result fails and retains evidence. Caller-owned scanner and
+Mac target directories retain their existing ephemeral-runner lifetime; no full
+host disposal claim is made. Nothing is uploaded or published, and acquisition
+uses no shared Cargo cache or credential-bearing configuration.
+
+All locked packages are included, even target-conditional or unused packages;
+this is source evidence, not an exact static-link map. Missing license text is
+explicitly recorded. Unknown native/prebuilt SDK, compiler/system runtime,
+preferred-source, relinking/install and legal obligations keep
+`distribution_ready=false` and `license_compliance_verified=false`. Copied notices
+never select a license route, authorize distribution, prove native SDK acceptance
+or close real-device/ordinary UI/installed migration/signing release gates.

@@ -152,7 +152,7 @@ impl PackageKind {
         matches!(
             (self, format),
             (Self::MacApp, UpdateFormat::App)
-                | (Self::WindowsNsis, UpdateFormat::WindowsPayloadV1)
+                | (Self::WindowsNsis, UpdateFormat::WindowsPayloadV2)
                 | (Self::LinuxAppImage, UpdateFormat::AppImage)
         )
     }
@@ -199,7 +199,7 @@ impl InstallLocation {
             // Legacy NSIS/loose executables have no complete owned ledger and
             // stay manual-only. The marked package uses a signed data payload,
             // never the non-transactional executable NSIS update backend.
-            if option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis-payload-v1") {
+            if option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis-payload-v2") {
                 return Err(UpdateError::UnsupportedPackage);
             }
             Self::writable(
@@ -442,7 +442,7 @@ impl StagedUpdate {
         session: &'a mut WindowsSession,
     ) -> Result<PreparedWindowsRestart<'a>, UpdateError> {
         let lease = activity.try_install()?;
-        if !matches!(self.update.format, UpdateFormat::WindowsPayloadV1) {
+        if !matches!(self.update.format, UpdateFormat::WindowsPayloadV2) {
             return Err(UpdateError::UnsupportedFormat);
         }
         let bytes = self.verified_bytes()?;

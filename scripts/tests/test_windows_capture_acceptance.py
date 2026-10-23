@@ -208,6 +208,29 @@ class WindowsCaptureTests(unittest.TestCase):
         self.assertEqual([call for call in kernel.calls if call[0] == "close"],
                          [("close", 21), ("close", 101), ("close", 102)])
 
+    def test_separate_raw_stdout_and_stderr_keep_suspended_job_and_owned_duplicates(self):
+        for failure in (None, 3):
+            kernel = Kernel(duplicate_failure=failure)
+            job = job_with(kernel)
+            with tempfile.TemporaryFile() as source, tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err, \
+                    patch.dict(sys.modules, {"msvcrt": types.SimpleNamespace(get_osfhandle=lambda fd: fd)}), \
+                    patch.object(ctypes, "get_last_error", return_value=5, create=True):
+                if failure:
+                    with self.assertRaises(capture.Failure):
+                        job.spawn([str(Path("fixture.exe").resolve())], {}, out, stdin_stream=source, stderr_stream=err)
+                    self.assertNotIn("create", [entry[0] for entry in kernel.calls])
+                else:
+                    job.spawn([str(Path("fixture.exe").resolve())], {}, out, stdin_stream=source, stderr_stream=err)
+                    creation = next(entry for entry in kernel.calls if entry[0] == "create")
+                    self.assertEqual(creation[6:], (101, 102, 103))
+                    events = [entry[0] for entry in kernel.calls]
+                    self.assertLess(events.index("assign"), events.index("resume"))
+                self.assertEqual(kernel.sources, [source.fileno(), out.fileno(), err.fileno()])
+                self.assertFalse(source.closed or out.closed or err.closed)
+                closed = [entry[1] for entry in kernel.calls if entry[0] == "close"]
+                self.assertIn(101, closed); self.assertIn(102, closed)
+                if not failure: self.assertIn(103, closed)
+
     def test_private_stdin_failure_paths_close_only_owned_duplicates(self):
         for options in ({"duplicate_failure": 1}, {"duplicate_failure": 2},
                         {"create": False}, {"assign": False}, {"resume": 0}):

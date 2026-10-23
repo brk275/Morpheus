@@ -5,20 +5,22 @@ use super::super::{MAX_UPDATE_BYTES, UpdateError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub(super) const MAGIC: &[u8] = b"MORPHEUS-WINDOWS-PAYLOAD-V1\n";
+pub(super) const MAGIC: &[u8] = b"MORPHEUS-WINDOWS-PAYLOAD-V2\n";
 pub(super) const MARKER: &str = "morpheus-install.json";
 pub(super) const UNINSTALLER: &str = "uninstall.exe";
-pub(super) const FILES: [&str; 5] = [
+pub(super) const FILES: [&str; 7] = [
     "LICENSE",
     "licenses/Symphonia-MPL-2.0.txt",
     "licenses/Symphonia-NOTICE.txt",
     "morpheus-app.exe",
     "themes/aurora.toml",
+    "licenses/THIRD-PARTY-NOTICES.txt",
+    "licenses/THIRD-PARTY-NOTICES.json",
 ];
 pub(super) const MARKER_LIMIT: usize = 16 * 1024;
 // Generated from the reviewed template and resource contract, not user input.
 pub(super) const UNINSTALL_CONTRACT: &str =
-    "3f45a065d910b1b8aa889bb4d74dfec33682c23bcfee2dc69d66ed5ce9382a9d";
+    "f76b4492cc3281c91c5ec703c39f69d732aa892427dbff5aa8d3f4b335bd02b6";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -72,7 +74,7 @@ impl Manifest {
             return Err(UpdateError::CorruptStage);
         }
         let value: Self = serde_json::from_slice(bytes).map_err(|_| UpdateError::CorruptStage)?;
-        if value.schema != 1
+        if value.schema != 2
             || !value.identity.valid()
             || value.uninstaller_contract != UNINSTALL_CONTRACT
             || value.files.len() != FILES.len()

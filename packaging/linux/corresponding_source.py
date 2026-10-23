@@ -18,6 +18,7 @@ import fnmatch
 import gzip
 import hashlib
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -89,18 +90,35 @@ def unique_json(data):
         raise SourceFailure("input") from None
 
 
+def windows_security():
+    # Fixed reviewed sibling helper, never a source-archive import or PATH lookup.
+    helper = Path(__file__).resolve().parents[2] / "scripts/native_notice_windows.py"
+    spec = importlib.util.spec_from_file_location("morpheus_source_windows_security", helper)
+    require(spec is not None and spec.loader is not None, "input")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.security()
+
+
+def read_descriptor(path, *, private=False):
+    if os.name == "nt":
+        return windows_security().open_read(path, private=private)
+    return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+
+
 def read_owned(path, bound, *, private=False):
     """No followed final link, external writer, or changed open-file identity."""
     path = Path(path)
     require(path.is_absolute() and path.resolve(strict=True) == path, "path")
     for ancestor in path.parents:
-        info = ancestor.stat()
-        require(info.st_uid in {0, os.getuid()} and not info.st_mode & 0o022, "path")
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        if os.name != "nt":
+            info = ancestor.stat()
+            require(info.st_uid in {0, os.getuid()} and not info.st_mode & 0o022, "path")
+    descriptor = read_descriptor(path, private=private)
     with os.fdopen(descriptor, "rb") as stream:
         before = os.fstat(stream.fileno())
-        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
-                and before.st_nlink == 1 and not before.st_mode & (0o077 if private else 0o022)
+        require(stat.S_ISREG(before.st_mode) and (os.name == "nt" or before.st_uid == os.getuid())
+                and before.st_nlink == 1 and (os.name == "nt" or not before.st_mode & (0o077 if private else 0o022))
                 and 0 < before.st_size <= bound, "input")
         data = stream.read(bound + 1)
         after = os.fstat(stream.fileno())
@@ -114,7 +132,7 @@ def clean_git_environment(environment):
     # process: these commands read raw objects only, never transports or hooks.
     result = {key: value for key, value in environment.items()
               if not key.startswith(("GIT_", "SSH_"))}
-    result.update(GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
+    result.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
                   GIT_NO_REPLACE_OBJECTS="1", GIT_ATTR_NOSYSTEM="1",
                   GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
                   GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="")
@@ -125,12 +143,15 @@ def safe_git(tool, repository):
     require(Path(tool).is_absolute(), "git")
     path = Path(repository)
     require(path.is_absolute() and path.resolve(strict=True) == path, "path")
-    for item in (path, *path.parents):
-        info = item.stat()
-        require(stat.S_ISDIR(info.st_mode) and info.st_uid in {0, os.getuid()}
-                and not info.st_mode & 0o022, "path")
-    return [tool, "--no-pager", "-c", "core.hooksPath=/dev/null",
-            "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null",
+    if os.name == "nt":
+        windows_security().path(path, directory=True)
+    else:
+        for item in (path, *path.parents):
+            info = item.stat()
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid in {0, os.getuid()}
+                    and not info.st_mode & 0o022, "path")
+    return [tool, "--no-pager", "-c", "core.hooksPath=" + os.devnull,
+            "-c", "core.fsmonitor=false", "-c", "core.attributesFile=" + os.devnull,
             "-c", "gc.auto=0", "-c", "maintenance.auto=false",
             "-c", "diff.external=", "-c", "core.pager=cat",
             "-C", str(path)]
@@ -255,7 +276,7 @@ def git_export(runner, repository, revision, tool, environment, budget):
                           timeout=60, output_limit=bound, binary_output=True,
                           stderr_limit=65536, **kwargs)
     commit = run("source-commit", ["cat-file", "commit", revision], 1024 * 1024)
-    require(object_id("commit", commit) == revision, "identity")
+    require(0 < len(commit) <= 1024 * 1024 and object_id("commit", commit) == revision, "identity")
     first = commit.split(b"\n", 1)[0]
     require(re.fullmatch(rb"tree [0-9a-f]{40}", first), "identity")
     tree = first[5:].decode("ascii")
@@ -319,7 +340,8 @@ def git_export(runner, repository, revision, tool, environment, budget):
     data = sink.getvalue()
     budget.add(inputs=len(data))
     inventory = {name: {**item, "sha256": digest(contents[name])} for name, item in entries.items()}
-    return data, {"commit": revision, "tree": tree, "archive_sha256": digest(data),
+    return data, {"git_identity_schema": 2, "commit": revision, "commit_object_hex": commit.hex(),
+                  "tree": tree, "archive_sha256": digest(data),
                   "files": inventory, "git_attributes_applied": False}, contents
 
 
@@ -553,13 +575,14 @@ def hash_owned_file(path, bound, *, prefix_bytes=0, private=False):
     require(path.is_absolute() and path.resolve(strict=True) == path, "path")
     require(type(prefix_bytes) is int and 0 <= prefix_bytes <= MAX_RUNTIME, "bounds")
     for ancestor in path.parents:
-        info = ancestor.stat()
-        require(info.st_uid in {0, os.getuid()} and not info.st_mode & 0o022, "path")
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        if os.name != "nt":
+            info = ancestor.stat()
+            require(info.st_uid in {0, os.getuid()} and not info.st_mode & 0o022, "path")
+    descriptor = read_descriptor(path, private=private)
     with os.fdopen(descriptor, "rb") as stream:
         before = os.fstat(stream.fileno())
-        require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and before.st_nlink == 1
-                and not before.st_mode & (0o077 if private else 0o022)
+        require(stat.S_ISREG(before.st_mode) and (os.name == "nt" or before.st_uid == os.getuid()) and before.st_nlink == 1
+                and (os.name == "nt" or not before.st_mode & (0o077 if private else 0o022))
                 and 0 < before.st_size <= bound, "input")
         hashed, prefix, count = hashlib.sha256(), bytearray(), 0
         while True:
@@ -1079,7 +1102,8 @@ def build(runner, root, repository, revision, git_tool, environment, plan_path):
         with target.open("xb") as stream:
             info = os.fstat(stream.fileno())
             created = (info.st_dev, info.st_ino)
-            os.fchmod(stream.fileno(), 0o600)
+            if os.name != "nt":
+                os.fchmod(stream.fileno(), 0o600)
             with gzip.GzipFile(fileobj=BoundedOutput(stream), mode="wb", filename="", mtime=0) as zipped:
                 with tarfile.open(fileobj=zipped, mode="w|", format=tarfile.PAX_FORMAT) as archive:
                     tar_add(archive, "workspace.tar.gz", workspace)
@@ -1218,8 +1242,9 @@ def output_directory(path, repository):
             and path != repository and repository not in path.parents
             and path not in repository.parents, "path")
     for ancestor in path.parents:
-        info = ancestor.stat()
-        require(info.st_uid in {0, os.getuid()} and not info.st_mode & 0o022, "path")
+        if os.name != "nt":
+            info = ancestor.stat()
+            require(info.st_uid in {0, os.getuid()} and not info.st_mode & 0o022, "path")
     info = path.lstat()
     require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
             and not info.st_mode & 0o077 and not any(path.iterdir()), "output")
