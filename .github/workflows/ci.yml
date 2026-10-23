@@ -478,6 +478,14 @@ jobs:
             Linux)
               cpal_tests=(
                 host::alsa::trigger_pipe_is_close_on_exec_and_still_wakes_the_worker
+                host::alsa::owned::tests::close_receipt_requires_actual_callback_tls_and_owner_join
+                host::alsa::owned::tests::null_pcm_close_receipt_requires_actual_control_tls_join
+                host::alsa::owned::tests::negative_consumed_close_stays_owned_but_rejected_open_transfers_no_pcm
+                host::alsa::owned::tests::revocation_is_atomic_with_callback_admission_and_pre_native_setup
+                host::alsa::owned::tests::actual_callback_panic_is_a_retained_worker_failure_not_a_drop_receipt
+                host::alsa::owned::tests::callback_unwind_revokes_before_a_later_native_admission
+                host::alsa::owned::tests::rejected_plugin_open_waits_for_actual_tls_then_allows_a_null_operation
+                host::alsa::owned::tests::failed_open_preserves_original_direction_mapping_without_a_native_retry
               )
               ;;
             Windows)

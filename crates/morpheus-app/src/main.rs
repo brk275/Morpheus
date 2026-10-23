@@ -129,7 +129,10 @@ use crate::voice_spaces::VoiceSpaces;
 enum ShutdownFailure {
     #[cfg(feature = "native-calls")]
     NativeCall,
-    #[cfg(all(feature = "native-calls", target_os = "macos"))]
+    #[cfg(all(
+        feature = "native-calls",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     AudioBackend,
     UpdateWorker,
 }
@@ -139,7 +142,10 @@ impl std::fmt::Display for ShutdownFailure {
         match self {
             #[cfg(feature = "native-calls")]
             Self::NativeCall => formatter.write_str("Native call shutdown could not be confirmed."),
-            #[cfg(all(feature = "native-calls", target_os = "macos"))]
+            #[cfg(all(
+                feature = "native-calls",
+                any(target_os = "macos", target_os = "linux")
+            ))]
             Self::AudioBackend => {
                 formatter.write_str("Native audio backend shutdown could not be confirmed.")
             }
@@ -4824,7 +4830,14 @@ fn run_application(
     let backend_result = runtime
         .block_on(morpheus_rtc::wait_for_all_coreaudio_release())
         .map_err(|_| ShutdownFailure::AudioBackend);
-    #[cfg(all(feature = "native-calls", target_os = "macos"))]
+    #[cfg(all(feature = "native-calls", target_os = "linux"))]
+    let backend_result = runtime
+        .block_on(morpheus_rtc::wait_for_all_alsa_release())
+        .map_err(|_| ShutdownFailure::AudioBackend);
+    #[cfg(all(
+        feature = "native-calls",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     if backend_result.is_err() {
         eprintln!("Could not confirm native audio backend shutdown.");
     }
@@ -4848,7 +4861,10 @@ fn run_application(
     // UI, draft, attachment, device-opening and ringing errors retain their
     // precedence. Failed call cleanup or an update drain must also prevent a
     // successful ordinary-shutdown result.
-    #[cfg(all(feature = "native-calls", target_os = "macos"))]
+    #[cfg(all(
+        feature = "native-calls",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     backend_result?;
     call_result?;
     update_result?;
