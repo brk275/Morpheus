@@ -139,14 +139,14 @@
 use base64::Engine;
 use cargo_packager_utils::current_exe::current_exe;
 use http::{
-    HeaderName,
     header::{ACCEPT, USER_AGENT},
+    HeaderName,
 };
 use minisign_verify::{PublicKey, Signature};
 use percent_encoding::{AsciiSet, CONTROLS};
 use reqwest::{
-    StatusCode,
     header::{HeaderMap, HeaderValue},
+    StatusCode,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
