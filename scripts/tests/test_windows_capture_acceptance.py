@@ -522,7 +522,7 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
         return {"GITHUB_ACTIONS":"true", "RUNNER_ENVIRONMENT":"github-hosted", "RUNNER_OS":"Windows",
                 "GITHUB_REPOSITORY":"brk275/Morpheus", "GITHUB_REF":"refs/heads/main",
                 "GITHUB_EVENT_NAME":"workflow_dispatch", "GITHUB_ACTOR":"brk275",
-                "GITHUB_TRIGGERING_ACTOR":"brk275", "ImageOS":"win25", "GITHUB_EVENT_PATH":str(event)}
+                "GITHUB_TRIGGERING_ACTOR":"brk275", "IMAGEOS":"win25", "GITHUB_EVENT_PATH":str(event)}
 
     def test_installed_update_requires_public_owner_manual_standard_windows_selection(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -547,6 +547,32 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
                 with self.assertRaises(update.Failure): update.guard(environment,platform)
             with self.assertRaises(update.Failure):
                 update.guard(environment | {"RUNNER_ENVIRONMENT":"self-hosted"},"win32")
+
+    def test_private_environment_preserves_windows_toolchain_keys_without_forwarding_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            inherited = {
+                "SYSTEMROOT": r"C:\Windows", "PROGRAMFILES": r"C:\Program Files",
+                "PROGRAMFILES(X86)": r"C:\Program Files (x86)", "PROGRAMW6432": r"C:\Program Files",
+                "VCTOOLSINSTALLDIR": r"C:\VS\VC\Tools", "WINDOWSSDKDIR": r"C:\Windows Kits\10",
+                "WINDOWSSDKVERSION": "10.0.26100.0/", "UNIVERSALCRTSDKDIR": r"C:\Windows Kits\10",
+                "UCRTVERSION": "10.0.26100.0", "IMAGEOS": "win25", "PATH": r"C:\tools",
+            }
+            source = inherited | {
+                "USERPROFILE": str(root / "original"), "RUNNER_TEMP": str(root),
+                "SystemRoot": r"C:\unreviewed", "ImageOS": "unreviewed",
+                "GITHUB_TOKEN": "synthetic", "CARGO_REGISTRIES_CRATES_IO_TOKEN": "synthetic",
+                "CARGO_PACKAGER_SIGN_PRIVATE_KEY": "synthetic", "HTTPS_PROXY": "synthetic",
+                "RUSTC_WRAPPER": "synthetic", "UNREVIEWED_VARIABLE": "synthetic",
+            }
+            selected = update.private_environment(source, root / "isolated")
+            self.assertEqual({key: selected[key] for key in inherited}, inherited)
+            for key in source.keys() - inherited.keys() - {"USERPROFILE", "RUNNER_TEMP"}:
+                self.assertNotIn(key, selected)
+            self.assertEqual(selected["USERPROFILE"], str(root / "isolated/home"))
+            self.assertEqual(selected["CARGO_HOME"], str(root / "original/.cargo"))
+            self.assertEqual(selected["RUSTUP_HOME"], str(root / "original/.rustup"))
+            self.assertEqual(source["USERPROFILE"], str(root / "original"))
 
     def test_compiled_nonce_proof_is_inert_and_rejects_missing_or_changed_dispatch_instrumentation(self):
         nonce = "a"*32

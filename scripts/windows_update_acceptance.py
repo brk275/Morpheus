@@ -61,7 +61,7 @@ def guard(environment, platform=sys.platform):
         "GITHUB_REPOSITORY":"brk275/Morpheus", "GITHUB_REF":"refs/heads/main", "GITHUB_EVENT_NAME":"workflow_dispatch",
         "GITHUB_ACTOR":"brk275", "GITHUB_TRIGGERING_ACTOR":"brk275"}.items():
         require(environment.get(name) == value)
-    require(environment.get("ImageOS") in {"win25", "win25-vs2026"})
+    require(environment.get("IMAGEOS") in {"win25", "win25-vs2026"})
     event = json.loads(read(Path(environment["GITHUB_EVENT_PATH"]), 1024 * 1024))
     owner = event.get("repository", {}).get("owner", {}).get("id")
     require(type(owner) is int and owner > 0 and event.get("sender", {}).get("id") == owner
@@ -107,10 +107,12 @@ def write_new(path, data):
     path.chmod(0o600)
 
 def private_environment(environment, home):
-    names = {"PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "ProgramFiles", "ProgramFiles(x86)",
-        "ProgramW6432", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "INCLUDE", "LIB", "LIBPATH",
-        "VCINSTALLDIR", "VSINSTALLDIR", "VCToolsInstallDir", "WindowsSdkDir", "WindowsSDKVersion",
-        "UniversalCRTSdkDir", "UCRTVersion", "CARGO_HOME", "RUSTUP_HOME", "RUNNER_TEMP", "ImageOS",
+    # CPython Windows os.environ.items() exposes canonical uppercase keys.
+    # Keep the same closed toolchain allowlist when copying that real mapping.
+    names = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "PROGRAMFILES", "PROGRAMFILES(X86)",
+        "PROGRAMW6432", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "INCLUDE", "LIB", "LIBPATH",
+        "VCINSTALLDIR", "VSINSTALLDIR", "VCTOOLSINSTALLDIR", "WINDOWSSDKDIR", "WINDOWSSDKVERSION",
+        "UNIVERSALCRTSDKDIR", "UCRTVERSION", "CARGO_HOME", "RUSTUP_HOME", "RUNNER_TEMP", "IMAGEOS",
         "GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "RUNNER_OS", "GITHUB_REPOSITORY", "GITHUB_REF",
         "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SHA", "GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR",
         "MORPHEUS_PACKAGE_SOURCE_REVISION"}
