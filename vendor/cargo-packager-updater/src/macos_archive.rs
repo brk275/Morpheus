@@ -33,11 +33,14 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
-/// Restore an owned link's exact ordinary permission bits without following it.
+/// Restore an owned link's exact owner-readable ordinary bits without following it.
 /// Used by both archive extraction and the application's backup copy. Directory
 /// and regular-file write restrictions are separate and remain unchanged.
 pub fn restore_owned_symlink_mode(path: &Path, mode: u32) -> Result<()> {
-    if mode & !0o777 != 0 {
+    // Darwin readlink authorizes READ_DATA on the link itself. Its owner
+    // must retain read permission for canonicalization and exact tree hashing;
+    // never temporarily change an installed link merely to inspect its target.
+    if mode & !0o777 != 0 || mode & 0o400 == 0 {
         return Err(invalid());
     }
     let before = fs::symlink_metadata(path)?;
@@ -215,7 +218,7 @@ pub fn unpack_verified_bundle(bytes: &[u8], destination: &Path) -> Result<PathBu
         let mode = header.mode()?;
         if size > MAX_ARCHIVE_BYTES
             || if kind.is_symlink() {
-                mode & !0o777 != 0
+                mode & !0o777 != 0 || mode & 0o400 == 0
             } else {
                 mode & 0o7022 != 0
             }
@@ -439,10 +442,11 @@ mod tests {
                 Some("theme"),
             ),
         ];
-        for mode in [0o777, 0o700, 0o640, 0] {
+        for mode in [0o777, 0o700, 0o640, 0o400, 0o444] {
             let destination = private_destination();
             let bytes = archive_with_link_mode(&entries, mode);
-            let app = unpack_verified_bundle(&bytes, destination.path()).unwrap();
+            let app = unpack_verified_bundle(&bytes, destination.path())
+                .unwrap_or_else(|error| panic!("readable link mode {mode:o}: {error:?}"));
             assert_eq!(
                 fs::symlink_metadata(app.join("Contents/Resources/link"))
                     .unwrap()
@@ -462,18 +466,58 @@ mod tests {
                 b"theme"
             );
         }
-        for mode in [0o1777, 0o2777, 0o4777, 0o100777] {
+        for mode in [
+            0, 0o200, 0o100, 0o300, 0o077, 0o1777, 0o2777, 0o4777, 0o100777,
+        ] {
             let destination = private_destination();
-            assert!(unpack_verified_bundle(
-                &archive_with_link_mode(&entries, mode),
-                destination.path()
-            )
-            .is_err());
+            assert!(
+                unpack_verified_bundle(&archive_with_link_mode(&entries, mode), destination.path())
+                    .is_err(),
+                "mode {mode:o}"
+            );
+            let resource = destination.path().join("Morpheus.app/Contents/Resources");
+            // Admission fails before creating the unsupported link, while the
+            // already copied regular target retains its exact bytes and mode.
+            assert!(fs::symlink_metadata(resource.join("link")).is_err());
+            assert_eq!(fs::read(resource.join("theme")).unwrap(), b"theme");
+            assert_eq!(
+                fs::metadata(resource.join("theme")).unwrap().mode() & 0o7777,
+                0o700
+            );
         }
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_destination();
         let file = directory.path().join("ordinary");
         fs::write(&file, b"keep").unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = directory.path().join("owned-link");
+        std::os::unix::fs::symlink("ordinary", &link).unwrap();
+        let before = fs::symlink_metadata(&link).unwrap();
+        for mode in [0, 0o200, 0o100, 0o300, 0o077, 0o1777, 0o2777, 0o4777] {
+            assert!(matches!(
+                restore_owned_symlink_mode(&link, mode),
+                Err(Error::Security(_))
+            ));
+            let after = fs::symlink_metadata(&link).unwrap();
+            assert_eq!(
+                (
+                    after.dev(),
+                    after.ino(),
+                    after.uid(),
+                    after.nlink(),
+                    after.mode()
+                ),
+                (
+                    before.dev(),
+                    before.ino(),
+                    before.uid(),
+                    before.nlink(),
+                    before.mode()
+                )
+            );
+            assert_eq!(fs::read_link(&link).unwrap(), Path::new("ordinary"));
+            assert_eq!(fs::read(&file).unwrap(), b"keep");
+            assert_eq!(fs::metadata(&file).unwrap().mode() & 0o7777, 0o600);
+        }
         assert!(restore_owned_symlink_mode(&file, 0o777).is_err());
         assert!(restore_owned_symlink_mode(directory.path(), 0o777).is_err());
         assert_eq!(fs::metadata(&file).unwrap().mode() & 0o7777, 0o600);

@@ -37,8 +37,12 @@ Additional source-only Mac transaction support:
   regular-file/directory modes.
   Raw tar iteration rejects PAX/GNU extension records rather than allocating
   attacker-sized metadata; release packages must use the accepted normal paths.
-- Ordinary symbolic-link permissions are preserved exactly, including Darwin's
-  normal `0777` mode; special bits and hardlinked links are rejected. Extraction
+- Owner-readable ordinary symbolic-link permissions are preserved exactly,
+  including `0777`, `0700`, `0640`, `0400` and `0444`; special bits, hardlinked
+  links and modes missing owner-read `0400` are rejected before creation or
+  restoration. Darwin authorizes `readlink` using the link's own read permission,
+  which `realpath` and complete bundle hashing need; the updater must not
+  temporarily change installed link permissions to inspect target text. Extraction
   and the application's backup copy share a checked Darwin `lchmod` wrapper,
   which changes the owned link itself without following its target and verifies
   its inode, owner and restored mode. The public SDK's `lchmod(3)`/`sys/stat.h`

@@ -71,3 +71,32 @@ input throughout.
 A successful producer receipt records the exact archive and complete bundle
 hashes, entry count, architecture, version and `signed: false`. It is a build
 receipt, not an installed-update or distribution approval.
+
+
+### Symlink permission admission
+
+Update archives and installed bundle identity/hash/copy paths admit only
+owner-readable ordinary symlink modes: `0400` must be set, all other ordinary
+permission bits are retained exactly, and special bits/hardlinked links remain
+rejected. Standard `0777`, private `0700`, `0640`, `0400` and `0444` links remain
+supported. Unreadable modes, including `0000`, owner write/execute-only and modes
+with only group/other read permission, are rejected before archive link creation
+or requested link-mode restoration; producer snapshot/header admission matches.
+No installed bundle permission is temporarily changed to inspect a link target.
+
+The restriction follows the Darwin source contract: Rust 1.99 canonicalization
+calls libc `realpath`, Apple's implementation calls `readlink` for link text,
+and XNU authorizes `readlink` with `KAUTH_VNODE_READ_DATA`, which requires the
+owner-read bit for these owned links. The earlier generic statement that link
+access bits are ignored when following a path does not imply that an application
+may read the link's stored target text. ARM run 39934040994 failed in the prior
+positive mode loop with EACCES; attribution to its `0000` iteration is derived
+from this source chain because the original log did not label the iteration.
+The positive regression now labels mode-specific failures.
+
+Failed-stage cleanup uses its existing separate bounded no-follow walker. It
+checks owner/type/link-count/special bits, concrete path/count/size bounds, and
+link text length from `lstat`, then unlinks only known entries under the owned
+bundle. It never needs to read or resolve a target, so unreadable, dangling and
+external links can be removed without touching their targets. This cleanup path
+cannot admit a bundle for identity, copying, installation or execution.

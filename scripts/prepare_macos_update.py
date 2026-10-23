@@ -254,7 +254,8 @@ def _snapshot(bundle):
                 record["kind"] = "file"
             else:
                 require(stat.S_ISLNK(metadata.st_mode) and len(logical.parts) >= 3
-                        and metadata.st_nlink == 1 and not metadata.st_mode & 0o7000)
+                        and metadata.st_nlink == 1 and not metadata.st_mode & 0o7000
+                        and metadata.st_mode & 0o400)
                 target = os.readlink(child.path)
                 _link(logical, target, bundle)
                 record.update(kind="link", size=0, target=target)
@@ -286,6 +287,8 @@ def _snapshot(bundle):
 
 
 def _header(record):
+    if record["kind"] == "link":
+        require(not record["mode"] & ~0o777 and record["mode"] & 0o400)
     info = tarfile.TarInfo(ROOT_NAME + ("/" + record["path"] if record["path"] else ""))
     info.mode, info.uid, info.gid, info.mtime = record["mode"], 0, 0, 0
     info.uname = info.gname = ""

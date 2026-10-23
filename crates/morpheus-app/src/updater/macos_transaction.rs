@@ -351,7 +351,9 @@ fn walk_entries(root: &Path, check_links: bool) -> Result<Vec<PathBuf>, UpdateEr
                 fs::symlink_metadata(&actual).map_err(|_| UpdateError::RecoveryRequired)?;
             if metadata.uid() != owner()
                 || if metadata.file_type().is_symlink() {
-                    metadata.mode() & 0o7000 != 0 || metadata.nlink() != 1
+                    metadata.mode() & 0o7000 != 0
+                        || metadata.nlink() != 1
+                        || (check_links && metadata.mode() & 0o400 == 0)
                 } else {
                     metadata.mode() & 0o7022 != 0
                 }
@@ -375,15 +377,22 @@ fn walk_entries(root: &Path, check_links: bool) -> Result<Vec<PathBuf>, UpdateEr
                     return Err(UpdateError::RecoveryRequired);
                 }
             } else if metadata.file_type().is_symlink() {
-                let target = fs::read_link(&actual).map_err(|_| UpdateError::RecoveryRequired)?;
-                if target.as_os_str().len() > 1024
-                    || (check_links
-                        && (target.is_absolute()
-                            || !actual
-                                .canonicalize()
-                                .map_err(|_| UpdateError::RecoveryRequired)?
-                                .starts_with(root)))
-                {
+                if check_links {
+                    let target =
+                        fs::read_link(&actual).map_err(|_| UpdateError::RecoveryRequired)?;
+                    if target.as_os_str().len() > 1024
+                        || target.is_absolute()
+                        || !actual
+                            .canonicalize()
+                            .map_err(|_| UpdateError::RecoveryRequired)?
+                            .starts_with(root)
+                    {
+                        return Err(UpdateError::RecoveryRequired);
+                    }
+                } else if metadata.len() > 1024 {
+                    // Failed-stage cleanup only unlinks the known owned entry.
+                    // lstat bounds its text length without reading/following a
+                    // target that an unreadable link mode deliberately hides.
                     return Err(UpdateError::RecoveryRequired);
                 }
             } else {

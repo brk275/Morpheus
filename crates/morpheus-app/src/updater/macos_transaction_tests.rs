@@ -185,6 +185,8 @@ fn real_unsigned_producer_roundtrips_exact_link_modes_through_native_reader_and_
         ("ordinary-link", 0o777),
         ("private-link", 0o700),
         ("readable-link", 0o640),
+        ("owner-read-link", 0o400),
+        ("all-read-link", 0o444),
     ];
     for (name, mode) in modes {
         let path = app.join("Contents/Resources").join(name);
@@ -570,4 +572,69 @@ fn helper_loader_cleanup_strips_every_raw_dyld_name_and_preserves_unrelated_envi
         );
     }
     assert_eq!(recorded.len(), removed.len() + preserved.len());
+}
+
+#[test]
+fn unreadable_links_fail_identity_and_copy_without_mutation_but_safe_cleanup_can_unlink_them() {
+    // Raw no-follow setup is intentionally test-only: the production restore
+    // helper rejects these unsupported modes before any mutation.
+    unsafe extern "C" {
+        fn lchmod(path: *const std::ffi::c_char, mode: u16) -> std::ffi::c_int;
+    }
+    for mode in [0, 0o200, 0o100, 0o300, 0o077] {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("Morpheus.app");
+        bundle(&app, &PackageMetadata::embedded().unwrap());
+        let target = app.join("Contents/Resources/theme.toml");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = app.join("Contents/Resources/unreadable-link");
+        std::os::unix::fs::symlink("theme.toml", &link).unwrap();
+        let raw = CString::new(link.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the private fixture path is NUL-terminated and lchmod acts
+        // only on this new owned symlink, never its target.
+        assert_eq!(unsafe { lchmod(raw.as_ptr(), mode) }, 0);
+        let before = fs::symlink_metadata(&link).unwrap();
+        assert!(matches!(
+            tree_hash(&app),
+            Err(UpdateError::RecoveryRequired)
+        ));
+        let copy = root.path().join("backup.app");
+        assert!(copy_bundle(&app, &copy).is_err());
+        assert!(!copy.exists());
+        let after = fs::symlink_metadata(&link).unwrap();
+        assert_eq!(
+            (
+                after.dev(),
+                after.ino(),
+                after.uid(),
+                after.nlink(),
+                after.mode()
+            ),
+            (
+                before.dev(),
+                before.ino(),
+                before.uid(),
+                before.nlink(),
+                before.mode()
+            )
+        );
+        assert_eq!(after.mode() & 0o7777, u32::from(mode));
+        assert_eq!(fs::read(&target).unwrap(), b"preserve resources");
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o600);
+        // An outside retained file proves cleanup unlinks only its own tree entries;
+        // the preserved inode/bytes/mode survive outside the removed app.
+        let retained = root.path().join("sentinel");
+        fs::rename(&target, &retained).unwrap();
+        // The original link is now dangling. A second unreadable link points
+        // outside the tree; cleanup must unlink both without reading targets.
+        let external = app.join("Contents/Resources/outside-link");
+        std::os::unix::fs::symlink(&retained, &external).unwrap();
+        let external_raw = CString::new(external.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the exact new private fixture link is owned and never followed.
+        assert_eq!(unsafe { lchmod(external_raw.as_ptr(), 0) }, 0);
+        remove_bundle(&app).unwrap();
+        assert!(!app.exists());
+        assert_eq!(fs::read(&retained).unwrap(), b"preserve resources");
+        assert_eq!(fs::metadata(&retained).unwrap().mode() & 0o7777, 0o600);
+    }
 }

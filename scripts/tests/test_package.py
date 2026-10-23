@@ -173,6 +173,41 @@ class PackageConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "Mac payload files use POSIX ownership and mode contracts")
 class MacUpdatePayloadTests(unittest.TestCase):
+    def test_link_header_admits_exact_owner_readable_modes_and_rejects_unreadable_or_special_bits(self):
+        record = {"path": "Contents/Resources/link", "kind": "link", "target": "LICENSE", "size": 0}
+        for mode in [0o777, 0o700, 0o640, 0o400, 0o444]:
+            self.assertEqual(mac_update._header(record | {"mode": mode}).mode, mode)
+        for mode in [0, 0o200, 0o100, 0o300, 0o077, 0o1777, 0o2777, 0o4777]:
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                mac_update._header(record | {"mode": mode})
+
+    @unittest.skipUnless(os.sys.platform == "darwin", "Darwin no-follow link mode semantics")
+    def test_unreadable_link_is_rejected_before_target_read_without_mutating_bundle_or_target(self):
+        for mode in [0, 0o200, 0o100, 0o300, 0o077]:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary, \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                root = Path(temporary)
+                source, app, output = self.fixture(root, "aarch64")
+                target = app / "Contents/Resources/LICENSE"
+                target.chmod(0o600)
+                data = target.read_bytes()
+                link = target.with_name("unreadable-link")
+                link.symlink_to("LICENSE")
+                # Set only the fresh private fixture link, never its target.
+                os.chmod(link, mode, follow_symlinks=False)
+                before = link.lstat()
+                with mock.patch.object(mac_update.os, "readlink", side_effect=AssertionError("unreadable target read")):
+                    with self.assertRaises(ValueError):
+                        mac_update.prepare_update(app, output, version="0.2.0", arch="aarch64", root=source)
+                after = link.lstat()
+                self.assertEqual((after.st_dev, after.st_ino, after.st_uid, after.st_nlink, after.st_mode, after.st_ctime_ns),
+                                 (before.st_dev, before.st_ino, before.st_uid, before.st_nlink, before.st_mode, before.st_ctime_ns))
+                self.assertEqual(after.st_mode & 0o7777, mode)
+                self.assertEqual(target.read_bytes(), data)
+                self.assertEqual(target.stat().st_mode & 0o7777, 0o600)
+                self.assertFalse(output.exists())
+                self.assertFalse(list(root.glob(".morpheus-mac-update-*.tmp")))
+
     @staticmethod
     def fixture(root, arch):
         source = root / "source"
