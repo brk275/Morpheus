@@ -905,6 +905,7 @@ pub struct LiveUi {
     drafts: Arc<DraftStore>,
     draft_write_tx: std::sync::Mutex<Option<mpsc::Sender<()>>>,
     draft_work: std::sync::Mutex<DraftWork>,
+    verification_work: crate::verification_work::VerificationWork,
     generation: Arc<AtomicU64>,
     recovery_notices: Arc<crate::timeline_recovery::Notices>,
     render_epoch: Arc<AtomicU64>,
@@ -1162,6 +1163,7 @@ impl LiveUi {
                 tasks: vec![draft_writer],
                 ..DraftWork::default()
             }),
+            verification_work: crate::verification_work::VerificationWork::default(),
             generation: Arc::new(AtomicU64::new(0)),
             recovery_notices,
             render_epoch: Arc::new(AtomicU64::new(0)),
@@ -1191,6 +1193,7 @@ impl LiveUi {
     /// thread before it yields. Loaded stores stay owned for the admitted work
     /// drain and final stable flush; resumable manager.stop remains distinct.
     pub(crate) fn close_action_admission(&self) {
+        self.verification_work.close();
         let mut work = self
             .draft_work
             .lock()
@@ -1203,6 +1206,41 @@ impl LiveUi {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
+    }
+
+    /// Capture synchronously with a verification UI intent. Reusing a local
+    /// account ID after a removal pause never revives an older lease.
+    pub(crate) fn verification_work_lease(
+        &self,
+        selection: &AccountSelection,
+        cancellation: &morpheus_matrix::VerificationCancellation,
+    ) -> Option<crate::verification_work::VerificationWorkLease> {
+        self.verification_work.lease(selection, cancellation)
+    }
+
+    pub(crate) fn spawn_verification_work(
+        &self,
+        runtime: &Handle,
+        lease: &crate::verification_work::VerificationWorkLease,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        self.verification_work.spawn(runtime, lease, task)
+    }
+
+    pub(crate) fn pause_verification_work(
+        &self,
+        account: &str,
+    ) -> Result<
+        crate::verification_work::VerificationWorkPause,
+        crate::verification_work::VerificationDrainError,
+    > {
+        self.verification_work.pause(account)
+    }
+
+    pub(crate) async fn drain_verification_work(
+        &self,
+    ) -> Result<(), crate::verification_work::VerificationDrainError> {
+        self.verification_work.drain().await
     }
 
     pub(crate) fn action_admission_closed(&self) -> bool {
