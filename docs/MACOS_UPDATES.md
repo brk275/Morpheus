@@ -159,11 +159,16 @@ app lock and revalidates the full prepared transaction before replacement.
 Releasing the lock just before main returns can no longer authorize apply
 while the original process is still alive.
 
-This adds an exit boundary, not evidence that all native cleanup was graceful.
-Main still reports call cleanup errors and a bounded, unconfirmed attachment
-audio release; a detached playback thread is outside Tokio runtime joining.
-Those media/device quiescence limits remain open. The original synthetic
-installed driver kept its old actor alive as a monitor and could not satisfy
+The parent-exit boundary does not establish graceful native cleanup. Main still
+logs call cleanup errors. Attachment playback now retains an owner that joins
+the actual download/decoder/output worker, including its thread-local teardown,
+before reporting release. A bounded wait retains pending or failed ownership;
+its typed error is returned after draft flushing and account-manager shutdown,
+so an unconfirmed attachment release cannot produce a successful main result.
+That application-worker join proves return of the public stream destructor,
+while backend monitor joining, native stop/dispose success, device quiescence
+and actual normal AppWindow shutdown remain independent open gates. The original
+synthetic installed driver kept its old actor alive as a monitor and could not satisfy
 this new exit requirement. The composed route now retains that actor's actual
 helper Child through a nonce-bound external kernel-observer acknowledgment,
 then allows the synthetic parent to really exit. Both the production parent's

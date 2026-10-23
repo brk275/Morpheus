@@ -2027,7 +2027,10 @@ impl CallWorker {
             _ = &mut self.cancel => Err(CallControllerError::Cancelled),
             _ = self.selection.revoked() => Err(CallControllerError::AccountChanged),
             _ = accepted_cancelled(self.accepted.as_ref()) => Err(CallControllerError::IncomingOfferUnavailable),
-            released = crate::audio_attachments::wait_for_release() => if released { Ok(()) } else { Err(CallControllerError::TimedOut("releasing attachment audio")) },
+            released = crate::audio_attachments::wait_for_release() => released.map_err(|error| match error {
+                crate::audio_attachments::ReleaseError::TimedOut => CallControllerError::TimedOut("releasing attachment audio"),
+                error => CallControllerError::Cleanup(error.to_string()),
+            }),
         };
         let setup = match released {
             Ok(()) => self.setup().await,

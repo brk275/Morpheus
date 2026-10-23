@@ -1,7 +1,7 @@
 //! One explicit, memory-only attachment player. No autoplay or plaintext files.
 //! Cancellation permanently retires the original view/account/security/call
 //! lease. A native open/drop already entered cannot be interrupted: its worker
-//! permit remains held until the actual stream has been destroyed.
+//! handle remains owned until the actual thread, including its TLS, is joined.
 #[cfg(feature = "native-calls")]
 mod decode;
 use crate::{AppWindow, live::LiveUi, security::SecurityGate};
@@ -16,33 +16,213 @@ use std::{
 };
 use tokio::sync::Notify;
 
-static WORKER: AtomicBool = AtomicBool::new(false);
-struct Permit;
-impl Permit {
-    fn take() -> Option<Self> {
-        WORKER
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self)
+/// One admitted playback owns both its supervisor and actual worker. The start
+/// channel remains closed until the supervisor handle is retained. Only the
+/// supervisor creates/joins the native worker; no join can block UI or Tokio
+/// while native open, stream destruction or worker TLS destruction is pending.
+static WORKERS: Workers = Workers::new();
+const RELEASE_WAIT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReleaseError {
+    TimedOut,
+    WorkerPanicked,
+    SupervisorFailed,
+}
+impl std::fmt::Display for ReleaseError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::TimedOut => {
+                "attachment audio worker release was not confirmed before the deadline"
+            }
+            Self::WorkerPanicked => "attachment audio worker panicked during playback or release",
+            Self::SupervisorFailed => "attachment audio worker ownership could not be confirmed",
+        })
     }
 }
-impl Drop for Permit {
-    fn drop(&mut self) {
-        WORKER.store(false, Ordering::Release);
-    }
+impl std::error::Error for ReleaseError {}
+
+#[derive(Default)]
+struct Completion {
+    // Only the supervisor publishes success, after actual worker.join(). A
+    // body-done flag, output permit, cancelled request or is_finished is not a
+    // substitute for that join, which also observes native worker TLS teardown.
+    result: Mutex<Option<Result<(), ReleaseError>>>,
 }
-/// Call setup holds its existing reservation, which permanently revokes the
-/// old player, while waiting for its download/decoder/native stream to release.
-/// It never starts a call output on top of an unreleased attachment stream.
-pub(crate) async fn wait_for_release() -> bool {
-    let until = tokio::time::Instant::now() + Duration::from_secs(3);
-    while WORKER.load(Ordering::Acquire) {
-        if tokio::time::Instant::now() >= until {
-            return false;
+impl Completion {
+    fn finish(&self, result: Result<(), ReleaseError>) {
+        let mut completed = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        if completed.is_none() {
+            *completed = Some(result);
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    true
+    fn result(&self) -> Option<Result<(), ReleaseError>> {
+        *self.result.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn released(&self) -> bool {
+        self.result() == Some(Ok(()))
+    }
+}
+struct Worker {
+    supervisor: Option<std::thread::JoinHandle<()>>,
+    completion: Arc<Completion>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionError {
+    Busy,
+    Failed,
+    Unavailable,
+}
+struct StartWorker {
+    start: std::sync::mpsc::SyncSender<()>,
+    completion: Arc<Completion>,
+}
+impl StartWorker {
+    fn start(self) -> Result<(), ReleaseError> {
+        self.start.send(()).map_err(|_| {
+            self.completion.finish(Err(ReleaseError::SupervisorFailed));
+            ReleaseError::SupervisorFailed
+        })
+    }
+}
+struct Workers {
+    worker: Mutex<Option<Worker>>,
+}
+impl Workers {
+    const fn new() -> Self {
+        Self {
+            worker: Mutex::new(None),
+        }
+    }
+    /// Pending/failed ownership is kept in place. No timeout, cancelled waiter,
+    /// replacement request or generation change may take/drop these handles.
+    fn poll_locked(worker: &mut Option<Worker>) -> Option<Result<(), ReleaseError>> {
+        let Some(active) = worker.as_mut() else {
+            return Some(Ok(()));
+        };
+        if let Some(Err(error)) = active.completion.result() {
+            return Some(Err(error));
+        }
+        let Some(handle) = active.supervisor.as_ref() else {
+            return Some(Err(ReleaseError::SupervisorFailed));
+        };
+        if !handle.is_finished() {
+            return None;
+        }
+        // This supervisor runs only the fixed channel/spawn/join protocol. All
+        // application/native work and its TLS were on the joined worker. This
+        // finished-supervisor join never waits on an audio open/drop. Rust does
+        // not promise a hard OS scheduling bound for the final join epilogue.
+        let joined = active
+            .supervisor
+            .take()
+            .expect("retained supervisor")
+            .join();
+        if joined.is_err() || active.completion.result().is_none() {
+            active
+                .completion
+                .finish(Err(ReleaseError::SupervisorFailed));
+            return Some(Err(ReleaseError::SupervisorFailed));
+        }
+        match active.completion.result() {
+            Some(Ok(())) => {
+                *worker = None;
+                Some(Ok(()))
+            }
+            Some(Err(error)) => Some(Err(error)),
+            None => Some(Err(ReleaseError::SupervisorFailed)),
+        }
+    }
+    fn poll_release(&self) -> Option<Result<(), ReleaseError>> {
+        Self::poll_locked(&mut self.worker.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    fn reserve(
+        &self,
+        completion: Arc<Completion>,
+        phase: Arc<AtomicU8>,
+        work: impl FnOnce() -> Result<(), ReleaseError> + Send + 'static,
+    ) -> Result<StartWorker, AdmissionError> {
+        self.reserve_with(completion, phase, work, |supervise| {
+            std::thread::Builder::new()
+                .name("attachment-audio-owner".into())
+                .spawn(supervise)
+        })
+    }
+    fn reserve_with(
+        &self,
+        completion: Arc<Completion>,
+        phase: Arc<AtomicU8>,
+        work: impl FnOnce() -> Result<(), ReleaseError> + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> Result<StartWorker, AdmissionError> {
+        let mut retained = self.worker.lock().unwrap_or_else(|e| e.into_inner());
+        match Self::poll_locked(&mut retained) {
+            None => return Err(AdmissionError::Busy),
+            Some(Err(_)) => return Err(AdmissionError::Failed),
+            Some(Ok(())) => {}
+        }
+        let (start, admitted) = std::sync::mpsc::sync_channel(1);
+        let completed = completion.clone();
+        let supervise = Box::new(move || {
+            // Dropping an unpublished start ticket cancels before any native
+            // worker exists. The closure's captured request/download inputs are
+            // destroyed before success is published, including this path.
+            if admitted.recv().is_err() {
+                drop(work);
+                completed.finish(Ok(()));
+                return;
+            }
+            let result = join_native(
+                std::thread::Builder::new()
+                    .name("attachment-audio".into())
+                    .spawn(work),
+                &phase,
+            );
+            completed.finish(result);
+        });
+        // If this spawn fails, no actual worker was ever created. Never put an
+        // existing native JoinHandle in a closure passed to a fallible spawn.
+        let supervisor = spawn(supervise).map_err(|_| AdmissionError::Unavailable)?;
+        *retained = Some(Worker {
+            supervisor: Some(supervisor),
+            completion: completion.clone(),
+        });
+        Ok(StartWorker { start, completion })
+    }
+    async fn wait(&self, bound: Duration) -> Result<(), ReleaseError> {
+        let until = tokio::time::Instant::now() + bound;
+        loop {
+            if let Some(result) = self.poll_release() {
+                return result;
+            }
+            if tokio::time::Instant::now() >= until {
+                return Err(ReleaseError::TimedOut);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+fn join_native(
+    native: std::io::Result<std::thread::JoinHandle<Result<(), ReleaseError>>>,
+    phase: &AtomicU8,
+) -> Result<(), ReleaseError> {
+    match native {
+        Ok(native) => native.join().unwrap_or(Err(ReleaseError::WorkerPanicked)),
+        Err(_) => {
+            // No native worker exists after a failed spawn. Preserve the
+            // playback error while proving there is no worker left to join.
+            phase.store(AudioError::Unavailable.code(), Ordering::Release);
+            Ok(())
+        }
+    }
+}
+/// Call setup already holds the reservation that permanently revokes the old
+/// request. Shutdown cancels it first. Neither may report release until the
+/// actual download/decoder/native worker has been joined. Native open/drop
+/// already entered is not interruptible: a bounded wait fails and retains its
+/// owner instead of permitting another stream or silently detaching the worker.
+pub(crate) async fn wait_for_release() -> Result<(), ReleaseError> {
+    WORKERS.wait(RELEASE_WAIT).await
 }
 pub(crate) struct ViewLease {
     pub(crate) live: Arc<AtomicBool>,
@@ -157,7 +337,8 @@ struct Request {
     event: String,
     thread: bool,
     focused: bool,
-    phase: AtomicU8,
+    phase: Arc<AtomicU8>,
+    completion: Arc<Completion>,
     #[cfg(feature = "native-calls")]
     playback: Arc<morpheus_rtc::PcmPlayback>,
 }
@@ -220,6 +401,9 @@ impl AudioAttachments {
         clear(ui);
     }
     fn tick(&self, ui: &AppWindow) {
+        // Reap only a completed, joined owner; pending/failed ownership remains
+        // retained even after the presentation request has been cancelled.
+        let release = WORKERS.poll_release();
         let request = self
             .request
             .lock()
@@ -242,6 +426,15 @@ impl AudioAttachments {
             ui.set_attachment_audio_status(AudioError::text(phase).into());
             return;
         }
+        if matches!(release, Some(Err(_))) {
+            ui.set_attachment_audio_loading(false);
+            ui.set_attachment_audio_playing(false);
+            ui.set_attachment_audio_status(
+                "Audio worker did not release safely. Restart Morpheus before playing audio."
+                    .into(),
+            );
+            return;
+        }
         #[cfg(feature = "native-calls")]
         {
             ui.set_attachment_audio_playing(request.playback.playing());
@@ -254,10 +447,12 @@ impl AudioAttachments {
                     AudioError::text(3)
                 } else if phase == 0 {
                     "Loading audio into memory…"
-                } else if request.playback.ended() {
+                } else if request.playback.ended() && request.completion.released() {
                     "Finished · Play loads it again"
-                } else if !request.playback.active() {
+                } else if !request.playback.active() && request.completion.released() {
                     "Stopped · Play loads it again"
+                } else if !request.playback.active() {
+                    "Releasing speaker…"
                 } else if request.playback.paused() {
                     "Paused · stays in memory"
                 } else if request.playback.playing() {
@@ -327,40 +522,62 @@ impl AudioAttachments {
                 if !view.current() || !call_authority() { return; }
                 player.shutdown(&ui);
                 ui.set_attachment_audio_event(event.clone()); ui.set_attachment_audio_thread(thread);
-                let Some(permit)=Permit::take() else { ui.set_attachment_audio_status("Previous playback is still being released. Try Play again shortly.".into()); return; };
                 let guard=Arc::new(Guard { selection, view, stopped:AtomicBool::new(false), wake:Notify::new(), calls:call_authority });
                 let native_guard=guard.clone(); let playback=morpheus_rtc::PcmPlayback::new(Arc::new(move || native_guard.current()));
-                let request=Arc::new(Request { guard,room:ui.get_active_room_id().to_string(),root:if thread {ui.get_thread_root_id().to_string()} else {String::new()},event:event.to_string(),thread,focused:ui.get_conversation_focused(),phase:AtomicU8::new(0),playback });
+                let request=Arc::new(Request { guard,room:ui.get_active_room_id().to_string(),root:if thread {ui.get_thread_root_id().to_string()} else {String::new()},event:event.to_string(),thread,focused:ui.get_conversation_focused(),phase:Arc::new(AtomicU8::new(0)),completion:Arc::new(Completion::default()),playback });
+                let manager=live.manager.clone(); let encrypted=ui.get_image_previews_encrypted_enabled();
+                let worker_request=request.clone(); let worker_runtime=runtime.clone();
+                let start=WORKERS.reserve(request.completion.clone(),request.phase.clone(),move || {
+                    let request=worker_request;
+                    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // Drive the same revocable bounded download on this one
+                        // owned thread. No Tokio task handle is discarded and no
+                        // blocking join job can delay runtime teardown forever.
+                        let downloaded=worker_runtime.block_on(async {
+                            tokio::select! { biased;
+                                _=request.guard.cancelled()=>Err(AudioError::Cancelled),
+                                result=while_allowed(||request.guard.current(),tokio::time::timeout(Duration::from_secs(45),manager.download_audio_playback_for(&request.guard.selection,&request.room,&request.event,encrypted)))=>match result {
+                                    Some(Ok(Ok(downloaded)))=>Ok(downloaded),
+                                    Some(Ok(Err(morpheus_matrix::MatrixCoreError::MediaTooLarge{..})))=>Err(AudioError::TooLarge),
+                                    Some(_)=>Err(AudioError::Unavailable),
+                                    None=>Err(AudioError::Cancelled),
+                                },
+                            }
+                        })?;
+                        drop(manager);
+                        if !request.guard.current() { return Err(AudioError::Cancelled); }
+                        let plain=downloaded.into_plaintext().map_err(|_|AudioError::Invalid)?;
+                        let deadline=std::time::Instant::now()+Duration::from_secs(30); let guard=request.guard.clone();
+                        let allowed:decode::Authority=Arc::new(move || guard.current() && std::time::Instant::now()<deadline);
+                        let clip=decode::decode(zeroize::Zeroizing::new(plain.bytes),&plain.metadata.mime_type,allowed)?;
+                        if !request.guard.current() { return Err(AudioError::Cancelled); }
+                        request.phase.store(1,Ordering::Release);
+                        request.playback.play_pcm(clip.samples,clip.rate,clip.channels).map_err(|_|AudioError::Unavailable)
+                    }));
+                    match result {
+                        Ok(Ok(()))=>Ok(()),
+                        Ok(Err(error))=>{request.phase.store(error.code(),Ordering::Release);Ok(())},
+                        Err(_)=>{request.phase.store(AudioError::Invalid.code(),Ordering::Release);Err(ReleaseError::WorkerPanicked)},
+                    }
+                });
+                let start=match start {
+                    Ok(start)=>start,
+                    Err(error)=>{
+                        request.stop();
+                        ui.set_attachment_audio_status(match error {
+                            AdmissionError::Busy=>"Previous playback is still being released. Try Play again shortly.",
+                            AdmissionError::Failed=>"Previous audio worker did not release safely. Restart Morpheus before playing audio.",
+                            AdmissionError::Unavailable=>AudioError::text(AudioError::Unavailable.code()),
+                        }.into());
+                        return;
+                    }
+                };
                 *player.request.lock().unwrap_or_else(|e|e.into_inner())=Some(request.clone());
                 ui.set_attachment_audio_loading(true); ui.set_attachment_audio_status("Loading audio into memory…".into());
-                let manager=live.manager.clone(); let encrypted=ui.get_image_previews_encrypted_enabled();
-                runtime.spawn(async move {
-                    let download=tokio::select! { biased;
-                        _=request.guard.cancelled()=>return,
-                        result=while_allowed(||request.guard.current(),tokio::time::timeout(Duration::from_secs(45),manager.download_audio_playback_for(&request.guard.selection,&request.room,&request.event,encrypted)))=>match result {Some(value)=>value,None=>return},
-                    };
-                    let downloaded=match download { Ok(Ok(d))=>d, Ok(Err(morpheus_matrix::MatrixCoreError::MediaTooLarge{..}))=>{request.phase.store(AudioError::TooLarge.code(),Ordering::Release);return;}, _=>{request.phase.store(AudioError::Unavailable.code(),Ordering::Release);return;} };
-                    drop(manager);
-                    if !request.guard.current() { return; }
-                    let failed=request.clone();
-                    let spawn=std::thread::Builder::new().name("attachment-audio".into()).spawn(move || {
-                        let _permit=permit;
-                        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if !request.guard.current() { return Err(AudioError::Cancelled); }
-                            let plain=downloaded.into_plaintext().map_err(|_|AudioError::Invalid)?;
-                            let deadline=std::time::Instant::now()+Duration::from_secs(30); let guard=request.guard.clone();
-                            let allowed:decode::Authority=Arc::new(move || guard.current() && std::time::Instant::now()<deadline);
-                            let clip=decode::decode(zeroize::Zeroizing::new(plain.bytes),&plain.metadata.mime_type,allowed)?;
-                            if !request.guard.current() { return Err(AudioError::Cancelled); }
-                            request.phase.store(1,Ordering::Release);
-                            request.playback.play_pcm(clip.samples,clip.rate,clip.channels).map_err(|_|AudioError::Unavailable)
-                        })).unwrap_or(Err(AudioError::Invalid));
-                        if let Err(error)=result { request.phase.store(error.code(),Ordering::Release); }
-                    });
-                    if spawn.is_err() { failed.phase.store(AudioError::Unavailable.code(),Ordering::Release); }
-                    // JoinHandle is detached; the permit stays on the owner thread,
-                    // including native open/drop. No blocking Tokio shutdown job.
-                });
+                // Publish the retained owner and request before the actual
+                // worker can enter download, decode or a native device call.
+                if start.start().is_err() { request.phase.store(AudioError::Unavailable.code(),Ordering::Release); }
+
             }
         });
         owner
@@ -370,6 +587,226 @@ impl AudioAttachments {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn phase() -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(0))
+    }
+    struct HeldTls {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Drop for HeldTls {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+        }
+    }
+    std::thread_local! {
+        static HELD_TLS: std::cell::RefCell<Option<HeldTls>> = const { std::cell::RefCell::new(None) };
+    }
+    #[tokio::test]
+    async fn worker_body_return_and_cancelled_wait_do_not_release_held_native_tls() {
+        let workers = Workers::new();
+        let completed = Arc::new(Completion::default());
+        let (entered, in_tls) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::channel();
+        workers
+            .reserve(completed.clone(), phase(), move || {
+                HELD_TLS.with(|slot| {
+                    *slot.borrow_mut() = Some(HeldTls {
+                        entered,
+                        release: released,
+                    })
+                });
+                Ok(())
+            })
+            .unwrap()
+            .start()
+            .unwrap();
+        // The body has returned but a real worker TLS destructor is held. The
+        // supervisor must still own/join that exact thread, not trust a flag.
+        in_tls.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!completed.released());
+        assert_eq!(workers.poll_release(), None);
+        let mut waiting = Box::pin(workers.wait(Duration::from_secs(2)));
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(waiting);
+        assert_eq!(
+            workers.wait(Duration::from_millis(20)).await,
+            Err(ReleaseError::TimedOut)
+        );
+        assert!(matches!(
+            workers.reserve(Arc::new(Completion::default()), phase(), || Ok(())),
+            Err(AdmissionError::Busy)
+        ));
+        assert!(!completed.released());
+        release.send(()).unwrap();
+        assert_eq!(workers.wait(Duration::from_secs(2)).await, Ok(()));
+        assert!(completed.released());
+        assert!(workers.worker.lock().unwrap().is_none());
+        let replacement = Arc::new(Completion::default());
+        workers
+            .reserve(replacement.clone(), phase(), || Ok(()))
+            .unwrap()
+            .start()
+            .unwrap();
+        assert_eq!(workers.wait(Duration::from_secs(2)).await, Ok(()));
+        assert!(replacement.released());
+    }
+    #[tokio::test]
+    async fn cancellation_before_publication_keeps_handle_owned_and_never_enters_retired_work() {
+        let workers = Workers::new();
+        let completed = Arc::new(Completion::default());
+        let allowed = Arc::new(AtomicBool::new(true));
+        let used = Arc::new(AtomicBool::new(false));
+        let gate = allowed.clone();
+        let entered = used.clone();
+        let start = workers
+            .reserve(completed.clone(), phase(), move || {
+                if gate.load(Ordering::Acquire) {
+                    entered.store(true, Ordering::Release);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(workers.poll_release(), None);
+        assert!(
+            workers
+                .worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .supervisor
+                .is_some()
+        );
+        assert!(!used.load(Ordering::Acquire));
+        allowed.store(false, Ordering::Release);
+        start.start().unwrap();
+        assert_eq!(workers.wait(Duration::from_secs(2)).await, Ok(()));
+        assert!(!used.load(Ordering::Acquire));
+        assert!(completed.released());
+    }
+    #[tokio::test]
+    async fn dropping_unpublished_ticket_joins_no_native_worker_and_all_captures_are_dropped() {
+        struct Capture(Arc<AtomicBool>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let workers = Workers::new();
+        let completed = Arc::new(Completion::default());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let capture = Capture(dropped.clone());
+        let start = workers
+            .reserve(completed.clone(), phase(), move || {
+                drop(capture);
+                panic!("unpublished work must never start")
+            })
+            .unwrap();
+        drop(start);
+        assert_eq!(workers.wait(Duration::from_secs(2)).await, Ok(()));
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(completed.released());
+    }
+    #[test]
+    fn failed_supervisor_spawn_never_creates_a_native_worker_or_loses_a_handle() {
+        let workers = Workers::new();
+        let completed = Arc::new(Completion::default());
+        let entered = Arc::new(AtomicBool::new(false));
+        let body = entered.clone();
+        let result = workers.reserve_with(
+            completed.clone(),
+            phase(),
+            move || {
+                body.store(true, Ordering::Release);
+                Ok(())
+            },
+            |_supervise| Err(std::io::Error::other("synthetic spawn failure")),
+        );
+        assert!(matches!(result, Err(AdmissionError::Unavailable)));
+        assert!(!entered.load(Ordering::Acquire));
+        assert!(!completed.released());
+        assert_eq!(workers.poll_release(), Some(Ok(())));
+        assert!(workers.worker.lock().unwrap().is_none());
+    }
+    #[test]
+    fn failed_native_spawn_preserves_playback_error_without_claiming_a_worker_started() {
+        let phase = AtomicU8::new(0);
+        assert_eq!(
+            join_native(
+                Err(std::io::Error::other("synthetic native spawn failure")),
+                &phase
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            phase.load(Ordering::Acquire),
+            AudioError::Unavailable.code()
+        );
+    }
+    #[tokio::test]
+    async fn native_panic_is_joined_but_latches_failed_release_and_blocks_replacement() {
+        let workers = Workers::new();
+        let completed = Arc::new(Completion::default());
+        workers
+            .reserve(completed.clone(), phase(), || {
+                panic!("synthetic worker panic")
+            })
+            .unwrap()
+            .start()
+            .unwrap();
+        assert_eq!(
+            workers.wait(Duration::from_secs(2)).await,
+            Err(ReleaseError::WorkerPanicked)
+        );
+        assert!(!completed.released());
+        assert!(matches!(
+            workers.reserve(Arc::new(Completion::default()), phase(), || Ok(())),
+            Err(AdmissionError::Failed)
+        ));
+        assert_eq!(
+            workers.poll_release(),
+            Some(Err(ReleaseError::WorkerPanicked))
+        );
+    }
+    #[tokio::test]
+    async fn supervisor_protocol_failure_never_turns_missing_completion_into_release() {
+        let workers = Workers::new();
+        let completed = Arc::new(Completion::default());
+        let start = workers
+            .reserve_with(
+                completed.clone(),
+                phase(),
+                || Ok(()),
+                |supervise| {
+                    std::thread::Builder::new().spawn(move || {
+                        drop(supervise);
+                        panic!("synthetic supervisor panic");
+                    })
+                },
+            )
+            .unwrap();
+        let _ = start.start();
+        assert_eq!(
+            workers.wait(Duration::from_secs(2)).await,
+            Err(ReleaseError::SupervisorFailed)
+        );
+        assert!(!completed.released());
+        assert!(matches!(
+            workers.reserve(Arc::new(Completion::default()), phase(), || Ok(())),
+            Err(AdmissionError::Failed)
+        ));
+    }
     #[test]
     fn view_lease_never_adopts_navigation_generation_or_security_aba() {
         let gate = Arc::new(SecurityGate::default());

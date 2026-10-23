@@ -4752,8 +4752,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "native-calls"))]
         updates.shutdown().await
     });
-    if !runtime.block_on(audio_attachments::wait_for_release()) {
-        eprintln!("Attachment audio worker did not confirm release before shutdown");
+    let audio_result = runtime.block_on(audio_attachments::wait_for_release());
+    if let Err(error) = audio_result {
+        // Still flush drafts and stop the manager; failure is returned below.
+        eprintln!("Could not release attachment audio during shutdown: {error}");
     }
     let draft_result = runtime.block_on(live.flush_drafts());
     runtime.block_on(manager.stop());
@@ -4766,6 +4768,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Could not save drafts during shutdown: {error}");
         return Err(Box::new(error));
     }
+    audio_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.finish()?;
     Ok(())
