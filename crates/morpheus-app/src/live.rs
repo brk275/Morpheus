@@ -6710,6 +6710,16 @@ mod stale_observer_tests {
             eprintln!("\nMORPHEUS_APP_RECOVERY_STAGE {}", stringify!($case));
         };
     }
+    // Additional fixed diagnostics for the one unresolved rollback-write case.
+    // These are observations only; the twelve completion checks stay unchanged.
+    macro_rules! write_revocation_boundary {
+        ($boundary:ident) => {
+            eprintln!(
+                "\nMORPHEUS_APP_RECOVERY_BOUNDARY write_revocation {}",
+                stringify!($boundary)
+            );
+        };
+    }
     macro_rules! recovery_check {
         ($case:ident) => {
             eprintln!("\nMORPHEUS_APP_RECOVERY_CHECK {}=true", stringify!($case));
@@ -8453,6 +8463,67 @@ mod stale_observer_tests {
         recovery_check!(rollback_race);
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum WriteRevocationPause {
+        Reached,
+        WorkerEnded,
+        TimedOut,
+    }
+
+    // A worker that exits before the named pause must fail the test instead of
+    // leaving its observer waiting forever. Never release the pause here: the
+    // caller must still prove the original pre-write interleaving itself.
+    async fn wait_for_write_revocation_pause(
+        point: &PausePoint,
+        rollback: &mut tokio::task::JoinHandle<()>,
+    ) -> WriteRevocationPause {
+        let reached = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                biased;
+                _ = point.entered() => true,
+                _ = &mut *rollback => false,
+            }
+        })
+        .await;
+        match reached {
+            Ok(true) => WriteRevocationPause::Reached,
+            Ok(false) => WriteRevocationPause::WorkerEnded,
+            Err(_) => {
+                rollback.abort();
+                let _ = (&mut *rollback).await;
+                WriteRevocationPause::TimedOut
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_pause_wait_rejects_an_early_ended_worker() {
+        let pauses = TestPauses::default();
+        let point = pauses.install("rollback.before_write");
+        let mut rollback = tokio::spawn(async {});
+        assert_eq!(
+            wait_for_write_revocation_pause(&point, &mut rollback).await,
+            WriteRevocationPause::WorkerEnded
+        );
+        assert!(rollback.is_finished());
+    }
+
+    #[tokio::test]
+    async fn rollback_pause_wait_does_not_release_the_reached_write_boundary() {
+        let pauses = TestPauses::default();
+        let point = pauses.install("rollback.before_write");
+        let mut rollback = tokio::spawn(async move {
+            pauses.reach("rollback.before_write").await;
+        });
+        assert_eq!(
+            wait_for_write_revocation_pause(&point, &mut rollback).await,
+            WriteRevocationPause::Reached
+        );
+        assert!(!rollback.is_finished());
+        point.proceed();
+        rollback.await.unwrap();
+    }
+
     /// Shared setup for the forced-interleaving tests: one logged-in account,
     /// discovery complete, the room selected.
     async fn prepared_live(
@@ -8792,6 +8863,7 @@ mod stale_observer_tests {
             return;
         };
         recovery_phase!(write_revocation);
+        write_revocation_boundary!(setup);
         let (directory, manager, live, a_account, selection) = prepared_live(&alice, &a_room).await;
         let scope = SendScope {
             account: a_account.id.clone(),
@@ -8801,6 +8873,7 @@ mod stale_observer_tests {
         let text = unique_text("rollback-write");
         live.drafts.set(&a_account.id, &a_room, &text.body);
         let revision = live.drafts.revision(&a_account.id, &a_room).unwrap();
+        write_revocation_boundary!(prepare_record);
         let handle = live
             .prepare_pending_send(&selection, &scope, &text, revision)
             .await
@@ -8813,8 +8886,11 @@ mod stale_observer_tests {
             scope.clone(),
             nonce.clone(),
         );
-        let rollback = tokio::spawn(async move {
+        write_revocation_boundary!(rollback_pause);
+        let mut rollback = tokio::spawn(async move {
+            write_revocation_boundary!(rollback_writer_lock);
             let tx = rb_live.drafts.begin_write_transaction().await;
+            write_revocation_boundary!(rollback_release);
             rb_live
                 .rollback_pending(
                     &tx,
@@ -8829,27 +8905,41 @@ mod stale_observer_tests {
                 )
                 .await;
         });
-        point.entered().await;
+        match wait_for_write_revocation_pause(&point, &mut rollback).await {
+            WriteRevocationPause::Reached => {}
+            WriteRevocationPause::WorkerEnded => {
+                write_revocation_boundary!(rollback_ended_before_pause);
+                panic!("the rollback ended before its pre-write pause");
+            }
+            WriteRevocationPause::TimedOut => {
+                write_revocation_boundary!(rollback_pause_timeout);
+                panic!("the rollback did not reach its pre-write pause");
+            }
+        }
         assert!(
             live.drafts
                 .record_status(&a_account.id, &a_room, None, &nonce)
                 .is_none(),
             "released and removed from the cache"
         );
+        write_revocation_boundary!(row_before_switch);
         assert!(
             row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await,
             "not yet written"
         );
+        write_revocation_boundary!(switch_account);
         let b_account = manager
             .add_password_account(&carol.homeserver_url, &carol.username, &carol.password)
             .await
             .expect("Second login failed");
         assert!(!selection.is_current());
         point.proceed();
+        write_revocation_boundary!(rollback_join);
         tokio::time::timeout(Duration::from_secs(30), rollback)
             .await
             .expect("the rollback must finish")
             .unwrap();
+        write_revocation_boundary!(row_after_write);
         assert!(
             !row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await,
             "the release authorized the write"
@@ -8859,27 +8949,36 @@ mod stale_observer_tests {
                 .record_status(&a_account.id, &a_room, None, &nonce)
                 .is_none()
         );
+        write_revocation_boundary!(switch_back);
         manager
             .switch_to(&a_account.id)
             .await
             .expect("Cannot switch back");
         let renewed = manager.account_selection(&a_account.id).unwrap();
+        write_revocation_boundary!(recovery_discovery);
         live.adopt_recovered_sends(renewed, Weak::default()).await;
+        write_revocation_boundary!(flush);
         live.flush_drafts().await.expect("the flush succeeds");
         assert!(live.drafts.dirty_keys().is_empty());
+        write_revocation_boundary!(row_after_flush);
         assert!(!row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await);
 
+        write_revocation_boundary!(logout_first);
         manager
             .logout_account(&a_account.id)
             .await
             .expect("Cannot remove first account");
+        write_revocation_boundary!(logout_second);
         manager
             .logout_account(&b_account.id)
             .await
             .expect("Cannot remove second account");
+        write_revocation_boundary!(manager_stop);
         manager.stop().await;
         drop(manager);
+        write_revocation_boundary!(profile_close);
         close_profile(directory, live).await;
+        write_revocation_boundary!(complete);
         recovery_check!(write_revocation);
     }
 

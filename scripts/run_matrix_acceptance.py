@@ -145,6 +145,17 @@ APP_RECOVERY_TESTS = tuple("live::stale_observer_tests::" + name for name in (
     "a_thread_submission_typed_over_during_preparation_is_kept_with_its_index",
 ))
 APP_RECOVERY_STAGE = re.compile(r"^MORPHEUS_APP_RECOVERY_STAGE ([a-z_]{1,48})$", re.MULTILINE)
+APP_RECOVERY_WRITE_BOUNDARIES = frozenset((
+    "setup", "prepare_record", "rollback_pause", "rollback_writer_lock", "rollback_release",
+    "rollback_ended_before_pause", "rollback_pause_timeout",
+    "row_before_switch", "switch_account", "rollback_join", "row_after_write", "switch_back",
+    "recovery_discovery", "flush", "row_after_flush", "logout_first", "logout_second",
+    "manager_stop", "profile_close", "complete",
+))
+APP_RECOVERY_PROGRESS = re.compile(
+    r"^(?:MORPHEUS_APP_RECOVERY_STAGE ([a-z_]{1,48})|"
+    r"MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation ([a-z_]{1,48}))$", re.MULTILINE,
+)
 APP_RECOVERY_CHECK = re.compile(r"^MORPHEUS_APP_RECOVERY_CHECK ([a-z_]{1,48})=(true|false)$", re.MULTILINE)
 # Share the same bounded first-panic header between process and recovery facts.
 NATIVE_PANIC = re.compile(
@@ -455,9 +466,13 @@ def app_recovery_diagnostics(output: str) -> dict:
     result = {}
     # Serial libtest cases continue after a panic; later stages are unrelated
     # to the first failure recorded by native_process_diagnostics.
-    for match in APP_RECOVERY_STAGE.finditer(output, 0, end):
+    for match in APP_RECOVERY_PROGRESS.finditer(output, 0, end):
         if match[1] in APP_RECOVERY_CASES:
             result["stage"] = match[1]
+            result.pop("boundary", None)
+        elif (result.get("stage") == "write_revocation"
+              and match[2] in APP_RECOVERY_WRITE_BOUNDARIES):
+            result["boundary"] = match[2]
     if (panic and result.get("stage") == "observer_revocation"
             and panic[0].startswith("thread '" + APP_RECOVERY_TESTS[0] + "'")
             and re.fullmatch(r"crates/morpheus-app/src/live\.rs:[0-9]+:[0-9]+:?", panic[1])):

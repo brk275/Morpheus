@@ -1329,13 +1329,15 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
             self.assertIsNotNone(name)
             self.assertNotIn(name[1], tests)
             tests[name[1]] = body
-        # These five native regressions share the module but have no recovery protocol.
+        # These native regressions share the module but have no recovery protocol.
         other_cases = {
             "a_departed_selection_neither_reveals_nor_focuses_after_a_switch_back",
             "a_created_room_opens_only_for_its_own_click_and_admitted_snapshot",
             "a_stale_snapshots_member_load_never_claims_over_a_newer_one",
             "stale_creation_follow_ups_keep_a_newer_rooms_feed_and_transition",
             "a_withdrawn_created_room_open_gives_up_held_waits_and_its_locks",
+            "rollback_pause_wait_rejects_an_early_ended_worker",
+            "rollback_pause_wait_does_not_release_the_reached_write_boundary",
         }
         self.assertEqual(tests.keys(), self.cases.keys() | other_cases)
         for name in other_cases:
@@ -1397,6 +1399,50 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
         self.assertTrue(process["panic_observed"])
         self.assertEqual(process["panic_family"], "morpheus")
         self.assertNotIn("PRIVATE", json.dumps((result, process)))
+
+    def test_write_revocation_boundaries_are_closed_and_belong_to_the_current_case(self):
+        stage = "MORPHEUS_APP_RECOVERY_STAGE write_revocation\n"
+        for boundary in acceptance_module.APP_RECOVERY_WRITE_BOUNDARIES:
+            marker = "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation " + boundary + "\n"
+            with self.subTest(boundary=boundary):
+                self.assertEqual(acceptance_module.app_recovery_diagnostics(stage + marker),
+                                 {"stage": "write_revocation", "boundary": boundary})
+                self.assertEqual(acceptance_module.app_recovery_diagnostics(marker), {})
+                self.assertEqual(acceptance_module.app_recovery_diagnostics(
+                    stage + marker + "MORPHEUS_APP_RECOVERY_STAGE typed_retention\n"),
+                    {"stage": "typed_retention"})
+        for marker in (
+                "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation PRIVATE_ACCOUNT\n",
+                "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation unknown_boundary\n",
+                "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation rollback_pause PRIVATE_TEXT\n",
+                "MORPHEUS_APP_RECOVERY_BOUNDARY other_case rollback_pause\n"):
+            with self.subTest(marker=marker):
+                result = acceptance_module.app_recovery_diagnostics(stage + marker)
+                self.assertEqual(result, {"stage": "write_revocation"})
+                self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_write_revocation_boundary_stops_at_first_panic_and_deadline_is_scan_gated(self):
+        output = ("MORPHEUS_APP_RECOVERY_STAGE write_revocation\n"
+                  "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation rollback_pause\n")
+        panic = ("thread 'worker' panicked at crates/morpheus-app/src/live.rs:42:7:\n"
+                 "PRIVATE_SERVER_RESPONSE\n"
+                 "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation complete\n")
+        expected = {"stage": "write_revocation", "boundary": "rollback_pause"}
+        self.assertEqual(acceptance_module.app_recovery_diagnostics(output + panic), expected)
+        for scanner_code in (0, 1):
+            with self.subTest(scanner_code=scanner_code), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                with self.child(runner, output, timeout=True, scanner_code=scanner_code) as (visible, _):
+                    with self.assertRaisesRegex(RuntimeError, "deadline" if scanner_code == 0 else "credential scanning"):
+                        runner.run(acceptance_module.APP_RECOVERY_LABEL, ["mock-test"], test=True, seconds=1)
+                records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                if scanner_code == 0:
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["app_recovery_diagnostics"], expected)
+                else:
+                    self.assertEqual(records, [])
+                self.assertNotIn("PRIVATE", visible.getvalue())
+                self.assertEqual(runner.results, [])
 
     def test_logout_panic_exposes_only_exact_variant_categories_not_payloads(self):
         header = ("MORPHEUS_APP_RECOVERY_STAGE observer_revocation\nthread '"
