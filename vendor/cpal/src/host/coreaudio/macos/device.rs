@@ -29,10 +29,10 @@ use objc2_core_audio::{
     kAudioStreamPropertyAvailablePhysicalFormats, kAudioStreamPropertyPhysicalFormat, AudioClassID,
     AudioDeviceID, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
     AudioObjectPropertyAddress, AudioObjectPropertyScope, AudioObjectSetPropertyData,
+    AudioStreamRangedDescription,
 };
 use objc2_core_audio_types::{
-    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioStreamRangedDescription,
-    AudioValueRange,
+    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioValueRange,
 };
 use objc2_core_foundation::{CFRetained, CFString};
 

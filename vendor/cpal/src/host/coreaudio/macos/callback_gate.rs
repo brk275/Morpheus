@@ -428,7 +428,7 @@ unsafe fn silence(
         }
     }
     unsafe {
-        *flags.as_ptr() |= 1 << 4;
+        (*flags.as_ptr()).insert(AudioUnitRenderActionFlags::UnitRenderAction_OutputIsSilence);
     }
     0
 }
@@ -529,7 +529,8 @@ pub(super) extern "C-unwind" fn render(
         Some(0) => {
             if kind == 1 {
                 unsafe {
-                    *flags.as_ptr() &= !(1 << 4);
+                    (*flags.as_ptr())
+                        .remove(AudioUnitRenderActionFlags::UnitRenderAction_OutputIsSilence);
                 }
             }
             0
@@ -595,7 +596,15 @@ mod tests {
     };
 
     fn output(token: usize, words: &mut [u32], channels: u32) -> (i32, u32) {
-        let mut flags = 0;
+        output_with_flags(token, words, channels, 0)
+    }
+    fn output_with_flags(
+        token: usize,
+        words: &mut [u32],
+        channels: u32,
+        initial_flags: u32,
+    ) -> (i32, u32) {
+        let mut flags = AudioUnitRenderActionFlags(initial_flags);
         let mut stamp: AudioTimeStamp = unsafe { std::mem::zeroed() };
         let mut list = AudioBufferList {
             mNumberBuffers: 1,
@@ -617,7 +626,7 @@ mod tests {
             words.len() as u32,
             &mut list,
         );
-        (result, flags)
+        (result, flags.0)
     }
     fn retire(token: Token) {
         let body = token.retire().unwrap();
@@ -642,14 +651,18 @@ mod tests {
         let stale = (generation << TOKEN_SHIFT) | (current.0 & ((1 << TOKEN_SHIFT) - 1));
         assert_ne!(stale, current.0);
         revoke_exact(stale);
-        let stale_result = output(stale, &mut [u32::MAX; 2], 1);
+        // Preserve other native flags, including bits unknown to this SDK version.
+        let stale_initial_flags = (1 << 31) | (1 << 2);
+        let stale_result = output_with_flags(stale, &mut [u32::MAX; 2], 1, stale_initial_flags);
         let still_admitted = SLOTS[current.0 & 63].admitted.load(Ordering::Acquire) == current.0;
         let not_failed = !current.failed();
-        let current_result = output(current.0, &mut [u32::MAX; 2], 1);
+        let current_result = output_with_flags(current.0, &mut [u32::MAX; 2], 1, u32::MAX);
         retire(current);
         assert_eq!(stale_result.0, 0);
+        assert_eq!(stale_result.1, stale_initial_flags | (1 << 4));
         assert!(still_admitted && not_failed);
         assert_eq!(current_result.0, 0);
+        assert_eq!(current_result.1, u32::MAX & !(1 << 4));
         assert_eq!(called.load(Ordering::Relaxed), 1);
     }
     #[test]
