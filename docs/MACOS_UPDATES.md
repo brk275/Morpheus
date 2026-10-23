@@ -100,3 +100,35 @@ link text length from `lstat`, then unlinks only known entries under the owned
 bundle. It never needs to read or resolve a target, so unreadable, dangling and
 external links can be removed without touching their targets. This cleanup path
 cannot admit a bundle for identity, copying, installation or execution.
+
+## Failed trial recovery and process cleanup
+
+The supervisor retains the actual spawned `Child` and observes its exit with
+`waitid(WNOWAIT)` before any anchored process-group signal. It never caches a
+numeric PID/PGID for use after reaping that child. The generic stop operation
+still rejects `EPERM`; readiness paths propagate the error, while `Drop` remains
+best effort. Neither a successful group signal nor an exited leader establishes
+that every descendant has stopped.
+
+Darwin's group signal implementation excludes zombies and returns `EPERM` when
+no eligible target is found. The same error can mean that live group members
+are not signalable. For an already observed exited **pre-health trial** only,
+that error now permits reaping the exact owned leader and reports an explicit
+group-cleanup-unproven failure. Live or unobserved leaders and other errors do
+not receive this recovery exception. There is no `ps` snapshot, orphan PID
+signal, permission downgrade or blanket `EPERM` suppression.
+
+Rollback is a separate operation: reacquire the installed app's lifetime lock,
+reread the durable journal, and require the exact protocol, nonce, candidate,
+old/new tree identities and current candidate bundle. An `AwaitingHealth` trial
+may then restore the previous app; a matching `Committed` health/store boundary
+always preserves the new app. A surviving lock holder or any identity mismatch
+blocks recovery. Startup rejects a late trial with a removed or mismatched
+journal, and the original pre-store health check again validates the nonce,
+phase, embedded/bundle identity and complete new tree before opening stores.
+
+Restoring and relaunching the old app does **not** resolve uncertain group
+cleanup: the supervisor still returns `RecoveryRequired` in that case. Actual
+descendant quiescence, normal UI shutdown and the old parent process's exit
+remain separate installed acceptance gates. Installation activation stays false;
+source regressions and this recovery path do not establish those gates.

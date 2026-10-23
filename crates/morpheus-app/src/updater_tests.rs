@@ -174,3 +174,22 @@ fn stage_failure_never_touches_account_data() {
     assert!(stage_bytes(update, PackageKind::MacApp, b"invalid").is_err());
     assert_eq!(fs::read(&account_file).unwrap(), b"keep me");
 }
+
+#[test]
+fn shipping_dispatch_rejects_reserved_mac_acceptance_inputs() {
+    use std::ffi::OsString;
+    for (plan, args) in [
+        (true, vec![]),
+        (false, vec![OsString::from("--morpheus-mac-qa-prepare")]),
+        (false, vec![OsString::from("--morpheus-mac-qa-foreign")]),
+    ] {
+        assert_eq!(
+            reject_macos_update_acceptance_inputs(plan, args),
+            Err(UpdateError::InvalidConfiguration)
+        );
+    }
+    assert_eq!(
+        reject_macos_update_acceptance_inputs(false, [OsString::from("--preview")]),
+        Ok(())
+    );
+}

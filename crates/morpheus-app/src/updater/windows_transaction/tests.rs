@@ -168,6 +168,42 @@ fn windows_install_gate_does_not_create_stage_or_release_a_call() {
 }
 
 #[test]
+fn shipping_windows_supervisor_admission_is_closed_before_any_path_access() {
+    let missing = Path::new("Z:\\not-an-installed-morpheus");
+    let id = "a".repeat(32);
+    assert_eq!(
+        supervisor(missing, &id),
+        Err(UpdateError::InstallNotValidated)
+    );
+    assert_eq!(
+        recovery_supervisor(missing, &id, &id),
+        Err(UpdateError::InstallNotValidated)
+    );
+}
+
+#[cfg(morpheus_windows_update_acceptance)]
+#[test]
+fn private_windows_acceptance_uses_closed_case_and_explicit_false_input_contracts() {
+    for value in ["discard", "upgrade", "interrupted-marker"] {
+        assert!(acceptance::valid_case(value));
+    }
+    for value in ["", "../upgrade", "UPGRADE", "upgrade\n", "untrusted-case"] {
+        assert!(!acceptance::valid_case(value));
+    }
+    assert!(acceptance::event_false(Some(&serde_json::json!(false))));
+    assert!(acceptance::event_false(Some(&serde_json::json!("false"))));
+    for value in [
+        serde_json::json!(null),
+        serde_json::json!(0),
+        serde_json::json!(true),
+        serde_json::json!("False"),
+    ] {
+        assert!(!acceptance::event_false(Some(&value)));
+    }
+    assert!(!acceptance::event_false(None));
+}
+
+#[test]
 fn windows_private_files_reject_hardlinks_and_exclusive_locks_cover_installer() {
     let temporary = tempfile::tempdir().unwrap();
     let directory = native::create_directory(&temporary.path().join("private")).unwrap();

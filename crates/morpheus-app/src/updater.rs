@@ -44,6 +44,36 @@ pub use macos_transaction::{MacAppSession, PreparedMacRestart};
 pub(crate) fn macos_installation_validated() -> bool {
     macos_transaction::INSTALLATION_VALIDATED
 }
+
+// Shipping binaries reject reserved synthetic requests before any profile or
+// network/UI initialization. No runtime variable enables the instrumented code.
+pub(crate) fn reject_macos_update_acceptance_request() -> Result<(), UpdateError> {
+    reject_macos_update_acceptance_inputs(
+        std::env::var_os("MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN").is_some(),
+        std::env::args_os().skip(1),
+    )
+}
+
+fn reject_macos_update_acceptance_inputs(
+    plan_present: bool,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<(), UpdateError> {
+    let request = plan_present
+        || args.into_iter().any(|arg| {
+            arg.to_str()
+                .is_some_and(|arg| arg.starts_with("--morpheus-mac-qa-"))
+        });
+    if request {
+        Err(UpdateError::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+pub(crate) fn run_macos_update_acceptance() -> Result<(), UpdateError> {
+    macos_transaction::acceptance::dispatch()
+}
 #[cfg(target_os = "windows")]
 mod windows_transaction;
 #[cfg(target_os = "windows")]
@@ -51,6 +81,12 @@ pub use windows_transaction::{PreparedWindowsRestart, WindowsSession};
 #[cfg(target_os = "windows")]
 pub fn windows_installation_validated() -> bool {
     windows_transaction::INSTALLATION_VALIDATED
+}
+
+#[cfg(all(target_os = "windows", morpheus_windows_update_acceptance))]
+pub(crate) fn run_windows_update_acceptance() -> Result<(), Box<dyn std::error::Error>> {
+    windows_transaction::acceptance::dispatch()?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

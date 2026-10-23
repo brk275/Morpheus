@@ -90,6 +90,22 @@ fn prepared() -> (tempfile::TempDir, MacAppSession, Journal) {
     (root, session, journal)
 }
 
+fn awaiting_store_health() -> (tempfile::TempDir, MacAppSession, Journal) {
+    let (root, session, mut journal) = prepared();
+    remove_bundle(&session.state.join("next.app")).unwrap();
+    journal.candidate = PackageMetadata::embedded().unwrap();
+    bundle(&session.state.join("next.app"), &journal.candidate);
+    fs::write(
+        session.state.join("next.app/Contents/Resources/theme.toml"),
+        b"new compatible resources",
+    )
+    .unwrap();
+    journal.new_hash = tree_hash(&session.state.join("next.app")).unwrap();
+    session.save(&journal).unwrap();
+    session.apply(&mut journal).unwrap();
+    (root, session, journal)
+}
+
 #[test]
 fn native_identity_rejects_wrong_cpu_writable_or_truncated_sections_and_unknown_fields() {
     let identity = PackageMetadata::embedded().unwrap();
@@ -384,18 +400,7 @@ fn public_install_gate_stays_closed_and_journal_rejects_links_and_unbounded_fiel
 
 #[test]
 fn health_commit_before_store_is_durable_and_cannot_be_reversed() {
-    let (_root, mut session, mut journal) = prepared();
-    remove_bundle(&session.state.join("next.app")).unwrap();
-    journal.candidate = PackageMetadata::embedded().unwrap();
-    bundle(&session.state.join("next.app"), &journal.candidate);
-    fs::write(
-        session.state.join("next.app/Contents/Resources/theme.toml"),
-        b"new compatible resources",
-    )
-    .unwrap();
-    journal.new_hash = tree_hash(&session.state.join("next.app")).unwrap();
-    session.save(&journal).unwrap();
-    session.apply(&mut journal).unwrap();
+    let (_root, mut session, journal) = awaiting_store_health();
     session.trial = Some(journal.id.clone());
     session.acknowledge_before_store().unwrap();
     let mut durable = session.journal().unwrap().unwrap();
@@ -407,6 +412,143 @@ fn health_commit_before_store_is_durable_and_cannot_be_reversed() {
     assert_eq!(
         tree_hash(&session.state.join("previous.app")).unwrap(),
         journal.old_hash
+    );
+}
+
+#[test]
+fn owned_exit_fixture() {
+    // Only the fresh hosted test process's explicitly selected child receives
+    // this value. This is the native test harness, never the GUI application.
+    if std::env::var_os("MORPHEUS_MAC_OWNED_EXIT_FIXTURE").as_deref()
+        == Some(std::ffi::OsStr::new("exit23"))
+    {
+        std::process::exit(23);
+    }
+}
+
+#[test]
+fn exited_owned_trial_reaps_only_its_leader_and_reports_unproved_group_cleanup() {
+    let executable = std::env::current_exe().unwrap();
+    // libtest names omit the crate prefix present in module_path!().
+    let module = module_path!().split_once("::").unwrap().1;
+    let mut command = Command::new(executable);
+    command
+        .arg("--exact")
+        .arg(format!("{module}::owned_exit_fixture"))
+        .arg("--nocapture")
+        .env("MORPHEUS_MAC_OWNED_EXIT_FIXTURE", "exit23")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = OwnedChild::spawn(&mut command).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !child.exited().unwrap() {
+        assert!(Instant::now() < deadline, "owned fixture did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // WNOWAIT has left the exact owned Child available as the group anchor.
+    assert!(child.child.is_some());
+    match child.stop_before_health() {
+        Err(TrialStopError::ExitedLeaderGroupUnproven(status)) => {
+            assert_eq!(status.code(), Some(23));
+        }
+        other => panic!("expected explicit Darwin cleanup uncertainty: {other:?}"),
+    }
+    assert!(child.child.is_none());
+    assert_eq!(child.exited(), Err(UpdateError::RecoveryRequired));
+    // No cached numeric identity survives the reap for Drop or another stop.
+    child.stop().unwrap();
+}
+
+#[test]
+fn serialized_trial_recovery_restores_old_tree_and_late_health_cannot_open_stores() {
+    let (_root, session, journal) = awaiting_store_health();
+    let installed = session.installed.clone();
+    drop(session);
+    assert_eq!(
+        recover_failed_trial(&installed, &journal),
+        Ok(TrialRecovery::RolledBack)
+    );
+    let mut late = MacAppSession::lock(&installed, Duration::ZERO).unwrap();
+    assert_eq!(tree_hash(&installed).unwrap(), journal.old_hash);
+    assert!(late.journal().unwrap().is_none());
+    late.trial = Some(journal.id);
+    assert_eq!(
+        late.acknowledge_before_store(),
+        Err(UpdateError::RecoveryRequired)
+    );
+    assert!(late.journal().unwrap().is_none());
+    assert_eq!(tree_hash(&installed).unwrap(), journal.old_hash);
+}
+
+#[test]
+fn serialized_trial_recovery_preserves_health_commit_that_won_the_lock() {
+    let (_root, mut session, journal) = awaiting_store_health();
+    let installed = session.installed.clone();
+    session.trial = Some(journal.id.clone());
+    session.acknowledge_before_store().unwrap();
+    drop(session);
+    assert_eq!(
+        recover_failed_trial(&installed, &journal),
+        Ok(TrialRecovery::Committed)
+    );
+    let session = MacAppSession::lock(&installed, Duration::ZERO).unwrap();
+    assert_eq!(session.journal().unwrap().unwrap().phase, Phase::Committed);
+    assert_eq!(tree_hash(&installed).unwrap(), journal.new_hash);
+    assert_eq!(
+        tree_hash(&session.state.join("previous.app")).unwrap(),
+        journal.old_hash
+    );
+}
+
+#[test]
+fn serialized_trial_recovery_rejects_other_transactions_phases_and_changed_tree() {
+    let (_root, session, journal) = awaiting_store_health();
+    let installed = session.installed.clone();
+    let state = session.state.clone();
+    drop(session);
+    for field in 0..6 {
+        let mut other = journal.clone();
+        match field {
+            0 => other.id.push('2'),
+            1 => other.candidate.version = "99.0.0".into(),
+            2 => other.old_hash = "0".repeat(64),
+            3 => other.new_hash = "0".repeat(64),
+            4 => other.protocol = 2,
+            _ => other.phase = Phase::Prepared,
+        }
+        assert_eq!(
+            recover_failed_trial(&installed, &other),
+            Err(UpdateError::RecoveryRequired)
+        );
+        assert_eq!(tree_hash(&installed).unwrap(), journal.new_hash);
+        assert_eq!(
+            tree_hash(&state.join("previous.app")).unwrap(),
+            journal.old_hash
+        );
+    }
+    let session = MacAppSession::lock(&installed, Duration::ZERO).unwrap();
+    let mut unrelated = journal.clone();
+    unrelated.phase = Phase::Prepared;
+    session.save(&unrelated).unwrap();
+    drop(session);
+    assert_eq!(
+        recover_failed_trial(&installed, &journal),
+        Err(UpdateError::RecoveryRequired)
+    );
+    let session = MacAppSession::lock(&installed, Duration::ZERO).unwrap();
+    session.save(&journal).unwrap();
+    fs::write(installed.join("Contents/Resources/theme.toml"), b"changed").unwrap();
+    let changed = tree_hash(&installed).unwrap();
+    drop(session);
+    assert_eq!(
+        recover_failed_trial(&installed, &journal),
+        Err(UpdateError::RecoveryRequired)
+    );
+    assert_eq!(tree_hash(&installed).unwrap(), changed);
+    assert_eq!(
+        MacAppSession::read_journal(&state).unwrap().unwrap().phase,
+        Phase::AwaitingHealth
     );
 }
 

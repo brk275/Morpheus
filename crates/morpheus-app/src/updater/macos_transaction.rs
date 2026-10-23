@@ -1127,6 +1127,18 @@ pub(super) fn prepare_restart<'a>(
     if !INSTALLATION_VALIDATED {
         return Err(UpdateError::InstallNotValidated);
     }
+    prepare_restart_admitted(session, bytes, version, lease)
+}
+
+// The shipping caller above always applies the closed activation gate. The
+// only other caller is the compile-gated, strictly synthetic acceptance actor;
+// archive, identity, tree, durability, nonce and lease checks stay shared here.
+fn prepare_restart_admitted<'a>(
+    session: &'a mut MacAppSession,
+    bytes: &[u8],
+    version: &str,
+    lease: InstallLease,
+) -> Result<PreparedMacRestart<'a>, UpdateError> {
     session.prepare(bytes, version)?;
     let id = session.journal()?.ok_or(UpdateError::RecoveryRequired)?.id;
     Ok(PreparedMacRestart {
@@ -1164,7 +1176,16 @@ fn remove_loader_environment(
 }
 
 // An unreaped leader reserves its PID/PGID, even after exit. Observe with
-// WNOWAIT, stop owned descendants, then perform the only reap.
+// WNOWAIT, attempt the anchored group signal, then perform the only reap.
+// Neither observing that leader nor a successful group signal proves that
+// every descendant has stopped. In particular, Darwin can return EPERM for
+// a zombie-only group and for a group containing live nonsignalable members.
+#[derive(Debug)]
+enum TrialStopError {
+    Failed(UpdateError),
+    ExitedLeaderGroupUnproven(std::process::ExitStatus),
+}
+
 struct OwnedChild {
     child: Option<Child>,
 }
@@ -1212,34 +1233,78 @@ impl OwnedChild {
         }
     }
     fn stop(&mut self) -> Result<(), UpdateError> {
-        let Some(child) = self.child.as_ref() else {
+        if self.child.is_none() {
             return Ok(());
-        };
-        let pid = i32::try_from(child.id()).map_err(|_| UpdateError::RecoveryRequired)?;
+        }
         self.exited()?;
+        self.signal_group()
+            .map_err(|_| UpdateError::RecoveryRequired)?;
+        self.reap_owned()?;
+        Ok(())
+    }
+
+    fn stop_before_health(&mut self) -> Result<(), TrialStopError> {
+        let exited = self.exited().map_err(TrialStopError::Failed)?;
+        match self.signal_group() {
+            Ok(()) => self
+                .reap_owned()
+                .map(|_| ())
+                .map_err(TrialStopError::Failed),
+            Err(error) if exited && error.raw_os_error() == Some(libc::EPERM) => {
+                // This is only an observed direct-child exit. Reap exactly
+                // that owned child, never signal its numeric group again,
+                // and keep group cleanup an explicit error. The supervisor
+                // may attempt serialized pre-store rollback, not claim drain.
+                let status = self.reap_owned().map_err(TrialStopError::Failed)?;
+                Err(TrialStopError::ExitedLeaderGroupUnproven(status))
+            }
+            Err(_) => Err(TrialStopError::Failed(UpdateError::RecoveryRequired)),
+        }
+    }
+
+    fn signal_group(&self) -> Result<(), std::io::Error> {
+        let pid = self
+            .child
+            .as_ref()
+            .and_then(|child| i32::try_from(child.id()).ok())
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ECHILD))?;
         loop {
             // SAFETY: spawn created this group; its unreaped leader reserves
             // the PID until the single wait below. Never signal after ECHILD.
             if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
-                break;
+                return Ok(());
             }
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
-                break;
+                return Ok(());
             }
             if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(UpdateError::RecoveryRequired);
+                return Err(error);
             }
         }
-        self.child
-            .take()
-            .unwrap()
+    }
+
+    fn reap_owned(&mut self) -> Result<std::process::ExitStatus, UpdateError> {
+        // Retain the actual Child even on wait failure. No caller keeps a
+        // cached PID/PGID or performs a later signal after this successful reap.
+        let status = self
+            .child
+            .as_mut()
+            .ok_or(UpdateError::RecoveryRequired)?
             .wait()
             .map_err(|_| UpdateError::RecoveryRequired)?;
-        Ok(())
+        self.child.take();
+        Ok(status)
     }
+    #[cfg(not(morpheus_macos_update_acceptance))]
     fn handoff(mut self) -> Child {
         self.child.take().unwrap()
+    }
+    #[cfg(morpheus_macos_update_acceptance)]
+    fn handoff(mut self) {
+        // Synthetic monitors retain waitable direct-child ownership, rather
+        // than trying to signal orphan numeric PIDs after a simulated shutdown.
+        acceptance::retain_child(self.child.take().unwrap());
     }
 }
 impl Drop for OwnedChild {
@@ -1248,9 +1313,54 @@ impl Drop for OwnedChild {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TrialRecovery {
+    RolledBack,
+    Committed,
+}
+
+fn same_transaction(left: &Journal, right: &Journal) -> bool {
+    left.protocol == right.protocol
+        && left.id == right.id
+        && left.old_hash == right.old_hash
+        && left.new_hash == right.new_hash
+        && left.candidate == right.candidate
+}
+
+fn recover_failed_trial(
+    installed: &Path,
+    expected: &Journal,
+) -> Result<TrialRecovery, UpdateError> {
+    // An exited leader is not a group-drain proof. Recovery is independently
+    // serialized with every trial's lifetime app lock. If a surviving holder
+    // still owns it, fail rather than replacing a potentially healthy app.
+    let session = MacAppSession::lock(installed, Duration::from_secs(5))?;
+    let mut latest = session.journal()?.ok_or(UpdateError::RecoveryRequired)?;
+    if expected.phase != Phase::AwaitingHealth
+        || !same_transaction(&latest, expected)
+        || !matches!(latest.phase, Phase::AwaitingHealth | Phase::Committed)
+        || tree_hash(&session.installed)? != latest.new_hash
+        || bundle_metadata(&session.installed)? != latest.candidate
+    {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    if latest.phase == Phase::Committed {
+        // A health/store boundary won the lock first. Preserve the exact new
+        // app, including on flush failure; an older persistence writer cannot
+        // be restarted by rolling it back.
+        session.confirm_commit()?;
+        return Ok(TrialRecovery::Committed);
+    }
+    session.rollback(&mut latest)?;
+    // Existing startup and acknowledge_before_store revalidate the nonce,
+    // phase, executable identity and complete tree before opening stores. A
+    // late trial cannot commit through this now-restored bundle/journal.
+    Ok(TrialRecovery::RolledBack)
+}
+
 fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
     let (installed, state) = MacAppSession::paths(installed)?;
-    let journal = MacAppSession::read_journal(&state)?.ok_or(UpdateError::RecoveryRequired)?;
+    let prepared = MacAppSession::read_journal(&state)?.ok_or(UpdateError::RecoveryRequired)?;
     let running = std::env::current_exe().map_err(|_| UpdateError::UnsupportedPackage)?;
     if running
         .canonicalize()
@@ -1260,10 +1370,10 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
             .join(EXECUTABLE)
             .canonicalize()
             .map_err(|_| UpdateError::RecoveryRequired)?
-        || journal.id != id
-        || journal.phase != Phase::Prepared
-        || !journal.candidate.compatible(&PackageMetadata::embedded()?)
-        || tree_hash(&state.join("previous.app"))? != journal.old_hash
+        || prepared.id != id
+        || prepared.phase != Phase::Prepared
+        || !prepared.candidate.compatible(&PackageMetadata::embedded()?)
+        || tree_hash(&state.join("previous.app"))? != prepared.old_hash
     {
         return Err(UpdateError::RecoveryRequired);
     }
@@ -1279,11 +1389,13 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
     sync_directory(&state)?;
     let session = MacAppSession::lock(&installed, Duration::from_secs(120))?;
     let mut journal = session.journal()?.ok_or(UpdateError::RecoveryRequired)?;
-    if journal.id != id {
+    if !same_transaction(&journal, &prepared) {
         return Err(UpdateError::RecoveryRequired);
     }
     session.apply(&mut journal)?;
     drop(session);
+    #[cfg(morpheus_macos_update_acceptance)]
+    acceptance::after_apply_checkpoint()?;
     let mut child = match OwnedChild::spawn(
         app_command(&installed)
             .arg("--morpheus-mac-update-trial")
@@ -1291,19 +1403,15 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
     ) {
         Ok(child) => child,
         Err(_) => {
-            let session = MacAppSession::lock(&installed, Duration::ZERO)?;
-            session.rollback(&mut journal)?;
-            drop(session);
-            app_command(&installed)
-                .spawn()
-                .map_err(|_| UpdateError::RestartFailed)?;
+            recover_failed_trial(&installed, &journal)?;
+            spawn_restarted(&installed)?;
             return Err(UpdateError::RestartFailed);
         }
     };
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let observed = MacAppSession::read_journal(&state)?.ok_or(UpdateError::RecoveryRequired)?;
-        if observed.id != id {
+        if !same_transaction(&observed, &journal) {
             return Err(UpdateError::RecoveryRequired);
         }
         if observed.phase == Phase::Committed {
@@ -1311,17 +1419,18 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
             return Ok(());
         }
         if child.exited()? || Instant::now() >= deadline {
-            child.stop()?;
-            let session = MacAppSession::lock(&installed, Duration::from_secs(5))?;
-            let mut latest = session.journal()?.ok_or(UpdateError::RecoveryRequired)?;
-            if latest.phase != Phase::Committed {
-                session.rollback(&mut latest)?;
-            }
-            drop(session);
-            app_command(&installed)
-                .spawn()
-                .map_err(|_| UpdateError::RestartFailed)?;
-            return if latest.phase == Phase::Committed {
+            let cleanup_unproven = match child.stop_before_health() {
+                Ok(()) => false,
+                Err(TrialStopError::ExitedLeaderGroupUnproven(_status)) => true,
+                Err(TrialStopError::Failed(error)) => return Err(error),
+            };
+            let recovered = recover_failed_trial(&installed, &journal)?;
+            spawn_restarted(&installed)?;
+            return if cleanup_unproven {
+                // Restoration/relaunch did not establish group quiescence.
+                // Keep that production cleanup gate visibly unresolved.
+                Err(UpdateError::RecoveryRequired)
+            } else if recovered == TrialRecovery::Committed {
                 Ok(())
             } else {
                 Err(UpdateError::RestartFailed)
@@ -1329,6 +1438,21 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn spawn_restarted(installed: &Path) -> Result<(), UpdateError> {
+    #[cfg(not(morpheus_macos_update_acceptance))]
+    {
+        app_command(installed)
+            .spawn()
+            .map_err(|_| UpdateError::RestartFailed)?;
+    }
+    #[cfg(morpheus_macos_update_acceptance)]
+    {
+        let child = OwnedChild::spawn(&mut app_command(installed))?;
+        child.handoff();
+    }
+    Ok(())
 }
 
 pub(super) fn early_dispatch() -> Result<bool, UpdateError> {
@@ -1357,6 +1481,10 @@ pub(super) fn early_dispatch() -> Result<bool, UpdateError> {
 }
 
 pub(super) fn begin_startup() -> Result<(Option<MacAppSession>, bool), UpdateError> {
+    begin_startup_admitted(INSTALLATION_VALIDATED)
+}
+
+fn begin_startup_admitted(admitted: bool) -> Result<(Option<MacAppSession>, bool), UpdateError> {
     let executable = std::env::current_exe().map_err(|_| UpdateError::UnsupportedPackage)?;
     let Some(installed) = executable
         .parent()
@@ -1381,7 +1509,7 @@ pub(super) fn begin_startup() -> Result<(Option<MacAppSession>, bool), UpdateErr
     {
         return Err(UpdateError::UnsupportedPackage);
     }
-    if !INSTALLATION_VALIDATED {
+    if !admitted {
         // Revoking future activation must not ignore an existing transaction
         // and open stores through unresolved application replacement.
         let pending = installed
@@ -1446,14 +1574,16 @@ pub(super) fn begin_startup() -> Result<(Option<MacAppSession>, bool), UpdateErr
         if replaced {
             let installed = session.installed.clone();
             drop(session);
-            app_command(&installed)
-                .spawn()
-                .map_err(|_| UpdateError::RestartFailed)?;
+            spawn_restarted(&installed)?;
             return Ok((None, true));
         }
     }
     Ok((Some(session), false))
 }
+
+#[cfg(any(test, morpheus_macos_update_acceptance))]
+#[path = "macos_transaction_acceptance.rs"]
+pub(super) mod acceptance;
 
 #[cfg(test)]
 #[path = "macos_transaction_tests.rs"]

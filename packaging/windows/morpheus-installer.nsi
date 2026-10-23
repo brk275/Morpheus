@@ -333,6 +333,39 @@ Var MorpheusLifetimeLock
     StrCpy $MorpheusLifetimeLock 0
 !macroend
 
+; NSIS DeleteRegKey /ifempty ignores values. Query BOTH counts natively;
+; failed/unknown queries retain the key, including an empty-named default.
+!macro MorpheusDeleteEmptyUserKey KEY
+  !define MORPHEUS_EMPTY_ID ${__LINE__}
+  !if "${ARCH}" == "x64"
+    !define MORPHEUS_EMPTY_VIEW 0x100
+    !define MORPHEUS_EMPTY_READ 0x109
+  !else if "${ARCH}" == "arm64"
+    !define MORPHEUS_EMPTY_VIEW 0x100
+    !define MORPHEUS_EMPTY_READ 0x109
+  !else
+    !define MORPHEUS_EMPTY_VIEW 0x200
+    !define MORPHEUS_EMPTY_READ 0x209
+  !endif
+  System::Call 'advapi32::RegOpenKeyExW(p 0x80000001, w "${KEY}", i 0, i ${MORPHEUS_EMPTY_READ}, *p.r0)i.r1'
+  StrCmp $1 0 0 morpheus_empty_done_${MORPHEUS_EMPTY_ID}
+  StrCpy $2 -1
+  StrCpy $3 -1
+  System::Call 'advapi32::RegQueryInfoKeyW(p r0, p 0, p 0, p 0, *i.r2, p 0, p 0, *i.r3, p 0, p 0, p 0, p 0)i.r1'
+  StrCmp $1 0 0 morpheus_empty_close_${MORPHEUS_EMPTY_ID}
+  StrCmp $2 0 0 morpheus_empty_close_${MORPHEUS_EMPTY_ID}
+  StrCmp $3 0 0 morpheus_empty_close_${MORPHEUS_EMPTY_ID}
+  ; RegDeleteKeyEx also refuses subkeys created since the checked snapshot.
+  ; Current-user writes remain under the installed-path lifetime exclusion.
+  System::Call 'advapi32::RegDeleteKeyExW(p 0x80000001, w "${KEY}", i ${MORPHEUS_EMPTY_VIEW}, i 0)i.r1'
+  morpheus_empty_close_${MORPHEUS_EMPTY_ID}:
+  System::Call 'advapi32::RegCloseKey(p r0)i.r1'
+  morpheus_empty_done_${MORPHEUS_EMPTY_ID}:
+  !undef MORPHEUS_EMPTY_READ
+  !undef MORPHEUS_EMPTY_VIEW
+  !undef MORPHEUS_EMPTY_ID
+!macroend
+
 Section Install
   Call MorpheusRequireFreshDestination
   !insertmacro MorpheusAcquireLifetimeLock
@@ -492,6 +525,17 @@ Section Uninstall
 
   ; Remove desktop shortcuts
   Delete "$DESKTOP\${PRODUCTNAME}.lnk"
+
+  ; Remove only our exact saved install path. Preserve any foreign replacement
+  ; or unrelated values/subkeys, then remove empty owned product/vendor keys.
+  ClearErrors
+  ReadRegStr $R8 SHCTX "${MANUPRODUCTKEY}" ""
+  IfErrors morpheus_keep_manufacturer_value
+  StrCmpS $R8 $INSTDIR 0 morpheus_keep_manufacturer_value
+  DeleteRegValue SHCTX "${MANUPRODUCTKEY}" ""
+  !insertmacro MorpheusDeleteEmptyUserKey "${MANUPRODUCTKEY}"
+  !insertmacro MorpheusDeleteEmptyUserKey "Software\${MANUFACTURER}"
+  morpheus_keep_manufacturer_value:
 
   ; Remove registry information for add/remove programs
   !if "${INSTALLMODE}" == "both"

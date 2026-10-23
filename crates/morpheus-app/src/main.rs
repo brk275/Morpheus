@@ -1606,6 +1606,44 @@ fn continue_account_action(ui: &AppWindow, action: i32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(morpheus_windows_update_acceptance)]
+    {
+        // This section exists only WITH the first-statement dispatch. The
+        // private driver checks it as inert PE data before any installation.
+        const ENTRY_TEXT: &str = concat!(
+            "MORPHEUS-WINDOWS-UPDATE-QA-V1\n",
+            env!("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_NONCE")
+        );
+        #[used]
+        #[unsafe(link_section = ".mrphqa")]
+        static ENTRY: [u8; ENTRY_TEXT.len()] = {
+            let text = ENTRY_TEXT.as_bytes();
+            let mut bytes = [0_u8; ENTRY_TEXT.len()];
+            let mut index = 0;
+            while index < text.len() {
+                bytes[index] = text[index];
+                index += 1;
+            }
+            bytes
+        };
+        std::hint::black_box(&ENTRY);
+        return updater::run_windows_update_acceptance();
+    }
+    // The synthetic transaction variant never enters config, network, UI,
+    // accounts or vault initialization, even with missing/invalid arguments.
+    #[cfg(morpheus_macos_update_acceptance)]
+    return updater::run_macos_update_acceptance().map_err(Into::into);
+    #[cfg(not(morpheus_macos_update_acceptance))]
+    updater::reject_macos_update_acceptance_request()?;
+    #[cfg(not(morpheus_windows_update_acceptance))]
+    if std::env::var_os("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_PLAN").is_some()
+        || std::env::var_os("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_PLAN_SHA256").is_some()
+        || std::env::args_os()
+            .skip(1)
+            .any(|arg| arg.to_string_lossy().starts_with("--morpheus-windows-qa-"))
+    {
+        return Err("Private Windows update acceptance is not compiled into this build".into());
+    }
     // `config validate` and `config schema` run first: before the screenshot
     // preview, the updater, the startup session, the window, the account
     // store, the credential vault, sync and media devices. They write nothing.

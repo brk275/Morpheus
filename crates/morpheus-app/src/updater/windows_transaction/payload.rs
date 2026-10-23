@@ -18,7 +18,7 @@ pub(super) const FILES: [&str; 5] = [
 pub(super) const MARKER_LIMIT: usize = 16 * 1024;
 // Generated from the reviewed template and resource contract, not user input.
 pub(super) const UNINSTALL_CONTRACT: &str =
-    "ed87459d7864597c82c14e013d21a95e59f8101d037917c34073e3a9ffaef7d8";
+    "3f45a065d910b1b8aa889bb4d74dfec33682c23bcfee2dc69d66ed5ce9382a9d";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

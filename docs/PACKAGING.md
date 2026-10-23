@@ -672,3 +672,54 @@ Space, tabbing to Manage accounts, opening that dialog, its Tab/Shift-Tab order,
 and closing it. These tokens contain no account labels or focused control text.
 A timeout at one boundary remains a failed installed check; these diagnostics
 do not substitute for keyboard or screen-reader acceptance.
+
+
+### Synthetic installed Mac transaction milestone (not release activation)
+
+`scripts/macos_update_acceptance.py` extends the private native package/update QA
+route. It requires explicit `--execute-on-free-hosted-runner`, a reviewed clean
+source revision, an external target cache, and the pinned default Gitleaks 8.30.1
+scanner for the native Mac architecture. No workflow selects it automatically.
+Its source and runner invocation must be independently reviewed before execution.
+
+It exports the exact reviewed tree twice, allowing only the existing app manifest
+and lockfile version substitutions (`-updateqa.1` and `-updateqa.2`). Each version
+uses one unchanged native-calls release build through pinned Cargo Packager 0.11.8
+and the normal Mac package configuration and bounded unsigned payload producer.
+The two builds share a fresh build-time nonce and an instrumented persistence
+cohort that cannot match shipping binaries or another run. In-memory package
+version/output/binary-directory overrides do not alter shipping configuration.
+Initial DMG packaging and installed UI QA remain separate and unchanged.
+
+The instrumented variant accepts only a closed nonce-bound plan in a fresh private
+runner temporary root. It exits through its synthetic dispatcher before config,
+profile, vault, network, media or UI initialization. Ordinary binaries reject
+reserved plan/command inputs before initialization and cannot activate this code
+through runtime environment or CLI flags. Production installation stays disabled.
+Only generated disposable signing keys are used, privately with the official
+signer after both builds; no Developer ID or release credentials are accepted.
+
+Six scenarios launch the actual packaged old/new executables and share production
+signature re-verification, extraction, complete bundle identity/tree checks,
+install/call exclusion, readiness, atomic swap, journal, startup recovery and
+pre-store health commit: successful upgrade plus committed restart, invalid
+signature, staged resource tampering, restart from Prepared, helper interruption
+after replacement before trial, and a trial that fails before health. Fixed event
+markers and exact trees/journal cleanup must agree. Child handles are retained;
+interruption targets only a live owned helper, and the external Prepared stop
+occurs before any helper exists. Failed or timed-out fixtures remain private;
+there is no orphan PID kill, profile cleanup or automatic unchanged retry.
+Raw logs are bounded, private and default-scanned before inspection; only fixed
+result fields and exact source/artifact/cohort hashes are public.
+
+This milestone simulates shutdown by releasing the old actor's session/install
+leases while retaining it as the helper's owning monitor. It does **not** prove
+normal UI shutdown or actual old-parent exit. Its single-member synthetic actor
+completion/reap is harness cleanup, not acceptance of production group-stop
+behavior (including the open Darwin zombie-only-group EPERM concern). Feed and
+download/TLS behavior, ordinary shipping-process handoff, Developer ID/notarization,
+physical-device/media behavior and actual storage/power-loss durability remain
+separate gates. Passing this route alone must not enable installation or mark the
+beta ready. Shared build/main/updater source changes also require ordinary native
+compilation on Apple Silicon, Intel Mac, Windows and Linux; the instrumented
+installed transaction scenarios require both native Mac labels.

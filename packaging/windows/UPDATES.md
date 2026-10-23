@@ -139,3 +139,46 @@ journal and partial registry boundary; failed health rollback; pre-store commit;
 subsequent launch and cleanup; and no account/profile/vault crossover. Storage
 durability, Narrator, real accounts/devices, signing and public release gates
 remain separate. No local application execution is implied by this draft.
+
+## Private installed mechanism acceptance (activation remains disabled)
+
+`scripts/windows_update_acceptance.py` is an explicitly selected, owner/manual,
+public-repository standard Windows hosted route. It is not automatically selected
+by the existing packaging workflow. After independent review, its caller must
+provide the exact reviewed clean source revision and independently authenticated
+Windows Gitleaks executable/hash. No installer, payload, raw log, fixture key or
+machine-specific receipt is uploaded.
+
+The driver uses two complete version-only Git exports and exactly one native
+build per version. Existing producer/template/Packager 0.11.8/signing and suspended
+CreateProcess-to-Job ownership are reused. The compile-only nonce changes the
+acceptance persistence cohort; ordinary builds compile none of its actor module.
+The private actor entry runs before configuration, UI, stores, networking and media.
+The separate shared build/main/updater hook hunks require explicit composition and
+review before this driver is runnable. Before any NSIS production/launch, the driver
+checks one exact read-only `.mrphqa` section as inert PE data. That nonce/tag section
+is defined inside main's compile-only first-statement dispatch hunk; omitted build
+or main instrumentation therefore fails closed without probing an unknown CLI. Ordinary builds reject the reserved plan
+variables and QA arguments. `INSTALLATION_VALIDATED` remains false.
+
+Fresh synthetic current-user NSIS installs exercise official signature rejection,
+truncation, discard, staged-byte mutation, the shared call/install lease, failed
+trial rollback, whole-owned-Job interruption after durable verified marker replacement
+and before EXE replacement, copied-helper startup recovery, acknowledged upgrade,
+terminal cleanup, genuine uninstall and subsequent reinstall. Cleanup enters the
+same startup/recovery cores, validates the original uninstaller/installed registry
+and refuses unknown identities or pending journals. It never executes a registry
+UninstallString or kills a numeric PID. Manufacturer-key uninstall cleanup removes
+only the default value matching the admitted directory, then empty owned keys;
+foreign values and unrelated subkeys remain. Checked native query success plus
+zero values and zero subkeys precedes empty-key removal; NSIS `/ifempty` alone is
+not used. The genuine uninstall cases also retain exact synthetic foreign named
+values, an empty-named foreign default, a child key, and a vendor-parent named value
+after its product subkey is gone, then conditionally clean
+only those nonce-bound fixtures through retained handles.
+
+This mechanism route is source-only until fresh Windows execution is independently
+accepted. It does not prove normal UI exit, live calls, HTTP download/system trust,
+public signing, devices, migrations, licensing or full beta/distribution readiness.
+The atomic call lease check uses a synthetic lease, not a live call. All such gates
+remain open, and a partial synthetic result must not enable production updates.

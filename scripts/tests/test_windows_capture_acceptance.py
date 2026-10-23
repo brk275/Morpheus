@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import struct
 import sys
 import tempfile
 import types
@@ -11,6 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from scripts import run_windows_capture_acceptance as capture
+from scripts import windows_update_acceptance as update
 
 
 HOSTED = {"MORPHEUS_WINDOWS_CAPTURE_ACCEPTANCE": "1", "GITHUB_ACTIONS": "true",
@@ -33,6 +35,7 @@ class Kernel:
         self.calls, self.terminated = [], set()
         self.duplicates = 0
         self.sources = []
+        self.directories = []
 
     def GetCurrentProcess(self):
         return -1
@@ -48,6 +51,7 @@ class Kernel:
 
     def CreateProcessW(self, executable, command, security, thread_security, inherit, flags,
                        environment, directory, startup, process):
+        self.directories.append(directory)
         self.calls.append(("create", executable, command.value, inherit, flags,
                            environment[len(environment)-2:], startup._obj.stdin,
                            startup._obj.stdout, startup._obj.stderr))
@@ -167,6 +171,25 @@ class WindowsCaptureTests(unittest.TestCase):
         self.assertIn(("close", 101), kernel.calls)
         self.assertIn(("close", 102), kernel.calls)
         self.assertNotIn(("close", 20), kernel.calls)
+
+    def test_explicit_export_cwd_keeps_suspended_job_ownership_and_refuses_injection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            kernel = Kernel()
+            job = job_with(kernel)
+            with tempfile.TemporaryFile() as log, \
+                    patch.dict(sys.modules, {"msvcrt": types.SimpleNamespace(get_osfhandle=lambda fd: fd)}), \
+                    patch.object(ctypes, "get_last_error", return_value=5, create=True):
+                job.spawn([str(root / "fixture.exe")], {"FIXTURE": "value"}, log, cwd=root)
+                self.assertEqual(kernel.directories, [str(root)])
+                events = [call[0] for call in kernel.calls]
+                self.assertLess(events.index("assign"), events.index("resume"))
+                for cwd, environment in (("C:relative", {}), ("relative", {}), (str(root) + "\0", {}),
+                                         (root, {"BAD=KEY": "value"}), (root, {"BAD": "injected\0value"})):
+                    before = len(kernel.calls)
+                    with self.subTest(cwd=cwd), self.assertRaises(capture.Failure):
+                        job.spawn([str(root / "fixture.exe")], environment, log, cwd=cwd)
+                    self.assertEqual(len(kernel.calls), before)
 
     def test_private_stdin_is_duplicated_without_closing_the_callers_stream(self):
         kernel = Kernel()
@@ -469,6 +492,163 @@ class WindowsCaptureTests(unittest.TestCase):
         self.assertNotIn("-Command", rust)
         self.assertIn("AllScreens.Count -ne 1", powershell)
         self.assertNotIn("Invoke-Expression", powershell)
+
+
+class InstalledWindowsUpdateTests(unittest.TestCase):
+    def hosted(self, event):
+        return {"GITHUB_ACTIONS":"true", "RUNNER_ENVIRONMENT":"github-hosted", "RUNNER_OS":"Windows",
+                "GITHUB_REPOSITORY":"brk275/Morpheus", "GITHUB_REF":"refs/heads/main",
+                "GITHUB_EVENT_NAME":"workflow_dispatch", "GITHUB_ACTOR":"brk275",
+                "GITHUB_TRIGGERING_ACTOR":"brk275", "ImageOS":"win25", "GITHUB_EVENT_PATH":str(event)}
+
+    def test_installed_update_requires_public_owner_manual_standard_windows_selection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            event = Path(temporary) / "event.json"
+            value = {"repository":{"owner":{"id":7},"private":False}, "sender":{"id":7},
+                     "inputs":{"platform":"windows","source_bundle":False}}
+            event.write_text(json.dumps(value))
+            environment = self.hosted(event)
+            update.guard(environment,"win32")
+            for name in environment:
+                bad = dict(environment); bad.pop(name)
+                with self.subTest(missing=name), self.assertRaises((update.Failure,KeyError)):
+                    update.guard(bad,"win32")
+            for change in ({"repository":{"owner":{"id":7},"private":True}}, {"sender":{"id":8}},
+                           {"inputs":{"platform":"linux","source_bundle":False}},
+                           {"inputs":{"platform":"windows","source_bundle":True}}):
+                event.write_text(json.dumps(value | change))
+                with self.subTest(change=change), self.assertRaises(update.Failure):
+                    update.guard(environment,"win32")
+            event.write_text(json.dumps(value))
+            for platform in ("darwin","linux"):
+                with self.assertRaises(update.Failure): update.guard(environment,platform)
+            with self.assertRaises(update.Failure):
+                update.guard(environment | {"RUNNER_ENVIRONMENT":"self-hosted"},"win32")
+
+    def test_compiled_nonce_proof_is_inert_and_rejects_missing_or_changed_dispatch_instrumentation(self):
+        nonce = "a"*32
+        identity = {"protocol":1,"product":"io.github.brk275.morpheus","version":"0.1.0-updateqa.1",
+                    "arch":"x86_64","persistence":"b"*64}
+        image = bytearray(12288)
+        image[:2]=b"MZ"; struct.pack_into("<I",image,60,128); image[128:132]=b"PE\0\0"
+        struct.pack_into("<HH",image,132,0x8664,2); struct.pack_into("<HH",image,148,240,2)
+        struct.pack_into("<H",image,152,0x20B); struct.pack_into("<H",image,220,2)
+        metadata = json.dumps(identity,separators=(",",":")).encode()
+        proof = update.ENTRY_MAGIC+nonce.encode()
+        for offset,name,start,data in ((392,b".mrphupd",4096,metadata),(432,b".mrphqa\0",8192,proof)):
+            image[offset:offset+8]=name
+            struct.pack_into("<I",image,offset+8,len(data)); struct.pack_into("<II",image,offset+16,4096,start)
+            struct.pack_into("<I",image,offset+36,0x40000040); image[start:start+len(data)]=data
+        self.assertEqual(update.instrumented_entry(bytes(image),nonce),identity)
+        for offset,data in ((432,b".omitted"),(8192,b"changed"),(468,struct.pack("<I",0xC0000040)),
+                            (8192+len(proof),b"x")):
+            bad = image.copy(); bad[offset:offset+len(data)]=data
+            with self.subTest(offset=offset), self.assertRaises((update.Failure,ValueError)):
+                update.instrumented_entry(bytes(bad),nonce)
+        with self.assertRaises(update.Failure): update.instrumented_entry(bytes(image),"c"*32)
+
+    def test_command_wait_uses_retained_handle_and_checks_private_log_bound_before_observing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            commands = update.Commands(root,{})
+            job = Mock()
+            job.kernel.WaitForSingleObject.side_effect = [258,0]
+            job.wait.return_value = 9
+            with patch.object(update.time,"sleep"):
+                self.assertEqual(commands.wait(job,123,1),9)
+            self.assertEqual(job.kernel.WaitForSingleObject.call_args_list,
+                             [unittest.mock.call(123,0),unittest.mock.call(123,0)])
+            job.wait.assert_called_once_with(123,0)
+            log = commands.logs / "0001.log"
+            with log.open("wb") as stream: stream.truncate(8*1024*1024+1)
+            job.reset_mock()
+            with self.assertRaises(update.Failure): commands.wait(job,123,1)
+            job.kernel.WaitForSingleObject.assert_not_called()
+
+    def test_registry_preflight_observes_both_hives_views_and_never_deletes_foreign_keys(self):
+        calls = []
+        def absent(hive,name,reserved,access):
+            calls.append((hive,name,access)); raise FileNotFoundError()
+        registry = types.SimpleNamespace(HKEY_CURRENT_USER=1,HKEY_LOCAL_MACHINE=2,KEY_WOW64_64KEY=0x100,
+                                        KEY_WOW64_32KEY=0x200,KEY_READ=0x19,OpenKey=absent)
+        with patch.dict(sys.modules,{"winreg":registry}):
+            update.absent_registry()
+        self.assertEqual(len(calls),8)
+        self.assertEqual({(hive,access) for hive,_,access in calls},
+                         {(1,0x119),(1,0x219),(2,0x119),(2,0x219)})
+        registry.OpenKey = Mock(return_value=object()); registry.CloseKey = Mock()
+        with patch.dict(sys.modules,{"winreg":registry}), self.assertRaises(update.Failure):
+            update.absent_registry()
+        registry.CloseKey.assert_called_once()
+        self.assertFalse(hasattr(registry,"DeleteKey"))
+
+    def test_failure_cleanup_uses_actual_recovery_then_terminal_probe_before_genuine_uninstall(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = Path(temporary).resolve(); (case / "installed").mkdir()
+            state = case / "installed.morpheus-update"; state.mkdir()
+            journal = state / "journal.json"; journal.write_text("synthetic journal")
+            old = {"executable_sha256":"a"*64,"identity":{"version":"0.1.0-updateqa.1"}}
+            new = {"executable_sha256":"b"*64,"identity":{"version":"0.1.0-updateqa.2"}}
+            commands = Mock(cleanup_failed=False); order = []
+            def run(args,**kwargs):
+                order.append(args[-1])
+                if args[-1]=="--morpheus-windows-qa-recover": journal.unlink()
+            commands.run.side_effect = run
+            with (patch.object(update,"digest",side_effect=lambda path,*args: "c"*64 if path.name=="uninstall.exe" else "a"*64),
+                  patch.object(update,"registration"),
+                  patch.object(update,"uninstall",side_effect=lambda *args:order.append("uninstall"))):
+                update.cleanup_case(commands,case,old,new,"c"*64,{})
+            self.assertEqual(order,["--morpheus-windows-qa-recover","--morpheus-windows-qa-cleanup","uninstall"])
+            journal.write_text("synthetic journal")
+            commands.reset_mock(); commands.run.side_effect=update.Failure()
+            with (patch.object(update,"digest",return_value="a"*64), patch.object(update,"registration"),
+                  patch.object(update,"uninstall") as uninstall, self.assertRaises(update.Failure)):
+                update.cleanup_case(commands,case,old,new,"a"*64,{})
+            self.assertEqual(commands.run.call_count,1)
+            self.assertTrue(journal.exists())
+            uninstall.assert_not_called()
+            commands.reset_mock()
+            with (patch.object(update,"digest",return_value="foreign"), patch.object(update,"registration"),
+                  patch.object(update,"uninstall") as uninstall, self.assertRaises(update.Failure)):
+                update.cleanup_case(commands,case,old,new,"a"*64,{})
+            commands.run.assert_not_called(); uninstall.assert_not_called()
+
+    def test_failed_job_drain_latches_cleanup_failure_and_prevents_recovery_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands = update.Commands(Path(temporary).resolve(),{})
+            job = Mock(); job.close.side_effect = RuntimeError("private cleanup failure")
+            with self.assertRaises(RuntimeError): commands.close_job(job)
+            self.assertTrue(commands.cleanup_failed)
+            with patch.object(update,"digest") as digest, self.assertRaises(update.Failure):
+                update.cleanup_case(commands,Path(temporary),{}, {},"uninstaller",{})
+            digest.assert_not_called()
+
+    def test_foreign_registry_fixture_requires_exact_retained_values_before_cleanup(self):
+        fixture = update.ManufacturerFixture.__new__(update.ManufacturerFixture)
+        fixture.W = Mock(REG_SZ=1,KEY_WOW64_64KEY=0x100,HKEY_CURRENT_USER=1)
+        fixture.mode, fixture.name, fixture.value = "foreign-default", "fixed-name", "exact-nonce-value"
+        fixture.product, fixture.vendor, fixture.child = 2,3,None
+        fixture.W.QueryInfoKey.side_effect=[(1,0,0),(0,1,0)]
+        fixture.W.QueryValueEx.return_value=("foreign-unexpected-value",1)
+        with self.assertRaises(update.Failure): fixture.finish()
+        fixture.W.DeleteValue.assert_not_called(); fixture.W.DeleteKeyEx.assert_not_called()
+        self.assertEqual(update.ManufacturerFixture.MODES,
+                         {"invalid-signature":"named-values","truncated":"foreign-default","discard":"subkey",
+                          "call-exclusion":"vendor-value"})
+
+    def test_plan_is_create_new_hash_bound_and_keeps_signer_credentials_out_of_actor_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            case = Path(temporary).resolve()
+            # No source or fixture credentials are read. The supplied key value
+            # is deliberately removed by the closed private environment.
+            base = {"USERPROFILE":str(case / "original"),"RUNNER_TEMP":str(case),
+                    "CARGO_PACKAGER_SIGN_PRIVATE_KEY":"private fixture key","GITHUB_TOKEN":"private token"}
+            plan = {"schema":1,"nonce":"a"*32,"case":"discard"}
+            environment = update.actor_environment(case,plan,base)
+            self.assertEqual(environment[update.PLAN_HASH],update.hashlib.sha256((case/"plan.json").read_bytes()).hexdigest())
+            self.assertNotIn("CARGO_PACKAGER_SIGN_PRIVATE_KEY",environment)
+            self.assertNotIn("GITHUB_TOKEN",environment)
+            with self.assertRaises(FileExistsError): update.actor_environment(case,plan,base)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,33 @@ class PackageConfigTests(unittest.TestCase):
         uninstall = template.split("Section Uninstall\n", 1)[1].split("SectionEnd", 1)[0]
         self.assertLess(uninstall.index("!insertmacro MorpheusAcquireLifetimeLock"), uninstall.index('Delete "$INSTDIR'))
 
+    def test_windows_uninstall_clears_only_the_exact_owned_manufacturer_default(self):
+        root = Path(__file__).resolve().parents[2]
+        template = (root / "packaging/windows/morpheus-installer.nsi").read_text()
+        uninstall = template.split("Section Uninstall\n",1)[1].split("SectionEnd",1)[0]
+        block = uninstall.split("  ClearErrors\n  ReadRegStr $R8 SHCTX",1)[1].split("  morpheus_keep_manufacturer_value:",1)[0]
+        self.assertIn('"${MANUPRODUCTKEY}" ""',block)
+        self.assertLess(block.index("IfErrors morpheus_keep_manufacturer_value"),block.index("DeleteRegValue"))
+        self.assertLess(block.index("StrCmpS $R8 $INSTDIR 0 morpheus_keep_manufacturer_value"),block.index("DeleteRegValue"))
+        self.assertEqual(re.findall(r'(?m)^  DeleteRegValue (.*)$',block),['SHCTX "${MANUPRODUCTKEY}" ""'])
+        self.assertNotIn("DeleteRegKey",block)
+        self.assertIn('!insertmacro MorpheusDeleteEmptyUserKey "${MANUPRODUCTKEY}"',block)
+        self.assertIn('!insertmacro MorpheusDeleteEmptyUserKey "Software\\${MANUFACTURER}"',block)
+        empty = template.split("!macro MorpheusDeleteEmptyUserKey KEY\n",1)[1].split("!macroend",1)[0]
+        self.assertIn("RegOpenKeyExW(p 0x80000001",empty)
+        self.assertIn("RegQueryInfoKeyW",empty)
+        for guard in ("StrCmp $1 0 0 morpheus_empty_close_", "StrCmp $2 0 0 morpheus_empty_close_",
+                      "StrCmp $3 0 0 morpheus_empty_close_"):
+            self.assertLess(empty.index(guard),empty.index("RegDeleteKeyExW"))
+        self.assertIn("RegCloseKey",empty)
+        self.assertNotIn("EnumRegValue",empty)
+        self.assertNotRegex(empty,r"(?m)^\s*DeleteRegKey")
+        contract = json.loads((root / "packaging/windows/update-contract.json").read_bytes())
+        self.assertEqual(contract["manufacturer_cleanup"],"exact-install-path-default-value-then-zero-values-and-subkeys-owned-keys")
+        self.assertEqual(contract["template_sha256"],hashlib.sha256(template.encode()).hexdigest())
+        self.assertEqual(prepare_windows_update.CONTRACT_SHA256,
+                         hashlib.sha256(prepare_windows_update.canonical(contract)).hexdigest())
+
     def windows_fixture(self, root):
         project = Path(__file__).resolve().parents[2]
         for relative in ["packaging/windows/update-contract.json", "packaging/windows/morpheus-installer.nsi"]:

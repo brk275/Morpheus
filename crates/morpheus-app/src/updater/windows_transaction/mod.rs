@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(morpheus_windows_update_acceptance)]
+pub(crate) mod acceptance;
 mod native;
 mod payload;
 use payload::{
@@ -467,6 +469,17 @@ pub(super) fn prepare_restart<'a>(
     if !INSTALLATION_VALIDATED {
         return Err(UpdateError::InstallNotValidated);
     }
+    prepare_restart_admitted(session, bytes, version, lease)
+}
+
+// Shipping callers reach this core only through the unchanged admission above.
+// The compile-only actor must validate its immutable private fixture plan first.
+fn prepare_restart_admitted<'a>(
+    session: &'a mut WindowsSession,
+    bytes: &[u8],
+    version: &str,
+    lease: InstallLease,
+) -> Result<PreparedWindowsRestart<'a>, UpdateError> {
     if session.journal()?.is_some() || session.install_lease.is_some() {
         return Err(UpdateError::UpdateActive);
     }
@@ -747,6 +760,10 @@ fn replace_payload(
         {
             return Err(UpdateError::RecoveryRequired);
         }
+        #[cfg(morpheus_windows_update_acceptance)]
+        if forward && path == MARKER {
+            acceptance::after_marker_replace(journal)?;
+        }
     }
     let (from, to) = if forward {
         (&journal.old_registration, &journal.new_registration)
@@ -993,6 +1010,16 @@ fn launch_recovery(session: &WindowsSession, journal: &Journal) -> Result<(), Up
     if !INSTALLATION_VALIDATED || !needs_copied_recovery(journal.phase) {
         return Err(UpdateError::InstallNotValidated);
     }
+    launch_recovery_admitted(session, journal)
+}
+
+fn launch_recovery_admitted(
+    session: &WindowsSession,
+    journal: &Journal,
+) -> Result<(), UpdateError> {
+    if !needs_copied_recovery(journal.phase) {
+        return Err(UpdateError::InstallNotValidated);
+    }
     let workspace = session.workspace(journal)?;
     let helper = checked_copied_helper(&workspace.path, journal)?;
     let request_path = workspace.path.join(RECOVERY_REQUEST);
@@ -1100,6 +1127,13 @@ fn recovery_supervisor(root: &Path, id: &str, nonce: &str) -> Result<(), UpdateE
     if !INSTALLATION_VALIDATED || !valid_id(id) || !valid_id(nonce) {
         return Err(UpdateError::InstallNotValidated);
     }
+    recovery_supervisor_admitted(root, id, nonce)
+}
+
+fn recovery_supervisor_admitted(root: &Path, id: &str, nonce: &str) -> Result<(), UpdateError> {
+    if !valid_id(id) || !valid_id(nonce) {
+        return Err(UpdateError::InstallNotValidated);
+    }
     let root = native::Directory::open(root)?;
     let mut state = root.path.as_os_str().to_os_string();
     state.push(".morpheus-update");
@@ -1167,6 +1201,13 @@ fn recovery_supervisor(root: &Path, id: &str, nonce: &str) -> Result<(), UpdateE
 
 fn supervisor(root: &Path, id: &str) -> Result<(), UpdateError> {
     if !INSTALLATION_VALIDATED || !valid_id(id) {
+        return Err(UpdateError::InstallNotValidated);
+    }
+    supervisor_admitted(root, id)
+}
+
+fn supervisor_admitted(root: &Path, id: &str) -> Result<(), UpdateError> {
+    if !valid_id(id) {
         return Err(UpdateError::InstallNotValidated);
     }
     let root = native::Directory::open(root)?;
@@ -1352,6 +1393,12 @@ pub(super) fn early_dispatch() -> Result<bool, UpdateError> {
 }
 
 pub(super) fn begin_startup() -> Result<(Option<WindowsSession>, bool), UpdateError> {
+    begin_startup_with_validation(INSTALLATION_VALIDATED)
+}
+
+fn begin_startup_with_validation(
+    validated: bool,
+) -> Result<(Option<WindowsSession>, bool), UpdateError> {
     if option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis-payload-v1") {
         return Ok((None, false));
     }
@@ -1373,7 +1420,7 @@ pub(super) fn begin_startup() -> Result<(Option<WindowsSession>, bool), UpdateEr
             .first()
             .is_some_and(|a| a == "--morpheus-windows-update-trial")
         {
-            if !INSTALLATION_VALIDATED
+            if !validated
                 || args.len() != 2
                 || args[1].to_str() != Some(journal.id.as_str())
                 || journal.phase != Phase::AwaitingHealth
@@ -1398,7 +1445,11 @@ pub(super) fn begin_startup() -> Result<(Option<WindowsSession>, bool), UpdateEr
                 return Err(UpdateError::RecoveryRequired);
             }
             if needs_copied_recovery(journal.phase) {
-                launch_recovery(&session, &journal)?;
+                if validated {
+                    launch_recovery_admitted(&session, &journal)?;
+                } else {
+                    launch_recovery(&session, &journal)?;
+                }
                 drop(session);
                 // main exits on this flag before UI, stores or call workers.
                 return Ok((None, true));
