@@ -763,8 +763,9 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
                 output._obj.value=ctypes.addressof(ace);return True
         security=windows.Security.__new__(windows.Security);security.a=Api()
         security.k=type("Kernel",(),{"LocalFree":staticmethod(lambda value:None)})()
-        security.sid="current-user"
-        security.sid_string=lambda value: "current-user" if getattr(value,"value",value)==ctypes.addressof(owner) else "foreign"
+        security.sid="current-user";security.default_owner="bound-token-owner"
+        security.test_owner="current-user";security.test_writer="foreign"
+        security.sid_string=lambda value: security.test_owner if getattr(value,"value",value)==ctypes.addressof(owner) else security.test_writer
         security.acl("fixture")
         security.a.mask=0x2
         with self.assertRaises(ValueError):security.acl("fixture")
@@ -773,6 +774,13 @@ class NativeNoticeWindowsOwnershipTests(unittest.TestCase):
         security.acl("fixture",ancestor=True)
         security.a.kind=9
         with self.assertRaises(ValueError):security.acl("fixture",ancestor=True)
+        security.a.kind=0;security.a.mask=0x120089
+        security.test_owner="bound-token-owner"
+        security.acl("fixture",private=True)
+        security.test_writer="bound-token-owner";security.a.mask=0x2
+        with self.assertRaises(ValueError):security.acl("fixture",private=True)
+        security.test_owner="S-1-5-32-544";security.a.mask=0x120089
+        with self.assertRaises(ValueError):security.acl("fixture",private=True)
 
 
 if __name__ == "__main__":

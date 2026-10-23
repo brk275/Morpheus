@@ -820,7 +820,14 @@ ownership, stop/drain and a final EOF receipt. Output overruns are failures; a
 capped prefix is never called a complete raw log and is retained on failure.
 Windows private fetch exports additionally refuse drive/ADS, device/reserved,
 case-prefix aliases, non-ASCII names and depths beyond 32; the current source tree
-fits this explicit portable subset. Roots have a protected inheritable current-user/System ACL; reparse,
+fits this explicit portable subset. Roots have a protected inheritable
+current-user/System write ACL. A private child may be owned by the exact current
+process TokenOwner copied from the same token as TokenUser; Windows can assign
+that default owner while inheriting a user/System-only DACL. This is an ownership
+exception, never a group write-ACE exception or an arbitrary Administrators SID
+allowance. Administrators/System remain the OS administrator trust boundary:
+an administrator able to take ownership or replace the runner/toolchain is not
+isolated by this source acquisition route. Reparse,
 remote-volume, foreign-writer and unstable-file inputs are refused. Linux retains
 its existing namespace acquisition and packaging route.
 

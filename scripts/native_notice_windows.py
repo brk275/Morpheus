@@ -45,12 +45,21 @@ class Security:
         token = W.HANDLE()
         require(self.a.OpenProcessToken(self.k.GetCurrentProcess(), 0x8, ctypes.byref(token)))
         try:
-            size = W.DWORD()
-            self.a.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
-            require(0 < size.value <= 65536)
-            storage = ctypes.create_string_buffer(size.value)
-            require(self.a.GetTokenInformation(token, 1, storage, size, ctypes.byref(size)))
-            self.sid = self.sid_string(ctypes.c_void_p.from_buffer(storage).value)
+            values = []
+            # Copy both SIDs from the same exact current-process token. A
+            # newly created child's owner need not equal TOKEN_USER; TOKEN_OWNER
+            # is the OS default, not an inferred Administrators category.
+            for information_class in (1, 4):  # TokenUser, TokenOwner
+                size = W.DWORD()
+                require(not self.a.GetTokenInformation(token, information_class, None, 0, ctypes.byref(size))
+                        and ctypes.get_last_error() == 122
+                        and ctypes.sizeof(ctypes.c_void_p) <= size.value <= 65536)
+                capacity = size.value
+                storage = ctypes.create_string_buffer(capacity)
+                require(self.a.GetTokenInformation(token, information_class, storage, capacity, ctypes.byref(size))
+                        and ctypes.sizeof(ctypes.c_void_p) <= size.value <= capacity)
+                values.append(self.sid_string(ctypes.c_void_p.from_buffer(storage).value))
+            self.sid, self.default_owner = values
         finally:
             require(self.k.CloseHandle(token))
 
@@ -71,7 +80,11 @@ class Security:
         require(status == 0 and descriptor.value and owner.value and dacl.value)
         try:
             allowed = {self.sid, "S-1-5-18"} | (set() if private else {"S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"})
-            require(self.sid_string(owner) in allowed)
+            owner_allowed = allowed | ({self.default_owner} if private else set())
+            require(self.sid_string(owner) in owner_allowed)
+            # Private write ACEs remain user/System only. The exact TokenOwner
+            # exception is ownership, never permission for a group writer.
+
             class Size(ctypes.Structure):
                 _fields_ = [("count", W.DWORD), ("used", W.DWORD), ("free", W.DWORD)]
             size = Size()
