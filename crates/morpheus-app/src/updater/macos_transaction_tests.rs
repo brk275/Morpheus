@@ -127,7 +127,7 @@ fn native_identity_rejects_wrong_cpu_writable_or_truncated_sections_and_unknown_
         assert!(executable_metadata(&valid[..len]).is_err());
     }
     let json = serde_json::to_string(&identity).unwrap();
-    let duplicate = json.replacen("{", "{\"protocol\":1,", 1);
+    let duplicate = json.replacen("{", "{\"protocol\":2,", 1);
     assert!(PackageMetadata::parse(duplicate.as_bytes()).is_err());
     let unknown = json.replacen("{", "{\"plugin\":true,", 1);
     assert!(PackageMetadata::parse(unknown.as_bytes()).is_err());
@@ -426,6 +426,236 @@ fn owned_exit_fixture() {
     }
 }
 
+// Test-only registration for a retained direct child. The production constructor
+// deliberately requires our actual parent, which cannot exit while retaining a
+// reap capability for its monitoring child. This independently exercises the
+// real kernel status payload through the unchanged production wait/predicate;
+// the real-parent arm admission is covered below. It is not a helper-launch or
+// ordinary application shutdown acceptance path.
+fn monitor_retained_child_status(
+    child: &OwnedChild,
+    transaction: &str,
+) -> Result<ParentExitMonitor, UpdateError> {
+    if child.exited()? {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    let parent = child
+        .child
+        .as_ref()
+        .and_then(|child| i32::try_from(child.id()).ok())
+        .ok_or(UpdateError::RecoveryRequired)?;
+    // SAFETY: successful kqueue returns a new descriptor owned by this call.
+    let descriptor = unsafe { libc::kqueue() };
+    if descriptor < 0 {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    // SAFETY: this is the exact successful new descriptor, closed only by RAII.
+    let queue = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    let monitor = ParentExitMonitor {
+        queue,
+        cookie: Box::new(ParentExitCookie {
+            transaction: transaction.to_owned(),
+        }),
+        parent,
+    };
+    let change = libc::kevent {
+        ident: parent as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT | libc::EV_RECEIPT,
+        fflags: PARENT_EXIT_NOTES,
+        data: 0,
+        udata: monitor.cookie_pointer(),
+    };
+    // SAFETY: one initialized change, one writable plain output and a zero
+    // timeout stay valid for this synchronous call on the retained queue.
+    let mut receipt: libc::kevent = unsafe { std::mem::zeroed() };
+    let immediate = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let count = unsafe {
+        libc::kevent(
+            monitor.queue.as_raw_fd(),
+            &change,
+            1,
+            &mut receipt,
+            1,
+            &immediate,
+        )
+    };
+    if count != 1 || !monitor.receipt_matches(&receipt) || child.exited()? {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    Ok(monitor)
+}
+
+#[test]
+fn macos_parent_status_fixture() {
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+
+    let Some(mode) = std::env::var_os("MORPHEUS_MAC_PARENT_STATUS_FIXTURE") else {
+        return;
+    };
+    let mode = match mode.to_str() {
+        Some("zero") => 0,
+        Some("failed17") => 17,
+        Some("abrupt86") => 86,
+        Some("owned-kill") => -1,
+        _ => std::process::exit(91),
+    };
+    let descriptor = match std::io::stdin().as_fd().try_clone_to_owned() {
+        Ok(descriptor) => descriptor,
+        Err(_) => std::process::exit(92),
+    };
+    let mut channel = UnixStream::from(descriptor);
+    if channel
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .is_err()
+        || channel
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .is_err()
+        || channel.write_all(b"R").is_err()
+    {
+        std::process::exit(93);
+    }
+    // Stay alive until the owning test has registered the real kernel filter.
+    // The kill case receives no release: it is killed through the actual Child.
+    let mut release = [0_u8; 1];
+    if channel.read_exact(&mut release).is_err() || release != *b"G" {
+        std::process::exit(94);
+    }
+    if mode == 86 {
+        // SAFETY: terminate only this explicitly selected disposable fixture;
+        // _exit intentionally skips every Rust/atexit cleanup path.
+        unsafe { libc::_exit(86) }
+    }
+    if mode < 0 {
+        std::process::exit(95);
+    }
+    std::process::exit(mode);
+}
+
+#[test]
+fn real_owned_child_status_allows_only_zero_through_the_production_parent_wait() {
+    use std::os::unix::{net::UnixStream, process::ExitStatusExt};
+
+    let executable = std::env::current_exe().unwrap();
+    let module = module_path!().split_once("::").unwrap().1;
+    let selector = format!("{module}::macos_parent_status_fixture");
+    for (fixture, expected_code) in [
+        ("zero", Some(0)),
+        ("failed17", Some(17)),
+        ("abrupt86", Some(86)),
+        ("owned-kill", None),
+    ] {
+        let (mut channel, actor) = UnixStream::pair().unwrap();
+        let mut command = Command::new(&executable);
+        command
+            .args(["--exact", &selector, "--nocapture"])
+            .env("MORPHEUS_MAC_PARENT_STATUS_FIXTURE", fixture)
+            .stdin(Stdio::from(OwnedFd::from(actor)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = OwnedChild::spawn(&mut command).unwrap();
+        drop(command); // No retained child-side stdin alias in the owner.
+        let observation = (|| -> Result<_, UpdateError> {
+            channel
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .map_err(|_| UpdateError::RecoveryRequired)?;
+            channel
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .map_err(|_| UpdateError::RecoveryRequired)?;
+            let mut ready = [0_u8; 1];
+            channel
+                .read_exact(&mut ready)
+                .map_err(|_| UpdateError::RecoveryRequired)?;
+            if ready != *b"R" {
+                return Err(UpdateError::RecoveryRequired);
+            }
+            let monitor = monitor_retained_child_status(&child, "OwnedKernelStatus1")?;
+            if fixture == "owned-kill" {
+                child
+                    .child
+                    .as_mut()
+                    .ok_or(UpdateError::RecoveryRequired)?
+                    .kill()
+                    .map_err(|_| UpdateError::RecoveryRequired)?;
+            } else {
+                channel
+                    .write_all(b"G")
+                    .map_err(|_| UpdateError::RecoveryRequired)?;
+            }
+            let result = monitor.wait("OwnedKernelStatus1", Duration::from_secs(10));
+            // Kernel event delivery and waitable-child publication can be
+            // adjacent. Observe real exit without reaping or cleanup signals.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let exited_before_cleanup = loop {
+                if child.exited()? {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            Ok((result, exited_before_cleanup))
+        })();
+        // Always finish real child ownership before any observation assertion,
+        // including failed setup/registration/wait paths. Never use a PID lookup
+        // or a process/group-name signal. Lost child ownership forbids killing.
+        let cleanup = (|| -> Result<_, UpdateError> {
+            if !child.exited()? {
+                let _ = child
+                    .child
+                    .as_mut()
+                    .ok_or(UpdateError::RecoveryRequired)?
+                    .kill();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if child.exited()? {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(UpdateError::RecoveryRequired);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            child.reap_owned()
+        })();
+        let status = match cleanup {
+            Ok(status) => status,
+            Err(_) => {
+                // Prevent OwnedChild::Drop from guessing a signal after lost
+                // ownership. Preserve its actual owner for ephemeral-host
+                // disposal and fail; never claim unconfirmed cleanup passed.
+                std::mem::forget(child);
+                panic!("Mac parent-status fixture cleanup could not be confirmed");
+            }
+        };
+        let (result, exited_before_cleanup) = observation.unwrap();
+        assert!(
+            exited_before_cleanup,
+            "Mac status fixture needed cleanup to exit"
+        );
+        assert!(child.child.is_none(), "Actual child was not reaped");
+        if let Some(code) = expected_code {
+            assert_eq!(status.code(), Some(code));
+        } else {
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+        }
+        if expected_code == Some(0) {
+            assert_eq!(result, Ok(()));
+        } else {
+            assert_eq!(result, Err(UpdateError::RecoveryRequired));
+        }
+    }
+}
+
 #[test]
 fn exited_owned_trial_reaps_only_its_leader_and_reports_unproved_group_cleanup() {
     let executable = std::env::current_exe().unwrap();
@@ -563,7 +793,7 @@ fn parent_exit_registration_is_owned_and_receipts_cannot_authorize_apply() {
         ident: parent as libc::uintptr_t,
         filter: libc::EVFILT_PROC,
         flags,
-        fflags: libc::NOTE_EXIT,
+        fflags: libc::NOTE_EXIT | libc::NOTE_EXITSTATUS,
         data: 0,
         udata: monitor.cookie_pointer(),
     };
@@ -573,7 +803,7 @@ fn parent_exit_registration_is_owned_and_receipts_cannot_authorize_apply() {
     let exit = event(libc::EV_EOF | libc::EV_ONESHOT | libc::EV_CLEAR);
     assert!(monitor.exit_matches(&exit));
     assert!(!monitor.receipt_matches(&exit));
-    for field in 0..8 {
+    for field in 0..9 {
         let mut invalid = event(libc::EV_EOF | libc::EV_ONESHOT | libc::EV_CLEAR);
         match field {
             0 => invalid.ident = (parent as libc::uintptr_t).wrapping_add(1),
@@ -583,15 +813,36 @@ fn parent_exit_registration_is_owned_and_receipts_cannot_authorize_apply() {
             4 => invalid.flags &= !libc::EV_EOF,
             5 => invalid.flags &= !libc::EV_ONESHOT,
             6 => invalid.fflags |= libc::NOTE_FORK,
+            7 => invalid.fflags = libc::NOTE_EXIT,
             _ => invalid.data = 1,
         }
         assert!(!monitor.exit_matches(&invalid), "event field {field}");
     }
-    let mut failed_receipt = event(libc::EV_ERROR | libc::EV_RECEIPT);
-    failed_receipt.data = i64::from(libc::ESRCH) as libc::intptr_t;
-    assert!(!monitor.receipt_matches(&failed_receipt));
-    // The live parent's successful registration receipt is insufficient.
-    // Only a later kernel NOTE_EXIT can authorize the separate lock step.
+    // Darwin's NOTE_EXITSTATUS carries wait status, not a plain exit code.
+    // These predicate checks do not substitute for actual hosted kernel exits.
+    for status in [
+        1 << 8,
+        255 << 8,
+        libc::SIGTERM,
+        libc::SIGABRT | 0x80,
+        1 << 16,
+        -1,
+    ] {
+        let mut failed_exit = event(libc::EV_EOF | libc::EV_ONESHOT);
+        failed_exit.data = status as libc::intptr_t;
+        assert!(!monitor.exit_matches(&failed_exit), "wait status {status}");
+    }
+    for error in [libc::ESRCH, libc::EACCES] {
+        let mut failed_receipt = event(libc::EV_ERROR | libc::EV_RECEIPT);
+        failed_receipt.data = error as libc::intptr_t;
+        assert!(!monitor.receipt_matches(&failed_receipt));
+    }
+    let mut status_missing = event(libc::EV_ERROR | libc::EV_RECEIPT);
+    status_missing.fflags = libc::NOTE_EXIT;
+    assert!(!monitor.receipt_matches(&status_missing));
+    // The real live-parent registration also proves that the kernel accepted
+    // this exact status request. Its receipt still cannot authorize apply.
+    // Only a later normal-success exit can authorize the separate lock step.
     assert_eq!(
         monitor.wait("FixtureParentExit1", Duration::from_millis(10)),
         Err(UpdateError::RecoveryRequired)
@@ -859,5 +1110,19 @@ fn unreadable_links_fail_identity_and_copy_without_mutation_but_safe_cleanup_can
         assert!(!app.exists());
         assert_eq!(fs::read(&retained).unwrap(), b"preserve resources");
         assert_eq!(fs::metadata(&retained).unwrap().mode() & 0o7777, 0o600);
+    }
+}
+
+#[test]
+fn native_identity_rejects_legacy_and_unknown_helper_protocols() {
+    let current = PackageMetadata::embedded().unwrap();
+    assert_eq!(current.protocol, 2);
+    for protocol in [0, 1, 3, u8::MAX] {
+        let mut rejected = current.clone();
+        rejected.protocol = protocol;
+        assert!(PackageMetadata::parse(&serde_json::to_vec(&rejected).unwrap()).is_err());
+        assert!(executable_metadata(&macho(&rejected)).is_err());
+        assert!(!rejected.compatible(&current));
+        assert!(!current.compatible(&rejected));
     }
 }

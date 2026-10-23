@@ -59,6 +59,53 @@ SDK downloader from legacy extraction caches. Select only the
 affected platforms and check active runs first. QA installers remain on the
 runner; signing, licensing and installed-package release gates still apply.
 
+## Explicit synthetic native update transactions
+
+After source/dependency review and stable affected native checks, the existing
+**Package validation** workflow can explicitly select `native_updates=true`
+with `platform=macos` or `platform=windows`. Keep `linux_formats=appimage` (its
+neutral default), `appimage_updates=false`, `appimage_capture=false` and
+`source_bundle=false`. Linux, all-platform, Debian/both-format and mixed mode
+selections are rejected before emitting runner/cache outputs. The new option is
+off by default; ordinary DMG/NSIS/AppImage package and installed UI behavior is
+unchanged when it is off. Supply the exact reviewed `source_revision` as above.
+
+The selected package workers retain the public, owner-only, main-only guard,
+independent source/history scan, candidate/OS concurrency lock, read-only token,
+no persisted credentials and trusted-main-only shared cache writes. They install
+the existing pinned Rust 1.99.0, Cargo Packager 0.11.8 and Windows NSIS tools.
+Before compilers, a preflight requires the matching native architecture and
+preinstalled Python 3.12+ with the actual archive/kernel APIs used by the driver;
+an unsupported image fails without starting either package build.
+A bounded HTTPS download authenticates both the official Gitleaks 8.30.1 archive
+and native executable before any driver log scan. No candidate scanner settings
+or release signing credentials are passed to the drivers.
+
+The existing Mac driver receives the exact selected checkout and a newly owned
+external target directory; the Windows driver owns its target in its private
+fixture root and receives the exact reviewed scanner hash. Each driver exports
+the selected tree twice and changes only app/lockfile versions to
+`-updateqa.1` and `-updateqa.2`, using one fresh compiled nonce/cohort and the
+existing generated disposable signing route. There are exactly two necessary
+version-only package builds per architecture: four for the explicit Mac request
+(Apple Silicon and Intel), or two for Windows. The ordinary package build,
+keyboard preflight and package smoke are omitted in this mode, so no third
+package or normal UI launch is added. Driver failure, missing observation,
+private log scan failure or cleanup failure remains a failed job; this route
+has a distinct synthetic/partial job name and no automatic retry.
+
+Only the drivers' existing synthetic installed transaction contracts are tested.
+Mac parent/helper kernel exit and recovery observations do not establish normal
+AppWindow/shipping shutdown or production group cleanup. Windows retains actual
+NSIS install/uninstall and retained Job/handle checks. Native backend/device and
+live-call release, ordinary UI/account/homeserver behavior, feed/download/TLS,
+release signing/notarization and power-loss gates remain separate. Production
+installation stays disabled. No installer, key, raw log or artifact is uploaded,
+no release is published, and passing this route alone cannot establish beta
+readiness. Adoption of this workflow/scope/docs change needs only its affected
+existing helper checks; actual installed runs remain an explicit later reviewed
+selection after the native application candidate is stable.
+
 ## Preparing corresponding source evidence
 
 An explicit source-only path prepares the committed Rust workspace, local
@@ -678,8 +725,9 @@ do not substitute for keyboard or screen-reader acceptance.
 
 `scripts/macos_update_acceptance.py` extends the private native package/update QA
 route. It requires explicit `--execute-on-free-hosted-runner`, a reviewed clean
-source revision, an external target cache, and the pinned default Gitleaks 8.30.1
-scanner for the native Mac architecture. No workflow selects it automatically.
+source revision, an external target directory, and the pinned default Gitleaks 8.30.1
+scanner for the native Mac architecture. The permanent workflow calls it only
+through the explicit `native_updates` selection above; it is never automatic.
 Its source and runner invocation must be independently reviewed before execution.
 
 It exports the exact reviewed tree twice, allowing only the existing app manifest

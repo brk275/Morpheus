@@ -162,8 +162,8 @@ jobs:
     concurrency:
       group: native-${{ github.sha }}-${{ matrix.os }}
       cancel-in-progress: false
-    # Intel cold native graphs need room to compile; test deadlines stay fixed.
-    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 150 || 90 }}
+    # Linux and Intel cold native graphs need compile room; test deadlines stay fixed.
+    timeout-minutes: ${{ (matrix.os == 'macos-15-intel' || matrix.os == 'ubuntu-24.04') && 150 || 90 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
@@ -546,6 +546,13 @@ jobs:
           import os
           import sys
 
+          def native_wayland_selection(route, runner, selected):
+              # Scope selects Linux Wayland once for the whole native matrix.
+              # Preserve malformed/missing values for the strict validator.
+              if route == "all" and runner in ("Windows", "macOS") and selected == "true":
+                  return "false"
+              return selected
+
           def native_check_error(route, runner, wayland, outcomes):
               routes = {"all", "models", "desktop", "devices", "vendor", "sdk", "matrix", "wayland"}
               if (not isinstance(route, str) or route not in routes or runner not in ("Linux", "Windows", "macOS")
@@ -585,7 +592,8 @@ jobs:
               ("sdk-receipt-tests", "SDK_OUTCOME"), ("matrix-tests", "MATRIX_OUTCOME"),
               ("preview-capture", "PREVIEW_OUTCOME"), ("preview-upload", "PREVIEW_UPLOAD_OUTCOME"))}
           error = native_check_error(os.environ.get("CHECK_ROUTE"), os.environ.get("RUNNER_PLATFORM"),
-              os.environ.get("WAYLAND_SELECTED"), outcomes)
+              native_wayland_selection(os.environ.get("CHECK_ROUTE"), os.environ.get("RUNNER_PLATFORM"),
+                  os.environ.get("WAYLAND_SELECTED")), outcomes)
           if error:
               print(error, file=sys.stderr)
               raise SystemExit(1)

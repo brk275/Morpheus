@@ -212,18 +212,18 @@ class WaylandWorkflowTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/main' && github.event_name != 'pull_request'", source)
 
 
-def load_native_validator():
+def load_native_validator(function_name="native_check_error"):
     source = WORKFLOW.read_text(encoding="utf-8")
     start, end = "          python3 - <<'PY_NATIVE_ACCEPTANCE'\n", "          PY_NATIVE_ACCEPTANCE\n"
     if source.count(start) != 1 or source.count(end) != 1:
         raise AssertionError("Expected one bounded native outcome validator")
     module = ast.parse(textwrap.dedent(source.split(start,1)[1].split(end,1)[0]))
-    functions = [node for node in module.body if isinstance(node,ast.FunctionDef) and node.name=="native_check_error"]
+    functions = [node for node in module.body if isinstance(node,ast.FunctionDef) and node.name==function_name]
     if len(functions)!=1 or functions[0].decorator_list or functions[0].args.defaults or functions[0].args.kw_defaults:
         raise AssertionError("Expected one pure native outcome validator")
     namespace = {}
     exec(compile(ast.Module(body=functions,type_ignores=[]),str(WORKFLOW),"exec"),namespace)
-    return namespace["native_check_error"]
+    return namespace[function_name]
 
 
 class NativeRouteWorkflowTests(unittest.TestCase):
@@ -253,6 +253,48 @@ class NativeRouteWorkflowTests(unittest.TestCase):
             self.assertIsNotNone(validate(route,"Linux","false",{}))
         self.assertIsNotNone(validate("matrix","Windows","false",{}))
         self.assertIsNotNone(validate("wayland","Linux","false",{}))
+
+    def test_global_wayland_selection_projects_to_runner_without_hiding_invalid_scope(self):
+        project = load_native_validator("native_wayland_selection")
+        validate = load_native_validator()
+        self.assertEqual(project("all", "Linux", "true"), "true")
+        for runner in ("Linux", "Windows", "macOS"):
+            self.assertEqual(project("all", runner, "false"), "false")
+            for malformed in (None, "", "TRUE", "False", "1", True, False, [], {}):
+                with self.subTest(runner=runner, malformed=malformed):
+                    self.assertIs(project("all", runner, malformed), malformed)
+        # The actual Windows failure had global Wayland=true, successful native
+        # outcomes, and a correctly skipped Linux-only Wayland step. Mac uses
+        # the same matrix-wide scope with its Windows-only capture also skipped.
+        for runner in ("Windows", "macOS"):
+            outcomes = {name: {"outcome": "success"} for name in (
+                "model-tests", "desktop-tests", "device-tests", "vendor-tests", "sdk-receipt-tests")}
+            outcomes.update({name: {"outcome": "skipped"} for name in (
+                "wayland-tests", "matrix-tests", "preview-capture", "preview-upload")})
+            outcomes["windows-capture-tests"] = {"outcome": "success" if runner == "Windows" else "skipped"}
+            self.assertIsNone(validate("all", runner, project("all", runner, "true"), outcomes))
+            self.assertIsNotNone(validate("all", runner, "true", outcomes))
+            for route in ("models", "desktop", "devices", "vendor", "sdk", "matrix", "wayland", "foreign"):
+                # Only the legitimate whole-matrix route may project true.
+                # Invalid route/global-Wayland pairs must stay fail-closed.
+                self.assertEqual(project(route, runner, "true"), "true")
+                self.assertIsNotNone(validate(route, runner, project(route, runner, "true"), outcomes))
+            for malformed in (None, "", "TRUE", "False", "1", True, False, [], {}):
+                self.assertIsNotNone(validate("all", runner, project("all", runner, malformed), outcomes))
+        # Bind this regression to the real wrapper, not just an unused helper.
+        source = WORKFLOW.read_text(encoding="utf-8")
+        start, end = "          python3 - <<'PY_NATIVE_ACCEPTANCE'\n", "          PY_NATIVE_ACCEPTANCE\n"
+        module = ast.parse(textwrap.dedent(source.split(start, 1)[1].split(end, 1)[0]))
+        calls = [node for node in ast.walk(module) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "native_check_error"]
+        self.assertEqual(len(calls), 1)
+        projection = calls[0].args[2]
+        self.assertIsInstance(projection, ast.Call)
+        self.assertIsInstance(projection.func, ast.Name)
+        self.assertEqual(projection.func.id, "native_wayland_selection")
+        self.assertEqual(ast.dump(projection.args[0]), ast.dump(calls[0].args[0]))
+        self.assertEqual(ast.dump(projection.args[1]), ast.dump(calls[0].args[1]))
+        self.assertEqual(ast.unparse(projection.args[2]), "os.environ.get('WAYLAND_SELECTED')")
 
     def test_manual_inputs_and_fixed_routes_keep_existing_security_and_commands(self):
         source=WORKFLOW.read_text(encoding="utf-8")

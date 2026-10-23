@@ -7,7 +7,7 @@ use super::{
     worker::IncomingHandle,
 };
 use crate::{calls::CallController, live::LiveUi};
-use morpheus_rtc::{RingAudioError, RingPlayback};
+use morpheus_rtc::{RingAudioError, RingAudioReleaseError, RingPlayback};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -56,6 +56,7 @@ impl IncomingAudio {
             changed: watch::channel(()).0,
         });
         let this = owner.clone();
+        let output_runtime = runtime.clone();
         let task = runtime.spawn(async move {
             let mut updates = offers.subscribe();
             let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -67,7 +68,7 @@ impl IncomingAudio {
                 }
                 // snapshot validates the live worker's exact selected epoch;
                 // every row also holds its own permanently revocable selection.
-                this.observe(offers.snapshot(), &live, &calls);
+                this.observe(offers.snapshot(), &live, &calls, &output_runtime);
                 tokio::select! {
                     changed = updates.changed() => { if changed.is_err() { break; } },
                     _ = tick.tick() => {},
@@ -82,6 +83,7 @@ impl IncomingAudio {
         rows: Vec<OfferPresentation>,
         live: &Arc<LiveUi>,
         calls: &Arc<CallController>,
+        output_runtime: &Handle,
     ) {
         let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(value) = current.as_ref() {
@@ -131,7 +133,21 @@ impl IncomingAudio {
                     && live.security_gate.ringing_allowed(security_epoch)
                     && calls.ringing_allowed(call_epoch)
             });
-            match RingPlayback::start(speaker, authority.deadline(), allowed) {
+            let output_runtime = output_runtime.clone();
+            match RingPlayback::start_after_output_release(
+                speaker,
+                authority.deadline(),
+                allowed,
+                move || {
+                    // Runs on the retained std ring owner, never a UI/Tokio
+                    // worker. Ring reservation already retired old PCM. New PCM
+                    // clicks fail that same atomic output authority, so this
+                    // actual attachment-thread/TLS wait has no ring wait cycle.
+                    output_runtime
+                        .block_on(crate::audio_attachments::wait_for_release())
+                        .map_err(|_| RingAudioReleaseError::OutputOwnerUnconfirmed)
+                },
+            ) {
                 Ok(playback) => {
                     *current = Some(Playing {
                         token: offer.token,

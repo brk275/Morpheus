@@ -3,7 +3,7 @@ use payload::{MAGIC, UNINSTALL_CONTRACT};
 
 fn identity(version: &str) -> Identity {
     Identity {
-        protocol: 1,
+        protocol: 2,
         product: "io.github.brk275.morpheus".into(),
         version: version.into(),
         arch: "x86_64".into(),
@@ -497,4 +497,111 @@ fn windows_committed_recovery_requires_the_journal_flush_before_accepting_stores
         &journal.uninstaller,
     )
     .unwrap();
+}
+
+#[test]
+fn windows_parent_exit_status_fixture() {
+    let Some(value) = std::env::var_os("MORPHEUS_WINDOWS_PARENT_STATUS_FIXTURE") else {
+        return;
+    };
+    // Re-enter only this unit-test function; ordinary app/UI startup is not run.
+    // The exception-shaped value exercises the DWORD boundary without causing
+    // a crash reporter or claiming actual normal-UI shutdown acceptance.
+    let code = match value.to_str() {
+        Some("zero") => 0,
+        Some("failed") => 17,
+        Some("active-value") => 259,
+        Some("exception-value") => 0xc000_0005_u32 as i32,
+        _ => panic!("Unknown parent status fixture"),
+    };
+    std::process::exit(code);
+}
+
+#[test]
+fn windows_forward_apply_requires_zero_status_on_the_retained_parent_handle() {
+    let executable = std::env::current_exe().unwrap();
+    let helper = format!(
+        "{}::windows_parent_exit_status_fixture",
+        module_path!().split_once("::").unwrap().1
+    );
+    for (fixture, expected) in [
+        ("zero", 0_u32),
+        ("failed", 17),
+        ("active-value", 259),
+        ("exception-value", 0xc000_0005),
+    ] {
+        let mut child = std::process::Command::new(&executable)
+            .args(["--exact", &helper, "--nocapture"])
+            .env("MORPHEUS_WINDOWS_PARENT_STATUS_FIXTURE", fixture)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // The retained Child handle keeps the actual process object/creation
+        // identity available even when this small fixture has already exited.
+        let observation = (|| -> Result<_, UpdateError> {
+            let stamp = native::ParentProcess::child_stamp(&child)?;
+            let parent = native::ParentProcess::open(child.id(), stamp)?;
+            let result = parent.wait_for_successful_exit(10_000);
+            Ok((result, parent.wait(0)?))
+        })();
+        // Cleanup always precedes observation assertions, including stamp,
+        // OpenProcess and native wait failures. Child::try_wait/kill use this
+        // actual owned handle, never a PID lookup or process-list snapshot.
+        let mut status = child.try_wait().ok().flatten();
+        if status.is_none() {
+            let _ = child.kill();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(exit)) => {
+                        status = Some(exit);
+                        break;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let Some(status) = status else {
+            // Unknown cleanup cannot become successful test evidence. Retain
+            // the actual handle for ephemeral-host disposal rather than drop
+            // ownership while claiming that the fixture was reaped.
+            std::mem::forget(child);
+            panic!("Parent status fixture cleanup could not be confirmed");
+        };
+        let (result, exited_before_cleanup) = observation.unwrap();
+        assert!(exited_before_cleanup, "Parent status fixture did not exit");
+        assert_eq!(status.code().map(|code| code as u32), Some(expected));
+        if expected == 0 {
+            assert!(matches!(result, Ok(true)));
+        } else {
+            assert!(matches!(result, Err(UpdateError::RestartFailed)));
+        }
+        // The observation's ordinary wait still counts failed exit as death
+        // for liveness and copied recovery, independently of the clean gate.
+    }
+}
+
+#[test]
+fn windows_identity_rejects_legacy_helpers_before_forward_payload_admission() {
+    let current = identity("0.1.0");
+    let next = identity("0.2.0");
+    assert_eq!(next.protocol, 2);
+    let valid = envelope(&next).0;
+    assert!(Payload::parse(&valid, &current, &next.version).is_ok());
+    for protocol in [0, 1, 3, u8::MAX] {
+        let mut rejected = next.clone();
+        rejected.protocol = protocol;
+        assert!(!rejected.valid());
+        assert!(!rejected.compatible(&current));
+        assert!(!current.compatible(&rejected));
+        assert!(pe_identity(&pe(&rejected)).is_err());
+        assert!(Payload::parse(&envelope(&rejected).0, &current, &next.version).is_err());
+        rejected.version = current.version.clone();
+        assert!(Payload::parse(&valid, &rejected, &next.version).is_err());
+    }
 }

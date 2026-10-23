@@ -168,7 +168,7 @@ class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
             new = {"bundle_sha256": "b" * 64, "version": "0.1.1", "arch": "aarch64", "persistence": "c" * 64}
             ticket = {"schema": 1, "nonce": NONCE, "transaction": "FixtureTransaction1", "parent": PID, "helper": PID + 1}
             journal = {"protocol": 1, "id": ticket["transaction"], "phase": "Prepared", "old_hash": old["bundle_sha256"],
-                       "new_hash": new["bundle_sha256"], "candidate": {"protocol": 1, "product": "io.github.brk275.morpheus",
+                       "new_hash": new["bundle_sha256"], "candidate": {"protocol": 2, "product": "io.github.brk275.morpheus",
                        "version": new["version"], "arch": new["arch"], "persistence": new["persistence"]}}
             path, journal_path = root / "helper-observer.json", root / update_qa.STATE / "journal.json"
             path.write_text(json.dumps(ticket)); path.chmod(0o600)

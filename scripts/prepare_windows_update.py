@@ -84,7 +84,8 @@ def pe_identity(data):
                     and not any(data[offset + used:offset + size]), "Unsupported identity section")
             identity = json.loads(data[offset:offset + used])
     require(isinstance(identity, dict) and set(identity) == {"protocol", "product", "version", "arch", "persistence"}
-            and identity["protocol"] == 1 and identity["product"] == "io.github.brk275.morpheus"
+            and type(identity["protocol"]) is int and identity["protocol"] == 2
+            and identity["product"] == "io.github.brk275.morpheus"
             and identity["arch"] == "x86_64" and isinstance(identity["version"], str)
             and 0 < len(identity["version"]) <= 128 and isinstance(identity["persistence"], str)
             and len(identity["persistence"]) == 64

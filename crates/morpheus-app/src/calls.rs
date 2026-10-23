@@ -707,13 +707,49 @@ impl Shared {
         Ok((token, done_tx))
     }
 
-    async fn finish_open_slot(&self, token: u64) {
+    async fn finish_open_slot(&self, token: u64) -> Result<(), CallControllerError> {
+        self.finish_open_slot_after_ring(token, morpheus_rtc::wait_for_ring_audio_release())
+            .await
+    }
+
+    async fn finish_open_slot_after_ring(
+        &self,
+        token: u64,
+        released: impl Future<Output = Result<(), morpheus_rtc::RingAudioReleaseError>>,
+    ) -> Result<(), CallControllerError> {
+        let (account_id, room_id) = {
+            let slot = self.slot.lock().await;
+            match &*slot {
+                CallSlot::OpeningSlot {
+                    token: current,
+                    account_id,
+                    room_id,
+                    ..
+                } if *current == token => (account_id.clone(), room_id.clone()),
+                _ => return Ok(()),
+            }
+        };
+        // This network-only operation revoked ringing at its first reservation.
+        // Its lease cannot publish a native-clean Idle while that owner remains
+        // unjoined, even when the state write itself succeeded or failed.
+        let cleanup = released.await.map_err(|error| error.to_string());
         let mut slot = self.slot.lock().await;
         if matches!(&*slot, CallSlot::OpeningSlot { token: current, .. } if *current == token) {
-            *slot = CallSlot::Idle;
-            self.release_update_lease();
-            self.status.send_replace(CallStatus::Idle);
+            if let Err(reason) = &cleanup {
+                let (_done, done) = watch::channel(Some(Err(reason.clone())));
+                *slot = CallSlot::CleanupFailed { token, done };
+                self.status.send_replace(CallStatus::CleanupFailed {
+                    account_id,
+                    room_id,
+                    reason: reason.clone(),
+                });
+            } else {
+                *slot = CallSlot::Idle;
+                self.release_update_lease();
+                self.status.send_replace(CallStatus::Idle);
+            }
         }
+        cleanup.map_err(CallControllerError::Cleanup)
     }
 
     /// Publish a live-call status only while the worker for `token` still
@@ -1368,9 +1404,11 @@ impl CallController {
         let (result_tx, result_rx) = oneshot::channel();
         tokio::spawn(async move {
             let result = controller.open_slot_reserved(&account_id, &room_id).await;
-            shared.finish_open_slot(token).await;
+            let cleanup = shared.finish_open_slot(token).await;
             done.send_replace(true);
-            let _ = result_tx.send(result);
+            // Preserve an earlier network error; the slot still retains any
+            // independent native cleanup failure and its installation lease.
+            let _ = result_tx.send(result.and(cleanup));
         });
         result_rx
             .await
@@ -1607,6 +1645,7 @@ impl CallController {
     ) -> Result<(), CallControllerError> {
         enum PriorOperation {
             Opening {
+                token: u64,
                 done: watch::Receiver<bool>,
             },
             CleanupFailed {
@@ -1620,16 +1659,19 @@ impl CallController {
                 // An observed leave acts only on its running call, below.
                 _ if observed.is_some() => None,
                 CallSlot::OpeningSlot {
+                    token,
                     account_id,
                     room_id,
                     done,
-                    ..
                 } => {
                     self.shared.status.send_replace(CallStatus::Ending {
                         account_id: account_id.clone(),
                         room_id: room_id.clone(),
                     });
-                    Some(PriorOperation::Opening { done: done.clone() })
+                    Some(PriorOperation::Opening {
+                        token: *token,
+                        done: done.clone(),
+                    })
                 }
                 CallSlot::CleanupFailed { token, done } => Some(PriorOperation::CleanupFailed {
                     token: *token,
@@ -1639,7 +1681,7 @@ impl CallController {
             }
         };
         match prior {
-            Some(PriorOperation::Opening { mut done }) => {
+            Some(PriorOperation::Opening { token, mut done }) => {
                 timeout(SHUTDOWN_TIMEOUT, async {
                     loop {
                         if *done.borrow_and_update() {
@@ -1652,6 +1694,18 @@ impl CallController {
                 })
                 .await
                 .map_err(|_| CallControllerError::TimedOut("waiting for call slot write"))??;
+                let slot = self.shared.slot.lock().await;
+                if let CallSlot::CleanupFailed {
+                    token: current,
+                    done,
+                } = &*slot
+                    && *current == token
+                {
+                    return match done.borrow().clone() {
+                        Some(Err(reason)) => Err(CallControllerError::Cleanup(reason)),
+                        _ => Err(CallControllerError::WorkerStopped),
+                    };
+                }
                 return Ok(());
             }
             Some(PriorOperation::CleanupFailed { token, mut done }) => {
@@ -1765,6 +1819,9 @@ impl CallController {
         // A server-leave acknowledgement cannot abandon an unjoined native
         // opener or its late result. Keep the shared call/update lease held.
         opener
+            .await
+            .map_err(|error| CallControllerError::Cleanup(error.to_string()))?;
+        morpheus_rtc::wait_for_ring_audio_release()
             .await
             .map_err(|error| CallControllerError::Cleanup(error.to_string()))?;
         // No other call can start while this slot is blocked, so any live
@@ -2043,10 +2100,17 @@ impl CallWorker {
             _ = &mut self.cancel => Err(CallControllerError::Cancelled),
             _ = self.selection.revoked() => Err(CallControllerError::AccountChanged),
             _ = accepted_cancelled(self.accepted.as_ref()) => Err(CallControllerError::IncomingOfferUnavailable),
-            released = crate::audio_attachments::wait_for_release() => released.map_err(|error| match error {
-                crate::audio_attachments::ReleaseError::TimedOut => CallControllerError::TimedOut("releasing attachment audio"),
-                error => CallControllerError::Cleanup(error.to_string()),
-            }),
+            released = async {
+                crate::audio_attachments::wait_for_release().await.map_err(|error| match error {
+                    crate::audio_attachments::ReleaseError::TimedOut => CallControllerError::TimedOut("releasing attachment audio"),
+                    error => CallControllerError::Cleanup(error.to_string()),
+                })?;
+                // The first call reservation permanently revoked the old ring.
+                // Require its real native worker/TLS receipt before any SDK join
+                // or call device open; unknown ownership keeps this call blocked.
+                morpheus_rtc::wait_for_ring_audio_release().await
+                    .map_err(|error| CallControllerError::Cleanup(error.to_string()))
+            } => released,
         };
         let setup = match released {
             Ok(()) => self.setup().await,
@@ -3244,9 +3308,12 @@ impl CallWorker {
         // error. Successful call cleanup additionally requires actual opener
         // completion; a timeout cannot publish Idle or release update exclusion.
         let cleanup = match cleanup {
-            Ok(()) => morpheus_rtc::wait_for_audio_device_release()
-                .await
-                .map_err(|error| error.to_string()),
+            Ok(()) => match morpheus_rtc::wait_for_audio_device_release().await {
+                Ok(()) => morpheus_rtc::wait_for_ring_audio_release()
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            },
             Err(original) => Err(original),
         };
         {
@@ -3545,7 +3612,7 @@ mod tests {
             !next(),
             "native media has not opened but the reservation already excludes attachment output"
         );
-        controller.shared.finish_open_slot(token).await;
+        controller.shared.finish_open_slot(token).await.unwrap();
         done.send_replace(true);
         assert!(!next(), "call completion must not adopt the old lease");
         assert!((controller.attachment_audio_authority())());
@@ -3690,11 +3757,74 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(controller.status().blocks_account_switch());
         assert!(!waiting.is_finished());
-        controller.shared.finish_open_slot(token).await;
+        controller.shared.finish_open_slot(token).await.unwrap();
         done.send_replace(true);
         waiting.await.unwrap().unwrap();
         assert!(!controller.status().blocks_account_switch());
         assert!(controller.shared.update_activity.try_install().is_ok());
+    }
+
+    #[tokio::test]
+    async fn opening_slot_keeps_update_exclusion_until_real_ring_receipt_and_reports_failed_drain()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let activity = UpdateActivity::default();
+        let controller = Arc::new(CallController::new(manager, activity.clone()));
+        let (token, done) = controller
+            .shared
+            .reserve_open_slot("fixture", "!fixture:example.org")
+            .await
+            .unwrap();
+        let waiting = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.end_call().await })
+        };
+        tokio::task::yield_now().await;
+        let (release, released) = oneshot::channel();
+        let mut cleanup = Box::pin(
+            controller
+                .shared
+                .finish_open_slot_after_ring(token, async { released.await.unwrap() }),
+        );
+        assert!(futures_util::poll!(cleanup.as_mut()).is_pending());
+        assert!(matches!(
+            activity.try_install(),
+            Err(UpdateError::CallActive)
+        ));
+        assert!(controller.status().blocks_account_switch());
+        release
+            .send(Err(
+                morpheus_rtc::RingAudioReleaseError::OutputOwnerUnconfirmed,
+            ))
+            .unwrap();
+        assert!(matches!(
+            cleanup.await,
+            Err(CallControllerError::Cleanup(_))
+        ));
+        done.send_replace(true);
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Err(CallControllerError::Cleanup(_))
+        ));
+        assert!(
+            matches!(*controller.shared.slot.lock().await, CallSlot::CleanupFailed { token: current, .. } if current == token)
+        );
+        assert!(matches!(
+            activity.try_install(),
+            Err(UpdateError::CallActive)
+        ));
+        assert!(matches!(
+            controller
+                .shared
+                .reserve_open_slot("fixture", "!next:example.org")
+                .await,
+            Err(CallControllerError::AlreadyBusy)
+        ));
+        // The existing explicit warning path still requires an independently
+        // joined ring. This synthetic case created no RTC owner, so it can clear.
+        controller.abandon_failed_leave().await.unwrap();
+        assert!(activity.try_install().is_ok());
     }
 
     #[tokio::test]
@@ -3718,12 +3848,12 @@ mod tests {
             .reserve_open_slot("account", "!room:example.org")
             .await
             .unwrap();
-        controller.shared.finish_open_slot(token + 1).await;
+        controller.shared.finish_open_slot(token + 1).await.unwrap();
         assert!(matches!(
             activity.try_install(),
             Err(UpdateError::CallActive)
         ));
-        controller.shared.finish_open_slot(token).await;
+        controller.shared.finish_open_slot(token).await.unwrap();
         assert!(activity.try_install().is_ok());
     }
 

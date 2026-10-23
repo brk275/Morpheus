@@ -157,7 +157,7 @@ def binary_identity(data, version, arch):
         position += word(position + 4)
     require(position == end and isinstance(identity, dict)
             and set(identity) == {"protocol", "product", "version", "arch", "persistence"}
-            and type(identity["protocol"]) is int and identity["protocol"] == 1
+            and type(identity["protocol"]) is int and identity["protocol"] == 2
             and identity["product"] == PRODUCT and identity["arch"] == arch
             and identity["version"] == version)
     _version(identity["version"])

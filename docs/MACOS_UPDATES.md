@@ -27,9 +27,11 @@ notarization remain separate requirements. The producer does not read a key.
 
 ## Identity and complete contents
 
-The producer parses the native Mach-O executable's immutable v1 identity
+The producer parses the native Mach-O executable's immutable v2 identity
 section without running it. Product, native architecture, requested version
-and persistence cohort must match. It validates the same closed XML plist
+and persistence cohort must match. The [native identity contract](NATIVE_UPDATE_IDENTITY.md)
+requires protocol 2; protocol 1 installations use an initial/manual installation
+rather than an update through a legacy helper. It validates the same closed XML plist
 shape as the native transaction: one root dictionary of unique string/boolean
 scalars, including the actual top-level bundle identity and all permission
 purpose strings.
@@ -143,25 +145,34 @@ before the root startup session releases its lifetime lock and install lease.
 This ordering stays in the real main path; a synthetic lease drop is not a
 substitute for process exit.
 
-The Mac helper now registers `EVFILT_PROC`/`NOTE_EXIT` on its actual direct
-parent before publishing readiness. The launching app supplies its own PID;
+The Mac helper registers `EVFILT_PROC` with `NOTE_EXIT | NOTE_EXITSTATUS` on
+its actual direct parent before publishing readiness. The launching app supplies
+its own PID;
 the helper rejects init/reparenting, a noncanonical PID, and any disagreement
 with `getppid` both before and after registration. It retains the owned kernel
 queue and per-transaction opaque cookie until the exit event is received.
 An immediate successful registration receipt is not an exit event.
 
-Only the exact registration's `NOTE_EXIT` with its expected process, filter,
-cookie and termination flags may complete the bounded wait. Registration
-errors, `EV_ERROR`, unexpected or lost events and timeout fail closed. There
-is no `kill(0)` check, cached-PID signal, process-name lookup or process snapshot.
+Only the exact registration's `NOTE_EXIT | NOTE_EXITSTATUS` with its expected
+process, filter, cookie, termination flags and complete wait status of zero may
+complete the bounded wait. Darwin leaves event data zero without the status
+request even for failed exits; status must be explicitly requested and returned.
+Nonzero exit, signal/core status, missing status, registration permission errors,
+`EV_ERROR`, unexpected or lost events and timeout fail closed. There is no `kill(0)` check, cached-PID signal, process-name lookup or process snapshot.
 After the kernel exit event, the helper independently acquires the installed
 app lock and revalidates the full prepared transaction before replacement.
 Releasing the lock just before main returns can no longer authorize apply
 while the original process is still alive.
 
-The parent-exit boundary does not establish graceful native cleanup. Main still
-logs call cleanup errors. Attachment playback now retains an owner that joins
-the actual download/decoder/output worker, including its thread-local teardown,
+The parent-exit boundary does not establish graceful native cleanup. Main now
+retains call and update-worker drain errors through all mandatory remaining
+cleanup, then returns a closed static error category after its existing UI,
+draft, attachment and device-opener error precedence. SDK/server error payloads
+are not included in these new final errors or their diagnostics. A failed or
+signalled old process cannot authorize apply; its installed old bundle and
+Prepared journal remain for the existing startup recovery path.
+
+Attachment playback retains an owner that joins the actual download/decoder/output worker, including its thread-local teardown,
 before reporting release. A bounded wait retains pending or failed ownership;
 its typed error is returned after draft flushing and account-manager shutdown,
 so an unconfirmed attachment release cannot produce a successful main result.
@@ -170,13 +181,15 @@ join before releasing call/update exclusion; unconfirmed opener shutdown is
 returned after draft and account cleanup.
 That application-worker join proves return of the public stream destructor,
 while backend monitor joining, native stop/dispose success, device quiescence
-and actual normal AppWindow shutdown remain independent open gates. The original
-synthetic installed driver kept its old actor alive as a monitor and could not satisfy
-this new exit requirement. The composed route now retains that actor's actual
+and actual normal AppWindow shutdown remain independent open gates. Existing
+account/task shutdown awaits and direct draft flushing have not been upgraded
+to a complete typed receipt for every SDK-owned background task by this change.
+The original synthetic installed driver kept its old actor alive as a monitor
+and could not satisfy this new exit requirement. The composed route now retains that actor's actual
 helper Child through a nonce-bound external kernel-observer acknowledgment,
 then allows the synthetic parent to really exit. Both the production parent's
-NOTE_EXIT and external helper exit/status must be observed, with no PID signal
-fallback. Forced after-apply interruption uses compile-only `_exit(86)` before
+normal-success exit/status and external helper exit/status must be observed,
+with no PID signal fallback. Forced after-apply interruption uses compile-only `_exit(86)` before
 any trial child and must be independently observed before startup recovery.
 These synthetic process observations do not establish normal AppWindow shutdown.
 Fresh native installed acceptance of the composed candidate remains mandatory.

@@ -122,6 +122,30 @@ use crate::local_video::{CaptureKind, CapturePhase, CaptureSource, LocalVideoSta
 use crate::notifications::DesktopNotifications;
 use crate::voice_spaces::VoiceSpaces;
 
+// Do not retain SDK/server errors here: Rust's Result termination prints Debug.
+// These closed categories make failed cleanup visible to the process-exit
+// observer without exposing an underlying account/media error in that output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownFailure {
+    #[cfg(feature = "native-calls")]
+    NativeCall,
+    UpdateWorker,
+}
+
+impl std::fmt::Display for ShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(feature = "native-calls")]
+            Self::NativeCall => formatter.write_str("Native call shutdown could not be confirmed."),
+            Self::UpdateWorker => {
+                formatter.write_str("Update worker shutdown could not be confirmed.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ShutdownFailure {}
+
 slint::include_modules!();
 
 #[derive(Clone)]
@@ -1653,7 +1677,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // An instrumented acceptance build refuses to start without a valid run
     // file, so it never runs as an ordinary app. See tests/TIMELINE_10K.md.
     #[cfg(morpheus_timeline_acceptance)]
-    let mut acceptance = timeline_acceptance::Acceptance::from_environment()?;
+    let acceptance = timeline_acceptance::Acceptance::from_environment()?;
     // Screenshot generation uses only the in-memory offline preview. Dispatch
     // before updater, configuration, credential vault or account initialization.
     #[cfg(debug_assertions)]
@@ -1672,6 +1696,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Ok(());
     }
+    // The root session outlives the entire ordinary application scope. Its
+    // private final-success authority is never emitted by a local destructor.
+    run_application(
+        update_session.clone(),
+        #[cfg(morpheus_timeline_acceptance)]
+        acceptance,
+    )?;
+    #[cfg(target_os = "linux")]
+    updater::complete_linux_shutdown(update_session)?;
+    Ok(())
+}
+
+fn run_application(
+    update_session: Arc<Mutex<updater::StartupSession>>,
+    #[cfg(morpheus_timeline_acceptance)] mut acceptance: timeline_acceptance::Acceptance,
+) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     morpheus_rtc::install_crypto_provider();
     let ui = AppWindow::new()?;
@@ -4733,7 +4773,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     incoming_calls.shutdown();
     notifications.shutdown();
     update_ui_task.abort();
-    let update_result = runtime.block_on(async {
+    let (update_result, call_result) = runtime.block_on(async {
         let _ = update_ui_task.await;
         // A cancelled download may still be waiting for its bounded network
         // timeout. Stop call capture concurrently, never after that wait.
@@ -4744,20 +4784,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 calls.end_call(),
                 incoming_calls.finish()
             );
-            if let Err(error) = call_result {
-                eprintln!("Could not leave native call during shutdown: {error}");
+            let call_result = call_result.map_err(|_| ShutdownFailure::NativeCall);
+            if call_result.is_err() {
+                eprintln!("Could not confirm native call shutdown.");
             }
-            update_result
+            (update_result, call_result)
         }
         #[cfg(not(feature = "native-calls"))]
-        updates.shutdown().await
+        (updates.shutdown().await, Ok::<(), ShutdownFailure>(()))
     });
+    #[cfg(feature = "native-calls")]
+    let ring_result = runtime.block_on(morpheus_rtc::wait_for_ring_audio_release());
+    #[cfg(feature = "native-calls")]
+    if let Err(error) = ring_result {
+        // Incoming UI shutdown revoked authority first. Still finish the other
+        // cleanup paths, then return the typed actual-worker release failure.
+        eprintln!("Could not release incoming sound during shutdown: {error}");
+    }
     #[cfg(feature = "native-calls")]
     let device_open_result = runtime.block_on(morpheus_rtc::wait_for_audio_device_release());
     #[cfg(feature = "native-calls")]
     if let Err(error) = device_open_result {
-        // Call shutdown errors above are diagnostic-only. An unjoined native
-        // opener additionally prevents successful quit after remaining cleanup.
+        // Preserve this independent join failure while all remaining cleanup
+        // completes; call cleanup failures are also returned below.
         eprintln!("Could not release audio device opener during shutdown: {error}");
     }
     let audio_result = runtime.block_on(audio_attachments::wait_for_release());
@@ -4767,9 +4816,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let draft_result = runtime.block_on(live.flush_drafts());
     runtime.block_on(manager.stop());
-    if let Err(error) = update_result {
-        // Static diagnostic only; all other app shutdown work still completes.
-        eprintln!("Could not finish update shutdown safely: {error}");
+    let update_result = update_result.map_err(|_| ShutdownFailure::UpdateWorker);
+    if update_result.is_err() {
+        // Keep diagnostics static and return failure only after all cleanup.
+        eprintln!("Could not confirm update worker shutdown.");
     }
     ui_result?;
     if let Err(error) = draft_result {
@@ -4779,6 +4829,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     audio_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     #[cfg(feature = "native-calls")]
     device_open_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    #[cfg(feature = "native-calls")]
+    ring_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    // UI, draft, attachment, device-opening and ringing errors retain their
+    // precedence. Failed call cleanup or an update drain must also prevent a
+    // successful ordinary-shutdown result.
+    call_result?;
+    update_result?;
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.finish()?;
     Ok(())
@@ -4787,6 +4844,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn shutdown_failures_report_only_closed_static_categories() {
+        let failure = ShutdownFailure::UpdateWorker;
+        assert_eq!(format!("{failure:?}"), "UpdateWorker");
+        assert_eq!(
+            failure.to_string(),
+            "Update worker shutdown could not be confirmed."
+        );
+        assert!(std::error::Error::source(&failure).is_none());
+        #[cfg(feature = "native-calls")]
+        {
+            let failure = ShutdownFailure::NativeCall;
+            assert_eq!(format!("{failure:?}"), "NativeCall");
+            assert_eq!(
+                failure.to_string(),
+                "Native call shutdown could not be confirmed."
+            );
+            assert!(std::error::Error::source(&failure).is_none());
+        }
+    }
 
     #[test]
     fn highlight_editor_normalizes_input_and_rejects_hidden_controls() {

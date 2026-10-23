@@ -228,7 +228,9 @@ fn persistence_fingerprint(
     persistence
 }
 
-// One immutable v1 record for native executable sections on Mac and Windows.
+// One immutable v2 record for native executable sections on Mac and Windows.
+// The closed protocol separates helpers with ordinary-shutdown handoff guards
+// from legacy helpers. It does not change the persistence cohort or journals.
 // No runtime file or user setting can select a persistence cohort. Keep the
 // existing cohort calculation above byte-for-byte equivalent.
 fn write_update_identity(persistence: &str) {
@@ -249,7 +251,7 @@ fn write_update_identity(persistence: &str) {
     // All interpolated scalars passed the closed ASCII checks above, so they
     // cannot inject JSON quoting, escapes or additional fields.
     let identity = format!(
-        "{{\"protocol\":1,\"product\":\"io.github.brk275.morpheus\",\"version\":\"{version}\",\"arch\":\"{arch}\",\"persistence\":\"{persistence}\"}}"
+        "{{\"protocol\":2,\"product\":\"io.github.brk275.morpheus\",\"version\":\"{version}\",\"arch\":\"{arch}\",\"persistence\":\"{persistence}\"}}"
     );
     let output =
         PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("morpheus-update-identity.json");

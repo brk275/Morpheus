@@ -527,7 +527,7 @@ class InstalledWindowsUpdateTests(unittest.TestCase):
 
     def test_compiled_nonce_proof_is_inert_and_rejects_missing_or_changed_dispatch_instrumentation(self):
         nonce = "a"*32
-        identity = {"protocol":1,"product":"io.github.brk275.morpheus","version":"0.1.0-updateqa.1",
+        identity = {"protocol":2,"product":"io.github.brk275.morpheus","version":"0.1.0-updateqa.1",
                     "arch":"x86_64","persistence":"b"*64}
         image = bytearray(12288)
         image[:2]=b"MZ"; struct.pack_into("<I",image,60,128); image[128:132]=b"PE\0\0"

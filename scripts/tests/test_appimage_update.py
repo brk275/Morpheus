@@ -9,7 +9,7 @@ from scripts.prepare_appimage_update import MAGIC, prepare_appimage, validate_me
 
 
 METADATA = {
-    "protocol": 1, "product": "io.github.brk275.morpheus",
+    "protocol": 2, "product": "io.github.brk275.morpheus",
     "version": "0.2.0", "arch": "x86_64", "persistence": "a" * 64,
 }
 
@@ -24,7 +24,8 @@ def image_bytes():
 
 class AppImageMetadataTests(unittest.TestCase):
     def test_metadata_rejects_wrong_product_architecture_or_unbounded_content(self):
-        for key, value in [("product", "other"), ("arch", "aarch64"), ("persistence", "a" * 65), ("version", "v" * 5000)]:
+        for key, value in [("protocol", 1), ("protocol", True), ("protocol", 2.0), ("protocol", 3),
+                           ("product", "other"), ("arch", "aarch64"), ("persistence", "a" * 65), ("version", "v" * 5000)]:
             with self.subTest(key=key), self.assertRaises(ValueError):
                 validate_metadata(dict(METADATA, **{key: value}))
 

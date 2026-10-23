@@ -30,6 +30,15 @@ just-built binaries' supported metadata command must report identical
 persistence fingerprints. Each final AppImage receives its compatibility
 footer before official Cargo Packager **0.11.8** signing.
 
+The footer producer and installed parser require exact integer protocol **2**.
+Legacy protocol1 packages require manual migration; an older helper is not
+accepted merely because its persistence cohort matches. Forward application
+also requires the final successful ordinary-app-scope authority, its consumed
+socket EOF, actual original thread-group pidfd death and a fresh lock/journal
+recheck. Source regressions for those boundaries do not establish the ordinary
+UI/runtime shutdown or older-kernel AppImage runtime route as accepted. Native
+backend disposal and signed installed behavior remain separate open gates.
+
 The public verification key and loopback HTTPS feed are compiled into these
 disposable builds using the existing production build configuration. They are
 the same in both builds. No runtime key/feed override, alternate signature

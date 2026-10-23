@@ -77,7 +77,7 @@ class PackageConfigTests(unittest.TestCase):
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes((project / relative).read_bytes())
-        identity = {"protocol": 1, "product": "io.github.brk275.morpheus", "version": "0.1.0",
+        identity = {"protocol": 2, "product": "io.github.brk275.morpheus", "version": "0.1.0",
                     "arch": "x86_64", "persistence": "a" * 64}
         native = bytearray(8192)
         native[:2] = b"MZ"
@@ -141,6 +141,29 @@ class PackageConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 prepare_windows_update.prepare(config, root, output)
             self.assertEqual(list(output.iterdir()), [])
+
+    def test_windows_producer_rejects_legacy_and_noninteger_helper_protocols_before_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, identity = self.windows_fixture(root)
+            binary = root / "target/release/morpheus-app.exe"
+            original = binary.read_bytes()
+            self.assertEqual(prepare_windows_update.pe_identity(original), identity)
+            output = root / "owned-output"
+            output.mkdir()
+            for protocol in [0, 1, 3, True, 2.0]:
+                encoded = prepare_windows_update.canonical(identity | {"protocol": protocol})
+                data = bytearray(original)
+                data[4096:] = b"\0" * 4096
+                data[4096:4096 + len(encoded)] = encoded
+                struct.pack_into("<I", data, 400, len(encoded))
+                binary.write_bytes(data)
+                with self.subTest(protocol=protocol), self.assertRaises(ValueError):
+                    prepare_windows_update.pe_identity(bytes(data))
+                with self.subTest(protocol=protocol), self.assertRaises(ValueError):
+                    prepare_windows_update.prepare(config, root, output)
+                self.assertEqual(list(output.iterdir()), [])
+                self.assertEqual(binary.read_bytes(), bytes(data))
 
     def test_missing_deb_maintainer_fails_before_build_but_other_formats_do_not(self):
         for formats in [None, "deb", "deb,appimage", "all", "default"]:
@@ -252,7 +275,7 @@ class MacUpdatePayloadTests(unittest.TestCase):
         app = root / "Morpheus.app"
         for relative in ["Contents/MacOS", "Contents/Resources"]:
             (app / relative).mkdir(parents=True, exist_ok=True)
-        identity = {"protocol": 1, "product": mac_update.PRODUCT, "version": "0.2.0",
+        identity = {"protocol": 2, "product": mac_update.PRODUCT, "version": "0.2.0",
                     "arch": arch, "persistence": "a" * 64}
         encoded = json.dumps(identity, separators=(",", ":")).encode("ascii")
         # Inert Mach-O/identity bytes only, never an executable fixture launch.
@@ -280,6 +303,31 @@ class MacUpdatePayloadTests(unittest.TestCase):
         for name, relative in mac_update.RESOURCES.items():
             (app / "Contents/Resources" / name).write_bytes((source / relative).read_bytes())
         return source, app, root / mac_update.ARCHIVE_NAME
+
+    def test_mac_producer_rejects_legacy_and_noninteger_helper_protocols_before_publication(self):
+        for arch in ["aarch64", "x86_64"]:
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory() as temporary, \
+                    mock.patch.dict(os.environ, {}, clear=True):
+                root = Path(temporary)
+                source, app, output = self.fixture(root, arch)
+                binary = app / mac_update.EXECUTABLE
+                original = binary.read_bytes()
+                identity = mac_update.binary_identity(original, "0.2.0", arch)
+                self.assertEqual(identity["protocol"], 2)
+                for protocol in [0, 1, 3, True, 2.0]:
+                    encoded = json.dumps(identity | {"protocol": protocol}, separators=(",", ":")).encode("ascii")
+                    data = bytearray(original[:512] + encoded)
+                    struct.pack_into("<Q", data, 80, len(data))
+                    struct.pack_into("<Q", data, 144, len(encoded))
+                    binary.write_bytes(data)
+                    before = mac_update._snapshot(app)
+                    with self.subTest(protocol=protocol), self.assertRaises(ValueError):
+                        mac_update.binary_identity(bytes(data), "0.2.0", arch)
+                    with self.subTest(protocol=protocol), self.assertRaises(ValueError):
+                        mac_update.prepare_update(app, output, version="0.2.0", arch=arch, root=source)
+                    self.assertFalse(output.exists())
+                    self.assertEqual(mac_update._snapshot(app), before)
+                    self.assertFalse(list(root.glob(".morpheus-mac-update-*.tmp")))
 
     def test_mac_selection_retains_exact_one_app_build_and_refuses_other_platforms_or_signing(self):
         config = package_config(platform="darwin")

@@ -23,7 +23,7 @@ def validate_metadata(metadata):
         "protocol", "product", "version", "arch", "persistence"
     }:
         raise ValueError("Invalid update metadata fields")
-    if metadata["protocol"] != 1 or metadata["product"] != "io.github.brk275.morpheus":
+    if type(metadata["protocol"]) is not int or metadata["protocol"] != 2 or metadata["product"] != "io.github.brk275.morpheus":
         raise ValueError("Unsupported update metadata protocol or product")
     if metadata["arch"] != "x86_64":
         raise ValueError("Only the supported Linux x86_64 AppImage can be prepared")

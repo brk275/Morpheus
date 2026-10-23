@@ -81,6 +81,7 @@ unsafe extern "system" {
         user: *mut u64,
     ) -> i32;
     fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+    fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
     fn LocalFree(memory: Handle) -> Handle;
 }
 #[link(name = "bcrypt")]
@@ -733,6 +734,24 @@ impl ParentProcess {
             258 => Ok(false),
             _ => Err(UpdateError::RestartFailed),
         }
+    }
+
+    /// Forward apply requires a successful old-app shutdown, not only its death.
+    /// Keep ordinary liveness and crash recovery on `wait`: those paths must
+    /// still recognize a terminated process whose exit status was not zero.
+    pub fn wait_for_successful_exit(&self, milliseconds: u32) -> Result<bool, UpdateError> {
+        if !self.wait(milliseconds)? {
+            return Ok(false);
+        }
+        let mut code = u32::MAX;
+        // SAFETY: this exact retained process handle has SYNCHRONIZE and
+        // PROCESS_QUERY_LIMITED_INFORMATION rights. The wait above observed its
+        // permanent signalled state; the writable DWORD remains valid here.
+        // No PID lookup, signal, reused handle or STILL_ACTIVE polling occurs.
+        if unsafe { GetExitCodeProcess(self.0.0, &mut code) } == 0 || code != 0 {
+            return Err(UpdateError::RestartFailed);
+        }
+        Ok(true)
     }
 }
 fn process_stamp(handle: Handle) -> Result<u64, UpdateError> {

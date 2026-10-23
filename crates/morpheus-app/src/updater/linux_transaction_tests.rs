@@ -247,6 +247,266 @@ fn malformed_footer_is_bounded_and_never_falls_back_to_executing_probe() {
 }
 
 #[test]
+fn legacy_helper_protocol_is_manual_only_in_both_forward_directions() {
+    let fixture = Fixture::new();
+    let mut session = AppImageSession::lock(&fixture.installed, Duration::ZERO).unwrap();
+    let mut legacy = fixture.next_metadata.clone();
+    legacy.protocol = 1;
+    assert!(!legacy.compatible(&PackageMetadata::embedded()));
+    assert!(!fixture.next_metadata.compatible(&legacy));
+    assert_eq!(
+        session.prepare(&image(&legacy, b"legacy"), &legacy.version),
+        Err(UpdateError::IncompatibleUpdate)
+    );
+    let mut legacy_installed = PackageMetadata::embedded();
+    legacy_installed.protocol = 1;
+    fs::write(
+        &fixture.installed,
+        image(&legacy_installed, b"legacy installation"),
+    )
+    .unwrap();
+    assert_eq!(
+        session.prepare(&fixture.next, &fixture.next_metadata.version),
+        Err(UpdateError::IncompatibleUpdate)
+    );
+    assert!(session.journal().unwrap().is_none());
+    assert!(!session.state.join("previous.AppImage").exists());
+}
+
+#[test]
+fn malformed_reserved_handoff_arguments_never_fall_through_to_ordinary_app() {
+    for args in [
+        vec!["app", "--morpheus-update-supervise"],
+        vec![
+            "app",
+            "--morpheus-update-supervise",
+            "/synthetic",
+            "id",
+            "extra",
+        ],
+        vec!["app", "--morpheus-update-metadata", "extra"],
+    ] {
+        let args = args
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(dispatch_args(&args), Err(UpdateError::RecoveryRequired));
+    }
+}
+
+#[test]
+fn final_success_authority_is_explicit_consuming_and_not_a_death_receipt() {
+    let fixture = Fixture::new();
+    let mut session = fixture.prepared();
+    let prepared = session.journal().unwrap().unwrap();
+    let digest = transaction_digest(&prepared).unwrap();
+    let (parent, mut receiver) = UnixStream::pair().unwrap();
+    session.shutdown_authority = Some(ShutdownAuthority {
+        channel: parent,
+        prepared,
+    });
+    session.complete_successful_shutdown().unwrap();
+    receive_exact_frame(
+        &mut receiver,
+        &authority_frame(SUCCESS_PREFIX, &digest),
+        true,
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    // The authority is a successful-scope statement, not a kernel-status or
+    // process-death statement. No rename/phase advance occurs when it is sent.
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.old);
+    let recovered = AppImageSession::lock(&fixture.installed, Duration::ZERO).unwrap();
+    assert_eq!(recovered.journal().unwrap().unwrap().phase, Phase::Prepared);
+}
+
+#[test]
+fn drop_or_changed_transaction_cannot_publish_a_success_authority() {
+    for change in [false, true] {
+        let fixture = Fixture::new();
+        let mut session = fixture.prepared();
+        let prepared = session.journal().unwrap().unwrap();
+        let digest = transaction_digest(&prepared).unwrap();
+        let (parent, mut receiver) = UnixStream::pair().unwrap();
+        session.shutdown_authority = Some(ShutdownAuthority {
+            channel: parent,
+            prepared: prepared.clone(),
+        });
+        if change {
+            let mut changed = prepared;
+            changed.candidate.version.push_str("-changed");
+            session.save(&changed).unwrap();
+            assert_eq!(
+                session.complete_successful_shutdown(),
+                Err(UpdateError::RecoveryRequired)
+            );
+        } else {
+            drop(session); // An unsuccessful ordinary scope releases no token.
+        }
+        assert_eq!(
+            receive_exact_frame(
+                &mut receiver,
+                &authority_frame(SUCCESS_PREFIX, &digest),
+                true,
+                Instant::now() + Duration::from_secs(2)
+            ),
+            Err(UpdateError::RecoveryRequired)
+        );
+        assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.old);
+    }
+}
+
+#[test]
+fn missing_truncated_foreign_and_extra_authority_bytes_fail_closed() {
+    let digest = "a".repeat(64);
+    let frame = authority_frame(SUCCESS_PREFIX, &digest);
+    for bytes in [
+        Vec::new(),
+        frame[..frame.len() - 1].to_vec(),
+        authority_frame(SUCCESS_PREFIX, &"b".repeat(64)),
+        authority_frame(b"MORPHEUS-LINUX-CLEAN-V1\n", &digest),
+        [frame.clone(), vec![0]].concat(),
+    ] {
+        let (mut parent, mut helper) = UnixStream::pair().unwrap();
+        parent.write_all(&bytes).unwrap();
+        drop(parent);
+        assert_eq!(
+            receive_exact_frame(
+                &mut helper,
+                &frame,
+                true,
+                Instant::now() + Duration::from_secs(2)
+            ),
+            Err(UpdateError::RecoveryRequired)
+        );
+    }
+    let (parent, mut helper) = UnixStream::pair().unwrap();
+    let mut extra_alias = parent.try_clone().unwrap();
+    extra_alias.write_all(&frame).unwrap();
+    drop(parent);
+    // A still-live writer alias must not look like the final consumed token.
+    assert_eq!(
+        receive_exact_frame(
+            &mut helper,
+            &frame,
+            true,
+            Instant::now() + Duration::from_millis(30)
+        ),
+        Err(UpdateError::RecoveryRequired)
+    );
+    drop(extra_alias);
+}
+
+#[test]
+fn failed_final_channel_write_preserves_prepared_installation() {
+    let fixture = Fixture::new();
+    let mut session = fixture.prepared();
+    let prepared = session.journal().unwrap().unwrap();
+    let (parent, helper) = UnixStream::pair().unwrap();
+    session.shutdown_authority = Some(ShutdownAuthority {
+        channel: parent,
+        prepared,
+    });
+    drop(helper);
+    assert_eq!(
+        session.complete_successful_shutdown(),
+        Err(UpdateError::RecoveryRequired)
+    );
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.old);
+    let recovered = AppImageSession::lock(&fixture.installed, Duration::ZERO).unwrap();
+    assert_eq!(recovered.journal().unwrap().unwrap().phase, Phase::Prepared);
+    assert_eq!(
+        fs::read(recovered.state.join("previous.AppImage")).unwrap(),
+        fixture.old
+    );
+}
+
+#[test]
+fn a_foreign_socket_creator_or_non_socket_cannot_become_the_original_parent() {
+    let (parent, helper) = UnixStream::pair().unwrap();
+    let foreign = Origin {
+        pid: std::process::id().checked_add(1).unwrap(),
+        uid: unsafe { libc::geteuid() },
+    };
+    assert!(matches!(
+        ParentExitMonitor::capture(&helper, &foreign),
+        Err(UpdateError::RecoveryRequired)
+    ));
+    drop(parent);
+    let file = tempfile::tempfile().unwrap();
+    let non_socket = UnixStream::from(OwnedFd::from(file));
+    let origin = Origin {
+        pid: std::process::id(),
+        uid: unsafe { libc::geteuid() },
+    };
+    assert!(matches!(
+        ParentExitMonitor::capture(&non_socket, &origin),
+        Err(UpdateError::RecoveryRequired)
+    ));
+}
+
+#[test]
+fn legacy_interrupted_journal_recovers_without_any_forward_authority() {
+    let fixture = Fixture::new();
+    let session = fixture.prepared();
+    let mut journal = session.journal().unwrap().unwrap();
+    journal.protocol = 1;
+    journal.origin = None;
+    journal.candidate.protocol = 1;
+    let mut old_identity = PackageMetadata::embedded();
+    old_identity.protocol = 1;
+    let old = image(&old_identity, b"legacy old application");
+    let next = image(&journal.candidate, b"legacy new application");
+    journal.old_hash = hash(&old);
+    journal.new_hash = hash(&next);
+    fs::write(&fixture.installed, &next).unwrap();
+    fs::write(session.state.join("previous.AppImage"), &old).unwrap();
+    fs::write(session.state.join("next.AppImage"), &next).unwrap();
+    journal.phase = Phase::AwaitingHealth;
+    session.save(&journal).unwrap();
+    assert_eq!(
+        transaction_digest(&journal),
+        Err(UpdateError::RecoveryRequired)
+    );
+    session.rollback(&mut journal).unwrap();
+    assert_eq!(fs::read(&fixture.installed).unwrap(), old);
+    assert!(session.journal().unwrap().is_none());
+}
+
+#[test]
+fn retained_startup_owner_prevents_consuming_the_final_authority() {
+    let fixture = Fixture::new();
+    let mut session = fixture.prepared();
+    let prepared = session.journal().unwrap().unwrap();
+    let digest = transaction_digest(&prepared).unwrap();
+    let (parent, mut helper) = UnixStream::pair().unwrap();
+    session.shutdown_authority = Some(ShutdownAuthority {
+        channel: parent,
+        prepared,
+    });
+    let startup = std::sync::Arc::new(std::sync::Mutex::new(super::super::StartupSession {
+        appimage: Some(session),
+        restarted: false,
+    }));
+    let still_owned = startup.clone();
+    assert_eq!(
+        super::super::complete_linux_shutdown(startup),
+        Err(UpdateError::RecoveryRequired)
+    );
+    drop(still_owned);
+    assert_eq!(
+        receive_exact_frame(
+            &mut helper,
+            &authority_frame(SUCCESS_PREFIX, &digest),
+            true,
+            Instant::now() + Duration::from_secs(2)
+        ),
+        Err(UpdateError::RecoveryRequired)
+    );
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.old);
+}
+
+#[test]
 fn cancelled_preparation_releases_call_exclusion_and_owned_files() {
     let fixture = Fixture::new();
     let mut session = AppImageSession::lock(&fixture.installed, Duration::ZERO).unwrap();
@@ -356,6 +616,69 @@ fn process_fixture_child() {
     };
     let root = PathBuf::from(std::env::var_os("MORPHEUS_UPDATE_PROCESS_FIXTURE_ROOT").unwrap());
     match mode.as_str() {
+        "authority-creator-token" | "authority-creator-none" | "authority-creator-abrupt" => {
+            let (mut parent, helper) = UnixStream::pair().unwrap();
+            let mut command = process_fixture_command("authority-observer", &root);
+            command
+                .env("MORPHEUS_UPDATE_ORIGIN_PID", std::process::id().to_string())
+                .stdin(Stdio::from(OwnedFd::from(helper)));
+            // Preserve the creator's group so the outer retained leader owns
+            // bounded cleanup even if this observer's assertion fails.
+            let child = command.spawn().unwrap();
+            drop(command); // Never retain the child endpoint in the creator.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("capability-ready").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if mode == "authority-creator-token" {
+                parent
+                    .write_all(&authority_frame(SUCCESS_PREFIX, &"a".repeat(64)))
+                    .unwrap();
+            }
+            drop(parent);
+            fs::write(root.join("authority-published"), b"fixed").unwrap();
+            while !root.join("creator-may-exit").exists() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if mode == "authority-creator-abrupt" {
+                // No Rust Drop/final-success path runs in this isolated actor.
+                std::process::exit(23);
+            }
+            // The outer test retains this creator's unreaped group leader.
+            // The observer must outlive this test process to observe its death.
+            drop(child);
+        }
+        "authority-observer" => {
+            let origin = Origin {
+                pid: std::env::var("MORPHEUS_UPDATE_ORIGIN_PID")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+                uid: unsafe { libc::geteuid() },
+            };
+            let mut channel =
+                UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
+            let monitor = ParentExitMonitor::capture(&channel, &origin).unwrap();
+            assert!(!monitor.exited(Duration::ZERO).unwrap());
+            fs::write(root.join("capability-ready"), b"fixed").unwrap();
+            let result = await_original_shutdown(
+                &mut channel,
+                &monitor,
+                &"a".repeat(64),
+                Instant::now() + Duration::from_secs(10),
+            );
+            fs::write(
+                root.join("authority-result"),
+                if result.is_ok() {
+                    b"accepted".as_slice()
+                } else {
+                    b"denied".as_slice()
+                },
+            )
+            .unwrap();
+        }
         "leader" => {
             // Inherit the leader's process group. std::process::Child's Drop
             // deliberately leaves this descendant alive when the leader exits.
@@ -384,6 +707,88 @@ fn process_fixture_child() {
             }
         }
         _ => panic!("unknown process fixture mode"),
+    }
+}
+
+#[test]
+fn original_process_death_and_success_authority_are_independent_required_receipts() {
+    for mode in [
+        "authority-creator-none",
+        "authority-creator-abrupt",
+        "authority-creator-token",
+    ] {
+        let success = mode == "authority-creator-token";
+        let root = tempfile::tempdir().unwrap();
+        let mut creator =
+            OwnedChild::spawn(&mut process_fixture_command(mode, root.path())).unwrap();
+        // Collect every post-spawn observation before assertions. Cleanup must
+        // run even if a wait, fixture metadata/read or native observation fails.
+        let observed = (|| -> Result<(bool, Vec<u8>), &'static str> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root
+                .path()
+                .join("authority-published")
+                .try_exists()
+                .map_err(|_| "authority publication metadata failed")?
+            {
+                if Instant::now() >= deadline {
+                    return Err("authority publication timed out");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // This is only a point observation before releasing the creator;
+            // it does not establish sustained post-token blocking. The actor
+            // independently observes a real live pidfd before readiness, and
+            // the positive result below also requires actual creator death.
+            let no_result_before_release = !root
+                .path()
+                .join("authority-result")
+                .try_exists()
+                .map_err(|_| "authority result metadata failed")?;
+            fs::write(root.path().join("creator-may-exit"), b"fixed")
+                .map_err(|_| "creator release failed")?;
+            loop {
+                let exited = creator
+                    .exited()
+                    .map_err(|_| "creator exit observation failed")?;
+                let result_ready = root
+                    .path()
+                    .join("authority-result")
+                    .try_exists()
+                    .map_err(|_| "authority result metadata failed")?;
+                if exited && result_ready {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err("authority result or creator death timed out");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let result = bounded_read(&root.path().join("authority-result"), 8)
+                .map_err(|_| "authority result read failed")?;
+            Ok((no_result_before_release, result))
+        })();
+        // Retain the unreaped creator through explicit group SIGKILL and leader
+        // reap before checking observations. This does not prove descendant
+        // reap, backend quiescence or a hard bound on the inherited stop call.
+        if creator.stop().is_err() {
+            // An unproved stop must retain the actual ownership object, never
+            // drop it and treat an ignored cleanup error as a receipt.
+            std::mem::forget(creator);
+            panic!("authority fixture cleanup was not confirmed");
+        }
+        let (no_result_before_release, result) = observed.unwrap();
+        if success {
+            assert!(no_result_before_release);
+        }
+        assert_eq!(
+            result,
+            if success {
+                b"accepted".as_slice()
+            } else {
+                b"denied".as_slice()
+            }
+        );
     }
 }
 

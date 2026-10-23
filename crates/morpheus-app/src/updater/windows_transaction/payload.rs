@@ -32,7 +32,7 @@ pub(super) struct Identity {
 
 impl Identity {
     pub fn valid(&self) -> bool {
-        self.protocol == 1
+        self.protocol == 2
             && self.product == "io.github.brk275.morpheus"
             && self.arch == "x86_64"
             && cargo_packager_updater::semver::Version::parse(&self.version).is_ok()

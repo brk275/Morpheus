@@ -61,7 +61,7 @@ impl PackageMetadata {
         }
         let metadata: Self =
             serde_json::from_slice(bytes).map_err(|_| UpdateError::IncompatibleUpdate)?;
-        if metadata.protocol != 1
+        if metadata.protocol != 2
             || metadata.product != "io.github.brk275.morpheus"
             || !matches!(metadata.arch.as_str(), "x86_64" | "aarch64")
             || metadata.version.is_empty()
@@ -1359,6 +1359,8 @@ fn recover_failed_trial(
     Ok(TrialRecovery::RolledBack)
 }
 
+const PARENT_EXIT_NOTES: u32 = libc::NOTE_EXIT | libc::NOTE_EXITSTATUS;
+
 struct ParentExitCookie {
     transaction: String,
 }
@@ -1406,7 +1408,7 @@ impl ParentExitMonitor {
             ident: parent as libc::uintptr_t,
             filter: libc::EVFILT_PROC,
             flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT | libc::EV_RECEIPT,
-            fflags: libc::NOTE_EXIT,
+            fflags: PARENT_EXIT_NOTES,
             data: 0,
             udata: monitor.cookie_pointer(),
         };
@@ -1456,14 +1458,17 @@ impl ParentExitMonitor {
         self.identity_matches(event)
             && event.flags & libc::EV_ERROR != 0
             && event.data == 0
-            && event.fflags == libc::NOTE_EXIT
+            && event.fflags == PARENT_EXIT_NOTES
     }
 
     fn exit_matches(&self, event: &libc::kevent) -> bool {
         self.identity_matches(event)
             && event.flags & libc::EV_ERROR == 0
             && event.flags & (libc::EV_EOF | libc::EV_ONESHOT) == (libc::EV_EOF | libc::EV_ONESHOT)
-            && event.fflags == libc::NOTE_EXIT
+            && event.fflags == PARENT_EXIT_NOTES
+            // NOTE_EXIT alone leaves data zero even for failed shutdown.
+            // With NOTE_EXITSTATUS, Darwin supplies the full wait status;
+            // exact zero admits only a normal successful parent exit.
             && event.data == 0
     }
 
@@ -1506,8 +1511,9 @@ impl ParentExitMonitor {
             {
                 continue;
             }
-            // Timeout, lost/foreign event, EV_ERROR or unexpected receipt is
-            // never replaced with kill(0), a process snapshot or a PID poll.
+            // Failed/signalled shutdown, timeout, lost/foreign events, EV_ERROR
+            // or unexpected receipts are never replaced with kill(0), a
+            // process snapshot or a PID poll.
             return Err(UpdateError::RecoveryRequired);
         }
     }

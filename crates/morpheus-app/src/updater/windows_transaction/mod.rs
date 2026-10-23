@@ -1237,8 +1237,10 @@ fn supervisor_admitted(root: &Path, id: &str) -> Result<(), UpdateError> {
         journal.helper_hash.as_bytes(),
     )?;
     // This real OS handle is bound to creation time, never a process-name kill
-    // or a reusable PID wait. Timeout leaves installation/backup untouched.
-    if !parent.wait(60_000)? {
+    // or a reusable PID wait. Only a confirmed successful old-app exit permits
+    // forward apply. Timeout, query failure and nonzero/exception exit leave the
+    // prepared installation and backup untouched for subsequent recovery.
+    if !parent.wait_for_successful_exit(60_000)? {
         return Err(UpdateError::RestartFailed);
     }
     let session = WindowsSession::lock(&root.path, journal.old.identity.clone())?;

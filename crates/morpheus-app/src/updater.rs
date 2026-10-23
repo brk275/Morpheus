@@ -513,6 +513,33 @@ impl StartupSession {
     }
 }
 
+/// Consume the final Linux handoff authority only after the ordinary app
+/// function returned successfully and dropped all UI/runtime/owner locals.
+/// Missing unique ownership is uncertainty, never a successful shutdown receipt.
+#[cfg(target_os = "linux")]
+pub fn complete_linux_shutdown(
+    startup: Arc<std::sync::Mutex<StartupSession>>,
+) -> Result<(), UpdateError> {
+    let pending = startup
+        .lock()
+        .map_err(|_| UpdateError::RecoveryRequired)?
+        .appimage
+        .as_ref()
+        .is_some_and(AppImageSession::shutdown_pending);
+    if !pending {
+        return Ok(());
+    }
+    let mut startup = Arc::try_unwrap(startup)
+        .map_err(|_| UpdateError::RecoveryRequired)?
+        .into_inner()
+        .map_err(|_| UpdateError::RecoveryRequired)?;
+    startup
+        .appimage
+        .take()
+        .ok_or(UpdateError::RecoveryRequired)?
+        .complete_successful_shutdown()
+}
+
 /// One shared exclusion gate for call joins and updater installation.
 #[derive(Clone, Default)]
 pub struct UpdateActivity(Arc<AtomicU8>);

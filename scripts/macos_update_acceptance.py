@@ -271,7 +271,7 @@ def helper_ticket(root, nonce, parent, old, new):
             and journal.get("new_hash") == new["bundle_sha256"])
     candidate = journal["candidate"]
     require(type(candidate) is dict and set(candidate) == {"protocol", "product", "version", "arch", "persistence"}
-            and type(candidate["protocol"]) is int and candidate["protocol"] == 1
+            and type(candidate["protocol"]) is int and candidate["protocol"] == 2
             and candidate["product"] == "io.github.brk275.morpheus" and candidate["version"] == new["version"]
             and candidate["arch"] == new["arch"] and candidate["persistence"] == new["persistence"])
     return ticket
