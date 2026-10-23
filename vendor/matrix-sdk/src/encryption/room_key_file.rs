@@ -245,4 +245,108 @@ mod tests {
             RoomKeyFileImportSummary { imported_count: 0, total_count: 0, file_key_count: 0 }
         );
     }
+
+    // New ephemeral native keys only: no copied secret fixture, server, vault or
+    // account data. These cases run through the SDK public byte/store API even
+    // though the path-patched crypto package is excluded from workspace tests.
+    fn generated_key() -> ExportedRoomKey {
+        use matrix_sdk_base::crypto::{
+            types::{EventEncryptionAlgorithm, SigningKeys},
+            vodozemac::{
+                megolm::{GroupSession, InboundGroupSession as NativeInbound, SessionConfig},
+                olm::Account,
+            },
+        };
+        use ruma::{DeviceKeyAlgorithm, room_id};
+
+        let account = Account::new();
+        let identity = account.identity_keys();
+        let group = GroupSession::new(SessionConfig::version_1());
+        let inbound = NativeInbound::new(&group.session_key(), SessionConfig::version_1());
+        let mut signing = SigningKeys::new();
+        signing.insert(DeviceKeyAlgorithm::Ed25519, identity.ed25519.into());
+        ExportedRoomKey {
+            algorithm: EventEncryptionAlgorithm::MegolmV1AesSha2,
+            room_id: room_id!("!room-key-fixture:example.org").to_owned(),
+            sender_key: identity.curve25519,
+            session_id: group.session_id(),
+            session_key: inbound.export_at_first_known_index(),
+            sender_claimed_keys: signing,
+            forwarding_curve25519_key_chain: Vec::new(),
+            shared_history: false,
+        }
+    }
+
+    #[async_test]
+    async fn test_nonempty_legacy_import_reexports_to_an_independent_store() {
+        use matrix_sdk_base::crypto::{decrypt_room_key_export_bounded, encrypt_room_key_export};
+
+        let key = generated_key();
+        let expected_room = key.room_id.clone();
+        let expected_session = key.session_id.clone();
+        let legacy = encrypt_room_key_export(&[key], "legacy-test-passphrase", 1)
+            .expect("Synthetic legacy export serializes");
+        let prepared = prepare_room_key_import(legacy.as_bytes(), "legacy-test-passphrase")
+            .unwrap_or_else(|_| panic!("Generated nonempty export must authenticate"));
+        assert_eq!(prepared.key_count(), 1);
+        let first_client = logged_in_client(None).await;
+        let first = first_client.encryption();
+        let result = first.room_key_import_store().await.unwrap().import(prepared).await.unwrap();
+        assert_eq!(
+            result,
+            RoomKeyFileImportSummary { imported_count: 1, total_count: 1, file_key_count: 1 }
+        );
+        let snapshot = first.prepare_room_key_export().await.unwrap();
+        assert_eq!(snapshot.key_count(), 1);
+        let encrypted = snapshot.encrypt("fresh-export-passphrase").unwrap();
+        let decoded =
+            decrypt_room_key_export_bounded(encrypted.as_bytes(), "fresh-export-passphrase")
+                .unwrap_or_else(|_| panic!("Reexport must authenticate"));
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].room_id, expected_room);
+        assert_eq!(decoded[0].session_id, expected_session);
+        drop(decoded);
+
+        let second_client = logged_in_client(None).await;
+        let second = second_client.encryption();
+        assert_eq!(second.prepare_room_key_export().await.unwrap().key_count(), 0);
+        let restored = prepare_room_key_import(encrypted.as_bytes(), "fresh-export-passphrase")
+            .unwrap_or_else(|_| panic!("Fresh export must prepare for a separate store"));
+        let result = second.room_key_import_store().await.unwrap().import(restored).await.unwrap();
+        assert_eq!(
+            result,
+            RoomKeyFileImportSummary { imported_count: 1, total_count: 1, file_key_count: 1 }
+        );
+        assert_eq!(second.prepare_room_key_export().await.unwrap().key_count(), 1);
+    }
+
+    #[test]
+    fn public_api_refuses_authenticated_over_count_before_store_admission() {
+        use matrix_sdk_base::crypto::{encrypt_room_key_export, encrypt_room_key_export_bounded};
+
+        let key = generated_key();
+        let encoded =
+            zeroize::Zeroizing::new(serde_json::to_string(&key).expect("Synthetic key serializes"));
+        let keys: Vec<ExportedRoomKey> = (0..=ROOM_KEY_FILE_MAX_KEYS)
+            .map(|_| {
+                serde_json::from_str(&encoded)
+                    .unwrap_or_else(|_| panic!("Generated synthetic key must decode"))
+            })
+            .collect();
+        // Writer rejects the complete over-limit snapshot, rather than emitting
+        // a truncated backup or doing expensive export KDF work first.
+        assert!(matches!(
+            encrypt_room_key_export_bounded(&keys, "test-export-passphrase"),
+            Err(BoundedKeyExportError::Limit)
+        ));
+        // Legacy public API produces an authenticated over-count input. Its low
+        // work factor is deliberate fixture setup; import retains compatibility.
+        let bytes = encrypt_room_key_export(&keys, "legacy-test-passphrase", 1)
+            .expect("Synthetic over-count legacy file serializes");
+        assert!(bytes.len() <= ROOM_KEY_FILE_MAX_BYTES, "Count must be the refusing limit");
+        assert!(matches!(
+            prepare_room_key_import(bytes.as_bytes(), "legacy-test-passphrase"),
+            Err(RoomKeyFileError::File(BoundedKeyExportError::Limit))
+        ));
+    }
 }
