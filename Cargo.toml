@@ -9,6 +9,7 @@ members = [
     "crates/morpheus-rtc",
     "crates/morpheus-ui-check",
     "vendor/lru",
+    "vendor/cpal",
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
     "vendor/matrix-rtc-core",
@@ -32,6 +33,8 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/brk275/Morpheus"
 
 [patch.crates-io]
+# Same-version CPAL: retained, fallible macOS native shutdown.
+cpal = { path = "vendor/cpal" }
 # Bound lossless WebP entropy-tree amplification before allocating groups.
 image-webp = { path = "vendor/image-webp" }
 # Isolate pinned WebRTC PipeWire stubs from the system PipeWire API on Linux.

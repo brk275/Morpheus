@@ -129,6 +129,8 @@ use crate::voice_spaces::VoiceSpaces;
 enum ShutdownFailure {
     #[cfg(feature = "native-calls")]
     NativeCall,
+    #[cfg(all(feature = "native-calls", target_os = "macos"))]
+    AudioBackend,
     UpdateWorker,
 }
 
@@ -137,6 +139,10 @@ impl std::fmt::Display for ShutdownFailure {
         match self {
             #[cfg(feature = "native-calls")]
             Self::NativeCall => formatter.write_str("Native call shutdown could not be confirmed."),
+            #[cfg(all(feature = "native-calls", target_os = "macos"))]
+            Self::AudioBackend => {
+                formatter.write_str("Native audio backend shutdown could not be confirmed.")
+            }
             Self::UpdateWorker => {
                 formatter.write_str("Update worker shutdown could not be confirmed.")
             }
@@ -4814,6 +4820,14 @@ fn run_application(
         // Still flush drafts and stop the manager; failure is returned below.
         eprintln!("Could not release attachment audio during shutdown: {error}");
     }
+    #[cfg(all(feature = "native-calls", target_os = "macos"))]
+    let backend_result = runtime
+        .block_on(morpheus_rtc::wait_for_all_coreaudio_release())
+        .map_err(|_| ShutdownFailure::AudioBackend);
+    #[cfg(all(feature = "native-calls", target_os = "macos"))]
+    if backend_result.is_err() {
+        eprintln!("Could not confirm native audio backend shutdown.");
+    }
     let draft_result = runtime.block_on(live.flush_drafts());
     runtime.block_on(manager.stop());
     let update_result = update_result.map_err(|_| ShutdownFailure::UpdateWorker);
@@ -4834,6 +4848,8 @@ fn run_application(
     // UI, draft, attachment, device-opening and ringing errors retain their
     // precedence. Failed call cleanup or an update drain must also prevent a
     // successful ordinary-shutdown result.
+    #[cfg(all(feature = "native-calls", target_os = "macos"))]
+    backend_result?;
     call_result?;
     update_result?;
     #[cfg(morpheus_timeline_acceptance)]
@@ -4861,6 +4877,16 @@ mod discovery_tests {
             assert_eq!(
                 failure.to_string(),
                 "Native call shutdown could not be confirmed."
+            );
+            assert!(std::error::Error::source(&failure).is_none());
+        }
+        #[cfg(all(feature = "native-calls", target_os = "macos"))]
+        {
+            let failure = ShutdownFailure::AudioBackend;
+            assert_eq!(format!("{failure:?}"), "AudioBackend");
+            assert_eq!(
+                failure.to_string(),
+                "Native audio backend shutdown could not be confirmed."
             );
             assert!(std::error::Error::source(&failure).is_none());
         }

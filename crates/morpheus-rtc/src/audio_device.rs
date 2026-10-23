@@ -49,6 +49,8 @@ pub enum AudioDeviceReleaseError {
     TimedOut,
     WorkerPanicked,
     SupervisorFailed,
+    #[cfg(target_os = "macos")]
+    NativeClose,
 }
 impl std::fmt::Display for AudioDeviceReleaseError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,6 +58,8 @@ impl std::fmt::Display for AudioDeviceReleaseError {
             Self::TimedOut => "audio device opener release was not confirmed before the deadline",
             Self::WorkerPanicked => "audio device opener panicked during startup or release",
             Self::SupervisorFailed => "audio device opener ownership could not be confirmed",
+            #[cfg(target_os = "macos")]
+            Self::NativeClose => "CoreAudio native cleanup failed and remains owned",
         })
     }
 }
@@ -125,7 +129,15 @@ async fn wait_for_device_release(bound: Duration) -> Result<(), AudioDeviceRelea
             &mut DEVICE_OPEN_OWNER.lock().unwrap_or_else(|e| e.into_inner()),
         );
         if let Some(result) = released {
-            return result;
+            result?;
+            #[cfg(target_os = "macos")]
+            crate::coreaudio_close::wait_for_retired_coreaudio_release()
+                .await
+                .map_err(|error| match error {
+                    crate::CoreAudioCloseError::TimedOut => AudioDeviceReleaseError::TimedOut,
+                    _ => AudioDeviceReleaseError::NativeClose,
+                })?;
+            return Ok(());
         }
         if tokio::time::Instant::now() >= until {
             return Err(AudioDeviceReleaseError::TimedOut);
@@ -1704,7 +1716,7 @@ impl RtcService {
                             }
                             // The capture stream ended without reporting why.
                             None => {
-                                let notice = local.lose_microphone(StreamFault::Lost);
+                                let notice = local.lose_microphone(controls, StreamFault::Lost).await?;
                                 local.report(controls, Some(notice));
                                 reconnect.reset();
                             }
@@ -1755,11 +1767,18 @@ impl RtcService {
         }
         .await;
         // Close the devices before unpublishing, as before the loop owned them.
+        let _ = publication.set_muted(true);
         drop(local);
         drop(remotes);
+        #[cfg(target_os = "macos")]
+        let native_close = crate::coreaudio_close::wait_for_retired_coreaudio_release().await;
         let _ = publication.set_muted(true);
         let _ = publication.unpublish().await;
-        result
+        result?;
+        #[cfg(target_os = "macos")]
+        native_close
+            .map_err(|_| MediaError::Device("CoreAudio native cleanup is not confirmed".into()))?;
+        Ok(())
     }
 
     /// Backward-compatible name for the original two-person proof. The audio
@@ -1820,11 +1839,8 @@ fn run_device_open<T: Send + 'static>(
     }
     loop {
         if state.taken {
-            return if panicked {
-                Err(AudioDeviceReleaseError::WorkerPanicked)
-            } else {
-                Ok(())
-            };
+            drop(state);
+            return finish_device_open(panicked);
         }
         if state.retired || !handoff.waiting.load(Ordering::Acquire) || !controls.is_authorized() {
             state.retired = true;
@@ -1834,11 +1850,7 @@ fn run_device_open<T: Send + 'static>(
             // Late results and receiver cancellation destroy it here, outside
             // every mutex, before the supervisor can join this thread's TLS.
             drop(unclaimed);
-            return if panicked {
-                Err(AudioDeviceReleaseError::WorkerPanicked)
-            } else {
-                Ok(())
-            };
+            return finish_device_open(panicked);
         }
         state = handoff
             .changed
@@ -1848,11 +1860,24 @@ fn run_device_open<T: Send + 'static>(
     }
 }
 
+fn finish_device_open(panicked: bool) -> Result<(), AudioDeviceReleaseError> {
+    #[cfg(target_os = "macos")]
+    let native = crate::coreaudio_close::close_retired_coreaudio_on_owned_worker();
+    if panicked {
+        return Err(AudioDeviceReleaseError::WorkerPanicked);
+    }
+    #[cfg(target_os = "macos")]
+    native.map_err(|_| AudioDeviceReleaseError::NativeClose)?;
+    // Other platforms retain only the original application worker/TLS receipt.
+    Ok(())
+}
+
 /// Open devices on one retained native owner. Its supervisor is published
 /// before the actual worker may exist, and the global fence clears only after
 /// real join/TLS completion. Native open/drop already entered is non-preemptible;
-/// waits stay bounded and failed ownership remains fenced. This does not prove
-/// CPAL's detached backend monitors or native disposal status.
+/// waits stay bounded and failed ownership remains fenced. On macOS the worker
+/// also consumes the explicit retired-backend close result. Other hosts retain
+/// the narrower application-worker/TLS receipt and their native disposal limits.
 async fn open_on_device_thread<T: Send + 'static>(
     controls: &AudioControls,
     open: impl FnOnce(&OpenGate<'_>) -> Result<T, MediaError> + Send + 'static,
@@ -1869,6 +1894,12 @@ async fn open_with_supervisor<T: Send + 'static>(
     open: impl FnOnce(&OpenGate<'_>) -> Result<T, MediaError> + Send + 'static,
     spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>> + Send,
 ) -> Result<T, MediaError> {
+    #[cfg(target_os = "macos")]
+    tokio::select! {
+        biased;
+        _ = controls.cancelled() => return Err(MediaError::CallEnded),
+        closed = crate::coreaudio_close::wait_for_retired_coreaudio_release() => closed.map_err(|_| MediaError::Device("CoreAudio native cleanup is not confirmed".into()))?,
+    }
     // Sequential microphone/speaker opens must not lose a route merely because
     // a successfully handed-off previous result is finishing its joined tail.
     // A genuinely pending/retired opener still fails busy, never starts a pool.
@@ -2234,6 +2265,20 @@ fn route_for(
     }
 }
 
+/// A route replacement may already hold its new stream while retiring the old one.
+/// Cancellation drops that new value immediately; its native backend stays owned.
+#[cfg(target_os = "macos")]
+async fn wait_for_route_close(controls: &AudioControls) -> Result<(), MediaError> {
+    tokio::select! {
+        biased;
+        _ = controls.cancelled() => Err(MediaError::CallEnded),
+        result = crate::coreaudio_close::wait_for_retired_coreaudio_release() => {
+            result.map_err(|_| MediaError::Device("CoreAudio route cleanup is not confirmed".into()))?;
+            controls.ensure_authorized()
+        }
+    }
+}
+
 /// The devices one join's audio loop uses, against the route the user chose.
 struct LocalAudio {
     /// The route the open devices answer, side by side.
@@ -2433,6 +2478,11 @@ impl LocalAudio {
                     // Nothing recorded before the swap is sent.
                     microphone.discard_buffered_frames();
                     controls.ensure_authorized()?;
+                    let previous = self.microphone.take();
+                    drop(previous);
+                    #[cfg(target_os = "macos")]
+                    wait_for_route_close(controls).await?;
+                    controls.ensure_authorized()?;
                     self.microphone = Some(microphone);
                     self.microphone_lost = false;
                     self.lost_microphone_id = None;
@@ -2456,6 +2506,11 @@ impl LocalAudio {
             match open_speaker(controls, wanted.speaker.clone()).await {
                 Ok(speaker) => {
                     controls.install_speaker(&speaker)?;
+                    let previous = self.speaker.take();
+                    drop(previous);
+                    #[cfg(target_os = "macos")]
+                    wait_for_route_close(controls).await?;
+                    controls.ensure_authorized()?;
                     self.speaker = Some(speaker);
                     self.speaker_lost = false;
                     self.speaker_fallback = false;
@@ -2483,7 +2538,11 @@ impl LocalAudio {
     /// Stop using a microphone whose stream was lost. Its exact device is
     /// the only one waited for; capture resumes only on it, or on a new
     /// choice. The track and the mute state are untouched.
-    fn lose_microphone(&mut self, fault: StreamFault) -> RouteNotice {
+    async fn lose_microphone(
+        &mut self,
+        controls: &AudioControls,
+        fault: StreamFault,
+    ) -> Result<RouteNotice, MediaError> {
         self.lost_microphone_id = self
             .microphone
             .take()
@@ -2494,7 +2553,9 @@ impl LocalAudio {
             StreamFault::Denied => RouteNotice::MicrophoneDenied,
             StreamFault::Lost => RouteNotice::MicrophoneLost,
         };
-        self.microphone_loss
+        #[cfg(target_os = "macos")]
+        wait_for_route_close(controls).await?;
+        Ok(self.microphone_loss)
     }
 
     /// Replace a lost speaker. Output only: playing through the system default
@@ -2503,8 +2564,10 @@ impl LocalAudio {
     /// lost is not replaced by yet another device.
     async fn lose_speaker(&mut self, controls: &AudioControls) -> Result<RouteNotice, MediaError> {
         let was_fallback = self.speaker_fallback;
-        self.speaker = None;
         controls.release_speaker();
+        self.speaker = None;
+        #[cfg(target_os = "macos")]
+        wait_for_route_close(controls).await?;
         self.speaker_lost = true;
         self.speaker_fallback = false;
         self.speaker_rerouted = false;
@@ -2539,7 +2602,7 @@ impl LocalAudio {
             .as_ref()
             .and_then(|microphone| microphone.health.take_fault())
         {
-            notice = Some(self.lose_microphone(fault));
+            notice = Some(self.lose_microphone(controls, fault).await?);
             changed = true;
         }
         if self
@@ -2589,6 +2652,11 @@ impl LocalAudio {
             match open_microphone(controls, Some(target)).await {
                 Ok(mut microphone) => {
                     microphone.discard_buffered_frames();
+                    let previous = self.microphone.take();
+                    drop(previous);
+                    #[cfg(target_os = "macos")]
+                    wait_for_route_close(controls).await?;
+                    controls.ensure_authorized()?;
                     self.microphone = Some(microphone);
                     self.microphone_lost = false;
                     self.lost_microphone_id = None;
@@ -2611,6 +2679,11 @@ impl LocalAudio {
             match open_speaker(controls, target.clone()).await {
                 Ok(speaker) => {
                     controls.install_speaker(&speaker)?;
+                    let previous = self.speaker.take();
+                    drop(previous);
+                    #[cfg(target_os = "macos")]
+                    wait_for_route_close(controls).await?;
+                    controls.ensure_authorized()?;
                     self.speaker = Some(speaker);
                     self.speaker_lost = false;
                     self.speaker_fallback = false;
@@ -3297,6 +3370,20 @@ mod tests {
             assert_eq!(steps.get(), cancel_at);
             assert_eq!(dropped.get(), created.get());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cancelled_route_does_not_start_an_observer_or_keep_its_prepared_value_live() {
+        let controls = guarded_controls(|| true);
+        controls.cancel();
+        // The actual route barrier must prefer irrevocable authority cancellation
+        // even when a backend-close observation could also complete immediately.
+        assert!(matches!(
+            wait_for_route_close(&controls).await,
+            Err(MediaError::CallEnded)
+        ));
+        assert!(controls.applied_state().microphone_muted);
     }
 
     #[test]

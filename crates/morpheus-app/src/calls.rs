@@ -3940,6 +3940,8 @@ mod tests {
             morpheus_rtc::AudioDeviceReleaseError::TimedOut,
             morpheus_rtc::AudioDeviceReleaseError::WorkerPanicked,
             morpheus_rtc::AudioDeviceReleaseError::SupervisorFailed,
+            #[cfg(target_os = "macos")]
+            morpheus_rtc::AudioDeviceReleaseError::NativeClose,
         ] {
             assert!(matches!(
                 controller.abandon_failed_leave_after_opener(async { Err(error) }).await,

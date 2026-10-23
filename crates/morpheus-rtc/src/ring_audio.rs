@@ -82,6 +82,129 @@ impl Drop for Permit {
     }
 }
 
+// Mac native teardown is fallible after the PCM producer returns or unwinds.
+// One process-retained slot owns the exact Permit before the first native step;
+// no playback handle, stack unwind or cancelled observer can drop that guard.
+#[cfg(target_os = "macos")]
+static PCM_NATIVE_OWNERS: PcmNativeOwners = PcmNativeOwners::new();
+#[cfg(target_os = "macos")]
+const PCM_FRESH: u8 = 0;
+#[cfg(target_os = "macos")]
+const PCM_PRODUCING: u8 = 1;
+#[cfg(target_os = "macos")]
+const PCM_TERMINAL: u8 = 2;
+#[cfg(target_os = "macos")]
+const PCM_CLOSING: u8 = 3;
+#[cfg(target_os = "macos")]
+const PCM_RELEASED: u8 = 4;
+#[cfg(target_os = "macos")]
+const PCM_FAILED: u8 = 5;
+#[cfg(target_os = "macos")]
+struct PcmNativeIdentity(AtomicU8);
+#[cfg(target_os = "macos")]
+impl PcmNativeIdentity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(AtomicU8::new(PCM_FRESH)))
+    }
+}
+#[cfg(target_os = "macos")]
+struct PcmNativeOwner {
+    identity: Arc<PcmNativeIdentity>,
+    _permit: Permit,
+}
+#[cfg(target_os = "macos")]
+struct PcmNativeOwners(Mutex<Option<PcmNativeOwner>>);
+#[cfg(target_os = "macos")]
+impl PcmNativeOwners {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+    fn admit(
+        &self,
+        identity: &Arc<PcmNativeIdentity>,
+        run: &Run,
+    ) -> Result<PcmProducer, RingAudioError> {
+        let mut owner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if owner.is_some() {
+            return Err(RingAudioError::Busy);
+        }
+        if !run.active() {
+            return Err(RingAudioError::Cancelled);
+        }
+        let permit = Permit::take().ok_or(RingAudioError::Busy)?;
+        // Each playback can produce only once. An old terminal/close observer
+        // can never become the release authority for a later production body.
+        identity
+            .0
+            .compare_exchange(
+                PCM_FRESH,
+                PCM_PRODUCING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| RingAudioError::Busy)?;
+        *owner = Some(PcmNativeOwner {
+            identity: identity.clone(),
+            _permit: permit,
+        });
+        Ok(PcmProducer(identity.clone()))
+    }
+    fn close_with(
+        &self,
+        identity: &Arc<PcmNativeIdentity>,
+        close: impl FnOnce() -> Result<(), ()>,
+    ) -> Result<(), ()> {
+        match identity.0.compare_exchange(
+            PCM_TERMINAL,
+            PCM_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            // Fresh means this playback never admitted native PCM. Released
+            // means its exact checked close already succeeded. Neither path
+            // touches another playback's owner or claims a new native close.
+            Err(PCM_FRESH | PCM_RELEASED) => return Ok(()),
+            // In particular, stop/cancel cannot release a producing body, and
+            // concurrent close, panic or terminal uncertainty never retries it.
+            Err(_) => return Err(()),
+        }
+        // No registry lock is held across native teardown. A panic leaves the
+        // exact owner in PCM_CLOSING and keeps its guard retained indefinitely.
+        if close().is_err() {
+            identity.0.store(PCM_FAILED, Ordering::Release);
+            return Err(());
+        }
+        let mut owner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(&owner.identity, identity))
+        {
+            identity.0.store(PCM_FAILED, Ordering::Release);
+            return Err(());
+        }
+        drop(owner.take());
+        identity.0.store(PCM_RELEASED, Ordering::Release);
+        Ok(())
+    }
+}
+#[cfg(target_os = "macos")]
+struct PcmProducer(Arc<PcmNativeIdentity>);
+#[cfg(target_os = "macos")]
+impl Drop for PcmProducer {
+    fn drop(&mut self) {
+        // This marker is created before open_pcm and destroyed only after its
+        // frame (including stream/sample Drop) has returned or fully unwound.
+        // It grants no cleanup receipt and never releases the actual Permit.
+        let _ = self.0.0.compare_exchange(
+            PCM_PRODUCING,
+            PCM_TERMINAL,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
 /// Fixed categories; backend errors and endpoint IDs are never retained/logged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RingAudioError {
@@ -124,6 +247,8 @@ pub enum RingAudioReleaseError {
     WorkerPanicked,
     SupervisorFailed,
     OutputOwnerUnconfirmed,
+    #[cfg(target_os = "macos")]
+    NativeClose,
 }
 impl std::fmt::Display for RingAudioReleaseError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -131,6 +256,8 @@ impl std::fmt::Display for RingAudioReleaseError {
             Self::TimedOut => "incoming sound worker release was not confirmed before the deadline",
             Self::WorkerPanicked => "incoming sound worker panicked during playback or release",
             Self::SupervisorFailed => "incoming sound worker ownership could not be confirmed",
+            #[cfg(target_os = "macos")]
+            Self::NativeClose => "CoreAudio incoming sound cleanup failed and remains owned",
             Self::OutputOwnerUnconfirmed => {
                 "the previous output worker release could not be confirmed"
             }
@@ -313,9 +440,13 @@ fn run_ring_worker(
         }
         work(&run, &resources)
     }));
+    #[cfg(target_os = "macos")]
+    let native_close = crate::coreaudio_close::close_retired_coreaudio_on_owned_worker();
     let released = match &result {
         Err(_) => Err(RingAudioReleaseError::WorkerPanicked),
         Ok(Err(RingWorkerError::Release(error))) => Err(*error),
+        #[cfg(target_os = "macos")]
+        _ if native_close.is_err() => Err(RingAudioReleaseError::NativeClose),
         _ => Ok(()),
     };
     let failed = released.is_err()
@@ -648,7 +779,7 @@ impl Tone {
 #[cfg(test)]
 mod tests {
     use super::*;
-    static PERMIT_TEST: Mutex<()> = Mutex::new(());
+    pub(super) static PERMIT_TEST: Mutex<()> = Mutex::new(());
     struct RingTlsHold {
         entered: std::sync::mpsc::SyncSender<()>,
         release: std::sync::mpsc::Receiver<()>,
@@ -1164,8 +1295,9 @@ mod tests {
     }
 }
 
-/// One explicit attachment's output state. The caller owns its single worker
-/// permit until play_pcm returns, after destruction of the actual native stream.
+/// One explicit attachment's output state. Mac retains its exact output permit
+/// through terminal production and checked native cleanup, including unwind;
+/// other platforms retain their existing stream-Drop ownership boundary.
 /// These controls never touch microphone capture, a call mixer, route or OS volume.
 pub struct PcmPlayback {
     run: Arc<Run>,
@@ -1174,6 +1306,10 @@ pub struct PcmPlayback {
     consumed: AtomicU64,
     total: AtomicU64,
     rate: AtomicU32,
+    #[cfg(target_os = "macos")]
+    native_close_failed: AtomicBool,
+    #[cfg(target_os = "macos")]
+    native_identity: Arc<PcmNativeIdentity>,
 }
 impl PcmPlayback {
     /// Original output epoch: a ringtone reservation permanently retires it,
@@ -1200,6 +1336,10 @@ impl PcmPlayback {
             consumed: AtomicU64::new(0),
             total: AtomicU64::new(0),
             rate: AtomicU32::new(0),
+            #[cfg(target_os = "macos")]
+            native_close_failed: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            native_identity: PcmNativeIdentity::new(),
         })
     }
     pub fn stop(&self) {
@@ -1218,6 +1358,28 @@ impl PcmPlayback {
     }
     pub fn unavailable(&self) -> bool {
         self.run.status.load(Ordering::Acquire) == 3
+    }
+    #[cfg(target_os = "macos")]
+    pub fn native_close_failed(&self) -> bool {
+        self.native_close_failed.load(Ordering::Acquire)
+    }
+    /// On the actual application owner thread only, after play_pcm has
+    /// returned/unwound. An early/concurrent call fails without native teardown
+    /// or releasing the still-producing owner's guard. A terminal native error
+    /// remains owned; only this exact terminal producer's checked success can
+    /// release it. This is separate from the application's actual worker/TLS join.
+    #[cfg(target_os = "macos")]
+    pub fn close_native_output_on_owned_worker(&self) -> Result<(), RingAudioError> {
+        self.stop();
+        PCM_NATIVE_OWNERS
+            .close_with(&self.native_identity, || {
+                crate::coreaudio_close::close_retired_coreaudio_on_owned_worker().map_err(|_| ())
+            })
+            .map_err(|()| {
+                self.native_close_failed.store(true, Ordering::Release);
+                self.run.status.store(3, Ordering::Release);
+                RingAudioError::Unavailable
+            })
     }
     pub fn active(&self) -> bool {
         self.run.active()
@@ -1263,14 +1425,35 @@ impl PcmPlayback {
             return Err(RingAudioError::Cancelled);
         }
         // No waiting/retry or extra native opener on an explicit Play.
+        #[cfg(target_os = "macos")]
+        let producer = PCM_NATIVE_OWNERS.admit(&self.native_identity, &self.run)?;
+        #[cfg(not(target_os = "macos"))]
         let _permit = Permit::take().ok_or(RingAudioError::Busy)?;
-        if !self.run.active() {
-            return Err(RingAudioError::Cancelled);
+        #[cfg(not(target_os = "macos"))]
+        let result = {
+            if !self.run.active() {
+                return Err(RingAudioError::Cancelled);
+            }
+            self.total
+                .store((samples.len() / count) as u64, Ordering::Release);
+            self.rate.store(rate, Ordering::Release);
+            self.open_pcm(samples, rate, channels)
+        };
+        #[cfg(target_os = "macos")]
+        let result = if self.run.active() {
+            self.total
+                .store((samples.len() / count) as u64, Ordering::Release);
+            self.rate.store(rate, Ordering::Release);
+            self.open_pcm(samples, rate, channels)
+        } else {
+            Err(RingAudioError::Cancelled)
+        };
+        #[cfg(target_os = "macos")]
+        drop(producer);
+        #[cfg(target_os = "macos")]
+        if self.close_native_output_on_owned_worker().is_err() {
+            return result.and(Err(RingAudioError::Unavailable));
         }
-        self.total
-            .store((samples.len() / count) as u64, Ordering::Release);
-        self.rate.store(rate, Ordering::Release);
-        let result = self.open_pcm(samples, rate, channels);
         if result == Err(RingAudioError::Unavailable) {
             self.run.status.store(3, Ordering::Release);
         } else if self.run.status.load(Ordering::Acquire) != 3 {
@@ -1434,6 +1617,153 @@ fn fill_pcm<T: ToneSample>(
 #[cfg(test)]
 mod pcm_tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pcm_guard_requires_terminal_producer_and_exact_checked_close_before_release() {
+        let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
+        let owners = PcmNativeOwners::new();
+        let state = PcmPlayback::new(Arc::new(|| true));
+        let producer = owners.admit(&state.native_identity, &state.run).unwrap();
+        assert!(Permit::take().is_none());
+        state.stop();
+        assert_eq!(
+            owners.close_with(&state.native_identity, || panic!("producer is still live")),
+            Err(())
+        );
+        assert_eq!(
+            state.native_identity.0.load(Ordering::Acquire),
+            PCM_PRODUCING
+        );
+        assert!(Permit::take().is_none());
+        drop(producer);
+        assert_eq!(
+            state.native_identity.0.load(Ordering::Acquire),
+            PCM_TERMINAL
+        );
+        assert!(
+            Permit::take().is_none(),
+            "terminal is not a cleanup receipt"
+        );
+        let closed = AtomicBool::new(false);
+        assert_eq!(
+            owners.close_with(&state.native_identity, || {
+                closed.store(true, Ordering::Release);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert!(closed.load(Ordering::Acquire));
+        assert!(owners.0.lock().unwrap().is_none());
+        assert!(Permit::take().is_some());
+        // A stale released identity cannot close/release a later generation.
+        let next = PcmPlayback::new(Arc::new(|| true));
+        let next_producer = owners.admit(&next.native_identity, &next.run).unwrap();
+        assert_eq!(
+            owners.close_with(&state.native_identity, || panic!("stale close ran")),
+            Ok(())
+        );
+        assert!(Permit::take().is_none());
+        assert!(Arc::ptr_eq(
+            &owners.0.lock().unwrap().as_ref().unwrap().identity,
+            &next.native_identity
+        ));
+        drop(next_producer);
+        assert_eq!(owners.close_with(&next.native_identity, || Ok(())), Ok(()));
+        assert!(Permit::take().is_some());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pcm_producer_panic_keeps_exact_guard_until_authentic_terminal_cleanup() {
+        let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
+        let owners = PcmNativeOwners::new();
+        let state = PcmPlayback::new(Arc::new(|| true));
+        let producer = owners.admit(&state.native_identity, &state.run).unwrap();
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _producer = producer;
+            panic!("synthetic PCM producer failure");
+        }));
+        assert!(
+            operation.is_err(),
+            "cleanup must not replace original panic"
+        );
+        assert_eq!(
+            state.native_identity.0.load(Ordering::Acquire),
+            PCM_TERMINAL
+        );
+        assert!(
+            Permit::take().is_none(),
+            "unwind must not drop the output guard"
+        );
+        assert!(owners.0.lock().unwrap().is_some());
+        assert_eq!(owners.close_with(&state.native_identity, || Ok(())), Ok(()));
+        assert!(Permit::take().is_some());
+        assert!(operation.is_err());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pcm_native_close_error_or_panic_retains_single_owner_without_retry() {
+        let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
+        for panic_close in [false, true] {
+            let owners = PcmNativeOwners::new();
+            let state = PcmPlayback::new(Arc::new(|| true));
+            let producer = owners.admit(&state.native_identity, &state.run).unwrap();
+            drop(producer);
+            let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owners.close_with(&state.native_identity, || {
+                    if panic_close {
+                        panic!("synthetic native close panic");
+                    }
+                    Err(())
+                })
+            }));
+            if panic_close {
+                assert!(closed.is_err());
+                assert_eq!(state.native_identity.0.load(Ordering::Acquire), PCM_CLOSING);
+            } else {
+                assert_eq!(closed.unwrap(), Err(()));
+                assert_eq!(state.native_identity.0.load(Ordering::Acquire), PCM_FAILED);
+            }
+            drop(state);
+            assert!(owners.0.lock().unwrap().is_some());
+            assert!(Permit::take().is_none());
+            let next = PcmPlayback::new(Arc::new(|| true));
+            assert!(matches!(
+                owners.admit(&next.native_identity, &next.run),
+                Err(RingAudioError::Busy)
+            ));
+            let identity = owners.0.lock().unwrap().as_ref().unwrap().identity.clone();
+            assert_eq!(
+                owners.close_with(&identity, || panic!("uncertain close must not retry")),
+                Err(())
+            );
+            assert!(Permit::take().is_none());
+            // These injected closures created no native resource. Only this
+            // local test registry is dropped; production's static owner is not.
+            drop(owners);
+            assert!(Permit::take().is_some());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pcm_cancel_before_admission_has_no_native_guard_or_close_receipt() {
+        let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
+        let owners = PcmNativeOwners::new();
+        let state = PcmPlayback::new(Arc::new(|| true));
+        state.stop();
+        assert!(matches!(
+            owners.admit(&state.native_identity, &state.run),
+            Err(RingAudioError::Cancelled)
+        ));
+        assert_eq!(state.native_identity.0.load(Ordering::Acquire), PCM_FRESH);
+        assert_eq!(
+            owners.close_with(&state.native_identity, || panic!(
+                "nothing entered native PCM"
+            )),
+            Ok(())
+        );
+        assert!(owners.0.lock().unwrap().is_none());
+        assert!(Permit::take().is_some());
+    }
     #[test]
     fn ringtone_reservation_retires_pcm_before_native_wait_and_never_revives_it() {
         let state = OutputArbitration::new();

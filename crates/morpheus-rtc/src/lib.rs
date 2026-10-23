@@ -301,3 +301,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(target_os = "macos", feature = "device-audio"))]
+mod coreaudio_close;
+#[cfg(all(target_os = "macos", feature = "device-audio"))]
+pub use coreaudio_close::{
+    CoreAudioCloseError, close_retired_coreaudio_on_owned_worker, wait_for_all_coreaudio_release,
+    wait_for_retired_coreaudio_release,
+};
