@@ -621,6 +621,7 @@ fn finish_export(
     let display = display_name(&pack);
     let weak = ui.as_weak();
     let failure_ui = ui.as_weak();
+    let write_scope = opened.clone();
     let failure_scope = opened.clone();
     let worker_owner = permit.clone();
     let spawned = worker_owner.spawn(
@@ -628,8 +629,8 @@ fn finish_export(
         move || {
             let result = export_theme_pack(&pack, &path).map_err(|error| error.to_string());
             drop(permit);
-            let _ =
-                weak.upgrade_in_event_loop(move |ui| finish_write(&ui, opened, display, result));
+            let _ = weak
+                .upgrade_in_event_loop(move |ui| finish_write(&ui, write_scope, display, result));
         },
         move || {
             let _ = failure_ui.upgrade_in_event_loop(move |ui| {
