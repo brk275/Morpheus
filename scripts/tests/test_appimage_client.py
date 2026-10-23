@@ -310,7 +310,7 @@ class ToolTests(unittest.TestCase):
                 spec = runtime.manifest()
                 spec["archives"] = {}
                 spec["kernel_headers"] = {}
-                for key in ("musl", "squashfuse", "zlib"):
+                for key in ("musl", "squashfuse", "zlib", "runtime"):
                     spec[key + "_patched_files"] = {}
                 progress = diagnostics.Progress(root)
                 progress.wrapper("build")

@@ -23,7 +23,7 @@ import appimage_client as client
 from appimage_process import download_package_input as download
 
 
-MANIFEST_SHA256 = "8e6ebc154c79b7b35d35289e7e4f915cd1732b1bfa15faa13562db8a97bbc24e"
+MANIFEST_SHA256 = "1ea9da98e5a0976bb039be5edc882503add202769ebded2affb01f274e8e6a81"
 NOTICE_DIR = "usr/share/doc/morpheus-app/appimage-runtime"
 MAX_RUNTIME = 4 * 1024 * 1024
 
@@ -301,7 +301,8 @@ def prepare(runner, root, environment):
     apply("musl", "musl-1.2.4-security-static-pie.patch")
     apply("squashfuse", "squashfuse-0.5.2-security.patch")
     apply("zlib", "zlib-1.3.2-CVE-2026-85091.patch")
-    for key in ("musl", "squashfuse", "zlib"):
+    apply("runtime", "type2-runtime-fedfad51-path-bounds.patch")
+    for key in ("musl", "squashfuse", "zlib", "runtime"):
         for name, expected in spec[key + "_patched_files"].items():
             if digest(client.read_regular(source / key / name, 1048576)) != expected:
                 fail()
@@ -379,6 +380,26 @@ def prepare(runner, root, environment):
     rs = source / "runtime/src/runtime"
     runtime_object = work / "runtime.o"
     args = [str(wrapper), "-std=gnu99", "-Os", "-fPIE", "-D_FILE_OFFSET_BITS=64", '-DGIT_COMMIT="' + spec["version_label"] + '"', "-ffunction-sections", "-fdata-sections", "-ffile-prefix-map=" + str(work) + "=/usr/src/morpheus-runtime", "-Wall", "-Werror", "-I" + str(prefix / "include/squashfuse"), "-I" + str(prefix / "include/fuse3"), "-c", str(rs / "runtime.c"), "-o", str(runtime_object)]
+    # Run boundary cases against this exact patched source, never a copied
+    # implementation. The fixture intercepts path probes before any mutation,
+    # mount, extraction or exec, but retains real compiler and exit checks.
+    fixture_name = "type2-runtime-path-regression.c"
+    fixture_pin = spec["regressions"][fixture_name]
+    fixture_source = client.read_regular(Path(__file__).with_name("runtime-patches") / fixture_name, 32768)
+    if len(fixture_source) != fixture_pin["size"] or digest(fixture_source) != fixture_pin["sha256"]:
+        fail()
+    fixture_path = work / fixture_name
+    fixture_binary = work / "runtime-path-regression"
+    client.write_new(fixture_path, fixture_source)
+    fixture_args = args[:-4] + ["-I" + str(rs), str(fixture_path), "-static", "-L" + str(prefix / "lib"),
+                               "-Wl,--gc-sections", "-Wl,--start-group", "-lsquashfuse", "-lsquashfuse_ll", "-lzstd", "-lz",
+                               "-lfuse3", "-lmimalloc", "-Wl,--end-group", "-pthread", "-o", str(fixture_binary)]
+    run("runtime-path-regression-build", fixture_args, cwd=rs)
+    mark("runtime-path-regression-verify")
+    require_static_regression(client.read_regular(fixture_binary, MAX_RUNTIME))
+    result = run("runtime-path-regression-test", [str(fixture_binary)], cwd=rs, budget=60, bound=65536)
+    if result != b"Morpheus runtime path regression passed.\n":
+        fail("tool")
     run("runtime-compile", args, cwd=rs)
     run("runtime-link", [str(wrapper), "-T", str(rs / "data_sections.ld"), "-Wl,--gc-sections", "-static", "-static-pie", "-L" + str(prefix / "lib"), str(runtime_object), "-Wl,--start-group", "-lsquashfuse", "-lsquashfuse_ll", "-lzstd", "-lz", "-lfuse3", "-lmimalloc", "-Wl,--end-group", "-pthread", "-Wl,-Map," + str(linker_map), "-o", str(output)], cwd=rs)
     run("runtime-strip", [tools["strip"], "--strip-debug", "--strip-unneeded", str(output)])
@@ -411,6 +432,7 @@ def prepare(runner, root, environment):
                 "host_inputs": host, "tool_version_output_sha256": versions,
                 "runtime_object_sha256": digest(client.read_regular(runtime_object, MAX_RUNTIME)),
                 "link_map_sha256": digest(mapping), "malformedtest_returned_zero": True,
+                "runtime_path_regression_returned_zero": True, "runtime_path_regression": fixture_pin,
                 "malformedtest_sha256": digest(malformed_bytes), "commands": commands,
                 "linked_inputs": loaded_files,
                 "fresh_private_prefix": True, "upstream_runtime_binary_downloaded": False,
@@ -427,6 +449,7 @@ def prepare(runner, root, environment):
             client.write_new(stage / (key + "-" + name), license_data)
     for name, content in patches.items():
         client.write_new(stage / name, content)
+    client.write_new(stage / fixture_name, fixture_source)
     # Include the exact UAPI declarations actually used; their per-file SPDX
     # terms (including Linux-syscall-note) remain in the source header text.
     headers = io.BytesIO()

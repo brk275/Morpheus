@@ -21,6 +21,7 @@ COMMANDS = frozenset((
     "runtime-malformed-build", "runtime-malformed-verify", "runtime-malformed-test", "runtime-squashfuse-install",
     "runtime-compile", "runtime-link", "runtime-strip", "runtime-headers", "runtime-zstd-stage",
     "runtime-native-config", "runtime-squashfuse-headers", "runtime-verify", "runtime-notices",
+    "runtime-path-regression-build", "runtime-path-regression-verify", "runtime-path-regression-test",
     "download-linuxdeploy", "download-appimage-plugin",
     "download-pipewire-dsc", "download-pipewire-original", "download-pipewire-debian", "download-pipewire-patch",
     "download-runtime-fuse", "download-runtime-mimalloc", "download-runtime-musl", "download-runtime-runtime",

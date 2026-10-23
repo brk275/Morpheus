@@ -145,10 +145,23 @@
       "sha256": "51121444cf1310e1e117083ba9167d79c5b5c621479f1b5d2c586f6f45a29e87",
       "size": 13650
     },
+    "type2-runtime-fedfad51-path-bounds.patch": {
+      "sha256": "a0a23399598020146b27cbe049fd3d94d7b04d7bbe90331f408b2113101eefe9",
+      "size": 3679
+    },
     "zlib-1.3.2-CVE-2026-85091.patch": {
       "sha256": "110ff14375733173d8aa54574473424fbd7dfe4b81f1ca34a759c6fe14b15b14",
       "size": 854
     }
+  },
+  "regressions": {
+    "type2-runtime-path-regression.c": {
+      "sha256": "7e2494741ebbb6c3f3ccb44b70bc2951c5689c239dd818023891b8cb0da0b42c",
+      "size": 5338
+    }
+  },
+  "runtime_patched_files": {
+    "src/runtime/runtime.c": "03a5397afcef4885bb631f8f7df47d69289661173185db4b54c5b8ef0b5fbb33"
   },
   "runtime_revision": "fedfad51acc2860b2916a1eef32ba4a500ff31ef",
   "schema": 1,
@@ -164,6 +177,15 @@
       "official_patch_source": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/3.21-stable/main/musl",
       "patch": "musl-1.2.4-security-static-pie.patch",
       "scope": "Exact upstream security changes backported to fixed1.2.4, plus Ubuntu static-PIE specs patch. Does not certify all libc defects absent."
+    },
+    "runtime": {
+      "deviation": "Compared with PR155, preserve full readlink capacity and reject >=capacity; also close adjacent implicit portable suffix joins. No compiler diagnostics are disabled.",
+      "patch": "type2-runtime-fedfad51-path-bounds.patch",
+      "regression": "type2-runtime-path-regression.c",
+      "reviewed_upstream_head": "a1fddcd61ad6307c0840f14324016ee488c49a7c",
+      "scope": "Bounds the portable directory suffix, rejects all three readlink truncations before NUL, and skips unrepresentable optional portable home/config counterparts without probing a truncated path. Original archive remains exact. Actual security fixture and installed package gates remain required.",
+      "upstream_reference": "https://github.com/AppImage/type2-runtime/pull/155",
+      "upstream_state_at_review": "open/unmerged"
     },
     "squashfuse": {
       "advisory": "GHSA-jg98-58rj-3mcc",
@@ -191,7 +213,7 @@
     "table.h": "ddcd5e932267337e31dccfc563582beb198a0ca6168b3464710a73d2f73aa947",
     "tests/malformedtest.c": "b35f57dfdd6e1ae560947b247655ee33046bbfabdee6fe2b67763fa461387e92"
   },
-  "version_label": "fedfad51+morpheus-security-3",
+  "version_label": "fedfad51+morpheus-security-4",
   "zlib_patched_files": {
     "gzwrite.c": "31d0da140edf382b82b13e2d87a22f59e158d9014ee026459e01cf437d0ab07d"
   }
