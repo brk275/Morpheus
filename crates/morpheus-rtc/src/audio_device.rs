@@ -6,6 +6,19 @@ use std::{
     },
 };
 
+#[cfg(target_os = "linux")]
+use crate::alsa_close::{
+    AlsaBackendCloseError as NativeAudioCloseError,
+    close_retired_alsa_on_owned_worker as close_retired_native_audio,
+    wait_for_retired_alsa_release as wait_for_retired_native_audio,
+};
+#[cfg(target_os = "macos")]
+use crate::coreaudio_close::{
+    CoreAudioCloseError as NativeAudioCloseError,
+    close_retired_coreaudio_on_owned_worker as close_retired_native_audio,
+    wait_for_retired_coreaudio_release as wait_for_retired_native_audio,
+};
+
 use cpal::{
     SampleFormat, Stream, SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -20,6 +33,15 @@ use tokio::{
 };
 
 use crate::{CallInfo, MediaError, Publication, RtcService, native::CallLease};
+
+#[cfg(target_os = "macos")]
+const NATIVE_CLOSE_MESSAGE: &str = "CoreAudio native cleanup is not confirmed";
+#[cfg(target_os = "linux")]
+const NATIVE_CLOSE_MESSAGE: &str = "ALSA native cleanup is not confirmed";
+#[cfg(target_os = "macos")]
+const NATIVE_ROUTE_CLOSE_MESSAGE: &str = "CoreAudio route cleanup is not confirmed";
+#[cfg(target_os = "linux")]
+const NATIVE_ROUTE_CLOSE_MESSAGE: &str = "ALSA route cleanup is not confirmed";
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHUNK_SAMPLES_PER_CHANNEL: usize = 480; // 10 ms
@@ -49,7 +71,7 @@ pub enum AudioDeviceReleaseError {
     TimedOut,
     WorkerPanicked,
     SupervisorFailed,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     NativeClose,
 }
 impl std::fmt::Display for AudioDeviceReleaseError {
@@ -60,6 +82,8 @@ impl std::fmt::Display for AudioDeviceReleaseError {
             Self::SupervisorFailed => "audio device opener ownership could not be confirmed",
             #[cfg(target_os = "macos")]
             Self::NativeClose => "CoreAudio native cleanup failed and remains owned",
+            #[cfg(target_os = "linux")]
+            Self::NativeClose => "ALSA native cleanup failed and remains owned",
         })
     }
 }
@@ -130,11 +154,11 @@ async fn wait_for_device_release(bound: Duration) -> Result<(), AudioDeviceRelea
         );
         if let Some(result) = released {
             result?;
-            #[cfg(target_os = "macos")]
-            crate::coreaudio_close::wait_for_retired_coreaudio_release()
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            wait_for_retired_native_audio()
                 .await
                 .map_err(|error| match error {
-                    crate::CoreAudioCloseError::TimedOut => AudioDeviceReleaseError::TimedOut,
+                    NativeAudioCloseError::TimedOut => AudioDeviceReleaseError::TimedOut,
                     _ => AudioDeviceReleaseError::NativeClose,
                 })?;
             return Ok(());
@@ -1770,14 +1794,13 @@ impl RtcService {
         let _ = publication.set_muted(true);
         drop(local);
         drop(remotes);
-        #[cfg(target_os = "macos")]
-        let native_close = crate::coreaudio_close::wait_for_retired_coreaudio_release().await;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let native_close = wait_for_retired_native_audio().await;
         let _ = publication.set_muted(true);
         let _ = publication.unpublish().await;
         result?;
-        #[cfg(target_os = "macos")]
-        native_close
-            .map_err(|_| MediaError::Device("CoreAudio native cleanup is not confirmed".into()))?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        native_close.map_err(|_| MediaError::Device(NATIVE_CLOSE_MESSAGE.into()))?;
         Ok(())
     }
 
@@ -1861,14 +1884,14 @@ fn run_device_open<T: Send + 'static>(
 }
 
 fn finish_device_open(panicked: bool) -> Result<(), AudioDeviceReleaseError> {
-    #[cfg(target_os = "macos")]
-    let native = crate::coreaudio_close::close_retired_coreaudio_on_owned_worker();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let native = close_retired_native_audio();
     if panicked {
         return Err(AudioDeviceReleaseError::WorkerPanicked);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     native.map_err(|_| AudioDeviceReleaseError::NativeClose)?;
-    // Other platforms retain only the original application worker/TLS receipt.
+    // Hosts without a native close implementation retain only the application worker/TLS receipt.
     Ok(())
 }
 
@@ -1894,11 +1917,11 @@ async fn open_with_supervisor<T: Send + 'static>(
     open: impl FnOnce(&OpenGate<'_>) -> Result<T, MediaError> + Send + 'static,
     spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>> + Send,
 ) -> Result<T, MediaError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     tokio::select! {
         biased;
         _ = controls.cancelled() => return Err(MediaError::CallEnded),
-        closed = crate::coreaudio_close::wait_for_retired_coreaudio_release() => closed.map_err(|_| MediaError::Device("CoreAudio native cleanup is not confirmed".into()))?,
+        closed = wait_for_retired_native_audio() => closed.map_err(|_| MediaError::Device(NATIVE_CLOSE_MESSAGE.into()))?,
     }
     // Sequential microphone/speaker opens must not lose a route merely because
     // a successfully handed-off previous result is finishing its joined tail.
@@ -2267,13 +2290,13 @@ fn route_for(
 
 /// A route replacement may already hold its new stream while retiring the old one.
 /// Cancellation drops that new value immediately; its native backend stays owned.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn wait_for_route_close(controls: &AudioControls) -> Result<(), MediaError> {
     tokio::select! {
         biased;
         _ = controls.cancelled() => Err(MediaError::CallEnded),
-        result = crate::coreaudio_close::wait_for_retired_coreaudio_release() => {
-            result.map_err(|_| MediaError::Device("CoreAudio route cleanup is not confirmed".into()))?;
+        result = wait_for_retired_native_audio() => {
+            result.map_err(|_| MediaError::Device(NATIVE_ROUTE_CLOSE_MESSAGE.into()))?;
             controls.ensure_authorized()
         }
     }
@@ -2480,7 +2503,7 @@ impl LocalAudio {
                     controls.ensure_authorized()?;
                     let previous = self.microphone.take();
                     drop(previous);
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     wait_for_route_close(controls).await?;
                     controls.ensure_authorized()?;
                     self.microphone = Some(microphone);
@@ -2508,7 +2531,7 @@ impl LocalAudio {
                     controls.install_speaker(&speaker)?;
                     let previous = self.speaker.take();
                     drop(previous);
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     wait_for_route_close(controls).await?;
                     controls.ensure_authorized()?;
                     self.speaker = Some(speaker);
@@ -2553,7 +2576,7 @@ impl LocalAudio {
             StreamFault::Denied => RouteNotice::MicrophoneDenied,
             StreamFault::Lost => RouteNotice::MicrophoneLost,
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         wait_for_route_close(controls).await?;
         Ok(self.microphone_loss)
     }
@@ -2566,7 +2589,7 @@ impl LocalAudio {
         let was_fallback = self.speaker_fallback;
         controls.release_speaker();
         self.speaker = None;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         wait_for_route_close(controls).await?;
         self.speaker_lost = true;
         self.speaker_fallback = false;
@@ -2654,7 +2677,7 @@ impl LocalAudio {
                     microphone.discard_buffered_frames();
                     let previous = self.microphone.take();
                     drop(previous);
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     wait_for_route_close(controls).await?;
                     controls.ensure_authorized()?;
                     self.microphone = Some(microphone);
@@ -2681,7 +2704,7 @@ impl LocalAudio {
                     controls.install_speaker(&speaker)?;
                     let previous = self.speaker.take();
                     drop(previous);
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     wait_for_route_close(controls).await?;
                     controls.ensure_authorized()?;
                     self.speaker = Some(speaker);
@@ -3406,7 +3429,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn cancelled_route_does_not_start_an_observer_or_keep_its_prepared_value_live() {
         let controls = guarded_controls(|| true);

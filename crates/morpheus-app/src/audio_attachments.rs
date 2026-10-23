@@ -28,7 +28,10 @@ pub(crate) enum ReleaseError {
     TimedOut,
     WorkerPanicked,
     SupervisorFailed,
-    #[cfg(all(feature = "native-calls", target_os = "macos"))]
+    #[cfg(all(
+        feature = "native-calls",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     NativeClose,
 }
 impl std::fmt::Display for ReleaseError {
@@ -41,6 +44,8 @@ impl std::fmt::Display for ReleaseError {
             Self::SupervisorFailed => "attachment audio worker ownership could not be confirmed",
             #[cfg(all(feature = "native-calls", target_os = "macos"))]
             Self::NativeClose => "CoreAudio attachment cleanup failed and remains owned",
+            #[cfg(all(feature = "native-calls", target_os = "linux"))]
+            Self::NativeClose => "ALSA attachment cleanup failed and remains owned",
         })
     }
 }
@@ -558,9 +563,9 @@ impl AudioAttachments {
                         request.phase.store(1,Ordering::Release);
                         request.playback.play_pcm(clip.samples,clip.rate,clip.channels).map_err(|_|AudioError::Unavailable)
                     }));
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     let native_close=request.playback.close_native_output_on_owned_worker();
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     if result.is_ok() && (native_close.is_err() || request.playback.native_close_failed()) {
                         request.phase.store(AudioError::Unavailable.code(),Ordering::Release);
                         return Err(ReleaseError::NativeClose);

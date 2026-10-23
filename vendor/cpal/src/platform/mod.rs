@@ -976,3 +976,19 @@ impl Stream {
         }
     }
 }
+
+/// Revoke this actual ALSA stream; the retained ticket is separate from Drop.
+#[cfg(target_os = "linux")]
+impl Stream {
+    pub fn request_alsa_close(&self) -> Option<crate::AlsaCloseTicket> {
+        match self.as_inner() {
+            StreamInner::Alsa(stream) => {
+                let ticket = stream.close_ticket();
+                ticket.request();
+                Some(ticket)
+            }
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+}
