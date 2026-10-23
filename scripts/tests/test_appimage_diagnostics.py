@@ -17,6 +17,36 @@ import package_appimage as P
 
 
 class ProgressTests(unittest.TestCase):
+    def test_native_source_phase_commands_and_reasons_are_closed_and_scan_gated(self):
+        from corresponding_source import SourceFailure
+        commands = {"source-cargo-version", "source-rustc-version", "source-cargo-fetch", "cache-git-commit",
+                    "source-commit", "source-tree", "source-objects"}
+        self.assertTrue(commands <= D.COMMANDS)
+        reasons = {"input", "path", "bounds", "identity", "lock", "missing", "archive",
+                   "link", "submodule", "git", "manifest", "output"}
+        for reason in reasons:
+            self.assertEqual(D.reason(SourceFailure(reason)), "source_" + reason)
+        class ForeignFailure(SourceFailure):
+            @property
+            def reason(self):
+                raise AssertionError("foreign properties must never be inspected")
+        foreign = ForeignFailure.__new__(ForeignFailure)
+        self.assertEqual(D.reason(foreign), "unknown")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress = D.Progress(root)
+            progress.wrapper("source")
+            progress.command("source-cargo-fetch")
+            progress.failed(SourceFailure("missing"))
+            self.assertTrue(D.valid_record(progress.value))
+            self.assertEqual(progress.value["failure"]["wrapper_phase"], "source")
+            self.assertEqual(progress.value["failure"]["command_stage"], "source-cargo-fetch")
+            self.assertEqual(progress.value["failure"]["reason"], "source_missing")
+            withheld = D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="source_missing")
+            self.assertEqual(withheld, {"diagnostics": "withheld", "passed": False})
+            visible = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="source_missing")
+            self.assertEqual(visible["failure"]["reason"], "source_missing")
+
     def test_first_failure_position_survives_later_commands_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -318,6 +318,8 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
 
     def test_generic_report_flush_failure_removes_the_private_handoff(self):
         import hashlib
+        import corresponding_source as S
+        import source_bundle_qa as Q
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             checkout, case = root / "checkout", root / "case"
@@ -325,7 +327,17 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
             (case / "packages").mkdir(parents=True)
             data = b"synthetic image bytes" * 5
             (case / "packages/candidate.AppImage").write_bytes(data)
-            receipt = {"installed_capture_passed": True, "appimage_sha256": hashlib.sha256(data).hexdigest()}
+            artifact_hash = hashlib.sha256(data).hexdigest()
+            receipt = {"installed_capture_passed": True, "appimage_sha256": artifact_hash,
+                "corresponding_source": {"schema": 1, "source_revision": "a" * 40, "source_tree": "b" * 40,
+                    "bundle_sha256": "c" * 64, "manifest_sha256": "d" * 64,
+                    "registry_packages": 1, "git_sources": 1, "locked_packages": 2,
+                    "distribution_ready": False, "unresolved_release_requirements": list(S.UNRESOLVED),
+                    "native_sources": {"coverage": "receipt-bound-known-native-components-only",
+                        "package_artifact_sha256": artifact_hash, "build_receipt_sha256": "e" * 64,
+                        "native_sources_complete": False, "actual_native_build_inputs_verified": False,
+                        "raw_receipts_included": False, "native_lifecycle_acceptance": False}}}
+            S.validate_receipt(receipt["corresponding_source"], "a" * 40, native_artifact=artifact_hash)
             def reporting(*args, flush=False, **kwargs):
                 # An unflushed stream may buffer successfully and fail only at
                 # interpreter shutdown, outside main's handoff cleanup scope.
@@ -334,6 +346,7 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
             with mock.patch.object(P, "ROOT", checkout), \
                     mock.patch.object(P, "public_hosted_environment"), \
                     mock.patch.object(P, "controlled_environment", return_value={}), \
+                    mock.patch.object(Q, "guard_native"), \
                     mock.patch.object(P, "expected_revision", return_value="a" * 40), \
                     mock.patch.object(P, "verify_checkout"), \
                     mock.patch.object(P, "command_tools", return_value={}), \

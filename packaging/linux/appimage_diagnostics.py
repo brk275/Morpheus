@@ -30,11 +30,13 @@ COMMANDS = frozenset((
     "tool-version", "distro-patch", "configure", "client-build", "inventory-elf", "inventory-owner", "inventory-package",
     "inventory-elf-client", "inventory-elf-dependency", "inventory-elf-deployed",
     "source-head", "source-clean", "source-archive",
+    "source-cargo-version", "source-rustc-version", "source-cargo-fetch", "cache-git-commit",
+    "source-commit", "source-tree", "source-objects",
     "capture-case", "capture-accessibility", "capture-peer-build", "capture-peer-list", "capture-dbus-env", "capture-portal-owner", "capture-focus", "capture-window",
     "capture-yellow", "capture-green", "capture-magenta", "capture-remove-source", "capture-close-window", "capture-imports",
     "capture-inventory", "capture-env-up", "capture-env-down", "capture-rtc-up", "capture-rtc-probe", "capture-rtc-rtc-fixture",
     "capture-rtc-down", "capture-backend-configure", "capture-backend-compile", "cleanup-rtc", "cleanup-env", "cleanup-inventory"))
-WRAPPER = frozenset(("namespace", "startup", "build", "capture", "complete"))
+WRAPPER = frozenset(("namespace", "startup", "build", "capture", "source", "complete"))
 MODES = frozenset(("none", "ordinary", "eager_bindings"))
 PHASES = frozenset(("none", "setup", "bus", "keyring", "display", "portal", "peer", "launch", "identity", "login", "join",
                     "static_frame", "changed_frame", "screen_stopped", "reopened_frame", "changed_after_reopen", "source_loss",
@@ -58,7 +60,9 @@ REASONS = frozenset((*BUILTIN_REASONS.values(), "command_deadline", "command_out
                      "inventory_input", "inventory_tool", "inventory_elf", "inventory_dependency",
                      "inventory_package", "inventory_notice", "inventory_deployment", "inventory_limit",
                      "inventory_elf_build_id", "inventory_elf_needed", "inventory_elf_soname",
-                     "inventory_elf_search", "inventory_search"))
+                     "inventory_elf_search", "inventory_search",
+                     "source_input", "source_path", "source_bounds", "source_identity", "source_lock", "source_missing",
+                     "source_archive", "source_link", "source_submodule", "source_git", "source_manifest", "source_output"))
 CLEANUP = frozenset(("not_started", "passed", "failed"))
 POSITIONS = ("wrapper_phase", "command_stage", "capture_mode", "capture_phase")
 FIELDS = frozenset((*POSITIONS, "schema", "peer_facts", "failure", "inner_cleanup"))
@@ -80,6 +84,11 @@ def reason(error):
         value = error.reason
         token = "inventory_" + value if type(value) is str else "inventory"
         return token if token in REASONS else "inventory"
+    from corresponding_source import SourceFailure
+    if type(error) is SourceFailure:
+        value = error.reason
+        token = "source_" + value if type(value) is str else "unknown"
+        return token if token in REASONS else "unknown"
     # Only the enumerated category is emitted. No repr/str/args/attributes from
     # a foreign exception or server response are inspected or serialized.
     return {"CaptureFailure": "capture", "IdentityFailure": "identity", "BindingFailure": "binding",
