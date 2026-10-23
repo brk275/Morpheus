@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-# Keep upstream decoder dev tools outside the application workspace.
-exclude = ["vendor/image-webp"]
+# Keep vendored library development feature sets outside the application workspace.
+exclude = ["vendor/image-webp", "vendor/cpal"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
@@ -9,7 +9,6 @@ members = [
     "crates/morpheus-rtc",
     "crates/morpheus-ui-check",
     "vendor/lru",
-    "vendor/cpal",
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
     "vendor/matrix-rtc-core",

@@ -22,8 +22,12 @@ provenance and regression tests when updating a dependency.
 
 ## CPAL source and verification boundary
 
-`cpal` 0.18.2 is an explicit workspace library member and a local
-`[patch.crates-io]` dependency. Its original crates.io archive has SHA256
+`cpal` 0.18.2 is a local `[patch.crates-io]` library dependency explicitly
+excluded from workspace membership. This preserves its optional backend API
+without adding unused backend families to Cargo's all-workspace-feature lock
+resolution. The existing default-feature-only `-p cpal --lib` regression
+selections use the root lock; the managed manifest has no dev dependencies.
+Its original crates.io archive has SHA256
 `6f02e8d0327b42d3e2e4ab2119af397344eb9fc54a34bf0ddeaa1277af8681f1`
 and records upstream commit `e1612d5d98152f8dc2a62e1b51ef7cbf4f7f26b7`.
 The complete Apache-2.0 [license](cpal/LICENSE), original source and hardware

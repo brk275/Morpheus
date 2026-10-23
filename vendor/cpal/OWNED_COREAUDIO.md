@@ -9,8 +9,13 @@ lock is provenance data and does not govern verification.
 
 ## Build and dependency boundary
 
-The normalized packaging manifest is deliberately managed as an explicit workspace
-library member. Example declarations and the four example-only dev dependencies
+The normalized packaging manifest is a local `[patch.crates-io]` dependency
+explicitly excluded from workspace membership. Cargo resolves every workspace
+member with all features for the lockfile; exclusion preserves the optional
+backend API without admitting unused backend dependency families. Exact
+default-feature-only `cargo test --locked -p cpal --lib` selections remain
+supported because the managed manifest has no dev dependencies.
+Example declarations and the four example-only dev dependencies
 (anyhow, clap, hound, ringbuf) are omitted from that manifest. Their original
 sources/manifest are preserved. Library tests use std and existing production
 CPAL dependencies; no new dependency version is admitted. macOS adds a direct
