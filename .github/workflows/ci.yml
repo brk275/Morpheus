@@ -5,15 +5,32 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
+  # Defaults retain full native verification; focused retries are explicit.
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Native platform (all is required for shared/release acceptance)
+        type: choice
+        default: all
+        options: [all, linux, windows, macos-arm, macos-intel]
+      checks:
+        description: Existing check route (focused results are partial evidence)
+        type: choice
+        default: all
+        options: [all, models, desktop, devices, vendor, sdk, matrix, wayland, config, helpers]
+      matrix_suite:
+        description: Existing Matrix suite (non-full requires Linux and matrix)
+        type: choice
+        default: full
+        options: [full, draft-recovery, drafts-only, timeline-reads, timeline-failures, media-only, app-timeline, outgoing-ring, native-call]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}-{1}-{2}-{3}', github.sha, inputs.platform, inputs.checks, inputs.matrix_suite) || github.event.pull_request.number || github.ref }}
+  # A focused manual dispatch must not cancel another selected route.
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   CARGO_BUILD_JOBS: "2"
@@ -25,7 +42,7 @@ jobs:
   scope:
     name: Security and change scope
     # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false
+    if: github.event.repository.private == false && (github.event_name != 'workflow_dispatch' || (github.repository == 'brk275/Morpheus' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -33,6 +50,13 @@ jobs:
       native_matrix: ${{ steps.scope.outputs.native_matrix }}
       config: ${{ steps.scope.outputs.config }}
       wayland: ${{ steps.scope.outputs.wayland }}
+      # A PR may still use its reviewed pre-selector base classifier. Only
+      # automatic events may widen missing route metadata to all/full. Manual
+      # selection stays empty/failing unless that reviewed classifier emits it.
+      manual: ${{ steps.scope.outputs.manual || (github.event_name != 'workflow_dispatch' && 'false' || '') }}
+      manual_platform: ${{ steps.scope.outputs.manual_platform || (github.event_name != 'workflow_dispatch' && 'all' || '') }}
+      check_route: ${{ steps.scope.outputs.check_route || (github.event_name != 'workflow_dispatch' && 'all' || '') }}
+      matrix_suite: ${{ steps.scope.outputs.matrix_suite || (github.event_name != 'workflow_dispatch' && 'full' || '') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -131,7 +155,7 @@ jobs:
       - run: cargo test --locked -p morpheus-config
 
   compile:
-    name: Check and test (${{ matrix.os }})
+    name: ${{ github.event_name == 'workflow_dispatch' && (needs.scope.outputs.manual_platform != 'all' || needs.scope.outputs.check_route != 'all' || needs.scope.outputs.matrix_suite != 'full') && format('Focused {0} ({1}, partial)', needs.scope.outputs.check_route, matrix.os) || format('Check and test ({0})', matrix.os) }}
     needs: [scope, helpers]
     if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
     runs-on: ${{ matrix.os }}
@@ -187,7 +211,7 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       - name: Prepare the pinned owned native PipeWire client
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'media-only'))
         timeout-minutes: 20
         shell: bash
         run: |
@@ -195,8 +219,10 @@ jobs:
           python3 scripts/build_linux_native.py --variant native \
             --prefix "$RUNNER_TEMP/morpheus-native-pipewire-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --github-env
       - name: Check native interface compilation before desktop dependencies
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop')
         run: cargo check --locked -p morpheus-ui-check
       - name: Test configuration, Matrix, and RTC protocol models
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'models')
         id: model-tests
         # Still fail the job below, but collect independent desktop/device
         # results on this candidate instead of paying the compilation cost
@@ -204,11 +230,13 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
       - name: Check desktop and Matrix crates
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop')
         run: cargo check --locked -p morpheus-app -p morpheus-matrix
       - name: Build desktop with native call and device adapters
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop')
         run: cargo build --locked -p morpheus-app --features native-calls
       - name: Verify the actual Linux app uses its owned native client
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop')
         timeout-minutes: 2
         shell: /usr/bin/python3 -I -B {0}
         run: |
@@ -384,7 +412,7 @@ jobs:
           compression-level: 0
           include-hidden-files: false
       - name: Smoke test Linux desktop startup under Xvfb
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop')
         shell: bash
         run: |
           set +e
@@ -395,6 +423,7 @@ jobs:
             exit 1
           fi
       - name: Test desktop controller and call guards
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop')
         id: desktop-tests
         # ElementHandle queries need compiler-generated element metadata even
         # when Rust debug symbols are disabled for the hosted test build.
@@ -406,10 +435,12 @@ jobs:
         continue-on-error: true
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
       - name: Test native device and call guards
+        id: device-tests
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices')
         run: cargo test --locked -p morpheus-rtc --features native-devices --lib
       - name: Test Windows capture of an owned synthetic window and display
         id: windows-capture-tests
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'devices')
         continue-on-error: true
         timeout-minutes: 15
         env:
@@ -426,6 +457,7 @@ jobs:
         timeout-minutes: 15
         run: python3 scripts/run_wayland_acceptance.py
       - name: Test vendored security fixes
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor')
         id: vendor-tests
         # Keep independent SDK and live checks on the already-built app.
         # The final gate still rejects any failed vendor regression command.
@@ -439,6 +471,7 @@ jobs:
           cargo test --locked -p cargo-packager-updater --lib
           cargo test --locked -p webrtc-sys-build --lib
       - name: Test pinned SDK sticky receipt and redaction regressions
+        if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'sdk')
         id: sdk-receipt-tests
         # Keep collecting the independently built app's live acceptance. The
         # final outcome gate still rejects failed SDK unit regressions.
@@ -446,10 +479,13 @@ jobs:
         shell: bash
         run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
       - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
-        if: runner.os == 'Linux'
+        id: matrix-tests
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'matrix')
         # Four fresh invitation cases each have a bounded 300-second command.
         # Preserve room for the existing checks and their service cleanup.
         timeout-minutes: 55
+        env:
+          MATRIX_SUITE: ${{ needs.scope.outputs.matrix_suite }}
         shell: bash
         run: |
           set -euo pipefail
@@ -461,7 +497,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/gitleaks"
           tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
           dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
-            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
+            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --suite "$MATRIX_SUITE"
       - name: Require the selected Wayland result
         if: ${{ !cancelled() && runner.os == 'Linux' }}
         env:
@@ -489,14 +525,76 @@ jobs:
               print("System Wayland was outside this change's inputs; its existing release gate remains open.")
           PY_WAYLAND_ACCEPTANCE
       - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
+        if: ${{ !cancelled() }}
+        env:
+          CHECK_ROUTE: ${{ needs.scope.outputs.check_route }}
+          WAYLAND_SELECTED: ${{ needs.scope.outputs.wayland }}
+          RUNNER_PLATFORM: ${{ runner.os }}
+          MODEL_OUTCOME: ${{ steps.model-tests.outcome }}
+          DESKTOP_OUTCOME: ${{ steps.desktop-tests.outcome }}
+          DEVICE_OUTCOME: ${{ steps.device-tests.outcome }}
+          WINDOWS_CAPTURE_OUTCOME: ${{ steps.windows-capture-tests.outcome }}
+          WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
+          VENDOR_OUTCOME: ${{ steps.vendor-tests.outcome }}
+          SDK_OUTCOME: ${{ steps.sdk-receipt-tests.outcome }}
+          MATRIX_OUTCOME: ${{ steps.matrix-tests.outcome }}
+          PREVIEW_OUTCOME: ${{ steps.preview-capture.outcome }}
+          PREVIEW_UPLOAD_OUTCOME: ${{ steps.preview-upload.outcome }}
         shell: bash
         run: |
-          echo "Protocol model, native preview, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
-          exit 1
+          python3 - <<'PY_NATIVE_ACCEPTANCE'
+          import os
+          import sys
+
+          def native_check_error(route, runner, wayland, outcomes):
+              routes = {"all", "models", "desktop", "devices", "vendor", "sdk", "matrix", "wayland"}
+              if (not isinstance(route, str) or route not in routes or runner not in ("Linux", "Windows", "macOS")
+                      or wayland not in ("true", "false") or not isinstance(outcomes, dict)):
+                  return "Native check selection is missing or malformed."
+              if ((wayland == "true" and runner != "Linux")
+                      or (route in ("matrix", "wayland") and runner != "Linux")
+                      or (route == "wayland" and wayland != "true")
+                      or (route not in ("all", "wayland") and wayland != "false")):
+                  return "Native check route disagrees with its platform or Wayland selection."
+              selected = {
+                  "model-tests": route in ("all", "models"),
+                  "desktop-tests": route in ("all", "desktop"),
+                  "device-tests": route in ("all", "devices"),
+                  "windows-capture-tests": runner == "Windows" and route in ("all", "devices"),
+                  "wayland-tests": runner == "Linux" and wayland == "true",
+                  "vendor-tests": route in ("all", "vendor"),
+                  "sdk-receipt-tests": route in ("all", "sdk"),
+                  "matrix-tests": runner == "Linux" and route in ("all", "matrix"),
+              }
+              for name, required in selected.items():
+                  value = outcomes.get(name)
+                  expected = "success" if required else "skipped"
+                  if not isinstance(value, dict) or value.get("outcome") != expected:
+                      return "A selected native check failed or did not run, or an unselected check ran."
+              # Preserve both existing continue-on-error preview failure gates.
+              for name in ("preview-capture", "preview-upload"):
+                  value = outcomes.get(name)
+                  if not isinstance(value, dict) or value.get("outcome") not in ("success", "skipped"):
+                      return "Native preview capture or publication failed."
+              return None
+
+          outcomes = {name: {"outcome": os.environ.get(variable)} for name, variable in (
+              ("model-tests", "MODEL_OUTCOME"), ("desktop-tests", "DESKTOP_OUTCOME"),
+              ("device-tests", "DEVICE_OUTCOME"), ("windows-capture-tests", "WINDOWS_CAPTURE_OUTCOME"),
+              ("wayland-tests", "WAYLAND_OUTCOME"), ("vendor-tests", "VENDOR_OUTCOME"),
+              ("sdk-receipt-tests", "SDK_OUTCOME"), ("matrix-tests", "MATRIX_OUTCOME"),
+              ("preview-capture", "PREVIEW_OUTCOME"), ("preview-upload", "PREVIEW_UPLOAD_OUTCOME"))}
+          error = native_check_error(os.environ.get("CHECK_ROUTE"), os.environ.get("RUNNER_PLATFORM"),
+              os.environ.get("WAYLAND_SELECTED"), outcomes)
+          if error:
+              print(error, file=sys.stderr)
+              raise SystemExit(1)
+          print("Every explicitly selected native check succeeded; omitted release gates remain open.")
+          PY_NATIVE_ACCEPTANCE
 
   acceptance:
-    name: CI acceptance
+    # Focused evidence must never emit the canonical full CI acceptance status.
+    name: ${{ github.event_name == 'workflow_dispatch' && (needs.scope.outputs.manual_platform != 'all' || needs.scope.outputs.check_route != 'all' || needs.scope.outputs.matrix_suite != 'full') && 'Focused CI acceptance (partial)' || 'CI acceptance' }}
     needs: [scope, helpers, config, compile]
     # Run after failed/skipped dependencies too. A selected check may never
     # disappear behind a skipped aggregate that branch protection accepts.
@@ -510,6 +608,7 @@ jobs:
       - name: Require every selected check to succeed
         env:
           CHECK_RESULTS: ${{ toJSON(needs) }}
+          CHECK_EVENT: ${{ github.event_name }}
         shell: bash
         run: |
           python3 - <<'PY_ACCEPTANCE'
@@ -517,7 +616,7 @@ jobs:
           import os
           import sys
 
-          def acceptance_error(needs):
+          def acceptance_error(needs, event_name):
               if not isinstance(needs, dict) or set(needs) != {"scope", "helpers", "config", "compile"}:
                   return "Missing dependency conclusions."
               if any(not isinstance(value, dict) for value in needs.values()):
@@ -549,6 +648,35 @@ jobs:
                   return "Native matrix disagrees with the selected standard checks."
               if wayland == "true" and "ubuntu-24.04" not in platforms:
                   return "Selected Wayland acceptance requires the Linux native job."
+              manual = outputs.get("manual")
+              platform = outputs.get("manual_platform")
+              route, suite = outputs.get("check_route"), outputs.get("matrix_suite")
+              choices = {"all": ["macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"],
+                         "linux": ["ubuntu-24.04"], "windows": ["windows-2025"],
+                         "macos-arm": ["macos-15"], "macos-intel": ["macos-15-intel"]}
+              routes = {"all", "models", "desktop", "devices", "vendor", "sdk", "matrix", "wayland", "config", "helpers"}
+              suites = {"full", "draft-recovery", "drafts-only", "timeline-reads", "timeline-failures",
+                        "media-only", "app-timeline", "outgoing-ring", "native-call"}
+              if (event_name not in ("push", "pull_request", "workflow_dispatch")
+                      or manual not in ("true", "false") or not isinstance(platform, str) or platform not in choices
+                      or not isinstance(route, str) or route not in routes
+                      or not isinstance(suite, str) or suite not in suites):
+                  return "Manual check selection is missing or malformed."
+              if manual != ("true" if event_name == "workflow_dispatch" else "false"):
+                  return "Manual check selection disagrees with the actual event."
+              if manual == "false":
+                  if (platform, route, suite) != ("all", "all", "full"):
+                      return "Automatic impact selection cannot be narrowed by manual inputs."
+              else:
+                  if ((route in ("matrix", "wayland") and platform != "linux")
+                          or (suite != "full" and route != "matrix")
+                          or (route == "helpers" and platform != "all")
+                          or (route == "config" and platform not in ("all", "linux"))):
+                      return "Incompatible manual check selection."
+                  expected_platforms = [] if route in ("helpers", "config") else choices[platform]
+                  if (platforms != expected_platforms or (config == "true") != (route == "config")
+                          or (wayland == "true") != ("ubuntu-24.04" in expected_platforms and route in ("all", "wayland"))):
+                      return "Manual scope disagrees with its exact selected jobs."
               for job, selected in (("config", config), ("compile", native)):
                   expected = "success" if selected == "true" else "skipped"
                   if needs[job].get("result") != expected:
@@ -556,7 +684,7 @@ jobs:
               return None
 
           try:
-              error = acceptance_error(json.loads(os.environ["CHECK_RESULTS"]))
+              error = acceptance_error(json.loads(os.environ["CHECK_RESULTS"]), os.environ["CHECK_EVENT"])
           except (KeyError, ValueError):
               error = "Dependency conclusions are missing or malformed."
           if error:

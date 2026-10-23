@@ -162,6 +162,58 @@ def classify(paths, force_all=False):
     }
 
 
+
+# Manual choices are fixed reviewed routes, never shell fragments, runner labels
+# or refs. All/default retains the full supported matrix and every existing gate.
+MANUAL_PLATFORMS = {
+    "all": PLATFORMS,
+    "linux": ("ubuntu-24.04",),
+    "windows": ("windows-2025",),
+    "macos-arm": ("macos-15",),
+    "macos-intel": ("macos-15-intel",),
+}
+MANUAL_CHECKS = frozenset({"all", "models", "desktop", "devices", "vendor", "sdk",
+                           "matrix", "wayland", "config", "helpers"})
+# Exact existing suites from run_matrix_acceptance.py; no new test composition.
+MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-reads",
+                           "timeline-failures", "media-only", "app-timeline",
+                           "outgoing-ring", "native-call"})
+
+
+def event_selection(event, event_name):
+    if event_name != "workflow_dispatch":
+        paths, force_all = changed_paths(event, event_name)
+        return classify(paths, force_all) | {
+            "manual": False, "manual_platform": "all",
+            "check_route": "all", "matrix_suite": "full",
+        }
+    inputs = event.get("inputs", {})
+    if not isinstance(inputs, dict) or set(inputs) - {"platform", "checks", "matrix_suite"}:
+        raise ValueError("Unknown manual CI inputs")
+    platform, route, suite = (inputs.get("platform", "all"), inputs.get("checks", "all"),
+                              inputs.get("matrix_suite", "full"))
+    if (type(platform) is not str or platform not in MANUAL_PLATFORMS
+            or type(route) is not str or route not in MANUAL_CHECKS
+            or type(suite) is not str or suite not in MATRIX_SUITES):
+        raise ValueError("Invalid manual CI selection")
+    if route in {"matrix", "wayland"} and platform != "linux":
+        raise ValueError("Focused Matrix and Wayland routes require explicit Linux")
+    if suite != "full" and route != "matrix":
+        raise ValueError("Focused Matrix suites require the Matrix route")
+    if route == "helpers" and platform != "all":
+        raise ValueError("Helpers run once on their fixed Linux host")
+    if route == "config" and platform not in {"all", "linux"}:
+        raise ValueError("Configuration runs on its fixed Linux host")
+    platforms = () if route in {"helpers", "config"} else MANUAL_PLATFORMS[platform]
+    return {
+        "native": bool(platforms), "native_matrix": {"os": list(platforms)},
+        "config": route == "config",
+        "wayland": "ubuntu-24.04" in platforms and route in {"all", "wayland"},
+        "manual": True, "manual_platform": platform,
+        "check_route": route, "matrix_suite": suite,
+    }
+
+
 def scanner_step_only(before, after):
     """Exclude CI scanner-only edits from native builds; compare all other bytes.
 
@@ -294,15 +346,16 @@ def main():
     parser.add_argument("--github-event", action="store_true")
     args = parser.parse_args()
     paths, force_all = args.paths, args.all
+    result = classify(paths, force_all)
     if args.github_event:
         with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
-            paths, force_all = changed_paths(json.load(event_file), os.environ["GITHUB_EVENT_NAME"])
-    result = classify(paths, force_all)
+            result = event_selection(json.load(event_file), os.environ["GITHUB_EVENT_NAME"])
     print(json.dumps(result, sort_keys=True))
     if args.github_event:
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
             for key, value in result.items():
-                output.write(f"{key}={json.dumps(value, separators=(',', ':'))}\n")
+                encoded = value if type(value) is str else json.dumps(value, separators=(",", ":"))
+                output.write(f"{key}={encoded}\n")
 
 
 if __name__ == "__main__":
