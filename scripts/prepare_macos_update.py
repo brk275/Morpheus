@@ -20,6 +20,12 @@ import tarfile
 import tempfile
 
 
+# Isolated direct-file execution omits the script directory from sys.path.
+# Admit only these reviewed file-relative sibling helpers, never cwd/PYTHONPATH
+# or a path supplied by an archive, manifest, environment or command argument.
+if not __package__ and sys.flags.isolated:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_EXPANDED_BYTES = 1024 * 1024 * 1024
 MAX_ENTRIES = 32_768
@@ -336,7 +342,7 @@ class _PayloadReader:
                 and _stamp(os.fstat(self.file.fileno())) == self.record["stamp"])
 
 
-def prepare_update(bundle, output, *, version, arch, root):
+def prepare_update(bundle, output, *, version, arch, root, notice_contents):
     """Return a closed receipt for an unsigned archive; never mutate the app."""
     require(not any(key in os.environ for key in
                     ("CARGO_PACKAGER_SIGN_PRIVATE_KEY", "CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD")))
@@ -368,6 +374,17 @@ def prepare_update(bundle, output, *, version, arch, root):
         resource = records.get(f"Contents/Resources/{name}")
         require(resource is not None and resource["kind"] == "file"
                 and resource["sha256"] == hashlib.sha256(_read(root / source, 16 * 1024 * 1024)).hexdigest())
+    if __package__:
+        from . import native_notices as notices
+    else:
+        import native_notices as notices
+    notices.verify_bytes(notice_contents, platform="darwin", version=version,
+                         lock=_read(root / "Cargo.lock", 4 * 1024 * 1024))
+    for name in notices.NAMES:
+        record = records.get(f"Contents/Resources/{name}")
+        require(record is not None and record["kind"] == "file"
+                and record["size"] == len(notice_contents[name])
+                and record["sha256"] == hashlib.sha256(notice_contents[name]).hexdigest())
     entries = [{"path": "", "mode": snapshot["mode"], "size": 0, "kind": "directory"}] + snapshot["records"]
     headers = [_header(record) for record in entries]
     created = False
@@ -421,10 +438,13 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--version", required=True)
     parser.add_argument("--arch", required=True, choices=["aarch64", "x86_64"])
+    parser.add_argument("--notices", required=True, type=Path, help="Exact already-validated plain-text notice directory")
     args = parser.parse_args()
     require(sys.platform == "darwin")
+    if __package__: from . import native_notices as notices
+    else: import native_notices as notices
     receipt = prepare_update(args.app, args.output, version=args.version, arch=args.arch,
-                             root=Path(__file__).resolve().parents[1])
+                             root=Path(__file__).resolve().parents[1], notice_contents=notices.read_files(args.notices))
     print("MORPHEUS_MAC_UPDATE " + json.dumps(receipt, sort_keys=True))
 
 

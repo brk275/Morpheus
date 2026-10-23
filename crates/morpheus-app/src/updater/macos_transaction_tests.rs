@@ -197,6 +197,46 @@ fn real_unsigned_producer_roundtrips_exact_link_modes_through_native_reader_and_
         fs::copy(repository.join(source), &output).unwrap();
         fs::set_permissions(output, fs::Permissions::from_mode(0o444)).unwrap();
     }
+    // The producer's notice input is already validated plain data. This
+    // explicitly synthetic closed ledger is not source/license acceptance;
+    // actual source authentication has separate existing Python coverage.
+    use sha2::Digest;
+    let text = b"Synthetic Slint notice fixture; no legal acceptance.\n";
+    let text_hash = format!("{:x}", sha2::Sha256::digest(text));
+    let lock = fs::read(repository.join("Cargo.lock")).unwrap();
+    let lock_hash = format!("{:x}", sha2::Sha256::digest(&lock));
+    let inventory = serde_json::json!({
+        "schema": 1, "source_revision": "a".repeat(40), "source_tree": "b".repeat(40),
+        "cargo_lock_sha256": lock_hash, "built_cargo_lock_sha256": lock_hash,
+        "package_version": identity.version, "platform": "darwin",
+        "source_bundle_sha256": "c".repeat(64), "source_manifest_sha256": "d".repeat(64),
+        "text_sha256": text_hash, "text_bytes": text.len(),
+        "texts": [{"sha256": text_hash, "offset": 0, "bytes": text.len()}],
+        "locked_packages": [{"name": "slint", "version": "1.18.1", "source": "committed-workspace",
+            "source_identity": {"tree": "b".repeat(40)}, "declared_license": "synthetic-test-only",
+            "license_texts": [{"source_path": "LICENSE", "sha256": text_hash}],
+            "missing_license_text": false, "license_obligations_verified": false,
+            "native_linked_inputs_verified": false}],
+        "local_patch_provenance": [{"source_path": "vendor/cpal/OWNED_COREAUDIO.md", "sha256": text_hash}],
+        "native_source_evidence": {"coverage": "rust-only", "bound_to_this_platform_binary": false},
+        "distribution_ready": false, "license_compliance_verified": false,
+        "unresolved_release_requirements": ["native-linked-input-and-sdk-source-provenance",
+            "compiler-system-runtime-licenses", "license-route-and-attribution-obligations",
+            "generated-preferred-source-forms", "relinking-and-installation-information",
+            "legal-distribution-approval"]
+    });
+    let notices = root.path().join("notices");
+    fs::DirBuilder::new().mode(0o700).create(&notices).unwrap();
+    for (name, bytes) in [
+        ("THIRD-PARTY-NOTICES.txt", text.to_vec()),
+        (
+            "THIRD-PARTY-NOTICES.json",
+            serde_json::to_vec(&inventory).unwrap(),
+        ),
+    ] {
+        fs::write(notices.join(name), &bytes).unwrap();
+        fs::write(app.join("Contents/Resources").join(name), bytes).unwrap();
+    }
     let modes = [
         ("ordinary-link", 0o777),
         ("private-link", 0o700),
@@ -224,6 +264,8 @@ fn real_unsigned_producer_roundtrips_exact_link_modes_through_native_reader_and_
         .arg(&identity.version)
         .arg("--arch")
         .arg(&identity.arch)
+        .arg("--notices")
+        .arg(&notices)
         .env_remove("CARGO_PACKAGER_SIGN_PRIVATE_KEY")
         .env_remove("CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD")
         .output()

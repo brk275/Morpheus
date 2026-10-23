@@ -251,5 +251,22 @@ class NativeUpdateWorkflowTests(unittest.TestCase):
         self.assertEqual(pins[("win32", "AMD64")][2], "17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c")
 
 
+class NativeNoticeWorkflowTests(unittest.TestCase):
+    def test_existing_native_jobs_supply_exact_source_inputs_and_always_cleanup_without_new_jobs(self):
+        workflow=(Path(__file__).resolve().parents[2]/".github/workflows/package-qa.yml").read_text()
+        self.assertEqual(workflow.count("scripts/native_notice_source.py --prepare"),1)
+        self.assertEqual(workflow.count("scripts/native_notice_source.py --finish"),1)
+        self.assertEqual(workflow.count("--native-source-bundle"),3)
+        self.assertEqual(workflow.count("--native-source-receipt"),3)
+        self.assertLess(workflow.index("Prepare candidate-bound portable source notice inputs"),
+                        workflow.index("Verify synthetic installed Mac update transactions"))
+        self.assertLess(workflow.index("Prepare candidate-bound portable source notice inputs"),
+                        workflow.index("Build unsigned QA package"))
+        self.assertIn("if: always() && runner.os != 'Linux' && env.MORPHEUS_NATIVE_SOURCE_ROOT != ''",workflow)
+        self.assertIn("Prepare pinned native notice and update scanner\n        if: runner.os != 'Linux'",workflow)
+        for forbidden in ("upload-artifact", "pull_request_target", "workflow_run:", "secrets."):
+            self.assertNotIn(forbidden,workflow)
+
+
 if __name__ == "__main__":
     unittest.main()

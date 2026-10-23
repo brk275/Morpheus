@@ -55,7 +55,7 @@ pub(super) fn event_false(value: Option<&serde_json::Value>) -> bool {
 }
 fn guard() -> Result<(), UpdateError> {
     require(NONCE.len() == 32 && NONCE.bytes().all(|b| b.is_ascii_hexdigit()))?;
-    require(option_env!("MORPHEUS_PACKAGE_FORMAT") == Some("nsis-payload-v1"))?;
+    require(option_env!("MORPHEUS_PACKAGE_FORMAT") == Some("nsis-payload-v2"))?;
     for (name, value) in [
         ("GITHUB_ACTIONS", "true"),
         ("RUNNER_ENVIRONMENT", "github-hosted"),
@@ -120,7 +120,7 @@ impl Plan {
                 && case_root.path.file_name().and_then(|v| v.to_str()) == Some(plan.case.as_str())
                 && plan.root == case_root.path
                 && plan.install == case_root.path.join("installed")
-                && plan.payload == run.path.join("new-package/Morpheus.windows-payload-v1.bin")
+                && plan.payload == run.path.join("new-package/Morpheus.windows-payload-v2.bin")
                 && plan.old.valid()
                 && plan.new.compatible(&plan.old)
                 && cargo_packager_updater::semver::Version::parse(&plan.new.version)
@@ -177,13 +177,13 @@ impl Plan {
             target: "windows-x86_64".into(),
             extract_path: self.root.clone(),
             // verify/stage only. No download/network method is called here.
-            download_url: "https://example.invalid/windows-payload-v1.bin"
+            download_url: "https://example.invalid/windows-payload-v2.bin"
                 .parse()
                 .map_err(|_| UpdateError::InvalidConfiguration)?,
             signature: signature.into(),
             timeout: Some(Duration::from_secs(10)),
             headers: Default::default(),
-            format: UpdateFormat::WindowsPayloadV1,
+            format: UpdateFormat::WindowsPayloadV2,
         })
     }
     fn fact(&self, name: &str, phase: &str, identity: &Identity) -> Result<(), UpdateError> {

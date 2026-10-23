@@ -336,8 +336,12 @@ class PreparationTests(unittest.TestCase):
     def cpal_source(project):
         source = project / "vendor/cpal"
         source.mkdir(parents=True)
-        for name in ("LICENSE", "OWNED_COREAUDIO.md"):
+        for name in ("LICENSE", "OWNED_COREAUDIO.md", "OWNED_ALSA.md"):
             (source / name).write_bytes((ROOT / "vendor/cpal" / name).read_bytes())
+        alsa = project / "vendor/alsa"
+        alsa.mkdir()
+        for name in N.ALSA_LICENSES:
+            (alsa / name).write_bytes((ROOT / "vendor/alsa" / name).read_bytes())
         return source
 
     def test_cpal_notices_authenticate_license_and_copy_exact_provenance(self):
@@ -347,17 +351,22 @@ class PreparationTests(unittest.TestCase):
             config = {"appimage": {"files": {}}}; notices = {}
             with mock.patch.object(N.client, "ROOT", project):
                 N.cpal_notices(root, config, notices)
-            self.assertEqual(len(notices), 2)
+            self.assertEqual(len(notices), 5)
             self.assertEqual(N.digest((source / "LICENSE").read_bytes()), N.CPAL_LICENSE_SHA256)
             for path, destination in config["appimage"]["files"].items():
                 self.assertEqual(N.digest(Path(path).read_bytes()), notices[destination])
             copied = {Path(path).name: Path(path).read_bytes() for path in config["appimage"]["files"]}
             self.assertEqual(copied["CPAL-0.18.2-PATCH.md"], (source / "OWNED_COREAUDIO.md").read_bytes())
+            self.assertEqual(copied["ALSA-0.11.0-PATCH.md"], (source / "OWNED_ALSA.md").read_bytes())
+            for name, checksum in N.ALSA_LICENSES.items():
+                data = (project / "vendor/alsa" / name).read_bytes()
+                self.assertEqual(N.digest(data), checksum)
+                self.assertEqual(copied["ALSA-0.11.0-" + name], data)
             (source / "OWNED_COREAUDIO.md").write_bytes(b"later source mutation")
             self.assertNotIn(b"later source mutation", copied.values())
 
     def test_cpal_notice_wrong_license_or_nonregular_input_fails_before_staging(self):
-        for mutation in ("license", "symlink", "missing"):
+        for mutation in ("license", "symlink", "missing", "alsa-license", "alsa-symlink", "alsa-provenance"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as folder, tempfile.TemporaryDirectory() as checkout:
                 root = Path(folder).resolve(); project = Path(checkout).resolve()
                 source = self.cpal_source(project)
@@ -366,8 +375,15 @@ class PreparationTests(unittest.TestCase):
                 elif mutation == "symlink":
                     (source / "OWNED_COREAUDIO.md").unlink()
                     (source / "OWNED_COREAUDIO.md").symlink_to(source / "LICENSE")
-                else:
+                elif mutation == "missing":
                     (source / "OWNED_COREAUDIO.md").unlink()
+                elif mutation == "alsa-license":
+                    (project / "vendor/alsa/LICENSE-MIT").write_bytes(b"changed upstream license")
+                elif mutation == "alsa-symlink":
+                    (project / "vendor/alsa/LICENSE-APACHE").unlink()
+                    (project / "vendor/alsa/LICENSE-APACHE").symlink_to(source / "LICENSE")
+                else:
+                    (source / "OWNED_ALSA.md").unlink()
                 config = {"appimage": {"files": {}}}; notices = {}
                 with mock.patch.object(N.client, "ROOT", project), self.assertRaises(N.InventoryFailure):
                     N.cpal_notices(root, config, notices)

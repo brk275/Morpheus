@@ -45,7 +45,7 @@ fn envelope(next: &Identity) -> (Vec<u8>, Manifest) {
         })
         .collect::<Vec<_>>();
     let manifest = Manifest {
-        schema: 1,
+        schema: 2,
         identity: next.clone(),
         uninstaller_contract: UNINSTALL_CONTRACT.into(),
         files: FILES
@@ -604,4 +604,30 @@ fn windows_identity_rejects_legacy_helpers_before_forward_payload_admission() {
         rejected.version = current.version.clone();
         assert!(Payload::parse(&valid, &rejected, &next.version).is_err());
     }
+}
+
+#[test]
+fn windows_notice_ledger_requires_v2_and_both_exact_hashed_notice_files() {
+    let (bytes, manifest) = envelope(&identity("0.2.0"));
+    assert_eq!(FILES.len(), 7);
+    assert_eq!(
+        &FILES[5..],
+        &[
+            "licenses/THIRD-PARTY-NOTICES.txt",
+            "licenses/THIRD-PARTY-NOTICES.json"
+        ]
+    );
+    let mut legacy = manifest.clone();
+    legacy.schema = 1;
+    legacy.files.truncate(5);
+    assert!(Manifest::parse(&serde_json::to_vec(&legacy).unwrap()).is_err());
+    let mut missing = manifest.clone();
+    missing.files.pop();
+    assert!(Manifest::parse(&serde_json::to_vec(&missing).unwrap()).is_err());
+    let mut wrong_path = manifest.clone();
+    wrong_path.files[5].path = "licenses/other.txt".into();
+    assert!(Manifest::parse(&serde_json::to_vec(&wrong_path).unwrap()).is_err());
+    let mut legacy_magic = bytes;
+    legacy_magic[MAGIC.len() - 2] = b'1';
+    assert!(Payload::parse(&legacy_magic, &identity("0.1.0"), "0.2.0").is_err());
 }
