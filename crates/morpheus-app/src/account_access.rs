@@ -415,6 +415,17 @@ impl AccountAccessUi {
                     Action::Remove(id) => {
                         let _transition = access.live.account_transition.lock().await;
                         if !(access.can_change)() { return Err(MatrixCoreError::SelectedAccountChanged); }
+                        // Cancel exact-account verification work and observe the real
+                        // task joins before the manager can revoke/delete its stores.
+                        // A failed drain retains the pause and sole task handles.
+                        let mut verification_pause = access.live.pause_verification_work(&id)
+                            .map_err(|error| MatrixCoreError::Io(std::io::Error::other(error)))?;
+                        verification_pause.drain().await
+                            .map_err(|error| MatrixCoreError::Io(std::io::Error::other(error)))?;
+                        if access.generation.load(Ordering::Acquire) != generation
+                            || access.live.action_admission_closed() || !(access.can_change)() {
+                            return Err(MatrixCoreError::SelectedAccountChanged);
+                        }
                         if access.live.manager.active_account().await.is_some_and(|a| a.id == id) {
                             access.live.clear_feed().await;
                         }

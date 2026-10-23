@@ -83,6 +83,7 @@ mod unread_navigation;
 mod update_controller;
 mod updater;
 mod verification;
+mod verification_work;
 #[cfg(feature = "native-calls")]
 mod video_render;
 #[cfg(feature = "native-calls")]
@@ -4377,7 +4378,25 @@ fn run_application(
                 return;
             }
             let Some(_security) = security_gate.try_account_access() else { return; };
+            // Reject an old A -> B -> A selection BEFORE pausing any account ID.
+            // The core repeats its atomic selection check below.
+            if !selection.is_current() {
+                show_error(&ui, "The account changed. Open its menu and request logout again.".into());
+                return;
+            }
             let account_id = selection.account_id().to_owned();
+            let mut verification_pause = match live.pause_verification_work(&account_id) {
+                Ok(pause) => pause,
+                Err(error) => { show_error(&ui, error.to_string()); return; }
+            };
+            if let Err(error) = verification_pause.drain().await {
+                show_error(&ui, error.to_string());
+                return;
+            }
+            if !selection.is_current() || live.action_admission_closed() {
+                show_error(&ui, "The account changed. Open its menu and request logout again.".into());
+                return;
+            }
             // The core checks selection identity atomically before any logout
             // effect. A queued A -> B (including A -> B -> A) cannot retarget it.
             let result = live.manager.logout_selected_account(&selection).await;
@@ -4775,6 +4794,7 @@ fn run_application(
         #[cfg(all(windows, feature = "native-calls"))]
         live.security_gate.begin_shutdown(None);
         live.close_action_admission();
+        verification::shutdown(&cleanup_ui);
         store.close_write_admission();
         style_profiles::close_application_admission();
         cleanup_ui.set_application_closing(true);
@@ -4882,6 +4902,7 @@ fn run_application(
             // writer sweep, while loaded account stores remain available.
             let appearance_result = style_profiles::wait_for_appearance_release().await;
             let draft_task_result = live.drain_draft_work().await;
+            let verification_result = live.drain_verification_work().await;
             let config_drain_result = loop {
                 match store.write_shutdown_confirmed() {
                     Ok(true) => break Ok(()),
@@ -4910,6 +4931,7 @@ fn run_application(
                     draft_task_result,
                     config_drain_result,
                     appearance_result,
+                    verification_result,
                 )
             }
             #[cfg(not(feature = "native-calls"))]
@@ -4922,6 +4944,7 @@ fn run_application(
                     draft_task_result,
                     config_drain_result,
                     appearance_result,
+                    verification_result,
                 )
             }
         }
@@ -4941,6 +4964,7 @@ fn run_application(
             draft_task_result,
             config_drain_result,
             appearance_result,
+            verification_result,
         ),
         wasapi_result,
     ) = windows_audio::run(&ui, wasapi_ui, &runtime, cleanup)?;
@@ -4959,6 +4983,7 @@ fn run_application(
             draft_task_result,
             config_drain_result,
             appearance_result,
+            verification_result,
         ),
     ) = {
         let result = ui.run();
@@ -4975,6 +5000,7 @@ fn run_application(
             draft_task_result,
             config_drain_result,
             appearance_result,
+            verification_result,
         ),
     ) = {
         let result = ui.run();
@@ -5004,6 +5030,7 @@ fn run_application(
     draft_task_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     config_drain_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     appearance_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    verification_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     #[cfg(feature = "native-calls")]
     discovery_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     #[cfg(all(windows, feature = "native-calls"))]
