@@ -87,3 +87,8 @@ The complete [MPL-2.0 license](../licenses/Symphonia-MPL-2.0.txt) and
 [source notice](../licenses/Symphonia-NOTICE.txt) are included as package
 resources and referenced in About. The small WAV reader is Morpheus code;
 no Symphonia generic metadata/artwork or RIFF package is enabled.
+
+
+## alsa 0.11.0: checked Linux PCM close
+
+`alsa/` preserves the complete checksum-pinned upstream 0.11.0 source archive and dual license. A two-method `src/pcm.rs` amendment exposes consuming checked PCM close and the native type query used by the Linux CPAL owner. Original `Cargo.toml.orig`, source and attribution remain available. The root patch uses the existing version and dependency identities; upstream dev tooling is outside the application workspace. See `cpal/OWNED_ALSA.md` for exact archive checksums, native-status/consumed-pointer distinction, worker/TLS ownership, selected-device failure boundaries and unverified target acceptance. Generic committed-source export includes all vendored files; this does not complete broader native/system/compiler/relink or distribution gates.

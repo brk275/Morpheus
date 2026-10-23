@@ -1,9 +1,15 @@
 //! Original quiet output-only ringtone. No microphone, media publication or file
 //! is opened. A retained supervisor holds the permit through returned application
-//! stream Drop and actual worker/TLS join; backend native disposal remains open.
+//! stream revocation, checked native close on implemented hosts and real worker/TLS
+//! join. Actual hardware/route acceptance remains a separate requirement.
 //! Native open/drop cannot be interrupted. Cancellation
 //! prevents later startup steps and makes subsequent callback buffers silent;
 //! samples already submitted to the OS cannot be recalled.
+
+#[cfg(target_os = "linux")]
+use crate::alsa_close::close_retired_alsa_on_owned_worker as close_retired_native_audio;
+#[cfg(target_os = "macos")]
+use crate::coreaudio_close::close_retired_coreaudio_on_owned_worker as close_retired_native_audio;
 
 use cpal::{
     SampleFormat, Stream, SupportedStreamConfig,
@@ -82,39 +88,39 @@ impl Drop for Permit {
     }
 }
 
-// Mac native teardown is fallible after the PCM producer returns or unwinds.
+// Mac and Linux native teardown is fallible after the PCM producer returns or unwinds.
 // One process-retained slot owns the exact Permit before the first native step;
 // no playback handle, stack unwind or cancelled observer can drop that guard.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 static PCM_NATIVE_OWNERS: PcmNativeOwners = PcmNativeOwners::new();
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PCM_FRESH: u8 = 0;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PCM_PRODUCING: u8 = 1;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PCM_TERMINAL: u8 = 2;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PCM_CLOSING: u8 = 3;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PCM_RELEASED: u8 = 4;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PCM_FAILED: u8 = 5;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct PcmNativeIdentity(AtomicU8);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl PcmNativeIdentity {
     fn new() -> Arc<Self> {
         Arc::new(Self(AtomicU8::new(PCM_FRESH)))
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct PcmNativeOwner {
     identity: Arc<PcmNativeIdentity>,
     _permit: Permit,
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct PcmNativeOwners(Mutex<Option<PcmNativeOwner>>);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl PcmNativeOwners {
     const fn new() -> Self {
         Self(Mutex::new(None))
@@ -188,9 +194,9 @@ impl PcmNativeOwners {
         Ok(())
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct PcmProducer(Arc<PcmNativeIdentity>);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for PcmProducer {
     fn drop(&mut self) {
         // This marker is created before open_pcm and destroyed only after its
@@ -247,7 +253,7 @@ pub enum RingAudioReleaseError {
     WorkerPanicked,
     SupervisorFailed,
     OutputOwnerUnconfirmed,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     NativeClose,
 }
 impl std::fmt::Display for RingAudioReleaseError {
@@ -258,6 +264,8 @@ impl std::fmt::Display for RingAudioReleaseError {
             Self::SupervisorFailed => "incoming sound worker ownership could not be confirmed",
             #[cfg(target_os = "macos")]
             Self::NativeClose => "CoreAudio incoming sound cleanup failed and remains owned",
+            #[cfg(target_os = "linux")]
+            Self::NativeClose => "ALSA incoming sound cleanup failed and remains owned",
             Self::OutputOwnerUnconfirmed => {
                 "the previous output worker release could not be confirmed"
             }
@@ -440,12 +448,12 @@ fn run_ring_worker(
         }
         work(&run, &resources)
     }));
-    #[cfg(target_os = "macos")]
-    let native_close = crate::coreaudio_close::close_retired_coreaudio_on_owned_worker();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let native_close = close_retired_native_audio();
     let released = match &result {
         Err(_) => Err(RingAudioReleaseError::WorkerPanicked),
         Ok(Err(RingWorkerError::Release(error))) => Err(*error),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         _ if native_close.is_err() => Err(RingAudioReleaseError::NativeClose),
         _ => Ok(()),
     };
@@ -1306,9 +1314,9 @@ pub struct PcmPlayback {
     consumed: AtomicU64,
     total: AtomicU64,
     rate: AtomicU32,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     native_close_failed: AtomicBool,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     native_identity: Arc<PcmNativeIdentity>,
 }
 impl PcmPlayback {
@@ -1336,9 +1344,9 @@ impl PcmPlayback {
             consumed: AtomicU64::new(0),
             total: AtomicU64::new(0),
             rate: AtomicU32::new(0),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             native_close_failed: AtomicBool::new(false),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             native_identity: PcmNativeIdentity::new(),
         })
     }
@@ -1359,7 +1367,7 @@ impl PcmPlayback {
     pub fn unavailable(&self) -> bool {
         self.run.status.load(Ordering::Acquire) == 3
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn native_close_failed(&self) -> bool {
         self.native_close_failed.load(Ordering::Acquire)
     }
@@ -1368,12 +1376,12 @@ impl PcmPlayback {
     /// or releasing the still-producing owner's guard. A terminal native error
     /// remains owned; only this exact terminal producer's checked success can
     /// release it. This is separate from the application's actual worker/TLS join.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn close_native_output_on_owned_worker(&self) -> Result<(), RingAudioError> {
         self.stop();
         PCM_NATIVE_OWNERS
             .close_with(&self.native_identity, || {
-                crate::coreaudio_close::close_retired_coreaudio_on_owned_worker().map_err(|_| ())
+                close_retired_native_audio().map_err(|_| ())
             })
             .map_err(|()| {
                 self.native_close_failed.store(true, Ordering::Release);
@@ -1425,11 +1433,11 @@ impl PcmPlayback {
             return Err(RingAudioError::Cancelled);
         }
         // No waiting/retry or extra native opener on an explicit Play.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let producer = PCM_NATIVE_OWNERS.admit(&self.native_identity, &self.run)?;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let _permit = Permit::take().ok_or(RingAudioError::Busy)?;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let result = {
             if !self.run.active() {
                 return Err(RingAudioError::Cancelled);
@@ -1439,7 +1447,7 @@ impl PcmPlayback {
             self.rate.store(rate, Ordering::Release);
             self.open_pcm(samples, rate, channels)
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let result = if self.run.active() {
             self.total
                 .store((samples.len() / count) as u64, Ordering::Release);
@@ -1448,9 +1456,9 @@ impl PcmPlayback {
         } else {
             Err(RingAudioError::Cancelled)
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         drop(producer);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if self.close_native_output_on_owned_worker().is_err() {
             return result.and(Err(RingAudioError::Unavailable));
         }
@@ -1617,7 +1625,7 @@ fn fill_pcm<T: ToneSample>(
 #[cfg(test)]
 mod pcm_tests {
     use super::*;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn pcm_guard_requires_terminal_producer_and_exact_checked_close_before_release() {
         let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
@@ -1671,7 +1679,7 @@ mod pcm_tests {
         assert_eq!(owners.close_with(&next.native_identity, || Ok(())), Ok(()));
         assert!(Permit::take().is_some());
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn pcm_producer_panic_keeps_exact_guard_until_authentic_terminal_cleanup() {
         let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
@@ -1699,7 +1707,7 @@ mod pcm_tests {
         assert!(Permit::take().is_some());
         assert!(operation.is_err());
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn pcm_native_close_error_or_panic_retains_single_owner_without_retry() {
         let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
@@ -1743,7 +1751,7 @@ mod pcm_tests {
             assert!(Permit::take().is_some());
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn pcm_cancel_before_admission_has_no_native_guard_or_close_receipt() {
         let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();

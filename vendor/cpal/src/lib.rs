@@ -1112,3 +1112,17 @@ pub fn drain_retired_owned_coreaudio(
 
 #[cfg(target_os = "macos")]
 pub use host::coreaudio::{CoreAudioClosePhase, OwnedCoreAudioCloseError};
+
+/// Linux-only checked native PCM close plus actual callback/control/TLS joins.
+/// Blocking: call only on a retained non-UI native worker. An error is NOT a
+/// device-release receipt, even if the primary PCM allocation was consumed.
+#[cfg(target_os = "linux")]
+pub fn drain_owned_alsa(timeout: std::time::Duration) -> Result<(), AlsaCloseError> {
+    host::alsa::drain_owned(timeout)
+}
+#[cfg(target_os = "linux")]
+pub fn drain_retired_owned_alsa(timeout: std::time::Duration) -> Result<(), AlsaCloseError> {
+    host::alsa::drain_retired(timeout)
+}
+#[cfg(target_os = "linux")]
+pub use host::alsa::{AlsaCloseError, AlsaCloseObservation, AlsaCloseTicket};
