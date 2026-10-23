@@ -92,3 +92,29 @@ no Symphonia generic metadata/artwork or RIFF package is enabled.
 ## alsa 0.11.0: checked Linux PCM close
 
 `alsa/` preserves the complete checksum-pinned upstream 0.11.0 source archive and dual license. A two-method `src/pcm.rs` amendment exposes consuming checked PCM close and the native type query used by the Linux CPAL owner. Original `Cargo.toml.orig`, source and attribution remain available. The root patch uses the existing version and dependency identities; upstream dev tooling is outside the application workspace. See `cpal/OWNED_ALSA.md` for exact archive checksums, native-status/consumed-pointer distinction, worker/TLS ownership, selected-device failure boundaries and unverified target acceptance. Generic committed-source export includes all vendored files; this does not complete broader native/system/compiler/relink or distribution gates.
+
+
+## Windows native ownership amendment
+
+The same-version CPAL 0.18.2 patch also implements retained native STA owners,
+checked default-input UI activation and standard Global Interface Table transfer.
+Native services, events and notification registration stay with their actual
+apartment owner. Typed close observations distinguish Pending, Released and
+Retained; callback flags, Stream Drop and a completed application body alone are
+not native-release receipts. Native uncertainty retains the same owner and blocks
+replacement. The returned receipt also requires actual worker/TLS and supervisor
+joins. Notification unregistration permits the documented final COM release; it
+does not claim to join every internal Windows callback thread.
+
+This amendment adds only the normalized manifest's WindowsAndMessaging feature
+on the already locked Windows bindings. Original upstream source, manifests,
+lockfile and Apache license remain preserved. It adds no installed DLL, sidecar
+or resource beyond the application binary. The seven-file signed Windows update
+payload and its initial-installer resource contract remain fixed. Source-bound
+notice files record provenance and unresolved obligations; they do not authorize
+native shutdown, restart, installation or distribution.
+
+The implementation remains subject to independent source review and fresh
+platform, COM/activation/buffer/error, ordinary-shutdown, installed-update and
+real-device acceptance. Production installation gates remain false. Existing Mac
+and ALSA ownership notes and their explicit native/library limitations still apply.
