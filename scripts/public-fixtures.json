@@ -285,6 +285,281 @@
       "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/tests/integration/encryption/to_device.rs:generic-api-key:58",
       "blob_sha256": "4c29df4a1aa56b899c9fa461f659367ac227af6bae7572275d300dc17b1a6b07",
       "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/tests/integration/encryption/to_device.rs"
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/backups/keys/decryption.rs:generic-api-key:289",
+      "blob_sha256": "336c875f4b0d74d3ad89fe3ab73012bf630aba6344592f61bb2371c7fb14df36",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/backups/keys/decryption.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/backups/mod.rs:generic-api-key:657",
+      "blob_sha256": "aefc5108b95042b7ba2435d1315de8a0e22e43cbabe89906489e81e51e70d96c",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/backups/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/machine/tests/mod.rs:generic-api-key:1774",
+      "blob_sha256": "7261893626baeb8a85c4178d32377832c98e3d36f150634d2e36f723b9a652c7",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/machine/tests/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/machine/tests/mod.rs:generic-api-key:1776",
+      "blob_sha256": "7261893626baeb8a85c4178d32377832c98e3d36f150634d2e36f723b9a652c7",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/machine/tests/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/machine/tests/send_encrypted_to_device.rs:generic-api-key:496",
+      "blob_sha256": "c1a4417695fa345c5be7785840d2b81702d860d75db2acda8e6ccb4f22d43607",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/machine/tests/send_encrypted_to_device.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/machine/tests/snapshots/processed_to_device_variants.snap:generic-api-key:12",
+      "blob_sha256": "166f7077d916932c71a296c3f903d5a3e7cd7a1b01b03727cc49d9e0c710bfcc",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/machine/tests/snapshots/processed_to_device_variants.snap. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/account.rs:generic-api-key:2128",
+      "blob_sha256": "6ba674bc529ac5bed722ac8e99730bb2de08a301ee867ba6a47bb3ab53a7d511",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/account.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs:generic-api-key:1001",
+      "blob_sha256": "729cb59f3c672e194cf45639bf1525a9c3e720ed51fcd7cc1baef81cc091722a",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs:generic-api-key:1084",
+      "blob_sha256": "729cb59f3c672e194cf45639bf1525a9c3e720ed51fcd7cc1baef81cc091722a",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs:generic-api-key:1129",
+      "blob_sha256": "729cb59f3c672e194cf45639bf1525a9c3e720ed51fcd7cc1baef81cc091722a",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs:generic-api-key:1319",
+      "blob_sha256": "729cb59f3c672e194cf45639bf1525a9c3e720ed51fcd7cc1baef81cc091722a",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs:generic-api-key:1321",
+      "blob_sha256": "729cb59f3c672e194cf45639bf1525a9c3e720ed51fcd7cc1baef81cc091722a",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs:generic-api-key:1388",
+      "blob_sha256": "729cb59f3c672e194cf45639bf1525a9c3e720ed51fcd7cc1baef81cc091722a",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs:generic-api-key:1389",
+      "blob_sha256": "729cb59f3c672e194cf45639bf1525a9c3e720ed51fcd7cc1baef81cc091722a",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/group_sessions/mod.rs:generic-api-key:339",
+      "blob_sha256": "edf045d89333be9c110fa9c47c4b9bbb6d21c10dccbb4db83115c089a114495c",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/group_sessions/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/group_sessions/mod.rs:generic-api-key:341",
+      "blob_sha256": "edf045d89333be9c110fa9c47c4b9bbb6d21c10dccbb4db83115c089a114495c",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/group_sessions/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/olm/utility.rs:generic-api-key:231",
+      "blob_sha256": "16eff314dfda9c1a72be4ba98d1f9571874f6ce2b0a86eb2453df0feb32dfafb",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/olm/utility.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/secret_storage.rs:generic-api-key:816",
+      "blob_sha256": "40ec17385c62da26db859562d979aac5bcf85dada4e29ff019c9e488aad6f1dd",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/secret_storage.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/secret_storage.rs:generic-api-key:823",
+      "blob_sha256": "40ec17385c62da26db859562d979aac5bcf85dada4e29ff019c9e488aad6f1dd",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/secret_storage.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/secret_storage.rs:generic-api-key:830",
+      "blob_sha256": "40ec17385c62da26db859562d979aac5bcf85dada4e29ff019c9e488aad6f1dd",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/secret_storage.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/secret_storage.rs:generic-api-key:837",
+      "blob_sha256": "40ec17385c62da26db859562d979aac5bcf85dada4e29ff019c9e488aad6f1dd",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/secret_storage.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/session_manager/group_sessions/mod.rs:generic-api-key:1178",
+      "blob_sha256": "70ce344aa9ebb950548c22711985e372321ba1232924e35587ad00da46299ab9",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/session_manager/group_sessions/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/session_manager/sessions.rs:generic-api-key:953",
+      "blob_sha256": "8d8502c351887d303037d8c714bf327b727a215b4555d8cb7edc3f76b0743a1a",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/session_manager/sessions.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/memorystore.rs:generic-api-key:1299",
+      "blob_sha256": "49a3873dd9a5cacf713b97564ef0537ef19a6f30e31bccca009ea147e08509a2",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/memorystore.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/memorystore.rs:generic-api-key:897",
+      "blob_sha256": "49a3873dd9a5cacf713b97564ef0537ef19a6f30e31bccca009ea147e08509a2",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/memorystore.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/mod.rs:generic-api-key:2312",
+      "blob_sha256": "e42fcd07611c130f1dd6b55d70e8a8bba506f1279a7c9e50bb2dc3e02715e39f",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/mod.rs:generic-api-key:2313",
+      "blob_sha256": "e42fcd07611c130f1dd6b55d70e8a8bba506f1279a7c9e50bb2dc3e02715e39f",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/mod.rs:generic-api-key:2314",
+      "blob_sha256": "e42fcd07611c130f1dd6b55d70e8a8bba506f1279a7c9e50bb2dc3e02715e39f",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/mod.rs:generic-api-key:2315",
+      "blob_sha256": "e42fcd07611c130f1dd6b55d70e8a8bba506f1279a7c9e50bb2dc3e02715e39f",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/mod.rs:generic-api-key:2396",
+      "blob_sha256": "e42fcd07611c130f1dd6b55d70e8a8bba506f1279a7c9e50bb2dc3e02715e39f",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/mod.rs:generic-api-key:2397",
+      "blob_sha256": "e42fcd07611c130f1dd6b55d70e8a8bba506f1279a7c9e50bb2dc3e02715e39f",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/snapshots/matrix_sdk_crypto__store__tests__build_room_key_bundle.snap:generic-api-key:12",
+      "blob_sha256": "809bd9144e3ddab3cb7854f14ee38e18a9862a4a9718fb727f7db4b334996c25",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/snapshots/matrix_sdk_crypto__store__tests__build_room_key_bundle.snap. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/store/snapshots/matrix_sdk_crypto__store__tests__build_room_key_bundle.snap:generic-api-key:22",
+      "blob_sha256": "809bd9144e3ddab3cb7854f14ee38e18a9862a4a9718fb727f7db4b334996c25",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/store/snapshots/matrix_sdk_crypto__store__tests__build_room_key_bundle.snap. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/olm_v1.rs:generic-api-key:450",
+      "blob_sha256": "852b409f12ac63d5c1f7833d035c046179487b2dfac74c17aa13c24f89536ba9",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/olm_v1.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/olm_v1.rs:generic-api-key:451",
+      "blob_sha256": "852b409f12ac63d5c1f7833d035c046179487b2dfac74c17aa13c24f89536ba9",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/olm_v1.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/room/encrypted.rs:generic-api-key:461",
+      "blob_sha256": "5d305270ca55f06c14d1119ac131b563e3d3e4aadcc59a829eb38755167a98e4",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/room/encrypted.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/room/encrypted.rs:generic-api-key:491",
+      "blob_sha256": "5d305270ca55f06c14d1119ac131b563e3d3e4aadcc59a829eb38755167a98e4",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/room/encrypted.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/room_key_request.rs:generic-api-key:306",
+      "blob_sha256": "9ec938d3b55959e0b46773dbdc95901ac4c73ab350f66eb79664673459c89ced",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/room_key_request.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/room_key_withheld.rs:generic-api-key:512",
+      "blob_sha256": "bbd4891cfd1581f87e26597dce5ab2c619bdaa775d78807d26f196b40eeb42ce",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/room_key_withheld.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/room_key_withheld.rs:generic-api-key:527",
+      "blob_sha256": "bbd4891cfd1581f87e26597dce5ab2c619bdaa775d78807d26f196b40eeb42ce",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/room_key_withheld.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/room_key_withheld.rs:generic-api-key:542",
+      "blob_sha256": "bbd4891cfd1581f87e26597dce5ab2c619bdaa775d78807d26f196b40eeb42ce",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/room_key_withheld.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/room_key_withheld.rs:generic-api-key:559",
+      "blob_sha256": "bbd4891cfd1581f87e26597dce5ab2c619bdaa775d78807d26f196b40eeb42ce",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/room_key_withheld.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/room_key_withheld.rs:generic-api-key:671",
+      "blob_sha256": "bbd4891cfd1581f87e26597dce5ab2c619bdaa775d78807d26f196b40eeb42ce",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/room_key_withheld.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/snapshots/decrypted_to_device_event_snapshot.snap:generic-api-key:19",
+      "blob_sha256": "f3fa443195a420122fa754f46a40bfdf4188ed9d89c0732fd68fc75d12ba31bb",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/snapshots/decrypted_to_device_event_snapshot.snap. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/snapshots/sender_device_keys_are_deserialized.snap:generic-api-key:36",
+      "blob_sha256": "5a9e6de9666b1515700a6635a42a8d39731c3627838db58ac6425d38c3bc17a4",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/snapshots/sender_device_keys_are_deserialized.snap. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/to_device.rs:generic-api-key:474",
+      "blob_sha256": "ecd8420ef20c13638535ba0617055b93329d529492a76e20ffc16ca33fe06ec3",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/to_device.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/to_device.rs:generic-api-key:475",
+      "blob_sha256": "ecd8420ef20c13638535ba0617055b93329d529492a76e20ffc16ca33fe06ec3",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/to_device.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/events/to_device.rs:generic-api-key:495",
+      "blob_sha256": "ecd8420ef20c13638535ba0617055b93329d529492a76e20ffc16ca33fe06ec3",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/events/to_device.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/mod.rs:generic-api-key:383",
+      "blob_sha256": "35ab863954ebb67c9b20d21b78899021a9884906755410b9f15058fcbf7b8292",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/mod.rs:generic-api-key:384",
+      "blob_sha256": "35ab863954ebb67c9b20d21b78899021a9884906755410b9f15058fcbf7b8292",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/mod.rs:generic-api-key:385",
+      "blob_sha256": "35ab863954ebb67c9b20d21b78899021a9884906755410b9f15058fcbf7b8292",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/mod.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/types/one_time_keys.rs:generic-api-key:148",
+      "blob_sha256": "cd5871140eded48827ef4e6e817f4eee9d4ccd65b6a966b1d88b7706548a4e15",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/types/one_time_keys.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/x509/rust_raw_x509_signer.rs:private-key:261",
+      "blob_sha256": "6eb565bf8ce0521d96cde07b4a69dfcba085639280a0a49c3773a1950618eb6a",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/x509/rust_raw_x509_signer.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/src/x509/x509_signer.rs:private-key:344",
+      "blob_sha256": "5dcf51d727fb9065f7cd9bd8b3545ff7c4264503f3815aff02943ae059eaf1eb",
+      "provenance": "Exact public Matrix SDK test or snapshot vector from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/crates/matrix-sdk-crypto/src/x509/x509_signer.rs. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/tests/fixtures/keys_claim.json:generic-api-key:1",
+      "blob_sha256": "d3e6e54bc78a1022feb82196f4d54a553582bcca2e55e79508ab65fe2afde34b",
+      "provenance": "Exact public signed-Curve25519 localhost benchmark one_time_keys fixture from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/benchmarks/benches/crypto_bench/keys_claim.json. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
     }
   ]
 }
