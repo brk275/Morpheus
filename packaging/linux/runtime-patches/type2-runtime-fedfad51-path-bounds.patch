@@ -1,0 +1,75 @@
+Backport the portable-path bounds fix discussed in AppImage/type2-runtime PR155
+(head a1fddcd61ad6307c0840f14324016ee488c49a7c, unmerged at source review).
+Original archive: fedfad51acc2860b2916a1eef32ba4a500ff31ef.
+Morpheus also rejects readlink truncation before NUL and bounds the adjacent
+implicit portable-home/config joins; an oversized optional counterpart is skipped.
+The original runtime license is retained. No compiler warning is disabled.
+
+--- a/src/runtime/runtime.c
++++ b/src/runtime/runtime.c
+@@ -725,13 +725,17 @@
+         char fullpath[PATH_MAX];
+ 
+         ssize_t length = readlink(appimage_path, fullpath, sizeof(fullpath));
+-        if (length < 0) {
++        if (length < 0 || length >= (ssize_t) sizeof(fullpath)) {
+             fprintf(stderr, "Error getting realpath for %s\n", appimage_path);
+             exit(EXIT_FAILURE);
+         }
+         fullpath[length] = '\0';
+ 
+-        sprintf(portable_dir, "%s.%s", fullpath, name);
++        int written = snprintf(portable_dir, sizeof(portable_dir), "%s.%s", fullpath, name);
++        if (written < 0 || (size_t) written >= sizeof(portable_dir)) {
++            fprintf(stderr, "Portable directory path is too long\n");
++            exit(EXIT_FAILURE);
++        }
+         if (!mkdir(portable_dir, S_IRWXU))
+             fprintf(stderr, "Portable %s directory created at %s\n", name, portable_dir);
+         else
+@@ -1447,17 +1451,21 @@
+     char portable_config_dir[PATH_MAX];
+ 
+     /* If there is a directory with the same name as the AppImage plus ".home", then export $HOME */
+-    strcpy(portable_home_dir, basepath);
+-    strcat(portable_home_dir, ".home");
+-    if (is_writable_directory(portable_home_dir)) {
++    int home_written = snprintf(portable_home_dir, sizeof(portable_home_dir), "%s.home", basepath);
++    if (home_written < 0)
++        exit(EXIT_EXECERROR);
++    /* An oversized counterpart is unavailable; never inspect a truncated path. */
++    if ((size_t) home_written < sizeof(portable_home_dir) && is_writable_directory(portable_home_dir)) {
+         fprintf(stderr, "Setting $HOME to %s\n", portable_home_dir);
+         setenv("HOME", portable_home_dir, 1);
+     }
+ 
+     /* If there is a directory with the same name as the AppImage plus ".config", then export $XDG_CONFIG_HOME */
+-    strcpy(portable_config_dir, basepath);
+-    strcat(portable_config_dir, ".config");
+-    if (is_writable_directory(portable_config_dir)) {
++    int config_written = snprintf(portable_config_dir, sizeof(portable_config_dir), "%s.config", basepath);
++    if (config_written < 0)
++        exit(EXIT_EXECERROR);
++    /* An oversized counterpart is unavailable; never inspect a truncated path. */
++    if ((size_t) config_written < sizeof(portable_config_dir) && is_writable_directory(portable_config_dir)) {
+         fprintf(stderr, "Setting $XDG_CONFIG_HOME to %s\n", portable_config_dir);
+         setenv("XDG_CONFIG_HOME", portable_config_dir, 1);
+     }
+@@ -1512,7 +1520,7 @@
+         char fullpath[PATH_MAX];
+ 
+         ssize_t length = readlink(appimage_path, fullpath, sizeof(fullpath));
+-        if (length < 0) {
++        if (length < 0 || length >= (ssize_t) sizeof(fullpath)) {
+             fprintf(stderr, "Error getting realpath for %s\n", appimage_path);
+             exit(EXIT_EXECERROR);
+         }
+@@ -1562,7 +1570,7 @@
+     if (getenv("TARGET_APPIMAGE") == NULL) {
+         // If we are operating on this file itself
+         ssize_t len = readlink(appimage_path, fullpath, sizeof(fullpath));
+-        if (len < 0) {
++        if (len < 0 || len >= (ssize_t) sizeof(fullpath)) {
+             perror("Failed to obtain absolute path");
+             exit(EXIT_EXECERROR);
+         }
