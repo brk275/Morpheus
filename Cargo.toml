@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 # Keep vendored library development feature sets outside the application workspace.
-exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa"]
+exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
@@ -71,3 +71,6 @@ matrix-sdk-ui = { path = "vendor/matrix-sdk-ui" }
 # Dependency resolution and compatibility remain subject to hosted verification.
 matrix-sdk = { path = "vendor/matrix-sdk" }
 matrix-sdk-search = { path = "vendor/matrix-sdk-search" }
+
+# Same-revision bounded encrypted room-key preparation; upstream tests preserved.
+matrix-sdk-crypto = { path = "vendor/matrix-sdk-crypto" }

@@ -542,3 +542,18 @@ f877eb2205818b3ee896d1b95626169f0050b2e3 (sha256
 The upstream record in `MORPHEUS_PROVENANCE.json` is unchanged. No dependency,
 feature, lockfile, workflow or scanner setting changes. The persistence cohort
 changes with this patch because `vendor/` is hashed.
+
+
+## Prepared bounded encrypted room-key bytes
+
+An opt-in `encryption::room_key_file` seam uses the same-revision path-patched
+crypto byte API. It returns opaque prepared import/export values and exposes an
+explicit import-target preparation await retaining the current machine read
+guard. Callers recheck their captured authority after all preparation awaits,
+then consume the existing store handoff without another client/store lookup.
+No filesystem, UI/account callbacks or hidden blocking tasks are added. Canonical
+key conversion is preflighted before mutation; only fixed errors and counts
+leave this seam. Admitted import is awaited through presentation cancellation;
+errors do not prove unchanged store state or completed remote backup. Complete
+export overflow is an error. See `../matrix-sdk-crypto/MORPHEUS_PATCH.md` for
+bounds, provenance, original fixtures and the still-open application/IO gates.
