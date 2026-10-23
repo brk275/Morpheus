@@ -314,6 +314,22 @@ mod tests {
     use super::*;
     use flate2::{write::GzEncoder, Compression};
 
+    fn private_destination() -> tempfile::TempDir {
+        // tempfile3.27 requests0777 for directories by default. Supply the
+        // parser's actual private staging contract explicitly; never change
+        // process-global umask or let a destination rejection mask a test of
+        // archive traversal, aliases, links, modes or bounded decoding.
+        let directory = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        assert_eq!(
+            fs::symlink_metadata(directory.path()).unwrap().mode() & 0o777,
+            0o700
+        );
+        directory
+    }
+
     fn archive(entries: &[(&str, tar::EntryType, &[u8], Option<&str>)]) -> Vec<u8> {
         archive_with_link_mode(entries, 0o777)
     }
@@ -347,7 +363,7 @@ mod tests {
 
     #[test]
     fn extracts_only_owned_bundle_files_and_safe_internal_links() {
-        let destination = tempfile::tempdir().unwrap();
+        let destination = private_destination();
         let bytes = archive(&[
             (
                 "Morpheus.app/Contents/Resources/theme",
@@ -374,6 +390,40 @@ mod tests {
     }
 
     #[test]
+    fn valid_archive_requires_a_private_real_empty_destination() {
+        let bytes = archive(&[(
+            "Morpheus.app/Contents/file",
+            tar::EntryType::Regular,
+            b"data",
+            None,
+        )]);
+        let destination = private_destination();
+        fs::set_permissions(destination.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(unpack_verified_bundle(&bytes, destination.path()).is_err());
+        assert!(fs::read_dir(destination.path()).unwrap().next().is_none());
+        fs::set_permissions(destination.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let owner = private_destination();
+        let alias = owner.path().join("destination-link");
+        std::os::unix::fs::symlink(destination.path(), &alias).unwrap();
+        assert!(unpack_verified_bundle(&bytes, &alias).is_err());
+        assert!(fs::read_dir(destination.path()).unwrap().next().is_none());
+
+        let sentinel = destination.path().join("sentinel");
+        fs::write(&sentinel, b"keep").unwrap();
+        assert!(unpack_verified_bundle(&bytes, destination.path()).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(destination.path()).unwrap().count(), 1);
+        fs::remove_file(sentinel).unwrap();
+
+        // Identical valid bytes must reach the archive reader after only the
+        // destination precondition is satisfied; rejection cases above cannot
+        // accidentally pass because their archive input was malformed.
+        let app = unpack_verified_bundle(&bytes, destination.path()).unwrap();
+        assert_eq!(fs::read(app.join("Contents/file")).unwrap(), b"data");
+    }
+
+    #[test]
     fn preserves_exact_link_modes_without_changing_the_target_or_accepting_special_bits() {
         let entries = [
             (
@@ -390,7 +440,7 @@ mod tests {
             ),
         ];
         for mode in [0o777, 0o700, 0o640, 0] {
-            let destination = tempfile::tempdir().unwrap();
+            let destination = private_destination();
             let bytes = archive_with_link_mode(&entries, mode);
             let app = unpack_verified_bundle(&bytes, destination.path()).unwrap();
             assert_eq!(
@@ -413,7 +463,7 @@ mod tests {
             );
         }
         for mode in [0o1777, 0o2777, 0o4777, 0o100777] {
-            let destination = tempfile::tempdir().unwrap();
+            let destination = private_destination();
             assert!(unpack_verified_bundle(
                 &archive_with_link_mode(&entries, mode),
                 destination.path()
@@ -438,7 +488,7 @@ mod tests {
             "Morpheus.app/Contents/../outside",
             "Morpheus.app/Contents/a:b",
         ] {
-            let destination = tempfile::tempdir().unwrap();
+            let destination = private_destination();
             let bytes = archive(&[(path, tar::EntryType::Regular, b"no", None)]);
             assert!(
                 unpack_verified_bundle(&bytes, destination.path()).is_err(),
@@ -452,7 +502,7 @@ mod tests {
             tar::EntryType::GNULongName,
             tar::EntryType::XHeader,
         ] {
-            let destination = tempfile::tempdir().unwrap();
+            let destination = private_destination();
             let bytes = archive(&[(
                 "Morpheus.app/Contents/file",
                 kind,
@@ -461,7 +511,7 @@ mod tests {
             )]);
             assert!(unpack_verified_bundle(&bytes, destination.path()).is_err());
         }
-        let destination = tempfile::tempdir().unwrap();
+        let destination = private_destination();
         let bytes = archive(&[
             (
                 "Morpheus.app/Contents/Theme",
@@ -481,7 +531,7 @@ mod tests {
 
     #[test]
     fn archive_rejects_case_aliases_in_implicit_parent_directories() {
-        let destination = tempfile::tempdir().unwrap();
+        let destination = private_destination();
         let bytes = archive(&[
             (
                 "Morpheus.app/Contents/Foo/a",
@@ -505,7 +555,7 @@ mod tests {
         let sentinel = outside.path().join("sentinel");
         fs::write(&sentinel, b"keep").unwrap();
         for target in ["../../../../outside", "/tmp/outside", "missing"] {
-            let destination = tempfile::tempdir().unwrap();
+            let destination = private_destination();
             let bytes = archive(&[(
                 "Morpheus.app/Contents/Resources/link",
                 tar::EntryType::Symlink,
@@ -515,7 +565,7 @@ mod tests {
             assert!(unpack_verified_bundle(&bytes, destination.path()).is_err());
             assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
         }
-        let destination = tempfile::tempdir().unwrap();
+        let destination = private_destination();
         let bytes = archive(&[
             (
                 "Morpheus.app/Contents/link",
@@ -535,7 +585,7 @@ mod tests {
 
     #[test]
     fn rejects_gzip_corruption_nonempty_destinations_and_large_declared_files() {
-        let destination = tempfile::tempdir().unwrap();
+        let destination = private_destination();
         let mut bytes = archive(&[(
             "Morpheus.app/Contents/file",
             tar::EntryType::Regular,
@@ -544,7 +594,7 @@ mod tests {
         )]);
         bytes.truncate(bytes.len() - 3);
         assert!(unpack_verified_bundle(&bytes, destination.path()).is_err());
-        let destination = tempfile::tempdir().unwrap();
+        let destination = private_destination();
         fs::write(destination.path().join("sentinel"), b"keep").unwrap();
         assert!(unpack_verified_bundle(&archive(&[]), destination.path()).is_err());
         assert_eq!(
@@ -559,7 +609,7 @@ mod tests {
         header.set_cksum();
         let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
         gzip.write_all(header.as_bytes()).unwrap();
-        let destination = tempfile::tempdir().unwrap();
+        let destination = private_destination();
         assert!(unpack_verified_bundle(&gzip.finish().unwrap(), destination.path()).is_err());
     }
 
