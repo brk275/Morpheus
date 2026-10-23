@@ -73,6 +73,7 @@ struct Book {
     incoming: Vec<Recorded>,
     outgoing: Vec<Recorded>,
     omitted: bool,
+    omitted_at: Option<Instant>,
     in_flight: bool,
     uncertain: bool,
 }
@@ -92,10 +93,15 @@ impl PeerVerificationBook {
             {
                 return;
             }
+            if book.incoming.len() == MAX_RECORDED {
+                // Never evict a tracked peer to make space. Unknown omitted
+                // peers require explicit acknowledgement for every request
+                // until the last omission's whole lifetime has elapsed.
+                book.omitted = true;
+                book.omitted_at = Some(Instant::now());
+                return;
+            }
             book.incoming.push(record);
-            let excess = book.incoming.len().saturating_sub(MAX_RECORDED);
-            book.omitted |= excess > 0;
-            book.incoming.drain(..excess);
         });
     }
 }
@@ -160,7 +166,13 @@ impl Reservation {
             if state.in_flight {
                 return Err(Error::RequestInProgress);
             }
-            if state.uncertain && !acknowledged {
+            if state
+                .omitted_at
+                .is_some_and(|at| at.elapsed() >= VERIFICATION_REQUEST_LIFETIME)
+            {
+                state.omitted_at = None;
+            }
+            if (state.uncertain || state.omitted_at.is_some()) && !acknowledged {
                 return Err(Error::RequestUncertain);
             }
             prune(&mut state.outgoing);
@@ -180,20 +192,57 @@ impl Reservation {
             records,
         ))
     }
-    fn settle(&mut self, record: Option<Recorded>, unknown: bool) {
+    fn tracks_outgoing(&self, record: &Recorded) -> bool {
         self.book.with(|book| {
+            book.outgoing
+                .iter()
+                .any(|old| same_record(old, &record.target, &record.flow_id))
+        })
+    }
+    /// Only an exact bound SDK request reporting a terminal state supplies
+    /// this receipt. A missing cache entry or unavailable read does not.
+    fn retire_terminal(&mut self, record: &Recorded) {
+        self.book.with(|book| {
+            book.outgoing
+                .retain(|old| !same_record(old, &record.target, &record.flow_id))
+        });
+    }
+    fn require_capacity(&self) -> Result<()> {
+        self.book.with(|book| {
+            if book.outgoing.len() < MAX_OUTGOING {
+                Ok(())
+            } else {
+                Err(Error::RequestInProgress)
+            }
+        })
+    }
+    fn settle(&mut self, record: Option<Recorded>, unknown: bool) -> Result<()> {
+        let result = self.book.with(|book| {
+            let mut result = Ok(());
             if let Some(record) = record {
-                book.outgoing
-                    .retain(|old| !same_record(old, &record.target, &record.flow_id));
-                book.outgoing.push(record);
-                let excess = book.outgoing.len().saturating_sub(MAX_OUTGOING);
-                book.outgoing.drain(..excess);
-                book.uncertain = false;
+                if !book
+                    .outgoing
+                    .iter()
+                    .any(|old| same_record(old, &record.target, &record.flow_id))
+                {
+                    if book.outgoing.len() == MAX_OUTGOING {
+                        // Defensive post-handoff refusal. Production checks
+                        // capacity before sending under this reservation.
+                        // Never discard another still-open tracked flow.
+                        book.uncertain = true;
+                        result = Err(Error::Unknown);
+                    } else {
+                        book.outgoing.push(record);
+                        book.uncertain = false;
+                    }
+                }
             }
             book.uncertain |= unknown;
             book.in_flight = false;
+            result
         });
         self.settled = true;
+        result
     }
 }
 impl Drop for Reservation {
@@ -458,11 +507,11 @@ impl AccountManager {
         // One total deadline for every duplicate lookup, session/identity read
         // and membership preparation. Nothing in this scope sends a step.
         let prepared = guarded(selection, cancellation, REQUEST_TIMEOUT, async {
-            for record in records
-                .iter()
-                .rev()
-                .filter(|record| record.target.user_id == target.user_id)
-            {
+            for record in records.iter().rev() {
+                let outgoing = reservation.tracks_outgoing(record);
+                if !outgoing && record.target.user_id != target.user_id {
+                    continue;
+                }
                 let known = guarded(selection, cancellation, LOCAL_TIMEOUT, async {
                     Ok(scoped
                         .loaded
@@ -472,18 +521,29 @@ impl AccountManager {
                         .await)
                 })
                 .await?;
-                if let Some(request) = known
-                    && snapshot(&request).is_open()
-                    && (!binding(&scoped.own, &record.target, &record.flow_id, &request)
-                        || !scoped
-                            .loaded
-                            .client
-                            .get_room(&record.target.room_id)
-                            .is_some_and(|room| room.state() == RoomState::Joined))
-                {
-                    // A passive or no-longer-joined flow must not be silently
-                    // superseded by creating another flow for this same peer.
-                    return Err(Error::RequestInProgress);
+                if let Some(request) = known {
+                    let bound = binding(&scoped.own, &record.target, &record.flow_id, &request);
+                    let open = snapshot(&request).is_open();
+                    if bound && !open {
+                        reservation.retire_terminal(record);
+                        continue;
+                    }
+                    if record.target.user_id == target.user_id
+                        && open
+                        && (!bound
+                            || !scoped
+                                .loaded
+                                .client
+                                .get_room(&record.target.room_id)
+                                .is_some_and(|room| room.state() == RoomState::Joined))
+                    {
+                        // A passive or no-longer-joined flow must not be
+                        // silently superseded for this same peer.
+                        return Err(Error::RequestInProgress);
+                    }
+                }
+                if record.target.user_id != target.user_id {
+                    continue;
                 }
                 match self
                     .open_peer_verification_selected(
@@ -501,6 +561,9 @@ impl AccountManager {
                     Err(error) => return Err(error),
                 }
             }
+            // Refuse before preparation or SDK handoff, without evicting an
+            // open tracked peer to admit another. All reads share this bound.
+            reservation.require_capacity()?;
             let identity = scoped
                 .loaded
                 .client
@@ -522,7 +585,7 @@ impl AccountManager {
         .await?;
         let (prepared, initial_master) = match prepared {
             PreparedPeer::Existing(session) => {
-                reservation.settle(None, false);
+                reservation.settle(None, false)?;
                 return Ok(PeerVerificationRequest::AlreadyOpen(session));
             }
             PreparedPeer::Send(prepared, master) => (prepared, Some(master)),
@@ -539,12 +602,12 @@ impl AccountManager {
         {
             Ok(request) => request,
             Err(error) => {
-                reservation.settle(None, error == Error::Unknown);
+                reservation.settle(None, error == Error::Unknown)?;
                 return Err(error);
             }
         };
         if !binding(&scoped.own, target, request.flow_id(), &request) {
-            reservation.settle(None, true);
+            reservation.settle(None, true)?;
             return Err(Error::Unknown);
         }
         reservation.settle(
@@ -554,7 +617,7 @@ impl AccountManager {
                 received: Instant::now(),
             }),
             false,
-        );
+        )?;
         Ok(PeerVerificationRequest::Sent(PeerVerificationSession(
             Arc::new(Session {
                 client: scoped.loaded.client.clone(),
@@ -971,7 +1034,9 @@ mod tests {
             Some(())
         );
         let (mut acknowledged, _) = Reservation::reserve(&book, true).unwrap();
-        acknowledged.settle(Some(record(first.clone())), false);
+        acknowledged
+            .settle(Some(record(first.clone())), false)
+            .unwrap();
         assert!(!book.with(|state| state.uncertain));
         for n in 0..MAX_RECORDED + 2 {
             book.record(Recorded {
@@ -989,6 +1054,95 @@ mod tests {
             assert_eq!(state.incoming.len(), MAX_RECORDED - 1);
             assert!(state.omitted);
         });
+    }
+
+    #[test]
+    fn outgoing_capacity_never_evicts_an_open_peer_and_reclaims_only_terminal_or_expired() {
+        let book = Arc::new(PeerVerificationBook::default());
+        let mut first = None;
+        for n in 0..MAX_OUTGOING {
+            let record = Recorded {
+                target: PeerVerificationTarget::parse(
+                    &format!("@peer{n}:example.org"),
+                    "!dm:example.org",
+                )
+                .unwrap(),
+                flow_id: format!("$outgoing-{n}"),
+                received: Instant::now(),
+            };
+            if n == 0 {
+                first = Some(record.clone());
+            }
+            let (mut reservation, _) = Reservation::reserve(&book, false).unwrap();
+            reservation.require_capacity().unwrap();
+            reservation.settle(Some(record), false).unwrap();
+        }
+        let first = first.unwrap();
+        let (mut reservation, records) = Reservation::reserve(&book, false).unwrap();
+        assert_eq!(
+            reservation.require_capacity(),
+            Err(Error::RequestInProgress)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| same_record(record, &first.target, &first.flow_id))
+        );
+        assert!(reservation.tracks_outgoing(&first));
+        // The actual SDK-bound terminal branch uses this exact retirement.
+        reservation.retire_terminal(&first);
+        reservation.require_capacity().unwrap();
+        reservation.settle(None, false).unwrap();
+        book.with(|state| {
+            state.outgoing[0].received = Instant::now()
+                .checked_sub(VERIFICATION_REQUEST_LIFETIME)
+                .unwrap();
+        });
+        let (reservation, _) = Reservation::reserve(&book, false).unwrap();
+        reservation.require_capacity().unwrap();
+        assert_eq!(book.with(|state| state.outgoing.len()), MAX_OUTGOING - 2);
+    }
+
+    #[test]
+    fn omitted_incoming_peers_require_ack_each_time_until_the_full_lifetime_expires() {
+        let book = Arc::new(PeerVerificationBook::default());
+        for n in 0..MAX_RECORDED + 1 {
+            book.record(Recorded {
+                target: PeerVerificationTarget::parse(
+                    &format!("@peer{n}:example.org"),
+                    "!dm:example.org",
+                )
+                .unwrap(),
+                flow_id: format!("$incoming-{n}"),
+                received: Instant::now(),
+            });
+        }
+        assert!(book.with(|state| {
+            state
+                .incoming
+                .iter()
+                .any(|record| record.flow_id == "$incoming-0")
+        }));
+        assert!(matches!(
+            Reservation::reserve(&book, false),
+            Err(Error::RequestUncertain)
+        ));
+        let (mut acknowledged, _) = Reservation::reserve(&book, true).unwrap();
+        acknowledged.settle(None, false).unwrap();
+        // The acknowledgement applies only to this deliberate request, never
+        // to all future absence assumptions about the omitted peer.
+        assert!(matches!(
+            Reservation::reserve(&book, false),
+            Err(Error::RequestUncertain)
+        ));
+        book.with(|state| {
+            state.omitted_at = Some(
+                Instant::now()
+                    .checked_sub(VERIFICATION_REQUEST_LIFETIME)
+                    .unwrap(),
+            )
+        });
+        assert!(Reservation::reserve(&book, false).is_ok());
     }
 
     #[test]
