@@ -1,0 +1,116 @@
+// Explicit peer SAS. Rust owns raw identifiers, sessions, admission and results.
+// Display labels never route an operation or grant trust.
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton, TokenField, TokenCheck } from "controls.slint";
+
+export struct PeerVerificationView {
+    // 0 idle, 1 incoming needs acceptance, 2 waiting/ready to continue,
+    // 3 values, 4 waiting for completion, 5 terminal result, 6 outgoing review.
+    stage: int,
+    busy: bool,
+    peer: string,
+    room: string,
+    detail: string,
+    emoji: string,
+    decimals: string,
+    error: string,
+    uncertain: bool,
+}
+export struct PeerVerificationRow { key: int, peer: string, room: string }
+export global PeerVerification {
+    in-out property <PeerVerificationView> view;
+    in-out property <[PeerVerificationRow]> requests;
+    in-out property <string> peer-input;
+    in-out property <bool> compared: false;
+    in-out property <bool> checked-uncertain: false;
+    in-out property <string> inbox-note;
+    callback request();
+    callback send();
+    callback refresh();
+    callback review(int);
+    callback accept();
+    callback advance();
+    callback confirm();
+    callback cancel();
+    callback dismiss();
+    callback protect();
+    callback withdraw-account(string) -> bool;
+    callback open-conversations();
+}
+export component PeerVerificationPanel inherits Rectangle {
+    in property <ControlColors> colors;
+    in property <color> surface;
+    in property <float> text-scale: 1;
+    in property <bool> allowed: false;
+    property <PeerVerificationView> view: PeerVerification.view;
+    background: root.surface;
+    border-radius: StyleTokens.radius * 1;
+    preferred-height: body.preferred-height + 28px;
+    min-height: self.preferred-height;
+    accessible-role: region;
+    accessible-label: "Verify a person's Matrix identity";
+    Timer {
+        interval: 3s;
+        running: root.allowed && !root.view.busy;
+        triggered => { PeerVerification.refresh(); }
+    }
+    body := VerticalLayout {
+        padding: 14px; spacing: 8px;
+        Text { text: "Verify a person"; color: root.colors.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+        Text {
+            text: "Compare emoji or numbers with this person using another trusted channel. A direct-room flag does not prove exclusive or private membership.";
+            color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        }
+        if root.view.stage == 0 : VerticalLayout {
+            spacing: 8px;
+            Text {
+                text: "Open or create a direct conversation using the ordinary chat controls, then return here. Verification uses that selected conversation; it never creates a room or sends an invitation.";
+                color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+            }
+            TokenField {
+                colors: root.colors; text-scale: root.text-scale;
+                text <=> PeerVerification.peer-input;
+                placeholder-text: "@person:homeserver"; label: "Exact Matrix ID of the person to verify";
+                enabled: root.allowed && !root.view.busy;
+            }
+            TokenCheck { colors: root.colors; text-scale: root.text-scale;
+                visible: root.view.uncertain;
+                text: "I checked with this person before requesting again";
+                checked <=> PeerVerification.checked-uncertain;
+                enabled: root.allowed && !root.view.busy;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                TokenButton { text: "Review verification request"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy && PeerVerification.peer-input != ""; activated => { PeerVerification.request(); } }
+                TokenButton { text: "Open conversations"; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.open-conversations(); } }
+            }
+            Text { text: "Incoming requests"; color: root.colors.ink; font-size: 12px * root.text-scale; }
+            for item in PeerVerification.requests : HorizontalLayout {
+                spacing: 8px;
+                Text { text: item.peer + "\nRoom: " + item.room; color: root.colors.ink; font-size: 11px * root.text-scale; wrap: word-wrap; horizontal-stretch: 1; }
+                TokenButton { text: "Review"; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.review(item.key); } }
+            }
+            if PeerVerification.inbox-note != "" : Text { text: PeerVerification.inbox-note; color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+        }
+        if root.view.peer != "" : Text { text: "Person: " + root.view.peer; color: root.colors.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+        if root.view.room != "" : Text { text: "Conversation: " + root.view.room; color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+        if root.view.detail != "" : Text { text: root.view.detail; color: root.colors.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+        if root.allowed && root.view.stage == 3 : VerticalLayout {
+            spacing: 8px;
+            Text { text: root.view.emoji; color: root.colors.ink; font-size: 14px * root.text-scale; wrap: word-wrap; accessible-label: "Compare these SAS emoji: " + root.view.emoji; }
+            Text { text: root.view.decimals; color: root.colors.ink; font-size: 14px * root.text-scale; wrap: word-wrap; accessible-label: "Compare these SAS numbers: " + root.view.decimals; }
+            TokenCheck { colors: root.colors; text-scale: root.text-scale; text: "I compared all values with this exact person and they match"; checked <=> PeerVerification.compared; enabled: root.allowed && !root.view.busy; }
+        }
+        if root.view.error != "" : Text { text: root.view.error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+        HorizontalLayout {
+            spacing: 8px;
+            if root.view.stage == 6 : TokenButton { text: "Send this exact request"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.send(); } }
+            if root.view.stage == 1 : TokenButton { text: "Accept this request"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.accept(); } }
+            if root.view.stage == 2 : TokenButton { text: "Continue comparison"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.advance(); } }
+            if root.view.stage == 3 : TokenButton { text: "Values match — confirm"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy && PeerVerification.compared; activated => { PeerVerification.confirm(); } }
+            if root.view.stage > 0 && root.view.stage < 5 : TokenButton { text: "Values differ / cancel"; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.cancel(); } }
+            if root.view.stage > 0 : TokenButton { text: "Dismiss here"; colors: root.colors; text-scale: root.text-scale; enabled: !root.view.busy; activated => { PeerVerification.dismiss(); } }
+            TokenButton { text: root.view.busy ? "Working…" : "Refresh status"; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.refresh(); } }
+        }
+    }
+}

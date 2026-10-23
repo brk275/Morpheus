@@ -13,6 +13,8 @@ import { AttachmentItem, AttachmentQueue } from "attachment-workbench.slint";
 import { TransferCenterPanel, TransferItem } from "transfer-center.slint";
 import { MediaViewer } from "media-viewer.slint";
 import { StyleTokens } from "style-tokens.slint";
+import { PeerVerification, PeerVerificationPanel } from "peer-verification.slint";
+export { PeerVerification, PeerVerificationRow, PeerVerificationView } from "peer-verification.slint";
 import { MorpheusIcon, MorpheusIcons } from "icons.slint";
 import { ActionRect, ControlColors, HoverSurface, TextAction, TokenButton, TokenSelect, TokenSlider } from "controls.slint";
 // Rust projects every accepted configuration into StyleTokens; the screen
@@ -4196,6 +4198,7 @@ export component AppWindow inherits Window {
         root.sas-emoji = "";
         root.sas-decimals = "";
         root.verification-protected();
+        PeerVerification.protect();
     }
     public function navigate-page(next: int) {
         if next != root.page { root.stop-attachment-audio(); }
@@ -4217,6 +4220,10 @@ export component AppWindow inherits Window {
         if root.sas-protected {
             root.withdraw-verification();
         }
+    }
+    out property <bool> peer-verification-protected: root.sas-protected || root.settings-reveal-protected || root.page != 1 || root.sas-busy || root.sas-stage != 0;
+    changed peer-verification-protected => {
+        if root.peer-verification-protected { PeerVerification.protect(); }
     }
     // Settings › Security & recovery › Devices: device-sessions.slint, owned
     // by device_sessions.rs. Row keys only route requests to that controller.
@@ -10717,6 +10724,11 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                            PeerVerificationPanel {
+                                colors: root.button-colors;
+                                surface: root.elevated; text-scale: root.text-scale;
+                                allowed: !root.peer-verification-protected;
+                            }
                             Rectangle {
                                 height: 108px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                                 VerticalLayout {
@@ -12807,7 +12819,7 @@ export component AppWindow inherits Window {
                     cancel-on-escape: true;
                     label: "Manage accounts";
                     cancelled => { root.account-menu-open = false; account-trigger.focus(); }
-                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); RoomAddresses.context-changed(); root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
+                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); RoomAddresses.context-changed(); root.withdraw-verification(); root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
                     HorizontalLayout {
                         padding-left: 9px; padding-right: 9px; spacing: 9px;
                         VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "manage-accounts"; ink: root.ink; } }
@@ -14704,7 +14716,7 @@ export component AppWindow inherits Window {
                     height: 38px * root.text-scale; vertical-stretch: 0;
                     text: "Choose a saved account"; ink: root.ink; muted: root.muted;
                     surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.manage-accounts-open = true; root.manage-accounts(); }
+                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.withdraw-verification(); root.manage-accounts-open = true; root.manage-accounts(); }
                 }
                 if root.account-access-notice != "" : Text {
                     text: root.account-access-notice; color: root.muted; font-size: 11px * root.text-scale;
