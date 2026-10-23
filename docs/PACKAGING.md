@@ -705,17 +705,28 @@ install/call exclusion, readiness, atomic swap, journal, startup recovery and
 pre-store health commit: successful upgrade plus committed restart, invalid
 signature, staged resource tampering, restart from Prepared, helper interruption
 after replacement before trial, and a trial that fails before health. Fixed event
-markers and exact trees/journal cleanup must agree. Child handles are retained;
-interruption targets only a live owned helper, and the external Prepared stop
-occurs before any helper exists. Failed or timed-out fixtures remain private;
+markers and exact trees/journal cleanup must agree. The old actor retains its
+actual helper `Child` while publishing a private nonce/transaction/parent/helper
+ticket. The external driver arms an exact kernel `NOTE_EXIT|NOTE_EXITSTATUS`
+observer before acknowledging it. Only then does the old actor release its
+synthetic session and actually exit; the production helper independently waits
+for that parent's registered `NOTE_EXIT` before acquiring the app lock/applying.
+The driver observes/reaps its actual old actor and requires the retained helper
+event/status. A registration receipt or lease release alone cannot pass.
+The after-apply case uses nonce-gated compile-only `_exit(86)` after observer
+acknowledgment and before any trial child, deliberately bypassing Rust cleanup.
+The external observer must report exactly that code before real startup recovery;
+a cooperative error return is not equivalent interruption coverage. The external
+Prepared stop signals only its still-owned direct child before any helper exists.
+Failed or timed-out fixtures remain private;
 there is no orphan PID kill, profile cleanup or automatic unchanged retry.
 Raw logs are bounded, private and default-scanned before inspection; only fixed
 result fields and exact source/artifact/cohort hashes are public.
 
-This milestone simulates shutdown by releasing the old actor's session/install
-leases while retaining it as the helper's owning monitor. It does **not** prove
-normal UI shutdown or actual old-parent exit. Its single-member synthetic actor
-completion/reap is harness cleanup, not acceptance of production group-stop
+This milestone observes actual exit of the synthetic parent process and its
+helper. It does **not** prove normal AppWindow shutdown or ordinary shipping
+process cleanup; those report gates remain false. Its single-member synthetic actor
+completion/reap and retained kernel helper event are harness observations, not acceptance of production group-stop
 behavior (including the open Darwin zombie-only-group EPERM concern). Feed and
 download/TLS behavior, ordinary shipping-process handoff, Developer ID/notarization,
 physical-device/media behavior and actual storage/power-loss durability remain

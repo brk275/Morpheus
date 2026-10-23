@@ -553,6 +553,87 @@ fn serialized_trial_recovery_rejects_other_transactions_phases_and_changed_tree(
 }
 
 #[test]
+fn parent_exit_registration_is_owned_and_receipts_cannot_authorize_apply() {
+    // This real native registration observes the test process's live parent;
+    // it does not signal it or assume anything from its process name/PID poll.
+    // SAFETY: getppid has no pointer arguments or side effects.
+    let parent = unsafe { libc::getppid() };
+    let monitor = ParentExitMonitor::arm(parent, "FixtureParentExit1").unwrap();
+    let event = |flags| libc::kevent {
+        ident: parent as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags,
+        fflags: libc::NOTE_EXIT,
+        data: 0,
+        udata: monitor.cookie_pointer(),
+    };
+    let receipt = event(libc::EV_ERROR | libc::EV_RECEIPT);
+    assert!(monitor.receipt_matches(&receipt));
+    assert!(!monitor.exit_matches(&receipt));
+    let exit = event(libc::EV_EOF | libc::EV_ONESHOT | libc::EV_CLEAR);
+    assert!(monitor.exit_matches(&exit));
+    assert!(!monitor.receipt_matches(&exit));
+    for field in 0..8 {
+        let mut invalid = event(libc::EV_EOF | libc::EV_ONESHOT | libc::EV_CLEAR);
+        match field {
+            0 => invalid.ident = (parent as libc::uintptr_t).wrapping_add(1),
+            1 => invalid.filter = libc::EVFILT_READ,
+            2 => invalid.udata = std::ptr::null_mut(),
+            3 => invalid.flags |= libc::EV_ERROR,
+            4 => invalid.flags &= !libc::EV_EOF,
+            5 => invalid.flags &= !libc::EV_ONESHOT,
+            6 => invalid.fflags |= libc::NOTE_FORK,
+            _ => invalid.data = 1,
+        }
+        assert!(!monitor.exit_matches(&invalid), "event field {field}");
+    }
+    let mut failed_receipt = event(libc::EV_ERROR | libc::EV_RECEIPT);
+    failed_receipt.data = i64::from(libc::ESRCH) as libc::intptr_t;
+    assert!(!monitor.receipt_matches(&failed_receipt));
+    // The live parent's successful registration receipt is insufficient.
+    // Only a later kernel NOTE_EXIT can authorize the separate lock step.
+    assert_eq!(
+        monitor.wait("FixtureParentExit1", Duration::from_millis(10)),
+        Err(UpdateError::RecoveryRequired)
+    );
+}
+
+#[test]
+fn parent_exit_monitor_rejects_wrong_parent_transaction_and_noncanonical_arguments() {
+    for parent in [-1, 0, 1, std::process::id() as libc::pid_t] {
+        assert!(matches!(
+            ParentExitMonitor::arm(parent, "FixtureParentExit1"),
+            Err(UpdateError::RecoveryRequired)
+        ));
+    }
+    // SAFETY: getppid has no pointer arguments or side effects.
+    let parent = unsafe { libc::getppid() };
+    let monitor = ParentExitMonitor::arm(parent, "FixtureParentExit1").unwrap();
+    assert_eq!(
+        monitor.wait("OtherTransaction", Duration::from_millis(10)),
+        Err(UpdateError::RecoveryRequired)
+    );
+    for invalid in [
+        "",
+        "0",
+        "1",
+        "-2",
+        "+2",
+        "02",
+        " 2",
+        "2 ",
+        "2147483648",
+        "99999999999",
+    ] {
+        assert_eq!(
+            parse_parent_pid(std::ffi::OsStr::new(invalid)),
+            Err(UpdateError::RecoveryRequired)
+        );
+    }
+    assert_eq!(parse_parent_pid(std::ffi::OsStr::new("42")), Ok(42));
+}
+
+#[test]
 fn copied_file_mode_is_restored_through_owned_handle_without_changing_global_umask() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("payload");

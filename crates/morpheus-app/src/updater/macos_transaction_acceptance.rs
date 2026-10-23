@@ -1,13 +1,15 @@
 //! Compile-gated synthetic installed-bundle transaction actors. Shipping builds
 //! contain no entry point or activation override. These actors never construct
-//! UI, runtimes, profiles, stores or network clients. Retained child ownership
-//! differs from shipping shutdown, which remains a separate acceptance gate.
+//! UI, runtimes, profiles, stores or network clients. The old actor really
+//! exits after its helper has an acknowledged kernel observer. This remains
+//! separate from normal AppWindow/account/media shutdown acceptance.
 
 use super::*;
 use std::cell::RefCell;
 
 const PLAN_ENV: &str = "MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN";
 const LIMIT: Duration = Duration::from_secs(150);
+const FORCED_AFTER_APPLY_EXIT: i32 = 86;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +243,49 @@ impl Run {
         Ok(())
     }
 
+    fn offer_helper_observer(&self, helper: &OwnedChild) -> Result<(), UpdateError> {
+        #[derive(Serialize)]
+        struct Ticket<'a> {
+            schema: u8,
+            nonce: &'a str,
+            transaction: String,
+            parent: u32,
+            helper: u32,
+        }
+        let journal =
+            MacAppSession::read_journal(&self.state)?.ok_or(UpdateError::RecoveryRequired)?;
+        require(journal.phase == Phase::Prepared && !helper.exited()?)?;
+        let ticket = Ticket {
+            schema: 1,
+            nonce: &self.plan.nonce,
+            transaction: journal.id,
+            parent: std::process::id(),
+            helper: helper
+                .child
+                .as_ref()
+                .ok_or(UpdateError::RecoveryRequired)?
+                .id(),
+        };
+        let bytes = serde_json::to_vec(&ticket).map_err(|_| UpdateError::RecoveryRequired)?;
+        require(bytes.len() <= 4096)?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.root.join("helper-observer.json"))
+            .map_err(|_| UpdateError::RecoveryRequired)?;
+        output
+            .write_all(&bytes)
+            .and_then(|_| output.sync_all())
+            .map_err(|_| UpdateError::RecoveryRequired)?;
+        // The actual Child remains retained and unreaped through the external
+        // observer's registration acknowledgment. No PID lookup may replace it.
+        self.mark("helper_ticket_ready")?;
+        self.wait("helper_observer_armed")?;
+        require(!helper.exited()?)
+    }
+
     fn assert_old(&self) -> Result<(), UpdateError> {
         require(
             tree_hash(&self.installed)? == self.plan.old_tree_sha256
@@ -301,10 +346,6 @@ pub(super) fn retain_child(child: Child) {
     });
 }
 
-fn retain_owned(mut child: OwnedChild) {
-    retain_child(child.child.take().unwrap());
-}
-
 struct Children;
 impl Drop for Children {
     fn drop(&mut self) {
@@ -351,11 +392,33 @@ pub(super) fn after_apply_checkpoint() -> Result<(), UpdateError> {
         .ok_or(UpdateError::InvalidConfiguration)?;
     if run.plan.case == Case::AfterApplyRecovery {
         run.mark("after_apply_before_trial")?;
-        // The owning synthetic monitor kills this exact helper while it has
-        // no trial child yet. This checkpoint is absent from shipping builds.
-        run.wait("never_continue_after_apply")?;
+        run.wait("force_exit_after_apply")?;
+        let journal =
+            MacAppSession::read_journal(&run.state)?.ok_or(UpdateError::RecoveryRequired)?;
+        require(
+            run.seen("helper_observer_armed")
+                && run.seen("helper_parent_exit_observed")
+                && journal.phase == Phase::AwaitingHealth
+                && tree_hash(&run.installed)? == run.plan.new_tree_sha256
+                && RETAINED.with(|children| children.borrow().is_empty()),
+        )?;
+        // SAFETY: this function is called only in the compile-gated actor
+        // after Run::load authenticated the compiled nonce/public fresh Mac
+        // fixture and the external observer acknowledged exact ownership.
+        // No trial child exists. _exit deliberately skips Rust cleanup to
+        // preserve real helper crash/interruption coverage, never shipping UI.
+        unsafe { libc::_exit(FORCED_AFTER_APPLY_EXIT) };
     }
     Ok(())
+}
+
+pub(super) fn parent_exit_checkpoint() -> Result<(), UpdateError> {
+    let run = CURRENT
+        .with(|run| run.borrow().clone())
+        .ok_or(UpdateError::InvalidConfiguration)?;
+    require(run.seen("helper_observer_armed"))?;
+    // Called only after the unchanged production monitor returns NOTE_EXIT.
+    run.mark("helper_parent_exit_observed")
 }
 
 fn startup(run: &Run, trial: bool) -> Result<(), UpdateError> {
@@ -431,56 +494,22 @@ fn prepare(run: &Run) -> Result<(), UpdateError> {
         Err(UpdateError::UpdateActive)
     ))?;
     run.mark("helper_ready_lease_held")?;
-    // Synthetic shutdown releases the production lifetime lock/install lease.
-    // The old actor remains only to retain and reap its actual helper child.
+    let mut helper = RETAINED
+        .with(|children| children.borrow_mut().pop())
+        .ok_or(UpdateError::RecoveryRequired)?;
+    require(RETAINED.with(|children| children.borrow().is_empty()))?;
+    run.offer_helper_observer(&helper)?;
+    // The external driver now owns a kernel registration for this exact
+    // anchored child. The old actor must actually return/exit so production
+    // NOTE_EXIT can fire; staying alive as its helper's monitor is invalid.
     drop(session);
     require(activity.try_start_call().is_ok())?;
     run.mark("synthetic_shutdown")?;
-    if run.plan.case == Case::AfterApplyRecovery {
-        run.wait("after_apply_before_trial")?;
-        let mut helper = RETAINED
-            .with(|children| children.borrow_mut().pop())
-            .ok_or(UpdateError::RecoveryRequired)?;
-        require(RETAINED.with(|children| children.borrow().is_empty()))?;
-        helper.stop()?;
-        run.mark("owned_helper_interrupted")?;
-        let child = OwnedChild::spawn(&mut app_command(&run.installed))?;
-        retain_owned(child);
-    }
-    let statuses = finish_children()?;
-    if matches!(
-        run.plan.case,
-        Case::TamperedStage | Case::TrialFailureRollback
-    ) {
-        require(statuses == [false])?;
-        if run.plan.case == Case::TamperedStage {
-            let (session, restarted) = begin_startup_admitted(true)?;
-            require(session.is_some() && !restarted)?;
-            drop(session);
-        }
-        run.assert_old()?;
-        run.mark("rollback_preserved_old")?;
-    } else if run.plan.case == Case::AfterApplyRecovery {
-        require(statuses == [true])?;
-        run.assert_old()?;
-        run.mark("interrupted_recovery_preserved_old")?;
-    } else {
-        require(statuses == [true] && tree_hash(&run.installed)? == run.plan.new_tree_sha256)?;
-        let journal =
-            MacAppSession::read_journal(&run.state)?.ok_or(UpdateError::RecoveryRequired)?;
-        require(
-            journal.phase == Phase::Committed
-                && tree_hash(&run.state.join("previous.app"))? == run.plan.old_tree_sha256,
-        )?;
-        let child = OwnedChild::spawn(&mut app_command(&run.installed))?;
-        retain_owned(child);
-        require(finish_children()? == [true])?;
-        require(
-            tree_hash(&run.installed)? == run.plan.new_tree_sha256
-                && MacAppSession::read_journal(&run.state)?.is_none(),
-        )?;
-        run.mark("upgrade_and_committed_restart")?;
-    }
+    // Transfer observation only after the kernel observer is armed. Dropping
+    // this actual Child does not reap or signal it; no numeric identity is
+    // later reused by this exiting parent. The driver's exact exit event is
+    // mandatory before any scenario or fixture cleanup can pass.
+    drop(helper.child.take().ok_or(UpdateError::RecoveryRequired)?);
     Ok(())
 }
 
@@ -491,11 +520,12 @@ pub(crate) fn dispatch() -> Result<(), UpdateError> {
     let args: Vec<_> = std::env::args_os().collect();
     let result = match args.get(1).and_then(|arg| arg.to_str()) {
         Some("--morpheus-mac-qa-prepare") if args.len() == 2 => prepare(&run),
-        Some("--morpheus-mac-update-supervise") if args.len() == 4 => {
+        Some("--morpheus-mac-update-supervise") if args.len() == 5 => {
             require(Path::new(&args[2]) == run.installed)?;
             supervise(
                 &run.installed,
                 args[3].to_str().ok_or(UpdateError::RecoveryRequired)?,
+                parse_parent_pid(&args[4])?,
             )
         }
         Some("--morpheus-mac-update-trial") if args.len() == 3 => startup(&run, true),

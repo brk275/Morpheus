@@ -3,8 +3,9 @@
 
 Two nonce-separated release packages exercise production signature/staging,
 bundle/helper/trial/health/recovery code. No UI, account, vault or network client
-is initialized. This partial milestone does not prove normal UI shutdown, actual
-old-parent exit, feed/download/TLS, Developer ID, power loss or device behavior.
+is initialized. The synthetic old parent actually exits under owned observation;
+this does not prove normal AppWindow/shipping shutdown, feed/download/TLS,
+Developer ID, power loss or device behavior.
 """
 from __future__ import annotations
 
@@ -17,7 +18,9 @@ from pathlib import Path
 import platform
 import re
 import secrets
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -43,14 +46,18 @@ MARKERS = {
                 "committed_restart_before_store", "upgrade_and_committed_restart"},
     "invalid_signature": {"invalid_signature_rejected"},
     "tampered_stage": {"prepared", "helper_ready_lease_held", "synthetic_shutdown", "continue_tampered_stage",
-                       "rollback_preserved_old"},
+                       "old_restart_before_store", "rollback_preserved_old"},
     "prepared_restart": {"prepared", "old_restart_before_store"},
     "after_apply_recovery": {"prepared", "helper_ready_lease_held", "synthetic_shutdown", "after_apply_before_trial",
-                             "owned_helper_interrupted", "old_restart_before_store", "recovery_relaunched_old",
+                             "force_exit_after_apply", "owned_helper_interrupted", "old_restart_before_store", "recovery_relaunched_old",
                              "interrupted_recovery_preserved_old"},
     "trial_failure_rollback": {"prepared", "helper_ready_lease_held", "synthetic_shutdown", "trial_failed_before_health",
                                "old_restart_before_store", "rollback_preserved_old"},
 }
+HELPER_CASES = frozenset(("upgrade", "tampered_stage", "after_apply_recovery", "trial_failure_rollback"))
+for _case in HELPER_CASES:
+    MARKERS[_case] |= {"helper_ticket_ready", "helper_observer_armed", "old_actor_exit_observed",
+                      "helper_parent_exit_observed"}
 STAGES = frozenset(("preflight", "export", "build_old", "build_new", "signing", "log_scan", "cleanup", "complete", *CASES))
 SCANNER_SHA256 = {
     "arm64": "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f",
@@ -62,6 +69,11 @@ MARKER_BYTES = b'{"passed":true}\n'
 APP = Path("Contents/MacOS/morpheus-app")
 STATE = ".Morpheus.app.morpheus-update"
 ROOT = Path(__file__).resolve().parents[1]
+# Darwin SDK sys/event.h constants not exported by CPython's select module.
+# The native observer still requires receipt + exact returned kernel payload.
+DARWIN_EV_RECEIPT = 0x0040
+DARWIN_NOTE_EXITSTATUS = 0x04000000
+FORCED_AFTER_APPLY_EXIT = 86
 
 
 class Refused(RuntimeError):
@@ -149,6 +161,7 @@ class Commands:
         self.logs = private_new(root / "logs")
         self.sequence = 0
         self.pending = []
+        self.helper_observers = []
         self.cleanup_failed = False
 
     def start(self, argv, *, cwd=None, extra=None):
@@ -198,6 +211,135 @@ class Commands:
         process, path = self.start(argv, cwd=cwd, extra=extra)
         self.finish(process, path, seconds=seconds, allow_stop=True)
         return path
+
+    def finish_actor(self, process, path, *, seconds=180, expected=0):
+        # These fixed synthetic actors never create same-group descendants.
+        # Observe/reap only this actual Popen; helper exit has its separate
+        # retained kernel registration. This is not a group-drain assertion.
+        failure, terminal = None, False
+        try:
+            deadline = time.monotonic() + seconds
+            while True:
+                status = smoke.process_status(process)
+                if status is not None:
+                    terminal = True
+                    break
+                require(path.lstat().st_size <= MAX_LOG and time.monotonic() < deadline)
+                time.sleep(0.05)
+            require(path.lstat().st_size <= MAX_LOG)
+        except BaseException as error:
+            failure = error
+        finally:
+            if terminal:
+                try:
+                    status = process.wait(timeout=5)
+                    self.pending.remove(process)
+                    require(status == expected)
+                except BaseException as error:
+                    if process in self.pending:
+                        self.cleanup_failed = True
+                    if failure is None:
+                        failure = error
+        if failure is not None:
+            raise failure
+
+
+def closed_object(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result)
+        result[key] = value
+    return result
+
+
+def helper_ticket(root, nonce, parent, old, new):
+    require(type(parent) is int and parent > 1 and type(nonce) is str
+            and re.fullmatch(r"[a-f0-9]{32}", nonce) is not None)
+    path = root / "helper-observer.json"
+    require(path.lstat().st_mode & 0o077 == 0)
+    ticket = json.loads(bounded(path, 4096), object_pairs_hook=closed_object)
+    require(type(ticket) is dict and set(ticket) == {"schema", "nonce", "transaction", "parent", "helper"}
+            and type(ticket["schema"]) is int and ticket["schema"] == 1 and ticket["nonce"] == nonce
+            and type(ticket["parent"]) is int and ticket["parent"] == parent
+            and type(ticket["helper"]) is int and 1 < ticket["helper"] < 2**31
+            and ticket["helper"] != parent and type(ticket["transaction"]) is str
+            and re.fullmatch(r"[A-Za-z0-9]{1,64}", ticket["transaction"]) is not None)
+    journal = json.loads(bounded(root / STATE / "journal.json", 16 * 1024), object_pairs_hook=closed_object)
+    require(type(journal) is dict and set(journal) == {"protocol", "id", "phase", "old_hash", "new_hash", "candidate"}
+            and type(journal.get("protocol")) is int and journal.get("protocol") == 1 and journal.get("phase") == "Prepared"
+            and journal.get("id") == ticket["transaction"] and journal.get("old_hash") == old["bundle_sha256"]
+            and journal.get("new_hash") == new["bundle_sha256"])
+    candidate = journal["candidate"]
+    require(type(candidate) is dict and set(candidate) == {"protocol", "product", "version", "arch", "persistence"}
+            and type(candidate["protocol"]) is int and candidate["protocol"] == 1
+            and candidate["product"] == "io.github.brk275.morpheus" and candidate["version"] == new["version"]
+            and candidate["arch"] == new["arch"] and candidate["persistence"] == new["persistence"])
+    return ticket
+
+
+class HelperExit:
+    """Owned kernel observation, armed while the real helper Child is anchored."""
+    def __init__(self, commands, parent, root, nonce, old, new):
+        require(sys.platform == "darwin" and hasattr(select, "kqueue") and hasattr(select, "kevent")
+                and parent in commands.pending and smoke.process_status(parent) is None)
+        ticket = helper_ticket(root, nonce, parent.pid, old, new)
+        self.commands, self.pid = commands, ticket["helper"]
+        self.cookie = int(nonce[:15], 16) + 1
+        self.queue = select.kqueue()
+        self.terminal = False
+        try:
+            os.set_inheritable(self.queue.fileno(), False)
+            require(not os.get_inheritable(self.queue.fileno()))
+            change = select.kevent(self.pid, filter=select.KQ_FILTER_PROC,
+                                   flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_ONESHOT | DARWIN_EV_RECEIPT,
+                                   fflags=select.KQ_NOTE_EXIT | DARWIN_NOTE_EXITSTATUS, udata=self.cookie)
+            receipt = self.queue.control([change], 1, 0)
+            require(len(receipt) == 1 and self.matches(receipt[0], receipt=True)
+                    and smoke.process_status(parent) is None and not self.queue.control([], 1, 0))
+        except BaseException:
+            self.queue.close()
+            raise
+        commands.helper_observers.append(self)
+
+    def matches(self, event, *, receipt=False):
+        identity = (event.ident == self.pid and event.filter == select.KQ_FILTER_PROC and event.udata == self.cookie
+                    and event.fflags == (select.KQ_NOTE_EXIT | DARWIN_NOTE_EXITSTATUS))
+        if receipt:
+            return identity and event.flags & select.KQ_EV_ERROR != 0 and event.data == 0
+        return (identity and event.flags & select.KQ_EV_ERROR == 0
+                and event.flags & (select.KQ_EV_EOF | select.KQ_EV_ONESHOT) == (select.KQ_EV_EOF | select.KQ_EV_ONESHOT)
+                and type(event.data) is int and 0 <= event.data <= 0xffff)
+
+    def record_terminal(self, events):
+        require(len(events) == 1 and self.matches(events[0]))
+        status = os.waitstatus_to_exitcode(events[0].data)
+        self.terminal = True
+        try:
+            self.queue.close()
+        except BaseException:
+            self.commands.cleanup_failed = True
+            raise
+        self.commands.helper_observers.remove(self)
+        return status
+
+    def finish(self, *, expected, seconds=420):
+        try:
+            deadline = time.monotonic() + seconds
+            while True:
+                remaining = deadline - time.monotonic()
+                require(remaining > 0)
+                events = self.queue.control([], 1, min(remaining, 1))
+                if not events:
+                    continue
+                status = self.record_terminal(events)
+                require(status == expected)
+                return
+        except BaseException:
+            if not self.terminal:
+                # Preserve the observation handle and private fixture. No
+                # orphan PID signal or invented successful cleanup is allowed.
+                self.commands.cleanup_failed = True
+            raise
 
 
 def export_source(commands, source, revision):
@@ -352,26 +494,69 @@ def run_case(commands, case, old, old_receipt, new_receipt, public, signature, n
     private_write(root / "run.json", json.dumps(plan, sort_keys=True).encode("ascii"))
     actor_env = {"MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN": str(root / "run.json")}
     process, log = commands.start([str(installed / APP), "--morpheus-mac-qa-prepare"], extra=actor_env)
+    observer = None
     if case in {"tampered_stage", "prepared_restart"}:
         wait_event(root, "prepared", process, log)
         require(not event_seen(root, "helper_ready_lease_held"))
         if case == "tampered_stage":
             tamper_staged_resource(root)
         else:
-            # This exact direct child has not spawned a helper. Its unreaped
-            # leader anchors the only group we may stop; no orphan PID lookup.
-            owned.stop_group(process)
-            commands.pending.remove(process)
+            # This fixed checkpoint has no helper/descendant yet. Signal only
+            # this still-owned unreaped direct child, never an orphan PID/group.
+            require(process in commands.pending and smoke.process_status(process) is None)
+            os.kill(process.pid, signal.SIGKILL)
+            commands.finish_actor(process, log, expected=-signal.SIGKILL)
             process, log = commands.start([str(installed / APP)], extra=actor_env)
-    commands.finish(process, log, seconds=420)
+    if case in HELPER_CASES:
+        wait_event(root, "helper_ticket_ready", process, log)
+        observer = HelperExit(commands, process, root, nonce, old_receipt, new_receipt)
+        private_write(root / "events/helper_observer_armed", MARKER_BYTES)
+    commands.finish_actor(process, log, seconds=420)
+    if observer is not None:
+        # This is an actual owned synthetic parent exit, not normal UI cleanup.
+        private_write(root / "events/old_actor_exit_observed", MARKER_BYTES)
+        if case == "after_apply_recovery":
+            wait_helper_event(root, "after_apply_before_trial", observer)
+            private_write(root / "events/force_exit_after_apply", MARKER_BYTES)
+            observer.finish(expected=FORCED_AFTER_APPLY_EXIT)
+            private_write(root / "events/owned_helper_interrupted", MARKER_BYTES)
+        else:
+            observer.finish(expected=0 if case == "upgrade" else 1)
+        require(event_seen(root, "helper_parent_exit_observed"))
+        if case == "upgrade":
+            journal = json.loads(bounded(root / STATE / "journal.json", 16 * 1024), object_pairs_hook=closed_object)
+            require(journal["phase"] == "Committed" and journal["new_hash"] == new_receipt["bundle_sha256"]
+                    and payload._snapshot(root / STATE / "previous.app")["tree_sha256"] == old_receipt["bundle_sha256"])
+        if case in {"upgrade", "tampered_stage", "after_apply_recovery"}:
+            restarted, restart_log = commands.start([str(installed / APP)], extra=actor_env)
+            commands.finish_actor(restarted, restart_log, seconds=420)
     expected = new_receipt if case == "upgrade" else old_receipt
     require(payload._snapshot(installed)["tree_sha256"] == expected["bundle_sha256"]
             and not (root / STATE / "journal.json").exists()
             and not (root / STATE / "previous.app").exists()
             and not (root / STATE / "next.app").exists())
+    if case == "upgrade":
+        private_write(root / "events/upgrade_and_committed_restart", MARKER_BYTES)
+    elif case in {"tampered_stage", "trial_failure_rollback"}:
+        private_write(root / "events/rollback_preserved_old", MARKER_BYTES)
+    elif case == "after_apply_recovery":
+        private_write(root / "events/interrupted_recovery_preserved_old", MARKER_BYTES)
     entries = {path.name for path in (root / "events").iterdir()}
     require(entries == MARKERS[case] and all(event_seen(root, token) for token in entries))
     return True
+
+
+def wait_helper_event(root, token, observer):
+    deadline = time.monotonic() + 180
+    while not event_seen(root, token):
+        require(time.monotonic() < deadline)
+        # The helper has a retained immutable registration. An early terminal
+        # event or error is a failure, never permission to signal its old PID.
+        early = observer.queue.control([], 1, 0)
+        if early:
+            observer.record_terminal(early)
+            raise Refused("mac_update_acceptance")
+        time.sleep(0.05)
 
 
 def scan_logs(commands, scanner):
@@ -402,7 +587,7 @@ def scan_final_logs(commands, scanner, report):
     report["checks"]["bounded_log_scan_attempted"] = True
     try:
         scan_logs(commands, scanner)
-        final = not commands.pending and not commands.cleanup_failed
+        final = not commands.pending and not commands.helper_observers and not commands.cleanup_failed
     except Exception:
         final = False
     # With live/unproved ownership these are snapshots, never final log or
@@ -431,7 +616,8 @@ def main():
     parser.add_argument("--gitleaks", type=Path, required=True)
     args = parser.parse_args()
     report = {"schema": 1, "check": "installed_macos_transaction_synthetic", "status": "failed", "stage": "preflight",
-              "checks": {}, "normal_ui_shutdown": False, "actual_old_parent_exit": False, "installation_enabled": False}
+              "checks": {}, "normal_ui_shutdown": False, "actual_old_parent_exit": False,
+              "production_group_cleanup": False, "power_loss": False, "installation_enabled": False}
     commands, root, completed = None, None, False
     try:
         hosted_guard(args.execute_on_free_hosted_runner)
@@ -478,6 +664,9 @@ def main():
         for case in CASES:
             report["stage"] = case
             report["checks"][case] = run_case(commands, case, old, old_receipt, new_receipt, public, signature, nonce)
+        report["checks"]["synthetic_parent_kernel_exit"] = True
+        report["checks"]["owned_helper_kernel_exit"] = True
+        report["checks"]["no_cleanup_after_apply_interruption"] = True
         # Fixed immutable public identities only; never plan paths or signatures.
         report["source_revision"] = revision
         report["artifacts"] = [{key: receipt[key] for key in ("version", "arch", "persistence", "sha256", "bundle_sha256")}
@@ -495,7 +684,7 @@ def main():
                 # Only successful, completely reaped scenarios may delete the
                 # root. On any failure preserve private data and do not signal
                 # discovered/orphan PIDs or race a still-running monitor.
-                if completed and final_logs and not commands.pending and not commands.cleanup_failed and not processes_in_fixture(root):
+                if completed and final_logs and not commands.pending and not commands.helper_observers and not commands.cleanup_failed and not processes_in_fixture(root):
                     report["stage"] = "cleanup"
                     require(root.parent == Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
                             and root.name.startswith("morpheus-mac-update-qa-") and not root.is_symlink()

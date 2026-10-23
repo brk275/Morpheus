@@ -132,3 +132,44 @@ cleanup: the supervisor still returns `RecoveryRequired` in that case. Actual
 descendant quiescence, normal UI shutdown and the old parent process's exit
 remain separate installed acceptance gates. Installation activation stays false;
 source regressions and this recovery path do not establish those gates.
+
+### Actual old-process exit before replacement
+
+The ordinary update UI already requests Slint event-loop quit after confirmed
+helper readiness. Main then cancels its UI owners, drains update/call/incoming
+work, requests attachment playback release, flushes drafts and awaits account
+sync/token/readiness shutdown. The runtime and UI/store owners are dropped
+before the root startup session releases its lifetime lock and install lease.
+This ordering stays in the real main path; a synthetic lease drop is not a
+substitute for process exit.
+
+The Mac helper now registers `EVFILT_PROC`/`NOTE_EXIT` on its actual direct
+parent before publishing readiness. The launching app supplies its own PID;
+the helper rejects init/reparenting, a noncanonical PID, and any disagreement
+with `getppid` both before and after registration. It retains the owned kernel
+queue and per-transaction opaque cookie until the exit event is received.
+An immediate successful registration receipt is not an exit event.
+
+Only the exact registration's `NOTE_EXIT` with its expected process, filter,
+cookie and termination flags may complete the bounded wait. Registration
+errors, `EV_ERROR`, unexpected or lost events and timeout fail closed. There
+is no `kill(0)` check, cached-PID signal, process-name lookup or process snapshot.
+After the kernel exit event, the helper independently acquires the installed
+app lock and revalidates the full prepared transaction before replacement.
+Releasing the lock just before main returns can no longer authorize apply
+while the original process is still alive.
+
+This adds an exit boundary, not evidence that all native cleanup was graceful.
+Main still reports call cleanup errors and a bounded, unconfirmed attachment
+audio release; a detached playback thread is outside Tokio runtime joining.
+Those media/device quiescence limits remain open. The original synthetic
+installed driver kept its old actor alive as a monitor and could not satisfy
+this new exit requirement. The composed route now retains that actor's actual
+helper Child through a nonce-bound external kernel-observer acknowledgment,
+then allows the synthetic parent to really exit. Both the production parent's
+NOTE_EXIT and external helper exit/status must be observed, with no PID signal
+fallback. Forced after-apply interruption uses compile-only `_exit(86)` before
+any trial child and must be independently observed before startup recovery.
+These synthetic process observations do not establish normal AppWindow shutdown.
+Fresh native installed acceptance of the composed candidate remains mandatory.
+Installation activation remains false.

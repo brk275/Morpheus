@@ -11,7 +11,7 @@ use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -1074,7 +1074,8 @@ impl PreparedMacRestart<'_> {
             app_command(&self.session.state.join("previous.app"))
                 .arg("--morpheus-mac-update-supervise")
                 .arg(&self.session.installed)
-                .arg(&self.id),
+                .arg(&self.id)
+                .arg(std::process::id().to_string()),
         )?;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -1358,7 +1359,173 @@ fn recover_failed_trial(
     Ok(TrialRecovery::RolledBack)
 }
 
-fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
+struct ParentExitCookie {
+    transaction: String,
+}
+
+// This is an observation handle, never a numeric-PID signalling capability.
+// The queue is dropped before its cookie, keeping udata valid until close.
+struct ParentExitMonitor {
+    queue: OwnedFd,
+    cookie: Box<ParentExitCookie>,
+    parent: libc::pid_t,
+}
+
+impl ParentExitMonitor {
+    fn arm(parent: libc::pid_t, transaction: &str) -> Result<Self, UpdateError> {
+        if parent <= 1
+            // SAFETY: getppid has no pointer arguments or side effects.
+            || unsafe { libc::getppid() } != parent
+            || transaction.is_empty()
+            || transaction.len() > 64
+            || !transaction.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        // SAFETY: kqueue returns a new descriptor owned by this call.
+        let descriptor = unsafe { libc::kqueue() };
+        if descriptor < 0 {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        // SAFETY: descriptor is the exact successful new kqueue descriptor;
+        // OwnedFd performs its only close, including all failures below.
+        let queue = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        // SAFETY: F_SETFD takes this integer flag, not a pointer. Never pass
+        // the retained event queue to the trial executable on a later exec.
+        if unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        let monitor = Self {
+            queue,
+            cookie: Box::new(ParentExitCookie {
+                transaction: transaction.to_owned(),
+            }),
+            parent,
+        };
+        let change = libc::kevent {
+            ident: parent as libc::uintptr_t,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT | libc::EV_RECEIPT,
+            fflags: libc::NOTE_EXIT,
+            data: 0,
+            udata: monitor.cookie_pointer(),
+        };
+        // SAFETY: kevent is a plain C event record with integer/pointer fields;
+        // zero is a valid initial output record, never dereferenced as a pointer.
+        let mut receipt: libc::kevent = unsafe { std::mem::zeroed() };
+        let immediate = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: the owned queue, one initialized change, one writable output
+        // and timeout all remain valid for this synchronous registration call.
+        let count = unsafe {
+            libc::kevent(
+                monitor.queue.as_raw_fd(),
+                &change,
+                1,
+                &mut receipt,
+                1,
+                &immediate,
+            )
+        };
+        if count != 1
+            || !monitor.receipt_matches(&receipt)
+            // The original parent must still exist as our actual parent
+            // after registration, before any readiness is published. Reject
+            // an exit/reparent/registration race instead of polling a PID.
+            // SAFETY: getppid has no pointer arguments or side effects.
+            || unsafe { libc::getppid() } != parent
+        {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        Ok(monitor)
+    }
+
+    fn cookie_pointer(&self) -> *mut libc::c_void {
+        std::ptr::from_ref(self.cookie.as_ref()).cast_mut().cast()
+    }
+
+    fn identity_matches(&self, event: &libc::kevent) -> bool {
+        event.ident == self.parent as libc::uintptr_t
+            && event.filter == libc::EVFILT_PROC
+            && event.udata == self.cookie_pointer()
+    }
+
+    fn receipt_matches(&self, event: &libc::kevent) -> bool {
+        self.identity_matches(event)
+            && event.flags & libc::EV_ERROR != 0
+            && event.data == 0
+            && event.fflags == libc::NOTE_EXIT
+    }
+
+    fn exit_matches(&self, event: &libc::kevent) -> bool {
+        self.identity_matches(event)
+            && event.flags & libc::EV_ERROR == 0
+            && event.flags & (libc::EV_EOF | libc::EV_ONESHOT) == (libc::EV_EOF | libc::EV_ONESHOT)
+            && event.fflags == libc::NOTE_EXIT
+            && event.data == 0
+    }
+
+    fn wait(self, transaction: &str, wait: Duration) -> Result<(), UpdateError> {
+        if transaction != self.cookie.transaction {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(UpdateError::RecoveryRequired);
+            }
+            let timeout = libc::timespec {
+                tv_sec: remaining
+                    .as_secs()
+                    .try_into()
+                    .map_err(|_| UpdateError::RecoveryRequired)?,
+                tv_nsec: remaining.subsec_nanos().into(),
+            };
+            // SAFETY: plain output record, as at registration above.
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            // SAFETY: this exact retained queue has no new change list; the
+            // single output and bounded timeout remain valid for the call.
+            let count = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &mut event,
+                    1,
+                    &timeout,
+                )
+            };
+            if count == 1 && self.exit_matches(&event) {
+                return Ok(());
+            }
+            if count < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            // Timeout, lost/foreign event, EV_ERROR or unexpected receipt is
+            // never replaced with kill(0), a process snapshot or a PID poll.
+            return Err(UpdateError::RecoveryRequired);
+        }
+    }
+}
+
+fn parse_parent_pid(value: &std::ffi::OsStr) -> Result<libc::pid_t, UpdateError> {
+    let text = value.to_str().ok_or(UpdateError::RecoveryRequired)?;
+    if text.is_empty() || text.len() > 10 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    let parent: libc::pid_t = text.parse().map_err(|_| UpdateError::RecoveryRequired)?;
+    if parent <= 1 || parent.to_string() != text {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    Ok(parent)
+}
+
+fn supervise(installed: &Path, id: &str, parent: libc::pid_t) -> Result<(), UpdateError> {
     let (installed, state) = MacAppSession::paths(installed)?;
     let prepared = MacAppSession::read_journal(&state)?.ok_or(UpdateError::RecoveryRequired)?;
     let running = std::env::current_exe().map_err(|_| UpdateError::UnsupportedPackage)?;
@@ -1377,6 +1544,10 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
     {
         return Err(UpdateError::RecoveryRequired);
     }
+    // Arm while the real old app is still waiting for readiness and owns its
+    // lifetime lock/install lease. A kernel knote remains bound to that actual
+    // process; numeric PID reuse cannot satisfy this exit event registration.
+    let parent_exit = ParentExitMonitor::arm(parent, id)?;
     let mut ready =
         tempfile::NamedTempFile::new_in(&state).map_err(|_| UpdateError::RecoveryRequired)?;
     ready
@@ -1387,7 +1558,13 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
         .persist_noclobber(state.join("supervisor-ready"))
         .map_err(|_| UpdateError::RecoveryRequired)?;
     sync_directory(&state)?;
-    let session = MacAppSession::lock(&installed, Duration::from_secs(120))?;
+    // UI quit runs the ordinary call/media/draft/account/runtime cleanup.
+    // Its final session drop alone is insufficient: require actual kernel
+    // process termination as well, then independently acquire the app lock.
+    parent_exit.wait(id, Duration::from_secs(120))?;
+    #[cfg(morpheus_macos_update_acceptance)]
+    acceptance::parent_exit_checkpoint()?;
+    let session = MacAppSession::lock(&installed, Duration::from_secs(5))?;
     let mut journal = session.journal()?.ok_or(UpdateError::RecoveryRequired)?;
     if !same_transaction(&journal, &prepared) {
         return Err(UpdateError::RecoveryRequired);
@@ -1466,13 +1643,17 @@ pub(super) fn early_dispatch() -> Result<bool, UpdateError> {
             );
             Ok(true)
         }
-        Some("--morpheus-mac-update-supervise") if args.len() == 4 => {
+        Some("--morpheus-mac-update-supervise") => {
             if !INSTALLATION_VALIDATED {
                 return Err(UpdateError::InstallNotValidated);
+            }
+            if args.len() != 5 {
+                return Err(UpdateError::RecoveryRequired);
             }
             supervise(
                 Path::new(&args[2]),
                 args[3].to_str().ok_or(UpdateError::RecoveryRequired)?,
+                parse_parent_pid(&args[4])?,
             )?;
             Ok(true)
         }

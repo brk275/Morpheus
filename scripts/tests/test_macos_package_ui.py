@@ -127,13 +127,144 @@ class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
 
     def test_final_scan_is_attempted_with_pending_or_failed_cleanup_and_cannot_pass(self):
         for pending, cleanup_failed in [([Mock()], False), ([], True)]:
-            commands = Mock(pending=pending, cleanup_failed=cleanup_failed)
+            commands = Mock(pending=pending, helper_observers=[], cleanup_failed=cleanup_failed)
             result = {"checks": {}}
             with patch.object(update_qa, "scan_logs") as scan:
                 self.assertFalse(update_qa.scan_final_logs(commands, Path("/fixed/scanner"), result))
                 scan.assert_called_once_with(commands, Path("/fixed/scanner"))
             self.assertTrue(result["checks"]["bounded_log_scan_attempted"])
             self.assertFalse(result["checks"]["default_log_scan"])
+
+    def test_pending_helper_observation_blocks_final_scan_acceptance_without_skipping_scan(self):
+        commands = types.SimpleNamespace(pending=[], helper_observers=[object()], cleanup_failed=False)
+        result = {"checks": {}}
+        with patch.object(update_qa, "scan_logs") as scan:
+            self.assertFalse(update_qa.scan_final_logs(commands, Path("/fixed/scanner"), result))
+            scan.assert_called_once()
+        self.assertTrue(result["checks"]["bounded_log_scan_attempted"])
+        self.assertFalse(result["checks"]["default_log_scan"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX owned-child observation")
+    def test_terminal_synthetic_actor_is_reaped_without_group_or_orphan_pid_signal(self):
+        commands = object.__new__(update_qa.Commands)
+        process, log = Mock(pid=PID, returncode=None), Mock()
+        process.wait.return_value = 0
+        log.lstat.return_value.st_size = 0
+        commands.pending, commands.helper_observers, commands.cleanup_failed = [process], [], False
+        with patch.object(update_qa.smoke, "process_status", return_value=0), \
+                patch.object(update_qa.owned, "stop_group") as group, patch.object(update_qa.os, "kill") as kill:
+            commands.finish_actor(process, log)
+        process.wait.assert_called_once_with(timeout=5)
+        group.assert_not_called()
+        kill.assert_not_called()
+        self.assertEqual(commands.pending, [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX private ticket ownership")
+    def test_helper_ticket_is_private_closed_nonce_and_exact_prepared_transaction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / update_qa.STATE).mkdir(mode=0o700)
+            old = {"bundle_sha256": "a" * 64}
+            new = {"bundle_sha256": "b" * 64, "version": "0.1.1", "arch": "aarch64", "persistence": "c" * 64}
+            ticket = {"schema": 1, "nonce": NONCE, "transaction": "FixtureTransaction1", "parent": PID, "helper": PID + 1}
+            journal = {"protocol": 1, "id": ticket["transaction"], "phase": "Prepared", "old_hash": old["bundle_sha256"],
+                       "new_hash": new["bundle_sha256"], "candidate": {"protocol": 1, "product": "io.github.brk275.morpheus",
+                       "version": new["version"], "arch": new["arch"], "persistence": new["persistence"]}}
+            path, journal_path = root / "helper-observer.json", root / update_qa.STATE / "journal.json"
+            path.write_text(json.dumps(ticket)); path.chmod(0o600)
+            journal_path.write_text(json.dumps(journal)); journal_path.chmod(0o600)
+            self.assertEqual(update_qa.helper_ticket(root, NONCE, PID, old, new), ticket)
+            for change in [{"nonce": "f" * 32}, {"schema": True}, {"parent": PID + 2}, {"helper": True}, {"foreign": 1}]:
+                path.write_text(json.dumps(ticket | change))
+                with self.assertRaises(update_qa.Refused):
+                    update_qa.helper_ticket(root, NONCE, PID, old, new)
+            path.write_text(json.dumps(ticket).replace("{", '{"schema":1,', 1))
+            with self.assertRaises(update_qa.Refused):
+                update_qa.helper_ticket(root, NONCE, PID, old, new)
+            path.write_text(json.dumps(ticket)); path.chmod(0o644)
+            with self.assertRaises(update_qa.Refused):
+                update_qa.helper_ticket(root, NONCE, PID, old, new)
+            path.chmod(0o600)
+            journal_path.write_text(json.dumps(journal | {"phase": "AwaitingHealth"}))
+            with self.assertRaises(update_qa.Refused):
+                update_qa.helper_ticket(root, NONCE, PID, old, new)
+
+    def fake_kernel(self):
+        return types.SimpleNamespace(KQ_FILTER_PROC=-5, KQ_EV_ERROR=0x4000, KQ_EV_EOF=0x8000,
+                                     KQ_EV_ONESHOT=0x10, KQ_NOTE_EXIT=0x80000000)
+
+    def helper_observer(self):
+        observer = object.__new__(update_qa.HelperExit)
+        observer.pid, observer.cookie, observer.terminal = PID + 1, 17, False
+        observer.queue = Mock()
+        observer.commands = types.SimpleNamespace(helper_observers=[observer], cleanup_failed=False)
+        return observer
+
+    def kernel_event(self, **changes):
+        event = {"ident": PID + 1, "filter": -5, "udata": 17, "fflags": 0x84000000,
+                 "flags": 0x8010, "data": update_qa.FORCED_AFTER_APPLY_EXIT << 8}
+        return types.SimpleNamespace(**(event | changes))
+
+    def test_failed_helper_registration_preserves_parent_anchor_and_never_signals_helper(self):
+        for failure in [[], [self.kernel_event(flags=0x4040, data=3)]]:
+            queue = Mock()
+            queue.fileno.return_value = 42
+            queue.control.return_value = failure
+            kernel = self.fake_kernel()
+            kernel.kqueue, kernel.kevent = Mock(return_value=queue), Mock()
+            kernel.KQ_EV_ADD, kernel.KQ_EV_ENABLE = 1, 4
+            parent = Mock(pid=PID)
+            commands = types.SimpleNamespace(pending=[parent], helper_observers=[], cleanup_failed=False)
+            with patch.object(update_qa, "select", kernel), patch.object(update_qa.sys, "platform", "darwin"), \
+                    patch.object(update_qa.smoke, "process_status", return_value=None), \
+                    patch.object(update_qa, "helper_ticket", return_value={"helper": PID + 1}), \
+                    patch.object(update_qa.os, "set_inheritable"), patch.object(update_qa.os, "get_inheritable", return_value=False), \
+                    patch.object(update_qa.os, "kill") as kill:
+                with self.assertRaises(update_qa.Refused):
+                    update_qa.HelperExit(commands, parent, Path("/fixed"), NONCE, {}, {})
+            self.assertEqual(commands.pending, [parent])
+            self.assertEqual(commands.helper_observers, [])
+            queue.close.assert_called_once()
+            parent.wait.assert_not_called()
+            kill.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX native wait status encoding")
+    def test_helper_exit_rejects_receipt_foreign_event_and_wrong_forced_status(self):
+        with patch.object(update_qa, "select", self.fake_kernel()), patch.object(update_qa.os, "kill") as kill:
+            observer = self.helper_observer()
+            self.assertTrue(observer.matches(self.kernel_event()))
+            receipt = self.kernel_event(flags=0x4040, data=0)
+            self.assertTrue(observer.matches(receipt, receipt=True))
+            self.assertFalse(observer.matches(receipt))
+            for change in [{"ident": PID + 2}, {"filter": -1}, {"udata": 18}, {"flags": 0xc010},
+                           {"flags": 0x10}, {"fflags": 0x80000000}, {"data": -1}, {"data": 0x10000}]:
+                self.assertFalse(observer.matches(self.kernel_event(**change)))
+            observer.queue.control.return_value = [self.kernel_event(data=0)]
+            with patch.object(update_qa.time, "monotonic", return_value=0):
+                with self.assertRaises(update_qa.Refused):
+                    observer.finish(expected=update_qa.FORCED_AFTER_APPLY_EXIT)
+            self.assertTrue(observer.terminal)
+            self.assertEqual(observer.commands.helper_observers, [])
+            observer.queue.close.assert_called_once()
+            kill.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX native wait status encoding")
+    def test_helper_timeout_keeps_registration_pending_and_forced_exit_requires_exact_status(self):
+        with patch.object(update_qa, "select", self.fake_kernel()), patch.object(update_qa.os, "kill") as kill:
+            pending = self.helper_observer()
+            with patch.object(update_qa.time, "monotonic", side_effect=[0, 2]):
+                with self.assertRaises(update_qa.Refused):
+                    pending.finish(expected=0, seconds=1)
+            self.assertEqual(pending.commands.helper_observers, [pending])
+            self.assertTrue(pending.commands.cleanup_failed)
+            pending.queue.close.assert_not_called()
+            observed = self.helper_observer()
+            observed.queue.control.return_value = [self.kernel_event()]
+            with patch.object(update_qa.time, "monotonic", return_value=0):
+                observed.finish(expected=update_qa.FORCED_AFTER_APPLY_EXIT)
+            self.assertEqual(observed.commands.helper_observers, [])
+            self.assertTrue(observed.terminal)
+            kill.assert_not_called()
 
     @unittest.skipUnless(os.name == "posix", "POSIX private log file contract")
     def test_oversized_or_failed_scan_does_not_skip_remaining_bounded_logs(self):
