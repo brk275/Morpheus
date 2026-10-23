@@ -271,12 +271,15 @@ def prepare_bytes(bundle, receipt_bytes, revision, *, platform, version, working
     # not invented license text or an assertion of complete legal obligations.
     for name, value in sorted(files.items()):
         path = PurePosixPath(name)
-        if (name == "vendor/README.md" or name.startswith("vendor/") and path.name in
+        if (name in {"vendor/README.md", "vendor/cpal/OWNED_ALSA.md"}
+                or name.startswith("vendor/") and path.name in
                 {"MORPHEUS_PATCH.md", "OWNED_COREAUDIO.md", "README.md"}):
             checksum = digest(plain(value)); keep_text(checksum, value)
             provenance.append({"source_path": name, "sha256": checksum})
     require(any(r["name"] == "slint" and r["license_texts"] for r in records)
             and any(x["source_path"] == "vendor/cpal/OWNED_COREAUDIO.md" for x in provenance))
+    if any(r["name"] == "alsa" and r["source"] == "committed-workspace" for r in records):
+        require(any(x["source_path"] == "vendor/cpal/OWNED_ALSA.md" for x in provenance))
     # Outer native material remains separately identified, never misattributed to
     # a Mac/Windows binary merely because a Linux source bundle contains it.
     native = manifest.get("native_sources")

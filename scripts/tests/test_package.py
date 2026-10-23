@@ -501,16 +501,21 @@ class MacUpdatePayloadTests(unittest.TestCase):
 
 class NativeNoticeEvidenceTests(unittest.TestCase):
     @staticmethod
-    def evidence(drop_license=False, registry=False):
+    def evidence(drop_license=False, registry=False, drop_alsa_provenance=False):
         source = native_notices.catalogue()
-        files = {"Cargo.toml": b'[workspace]\nmembers = ["app", "vendor/cpal", "vendor/slint"]\n',
-                 "Cargo.lock": b'version = 4\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n[[package]]\nname = "cpal"\nversion = "0.18.2"\n[[package]]\nname = "slint"\nversion = "1.18.1"\n',
+        files = {"Cargo.toml": b'[workspace]\nmembers = ["app", "vendor/cpal", "vendor/slint"]\nexclude = ["vendor/alsa"]\n[patch.crates-io]\nalsa = { path = "vendor/alsa" }\n',
+                 "Cargo.lock": b'version = 4\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n[[package]]\nname = "cpal"\nversion = "0.18.2"\n[[package]]\nname = "slint"\nversion = "1.18.1"\n[[package]]\nname = "alsa"\nversion = "0.11.0"\n',
                  "LICENSE": b"Fixture root source license\n",
                  "app/Cargo.toml": b'[package]\nname = "fixture"\nversion = "0.1.0"\nlicense = "MIT"\n',
                  "app/LICENSE": b"Fixture application license\n",
                  "vendor/cpal/Cargo.toml": b'[package]\nname = "cpal"\nversion = "0.18.2"\nlicense = "Apache-2.0"\n',
                  "vendor/cpal/LICENSE": b"Fixture CPAL license\n",
                  "vendor/cpal/OWNED_COREAUDIO.md": b"Fixture exact local patch provenance\n",
+                 "vendor/cpal/OWNED_ALSA.md": b"Fixture exact ALSA patch provenance\n",
+                 "vendor/alsa/Cargo.toml": b'[package]\nname = "alsa"\nversion = "0.11.0"\nlicense = "Apache-2.0 OR MIT"\n',
+                 "vendor/alsa/Cargo.toml.orig": b"Fixture preserved upstream manifest\n",
+                 "vendor/alsa/LICENSE-APACHE": b"Fixture ALSA Apache license\n",
+                 "vendor/alsa/LICENSE-MIT": b"Fixture ALSA MIT license\n",
                  "vendor/slint/Cargo.toml": b'[package]\nname = "slint"\nversion = "1.18.1"\nlicense = "GPL-3.0-only"\n',
                  "vendor/slint/LICENSE": b"Fixture Slint license\n",
                  "vendor/slint/LICENSES/extra.txt": b"Fixture extra source license\n"}
@@ -528,6 +533,8 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
                 + source.REGISTRY + '"\nchecksum = "' + source.digest(registry_archive) + '"\n').encode()
         if drop_license:
             files.pop("LICENSE"); files.pop("app/LICENSE")
+        if drop_alsa_provenance:
+            files.pop("vendor/cpal/OWNED_ALSA.md")
         entries = {name: {"mode": "100644", "oid": source.object_id("blob", data), "bytes": len(data)}
                    for name, data in files.items()}
         tree = source.tree_identity(entries)
@@ -571,10 +578,24 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
         bundle, receipt = build()
         contents = native_notices.prepare_bytes(bundle, receipt, revision, platform="darwin", version="0.1.0")
         parsed = native_notices.verify_bytes(contents, revision=revision, platform="darwin", version="0.1.0")
-        self.assertEqual(len(parsed["locked_packages"]), 3)
+        self.assertEqual(len(parsed["locked_packages"]), 4)
         self.assertIn(b"This application uses Slint", contents[native_notices.TEXT])
         self.assertIn(b"Fixture extra source license", contents[native_notices.TEXT])
         self.assertIn(b"Fixture exact local patch provenance", contents[native_notices.TEXT])
+        self.assertIn(b"Fixture exact ALSA patch provenance", contents[native_notices.TEXT])
+        alsa = next(item for item in parsed["locked_packages"] if item["name"] == "alsa")
+        self.assertEqual(alsa["source"], "committed-workspace")
+        self.assertEqual(alsa["declared_license"], "Apache-2.0 OR MIT")
+        self.assertTrue({"vendor/alsa/LICENSE-APACHE", "vendor/alsa/LICENSE-MIT"}.issubset(
+            {item["source_path"] for item in alsa["license_texts"]}))
+        self.assertIn({"source_path": "vendor/cpal/OWNED_ALSA.md",
+                       "sha256": source.digest(files["vendor/cpal/OWNED_ALSA.md"])},
+                      parsed["local_patch_provenance"])
+        windows = native_notices.prepare_bytes(bundle, receipt, revision, platform="win32", version="0.1.0")
+        self.assertIn(b"Fixture ALSA MIT license", windows[native_notices.TEXT])
+        _, _, _, missing_revision, missing_build = self.evidence(drop_alsa_provenance=True)
+        with self.assertRaises(ValueError):
+            native_notices.prepare_bytes(*missing_build(), missing_revision, platform="win32", version="0.1.0")
         self.assertFalse(parsed["distribution_ready"])
         self.assertFalse(parsed["license_compliance_verified"])
         self.assertFalse(parsed["native_source_evidence"]["bound_to_this_platform_binary"])
