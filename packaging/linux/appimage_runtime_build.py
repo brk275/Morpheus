@@ -47,6 +47,36 @@ def manifest():
     return value
 
 
+def require_static_regression(data):
+    """Reject a regression executable that needs a loader or shared library."""
+    if (type(data) is not bytes or not 1024 <= len(data) <= MAX_RUNTIME
+            or data[:7] != b"\x7fELF\x02\x01\x01"):
+        fail("tool")
+    kind, machine, version, entry, phoff, shoff, flags, ehsize, phsize, phnum, shsize, shnum, names = struct.unpack_from(
+        "<HHIQQQIHHHHHH", data, 16)
+    if (kind not in (2, 3) or machine != 62 or version != 1 or ehsize != 64
+            or phsize != 56 or not 1 <= phnum <= 128 or phoff < 64
+            or phoff + phnum * 56 > len(data)):
+        fail("tool")
+    for index in range(phnum):
+        ptype, pflags, offset, va, pa, size, memory, align = struct.unpack_from("<IIQQQQQQ", data, phoff + index * 56)
+        if offset + size > len(data) or ptype == 3:
+            fail("tool")
+        if ptype == 2:
+            if size % 16 or size > 65536:
+                fail("tool")
+            terminated = False
+            for at in range(offset, offset + size, 16):
+                tag, value = struct.unpack_from("<qQ", data, at)
+                if tag == 1:
+                    fail("tool")
+                if tag == 0:
+                    terminated = True
+                    break
+            if not terminated:
+                fail("tool")
+
+
 def static_identity(data):
     """Require bounded x86-64 static PIE, NX stack and its reserved MD5 slot."""
     if (type(data) is not bytes or not 1024 <= len(data) <= MAX_RUNTIME
@@ -325,15 +355,17 @@ def prepare(runner, root, environment):
     run("runtime-squashfuse-bootstrap", [tools["autoreconf"], "-i"], cwd=sq)
     run("runtime-squashfuse-configure", [str(sq / "configure"), "--prefix=" + str(prefix), "--disable-shared", "--enable-static", "--disable-demo", "--with-zlib=" + str(prefix), "--with-zstd=" + str(prefix), "--without-xz", "--without-lzo", "--without-lz4"], cwd=sq)
     run("runtime-squashfuse-build", [tools["make"], "-j2"], cwd=sq, budget=180)
-    run("runtime-malformed-build", [tools["make"], "malformedtest"], cwd=sq)
+    # Libtool consumes -static without requesting complete static program
+    # linkage. Override only this make invocation, preserving private flags.
+    run("runtime-malformed-build", [tools["make"], "malformedtest", "LDFLAGS=" + env["LDFLAGS"] + " -all-static"], cwd=sq)
     # The actual upstream malformed-image target must exist and return0;
     # skip77 is not success. Link it against the same freshly patched libs.
     malformed = sq / "malformedtest"
     if not malformed.is_file() or malformed.is_symlink():
         fail()
     malformed_bytes = client.read_regular(malformed, 4 * 1024 * 1024)
-    if malformed_bytes[:7] != b"\x7fELF\x02\x01\x01":
-        fail()
+    mark("runtime-malformed-verify")
+    require_static_regression(malformed_bytes)
     run("runtime-malformed-test", [str(malformed)], cwd=sq, budget=60, bound=65536)
     run("runtime-squashfuse-install", [tools["make"], "install"], cwd=sq)
     # Upstream explicitly installs all public/internal headers for runtime.c.
