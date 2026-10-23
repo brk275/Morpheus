@@ -106,8 +106,9 @@ use crate::{
 };
 
 /// How long `save` and `load_or_create` wait for the writer locks before
-/// giving up with [`CommitError::Busy`]. `commit` does not wait. A writer
-/// holds the file lock only from the comparison through the rename.
+/// giving up with [`CommitError::Busy`]. `commit` does not wait. UI commits
+/// hold their locks through staging and publication; background writers stage
+/// before acquiring them.
 const WRITER_LOCK_WAIT: Duration = Duration::from_secs(2);
 const WRITER_LOCK_POLL: Duration = Duration::from_millis(10);
 
