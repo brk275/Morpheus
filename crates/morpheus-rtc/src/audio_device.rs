@@ -3001,12 +3001,29 @@ mod tests {
                 }))
             },
         ));
-        assert!(
-            cancelled_before_native
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
+        // Pending can still be the mandatory native-backend retirement wait.
+        // Drive this same future until its actual retained supervisor exists;
+        // only then exercise cancellation or wait on the native-thread channel.
+        let supervisor_published = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| match cancelled_before_native.as_mut().poll(cx) {
+                std::task::Poll::Ready(_) => std::task::Poll::Ready(false),
+                std::task::Poll::Pending => {
+                    if DEVICE_OPEN_OWNER
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|owner| owner.supervisor.is_some())
+                    {
+                        std::task::Poll::Ready(true)
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }
+            }),
+        )
+        .await;
+        assert!(matches!(supervisor_published, Ok(true)));
         assert!(
             DEVICE_OPEN_OWNER
                 .lock()
@@ -3039,12 +3056,29 @@ mod tests {
             continue_open.recv_timeout(Duration::from_secs(2)).unwrap();
             Ok(result)
         }));
-        assert!(
-            opening
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
+        // Pending can still be the mandatory native-backend retirement wait.
+        // Drive this same future until its actual retained supervisor exists;
+        // only then exercise cancellation or wait on the native-thread channel.
+        let supervisor_published = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| match opening.as_mut().poll(cx) {
+                std::task::Poll::Ready(_) => std::task::Poll::Ready(false),
+                std::task::Poll::Pending => {
+                    if DEVICE_OPEN_OWNER
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|owner| owner.supervisor.is_some())
+                    {
+                        std::task::Poll::Ready(true)
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }
+            }),
+        )
+        .await;
+        assert!(matches!(supervisor_published, Ok(true)));
         let actual_thread = entered_open.recv_timeout(Duration::from_secs(2)).unwrap();
         // Drop the whole suspended future, not just the cancellation signal.
         // The actual result is late and its destructor must stay off Tokio.
