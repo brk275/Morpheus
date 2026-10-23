@@ -183,6 +183,8 @@ class ScopeTests(unittest.TestCase):
                      "packaging/linux/appimage_process.py",
                      "packaging/linux/appimage_runtime_build.py",
                      "packaging/linux/runtime-build.json",
+                     "packaging/linux/runtime-patches/type2-runtime-fedfad51-path-bounds.patch",
+                     "packaging/linux/runtime-patches/type2-runtime-path-regression.c",
                      "packaging/linux/corresponding_source.py",
                      "packaging/linux/source_bundle_qa.py"):
             with self.subTest(path=path):
@@ -194,7 +196,9 @@ class ScopeTests(unittest.TestCase):
         # The peer is compiled by native CI; unknown package inputs fail closed.
         for path in ("packaging/linux/appimage_peer.rs", "packaging/linux/new-helper.py",
                      "packaging/linux/AppRun", "packaging/linux/appimage-tools.json",
-                     "packaging/linux/runtime-build-local.json"):
+                     "packaging/linux/runtime-build-local.json",
+                     "packaging/linux/runtime-patches/type2-runtime-fedfad51-path-bounds.patch.extra",
+                     "packaging/linux/runtime-patches/type2-runtime-path-regression-other.c"):
             with self.subTest(path=path):
                 self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
 
