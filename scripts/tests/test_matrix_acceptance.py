@@ -637,6 +637,34 @@ class FinalizationTests(unittest.TestCase):
         runner.element_case.assert_not_called()
         self.assert_both_cleanups(runner)
 
+    def test_oauth_only_runs_all_existing_phases_without_seeded_or_rtc_services_and_keeps_cleanup(self):
+        for failure_at in (None, "oauth_cases", "finish_checks"):
+            with self.subTest(failure_at=failure_at), self.mocked_main() as (runner, _):
+                failure = RuntimeError("fixed incomplete OAuth result")
+                if failure_at:
+                    getattr(runner, failure_at).side_effect = failure
+                with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner", "--suite", "oauth-only"]):
+                    if failure_at:
+                        with self.assertRaises(RuntimeError) as caught:
+                            acceptance_module.main()
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        self.assertIsNone(acceptance_module.main())
+                runner.group.assert_called_once_with(acceptance_module.OAUTH_LABELS, runner.oauth_cases)
+                runner.oauth_cases.assert_called_once_with()
+                runner.start_keyring.assert_called_once_with()
+                runner.require_containment.assert_called_once_with()
+                self.assertEqual(acceptance_module.SUITES["oauth-only"], acceptance_module.OAUTH_LABELS)
+                self.assertEqual([call.args for call in runner.script.call_args_list],
+                                 [("local_matrix_rtc", "down"), ("local_matrix_env", "down")])
+                runner.test.assert_not_called()
+                runner.app_timeline.assert_not_called()
+                runner.app_recovery.assert_not_called()
+                runner.rtc_cases.assert_not_called()
+                runner.outgoing_ring_cases.assert_not_called()
+                runner.element_case.assert_not_called()
+                self.assert_both_cleanups(runner)
+
     def test_drafts_only_main_runs_only_drafts_and_preserves_cleanup(self):
         with self.mocked_main() as (runner, _):
             with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
@@ -1681,6 +1709,20 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(oauth_diagnostics(output), {"stage": "login_finish", "failure": "rust_acceptance"})
         self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE password_value\n"
                                            "MORPHEUS_OAUTH_FAILURE https://example.org/private"), {})
+
+    def test_registration_outcomes_survive_only_the_existing_closed_oauth_reducer(self):
+        import local_matrix_auth
+        expected = {"registration_command", "registration_exit_two", "registration_exit_exec", "registration_exit_other"}
+        helper = {failure.value for failure in local_matrix_auth.Failure if failure.value.startswith("registration_")}
+        self.assertEqual(helper, expected)
+        self.assertLessEqual(helper, acceptance_module.OAUTH_FAILURES)
+        for code in expected:
+            self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE registration\n"
+                                              f"MORPHEUS_OAUTH_FAILURE {code}\n"
+                                              f"MORPHEUS_OAUTH_FAILURE {code} private-body\n"),
+                             {"stage": "registration", "failure": code})
+        self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_FAILURE registration_exit_two_unknown\n"
+                                          "MORPHEUS_OAUTH_FAILURE registration_exit_other private-token\n"), {})
 
     def test_incoming_discovery_counters_are_bounded_and_never_relay_unknown_values(self):
         for name in acceptance_module.INCOMING_DIAGNOSTICS:

@@ -301,7 +301,7 @@ class ScopeTests(unittest.TestCase):
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "media-only", "app-timeline",
-                                         "outgoing-ring", "native-call"})
+                                         "outgoing-ring", "native-call", "oauth-only"})
         source = ast.parse((Path(__file__).resolve().parents[1]/"run_matrix_acceptance.py").read_text())
         suites = [node.value for node in source.body if isinstance(node,ast.Assign)
                   and any(isinstance(target,ast.Name) and target.id=="SUITES" for target in node.targets)]
@@ -326,7 +326,9 @@ class ScopeTests(unittest.TestCase):
                   {"matrix_suite": "full; echo unsafe"}, {"ref": "main"}, {"platform": []},
                   {"checks": None}, {"platform": "windows", "checks": "matrix"},
                   {"checks": "wayland"}, {"checks": "all", "matrix_suite": "drafts-only"},
-                  {"platform": "windows", "checks": "config"}, {"platform": "linux", "checks": "helpers"})
+                  {"platform": "windows", "checks": "config"}, {"platform": "linux", "checks": "helpers"},
+                  {"platform": "all", "checks": "matrix", "matrix_suite": "oauth-only"},
+                  {"platform": "linux", "checks": "all", "matrix_suite": "oauth-only"})
         for value in values:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 event_selection({"inputs": value}, "workflow_dispatch")

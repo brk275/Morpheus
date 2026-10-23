@@ -218,6 +218,7 @@ OAUTH_STAGES = frozenset((
     "logout_remote", "logout_account", "logout_vault",
 ))
 OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_acceptance", "deadline",
+                           "registration_command", "registration_exit_two", "registration_exit_exec", "registration_exit_other",
                            "logout_timeout", "logout_operation", "logout_remote", "logout_account",
                            "logout_vault_lookup", "logout_vault_retained",
                            "browser_callback_fragment", "browser_callback_query", "browser_callback_state",
@@ -403,7 +404,7 @@ SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
           "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
           "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
-          "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS)}
+          "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS), "oauth-only": OAUTH_LABELS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1338,6 +1339,10 @@ class Acceptance:
                 if self.suite == "full":
                     output.write("Full suite: real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
                                  "synthetic call media and OAuth browser-form protocol automation.\n\n")
+                elif self.suite == "oauth-only":
+                    output.write("Focused OAuth checks: the existing disposable MAS, Synapse, PostgreSQL and OS Secret Service lifecycle. "
+                                 "All cancellation/login-refresh, vaulted restart/automatic refresh and logout phases remain mandatory. "
+                                 "No chat, RTC, Element, device, desktop or installed-package acceptance is implied.\n\n")
                 elif self.suite == "timeline-reads":
                     output.write("Focused timeline-read checks: real Synapse and an ephemeral OS Secret Service. "
                                  "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths, key recovery, chat without a call service and generated-window model delivery/revocation. "
@@ -1443,6 +1448,13 @@ def main():
     try:
         acceptance.start_keyring()
         acceptance.require_containment()
+        if args.suite == "oauth-only":
+            # OAuth owns its MAS/Postgres/Synapse lifecycle; no seeded chat or RTC
+            # services are a prerequisite. The same outer cleanup/inventory/scan
+            # remains unconditional, including on incomplete evidence or failure.
+            acceptance.group(OAUTH_LABELS, acceptance.oauth_cases)
+            acceptance.finish_checks()
+            return
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
         if args.suite == "native-call":

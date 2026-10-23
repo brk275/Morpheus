@@ -22,7 +22,7 @@ on:
         description: Existing Matrix suite (non-full requires Linux and matrix)
         type: choice
         default: full
-        options: [full, draft-recovery, drafts-only, timeline-reads, timeline-failures, media-only, app-timeline, outgoing-ring, native-call]
+        options: [full, draft-recovery, drafts-only, timeline-reads, timeline-failures, media-only, app-timeline, outgoing-ring, native-call, oauth-only]
 
 permissions:
   contents: read
@@ -211,7 +211,7 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       - name: Prepare the pinned owned native PipeWire client
-        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'media-only'))
+        if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'desktop' || needs.scope.outputs.check_route == 'devices' || needs.scope.outputs.check_route == 'wayland' || (needs.scope.outputs.check_route == 'matrix' && needs.scope.outputs.matrix_suite != 'drafts-only' && needs.scope.outputs.matrix_suite != 'timeline-failures' && needs.scope.outputs.matrix_suite != 'media-only' && needs.scope.outputs.matrix_suite != 'oauth-only'))
         timeout-minutes: 20
         shell: bash
         run: |
@@ -664,7 +664,7 @@ jobs:
                          "macos-arm": ["macos-15"], "macos-intel": ["macos-15-intel"]}
               routes = {"all", "models", "desktop", "devices", "vendor", "sdk", "matrix", "wayland", "config", "helpers"}
               suites = {"full", "draft-recovery", "drafts-only", "timeline-reads", "timeline-failures",
-                        "media-only", "app-timeline", "outgoing-ring", "native-call"}
+                        "media-only", "app-timeline", "outgoing-ring", "native-call", "oauth-only"}
               if (event_name not in ("push", "pull_request", "workflow_dispatch")
                       or manual not in ("true", "false") or not isinstance(platform, str) or platform not in choices
                       or not isinstance(route, str) or route not in routes
