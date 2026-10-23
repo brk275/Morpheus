@@ -56,6 +56,8 @@ MANUAL_LINUX_PACKAGE_INPUTS = {
     "packaging/linux/appimage_process.py",
     "packaging/linux/appimage_runtime_build.py",
     "packaging/linux/runtime-build.json",
+    "packaging/linux/runtime-patches/type2-runtime-fedfad51-path-bounds.patch",
+    "packaging/linux/runtime-patches/type2-runtime-path-regression.c",
     "packaging/linux/corresponding_source.py",
     "packaging/linux/source_bundle_qa.py",
 }
