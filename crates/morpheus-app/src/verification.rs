@@ -34,7 +34,9 @@ use morpheus_matrix::{
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::runtime::Handle;
 
-use crate::{AppWindow, VerificationRequestItem, live::LiveUi};
+use crate::{
+    AppWindow, VerificationRequestItem, live::LiveUi, verification_work::VerificationWorkLease,
+};
 
 const IDLE: i32 = 0;
 const WAITING_FOR_REQUEST: i32 = 1;
@@ -56,6 +58,7 @@ struct View {
     account: String,
     selection: AccountSelection,
     cancellation: VerificationCancellation,
+    work: VerificationWorkLease,
 }
 
 #[derive(Default)]
@@ -119,7 +122,12 @@ fn may_act(live_session: bool, page: i32, protected: bool) -> bool {
 fn current_view(
     ui: &AppWindow,
     live: &LiveUi,
-) -> Option<(String, AccountSelection, VerificationCancellation)> {
+) -> Option<(
+    String,
+    AccountSelection,
+    VerificationCancellation,
+    VerificationWorkLease,
+)> {
     if !eligible(ui) {
         return None;
     }
@@ -132,16 +140,20 @@ fn current_view(
             view.account == account
                 && view.selection.is_current()
                 && !view.cancellation.is_cancelled()
+                && view.work.is_current()
         });
         if !reusable {
             if let Some(old) = state.view.take() {
                 old.cancellation.cancel();
             }
             let selection = live.manager.account_selection(&account)?;
+            let cancellation = VerificationCancellation::new();
+            let work = live.verification_work_lease(&selection, &cancellation)?;
             state.view = Some(View {
                 account: account.clone(),
                 selection,
-                cancellation: VerificationCancellation::new(),
+                cancellation,
+                work,
             });
         }
         let view = state.view.as_ref()?;
@@ -149,6 +161,7 @@ fn current_view(
             view.account.clone(),
             view.selection.clone(),
             view.cancellation.clone(),
+            view.work.clone(),
         ))
     })
 }
@@ -160,12 +173,14 @@ fn publishable(
     live: &LiveUi,
     account_id: &str,
     selection: &AccountSelection,
+    work: &VerificationWorkLease,
     operation: i32,
 ) -> bool {
     eligible(ui)
         && ui.get_active_account_local_id().as_str() == account_id
         && ui.get_sas_operation() == operation
         && selection.is_current()
+        && work.is_current()
         && !live.security_gate.blocked()
 }
 
@@ -174,19 +189,41 @@ fn same_flow(
     live: &LiveUi,
     account_id: &str,
     selection: &AccountSelection,
+    work: &VerificationWorkLease,
     operation: i32,
     flow_id: &str,
 ) -> bool {
-    publishable(ui, live, account_id, selection, operation)
+    publishable(ui, live, account_id, selection, work, operation)
         && ui.get_sas_flow_id().as_str() == flow_id
 }
 
 /// The security gate's generation now, as a fence the core rechecks right
 /// before handing a step to the SDK.
-fn admission(live: &LiveUi) -> impl Fn() -> bool + Send + Sync + 'static {
+fn admission(
+    live: &LiveUi,
+    work: &VerificationWorkLease,
+) -> impl Fn() -> bool + Send + Sync + 'static {
     let gate = live.security_gate.clone();
     let generation = gate.ringing_generation();
-    move || gate.ringing_allowed(generation)
+    let work = work.clone();
+    move || work.is_current() && gate.ringing_allowed(generation)
+}
+
+/// Registration and terminal/account admission share the owner's mutex. A
+/// refused future is never polled; restore the current UI's pending flags.
+fn spawn_owned(
+    ui: &AppWindow,
+    live: &LiveUi,
+    runtime: &Handle,
+    work: &VerificationWorkLease,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    if !live.spawn_verification_work(runtime, work, task) {
+        ui.set_sas_busy(false);
+        ui.set_sas_incoming_loading(false);
+        ui.set_sas_notice("".into());
+        ui.set_sas_error("Verification work could not start. Wait for account cleanup, then reopen verification.".into());
+    }
 }
 
 /// Fixed text for a step that did not complete; `None` for a closed view
@@ -495,7 +532,7 @@ fn request_own(window: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, acknowle
     {
         return;
     }
-    let Some((account_id, selection, cancellation)) = current_view(window, live) else {
+    let Some((account_id, selection, cancellation, work)) = current_view(window, live) else {
         return;
     };
     let operation = next_operation(window);
@@ -504,16 +541,18 @@ fn request_own(window: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, acknowle
     window.set_sas_incoming_loading(false);
     window.set_sas_error("".into());
     window.set_sas_notice("Sending a request to your other device…".into());
-    let admitted = admission(live);
+    let admitted = admission(live, &work);
     let live = live.clone();
     let weak = window.as_weak();
-    handle.spawn(async move {
+    let owner = live.clone();
+    let task_work = work.clone();
+    spawn_owned(window, &owner, handle, &task_work, async move {
         let manager = live.manager.clone();
         let result = manager
             .request_own_verification_selected(&selection, &cancellation, &admitted, acknowledged)
             .await;
         let _ = weak.upgrade_in_event_loop(move |window| {
-            if !publishable(&window, &live, &account_id, &selection, operation) {
+            if !publishable(&window, &live, &account_id, &selection, &work, operation) {
                 return;
             }
             window.set_sas_busy(false);
@@ -574,6 +613,11 @@ fn adopt(ui: &AppWindow, info: &OwnVerification) {
     });
 }
 
+/// Revoke the UI view synchronously; actual task release is the shared drain.
+pub(crate) fn shutdown(ui: &AppWindow) {
+    clear_ui(ui);
+}
+
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     let weak = ui.as_weak();
     ui.on_verification_protected(move || {
@@ -594,7 +638,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         {
             return;
         }
-        let Some((account_id, selection, cancellation)) = current_view(&window, &incoming_live)
+        let Some((account_id, selection, cancellation, work)) =
+            current_view(&window, &incoming_live)
         else {
             return;
         };
@@ -602,13 +647,15 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         window.set_sas_incoming_loading(true);
         let live = incoming_live.clone();
         let weak = weak.clone();
-        incoming_handle.spawn(async move {
+        let owner = live.clone();
+        let task_work = work.clone();
+        spawn_owned(&window, &owner, &incoming_handle, &task_work, async move {
             let manager = live.manager.clone();
             let result = manager
                 .pending_own_verifications_selected(&selection, &cancellation)
                 .await;
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if !publishable(&window, &live, &account_id, &selection, operation)
+                if !publishable(&window, &live, &account_id, &selection, &work, operation)
                     || window.get_sas_stage() != IDLE
                 {
                     return;
@@ -650,7 +697,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if !reviewable {
             return;
         }
-        let Some((account_id, selection, cancellation)) = current_view(&window, &accept_live)
+        let Some((account_id, selection, cancellation, work)) = current_view(&window, &accept_live)
         else {
             return;
         };
@@ -665,16 +712,18 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         crate::withdraw_call_bar(&window);
         window.set_sas_busy(true);
         window.set_sas_incoming_loading(false);
-        let admitted = admission(&accept_live);
+        let admitted = admission(&accept_live, &work);
         let live = accept_live.clone();
         let weak = weak.clone();
-        accept_handle.spawn(async move {
+        let owner = live.clone();
+        let task_work = work.clone();
+        spawn_owned(&window, &owner, &accept_handle, &task_work, async move {
             let manager = live.manager.clone();
             let result = manager
                 .accept_own_verification_selected(&selection, &cancellation, &flow_id, &admitted)
                 .await;
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if !publishable(&window, &live, &account_id, &selection, operation)
+                if !publishable(&window, &live, &account_id, &selection, &work, operation)
                     || window.get_sas_stage() != IDLE
                 {
                     return;
@@ -719,7 +768,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if !with(|state| state.inbox.iter().any(|info| info.flow_id == flow_id)) {
             return;
         }
-        let Some((account_id, selection, cancellation)) = current_view(&window, &decline_live)
+        let Some((account_id, selection, cancellation, work)) =
+            current_view(&window, &decline_live)
         else {
             return;
         };
@@ -730,13 +780,15 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         window.set_sas_notice("".into());
         let live = decline_live.clone();
         let weak = weak.clone();
-        decline_handle.spawn(async move {
+        let owner = live.clone();
+        let task_work = work.clone();
+        spawn_owned(&window, &owner, &decline_handle, &task_work, async move {
             let manager = live.manager.clone();
             let result = manager
                 .cancel_own_verification_selected(&selection, &cancellation, &flow_id)
                 .await;
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if !publishable(&window, &live, &account_id, &selection, operation) {
+                if !publishable(&window, &live, &account_id, &selection, &work, operation) {
                     return;
                 }
                 window.set_sas_busy(false);
@@ -797,17 +849,20 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if flow_id.is_empty() {
             return;
         }
-        let Some((account_id, selection, cancellation)) = current_view(&window, &refresh_live)
+        let Some((account_id, selection, cancellation, work)) =
+            current_view(&window, &refresh_live)
         else {
             return;
         };
         let operation = next_operation(&window);
         crate::withdraw_call_bar(&window);
         window.set_sas_busy(true);
-        let admitted = admission(&refresh_live);
+        let admitted = admission(&refresh_live, &work);
         let live = refresh_live.clone();
         let weak = weak.clone();
-        refresh_handle.spawn(async move {
+        let owner = live.clone();
+        let task_work = work.clone();
+        spawn_owned(&window, &owner, &refresh_handle, &task_work, async move {
             let manager = live.manager.clone();
             let info = manager
                 .own_verification_selected(&selection, &cancellation, &flow_id)
@@ -840,7 +895,15 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 None
             };
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if !same_flow(&window, &live, &account_id, &selection, operation, &flow_id) {
+                if !same_flow(
+                    &window,
+                    &live,
+                    &account_id,
+                    &selection,
+                    &work,
+                    operation,
+                    &flow_id,
+                ) {
                     return;
                 }
                 window.set_sas_busy(false);
@@ -971,23 +1034,34 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if flow_id.is_empty() {
             return;
         }
-        let Some((account_id, selection, cancellation)) = current_view(&window, &start_live) else {
+        let Some((account_id, selection, cancellation, work)) = current_view(&window, &start_live)
+        else {
             return;
         };
         let operation = next_operation(&window);
         crate::withdraw_call_bar(&window);
         window.set_sas_busy(true);
         window.set_sas_error("".into());
-        let admitted = admission(&start_live);
+        let admitted = admission(&start_live, &work);
         let live = start_live.clone();
         let weak = weak.clone();
-        start_handle.spawn(async move {
+        let owner = live.clone();
+        let task_work = work.clone();
+        spawn_owned(&window, &owner, &start_handle, &task_work, async move {
             let manager = live.manager.clone();
             let result = manager
                 .start_own_sas_selected(&selection, &cancellation, &flow_id, &admitted)
                 .await;
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if !same_flow(&window, &live, &account_id, &selection, operation, &flow_id) {
+                if !same_flow(
+                    &window,
+                    &live,
+                    &account_id,
+                    &selection,
+                    &work,
+                    operation,
+                    &flow_id,
+                ) {
                     return;
                 }
                 window.set_sas_busy(false);
@@ -1027,7 +1101,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if flow_id.is_empty() {
             return;
         }
-        let Some((account_id, selection, cancellation)) = current_view(&window, &confirm_live)
+        let Some((account_id, selection, cancellation, work)) =
+            current_view(&window, &confirm_live)
         else {
             return;
         };
@@ -1035,16 +1110,26 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         crate::withdraw_call_bar(&window);
         window.set_sas_busy(true);
         window.set_sas_error("".into());
-        let admitted = admission(&confirm_live);
+        let admitted = admission(&confirm_live, &work);
         let live = confirm_live.clone();
         let weak = weak.clone();
-        confirm_handle.spawn(async move {
+        let owner = live.clone();
+        let task_work = work.clone();
+        spawn_owned(&window, &owner, &confirm_handle, &task_work, async move {
             let manager = live.manager.clone();
             let result = manager
                 .confirm_own_sas_selected(&selection, &cancellation, &flow_id, &admitted)
                 .await;
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if !same_flow(&window, &live, &account_id, &selection, operation, &flow_id) {
+                if !same_flow(
+                    &window,
+                    &live,
+                    &account_id,
+                    &selection,
+                    &work,
+                    operation,
+                    &flow_id,
+                ) {
                     return;
                 }
                 window.set_sas_busy(false);
@@ -1103,15 +1188,21 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         // Its own cancellation: the view just closed, but the cancel must
         // still be sent for this exact account.
         let cancellation = VerificationCancellation::new();
+        let Some(work) = cancel_live.verification_work_lease(&selection, &cancellation) else {
+            window.set_sas_notice("Verification closed here. Account cleanup is in progress; the request ends when it expires.".into());
+            return;
+        };
         let live = cancel_live.clone();
         let weak = weak.clone();
-        handle.spawn(async move {
+        let owner = live.clone();
+        let task_work = work.clone();
+        spawn_owned(&window, &owner, &handle, &task_work, async move {
             let manager = live.manager.clone();
             let result = manager
                 .cancel_own_verification_selected(&selection, &cancellation, &flow_id)
                 .await;
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if !publishable(&window, &live, &account_id, &selection, operation)
+                if !publishable(&window, &live, &account_id, &selection, &work, operation)
                     || window.get_sas_stage() != IDLE
                 {
                     return;
