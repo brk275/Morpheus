@@ -183,9 +183,10 @@ impl StateEvidence {
         let Some(key) = event.get("state_key").and_then(Value::as_str) else {
             return;
         };
-        let Some(content) = event.get("content") else {
-            return;
-        };
+        // A known slot envelope without content is PRESENT and malformed,
+        // never absence or permission to fall back to an unstable open alias.
+        let malformed = Value::Null;
+        let content = event.get("content").unwrap_or(&malformed);
         if kind == "m.room.member"
             && content.get("membership").and_then(Value::as_str) == Some("join")
             && UserId::parse(key).is_ok()
@@ -717,6 +718,19 @@ mod tests {
                     .is_empty()
             );
         }
+        stock.stable_sticky_slot = None;
+        stock.unstable_sticky_slot = Some(json!({"status":"open","application":{"type":"m.call"}}));
+        stock.add(
+            &json!({"type":SLOT_EVENT_TYPE,"state_key":"m.call#ROOM"}),
+            NOW,
+        );
+        assert_eq!(stock.stable_sticky_slot, Some(Value::Null));
+        assert!(
+            normalized_modes(ROOM, true, &stock, &sticky(InteropMode::Sticky2025), NOW)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let mut state = state();
         state.add(&legacy(), NOW);
         let modes = normalized_modes(ROOM, true, &state, &sticky(InteropMode::Current), NOW)
