@@ -716,7 +716,6 @@ impl OutageSession {
                             .as_ref()
                             .ok_or(())?
                             .push_video(frame(sequence, level))
-                            .await
                             .map_err(|_| ())?;
                     }
                 }
@@ -907,7 +906,7 @@ impl OutageSession {
         if let Some((client, handle)) = self.barrier_handler.take() {
             client.remove_event_handler(handle);
         }
-        require(received == sent.event_id)?;
+        require(received == sent.response.event_id)?;
         Ok(received)
     }
 
