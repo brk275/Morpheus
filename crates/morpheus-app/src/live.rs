@@ -7179,17 +7179,43 @@ mod stale_observer_tests {
         match manager.logout_account(id).await {
             Ok(_) => {}
             Err(MatrixCoreError::AccountRemovalPending) => {
-                let removal = tokio::time::timeout(
+                eprintln!("MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage=logout_pending");
+                let observed = tokio::time::timeout(
                     Duration::from_secs(30),
                     manager.finish_pending_account_removal(id),
                 )
-                .await
-                .map_err(|_| MatrixCoreError::AccountRemovalPending)??;
-                if removal.account_id != id
-                    || !removal.complete
-                    || !removal.credentials_removed
-                    || !removal.store_removed
-                {
+                .await;
+                let removal = match observed {
+                    Ok(Ok(removal)) => removal,
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage=existing_observation_error"
+                        );
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage=existing_observation_timeout"
+                        );
+                        return Err(MatrixCoreError::AccountRemovalPending);
+                    }
+                };
+                eprintln!(
+                    "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage=existing_finished complete={} credentials={} store={}",
+                    u8::from(removal.complete),
+                    u8::from(removal.credentials_removed),
+                    u8::from(removal.store_removed),
+                );
+                if removal.account_id != id {
+                    eprintln!(
+                        "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage=wrong_account complete={} credentials={} store={}",
+                        u8::from(removal.complete),
+                        u8::from(removal.credentials_removed),
+                        u8::from(removal.store_removed),
+                    );
+                    return Err(MatrixCoreError::AccountRemovalPending);
+                }
+                if !removal.complete || !removal.credentials_removed || !removal.store_removed {
                     return Err(MatrixCoreError::AccountRemovalPending);
                 }
             }
@@ -7207,6 +7233,7 @@ mod stale_observer_tests {
                 .iter()
                 .any(|pending| pending == id)
         {
+            eprintln!("MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage=registry_remaining");
             return Err(MatrixCoreError::AccountRemovalPending);
         }
         Ok(())
