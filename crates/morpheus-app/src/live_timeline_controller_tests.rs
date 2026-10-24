@@ -508,6 +508,7 @@ impl Scenario {
             "Signing in another account must end the lease"
         );
         check!(old_lease_revoked);
+        stage!(revocation_feeds);
         self.wait_until_stopped().await;
         settle(&self.ui).await;
         assert!(
@@ -1610,6 +1611,7 @@ impl Scenario {
             let room = self.room.clone();
             async move { live.refresh_members_for(account, room, weak, true).await }
         };
+        stage!(revocation_settle);
         settle(&self.ui).await;
         assert!(
             !self.ui.get_member_loading(),
@@ -1618,15 +1620,18 @@ impl Scenario {
         let (members, error) = (self.ui.get_members(), self.ui.get_member_error());
         let held = self.live.pauses.install("members.before_claim");
         let mut stale = OwnedTask::spawn(&self.runtime, load(self.account.clone()));
+        stage!(revocation_member_pause);
         tokio::time::timeout(Duration::from_secs(60), held.entered())
             .await
             .expect("The old account's load must reach its claim");
+        stage!(revocation_login);
         let other_id = self.switch_away(other).await;
         assert_eq!(
             self.live.selected_room.lock().await.as_deref(),
             Some(self.room.as_str()),
             "The same room ID is still the selected one"
         );
+        stage!(revocation_members);
         on_runtime(&self.runtime, load(other_id.clone())).await;
         let claimed = self.live.member_epoch.load(Ordering::Acquire);
         let current = Some((other_id.clone(), self.room.clone(), claimed));
@@ -1636,6 +1641,7 @@ impl Scenario {
             "The other account's own load must claim"
         );
         held.proceed();
+        stage!(revocation_join);
         stale.join().await;
         settle(&self.ui).await;
         assert_eq!(

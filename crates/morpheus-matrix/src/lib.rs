@@ -728,7 +728,6 @@ struct RecoveryGate {
     /// requests cannot be matched to saved records, so their queues stay
     /// paused until the user discards the unreadable data.
     blocked: HashSet<String>,
-    scan: Option<JoinHandle<()>>,
 }
 
 impl RecoveryGate {
@@ -1185,6 +1184,9 @@ struct State {
     pending_sso: HashMap<String, PendingSso>,
     sync_task: Option<SyncTask>,
     queue_recovery_task: Option<JoinHandle<()>>,
+    /// The selection-time scan never owns or removes its own join handle.
+    /// Kept outside its coverage gate so stop can abort before waiting on it.
+    recovery_scan_task: Option<JoinHandle<()>>,
     removal_owner: Option<account_access::RemovalOwner>,
 }
 
@@ -1273,6 +1275,7 @@ impl AccountManager {
                 pending_sso: HashMap::new(),
                 sync_task: None,
                 queue_recovery_task: None,
+                recovery_scan_task: None,
                 removal_owner: None,
             }),
             active_tx,
@@ -3294,15 +3297,9 @@ impl AccountManager {
         // before any acknowledgement can be emitted, rooms whose rows could
         // not be read stay disabled, and an absent SDK request is reported as
         // unknown, never as sent. Stale grants from an earlier selection die.
+        stop_recovery_scan(&mut state.recovery_scan_task).await;
         {
             let mut gate = loaded.recovery_gate.lock().await;
-            if let Some(previous) = gate.scan.as_mut() {
-                previous.abort();
-                if let Err(error) = previous.await {
-                    account_access::retain_join_panic(error);
-                }
-            }
-            gate.scan.take();
             gate.epoch = gate.epoch.wrapping_add(1);
             gate.complete = false;
             gate.scanned.clear();
@@ -3313,7 +3310,7 @@ impl AccountManager {
             }
             let epoch = gate.epoch;
             let scan_loaded = loaded.clone();
-            gate.scan = Some(tokio::spawn(async move {
+            state.recovery_scan_task = Some(tokio::spawn(async move {
                 recover_pending_sends(scan_loaded, epoch).await;
             }));
         }
@@ -4311,7 +4308,6 @@ async fn recover_pending_sends(loaded: Arc<LoadedAccount>, epoch: u64) {
     gate.scanned = scanned;
     gate.blocked = blocked;
     gate.complete = true;
-    gate.scan = None;
     for room_id in persisted {
         if !gate.covers(room_id.as_str()) || gate.blocked.contains(room_id.as_str()) {
             continue;
@@ -4582,28 +4578,33 @@ fn start_event_cache(client: &Client) -> Result<()> {
         .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
 }
 
+/// Stop and observe this exact scan without locking the coverage it may hold.
+/// Cancellation retains the original handle in State; replacement happens only
+/// after its actual join (including task destructors), never from a ready flag.
+async fn stop_recovery_scan(scan: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = scan.as_mut() {
+        task.abort();
+        if let Err(error) = task.await {
+            account_access::retain_join_panic(error);
+        }
+    }
+    scan.take();
+}
+
 async fn stop_sync(state: &mut State) {
     // Publish stop intent synchronously, before any recovery/queue await. A
     // cancelled pause cannot make a stopping owner pass the active shortcut.
     if let Some(sync) = state.sync_task.as_mut() {
         sync.request_stop();
     }
+    // Discovery must not enable any queue after this pause. Its owner is
+    // independent of the coverage gate, which the scan can hold across reads.
+    stop_recovery_scan(&mut state.recovery_scan_task).await;
     if let Some(loaded) = state
         .active_account_id
         .as_ref()
         .and_then(|id| state.loaded.get(id))
     {
-        // Discovery must not enable the queue after this pause.
-        {
-            let mut gate = loaded.recovery_gate.lock().await;
-            if let Some(scan) = gate.scan.as_mut() {
-                scan.abort();
-                if let Err(error) = scan.await {
-                    account_access::retain_join_panic(error);
-                }
-            }
-            gate.scan.take();
-        }
         // The SDK lets an already in-flight request finish, then holds all
         // later queued requests. This is the closest safe pause boundary.
         loaded.client.send_queue().set_enabled(false).await;
@@ -5106,6 +5107,90 @@ mod tests {
             assert!(pending && requested_once && actual_request && released);
             assert_eq!(retained, Some(original));
             assert!(slot.is_none());
+        });
+    }
+
+    #[test]
+    fn discovery_stop_retains_the_owner_while_its_coverage_gate_is_held() {
+        use futures_util::FutureExt;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let gate = Arc::new(Mutex::new(RecoveryGate::default()));
+            let worker_gate = gate.clone();
+            let (entered, started) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _coverage = worker_gate.lock().await;
+                let _ = entered.send(());
+                std::future::pending::<()>().await;
+            });
+            let original = task.id();
+            let mut scan = Some(task);
+            let entered = started.await.is_ok();
+            let mut first = Box::pin(stop_recovery_scan(&mut scan));
+            let pending = first.as_mut().now_or_never().is_none();
+            drop(first);
+            let retained = scan.as_ref().map(JoinHandle::id);
+            let held_before_join = gate.try_lock().is_err();
+            // The same original task must actually release the coverage gate.
+            stop_recovery_scan(&mut scan).await;
+            let stopped = scan.is_none();
+            let released = gate.try_lock().is_ok();
+
+            // A completed scan remains owned until observed; retaining it must
+            // not prevent a later epoch's discovery from running and joining.
+            let next_gate = gate.clone();
+            let (finished, done) = oneshot::channel();
+            scan = Some(tokio::spawn(async move {
+                next_gate.lock().await.epoch += 1;
+                let _ = finished.send(());
+            }));
+            let replacement = scan.as_ref().map(JoinHandle::id);
+            let finished = done.await.is_ok();
+            let completed_retained = scan.as_ref().map(JoinHandle::id);
+            stop_recovery_scan(&mut scan).await;
+            let next_epoch = gate.lock().await.epoch;
+
+            // Every authentic worker is joined before any assertion can unwind.
+            assert!(entered && pending && held_before_join && stopped && released);
+            assert_eq!(retained, Some(original));
+            assert!(finished && replacement.is_some());
+            assert_eq!(completed_retained, replacement);
+            assert_eq!(next_epoch, 1);
+            assert!(scan.is_none());
+        });
+    }
+
+    #[test]
+    fn discovery_stop_observes_a_panicked_owner_before_clearing_it() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (unwound, dropped) = oneshot::channel();
+            struct OnDrop(Option<oneshot::Sender<()>>);
+            impl Drop for OnDrop {
+                fn drop(&mut self) {
+                    if let Some(unwound) = self.0.take() {
+                        let _ = unwound.send(());
+                    }
+                }
+            }
+            let task = tokio::spawn(async move {
+                let _drop = OnDrop(Some(unwound));
+                panic!("synthetic recovery discovery failure");
+            });
+            let original = task.id();
+            let mut scan = Some(task);
+            let actual_drop = dropped.await.is_ok();
+            let retained = scan.as_ref().map(JoinHandle::id);
+            stop_recovery_scan(&mut scan).await;
+            assert!(actual_drop);
+            assert_eq!(retained, Some(original));
+            assert!(scan.is_none());
         });
     }
 

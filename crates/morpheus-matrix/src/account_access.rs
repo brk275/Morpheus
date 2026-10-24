@@ -652,6 +652,13 @@ impl AccountManager {
         state.registry = next;
         if state.active_account_id.as_deref() == Some(id) {
             self.selections.replace(None);
+            // Direct local removal bypasses stop_sync. Publish the same stop
+            // intent before awaiting discovery, and keep its original owner
+            // until the actual join before queues/stores can be retired.
+            if let Some(sync) = state.sync_task.as_mut() {
+                sync.request_stop();
+            }
+            stop_recovery_scan(&mut state.recovery_scan_task).await;
             if let Some(loaded) = state.loaded.get(id) {
                 loaded.client.send_queue().set_enabled(false).await;
             }
@@ -829,6 +836,15 @@ mod tests {
     use keyring::credential::CredentialApi;
     use std::future::Future;
     use std::sync::{Mutex as StdMutex, OnceLock};
+
+    // Exercise the exact fixture adapter against this module's real removal
+    // owners, including cancellation, drain-only and failed-erasure receipts.
+    mod fixture_removal {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/account_removal.rs"
+        ));
+    }
 
     type MockEntries = HashMap<(String, String), Arc<keyring::mock::MockCredential>>;
     fn entries() -> &'static StdMutex<MockEntries> {
@@ -1675,6 +1691,90 @@ mod tests {
     }
 
     #[test]
+    fn draft_fixture_observes_the_original_erasure_after_cancel_without_retrying_logout() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let saved = account();
+            let other = account();
+            let path = directory.0.join("accounts").join(&saved.id);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("keep"), b"owned draft cleanup fixture").unwrap();
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts = vec![saved.clone(), other.clone()];
+                save_registry(&directory.0, &state.registry).unwrap();
+            }
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            let (entered, waiting) = oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let credential = controlled_removal_credential(&saved.id, move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = entered.send(());
+                let _ = held.recv();
+            });
+            // Deliberately not a stored session: remote logout cannot use it.
+            // The actual credential deletion is still the production worker.
+            credential
+                .set_password("owned draft cleanup fixture")
+                .unwrap();
+            let observations = async {
+                let logout =
+                    tokio::time::timeout(Duration::from_secs(5), manager.logout_account(&saved.id))
+                        .await
+                        .map_err(|_| "logout did not return its bounded result")?;
+                let was_pending = matches!(&logout, Err(MatrixCoreError::AccountRemovalPending));
+                tokio::time::timeout(Duration::from_secs(2), waiting)
+                    .await
+                    .map_err(|_| "native deletion did not enter")?
+                    .map_err(|_| "native deletion observation closed")?;
+                let mut completion = Box::pin(fixture_removal::finish_logout(
+                    &manager, &saved.id, &path, logout,
+                ));
+                let was_waiting = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(completion.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                drop(completion);
+                let original_owner =
+                    manager
+                        .state
+                        .lock()
+                        .await
+                        .removal_owner
+                        .as_ref()
+                        .map(|owner| match &owner.work {
+                            RemovalWork::Deleting(task) => Some(task.id()),
+                            _ => None,
+                        });
+                Ok::<_, &'static str>((was_pending, was_waiting, original_owner.flatten()))
+            }
+            .await;
+            // Release and really join before any observation can assert/panic.
+            let released = release.send(()).is_ok();
+            let completion = fixture_removal::finish_logout(
+                &manager,
+                &saved.id,
+                &path,
+                Err(MatrixCoreError::AccountRemovalPending),
+            )
+            .await;
+            manager.stop().await;
+            let accounts = manager.accounts().await;
+            let pending = manager.app_password_status().await.pending_removals;
+            let gone =
+                !path.exists() && matches!(credential.get_secret(), Err(keyring::Error::NoEntry));
+            let (was_pending, was_waiting, original_owner) = observations.unwrap();
+            assert!(was_pending && was_waiting && original_owner.is_some() && released);
+            completion.expect("the same actual erasure must finish");
+            assert!(gone && pending.is_empty());
+            assert_eq!(accounts, [other]);
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no deletion retry");
+        });
+    }
+
+    #[test]
     fn pending_erasure_retains_the_same_worker_through_cancel_retry_and_stop() {
         runtime().block_on(async {
             let directory = TestDirectory::new();
@@ -1864,6 +1964,13 @@ mod tests {
                 panic!("owned token drain did not join");
             }
             let completion = completion.unwrap();
+            let fixture_completion = fixture_removal::finish_logout(
+                &manager,
+                &saved.id,
+                &path,
+                Err(MatrixCoreError::AccountRemovalPending),
+            )
+            .await;
             let credential_preserved = credential.get_secret().is_ok();
             let store_preserved = path.join("keep").is_file();
             let no_delete = calls.load(Ordering::SeqCst) == 0;
@@ -1891,6 +1998,7 @@ mod tests {
                     && !completion.store_removed
             );
             assert!(credential_preserved && store_preserved && no_delete && token_joined);
+            assert_eq!(fixture_completion, Err("account erasure incomplete"));
             assert!(
                 unrelated
                     .expect("unrelated removal after an actual drain failed")
@@ -2031,6 +2139,13 @@ mod tests {
             credential.set_password("owned failure fixture").unwrap();
             let failed = manager.remove_account(&saved.id).await;
             let completion = manager.finish_pending_account_removal(&saved.id).await;
+            let fixture_completion = fixture_removal::finish_logout(
+                &manager,
+                &saved.id,
+                &path,
+                Err(MatrixCoreError::AccountRemovalPending),
+            )
+            .await;
             let blocked = manager
                 .app_password_status()
                 .await
@@ -2048,6 +2163,10 @@ mod tests {
                 Err(MatrixCoreError::AccountRemovalPending)
             ));
             assert!(blocked && preserved);
+            assert_eq!(
+                fixture_completion,
+                Err("account removal observation failed")
+            );
             assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
             assert!(
                 explicit
@@ -2374,6 +2493,121 @@ mod tests {
                 Err(MatrixCoreError::AccountRemovalPending)
             ));
             assert_eq!(manager.accounts().await, [saved]);
+        });
+    }
+
+    #[test]
+    fn direct_removal_retains_discovery_until_its_actual_join() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let saved = account();
+            let other = account();
+            let path = directory.0.join("accounts").join(&saved.id);
+            let other_path = directory.0.join("accounts").join(&other.id);
+            fs::create_dir(&path).unwrap();
+            fs::create_dir(&other_path).unwrap();
+            fs::write(path.join("keep"), b"discovery removal fixture").unwrap();
+            fs::write(other_path.join("keep"), b"other account fixture").unwrap();
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts = vec![saved.clone(), other.clone()];
+                state.registry.active_account_id = Some(saved.id.clone());
+                state.active_account_id = Some(saved.id.clone());
+                save_registry(&directory.0, &state.registry).unwrap();
+            }
+            manager.publish_active_account(Some(saved.clone()));
+            let selection = manager.account_selection(&saved.id).unwrap();
+            let gate = Arc::new(Mutex::new(RecoveryGate::default()));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let after_join = Arc::new(AtomicBool::new(false));
+            let counted = calls.clone();
+            let observed_drop = dropped.clone();
+            let observed_gate = gate.clone();
+            let observed_order = after_join.clone();
+            let credential = controlled_removal_credential(&saved.id, move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                observed_order.store(
+                    observed_drop.load(Ordering::Acquire) && observed_gate.try_lock().is_ok(),
+                    Ordering::Release,
+                );
+            });
+            credential
+                .set_password("discovery removal fixture")
+                .unwrap();
+            struct ScanDrop(Arc<AtomicBool>);
+            impl Drop for ScanDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let worker_gate = gate.clone();
+            let worker_drop = dropped.clone();
+            let (entered, started) = oneshot::channel();
+            let scan = tokio::spawn(async move {
+                let _coverage = worker_gate.lock().await;
+                let _drop = ScanDrop(worker_drop);
+                let _ = entered.send(());
+                std::future::pending::<()>().await;
+            });
+            let original = scan.id();
+            let entered = started.await.is_ok();
+            let (shutdown, stopped) = oneshot::channel();
+            {
+                let mut state = manager.state.lock().await;
+                state.recovery_scan_task = Some(scan);
+                state.sync_task = Some(SyncTask {
+                    shutdown: Some(shutdown),
+                    task: tokio::spawn(async move {
+                        let _ = stopped.await;
+                    }),
+                });
+            }
+            let mut first = Box::pin(manager.remove_account(&saved.id));
+            let was_pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(first.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            drop(first);
+            let (retained, stop_requested) = {
+                let state = manager.state.lock().await;
+                (
+                    state.recovery_scan_task.as_ref().map(JoinHandle::id),
+                    state
+                        .sync_task
+                        .as_ref()
+                        .is_some_and(|task| task.shutdown.is_none()),
+                )
+            };
+            let held_before_join = gate.try_lock().is_err();
+            // Resume the explicit local removal. Only the original discovery
+            // is joined; completion observation never retries native erasure.
+            let completion = match manager.remove_account(&saved.id).await {
+                Ok(removal) if removal.complete => Ok(removal),
+                Ok(_) => manager.finish_pending_account_removal(&saved.id).await,
+                Err(error) => Err(error),
+            };
+            manager.stop().await;
+            let scan_retired = manager.state.lock().await.recovery_scan_task.is_none();
+            let accounts = manager.accounts().await;
+            let pending = manager.app_password_status().await.pending_removals;
+            let store_gone = matches!(path.try_exists(), Ok(false));
+            let credential_gone = matches!(credential.get_secret(), Err(keyring::Error::NoEntry));
+            let other_store = fs::read(other_path.join("keep"));
+            // Observe all original async/native handles before assertions.
+            assert!(entered && was_pending && stop_requested && held_before_join);
+            assert_eq!(retained, Some(original));
+            assert!(!selection.is_current());
+            let completion = completion.expect("the original local removal must complete");
+            assert!(
+                completion.complete && completion.credentials_removed && completion.store_removed
+            );
+            assert!(scan_retired && after_join.load(Ordering::Acquire));
+            assert!(store_gone && credential_gone && pending.is_empty());
+            assert_eq!(accounts, [other]);
+            assert_eq!(other_store.unwrap(), b"other account fixture");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "one native erasure");
         });
     }
 

@@ -385,7 +385,9 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             "CHECK thread_root_excluded=true",
             "STAGE message_copy_callbacks", "CHECK message_copy_callbacks=true",
             "CHECK feeds_running=true",
-            "STAGE revocation", "CHECK old_lease_revoked=true",
+            "STAGE revocation", "STAGE revocation_settle", "STAGE revocation_member_pause",
+            "STAGE revocation_login", "STAGE revocation_members", "STAGE revocation_join",
+            "CHECK old_lease_revoked=true", "STAGE revocation_feeds",
             "CHECK idle_feeds_stopped=true", "STAGE renewal",
             "CHECK message_copy_account_aba=true",
             "CHECK late_events_in_core=true", "CHECK stale_room_rejected=true",
@@ -1309,7 +1311,7 @@ class DraftStageTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 self.assertEqual(acceptance_module.drafts_diagnostics(
                     f"MORPHEUS_DRAFTS_STAGE {stage}\n"),
-                    {"test_entered": stage == "fixture", "stage": stage})
+                    {"test_entered": stage in ("fixture", "recovery_fixture"), "stage": stage})
         for payload in ("private_token", "https://private.example", "/private/path",
                         "complete private-password", "complete\rprivate-password", "x" * 1000):
             with self.subTest(payload=payload):
@@ -1318,6 +1320,60 @@ class DraftStageTests(unittest.TestCase):
                     "MORPHEUS_DRAFTS_STAGE tracked_enqueue\n"
                     f"MORPHEUS_DRAFTS_STAGE {payload}\n"),
                     {"test_entered": True, "stage": "tracked_enqueue"})
+
+    def test_logout_observations_stop_at_first_panic_and_cannot_claim_completion(self):
+        stage = "MORPHEUS_DRAFTS_STAGE recovery_fixture\nMORPHEUS_DRAFTS_STAGE recovery_coverage\n"
+        marker = "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage="
+        panic = ("thread 'pending_sends_are_recovered_from_real_sdk_requests' panicked at "
+                 "crates/morpheus-matrix/tests/drafts_local.rs:2740:14:\nPRIVATE_ERROR\n")
+        observed = (marker + "logout_pending\n"
+                    + marker + "existing_finished complete=0 credentials=1 store=0\n")
+        output = (marker + "registry_remaining\n" + stage + observed + panic
+                  + "MORPHEUS_DRAFTS_STAGE recovery_complete\n" + marker + "store_remaining\n")
+        result = acceptance_module.drafts_diagnostics(output)
+        self.assertEqual(result, {
+            "test_entered": True, "stage": "recovery_coverage",
+            "account_removal_observations": [
+                {"stage": "logout_pending"},
+                {"stage": "existing_finished", "complete": False, "credentials": True, "store": False},
+            ],
+        })
+        self.assertNotIn("PRIVATE", json.dumps(result))
+        self.assertFalse(acceptance_module.drafts_completed(stage + observed))
+        for name in acceptance_module.ACCOUNT_REMOVAL_STAGES:
+            with self.subTest(stage=name):
+                result = acceptance_module.drafts_diagnostics(stage + marker + name + "\n")
+                self.assertEqual(result["account_removal_observations"], [{"stage": name}])
+        for invalid in (
+                "unknown", "existing_finished complete=0", "existing_finished complete=0 credentials=1",
+                "existing_finished complete=0 credentials=1 store=2",
+                "existing_finished complete=0 credentials=1 store=0 PRIVATE_VALUE",
+                "x" * (acceptance_module.ACCOUNT_REMOVAL_MAX_LINE_LENGTH + 1)):
+            with self.subTest(invalid=invalid):
+                self.assertNotIn("account_removal_observations", acceptance_module.drafts_diagnostics(
+                    stage + marker + invalid + "\n"))
+        excess = (marker + "logout_pending\n") * (acceptance_module.ACCOUNT_REMOVAL_MAX_LINES + 1)
+        self.assertNotIn("account_removal_observations", acceptance_module.drafts_diagnostics(stage + excess))
+
+    def test_logout_observations_use_the_existing_scan_gate_and_never_publish_private_errors(self):
+        output = ("MORPHEUS_DRAFTS_STAGE recovery_fixture\n"
+                  "MORPHEUS_DRAFTS_STAGE recovery_coverage\n"
+                  "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage=logout_error\nPRIVATE_ERROR\n")
+        for scanner_code in (0, 1):
+            with self.subTest(scanner_code=scanner_code), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                with self.child(runner, output, timeout=True, scanner_code=scanner_code) as (visible, _):
+                    with self.assertRaisesRegex(RuntimeError, "deadline" if scanner_code == 0 else "credential scanning"):
+                        runner.run("drafts_local", ["mock-test"], test=True, seconds=1)
+                records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                if scanner_code == 0:
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["drafts_diagnostics"]["account_removal_observations"],
+                                     [{"stage": "logout_error"}])
+                else:
+                    self.assertEqual(records, [])
+                self.assertNotIn("PRIVATE", visible.getvalue())
+                self.assertEqual(runner.results, [])
 
     def test_source_emits_all_unique_stages_from_entry_through_cleanup(self):
         source = (Path(__file__).resolve().parents[2]

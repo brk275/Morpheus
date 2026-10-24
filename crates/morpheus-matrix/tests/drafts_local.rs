@@ -3,6 +3,8 @@
 //! printed by this test.
 #![recursion_limit = "512"]
 
+#[path = "support/account_removal.rs"]
+mod account_removal;
 #[path = "support/opened_room.rs"]
 mod opened_room;
 
@@ -29,7 +31,8 @@ use matrix_sdk::{
 };
 use morpheus_matrix::{
     AccountManager, AccountSelection, ComposeSendTarget, ComposeText, DraftEnvelope, Generation,
-    MatrixCoreError, MentionTarget, QuarantineReason, QueuedSendOutcome, RowRevision, TextFormat,
+    LogoutResult, MatrixCoreError, MentionTarget, QuarantineReason, QueuedSendOutcome, RowRevision,
+    TextFormat,
 };
 use serde::Deserialize;
 use tokio::time::{Instant, sleep};
@@ -787,10 +790,14 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             .expect("Cannot reload deleted room row");
         assert!(gone.text.body.is_empty() && gone.envelope.is_empty());
         phase!(logout_alice);
-        manager
-            .logout_account(&a_account.id)
-            .await
-            .expect("Cannot remove first account");
+        account_removal::finish_logout(
+            &manager,
+            &a_account.id,
+            &root.join("accounts").join(&a_account.id),
+            manager.logout_account(&a_account.id).await,
+        )
+        .await
+        .expect("Cannot remove first account");
         assert!(!root.join("accounts").join(&a_account.id).exists());
         phase!(switch_carol);
         manager
@@ -813,10 +820,14 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             b_thread_body
         );
         phase!(logout_carol);
-        manager
-            .logout_account(&b_account.id)
-            .await
-            .expect("Cannot remove second account");
+        account_removal::finish_logout(
+            &manager,
+            &b_account.id,
+            &root.join("accounts").join(&b_account.id),
+            manager.logout_account(&b_account.id).await,
+        )
+        .await
+        .expect("Cannot remove second account");
         phase!(stop_final);
         manager.stop().await;
     });
@@ -2734,26 +2745,38 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         drop(sdk_new_room);
 
         drop(client);
-        manager
-            .logout_account(&a_account.id)
-            .await
-            .expect("Cannot remove first account");
+        account_removal::finish_logout(
+            &manager,
+            &a_account.id,
+            &root.join("accounts").join(&a_account.id),
+            manager.logout_account(&a_account.id).await,
+        )
+        .await
+        .expect("Cannot remove first account");
         manager
             .switch_to(&b_account.id)
             .await
             .expect("Cannot switch to second account");
-        manager
-            .logout_account(&b_account.id)
-            .await
-            .expect("Cannot remove second account");
+        account_removal::finish_logout(
+            &manager,
+            &b_account.id,
+            &root.join("accounts").join(&b_account.id),
+            manager.logout_account(&b_account.id).await,
+        )
+        .await
+        .expect("Cannot remove second account");
         keeper
             .leave_room(&new_room)
             .await
             .expect("Cannot leave the fixture keeper room");
-        keeper
-            .logout_account(&keeper_account.id)
-            .await
-            .expect("Cannot remove the fixture keeper account");
+        account_removal::finish_logout(
+            &keeper,
+            &keeper_account.id,
+            &root.join("room-keeper").join("accounts").join(&keeper_account.id),
+            keeper.logout_account(&keeper_account.id).await,
+        )
+        .await
+        .expect("Cannot remove the fixture keeper account");
         keeper.stop().await;
         drop(keeper);
         phase!(recovery_stop);

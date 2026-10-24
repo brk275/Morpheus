@@ -126,7 +126,9 @@ APP_TIMELINE_STAGES = frozenset((
     "setup_dispatch", "setup_login", "setup_rooms", "setup_ready",
     "setup", "activation", "room_open", "room_delivery", "thread_delivery",
     "message_copy_callbacks",
-    "revocation", "renewal", "reopen", "queued_revocation", "queued_drain",
+    "revocation", "revocation_settle", "revocation_member_pause", "revocation_login",
+    "revocation_members", "revocation_join", "revocation_feeds",
+    "renewal", "reopen", "queued_revocation", "queued_drain",
     "queued_reopen", "link_continuation", "member_publication", "cleanup", "complete",
     "cleanup_logout_primary", "cleanup_logout_other", "cleanup_manager_stop",
     "cleanup_drop_live", "cleanup_drop_ui", "cleanup_wait_profile",
@@ -177,6 +179,7 @@ APP_RECOVERY_CHECK = re.compile(r"^MORPHEUS_APP_RECOVERY_CHECK ([a-z_]{1,48})=(t
 ACCOUNT_REMOVAL_STAGES = frozenset((
     "logout_pending", "existing_observation_timeout", "existing_observation_error",
     "existing_finished", "wrong_account", "registry_remaining",
+    "logout_error", "store_remaining", "store_observation_error",
 ))
 ACCOUNT_REMOVAL_LINE = re.compile(r"^MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION[^\n]*$", re.MULTILINE)
 ACCOUNT_REMOVAL_OBSERVATION = re.compile(
@@ -547,11 +550,18 @@ def live_diagnostics(output: str) -> dict:
 def drafts_diagnostics(output: str) -> dict:
     """Publish only recognized source tokens, never captured draft/server data."""
     result = {"test_entered": False}
-    for match in DRAFTS_STAGE.finditer(output):
+    panic = NATIVE_PANIC.search(output)
+    end = panic.start() if panic else len(output)
+    stage_start = 0
+    for match in DRAFTS_STAGE.finditer(output, 0, end):
         stage = match[1]
         if stage in DRAFTS_STAGES:
-            result["test_entered"] |= stage == "fixture"
+            result["test_entered"] |= stage in ("fixture", "recovery_fixture")
             result["stage"] = stage
+            stage_start = match.end()
+    observations = account_removal_observations(output, stage_start, end)
+    if observations:
+        result["account_removal_observations"] = observations
     return result
 
 
