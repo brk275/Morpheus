@@ -560,6 +560,11 @@
       "fingerprint": "09c492a2b61c5231f63b6511d0bdd38b2b5683a3:vendor/matrix-sdk-crypto/tests/fixtures/keys_claim.json:generic-api-key:1",
       "blob_sha256": "d3e6e54bc78a1022feb82196f4d54a553582bcca2e55e79508ab65fe2afde34b",
       "provenance": "Exact public signed-Curve25519 localhost benchmark one_time_keys fixture from pinned matrix-org/matrix-rust-sdk c6ad52ecc09eaa36601f55effb0a48a533eb87dd: https://github.com/matrix-org/matrix-rust-sdk/blob/c6ad52ecc09eaa36601f55effb0a48a533eb87dd/benchmarks/benches/crypto_bench/keys_claim.json. Matched lines independently verified against that public source; entire vendored blob is bound to this fingerprint."
+    },
+    {
+      "fingerprint": "7fe071d9c45315d4c82cd9ebcf0071a114c83d6e:vendor/matrix-rtc-call-sdk/src/attach/tests.rs:generic-api-key:197",
+      "blob_sha256": "afd7f29596790fd0fcf2250cc4044b6b0d3f64325c6083e6c1992181df9019e9",
+      "provenance": "Public MatrixRTC mock media-key fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-call-sdk/src/attach/tests.rs; cfg(test) MockBackend, FakeTransport and RecordingRing use fixed synthetic data without network credentials."
     }
   ]
 }
