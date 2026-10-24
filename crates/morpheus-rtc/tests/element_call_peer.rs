@@ -327,7 +327,7 @@ async fn group_and_screen(
     bob: &TestAccount,
     carol: &TestAccount,
     room: &str,
-    microphone: &NativeTone,
+    original_microphone: &NativeTone,
 ) {
     let (microphone_sid, _) =
         native_sender(rtc, room, livekit::track::TrackSource::Microphone, None)
@@ -453,13 +453,13 @@ async fn group_and_screen(
     .await
     .expect("Late-peer decoded media timed out");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_late_join_media=true");
-    let microphone = late
+    let late_microphone = late
         .publish_microphone(room, 48_000, 1, false)
         .await
         .expect("Late microphone failed");
-    assert_eq!(microphone.account_user_id(), carol.user_id);
-    write_owner(root, "group-audio-owner.json", &microphone, None);
-    let tone = NativeTone::with_frequency(microphone, 1700.0);
+    assert_eq!(late_microphone.account_user_id(), carol.user_id);
+    write_owner(root, "group-audio-owner.json", &late_microphone, None);
+    let tone = NativeTone::with_frequency(late_microphone, 1700.0);
     let screen = rtc
         .publish_screen(room, 640, 360, false)
         .await
@@ -545,7 +545,7 @@ async fn group_and_screen(
     .await
     .expect("Actual same media senders did not adopt the departure key");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_key_rotation=true");
-    microphone.changed.store(true, Ordering::Release);
+    original_microphone.changed.store(true, Ordering::Release);
     screen.changed.store(true, Ordering::Release);
     write_marker(root.join("screen-changed"), b"changed\n");
     wait_for_marker(&root.join("screen-change-observed")).await;
