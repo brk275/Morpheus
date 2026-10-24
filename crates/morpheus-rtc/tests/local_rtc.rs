@@ -4,7 +4,13 @@
 
 #![cfg(feature = "native-rtc")]
 
-use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use livekit::SimulateScenario;
@@ -92,7 +98,7 @@ async fn original_sticky_slot_without_lower(
             _ => return Err(()),
         }
     }
-    // The pinned SDK translates its stable slot write to this unstable type.
+    // This fresh canonical case must have written only the unstable upper slot.
     let response = client
         .send(get_state_event_for_key::v3::Request::new(
             room_id.to_owned(),
@@ -126,6 +132,197 @@ async fn original_sticky_slot_without_lower(
     {
         return Err(());
     }
+    Ok(())
+}
+
+// Actual state-event identity plus content; omit changing age/unsigned metadata.
+// Used only after the original canonical-slot and encrypted-media acceptance.
+type SlotSnapshot = BTreeMap<(String, String), (String, serde_json::Value)>;
+
+async fn slot_snapshot(
+    client: &Client,
+    room_id: &matrix_sdk::ruma::RoomId,
+    admit: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<SlotSnapshot, ()> {
+    use matrix_sdk::ruma::{EventId, api::client::state::get_state_events};
+    let room = client.get_room(room_id).ok_or(())?;
+    if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+        return Err(());
+    }
+    let response = client
+        .send(get_state_events::v3::Request::new(room_id.to_owned()))
+        .with_request_config(
+            RequestConfig::new()
+                .retry_limit(0)
+                .timeout(Duration::from_secs(5))
+                .max_response_bytes(8 * 1024 * 1024),
+        )
+        .await
+        .map_err(|_| ())?;
+    if !admit() || room.state() != matrix_sdk::RoomState::Joined || response.room_state.len() > 8192
+    {
+        return Err(());
+    }
+    let mut slots = BTreeMap::new();
+    for raw in response.room_state {
+        let Some(kind) = raw.get_field::<String>("type").map_err(|_| ())? else {
+            return Err(());
+        };
+        if !matches!(kind.as_str(), "m.rtc.slot" | "org.matrix.msc4143.rtc.slot") {
+            continue;
+        }
+        if raw.json().get().len() > 64 * 1024 {
+            return Err(());
+        }
+        let value: serde_json::Value = serde_json::from_str(raw.json().get()).map_err(|_| ())?;
+        if value
+            .get("room_id")
+            .is_some_and(|id| id.as_str() != Some(room_id.as_str()))
+        {
+            return Err(());
+        }
+        let key = value
+            .get("state_key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?;
+        let event = value
+            .get("event_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?;
+        if key.len() > 1024 || event.len() > 1024 || EventId::parse(event).is_err() {
+            return Err(());
+        }
+        let content = value.get("content").cloned().ok_or(())?;
+        if slots
+            .insert((kind, key.to_owned()), (event.to_owned(), content))
+            .is_some()
+        {
+            return Err(());
+        }
+    }
+    Ok(slots)
+}
+
+// Seed only the existing selected slot's stable spelling, after the independent
+// fresh canonical case. This is a fixture prerequisite, not the mutation under test.
+async fn seed_stable_slot(
+    client: &Client,
+    room_id: &matrix_sdk::ruma::RoomId,
+    slot_id: &str,
+    content: &serde_json::Value,
+    admit: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<String, ()> {
+    use matrix_sdk::ruma::{
+        api::client::state::send_state_event,
+        events::{AnyStateEventContent, StateEventType},
+        serde::Raw,
+    };
+    let room = client.get_room(room_id).ok_or(())?;
+    let raw = serde_json::value::to_raw_value(content).map_err(|_| ())?;
+    let request = send_state_event::v3::Request::new_raw(
+        room_id.to_owned(),
+        StateEventType::from("m.rtc.slot"),
+        slot_id.to_owned(),
+        Raw::<AnyStateEventContent>::from_json(raw),
+    );
+    if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+        return Err(());
+    }
+    let response = client
+        .send(request)
+        .with_request_config(
+            RequestConfig::new()
+                .retry_limit(0)
+                .timeout(Duration::from_secs(5))
+                .max_response_bytes(64 * 1024),
+        )
+        .await
+        .map_err(|_| ())?;
+    if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+        return Err(());
+    }
+    Ok(response.event_id.to_string())
+}
+
+async fn stable_slot_close_and_reopen(
+    rtc: &RtcService,
+    room_id: &str,
+    options: &CallOptions,
+    admit: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<(), ()> {
+    let room = matrix_sdk::ruma::RoomId::parse(room_id).map_err(|_| ())?;
+    let slot_id = match options.interop_mode {
+        morpheus_rtc::InteropMode::Sticky2025 => "m.call#ROOM",
+        morpheus_rtc::InteropMode::Current => options.slot_id.as_str(),
+        morpheus_rtc::InteropMode::RoomState => return Err(()),
+    };
+    let stable = ("m.rtc.slot".to_owned(), slot_id.to_owned());
+    let unstable = ("org.matrix.msc4143.rtc.slot".to_owned(), slot_id.to_owned());
+    let open = serde_json::json!({
+        "status": "open", "application": {"type": "m.call"},
+        "encryption": {"type": "m.per_member"}
+    });
+    let baseline = slot_snapshot(rtc.client(), &room, admit.as_ref()).await?;
+    if baseline.contains_key(&stable)
+        || baseline.get(&unstable).map(|value| &value.1) != Some(&open)
+    {
+        return Err(());
+    }
+    if options.interop_mode == morpheus_rtc::InteropMode::Sticky2025
+        && ["m.rtc.slot", "org.matrix.msc4143.rtc.slot"]
+            .iter()
+            .any(|kind| baseline.contains_key(&(kind.to_string(), "m.call#room".to_owned())))
+    {
+        return Err(());
+    }
+    // Every non-target slot, especially the original shadow unstable event,
+    // must preserve its exact event ID and content through all actual writes.
+    let preserved = |mut current: SlotSnapshot| {
+        current.remove(&stable);
+        current == baseline
+    };
+    let seeded_id = seed_stable_slot(rtc.client(), &room, slot_id, &open, admit.as_ref()).await?;
+    let seeded = slot_snapshot(rtc.client(), &room, admit.as_ref()).await?;
+    if seeded.get(&stable) != Some(&(seeded_id.clone(), open.clone())) || !preserved(seeded) {
+        return Err(());
+    }
+    if !admit() {
+        return Err(());
+    }
+    rtc.close_slot(room_id, slot_id).await.map_err(|_| ())?;
+    let closed = slot_snapshot(rtc.client(), &room, admit.as_ref()).await?;
+    if !closed.get(&stable).is_some_and(|(id, value)| {
+        id != &seeded_id && value == &serde_json::json!({"status": "closed"})
+    }) || !preserved(closed)
+    {
+        return Err(());
+    }
+    // An empty stable object is also authoritative closed state. Verify that
+    // it cannot be hidden by the still-open original unstable event.
+    let empty = serde_json::json!({});
+    let empty_id = seed_stable_slot(rtc.client(), &room, slot_id, &empty, admit.as_ref()).await?;
+    let emptied = slot_snapshot(rtc.client(), &room, admit.as_ref()).await?;
+    if emptied.get(&stable) != Some(&(empty_id.clone(), empty)) || !preserved(emptied) {
+        return Err(());
+    }
+    rtc.open_outgoing_slot(
+        room_id,
+        &options.slot_id,
+        true,
+        options.interop_mode,
+        Arc::clone(&admit),
+    )
+    .await
+    .map_err(|_| ())?;
+    let reopened = slot_snapshot(rtc.client(), &room, admit.as_ref()).await?;
+    if !reopened
+        .get(&stable)
+        .is_some_and(|(id, value)| id != &empty_id && value == &open)
+        || !preserved(reopened)
+    {
+        return Err(());
+    }
+    eprintln!("MORPHEUS_RTC_STABLE_SLOT_CYCLE complete=true");
     Ok(())
 }
 
@@ -798,15 +995,9 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
         .await
         .expect("Alice sign-in failed");
-    let slot_selection = if options.interop_mode == morpheus_rtc::InteropMode::Sticky2025 {
-        Some(
-            alice_manager
-                .account_selection(&alice_account.id)
-                .expect("Original Alice slot selection missing"),
-        )
-    } else {
-        None
-    };
+    let slot_selection = alice_manager
+        .account_selection(&alice_account.id)
+        .expect("Original Alice slot selection missing");
     wait_for_sticky_sync(&alice_manager).await;
     wait_for_room(&alice_manager, room_id).await;
     wait_for_room(&alice_manager, unencrypted_room_id).await;
@@ -856,17 +1047,22 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .await
         .expect("Cannot designate shared voice space");
     if options.interop_mode == morpheus_rtc::InteropMode::Sticky2025 {
-        let original_selection = slot_selection
-            .as_ref()
-            .expect("Original Sticky slot selection missing");
-        let admit = || original_selection.is_current();
+        let original_selection = slot_selection.clone();
+        let admit: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || original_selection.is_current());
         alice_rtc
-            .open_outgoing_slot(room_id, "m.call#room", true, options.interop_mode, &admit)
+            .open_outgoing_slot(
+                room_id,
+                "m.call#room",
+                true,
+                options.interop_mode,
+                Arc::clone(&admit),
+            )
             .await
             .expect("Cannot open original Sticky encrypted slot");
         let original_room =
             matrix_sdk::ruma::RoomId::parse(room_id).expect("Invalid owned fixture room");
-        original_sticky_slot_without_lower(&alice_client, &original_room, &admit)
+        original_sticky_slot_without_lower(&alice_client, &original_room, admit.as_ref())
             .await
             .expect("Original Sticky slot or no-lower proof failed");
     } else {
@@ -1208,6 +1404,17 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .await
         .expect("Bob final leave failed");
     alice_rtc.leave(room_id).await.expect("Alice leave failed");
+    // Keep the fresh canonical/media proof above independent: stable authority
+    // is introduced only after both original RTC owners have actually left.
+    let original_selection = slot_selection.clone();
+    stable_slot_close_and_reopen(
+        &alice_rtc,
+        room_id,
+        &options,
+        Arc::new(move || original_selection.is_current()),
+    )
+    .await
+    .expect("Stable slot close/empty/reopen changed authority, encryption or another slot");
     drop(bob_rtc);
     drop(alice_rtc);
     bob_manager

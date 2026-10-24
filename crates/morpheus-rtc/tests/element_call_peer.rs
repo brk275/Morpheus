@@ -852,13 +852,21 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
         InteropMode::Sticky2025 => {
             // Keep the internal id lower, but write ONLY the original stock
             // upper slot. No Current preseed may conceal the ingest boundary.
-            let admit = || slot_selection.is_current();
-            rtc.open_outgoing_slot(room_id, NATIVE_ROOM_SLOT_ID, true, interop_mode, &admit)
-                .await
-                .expect("Cannot open original Sticky encrypted slot");
+            let original_selection = slot_selection.clone();
+            let admit: Arc<dyn Fn() -> bool + Send + Sync> =
+                Arc::new(move || original_selection.is_current());
+            rtc.open_outgoing_slot(
+                room_id,
+                NATIVE_ROOM_SLOT_ID,
+                true,
+                interop_mode,
+                Arc::clone(&admit),
+            )
+            .await
+            .expect("Cannot open original Sticky encrypted slot");
             let original_room =
                 matrix_sdk::ruma::RoomId::parse(room_id).expect("Invalid owned fixture room");
-            original_sticky_slot_without_lower(rtc.client(), &original_room, &admit)
+            original_sticky_slot_without_lower(rtc.client(), &original_room, admit.as_ref())
                 .await
                 .expect("Original Sticky slot or no-lower proof failed");
             CallOptions::element_call_matrix_2_0()

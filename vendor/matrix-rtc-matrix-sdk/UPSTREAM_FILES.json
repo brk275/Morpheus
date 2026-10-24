@@ -1,0 +1,49 @@
+{
+  "repository": "https://github.com/element-hq/matrix-rust-rtc",
+  "revision": "53880ef1ef66b62df555ce71ccd1d6c85b813596",
+  "tag": "v0.5.0-rc.2",
+  "package_path": "crates/matrix-rtc-matrix-sdk",
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "mode": "100644",
+      "blob": "f75c168b896483e2f30c7c7a303d206fbcb73ae7",
+      "bytes": 2655,
+      "sha256": "4b17b507c4058b9a5be0e2175e91048baf08d3f0f6a39d195fba61f41878ada7"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "blob": "d1998f930c25889d071a3e7dc69e44adcc20c2a1",
+      "bytes": 869,
+      "sha256": "4efe969bd9c7451fa4abbf9ccde1047a809b90962719c7f16cd7ab036b5fc2ce"
+    },
+    {
+      "path": "src/lib.rs",
+      "mode": "100644",
+      "blob": "618d3e5c31a78b3ecbe98d60f6c22d7378f00629",
+      "bytes": 713,
+      "sha256": "697e6600bb67edd1eb4abda12033eaf1ddef484886645ba0199f0faeee3ec048"
+    },
+    {
+      "path": "src/sdk.rs",
+      "mode": "100644",
+      "blob": "df690c1985c6c16e5d9ae8fe690e05c8f7fad984",
+      "bytes": 41617,
+      "sha256": "c63c02e4d5e6f3236fc0395c7dbc90472285e28624b197da00bd34f802869899"
+    }
+  ],
+  "modified_upstream_files": [
+    "Cargo.toml",
+    "src/sdk.rs"
+  ],
+  "additional_runtime_files": [
+    "src/sdk/slot_write.rs"
+  ],
+  "original_manifest": "Cargo.toml.upstream",
+  "owning_workspace_manifest": "Cargo.workspace.toml.upstream",
+  "licenses": [
+    "LICENSE",
+    "LICENSE-COMMERCIAL"
+  ]
+}

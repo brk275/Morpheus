@@ -461,18 +461,20 @@ impl Session {
         self.rtc = Some(RtcService::new(alice_client.clone()));
         let rtc = self.rtc.as_mut().ok_or(())?;
         if case.mode == InteropMode::Sticky2025 {
-            let original_selection = slot_selection.as_ref().ok_or(())?;
-            let admit = || original_selection.is_current();
+            let original_selection = slot_selection.as_ref().ok_or(())?.clone();
+            let admit: Arc<dyn Fn() -> bool + Send + Sync> =
+                Arc::new(move || original_selection.is_current());
             rtc.open_outgoing_slot(
                 case.room_id.as_str(),
                 "m.call#room",
                 true,
                 case.mode,
-                &admit,
+                Arc::clone(&admit),
             )
             .await
             .map_err(|_| ())?;
-            original_sticky_slot_without_lower(&alice_client, &case.room_id, &admit).await?;
+            original_sticky_slot_without_lower(&alice_client, &case.room_id, admit.as_ref())
+                .await?;
         } else {
             rtc.open_slot(case.room_id.as_str(), "m.call#room", true)
                 .await

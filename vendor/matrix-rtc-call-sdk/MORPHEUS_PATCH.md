@@ -47,3 +47,15 @@ The original Apple-only `build.rs` still emits `-ObjC` for its declared examples
 and tests. No build-hook or native/unsafe implementation is changed. The root
 lock changes only this same-version SDK's Git source identity to the local
 patch; all 1,174 package versions/dependency references remain unchanged.
+
+## Standalone slot wire and admission
+
+Standalone open/close now use the same `DialectBackend` as joined rooms, so the
+canonical slot event type no longer depends on a nonexistent locked Ruma alias.
+The admitted open entry retains the original account/room predicate through the
+SDK backend's authority read and final state write. Existing low-level free APIs
+remain available. The same-revision adapter's
+[patch notes](../matrix-rtc-matrix-sdk/MORPHEUS_PATCH.md) bind stable-state
+precedence, fixed read failures, request limits, single-write behavior and the
+remaining stable-only stock-close/distributed-race limitations. No default,
+membership/key/transport policy or original held-event ownership is changed.

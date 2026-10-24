@@ -1,0 +1,60 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-rtc-matrix-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The matrix-rust-sdk implementation of the MatrixRTC core's MatrixBackend."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait.workspace = true
+log.workspace = true
+
+# The per-subscription tasks and their wake/retry timers; the SDK brings the
+# runtime.
+tokio = { workspace = true }
+
+# Upstream matrix-rust-sdk (rev in the workspace manifest). Keeps its default
+# features (e2e-encryption, sqlite, rustls-aws-lc-rs,
+# automatic-room-key-forwarding). See `sdk`.
+#
+# Key forwarding stays ON deliberately. Without it a freshly logged-in device
+# cannot obtain the Megolm sessions for member events sent before it existed,
+# and simply does not see those peers — the exact failure that makes an
+# in-progress Element Call invisible to a new device. Tools that want the
+# request/forward chatter out of their measurements switch it off per client at
+# runtime instead; see `matrix-rtc-call-sdk/examples/load_test.rs`.
+#
+# `experimental-send-custom-to-device` exposes
+# `Encryption::encrypt_and_send_raw_to_device`, used to distribute MSC4143 media
+# keys as Olm-encrypted to-device messages (see `sdk`). It pulls in
+# `e2e-encryption`, already on via defaults.
+#
+# `unstable-msc4354` for MSC4354 sticky events, the spec-current membership
+# carrier. Their `encryption_info().sender_device` is the only source for a
+# member event's sending device now that MSC4143 has dropped
+# `member.claimed_device_id`. See `sdk::snapshot`.
+#
+# Member events are parsed with `matrix_rtc_core::RawStickyEventContent`, never
+# ruma's typed RTC events: upstream ruma does not model the 2026 MSC4143 rewrite,
+# and the core must not depend on ruma anyway.
+matrix-sdk = { workspace = true, features = ["experimental-send-custom-to-device", "unstable-msc4354"] }
+# Only needed to name `crypto::CollectStrategy` (the key-sharing strategy passed
+# to `encrypt_and_send_raw_to_device`); matrix-sdk does not re-export it.
+# `e2e-encryption` gates the `crypto` re-export.
+matrix-sdk-base = { workspace = true, features = ["e2e-encryption"] }
+
+[dev-dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

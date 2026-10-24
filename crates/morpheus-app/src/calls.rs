@@ -1480,6 +1480,9 @@ impl CallController {
         }
         self.ensure_account(&account_id).await?;
         let slot_id = CallOptions::default().slot_id;
+        let original_selection = selection.clone();
+        let admit: Arc<dyn Fn() -> bool + Send + Sync> =
+            Arc::new(move || original_selection.is_current());
         timeout(
             JOIN_TIMEOUT,
             rtc.open_outgoing_slot(
@@ -1487,7 +1490,7 @@ impl CallController {
                 &slot_id,
                 encryption.is_encrypted(),
                 mode.options().interop_mode,
-                &|| selection.is_current(),
+                admit,
             ),
         )
         .await

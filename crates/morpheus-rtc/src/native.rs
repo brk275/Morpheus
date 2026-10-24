@@ -6,7 +6,9 @@ use std::{
     },
 };
 
-use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, Participant, close_slot, open_slot};
+use matrix_rtc_call_sdk::{
+    LiveKitCall, LiveKitCallOptions, Participant, close_slot, open_slot, open_slot_with_admission,
+};
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption, compat::MembershipFormat};
 use matrix_rtc_transport::MediaStreamKind;
 use matrix_sdk::{
@@ -281,7 +283,7 @@ impl RtcService {
         slot_id: &str,
         encrypted: bool,
         mode: InteropMode,
-        admit: &(dyn Fn() -> bool + Send + Sync),
+        admit: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<(), RtcError> {
         self.open_slot_inner(room_id, slot_id, encrypted, Some((mode, admit)))
             .await
@@ -292,7 +294,7 @@ impl RtcService {
         room_id: &str,
         slot_id: &str,
         encrypted: bool,
-        outgoing: Option<(InteropMode, &(dyn Fn() -> bool + Send + Sync))>,
+        outgoing: Option<(InteropMode, Arc<dyn Fn() -> bool + Send + Sync>)>,
     ) -> Result<(), RtcError> {
         let room = self.ensure_loaded_room(room_id)?;
         let encryption_state = room
@@ -327,13 +329,29 @@ impl RtcService {
             extra: Default::default(),
         });
         if let Some((mode, admit)) = outgoing {
-            let handoff_admit = || admit() && room.state() == matrix_sdk::RoomState::Joined;
+            let original_room = room.clone();
+            let handoff_admit: Arc<dyn Fn() -> bool + Send + Sync> =
+                Arc::new(move || admit() && original_room.state() == matrix_sdk::RoomState::Joined);
             crate::outgoing_preflight::handover(
-                crate::outgoing_preflight::check(&self.client, &room, mode, true, &handoff_admit),
-                &handoff_admit,
+                crate::outgoing_preflight::check(
+                    &self.client,
+                    &room,
+                    mode,
+                    true,
+                    handoff_admit.as_ref(),
+                ),
+                handoff_admit.as_ref(),
                 || async {
                     let wire_slot_id = MembershipFormat::from(mode).token_slot_id(slot_id);
-                    open_slot(&self.client, room_id, &wire_slot_id, "m.call", encryption).await?;
+                    open_slot_with_admission(
+                        &self.client,
+                        room_id,
+                        &wire_slot_id,
+                        "m.call",
+                        encryption,
+                        handoff_admit.clone(),
+                    )
+                    .await?;
                     Ok(())
                 },
             )
@@ -612,6 +630,9 @@ pub fn install_crypto_provider() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
 }
+
+#[cfg(test)]
+mod slot_authority_tests;
 
 #[cfg(test)]
 mod tests {

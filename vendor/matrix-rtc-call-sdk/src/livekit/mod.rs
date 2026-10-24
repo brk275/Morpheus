@@ -15,4 +15,7 @@ mod call;
 
 pub use attach::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 #[cfg(feature = "matrix-sdk")]
-pub use call::{LiveKitCall, LiveKitCallError, LiveKitCallOptions, close_slot, open_slot};
+pub use call::{
+    LiveKitCall, LiveKitCallError, LiveKitCallOptions, close_slot, open_slot,
+    open_slot_with_admission,
+};

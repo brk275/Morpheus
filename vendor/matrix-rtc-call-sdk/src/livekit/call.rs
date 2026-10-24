@@ -628,7 +628,7 @@ impl LiveKitCall {
     }
 }
 
-/// Close a MatrixRTC slot in a room by publishing an empty `m.rtc.slot` state
+/// Close a MatrixRTC slot in a room by publishing a closed `m.rtc.slot` state
 /// event. Everyone in it — this client's own calls included — leaves, and
 /// their calls end with `EndedReason::SlotClosed`.
 ///
@@ -638,10 +638,15 @@ pub async fn close_slot(
     room_id: &str,
     slot_id: &str,
 ) -> Result<(), LiveKitCallError> {
-    BaseRtcRoom::with_backend(room_id, Arc::new(SdkMatrixBackend::new(client.clone())))
-        .close_slot(slot_id.to_owned())
-        .await
-        .map_err(signalling_error)
+    BaseRtcRoom::with_backend(
+        room_id,
+        Arc::new(compat::DialectBackend::new(Arc::new(
+            SdkMatrixBackend::new(client.clone()),
+        ))),
+    )
+    .close_slot(slot_id.to_owned())
+    .await
+    .map_err(signalling_error)
 }
 
 /// Open a MatrixRTC slot in a room by publishing its `m.rtc.slot` state event.
@@ -656,8 +661,33 @@ pub async fn open_slot(
     application: &str,
     encryption: Option<SlotEncryption>,
 ) -> Result<(), LiveKitCallError> {
-    BaseRtcRoom::with_backend(room_id, Arc::new(SdkMatrixBackend::new(client.clone())))
-        .open_slot(slot_id.to_owned(), application.to_owned(), encryption)
-        .await
-        .map_err(signalling_error)
+    BaseRtcRoom::with_backend(
+        room_id,
+        Arc::new(compat::DialectBackend::new(Arc::new(
+            SdkMatrixBackend::new(client.clone()),
+        ))),
+    )
+    .open_slot(slot_id.to_owned(), application.to_owned(), encryption)
+    .await
+    .map_err(signalling_error)
+}
+
+/// Open a slot while retaining the caller's original account/room admission.
+/// The same predicate is rechecked after the authority read and before its write.
+pub async fn open_slot_with_admission(
+    client: &Client,
+    room_id: &str,
+    slot_id: &str,
+    application: &str,
+    encryption: Option<SlotEncryption>,
+    admission: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<(), LiveKitCallError> {
+    let backend = SdkMatrixBackend::new(client.clone()).with_slot_write_admission(admission);
+    BaseRtcRoom::with_backend(
+        room_id,
+        Arc::new(compat::DialectBackend::new(Arc::new(backend))),
+    )
+    .open_slot(slot_id.to_owned(), application.to_owned(), encryption)
+    .await
+    .map_err(signalling_error)
 }
