@@ -45,6 +45,7 @@ mod notification_center;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
+mod peer_verification;
 mod people_directory;
 mod pinned_messages;
 mod polls;
@@ -53,6 +54,7 @@ mod preview_capture;
 mod room_activity;
 mod room_addresses;
 mod room_creation;
+mod room_key_files;
 mod room_leave;
 mod room_media_browser;
 mod room_organization;
@@ -73,6 +75,7 @@ mod theme_studio;
 mod thread_browser;
 mod thread_history;
 // Instrumented release builds only (see build.rs); unit tests cover its pure checks.
+mod message_copy;
 #[cfg(any(test, morpheus_timeline_acceptance))]
 mod timeline_acceptance;
 mod timeline_delivery;
@@ -83,6 +86,7 @@ mod unread_navigation;
 mod update_controller;
 mod updater;
 mod verification;
+mod verification_work;
 #[cfg(feature = "native-calls")]
 mod video_render;
 #[cfg(feature = "native-calls")]
@@ -239,6 +243,7 @@ fn message(
 ) -> MessageItem {
     let clocks = message_metadata::ClockLabels::from_preview(time);
     MessageItem {
+        copy_token: Default::default(),
         event_id: SharedString::default(),
         is_own: false,
         sender: sender.into(),
@@ -1788,6 +1793,8 @@ fn run_application(
         ui.as_weak(),
         voice_spaces.clone(),
     );
+    let peer_verification_ui =
+        peer_verification::PeerVerificationUi::register(&ui, live.clone(), runtime.handle());
     #[cfg(not(all(windows, feature = "native-calls")))]
     security::register(&ui, live.clone(), runtime.handle().clone());
     let image_previews =
@@ -1812,6 +1819,7 @@ fn run_application(
         room_activity::RoomActivityUi::register(&ui, live.clone(), store.clone(), runtime.handle());
     let unread_navigation_ui =
         unread_navigation::UnreadNavigationUi::register(&ui, live.clone(), runtime.handle());
+    room_key_files::register(&ui, live.clone(), runtime.handle().clone());
     let device_sessions =
         device_sessions::DeviceSessionsUi::register(&ui, live.clone(), runtime.handle());
     let member_privacy =
@@ -3179,6 +3187,7 @@ fn run_application(
         }
     });
 
+    message_copy::register(&ui, &live);
     message_search::register(&ui, live.clone(), runtime.handle().clone());
     space_explorer::register(&ui, live.clone(), runtime.handle().clone());
     room_creation::register(&ui, live.clone(), runtime.handle().clone());
@@ -3752,6 +3761,7 @@ fn run_application(
             }
             let live = thread_live.clone();
             let generation = live.begin_thread_request();
+            message_copy::thread_opened(&ui);
             let weak = weak.clone();
             thread_handle.spawn(async move {
                 let error_account_id = account_id.clone();
@@ -4377,7 +4387,31 @@ fn run_application(
                 return;
             }
             let Some(_security) = security_gate.try_account_access() else { return; };
+            // Reject an old A -> B -> A selection BEFORE pausing any account ID.
+            // The core repeats its atomic selection check below.
+            if !selection.is_current() {
+                show_error(&ui, "The account changed. Open its menu and request logout again.".into());
+                return;
+            }
             let account_id = selection.account_id().to_owned();
+            let mut verification_pause = match live.pause_verification_work(&account_id) {
+                Ok(pause) => pause,
+                Err(error) => { show_error(&ui, error.to_string()); return; }
+            };
+            // The paused account cannot mint new views. A UI acknowledgement
+            // proves its actual Session was dropped before any store effect.
+            if let Err(error) = peer_verification::withdraw_paused_account(ui.clone(), account_id.clone()).await {
+                show_error(&ui, error.to_string());
+                return;
+            }
+            if let Err(error) = verification_pause.drain().await {
+                show_error(&ui, error.to_string());
+                return;
+            }
+            if !selection.is_current() || live.action_admission_closed() {
+                show_error(&ui, "The account changed. Open its menu and request logout again.".into());
+                return;
+            }
             // The core checks selection identity atomically before any logout
             // effect. A queued A -> B (including A -> B -> A) cannot retarget it.
             let result = live.manager.logout_selected_account(&selection).await;
@@ -4437,6 +4471,9 @@ fn run_application(
         window.invoke_cancel_room_settings();
         window.invoke_close_image_preview();
         window.invoke_stop_attachment_audio();
+        // Drop the already-visible SDK session before any logout work. The
+        // mandatory post-pause UI acknowledgement below closes recreation.
+        window.invoke_withdraw_verification();
         if !logout_live.is_live.load(Ordering::Acquire) {
             if window.get_call_connected() {
                 window.set_pending_account_index(-3);
@@ -4775,7 +4812,12 @@ fn run_application(
         #[cfg(all(windows, feature = "native-calls"))]
         live.security_gate.begin_shutdown(None);
         live.close_action_admission();
+        message_copy::retire(&cleanup_ui);
+        verification::shutdown(&cleanup_ui);
+        // Actual UI-owned SDK sessions go before any async task/store drain.
+        peer_verification_ui.shutdown(&cleanup_ui);
         store.close_write_admission();
+        room_key_files::close_admission(&cleanup_ui);
         style_profiles::close_application_admission();
         cleanup_ui.set_application_closing(true);
         cleanup_ui.set_update_status("Closing Morpheus. Saving drafts and releasing audio…".into());
@@ -4882,6 +4924,7 @@ fn run_application(
             // writer sweep, while loaded account stores remain available.
             let appearance_result = style_profiles::wait_for_appearance_release().await;
             let draft_task_result = live.drain_draft_work().await;
+            let verification_result = live.drain_verification_work().await;
             let config_drain_result = loop {
                 match store.write_shutdown_confirmed() {
                     Ok(true) => break Ok(()),
@@ -4910,6 +4953,7 @@ fn run_application(
                     draft_task_result,
                     config_drain_result,
                     appearance_result,
+                    verification_result,
                 )
             }
             #[cfg(not(feature = "native-calls"))]
@@ -4922,6 +4966,7 @@ fn run_application(
                     draft_task_result,
                     config_drain_result,
                     appearance_result,
+                    verification_result,
                 )
             }
         }
@@ -4941,6 +4986,7 @@ fn run_application(
             draft_task_result,
             config_drain_result,
             appearance_result,
+            verification_result,
         ),
         wasapi_result,
     ) = windows_audio::run(&ui, wasapi_ui, &runtime, cleanup)?;
@@ -4959,6 +5005,7 @@ fn run_application(
             draft_task_result,
             config_drain_result,
             appearance_result,
+            verification_result,
         ),
     ) = {
         let result = ui.run();
@@ -4975,6 +5022,7 @@ fn run_application(
             draft_task_result,
             config_drain_result,
             appearance_result,
+            verification_result,
         ),
     ) = {
         let result = ui.run();
@@ -5004,6 +5052,7 @@ fn run_application(
     draft_task_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     config_drain_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     appearance_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    verification_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     #[cfg(feature = "native-calls")]
     discovery_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     #[cfg(all(windows, feature = "native-calls"))]

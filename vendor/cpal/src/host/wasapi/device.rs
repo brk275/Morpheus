@@ -1339,7 +1339,9 @@ impl Devices {
                 let device = collection.Item(index)?;
                 let id = device.GetId()?;
                 let _id = ComString(id);
-                let text = id.to_string().map_err(Error::from)?;
+                let text = id.to_string().map_err(|_| {
+                    Error::with_message(ErrorKind::BackendError, "Invalid audio endpoint identity")
+                })?;
                 if text.is_empty() || text.encode_utf16().count() > 16384 || text.contains('\0') {
                     return Err(backend_error("Invalid audio endpoint identity"));
                 }

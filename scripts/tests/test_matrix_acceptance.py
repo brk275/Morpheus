@@ -354,12 +354,16 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             "STAGE activation", "STAGE room_open",
             "STAGE room_delivery", "CHECK room_delivery=true",
             "STAGE thread_delivery", "CHECK thread_delivery=true",
-            "CHECK thread_root_excluded=true", "CHECK feeds_running=true",
+            "CHECK thread_root_excluded=true",
+            "STAGE message_copy_callbacks", "CHECK message_copy_callbacks=true",
+            "CHECK feeds_running=true",
             "STAGE revocation", "CHECK old_lease_revoked=true",
             "CHECK idle_feeds_stopped=true", "STAGE renewal",
+            "CHECK message_copy_account_aba=true",
             "CHECK late_events_in_core=true", "CHECK stale_room_rejected=true",
             "CHECK stale_thread_rejected=true", "STAGE reopen",
-            "CHECK renewed_room_delivery=true", "CHECK renewed_thread_delivery=true",
+            "CHECK renewed_room_delivery=true", "CHECK message_copy_renewed_delivery=true",
+            "CHECK renewed_thread_delivery=true",
             "STAGE queued_revocation", "CHECK queued_callbacks_observed=true",
             "STAGE queued_drain", "CHECK queued_room_rejected=true",
             "CHECK queued_thread_rejected=true", "STAGE queued_reopen",
@@ -378,9 +382,9 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         lines.append("test result: ok. 1 passed; 0 failed; 0 ignored;")
         return "\n".join(lines) + "\n"
 
-    def test_one_harness_requires_all_twenty_observable_facts_and_cleanup(self):
+    def test_one_harness_requires_all_twenty_three_observable_facts_and_cleanup(self):
         checks = acceptance_module.app_timeline_evidence(self.output())
-        self.assertEqual(len(checks), 20)
+        self.assertEqual(len(checks), 23)
         self.assertEqual(set(checks), acceptance_module.APP_TIMELINE_CHECKS)
         self.assertTrue(all(checks.values()))
         self.assertIn("queued_callbacks_observed", checks)
@@ -389,6 +393,9 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         self.assertIn("link_follow_up_stale_retry_rejected", checks)
         self.assertIn("link_follow_up_held_focus_rejected", checks)
         self.assertIn("member_publication", checks)
+        self.assertIn("message_copy_callbacks", checks)
+        self.assertIn("message_copy_account_aba", checks)
+        self.assertIn("message_copy_renewed_delivery", checks)
         self.assertIn("member_publication", acceptance_module.APP_TIMELINE_STAGES)
         self.assertIn("cleanup_complete", checks)
 

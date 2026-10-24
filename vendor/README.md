@@ -12,7 +12,7 @@ provenance and regression tests when updating a dependency.
 | matrix-rtc-livekit | Secure authorization and media endpoints | [Patch notes](matrix-rtc-livekit/README.md) |
 | matrix-rtc-core 0.5.0-rc.2 | Bounded encrypted membership renewal for newly joined devices | [Patch notes](matrix-rtc-core/MORPHEUS_PATCH.md) |
 | matrix-sdk-crypto 0.19.1 | Same-revision bounded canonical encrypted room-key preparation; original fixtures retained | [Patch notes](matrix-sdk-crypto/MORPHEUS_PATCH.md) |
-| matrix-sdk 0.19.1 | Typed search entry points; optional per-request response-body limit; generated recovery-key handoff; opt-in stored-members identity status stream; opt-in receipt without the unread-flag write | [Patch notes](matrix-sdk/MORPHEUS_PATCH.md) |
+| matrix-sdk 0.19.1 | Typed search entry points; optional per-request response-body limit; generated recovery-key handoff; opt-in stored-members identity status stream; opt-in receipt without the unread-flag write; explicit existing-room peer SAS preparation | [Patch notes](matrix-sdk/MORPHEUS_PATCH.md) |
 | matrix-sdk-ui 0.19.1 | Required room-state sync and poll end authorization; opt-in mark-as-read without unread-flag writes | [Patch notes](matrix-sdk-ui/MORPHEUS_PATCH.md) |
 | matrix-sdk-base 0.19.1 | Preserve bounded encrypted keyless sticky receipts and their revocation | [Patch notes](matrix-sdk-base/MORPHEUS_PATCH.md) |
 | livekit-api 0.5.3 | Secure signaling, fallback endpoints, and authenticated redirects | [Patch notes](livekit-api/README.md) |

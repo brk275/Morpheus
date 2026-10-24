@@ -600,9 +600,16 @@ class NativeNoticeEvidenceTests(unittest.TestCase):
         self.assertFalse(parsed["license_compliance_verified"])
         self.assertFalse(parsed["native_source_evidence"]["bound_to_this_platform_binary"])
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            # Canonicalize only our owned fixture, not evidence inside the
+            # production reader: Darwin temporary roots may have aliases.
+            root = Path(temporary).resolve(strict=True)
             native_notices.write_files(root, contents)
             self.assertEqual(native_notices.read_files(root), contents)
+            if os.name != "nt":
+                alias = root / "notice-alias"
+                alias.symlink_to(root, target_is_directory=True)
+                with self.assertRaises(ValueError): native_notices.read_files(alias)
+                self.assertEqual(native_notices.read_files(root), contents)
             with self.assertRaises(ValueError): native_notices.write_files(root, contents)
 
     def test_every_locked_registry_archive_is_required_and_checksum_bound(self):

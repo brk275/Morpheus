@@ -758,6 +758,37 @@ pub(crate) fn open(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, href: &s
     true
 }
 
+/// An explicit room-reference action captured by another owned view. Keep its
+/// exact original selection through the read; never reacquire a new same-ID
+/// account. The caller has closed its clean form before this handoff.
+pub(crate) fn open_room_for_selection(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    handle: &Handle,
+    selection: &AccountSelection,
+    security_generation: u64,
+    room: &matrix_sdk::ruma::RoomId,
+) -> bool {
+    if !on_screen(ui, live, selection)
+        || !live.security_gate.ringing_allowed(security_generation)
+        || live.action_admission_closed()
+        || surface_blocked(ui)
+    {
+        return false;
+    }
+    end_link(ui);
+    crate::message_search::surface_entered(ui);
+    crate::thread_browser::withdraw(ui);
+    let operation = next_operation();
+    let target = MatrixLinkTarget::Room {
+        room_or_alias_id: room.to_string(),
+        event_id: None,
+        via_servers: Vec::new(),
+    };
+    read_selected(ui, live, handle, operation, target, selection.clone());
+    true
+}
+
 /// Read a room link for the account on screen; the card appears only if the
 /// read is still running after REVEAL_DELAY.
 fn read(
@@ -778,6 +809,17 @@ fn read(
         show(ui, &signed_out_card());
         return;
     };
+    read_selected(ui, live, handle, operation, target, selection);
+}
+
+fn read_selected(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    handle: &Handle,
+    operation: u64,
+    target: MatrixLinkTarget,
+    selection: AccountSelection,
+) {
     let reading = JoinCancellation::new();
     let card = reading_card(&target);
     // The click's navigation, captured once: the timer and the read's

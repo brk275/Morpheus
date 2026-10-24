@@ -2439,6 +2439,42 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         ],
     )),
     live(target(
+        "security.room_key_files",
+        "Security",
+        "Settings › Security & recovery › Encrypted room-key files",
+        "Encrypted room-key files",
+        "Import a Matrix-compatible encrypted key file, or export this account's room keys with a fresh passphrase.",
+        &[
+            "room keys",
+            "import room keys",
+            "export room keys",
+            "encrypted key file",
+            "key file import",
+            "key file export",
+            "Matrix key import",
+            "Matrix key export",
+        ],
+    )),
+    live(target(
+        "security.peer_verification",
+        "Security",
+        "Settings › Security & recovery › Verify a person",
+        "Verify a person",
+        "Compare emoji or numbers with an exact Matrix ID, or review incoming verification requests.",
+        &[
+            "peer verification",
+            "person verification",
+            "verify person",
+            "verify someone",
+            "matrix id",
+            "sas comparison",
+            "emoji comparison",
+            "incoming verification",
+            "incoming request",
+            "received request",
+        ],
+    )),
+    live(target(
         "security.devices",
         "Security",
         "Settings › Security & recovery › Devices",
@@ -2932,6 +2968,74 @@ mod tests {
             search_settings("verify", offline)
                 .iter()
                 .all(|target| target.requires == Requirement::Always)
+        );
+    }
+
+    #[test]
+    fn encrypted_room_key_file_search_is_live_and_keeps_own_recovery_separate() {
+        let all = |_| true;
+        for query in [
+            "room keys",
+            "import room keys",
+            "export room keys",
+            "encrypted key file",
+            "key file import",
+            "key file export",
+            "Matrix key import",
+            "Matrix key export",
+        ] {
+            assert_eq!(
+                search_settings(query, all).first().map(|target| target.id),
+                Some("security.room_key_files"),
+                "{query}"
+            );
+        }
+        let target = setting_target("security.room_key_files").unwrap();
+        assert_eq!(target.route, Route::Settings);
+        assert_eq!(target.requires, Requirement::LiveSession);
+        let offline = |requirement| requirement == Requirement::Always;
+        assert!(search_settings("room keys", offline).is_empty());
+        assert!(search_settings("encrypted key file", offline).is_empty());
+        assert_eq!(
+            search_settings("recovery key", all)
+                .first()
+                .map(|target| target.id),
+            Some("security.recovery")
+        );
+    }
+
+    #[test]
+    fn person_and_incoming_verification_search_reveal_one_live_control() {
+        let all = |_| true;
+        for query in [
+            "verify person",
+            "verify someone",
+            "peer verification",
+            "Matrix ID",
+            "SAS comparison",
+            "emoji comparison",
+            "incoming verification",
+            "incoming request",
+            "received request",
+        ] {
+            assert_eq!(
+                search_settings(query, all).first().map(|target| target.id),
+                Some("security.peer_verification"),
+                "{query}"
+            );
+        }
+        let target = setting_target("security.peer_verification").unwrap();
+        assert_eq!(target.route, Route::Settings);
+        assert_eq!(target.requires, Requirement::LiveSession);
+        let offline = |requirement| requirement == Requirement::Always;
+        assert!(search_settings("peer verification", offline).is_empty());
+        assert!(search_settings("incoming verification", offline).is_empty());
+        // Own-device recovery retains its existing destination.
+        assert_eq!(
+            search_settings("recovery key", all)
+                .first()
+                .map(|target| target.id),
+            Some("security.recovery")
         );
     }
 

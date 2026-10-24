@@ -1,6 +1,9 @@
 //! Revocable, exact-room settings sessions. Reads are authoritative server GETs;
 //! per-field baseline checks detect observed changes, never promise atomic CAS.
 //! Room-avatar state is shared metadata even when the room's messages are encrypted.
+//! Replacement-room metadata is an exception to the authoritative editable reads:
+//! it comes from the SDK's current synced tombstone and is rechecked at navigation.
+//! It is a reference to review, never proof of the replacement's identity or access.
 //!
 //! Each write (name, topic, join rule, avatar, avatar removal) is one state
 //! request, and an avatar adds one media upload before it, a typed request
@@ -260,6 +263,11 @@ pub struct RoomSettingsSnapshot {
     pub permissions: RoomSettingsPermissions,
     pub room_version: String,
     pub encrypted: bool,
+    /// A typed reference from this exact room's currently synced tombstone.
+    /// No automatic join/leave, and no claim that the new room is trustworthy.
+    pub replacement_room: Option<OwnedRoomId>,
+    /// Bounded plain display text; never routing input.
+    pub replacement_reason: String,
 }
 
 /// No Debug/Serialize: image bytes remain private, in memory. The caller must
@@ -459,6 +467,15 @@ impl RoomSettingsSession {
             .unwrap_or_else(|e| e.into_inner())
             .snapshot
             .clone()
+    }
+    /// Recheck the current synced target under this form's original account and
+    /// admission. The caller must still match its displayed snapshot before
+    /// handing this typed ID to protected navigation. No network request is sent.
+    pub fn replacement_room(&self) -> Result<Option<OwnedRoomId>> {
+        self.admit()?;
+        let (room, _) = replacement_metadata(&self.room);
+        self.admit()?;
+        Ok(room)
     }
     fn check(&self) -> Result<()> {
         ensure_scope(&self.selection, &self.cancellation)?;
@@ -1134,6 +1151,9 @@ async fn read_settings(room: &Room, own: &OwnedUserId) -> Result<Loaded> {
         topic.as_ref(),
         encryption.is_some(),
     )?;
+    let (replacement_room, replacement_reason) = replacement_metadata(room);
+    loaded.snapshot.replacement_room = replacement_room;
+    loaded.snapshot.replacement_reason = replacement_reason;
     loaded.raw = RawContents {
         name: name_raw,
         topic: topic_raw,
@@ -1196,12 +1216,34 @@ fn assemble(
             permissions,
             room_version: creation.room_version.as_str().to_owned(),
             encrypted,
+            replacement_room: None,
+            replacement_reason: String::new(),
         },
         // The exact stored text is filled in by `read_settings`.
         raw: RawContents::default(),
         avatar_source,
     })
 }
+fn replacement_metadata(room: &Room) -> (Option<OwnedRoomId>, String) {
+    let Some(successor) = room.successor_room() else {
+        return (None, String::new());
+    };
+    if successor.room_id.as_str() == room.room_id().as_str()
+        || successor.room_id.as_str().len() > MAX_ROOM_ID_BYTES
+    {
+        return (None, String::new());
+    }
+    let reason = successor.reason.as_deref().unwrap_or_default();
+    // Single-line plain text, at most 256 Unicode scalars (1024 UTF-8 bytes).
+    // Never interpret markup, directional controls or a URL from the reason.
+    let reason = reason.chars().take(256).map(|c| {
+        if c.is_control() { ' ' }
+        else if matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { '\u{fffd}' }
+        else { c }
+    }).collect();
+    (Some(successor.room_id), reason)
+}
+
 fn state_text(event: Option<&StateEnvelope>, key: &str, maximum: usize) -> Result<String> {
     match event.and_then(|e| e.content.get(key)) {
         None => Ok(String::new()),
@@ -2637,6 +2679,124 @@ mod tests {
         session
             .unwrap()
             .with_admission(Arc::new(move || gate.load(Ordering::SeqCst)))
+    }
+
+    #[test]
+    fn a_synced_replacement_is_typed_rechecked_and_never_changes_membership() {
+        runtime().block_on(async {
+            let server = SettingsServer::start();
+            let (directory, manager, account) = signed_in(&server).await;
+            let client = manager.state.lock().await.loaded[&account.id]
+                .client
+                .clone();
+            let gate = Arc::new(AtomicBool::new(true));
+            let cancellation = RoomSettingsCancellation::new();
+            let session = open(&manager, &account, &gate, cancellation.clone()).await;
+            assert!(session.snapshot().replacement_room.is_none());
+            assert!(session.replacement_room().unwrap().is_none());
+            let replacement = room_id!("!replacement:example.org");
+            let successor_sync = |target: &str, batch: &str| {
+                let mut sync = joined_room();
+                sync["next_batch"] = batch.into();
+                let reason = format!("Moved\n\u{202e}{}", "x".repeat(600));
+                let mut event: Value = serde_json::from_str(&full_event(
+                    "m.room.tombstone",
+                    "",
+                    &json!({"replacement_room":target,"body":reason}).to_string(),
+                ))
+                .unwrap();
+                event["event_id"] = format!("$replacement-{batch}").into();
+                sync["rooms"]["join"][ROOM]["state"]["events"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(event);
+                sync
+            };
+            server
+                .served
+                .syncs
+                .lock()
+                .unwrap()
+                .push_back(successor_sync(replacement.as_str(), "replacement-1"));
+            client
+                .sync_once(matrix_sdk::config::SyncSettings::default())
+                .await
+                .unwrap();
+            let snapshot = session.refresh().await.unwrap();
+            assert_eq!(snapshot.replacement_room.as_deref(), Some(replacement));
+            assert!(snapshot.replacement_reason.starts_with("Moved \u{fffd}"));
+            assert_eq!(snapshot.replacement_reason.chars().count(), 256);
+            assert!(snapshot.replacement_reason.len() <= 1024);
+            let reads = server.served.state_reads.lock().unwrap().len();
+            assert_eq!(
+                session.replacement_room().unwrap().as_deref(),
+                Some(replacement)
+            );
+            // The navigation recheck uses only current SDK state, not another
+            // request, a URL from the reason or a join/leave/room-state write.
+            assert_eq!(server.served.state_reads.lock().unwrap().len(), reads);
+            server
+                .served
+                .syncs
+                .lock()
+                .unwrap()
+                .push_back(successor_sync("!changed:example.org", "replacement-2"));
+            client
+                .sync_once(matrix_sdk::config::SyncSettings::default())
+                .await
+                .unwrap();
+            assert_ne!(
+                session.replacement_room().unwrap(),
+                snapshot.replacement_room
+            );
+            gate.store(false, Ordering::SeqCst);
+            assert_eq!(
+                session.replacement_room(),
+                Err(RoomSettingsError::SecurityBusy)
+            );
+            gate.store(true, Ordering::SeqCst);
+            server
+                .served
+                .syncs
+                .lock()
+                .unwrap()
+                .push_back(successor_sync(ROOM, "replacement-self"));
+            client
+                .sync_once(matrix_sdk::config::SyncSettings::default())
+                .await
+                .unwrap();
+            assert!(session.replacement_room().unwrap().is_none());
+            cancellation.cancel();
+            assert_eq!(
+                session.replacement_room(),
+                Err(RoomSettingsError::Cancelled)
+            );
+            let another = open(&manager, &account, &gate, RoomSettingsCancellation::new()).await;
+            manager.selections.replace(None);
+            manager.selections.replace(Some(&account.id));
+            assert_eq!(
+                another.replacement_room(),
+                Err(RoomSettingsError::AccountChanged)
+            );
+            assert!(server.writes().is_empty());
+            assert_eq!(
+                client
+                    .get_room(room_id!("!settings:example.org"))
+                    .unwrap()
+                    .state(),
+                RoomState::Joined
+            );
+            assert!(
+                client
+                    .get_room(replacement)
+                    .is_none_or(|room| room.state() != RoomState::Joined)
+            );
+            drop(another);
+            drop(session);
+            drop(client);
+            drop(manager);
+            let _ = std::fs::remove_dir_all(directory);
+        });
     }
 
     #[test]

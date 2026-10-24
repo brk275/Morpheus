@@ -1802,6 +1802,7 @@ mod tests {
                 recovery_ready: watch::channel(false).0,
                 incoming_verification_tx,
                 verification_book: Default::default(),
+                peer_verifications: Default::default(),
                 notification_handler_registered: Mutex::new(false),
                 token_task: Mutex::new(Some(SyncTask {
                     shutdown: Some(shutdown),

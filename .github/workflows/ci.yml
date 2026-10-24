@@ -528,7 +528,31 @@ jobs:
         # final outcome gate still rejects failed SDK unit regressions.
         continue-on-error: true
         shell: bash
-        run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
+        run: |
+          set -euo pipefail
+          cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # The SDK macro generates the exact test name. Cargo accepts an
+            # empty filter, so require its presence before executing it.
+            export RUST_LOG=warn
+            peer_case=encryption::verification::test_explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_dm
+            cargo test --locked -p matrix-sdk --test integration --features testing,e2e-encryption -- --list > "$RUNNER_TEMP/morpheus-peer-sas-sdk-tests.txt"
+            grep -Fqx -- "$peer_case: test" "$RUNNER_TEMP/morpheus-peer-sas-sdk-tests.txt"
+            cargo test --locked -p matrix-sdk --test integration --features testing,e2e-encryption "$peer_case" -- --exact
+            # Exercise the public encrypted-key byte/store boundary. Require
+            # every exact case before running; an empty Cargo filter is not a pass.
+            cargo test --locked -p matrix-sdk --features testing,e2e-encryption --lib -- --list > "$RUNNER_TEMP/morpheus-room-key-sdk-tests.txt"
+            for key_case in \
+              encryption::room_key_file::tests::invalid_preparation_has_fixed_non_secret_error \
+              encryption::room_key_file::tests::public_byte_reader_refuses_layout_and_kdf_before_store_preparation \
+              encryption::room_key_file::tests::test_explicit_target_keeps_current_machine_and_imports_prepared_empty_export \
+              encryption::room_key_file::tests::test_nonempty_legacy_import_reexports_to_an_independent_store \
+              encryption::room_key_file::tests::public_api_refuses_authenticated_over_count_before_store_admission
+            do
+              grep -Fqx -- "$key_case: test" "$RUNNER_TEMP/morpheus-room-key-sdk-tests.txt"
+              cargo test --locked -p matrix-sdk --features testing,e2e-encryption --lib "$key_case" -- --exact
+            done
+          fi
       - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
         id: matrix-tests
         if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'matrix')

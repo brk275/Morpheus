@@ -58,11 +58,11 @@ pub const MAX_VERIFICATION_DEVICE_NAME_CHARS: usize = 64;
 /// Matrix verification requests expire ten minutes after they are sent.
 pub const VERIFICATION_REQUEST_LIFETIME: Duration = Duration::from_secs(10 * 60);
 // Reads of the client and its crypto store, no network.
-const LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
 // One step sent to the other device.
-const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 // The own identity may be fetched from the homeserver before a request.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 /// Incoming flow IDs recorded per account: the event handler drops the
 /// oldest beyond this, and a listing examines at most this many.
 pub(crate) const MAX_RECORDED_VERIFICATIONS: usize = 64;
@@ -395,7 +395,7 @@ fn offers_sas(methods: &[VerificationMethod]) -> bool {
 }
 
 /// The listing of one request, from the SDK's current state.
-fn snapshot(request: &VerificationRequest) -> OwnVerification {
+pub(crate) fn snapshot(request: &VerificationRequest) -> OwnVerification {
     let mut info = OwnVerification {
         flow_id: request.flow_id().to_owned(),
         own_user_id: request.own_user_id().to_string(),
@@ -453,7 +453,7 @@ fn snapshot(request: &VerificationRequest) -> OwnVerification {
     info
 }
 
-fn scope_error(
+pub(crate) fn scope_error(
     selection: &AccountSelection,
     cancellation: &VerificationCancellation,
 ) -> OwnVerificationResult<()> {
@@ -468,7 +468,7 @@ fn scope_error(
 
 /// One wait that sends nothing: it ends at once on cancellation, account
 /// change or timeout, and is re-checked before its result is used.
-async fn guarded<T>(
+pub(crate) async fn guarded<T>(
     selection: &AccountSelection,
     cancellation: &VerificationCancellation,
     limit: Duration,
@@ -493,7 +493,7 @@ async fn guarded<T>(
 /// Any SDK error type is accepted (`matrix_sdk::Error` for most steps,
 /// `RequestVerificationError` for a new request): the SDK may have sent the
 /// event before failing, so each maps to Unknown without being inspected.
-async fn dispatch<T, E>(
+pub(crate) async fn dispatch<T, E>(
     selection: &AccountSelection,
     cancellation: &VerificationCancellation,
     admitted: &(dyn Fn() -> bool + Send + Sync),
@@ -517,13 +517,13 @@ async fn dispatch<T, E>(
 
 /// The selected account's client and own user, taken under the manager's
 /// state lock and released before anything else is awaited.
-struct Scoped {
-    loaded: Arc<LoadedAccount>,
-    own: OwnedUserId,
+pub(crate) struct Scoped {
+    pub(crate) loaded: Arc<LoadedAccount>,
+    pub(crate) own: OwnedUserId,
 }
 
 impl AccountManager {
-    async fn verification_scope(
+    pub(crate) async fn verification_scope(
         &self,
         selection: &AccountSelection,
         cancellation: &VerificationCancellation,
@@ -906,7 +906,7 @@ impl AccountManager {
     }
 }
 
-fn presentation(sas: &SasVerification) -> SasPresentation {
+pub(crate) fn presentation(sas: &SasVerification) -> SasPresentation {
     let emoji = sas.emoji().map(|items| {
         items
             .into_iter()

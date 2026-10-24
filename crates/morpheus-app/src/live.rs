@@ -905,6 +905,7 @@ pub struct LiveUi {
     drafts: Arc<DraftStore>,
     draft_write_tx: std::sync::Mutex<Option<mpsc::Sender<()>>>,
     draft_work: std::sync::Mutex<DraftWork>,
+    verification_work: crate::verification_work::VerificationWork,
     generation: Arc<AtomicU64>,
     recovery_notices: Arc<crate::timeline_recovery::Notices>,
     render_epoch: Arc<AtomicU64>,
@@ -1162,6 +1163,7 @@ impl LiveUi {
                 tasks: vec![draft_writer],
                 ..DraftWork::default()
             }),
+            verification_work: crate::verification_work::VerificationWork::default(),
             generation: Arc::new(AtomicU64::new(0)),
             recovery_notices,
             render_epoch: Arc::new(AtomicU64::new(0)),
@@ -1191,6 +1193,7 @@ impl LiveUi {
     /// thread before it yields. Loaded stores stay owned for the admitted work
     /// drain and final stable flush; resumable manager.stop remains distinct.
     pub(crate) fn close_action_admission(&self) {
+        self.verification_work.close();
         let mut work = self
             .draft_work
             .lock()
@@ -1203,6 +1206,41 @@ impl LiveUi {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
+    }
+
+    /// Capture synchronously with a verification UI intent. Reusing a local
+    /// account ID after a removal pause never revives an older lease.
+    pub(crate) fn verification_work_lease(
+        &self,
+        selection: &AccountSelection,
+        cancellation: &morpheus_matrix::VerificationCancellation,
+    ) -> Option<crate::verification_work::VerificationWorkLease> {
+        self.verification_work.lease(selection, cancellation)
+    }
+
+    pub(crate) fn spawn_verification_work(
+        &self,
+        runtime: &Handle,
+        lease: &crate::verification_work::VerificationWorkLease,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        self.verification_work.spawn(runtime, lease, task)
+    }
+
+    pub(crate) fn pause_verification_work(
+        &self,
+        account: &str,
+    ) -> Result<
+        crate::verification_work::VerificationWorkPause,
+        crate::verification_work::VerificationDrainError,
+    > {
+        self.verification_work.pause(account)
+    }
+
+    pub(crate) async fn drain_verification_work(
+        &self,
+    ) -> Result<(), crate::verification_work::VerificationDrainError> {
+        self.verification_work.drain().await
     }
 
     pub(crate) fn action_admission_closed(&self) -> bool {
@@ -4567,6 +4605,11 @@ impl LiveUi {
                                 return;
                             };
                             let messages = presentation.messages;
+                            let copy_scope = crate::message_copy::capture_publication(
+                                &ui,
+                                &selected_account,
+                                false,
+                            );
                             if selected_account.is_current()
                                 && live_flag.load(Ordering::Acquire)
                                 && current_generation.load(Ordering::Acquire) == generation
@@ -4579,7 +4622,11 @@ impl LiveUi {
                                     &room_id,
                                 )
                             {
-                                publish_live_messages(&ui, messages.as_ref().clone());
+                                publish_live_messages_scoped(
+                                    &ui,
+                                    messages.as_ref().clone(),
+                                    copy_scope,
+                                );
                                 recovery.publish(
                                     &ui,
                                     crate::timeline_recovery::Pane::Room,
@@ -4784,6 +4831,8 @@ impl LiveUi {
                             back.give_back(selected_account, room_id);
                             return;
                         }
+                        let copy_scope =
+                            crate::message_copy::capture_publication(&ui, &selected_account, false);
                         if selected_account.is_current()
                             && live_flag.load(Ordering::Acquire)
                             && current_generation.load(Ordering::Acquire) == generation
@@ -4796,9 +4845,10 @@ impl LiveUi {
                             )
                         {
                             unshown.store(false, Ordering::Release);
-                            ui.set_messages(crate::timeline_model::update_shared(
+                            ui.set_messages(crate::timeline_model::update_scoped(
                                 ui.get_messages(),
                                 messages.as_ref().clone(),
+                                copy_scope,
                             ));
                             ui.set_conversation_focused(true);
                             recovery.publish(
@@ -4997,6 +5047,11 @@ impl LiveUi {
                                 return;
                             };
                             let messages = presentation.messages;
+                            let copy_scope = crate::message_copy::capture_publication(
+                                &ui,
+                                &selected_account,
+                                true,
+                            );
                             if selected_account.is_current()
                                 && is_live.load(Ordering::Acquire)
                                 && current_generation.load(Ordering::Acquire) == generation
@@ -5004,7 +5059,12 @@ impl LiveUi {
                                 && ui.get_active_room_id().as_str() == room_id
                                 && ui.get_thread_root_id().as_str() == root_event_id
                             {
-                                message_search::show_thread_root(&ui, &messages, &root_event_id);
+                                message_search::show_thread_root(
+                                    &ui,
+                                    &messages,
+                                    &root_event_id,
+                                    copy_scope.clone(),
+                                );
                                 let replies = messages
                                     .iter()
                                     .filter(|message| {
@@ -5012,9 +5072,10 @@ impl LiveUi {
                                     })
                                     .cloned()
                                     .collect();
-                                ui.set_thread_messages(crate::timeline_model::update_shared(
+                                ui.set_thread_messages(crate::timeline_model::update_scoped(
                                     ui.get_thread_messages(),
                                     replies,
+                                    copy_scope,
                                 ));
                                 recovery.publish(
                                     &ui,
@@ -5508,6 +5569,7 @@ fn apply_snapshot(
         crate::kept_replies::leaving_room(ui);
     }
     if selection_changed {
+        crate::message_copy::retire(ui);
         ui.set_room_admin_open(false);
         ui.set_room_admin_operation(ui.get_room_admin_operation().wrapping_add(1));
         ui.set_room_admin_busy(false);
@@ -5748,6 +5810,7 @@ fn apply_snapshot(
 }
 
 fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::SecurityGate) {
+    crate::message_copy::retire(ui);
     crate::security::clear_ui(ui, security_gate);
     // Calls cannot outlive their account, so its call authority is already
     // revoked here. Its call tiles, pictures and roster must not wait for
@@ -6053,6 +6116,7 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
     };
     let rich_body = styled_markdown.unwrap_or_else(|| StyledText::from_plain_text(display_body));
     MessageItem {
+        copy_token: Default::default(),
         event_id: info.event_id.as_deref().unwrap_or("").into(),
         is_own: info.is_own,
         sender: sender.into(),
@@ -6126,10 +6190,20 @@ fn visible_feed_target(
 /// not an authority token: even a same-length replacement with the same newest
 /// event must place the unread marker again. Focused feeds and divider writes
 /// do not call it.
+#[cfg(test)]
 pub(crate) fn publish_live_messages(ui: &AppWindow, messages: Vec<Arc<MessageInfo>>) {
-    ui.set_messages(crate::timeline_model::update_shared(
+    publish_live_messages_scoped(ui, messages, None);
+}
+
+fn publish_live_messages_scoped(
+    ui: &AppWindow,
+    messages: Vec<Arc<MessageInfo>>,
+    scope: Option<std::rc::Rc<crate::message_copy::CopyScope>>,
+) {
+    ui.set_messages(crate::timeline_model::update_scoped(
         ui.get_messages(),
         messages,
+        scope,
     ));
     // Live rows replace any focused view, and with it that view's history
     // paging state. Notify only after both the model and that state are final.

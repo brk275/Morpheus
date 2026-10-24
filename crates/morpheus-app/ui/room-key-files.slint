@@ -1,0 +1,148 @@
+// Encrypted Matrix room-key files. Secrets belong only to these password
+// controls and private window backing values. Submit and synchronous page
+// withdrawal clear both before invoking Rust. No secret is a public window
+// output property; clearing values is not a claim of memory zeroization.
+import { Palette } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton } from "controls.slint";
+
+component KeyPassphrase inherits Rectangle {
+    in-out property <string> text;
+    in property <string> label;
+    in property <bool> enabled;
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    out property <bool> has-focus: input.has-focus;
+    callback cancelled();
+    forward-focus: input;
+    min-height: max(34px, 16px * root.text-scale + 14px);
+    horizontal-stretch: 1;
+    background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.colors.surface;
+    border-radius: StyleTokens.input-corner;
+    border-width: input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+    border-color: input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.colors.accent) : root.colors.outline;
+    input := TextInput {
+        x: StyleTokens.input-padding;
+        width: max(0px, parent.width - 2 * StyleTokens.input-padding);
+        height: parent.height;
+        text <=> root.text;
+        input-type: password;
+        single-line: true;
+        enabled: root.enabled;
+        color: root.colors.ink;
+        font-size: 12px * root.text-scale;
+        vertical-alignment: center;
+        selection-background-color: Palette.selection-background;
+        selection-foreground-color: Palette.selection-foreground;
+        accessible-label: root.label;
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.text = "";
+                root.cancelled();
+                accept
+            } else { reject }
+        }
+    }
+}
+
+export component RoomKeyFilesPanel inherits VerticalLayout {
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    in property <bool> available;
+    in property <bool> security-busy;
+    in property <bool> busy;
+    in property <string> scope-key;
+    in property <string> message;
+    in property <int> reveal-request;
+    in-out property <string> passphrase;
+    in-out property <string> confirmation;
+    property <bool> can-act: root.available && !root.security-busy && !root.busy;
+    property <int> retired-reveal-request: 0;
+    callback reveal-at(length);
+    callback revealed(string);
+    callback import-file(string);
+    callback export-file(string, string);
+    callback cancel();
+    callback context-changed();
+    function clear() { root.passphrase = ""; root.confirmation = ""; }
+    changed scope-key => { root.retired-reveal-request = root.reveal-request; root.clear(); root.context-changed(); }
+    changed available => { if !root.available { root.clear(); root.context-changed(); } }
+    changed security-busy => { if root.security-busy { root.clear(); root.context-changed(); } }
+    changed can-act => { if !root.can-act { root.retired-reveal-request = root.reveal-request; } }
+    // Search reveals the existing input only. It never opens a chooser or
+    // submits either action, and a later account/unprotect cannot replay it.
+    changed reveal-request => {
+        if root.can-act && root.reveal-request > 0 && root.reveal-request != root.retired-reveal-request {
+            root.reveal-at(passphrase-input.absolute-position.y);
+            passphrase-input.focus();
+            if passphrase-input.has-focus { root.revealed("security.room_key_files"); }
+        }
+    }
+    spacing: 8px;
+    Text { text: "Encrypted room-key files"; color: root.colors.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+    Text {
+        text: "Import a Matrix-compatible encrypted file into this account, or export all keys in its captured snapshot. Use a fresh export passphrase of at least 12 UTF-8 bytes and keep it separately. Export never replaces an existing file.";
+        color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+    Text { text: "Key-file passphrase"; color: root.colors.ink; font-size: 11px * root.text-scale; }
+    passphrase-input := KeyPassphrase {
+        text <=> root.passphrase; label: "Encrypted room-key file passphrase";
+        colors: root.colors; text-scale: root.text-scale; enabled: root.can-act;
+        changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } }
+        cancelled => { root.clear(); root.cancel(); }
+    }
+    Text { text: "Confirm new export passphrase (export only)"; color: root.colors.ink; font-size: 11px * root.text-scale; }
+    KeyPassphrase {
+        text <=> root.confirmation; label: "Confirm the fresh encrypted room-key export passphrase";
+        colors: root.colors; text-scale: root.text-scale; enabled: root.can-act;
+        changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } }
+        cancelled => { root.clear(); root.cancel(); }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        TokenButton {
+            text: "Import encrypted keys…"; colors: root.colors; text-scale: root.text-scale;
+            enabled: root.can-act && root.passphrase != "";
+            activated => {
+                if root.can-act && root.passphrase != "" {
+                    let secret = root.passphrase;
+                    root.clear();
+                    root.import-file(secret);
+                }
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        TokenButton {
+            text: "Export encrypted keys…"; colors: root.colors; text-scale: root.text-scale;
+            enabled: root.can-act && root.passphrase != "" && root.confirmation == root.passphrase;
+            activated => {
+                if root.can-act && root.passphrase != "" && root.confirmation == root.passphrase {
+                    let secret = root.passphrase;
+                    let confirmation = root.confirmation;
+                    root.clear();
+                    root.export-file(secret, confirmation);
+                }
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    HorizontalLayout {
+        spacing: 8px;
+        TokenButton {
+            text: "Cancel new file actions"; colors: root.colors; text-scale: root.text-scale;
+            enabled: root.busy;
+            activated => { root.clear(); root.cancel(); }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    if root.busy : Text {
+        text: "Close an open file chooser to finish cancellation. An admitted import or publication is still awaited before this account can be removed.";
+        color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+    if root.message != "" : Text {
+        text: root.message; color: root.colors.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+}

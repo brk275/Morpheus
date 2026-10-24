@@ -105,6 +105,7 @@ APP_TIMELINE_LABEL = "app-live-timeline"
 APP_TIMELINE_CASE = "account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation"
 APP_TIMELINE_CHECKS = frozenset((
     "room_delivery", "thread_delivery", "thread_root_excluded", "feeds_running",
+    "message_copy_callbacks", "message_copy_account_aba", "message_copy_renewed_delivery",
     "old_lease_revoked", "idle_feeds_stopped", "late_events_in_core",
     "stale_room_rejected", "stale_thread_rejected", "renewed_thread_delivery",
     "renewed_room_delivery", "queued_callbacks_observed", "queued_room_rejected",
@@ -116,6 +117,7 @@ APP_TIMELINE_STAGES = frozenset((
     "setup_profile", "setup_config", "setup_window", "setup_controller",
     "setup_dispatch", "setup_login", "setup_rooms", "setup_ready",
     "setup", "activation", "room_open", "room_delivery", "thread_delivery",
+    "message_copy_callbacks",
     "revocation", "renewal", "reopen", "queued_revocation", "queued_drain",
     "queued_reopen", "link_continuation", "member_publication", "cleanup", "complete",
     "cleanup_logout_primary", "cleanup_logout_other", "cleanup_manager_stop",

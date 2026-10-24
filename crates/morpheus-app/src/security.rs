@@ -482,6 +482,7 @@ pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
         return;
     }
     crate::verification::clear_ui(ui);
+    crate::peer_verification::clear_presentation(ui);
     // The session list, any sign-out step and its challenge end with the account.
     crate::device_sessions::clear_presentation(ui);
     next_operation(ui);

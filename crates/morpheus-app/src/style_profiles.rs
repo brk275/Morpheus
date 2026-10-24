@@ -175,8 +175,44 @@ pub(crate) enum AppearanceObservation {
     Released(Result<(), AppearanceDrainError>),
     Retained,
 }
+/// Exact worker receipt. It can become Released only after that worker AND
+/// its supervisor have actually joined. This is independent of global idle,
+/// body callbacks, cancellation and the operation permit's lifetime.
+pub(crate) struct DialogWorkTicket {
+    receipt: Arc<Mutex<AppearanceObservation>>,
+    admission_sent: bool,
+}
+impl DialogWorkTicket {
+    fn receipt(&self) -> AppearanceObservation {
+        self.receipt
+            .lock()
+            .map(|receipt| *receipt)
+            .unwrap_or(AppearanceObservation::Retained)
+    }
+    pub(crate) fn observe(&self) -> AppearanceObservation {
+        // Registry -> receipt is the only lock order; worker bodies never hold
+        // either. Observe actual joins before inspecting this exact receipt.
+        let Ok(mut owners) = workers().lock() else {
+            return AppearanceObservation::Retained;
+        };
+        let _ = owners.observe();
+        self.receipt()
+    }
+    /// Deliberately no timeout/select cancellation. The enclosing retained
+    /// verification task must stay owned on unknown native/TLS completion;
+    /// account removal sees Pending instead of a false destructive receipt.
+    pub(crate) async fn wait_joined(self) -> Result<(), AppearanceDrainError> {
+        loop {
+            if let AppearanceObservation::Released(result) = self.observe() {
+                return result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
 struct DialogWorker {
     supervisor: Option<std::thread::JoinHandle<()>>,
+    receipt: Arc<Mutex<AppearanceObservation>>,
     outcome: Arc<Mutex<Option<Result<(), AppearanceDrainError>>>>,
     // Including the supervisor's real join, not just its completion flag.
     _lease: DialogPermit,
@@ -212,9 +248,25 @@ impl DialogWorkers {
             if !matches!(joined, Some(Ok(()))) || result.is_none() {
                 owner.retained = true;
                 self.failed = Some(AppearanceDrainError::Ownership);
+                if let Ok(mut receipt) = owner.receipt.lock() {
+                    *receipt = AppearanceObservation::Retained;
+                }
                 index += 1;
             } else {
-                if let Some(Err(error)) = result {
+                let result = result.expect("Actual worker result checked above");
+                let published = if let Ok(mut receipt) = owner.receipt.lock() {
+                    *receipt = AppearanceObservation::Released(result);
+                    true
+                } else {
+                    false
+                };
+                if !published {
+                    owner.retained = true;
+                    self.failed = Some(AppearanceDrainError::Ownership);
+                    index += 1;
+                    continue;
+                }
+                if let Err(error) = result {
                     self.failed = Some(error);
                 }
                 // Only a real worker/TLS join followed by supervisor join
@@ -231,13 +283,13 @@ impl DialogWorkers {
         }
     }
 
-    fn spawn(
+    fn spawn_ticket(
         &mut self,
         permit: &DialogPermit,
         name: &'static str,
         body: impl FnOnce() + Send + 'static,
         spawn_failed: impl FnOnce() + Send + 'static,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<DialogWorkTicket> {
         let _ = self.observe();
         // One global operation can hand its permit from a completed dialog
         // body to one file writer while that dialog's TLS is still retiring.
@@ -247,6 +299,7 @@ impl DialogWorkers {
                 "Appearance work is closing or still owned",
             ));
         }
+        let receipt = Arc::new(Mutex::new(AppearanceObservation::Pending));
         let outcome = Arc::new(Mutex::new(None));
         let publish = outcome.clone();
         let (allow, admitted) = std::sync::mpsc::sync_channel::<()>(1);
@@ -272,13 +325,34 @@ impl DialogWorkers {
             })?;
         self.owners.push(DialogWorker {
             supervisor: Some(supervisor),
+            receipt: receipt.clone(),
             outcome,
             _lease: permit.clone(),
             retained: false,
         });
-        allow
-            .send(())
-            .map_err(|_| std::io::Error::other("Appearance supervisor did not admit work"))
+        // Once the actual handle is registered, always return its ticket even
+        // if readiness delivery fails. The caller must still await its joins.
+        let admission_sent = allow.send(()).is_ok();
+        Ok(DialogWorkTicket {
+            receipt,
+            admission_sent,
+        })
+    }
+    fn spawn(
+        &mut self,
+        permit: &DialogPermit,
+        name: &'static str,
+        body: impl FnOnce() + Send + 'static,
+        spawn_failed: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<()> {
+        let ticket = self.spawn_ticket(permit, name, body, spawn_failed)?;
+        if ticket.admission_sent {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "Appearance supervisor did not admit work",
+            ))
+        }
     }
 }
 impl DialogPermit {
@@ -314,6 +388,17 @@ impl DialogPermit {
             .map(|_| Self {
                 _lease: Arc::new(DialogLease(busy)),
             })
+    }
+    pub(crate) fn spawn_owned(
+        &self,
+        name: &'static str,
+        body: impl FnOnce() + Send + 'static,
+        spawn_failed: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<DialogWorkTicket> {
+        workers()
+            .lock()
+            .map_err(|_| std::io::Error::other("Appearance ownership is unavailable"))?
+            .spawn_ticket(self, name, body, spawn_failed)
     }
     pub(crate) fn spawn(
         &self,
@@ -1608,6 +1693,94 @@ mod tests {
         assert!(refused);
         assert_eq!(observation, AppearanceObservation::Released(Ok(())));
         assert!(!busy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn exact_dialog_ticket_waits_for_actual_worker_tls_and_supervisor_join() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let mut owners = DialogWorkers::default();
+        let permit = DialogPermit::acquire_in(&mut owners, busy.clone()).expect("free local lease");
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let ticket = owners.spawn_ticket(
+            &permit,
+            "morpheus-ticket-tls-regression",
+            move || {
+                HELD_TLS.with(|slot| {
+                    *slot.borrow_mut() = Some(HeldTls {
+                        entered,
+                        release: released,
+                    })
+                });
+            },
+            || {},
+        );
+        drop(permit);
+        let entered = entering.recv_timeout(std::time::Duration::from_secs(3));
+        let before = ticket.as_ref().ok().map(DialogWorkTicket::receipt);
+        let pending = owners.observe();
+        let _ = release.send(());
+        let observation = drain_test_workers(owners);
+        // Evaluate failures only after retained real worker/TLS cleanup.
+        assert!(entered.is_ok());
+        assert_eq!(before, Some(AppearanceObservation::Pending));
+        assert_eq!(pending, AppearanceObservation::Pending);
+        assert_eq!(observation, AppearanceObservation::Released(Ok(())));
+        assert_eq!(
+            ticket.unwrap().receipt(),
+            AppearanceObservation::Released(Ok(()))
+        );
+        assert!(!busy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn exact_joined_ticket_does_not_claim_unrelated_workers_joined() {
+        let busy = Arc::new(AtomicBool::new(false));
+        let mut owners = DialogWorkers::default();
+        let permit = DialogPermit::acquire_in(&mut owners, busy.clone()).expect("free local lease");
+        let first = owners.spawn_ticket(&permit, "morpheus-ticket-first-regression", || {}, || {});
+        // Retain the operation permit and use its existing dialog/writer transfer.
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let second = owners.spawn_ticket(
+            &permit,
+            "morpheus-ticket-second-regression",
+            move || {
+                HELD_TLS.with(|slot| {
+                    *slot.borrow_mut() = Some(HeldTls {
+                        entered,
+                        release: released,
+                    })
+                });
+            },
+            || {},
+        );
+        drop(permit);
+        let entered = entering.recv_timeout(std::time::Duration::from_secs(3));
+        // First-body completion is not enough; drive the real joins.
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while first
+            .as_ref()
+            .is_ok_and(|ticket| ticket.receipt() == AppearanceObservation::Pending)
+            && std::time::Instant::now() < limit
+        {
+            let _ = owners.observe();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let first_state = first.as_ref().ok().map(DialogWorkTicket::receipt);
+        let second_state = second.as_ref().ok().map(DialogWorkTicket::receipt);
+        let global = owners.observe();
+        let _ = release.send(());
+        let observation = drain_test_workers(owners);
+        assert!(entered.is_ok());
+        assert_eq!(first_state, Some(AppearanceObservation::Released(Ok(()))));
+        assert_eq!(second_state, Some(AppearanceObservation::Pending));
+        assert_eq!(global, AppearanceObservation::Pending);
+        assert_eq!(observation, AppearanceObservation::Released(Ok(())));
+        assert_eq!(
+            second.unwrap().receipt(),
+            AppearanceObservation::Released(Ok(()))
+        );
     }
 
     #[test]

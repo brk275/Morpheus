@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scripts.scan_history import classify, git, load_manifest, scan
+from scripts.scan_history import MergeProvenance, classify, fixture_digest, git, load_manifest, scan
 
 
 class HistoryScannerTests(unittest.TestCase):
@@ -95,6 +95,65 @@ class HistoryScannerTests(unittest.TestCase):
         (self.repo / "fixture.txt").write_text(self.canary + "changed bytes\n")
         self.commit("New introduction must not inherit an exception")
         self.assertGreater(self.execute("new-introduction")["unexpected_findings"], 0)
+
+    def test_digest_reuses_verified_blob_bytes_across_paths_and_commits(self):
+        content = b"Reviewed synthetic public fixture bytes\n"
+        (self.repo / "fixture.txt").write_bytes(content)
+        (self.repo / "same.txt").write_bytes(content)
+        original = self.commit("Identical fixture objects at separate paths")
+        (self.repo / "readme.txt").write_text("Unrelated history only\n")
+        later = self.commit("Same fixture object in another commit")
+        expected = hashlib.sha256(content).hexdigest()
+        proof = MergeProvenance(self.repo)
+        with mock.patch("scripts.scan_history.fixture_digest", wraps=fixture_digest) as verify:
+            self.assertEqual(proof.digest(original, "fixture.txt"), expected)
+            self.assertEqual(proof.digest(original, "fixture.txt"), expected)
+            self.assertEqual(proof.digest(original, "same.txt"), expected)
+            self.assertEqual(proof.digest(later, "fixture.txt"), expected)
+            verify.assert_called_once_with(self.repo, original, "fixture.txt", proof.query)
+        self.assertEqual(len(proof.digests), 3)
+        self.assertEqual(len(proof.blob_digests), 1)
+        # One tree + the existing size/type/content queries for the first
+        # object, then one tree per new location; the exact-key hit costs none.
+        self.assertEqual(proof.queries, 6)
+
+        # A byte cache is not path/commit admission. Reject malformed identities
+        # before either cache, even after real verified content is present.
+        for commit, path in (("HEAD", "fixture.txt"), ("A" * 40, "fixture.txt"),
+                             (original, "../fixture.txt"), (original, "/fixture.txt"),
+                             (original, "same.txt:other"), (original, "same.txt\n"),
+                             (original, "")):
+            with self.subTest(commit=commit, path=path), self.assertRaises(ValueError):
+                proof.digest(commit, path)
+        self.assertEqual(proof.queries, 6)
+
+    def test_changed_blob_cannot_reuse_a_verified_digest_or_reviewed_exception(self):
+        original_bytes = b"Reviewed synthetic fixture\n"
+        (self.repo / "fixture.txt").write_bytes(original_bytes)
+        original = self.commit("Reviewed original object")
+        changed_bytes = original_bytes + b"Unreviewed additional bytes\n"
+        (self.repo / "fixture.txt").write_bytes(changed_bytes)
+        changed = self.commit("Changed whole-blob content")
+        original_digest = hashlib.sha256(original_bytes).hexdigest()
+        changed_digest = hashlib.sha256(changed_bytes).hexdigest()
+        proof = MergeProvenance(self.repo)
+        with mock.patch("scripts.scan_history.fixture_digest", wraps=fixture_digest) as verify:
+            self.assertEqual(proof.digest(original, "fixture.txt"), original_digest)
+            self.assertEqual(proof.digest(changed, "fixture.txt"), changed_digest)
+            self.assertEqual(verify.call_count, 2)
+        self.assertNotEqual(proof.blob(original, "fixture.txt")[1],
+                            proof.blob(changed, "fixture.txt")[1])
+        self.assertEqual(len(proof.blob_digests), 2)
+
+        def finding(commit):
+            return {"Commit": commit, "File": "fixture.txt", "RuleID": "generic-api-key",
+                    "StartLine": 1, "Fingerprint": f"{commit}:fixture.txt:generic-api-key:1"}
+
+        findings = [finding(original), finding(changed)]
+        fixtures = {row["Fingerprint"]: {"blob_sha256": original_digest}
+                    for row in findings}
+        self.assertEqual(classify(self.repo, findings, fixtures),
+                         {"findings": 2, "reviewed_public_fixtures": 1, "unexpected_findings": 1})
 
     def test_scanner_fingerprint_mismatch_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "fingerprint"):

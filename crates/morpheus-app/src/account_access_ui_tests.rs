@@ -3317,6 +3317,35 @@ async fn assert_appearance_workspace_and_search(
     ui.on_activate_saved_account(move |_| counted.set(counted.get() + 1));
     let counted = actions.clone();
     ui.on_remove_saved_account(move |_| counted.set(counted.get() + 1));
+    let peer = ui.global::<crate::PeerVerification>();
+    let peer_before = peer.get_view();
+    let peer_input_before = peer.get_peer_input();
+    let peer_compared_before = peer.get_compared();
+    peer.set_view(crate::PeerVerificationView::default());
+    let counted = actions.clone();
+    peer.on_request(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    peer.on_send(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    peer.on_accept(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    peer.on_advance(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    peer.on_confirm(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    peer.on_cancel(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    peer.on_dismiss(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    peer.on_open_conversations(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    peer.on_review(move |_| counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    ui.on_room_key_file_import(move |_| counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    ui.on_room_key_file_export(move |_, _| counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    ui.on_room_key_file_cancel(move || counted.set(counted.get() + 1));
     let before = std::fs::read_to_string(store.path()).unwrap();
     let live = ui.get_live_session();
     ui.set_live_session(true);
@@ -3455,6 +3484,229 @@ async fn assert_appearance_workspace_and_search(
         assert_eq!(ui.get_image_preview_open(), viewer_open, "{query}");
         assert_eq!(actions.get(), 0, "{query}: search ran an action");
     }
+    // Peer aliases focus a real control without sending, accepting, comparing
+    // or dismissing. Incoming requests share the existing panel, not a submenu.
+    for query in [
+        "verify person",
+        "Matrix ID",
+        "SAS comparison",
+        "incoming verification",
+    ] {
+        ui.set_settings_search_query(query.into());
+        ui.invoke_settings_search(query.into());
+        settle(ui).await;
+        let result = ui.get_settings_search_results().row_data(0).unwrap();
+        assert_eq!(result.id, "security.peer_verification", "{query}");
+        ui.invoke_settings_search_choose(result.id);
+        settle(ui).await;
+        assert_eq!(ui.get_settings_revealed_id(), "security.peer_verification");
+        assert!(focused_control_has_label(
+            ui,
+            "Exact Matrix ID of the person to verify"
+        ));
+        assert!(inside_window(
+            ui,
+            item_bounds(&control_with_label(
+                ui,
+                "Exact Matrix ID of the person to verify"
+            ))
+        ));
+        assert_eq!(actions.get(), 0, "peer search ran an action");
+    }
+    // An existing comparison keeps its exact person, room, values and explicit
+    // comparison checkbox. Search only focuses the safe refresh control.
+    let comparison = crate::PeerVerificationView {
+        stage: 3,
+        peer: "@peer:example.org".into(),
+        room: "!comparison:example.org".into(),
+        emoji: "synthetic comparison".into(),
+        decimals: "1111 2222 3333".into(),
+        detail: "Compare these values with this person.".into(),
+        ..Default::default()
+    };
+    peer.set_view(comparison.clone());
+    peer.set_compared(true);
+    settle(ui).await;
+    let geometry_before = (ui.window().size(), ui.get_font_scale_percent());
+    for scale in [100, 200] {
+        ui.window().set_size(slint::PhysicalSize::new(640, 760));
+        ui.set_font_scale_percent(scale);
+        settle(ui).await;
+        assert!(crate::settings_search::reveal(
+            ui,
+            "security.peer_verification"
+        ));
+        settle(ui).await;
+        assert!(focused_control_has_label(
+            ui,
+            "Refresh peer verification status"
+        ));
+        assert!(inside_window(
+            ui,
+            item_bounds(&control_with_label(ui, "Refresh peer verification status"))
+        ));
+        for label in [
+            "Values match — confirm",
+            "Values differ / cancel",
+            "Dismiss here",
+            "Refresh peer verification status",
+        ] {
+            let bounds = item_bounds(&control_with_label(ui, label));
+            assert!(
+                bounds.right > bounds.left
+                    && bounds.left >= -0.5
+                    && bounds.right <= window_size(ui).0 + 0.5,
+                "peer action must fit horizontally at {scale}%"
+            );
+        }
+        for label in [
+            "Dismiss here",
+            "Values differ / cancel",
+            "Values match — confirm",
+        ] {
+            key(ui, Key::Backtab);
+            settle(ui).await;
+            assert!(focused_control_has_label(ui, label));
+            assert!(
+                inside_window(ui, item_bounds(&control_with_label(ui, label))),
+                "Tab must scroll the complete peer action into view at {scale}%"
+            );
+        }
+        let shown = peer.get_view();
+        assert_eq!(shown.stage, comparison.stage);
+        assert_eq!(shown.peer, comparison.peer);
+        assert_eq!(shown.room, comparison.room);
+        assert_eq!(shown.emoji, comparison.emoji);
+        assert_eq!(shown.decimals, comparison.decimals);
+        assert!(peer.get_compared());
+        assert_eq!(actions.get(), 0);
+    }
+    ui.set_font_scale_percent(geometry_before.1);
+    ui.window().set_size(geometry_before.0);
+    for (stage, busy) in [(3, true), (6, false)] {
+        let mut unavailable = comparison.clone();
+        unavailable.stage = stage;
+        unavailable.busy = busy;
+        peer.set_view(unavailable);
+        settle(ui).await;
+        assert!(crate::settings_search::reveal(
+            ui,
+            "security.peer_verification"
+        ));
+        settle(ui).await;
+        assert_eq!(
+            ui.get_settings_revealed_id(),
+            "security.peer_verification:status"
+        );
+        assert!(focused_control_has_label(ui, "Peer verification status"));
+        assert_eq!(actions.get(), 0, "unavailable search ran an action");
+    }
+    peer.set_view(crate::PeerVerificationView::default());
+    ui.set_settings_revealed_id("".into());
+    ui.set_security_busy(true);
+    settle(ui).await;
+    assert!(crate::settings_search::reveal(
+        ui,
+        "security.peer_verification"
+    ));
+    settle(ui).await;
+    assert_eq!(ui.get_settings_revealed_id(), "");
+    ui.set_security_busy(false);
+    settle(ui).await;
+    assert_eq!(
+        ui.get_settings_revealed_id(),
+        "",
+        "unprotect must not replay focus"
+    );
+    assert!(crate::settings_search::reveal(
+        ui,
+        "security.peer_verification"
+    ));
+    settle(ui).await;
+    assert!(focused_control_has_label(
+        ui,
+        "Exact Matrix ID of the person to verify"
+    ));
+    assert_eq!(actions.get(), 0);
+    peer.set_view(peer_before);
+    peer.set_peer_input(peer_input_before);
+    peer.set_compared(peer_compared_before);
+    peer.on_request(|| {});
+    peer.on_send(|| {});
+    peer.on_accept(|| {});
+    peer.on_advance(|| {});
+    peer.on_confirm(|| {});
+    peer.on_cancel(|| {});
+    peer.on_dismiss(|| {});
+    peer.on_open_conversations(|| {});
+    peer.on_review(|_| {});
+
+    // Choosing a key-file result focuses the actual password input only:
+    // no chooser, import, export or cancellation is dispatched.
+    let key_file_before = (ui.get_room_key_file_busy(), ui.get_room_key_file_closed());
+    ui.set_room_key_file_busy(false);
+    ui.set_room_key_file_closed(false);
+    for query in ["import room keys", "export room keys", "encrypted key file"] {
+        ui.set_settings_search_query(query.into());
+        ui.invoke_settings_search(query.into());
+        settle(ui).await;
+        let result = ui.get_settings_search_results().row_data(0).unwrap();
+        assert_eq!(result.id, "security.room_key_files", "{query}");
+        ui.invoke_settings_search_choose(result.id);
+        settle(ui).await;
+        assert_eq!(ui.get_settings_revealed_id(), "security.room_key_files");
+        assert!(focused_control_has_label(
+            ui,
+            "Encrypted room-key file passphrase"
+        ));
+        assert!(inside_window(
+            ui,
+            item_bounds(&control_with_label(
+                ui,
+                "Encrypted room-key file passphrase"
+            ))
+        ));
+        assert!(key_file_inputs_empty(ui));
+        assert_eq!(actions.get(), 0, "key-file search ran an action");
+    }
+    for protected in [true, false] {
+        ui.set_room_key_file_busy(!protected);
+        ui.set_security_busy(protected);
+        settle(ui).await;
+        ui.set_settings_revealed_id("".into());
+        assert!(crate::settings_search::reveal(
+            ui,
+            "security.room_key_files"
+        ));
+        settle(ui).await;
+        assert_eq!(ui.get_settings_revealed_id(), "");
+        ui.set_room_key_file_busy(false);
+        ui.set_security_busy(false);
+        settle(ui).await;
+        assert_eq!(
+            ui.get_settings_revealed_id(),
+            "",
+            "unprotect/completion must not replay an old key-file focus"
+        );
+        assert_eq!(actions.get(), 0);
+    }
+    assert!(crate::settings_search::reveal(
+        ui,
+        "security.room_key_files"
+    ));
+    settle(ui).await;
+    assert!(focused_control_has_label(
+        ui,
+        "Encrypted room-key file passphrase"
+    ));
+    assert!(key_file_inputs_empty(ui));
+    assert_eq!(actions.get(), 0);
+    ui.set_room_key_file_busy(key_file_before.0);
+    ui.set_room_key_file_closed(key_file_before.1);
+    ui.on_room_key_file_import(|_| {});
+    ui.on_room_key_file_export(|_, _| {});
+    ui.on_room_key_file_cancel(|| {});
+
     for (target, label) in [
         ("appearance.reduce_motion", "Reduce motion, off"),
         ("notifications.desktop", "Desktop notifications"),
@@ -4922,9 +5174,41 @@ async fn assert_live_preview(ui: &AppWindow) {
 /// The themed select keeps ComboBox's keyboard contract: Up and Down choose
 /// directly, Return opens the list without choosing, keys in the list choose
 /// live, Escape closes it with focus back on the select, and a disabled
-/// select ignores keys.
+/// select ignores keys and late accessibility actions. Options expose an actual
+/// default action that chooses and closes without applying a customization.
 async fn assert_themed_select(ui: &AppWindow) {
-    use std::{cell::RefCell, rc::Rc};
+    use slint::private_unstable_api::re_exports::{
+        AccessibilityAction, AccessibleStringProperty, ItemRc, SupportedAccessibilityAction,
+        WindowInner,
+    };
+    use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
+
+    // Read the actual generated popup item, not a callback or a source string.
+    fn popup_option(ui: &AppWindow, label: &str) -> ItemRc {
+        let window = WindowInner::from_pub(ui.window());
+        let popup_root = {
+            let popups = window.active_popups();
+            assert_eq!(popups.len(), 1, "the select owns one open list");
+            ItemRc::new_root(popups[0].component.clone())
+        };
+        let mut options = Vec::new();
+        let _ = popup_root.visit_descendants(|item| {
+            if item
+                .accessible_string_property(AccessibleStringProperty::Label)
+                .as_deref()
+                == Some(label)
+                && item
+                    .accessible_string_property(AccessibleStringProperty::ItemSelectable)
+                    .as_deref()
+                    == Some("true")
+            {
+                options.push(item.clone());
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        assert_eq!(options.len(), 1, "the requested option is unique");
+        options.pop().unwrap()
+    }
 
     let chosen = Rc::new(RefCell::new(Vec::<String>::new()));
     let record = chosen.clone();
@@ -5008,8 +5292,67 @@ async fn assert_themed_select(ui: &AppWindow) {
     ui.set_font_scale_percent(previous_scale);
     settle(ui).await;
 
+    // An assistive client can choose a real customization option after
+    // expanding its named combobox. Choosing a reset section never resets it.
+    let previous_section = ui.get_studio_reset_index();
+    let pending = ui.get_studio_pending();
+    ui.set_studio_reset_index(0);
+    assert!(crate::settings_search::reveal(ui, "appearance.studio"));
+    settle(ui).await;
+    let section = "Section to reset";
+    control_with_label(ui, section).accessible_action(&AccessibilityAction::Expand);
+    settle(ui).await;
+    let option = popup_option(ui, "Shapes and spacing");
+    assert!(
+        option
+            .supported_accessibility_actions()
+            .contains(SupportedAccessibilityAction::Default)
+    );
+    assert_eq!(
+        option
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("true")
+    );
+    option.accessible_action(&AccessibilityAction::Default);
+    settle(ui).await;
+    assert_eq!(ui.get_studio_reset_index(), 2);
+    assert_eq!(
+        ui.get_studio_pending(),
+        pending,
+        "selection applies nothing"
+    );
+    assert!(
+        WindowInner::from_pub(ui.window())
+            .active_popups()
+            .is_empty()
+    );
+    assert!(focused_control_has_label(ui, section), "focus returns");
+    ui.set_studio_reset_index(previous_section);
+
+    // Keep an actual popup item across disabling/closing. A late AT action
+    // must obey the same enabled guard and cannot change a call preference.
+    assert!(crate::settings_search::reveal(ui, "media.audio_devices"));
+    settle(ui).await;
+    control_with_label(ui, label).accessible_action(&AccessibilityAction::Expand);
+    settle(ui).await;
+    let stale = popup_option(ui, "System default");
+    let before = chosen.borrow().len();
     ui.set_audio_devices_busy(true);
     settle(ui).await;
+    assert_eq!(
+        stale
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("false")
+    );
+    stale.accessible_action(&AccessibilityAction::Default);
+    settle(ui).await;
+    assert_eq!(
+        chosen.borrow().len(),
+        before,
+        "disabled AT action is refused"
+    );
     key(ui, Key::UpArrow);
     assert_eq!(ui.get_audio_microphone_index(), 1, "disabled");
     assert_eq!(switched.get(), 0, "choosing never switches the call");
@@ -5461,6 +5804,248 @@ async fn assert_room_addresses_bounded_close_and_context(
     settle(ui).await;
 }
 
+const KEY_FILE_INPUT_LABELS: [&str; 2] = [
+    "Encrypted room-key file passphrase",
+    "Confirm the fresh encrypted room-key export passphrase",
+];
+fn key_file_inputs_empty(ui: &AppWindow) -> bool {
+    use slint::private_unstable_api::re_exports::TextInput;
+    KEY_FILE_INPUT_LABELS.iter().all(|label| {
+        control_with_label(ui, label)
+            .downcast::<TextInput>()
+            .expect("the labelled password input")
+            .as_pin_ref()
+            .text()
+            .is_empty()
+    })
+}
+fn fill_key_file_inputs(ui: &AppWindow) {
+    use slint::private_unstable_api::re_exports::{FocusReason, TextInput, WindowInner};
+    assert!(key_file_inputs_empty(ui));
+    for label in KEY_FILE_INPUT_LABELS {
+        let target = control_with_label(ui, label);
+        let window = WindowInner::from_pub(ui.window());
+        window.set_focus_item(&target, true, FocusReason::PointerClick);
+        assert!(focused_control_has_label(ui, label));
+        assert!(
+            target
+                .downcast::<TextInput>()
+                .unwrap()
+                .as_pin_ref()
+                .has_focus(),
+            "typing must reach the actual password input"
+        );
+        type_text(ui, "fixture-only-passphrase");
+        assert!(
+            target
+                .downcast::<TextInput>()
+                .unwrap()
+                .as_pin_ref()
+                .text()
+                .as_str()
+                == "fixture-only-passphrase",
+            "the actual input must contain the synthetic fixture before withdrawal"
+        );
+    }
+}
+
+/// The context observer belongs to the persistent generated window. No chooser,
+/// account/store work or native worker is started by this presentation case.
+async fn assert_key_file_context_outlives_the_settings_subtree(ui: &AppWindow) {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    let previous = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_active_account_local_id(),
+        ui.get_sas_busy(),
+        ui.get_sas_stage(),
+        ui.get_access_open(),
+        ui.get_security_busy(),
+        ui.get_show_sign_in(),
+        ui.get_account_switch_pending(),
+        ui.get_security_recovery_key(),
+        ui.get_application_closing(),
+        ui.get_room_key_file_closed(),
+    );
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("key-context-a".into());
+    ui.set_sas_busy(false);
+    ui.set_sas_stage(0);
+    ui.set_access_open(false);
+    ui.set_security_busy(false);
+    ui.set_show_sign_in(false);
+    ui.set_account_switch_pending(false);
+    ui.set_security_recovery_key("".into());
+    ui.set_application_closing(false);
+    ui.set_room_key_file_closed(false);
+    settle(ui).await;
+
+    let contexts = Rc::new(Cell::new(0usize));
+    let order = Rc::new(RefCell::new(Vec::new()));
+    let count = contexts.clone();
+    let observed = order.clone();
+    ui.on_room_key_file_context_changed(move || {
+        count.set(count.get() + 1);
+        observed.borrow_mut().push("context");
+    });
+    let observed = order.clone();
+    let check_inputs = Rc::new(Cell::new(false));
+    let check = check_inputs.clone();
+    let weak = ui.as_weak();
+    ui.on_room_key_file_withdraw(move || {
+        // Read actual state at callback entry, not after a deferred settle.
+        let ui = weak.upgrade().unwrap();
+        let page = ui.get_page();
+        if check.get() {
+            assert!(
+                key_file_inputs_empty(&ui),
+                "both secrets clear before Rust withdrawal"
+            );
+        }
+        observed.borrow_mut().push(if page == 1 {
+            "key-withdraw-before-page"
+        } else {
+            "key-withdraw"
+        });
+    });
+    let observed = order.clone();
+    ui.on_verification_protected(move || observed.borrow_mut().push("withdraw"));
+    let actions = Rc::new(Cell::new(0usize));
+    let count = actions.clone();
+    ui.on_room_key_file_import(move |_| count.set(count.get() + 1));
+    let count = actions.clone();
+    ui.on_room_key_file_export(move |_, _| count.set(count.get() + 1));
+
+    // Settings is absent throughout these transitions. Child-only observers
+    // cannot supply these notifications, including the closed-window boundary.
+    let before = contexts.get();
+    ui.set_active_account_local_id("key-context-b".into());
+    settle(ui).await;
+    assert!(contexts.get() > before);
+    let before = contexts.get();
+    ui.set_sas_busy(true);
+    settle(ui).await;
+    assert!(contexts.get() > before);
+    ui.set_sas_busy(false);
+    let before = contexts.get();
+    ui.set_sas_stage(1);
+    settle(ui).await;
+    assert!(contexts.get() > before);
+    ui.set_sas_stage(0);
+    let before = contexts.get();
+    ui.set_access_open(true);
+    settle(ui).await;
+    assert!(contexts.get() > before && ui.get_sas_protected());
+    ui.set_access_open(false);
+    let before = contexts.get();
+    ui.set_live_session(false);
+    settle(ui).await;
+    assert!(contexts.get() > before);
+    ui.set_live_session(true);
+    let before = contexts.get();
+    ui.set_application_closing(true);
+    settle(ui).await;
+    assert!(contexts.get() > before);
+    ui.set_application_closing(false);
+    let before = contexts.get();
+    ui.set_room_key_file_closed(true);
+    settle(ui).await;
+    assert!(contexts.get() > before);
+    ui.set_room_key_file_closed(false);
+
+    ui.set_page(1);
+    settle(ui).await;
+    fill_key_file_inputs(ui);
+    // Use the real protection entry before a coalescing leave-and-return. The
+    // callback sees empty generated controls before any changed handler runs.
+    check_inputs.set(true);
+    ui.invoke_withdraw_verification();
+    check_inputs.set(false);
+    assert!(key_file_inputs_empty(ui));
+    ui.set_access_open(true);
+    ui.set_access_open(false);
+    settle(ui).await;
+    assert!(key_file_inputs_empty(ui));
+    assert_eq!(actions.get(), 0);
+
+    fill_key_file_inputs(ui);
+    order.borrow_mut().clear();
+    check_inputs.set(true);
+    // Leave and return before any change-handler processing. The original
+    // context is withdrawn at the real navigation entry despite coalescing.
+    ui.invoke_navigate_page(0);
+    assert_eq!(ui.get_page(), 0);
+    assert_eq!(order.borrow().first(), Some(&"key-withdraw-before-page"));
+    assert!(order.borrow().iter().any(|event| *event == "withdraw"));
+    ui.invoke_navigate_page(1);
+    check_inputs.set(false);
+    assert_eq!(ui.get_page(), 1);
+    assert!(key_file_inputs_empty(ui));
+    assert_eq!(actions.get(), 0);
+    settle(ui).await;
+    assert!(
+        key_file_inputs_empty(ui),
+        "reopening cannot replay either secret"
+    );
+    // An externally changed account also clears through the persistent
+    // fallback, without opening a chooser or invoking an import/export.
+    fill_key_file_inputs(ui);
+    ui.set_active_account_local_id("key-context-c".into());
+    settle(ui).await;
+    assert!(key_file_inputs_empty(ui));
+    ui.set_active_account_local_id("key-context-b".into());
+    settle(ui).await;
+    assert!(key_file_inputs_empty(ui));
+    order.borrow_mut().clear();
+    ui.set_page(0);
+    settle(ui).await;
+    let leaving = order.borrow();
+    let context = leaving
+        .iter()
+        .position(|event| *event == "context")
+        .unwrap();
+    let withdraw = leaving
+        .iter()
+        .position(|event| *event == "withdraw")
+        .unwrap();
+    assert!(
+        context < withdraw,
+        "context withdrawal precedes page navigation callbacks"
+    );
+    drop(leaving);
+    ui.set_page(1);
+    settle(ui).await;
+    assert_eq!(
+        actions.get(),
+        0,
+        "context changes and reopening never submit file work"
+    );
+
+    ui.on_room_key_file_context_changed(|| {});
+    ui.on_room_key_file_withdraw(|| {});
+    ui.on_verification_protected(|| {});
+    ui.on_room_key_file_import(|_| {});
+    ui.on_room_key_file_export(|_, _| {});
+    ui.set_page(previous.0);
+    ui.set_live_session(previous.1);
+    ui.set_active_account_local_id(previous.2);
+    ui.set_sas_busy(previous.3);
+    ui.set_sas_stage(previous.4);
+    ui.set_access_open(previous.5);
+    ui.set_security_busy(previous.6);
+    ui.set_show_sign_in(previous.7);
+    ui.set_account_switch_pending(previous.8);
+    ui.set_security_recovery_key(previous.9);
+    ui.set_application_closing(previous.10);
+    ui.set_room_key_file_closed(previous.11);
+    settle(ui).await;
+}
+
 async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgress>) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
@@ -5475,6 +6060,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     ui.window()
         .dispatch_event(WindowEvent::WindowActiveChanged(true));
     phase.set(1);
+    assert_key_file_context_outlives_the_settings_subtree(&ui).await;
     assert_sign_in_keyboard(&ui).await;
     settle(&ui).await;
     phase.set(2);
@@ -6298,6 +6884,41 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert!(manager.active_account().await.is_none());
 
     assert_removed_account_menu_projection(&ui);
+    // The real close is deliberately last: its process-thread admission must
+    // never be reset just to continue earlier presentation checks.
+    ui.set_live_session(true);
+    ui.set_show_sign_in(false);
+    ui.set_access_open(false);
+    ui.set_security_busy(false);
+    ui.set_account_switch_pending(false);
+    ui.set_security_recovery_key("".into());
+    ui.set_sas_busy(false);
+    ui.set_sas_stage(0);
+    ui.set_application_closing(false);
+    ui.set_room_key_file_closed(false);
+    ui.set_page(1);
+    settle(&ui).await;
+    fill_key_file_inputs(&ui);
+    let quit_withdrawn = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = quit_withdrawn.clone();
+    let weak = ui.as_weak();
+    ui.on_room_key_file_withdraw(move || {
+        let ui = weak.upgrade().unwrap();
+        assert!(
+            !ui.get_room_key_file_closed(),
+            "withdrawal precedes closing flags"
+        );
+        assert!(
+            key_file_inputs_empty(&ui),
+            "quit clears both real password inputs"
+        );
+        observed.set(true);
+    });
+    crate::room_key_files::close_admission(&ui);
+    assert!(quit_withdrawn.get());
+    assert!(ui.get_room_key_file_closed());
+    assert!(key_file_inputs_empty(&ui));
+    // No event-loop settle is allowed to manufacture this quit clear receipt.
     pinned.shutdown(&ui);
     ui.hide().unwrap();
     drop(ui); // Drops the registered controller callbacks.
@@ -14501,6 +15122,93 @@ async fn assert_room_permissions_editor(ui: &AppWindow, live: &Arc<LiveUi>, runt
         ui.set_room_admin_busy(saved.0);
         ui.set_room_settings_confirmation(saved.1);
         ui.set_room_settings_dirty(saved.2);
+        settle(ui).await;
+    }
+
+    // The new replacement reference remains an explicit navigation action.
+    // Test the actual generated control before any settings controller is
+    // registered; no request can be sent by this presentation fixture.
+    {
+        use slint::private_unstable_api::re_exports::AccessibilityAction;
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        ui.on_room_settings_action(move |action| {
+            if action == 10 {
+                seen.set(seen.get() + 1);
+            }
+        });
+        let saved = (
+            ui.get_room_settings_loaded(),
+            ui.get_room_admin_account_id(),
+            ui.get_room_admin_room_id(),
+            ui.get_page(),
+            ui.get_room_settings_refresh_required(),
+            ui.get_room_settings_dirty(),
+            ui.get_room_settings_staged(),
+            ui.get_room_admin_busy(),
+            ui.get_room_settings_confirmation(),
+        );
+        ui.set_page(0);
+        ui.set_room_admin_account_id(ui.get_active_account_local_id());
+        ui.set_room_admin_room_id(ui.get_active_room_id());
+        ui.set_room_settings_loaded(true);
+        ui.set_room_settings_refresh_required(false);
+        ui.set_room_settings_dirty(false);
+        ui.set_room_settings_staged(false);
+        ui.set_room_admin_busy(false);
+        ui.set_room_settings_confirmation(0);
+        ui.set_room_settings_replacement_id("!replacement:example.org".into());
+        ui.set_room_settings_replacement_reason("A new room is listed.".into());
+        ui.set_room_admin_mode(0);
+        ui.set_room_admin_open(true);
+        settle(ui).await;
+        let label = "Open replacement room !replacement:example.org";
+        assert_eq!(calls.get(), 0, "showing metadata never navigates");
+        ui.set_room_settings_dirty(true);
+        settle(ui).await;
+        control_with_label(ui, label).accessible_action(&AccessibilityAction::Default);
+        assert_eq!(calls.get(), 0, "dirty edits remain in their original form");
+        ui.set_room_settings_dirty(false);
+        ui.set_room_admin_busy(true);
+        settle(ui).await;
+        control_with_label(ui, label).accessible_action(&AccessibilityAction::Default);
+        assert_eq!(calls.get(), 0, "pending work is not discarded");
+        ui.set_room_admin_busy(false);
+        ui.set_room_admin_account_id("another-account".into());
+        settle(ui).await;
+        control_with_label(ui, label).accessible_action(&AccessibilityAction::Default);
+        assert_eq!(calls.get(), 0, "stale account cannot dispatch the action");
+        ui.set_room_admin_account_id(ui.get_active_account_local_id());
+        ui.set_room_admin_room_id("!another:example.org".into());
+        settle(ui).await;
+        control_with_label(ui, label).accessible_action(&AccessibilityAction::Default);
+        assert_eq!(
+            calls.get(),
+            0,
+            "stale source room cannot dispatch the action"
+        );
+        ui.set_room_admin_room_id(ui.get_active_room_id());
+        settle(ui).await;
+        control_with_label(ui, label).accessible_action(&AccessibilityAction::Default);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            ui.get_active_room_id(),
+            shown,
+            "the original room is not changed by metadata or UI publication"
+        );
+        ui.on_room_settings_action(|_| {});
+        ui.set_room_admin_open(false);
+        ui.set_room_settings_replacement_id("".into());
+        ui.set_room_settings_replacement_reason("".into());
+        ui.set_room_settings_loaded(saved.0);
+        ui.set_room_admin_account_id(saved.1);
+        ui.set_room_admin_room_id(saved.2);
+        ui.set_page(saved.3);
+        ui.set_room_settings_refresh_required(saved.4);
+        ui.set_room_settings_dirty(saved.5);
+        ui.set_room_settings_staged(saved.6);
+        ui.set_room_admin_busy(saved.7);
+        ui.set_room_settings_confirmation(saved.8);
         settle(ui).await;
     }
 

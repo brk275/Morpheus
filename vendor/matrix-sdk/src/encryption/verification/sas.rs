@@ -208,6 +208,12 @@ impl SasVerification {
         self.inner.is_self_verification()
     }
 
+    /// The exact request flow this SAS belongs to. Read-only; does not advance
+    /// the verification or grant trust.
+    pub fn flow_id(&self) -> &str {
+        self.inner.flow_id().as_str()
+    }
+
     /// Get our own user id.
     pub fn own_user_id(&self) -> &UserId {
         self.inner.user_id()

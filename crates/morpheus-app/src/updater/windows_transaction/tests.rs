@@ -497,6 +497,24 @@ fn windows_committed_recovery_requires_the_journal_flush_before_accepting_stores
         &journal.uninstaller,
     )
     .unwrap();
+    // The complete reviewed payload includes both native-notice files. Its
+    // larger exact ledger still refuses any unexpected installed file, and
+    // validation never removes that file to make the tree acceptable.
+    let unexpected = root.path.join("unexpected.dll");
+    native::write_new(&unexpected, b"synthetic unexpected resource").unwrap();
+    assert!(matches!(
+        check_tree(
+            &root.path,
+            &journal.new,
+            &journal.new_marker,
+            &journal.uninstaller,
+        ),
+        Err(UpdateError::UnsupportedPackage)
+    ));
+    assert_eq!(
+        native::read(&unexpected, 128).unwrap(),
+        b"synthetic unexpected resource"
+    );
 }
 
 #[test]

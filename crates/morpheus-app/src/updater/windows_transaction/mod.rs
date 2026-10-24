@@ -242,7 +242,7 @@ fn enumerate(root: &Path, complete: bool) -> Result<Vec<String>, UpdateError> {
             } else {
                 return Err(UpdateError::UnsupportedPackage);
             }
-            if result.len() > 7 {
+            if result.len() > all_paths().count() {
                 return Err(UpdateError::UnsupportedPackage);
             }
         }

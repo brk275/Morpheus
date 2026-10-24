@@ -331,3 +331,181 @@ async fn test_request_user_identity() {
     assert_matches!(encryption.request_user_identity(bob_id).await, Ok(Some(_)));
     assert_matches!(encryption.get_user_identity(bob_id).await, Ok(Some(_)));
 }
+
+/// The explicit-room path must neither pick another DM nor create/invite.
+/// It reads first, consumes a prepared request once, and stores the returned
+/// event under the exact peer/room in the ordinary crypto verification cache.
+#[async_test]
+async fn test_explicit_peer_room_preparation_never_creates_invites_or_substitutes_a_dm() {
+    use matrix_sdk::encryption::identities::RequestVerificationError;
+    use matrix_sdk_test::{JoinedRoomBuilder, event_factory::EventFactory};
+    use ruma::{
+        event_id,
+        events::{
+            key::verification::VerificationMethod,
+            room::member::{MembershipState, RoomMemberEventContent},
+        },
+        room_id,
+    };
+    use wiremock::matchers::path_regex;
+
+    let server = MatrixMockServer::new().await;
+    server.mock_crypto_endpoints_preset().await;
+    let alice_id = owned_user_id!("@alice:example.org");
+    let bob_id = owned_user_id!("@bob:example.org");
+    let alice = server
+        .client_builder_for_crypto_end_to_end(&alice_id, &owned_device_id!("ALICE"))
+        .build()
+        .await;
+    let bob = server
+        .client_builder_for_crypto_end_to_end(&bob_id, &owned_device_id!("BOB"))
+        .build()
+        .await;
+    bootstrap_cross_signing(&alice).await;
+    bootstrap_cross_signing(&bob).await;
+    server.mock_sync().ok_and_run(&alice, |_| {}).await;
+    server.mock_sync().ok_and_run(&bob, |_| {}).await;
+    {
+        let machine = alice.olm_machine_for_testing().await;
+        machine.as_ref().unwrap().update_tracked_users([bob_id.as_ref()]).await.unwrap();
+    }
+    server.mock_sync().ok_and_run(&alice, |_| {}).await;
+    let identity = alice.encryption().get_user_identity(&bob_id).await.unwrap().unwrap();
+    let own = alice.encryption().get_user_identity(&alice_id).await.unwrap().unwrap();
+    let chosen = room_id!("!chosen:example.org");
+    let other = room_id!("!other:example.org");
+    let invited_peer = room_id!("!invited-peer:example.org");
+    server
+        .mock_sync()
+        .ok_and_run(&alice, |builder| {
+            builder.add_global_account_data(ruma::serde::Raw::new(&json!({
+            "type": "m.direct", "content": {(bob_id.as_str()): [chosen, other, invited_peer]}
+        })).unwrap().cast::<ruma::events::AnyGlobalAccountDataEvent>());
+            builder.add_joined_room(JoinedRoomBuilder::new(chosen));
+            builder.add_joined_room(JoinedRoomBuilder::new(other));
+            builder.add_joined_room(JoinedRoomBuilder::new(invited_peer));
+        })
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/(v3|r0)/createRoom$"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/invite$"))
+        .respond_with(ResponseTemplate::new(400))
+        .expect(0)
+        .mount(&server)
+        .await;
+    assert!(matches!(
+        identity.prepare_verification_in_room_with_methods(chosen, vec![]).await,
+        Err(RequestVerificationError::EmptyMethods)
+    ));
+    assert!(matches!(
+        own.prepare_verification_in_room_with_methods(chosen, vec![VerificationMethod::SasV1])
+            .await,
+        Err(RequestVerificationError::NotOtherIdentity)
+    ));
+    assert!(matches!(
+        identity
+            .prepare_verification_in_room_with_methods(
+                room_id!("!absent:example.org"),
+                vec![VerificationMethod::SasV1]
+            )
+            .await,
+        Err(RequestVerificationError::NotJoinedDirectRoom)
+    ));
+
+    let members = |room, membership| {
+        let factory = EventFactory::new().room(room);
+        vec![
+            factory
+                .event(RoomMemberEventContent::new(MembershipState::Join))
+                .sender(alice_id.as_ref())
+                .state_key(alice_id.as_ref())
+                .into_raw(),
+            factory
+                .event(RoomMemberEventContent::new(membership))
+                .sender(bob_id.as_ref())
+                .state_key(bob_id.as_ref())
+                .into_raw(),
+        ]
+    };
+    // An invited peer is not joined. Refusal must not turn into an invitation.
+    Mock::given(method("GET"))
+        .and(path_regex(format!("^/_matrix/client/v3/rooms/{invited_peer}/members$")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"chunk": members(invited_peer, MembershipState::Invite)})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(matches!(
+        identity
+            .prepare_verification_in_room_with_methods(
+                invited_peer,
+                vec![VerificationMethod::SasV1]
+            )
+            .await,
+        Err(RequestVerificationError::NotJoinedDirectRoom)
+    ));
+    Mock::given(method("GET"))
+        .and(path_regex(format!("^/_matrix/client/v3/rooms/{chosen}/members$")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"chunk": members(chosen, MembershipState::Join)})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    server.mock_room_state_encryption().plain().mount().await;
+    let event = event_id!("$explicit-peer-request");
+    Mock::given(method("PUT"))
+        .and(path_regex(format!("^/_matrix/client/v3/rooms/{chosen}/send/m.room.message/.*")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": event})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let prepared = identity
+        .prepare_verification_in_room_with_methods(chosen, vec![VerificationMethod::SasV1])
+        .await
+        .unwrap();
+    // Preparation did not send an event to either DM.
+    assert!(
+        !server.received_requests().await.unwrap().iter().any(|request| request.method.as_str()
+            == "PUT"
+            && request.url.path().contains("/send/"))
+    );
+    let request = prepared.send().await.unwrap();
+    assert_eq!(request.room_id(), Some(chosen));
+    assert_eq!(request.other_user_id(), bob_id);
+    assert_eq!(request.own_user_id(), alice_id);
+    assert_eq!(request.flow_id(), event.as_str());
+    assert!(!request.is_self_verification());
+    let cached =
+        alice.encryption().get_verification_request(&bob_id, event.as_str()).await.unwrap();
+    assert_eq!(cached.room_id(), Some(chosen));
+    assert_eq!(cached.other_user_id(), bob_id);
+
+    // A prepared value does not keep authority to a DM that is no longer in
+    // the client's joined DM routing set at send handoff.
+    let stale = identity
+        .prepare_verification_in_room_with_methods(chosen, vec![VerificationMethod::SasV1])
+        .await
+        .unwrap();
+    server
+        .mock_sync()
+        .ok_and_run(&alice, |builder| {
+            builder.add_global_account_data(
+                ruma::serde::Raw::new(&json!({
+                    "type": "m.direct", "content": {(bob_id.as_str()): [other]}
+                }))
+                .unwrap()
+                .cast::<ruma::events::AnyGlobalAccountDataEvent>(),
+            );
+        })
+        .await;
+    assert!(matches!(stale.send().await, Err(RequestVerificationError::NotJoinedDirectRoom)));
+}

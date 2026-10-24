@@ -4,7 +4,13 @@
 //! rebuilding unchanged Slint rows; only row_data formats a requested row.
 //! Account, room and feed-generation guards remain at the publication callers.
 
-use std::{any::Any, cell::RefCell, sync::Arc};
+use std::{
+    any::Any,
+    cell::RefCell,
+    collections::VecDeque,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 
 use morpheus_matrix::MessageInfo;
 use slint::{Model, ModelNotify, ModelRc, ModelTracker};
@@ -16,6 +22,9 @@ use crate::MessageItem;
 const MAX_ROW_NOTIFICATIONS: usize = 128;
 
 struct TimelineModel {
+    weak: Weak<Self>,
+    copy_scope: RefCell<Option<Rc<crate::message_copy::CopyScope>>>,
+    copy_projected: RefCell<VecDeque<usize>>,
     rows: RefCell<Vec<Arc<MessageInfo>>>,
     notify: ModelNotify,
     #[cfg(test)]
@@ -23,6 +32,20 @@ struct TimelineModel {
 }
 
 impl TimelineModel {
+    // Re-arm only the bounded recent projections. This never resets history
+    // geometry, scroll or drafts just to refresh opaque Copy metadata.
+    fn notify_copy_rows(&self) {
+        let rows: Vec<_> = self
+            .copy_projected
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|row| *row < self.rows.borrow().len())
+            .collect();
+        for row in rows {
+            self.notify.row_changed(row);
+        }
+    }
     fn replace(&self, next: Vec<Arc<MessageInfo>>) {
         let (prefix, removed, added) = {
             let old = self.rows.borrow();
@@ -110,9 +133,27 @@ impl Model for TimelineModel {
     fn row_data(&self, row: usize) -> Option<MessageItem> {
         let rows = self.rows.borrow();
         let info = rows.get(row)?;
+        {
+            let mut recent = self.copy_projected.borrow_mut();
+            if let Some(old) = recent.iter().position(|index| *index == row) {
+                recent.remove(old);
+            }
+            if recent.len() == MAX_ROW_NOTIFICATIONS {
+                recent.pop_front();
+            }
+            recent.push_back(row);
+        }
         #[cfg(test)]
         self.projected.set(self.projected.get() + 1);
-        Some(crate::live::message_item(info))
+        let mut item = crate::live::message_item(info);
+        item.copy_token = crate::message_copy::row_token(
+            self.weak.clone(),
+            self.copy_scope.borrow().as_ref(),
+            row,
+            info,
+        )
+        .into();
+        Some(item)
     }
 
     fn model_tracker(&self) -> &dyn ModelTracker {
@@ -126,20 +167,71 @@ impl Model for TimelineModel {
 
 /// Apply a snapshot to an existing timeline model or replace a non-timeline
 /// model (including an account-detach/room-change blank) with a fresh one.
+#[cfg(test)]
 pub(crate) fn update_shared(
     current: ModelRc<MessageItem>,
     rows: Vec<Arc<MessageInfo>>,
 ) -> ModelRc<MessageItem> {
+    // Unscoped/test snapshots deliberately carry no Copy capability.
+    update_scoped(current, rows, None)
+}
+
+/// The actual feed publication's pre-guard captured original capability.
+pub(crate) fn update_scoped(
+    current: ModelRc<MessageItem>,
+    rows: Vec<Arc<MessageInfo>>,
+    scope: Option<Rc<crate::message_copy::CopyScope>>,
+) -> ModelRc<MessageItem> {
     if let Some(model) = current.as_any().downcast_ref::<TimelineModel>() {
+        // Source replacement precedes a reset that can synchronously project.
         model.replace(rows);
+        let reuse = {
+            let old = model.copy_scope.borrow();
+            old.as_ref()
+                .zip(scope.as_ref())
+                .filter(|(a, b)| crate::message_copy::same_scope(a, b))
+                .map(|(old, _)| old.clone())
+        };
+        let next = reuse.or(scope);
+        let same = match (model.copy_scope.borrow().as_ref(), next.as_ref()) {
+            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            *model.copy_scope.borrow_mut() = next;
+            model.notify_copy_rows();
+        }
         current
     } else {
-        ModelRc::new(TimelineModel {
+        let model = Rc::new_cyclic(|weak| TimelineModel {
+            weak: weak.clone(),
+            copy_scope: RefCell::new(scope),
+            copy_projected: RefCell::new(VecDeque::new()),
             rows: RefCell::new(rows),
             notify: ModelNotify::default(),
             #[cfg(test)]
             projected: std::cell::Cell::new(0),
-        })
+        });
+        ModelRc::from(model)
+    }
+}
+
+/// A modal/context callback can only renew an already-bound exact target;
+/// it cannot turn old-account rows into a fresh publication.
+pub(crate) fn refresh_copy_context(current: &ModelRc<MessageItem>) {
+    let Some(model) = current.as_any().downcast_ref::<TimelineModel>() else {
+        return;
+    };
+    let next = crate::message_copy::context_scope(model.copy_scope.borrow().as_ref());
+    let same = match (model.copy_scope.borrow().as_ref(), next.as_ref()) {
+        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same {
+        *model.copy_scope.borrow_mut() = next;
+        model.notify_copy_rows();
     }
 }
 
@@ -172,6 +264,24 @@ pub(crate) fn has_event_at(model: &ModelRc<MessageItem>, index: usize, event_id:
     model
         .row_data(index)
         .is_some_and(|row| row.event_id.as_str() == event_id)
+}
+
+/// Exact row identity without projection or an event-ID search.
+pub(crate) fn has_exact_row(
+    model: &ModelRc<MessageItem>,
+    index: usize,
+    row: &Arc<MessageInfo>,
+) -> bool {
+    model
+        .as_any()
+        .downcast_ref::<TimelineModel>()
+        .is_some_and(|model| {
+            model
+                .rows
+                .borrow()
+                .get(index)
+                .is_some_and(|shown| Arc::ptr_eq(shown, row))
+        })
 }
 
 /// The row showing `event_id`, projecting only that row.
@@ -317,6 +427,34 @@ pub(crate) mod tests {
         row
     }
 
+    #[test]
+    fn copy_capability_requires_the_exact_model_row_and_index_after_edits_or_moves() {
+        let original = Arc::new(fixture(1));
+        let second = Arc::new(fixture(2));
+        let model = update_shared(ModelRc::default(), vec![original.clone(), second.clone()]);
+        assert!(has_exact_row(&model, 0, &original));
+        let mut edited = original.as_ref().clone();
+        edited.body = "Edited accepted text".into();
+        edited.rich_markdown = None;
+        edited.rich_accessible = None;
+        let edited = Arc::new(edited);
+        let model = update_shared(model, vec![edited.clone(), second.clone()]);
+        assert!(
+            !has_exact_row(&model, 0, &original),
+            "same event ID must not revive the old row"
+        );
+        assert!(has_exact_row(&model, 0, &edited));
+        let other_model = update_shared(ModelRc::default(), vec![original.clone()]);
+        assert!(has_exact_row(&other_model, 0, &original));
+        assert!(!has_exact_row(&model, 0, &original));
+        let model = update_shared(model, vec![second, edited.clone()]);
+        assert!(
+            !has_exact_row(&model, 0, &edited),
+            "an old index is not the moved row"
+        );
+        assert!(has_exact_row(&model, 1, &edited));
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Change {
         Changed(usize, usize),
@@ -410,6 +548,48 @@ pub(crate) mod tests {
         assert!(!has_event_at(&model, 10_000, "$fixture-7654:example.org"));
         assert!(!has_event_at(&model, 9_999, "$fixture-9999:example.org"));
         assert_eq!(projection_count(&model), 0);
+    }
+
+    #[test]
+    fn copy_rearm_notifies_only_bounded_recent_rows_without_resetting_the_history() {
+        let original: Vec<_> = (0..10_000).map(|i| Arc::new(fixture(i))).collect();
+        let model = update_shared(ModelRc::default(), original.clone());
+        for index in 9_700..10_000 {
+            assert!(model.row_data(index).is_some());
+        }
+        let observer = Box::pin(ModelChangeListenerContainer::new(Observer {
+            model: model.clone(),
+            changes: RefCell::new(Vec::new()),
+        }));
+        model
+            .model_tracker()
+            .attach_peer(observer.as_ref().model_peer());
+        let before = projection_count(&model);
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        assert_eq!(stored.copy_projected.borrow().len(), MAX_ROW_NOTIFICATIONS);
+        stored.notify_copy_rows();
+        let changes = observer.as_ref().get().changes.borrow();
+        assert_eq!(changes.len(), MAX_ROW_NOTIFICATIONS);
+        assert!(
+            changes
+                .iter()
+                .all(|change| matches!(change, Change::Changed(_, 10_000))),
+            "Copy rearm must not reset or resize the actual history"
+        );
+        assert_eq!(
+            projection_count(&model) - before,
+            MAX_ROW_NOTIFICATIONS,
+            "only the actual observer's bounded reentrant reads project rows"
+        );
+        assert!(
+            stored
+                .rows
+                .borrow()
+                .iter()
+                .zip(&original)
+                .all(|(a, b)| Arc::ptr_eq(a, b)),
+            "Copy metadata refresh preserves all immutable payload allocations"
+        );
     }
 
     #[test]
