@@ -238,7 +238,7 @@ mod tests {
                 || {
                     let _ = encryption_stop.send(());
                 },
-                async move {
+                async {
                     // Actual expiration phase cannot start before BOTH stop
                     // authorities have been submitted by production helper.
                     let (room, encryption) =
