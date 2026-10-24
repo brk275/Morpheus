@@ -1560,6 +1560,73 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
         self.assertEqual(result, {})
         self.assertNotIn("PRIVATE", json.dumps(result))
 
+    def test_account_removal_observations_keep_only_actual_closed_facts_before_first_panic(self):
+        stage = "MORPHEUS_APP_RECOVERY_STAGE observer_revocation\n"
+        marker = "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage="
+        panic = ("thread '" + acceptance_module.APP_RECOVERY_TESTS[0]
+                 + "' panicked at crates/morpheus-app/src/live.rs:42:7:\n"
+                 "Cannot remove first account: AccountRemovalPending\n")
+        observed = (marker + "logout_pending\n"
+                    + marker + "existing_finished complete=0 credentials=1 store=0\n")
+        output = (marker + "registry_remaining\n" + stage + observed + panic
+                  + marker + "wrong_account complete=1 credentials=1 store=1\nPRIVATE_RESPONSE\n")
+        result = acceptance_module.app_recovery_diagnostics(output)
+        self.assertEqual(result["cleanup_failure"]["category"], "account_removal_pending")
+        self.assertEqual(result["account_removal_observations"], [
+            {"stage": "logout_pending"},
+            {"stage": "existing_finished", "complete": False, "credentials": True, "store": False},
+        ])
+        self.assertNotIn("PRIVATE", json.dumps(result))
+        for name in acceptance_module.ACCOUNT_REMOVAL_STAGES:
+            with self.subTest(stage=name):
+                result = acceptance_module.app_recovery_diagnostics(stage + marker + name + "\r\n" + panic)
+                self.assertEqual(result["account_removal_observations"], [{"stage": name}])
+        for output in (stage + observed, stage + observed + panic.replace("first account", "other account"),
+                       "MORPHEUS_APP_RECOVERY_STAGE typed_retention\n" + observed + panic):
+            self.assertNotIn("account_removal_observations", acceptance_module.app_recovery_diagnostics(output))
+
+    def test_account_removal_observations_reject_partial_bad_oversized_and_excess_lines(self):
+        stage = "MORPHEUS_APP_RECOVERY_STAGE observer_revocation\n"
+        marker = "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage="
+        panic = ("thread '" + acceptance_module.APP_RECOVERY_TESTS[0]
+                 + "' panicked at crates/morpheus-app/src/live.rs:42:7:\n"
+                 "Cannot remove first account: AccountRemovalPending\n")
+        expected = acceptance_module.app_recovery_diagnostics(stage + panic)
+        for invalid in (
+                "PRIVATE_STAGE", "unknown", "existing_finished complete=0",
+                "existing_finished complete=0 credentials=0", "existing_finished complete=true credentials=0 store=0",
+                "existing_finished complete=0 credentials=0 store=2",
+                "existing_finished complete=0 credentials=0 store=0 PRIVATE_RESPONSE",
+                "existing_finished complete=0 credentials=0 store=0 complete=1",
+                "existing_finished\rPRIVATE_RESPONSE", "x" * (acceptance_module.ACCOUNT_REMOVAL_MAX_LINE_LENGTH + 1)):
+            with self.subTest(invalid=invalid):
+                output = stage + marker + "logout_pending\n" + marker + invalid + "\n" + panic
+                self.assertEqual(acceptance_module.app_recovery_diagnostics(output), expected)
+        excess = (marker + "logout_pending\n") * (acceptance_module.ACCOUNT_REMOVAL_MAX_LINES + 1)
+        self.assertEqual(acceptance_module.app_recovery_diagnostics(stage + excess + panic), expected)
+
+    def test_account_removal_observations_are_published_only_after_the_existing_scan_gate(self):
+        output = ("MORPHEUS_APP_RECOVERY_STAGE observer_revocation\n"
+                  "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage=existing_observation_error\n"
+                  "thread '" + acceptance_module.APP_RECOVERY_TESTS[0]
+                  + "' panicked at crates/morpheus-app/src/live.rs:42:7:\n"
+                  "Cannot remove first account: AccountRemovalPending\nPRIVATE_RESPONSE\n")
+        for scanner_code in (0, 1):
+            with self.subTest(scanner_code=scanner_code), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                with self.child(runner, output, timeout=True, scanner_code=scanner_code) as (visible, _):
+                    with self.assertRaisesRegex(RuntimeError, "deadline" if scanner_code == 0 else "credential scanning"):
+                        runner.run(acceptance_module.APP_RECOVERY_LABEL, ["mock-test"], test=True, seconds=1)
+                records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                if scanner_code == 0:
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["app_recovery_diagnostics"]["account_removal_observations"],
+                                     [{"stage": "existing_observation_error"}])
+                else:
+                    self.assertEqual(records, [])
+                self.assertNotIn("PRIVATE", visible.getvalue())
+                self.assertEqual(runner.results, [])
+
     def test_nonpanic_quotes_and_malformed_headers_keep_last_allowed_stage(self):
         output = ("MORPHEUS_APP_RECOVERY_STAGE observer_revocation\n"
                   "server quoted panicked at PRIVATE_PATH\n"

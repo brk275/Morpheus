@@ -165,6 +165,17 @@ APP_RECOVERY_PROGRESS = re.compile(
     r"MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation ([a-z_]{1,48}))$", re.MULTILINE,
 )
 APP_RECOVERY_CHECK = re.compile(r"^MORPHEUS_APP_RECOVERY_CHECK ([a-z_]{1,48})=(true|false)$", re.MULTILINE)
+ACCOUNT_REMOVAL_STAGES = frozenset((
+    "logout_pending", "existing_observation_timeout", "existing_observation_error",
+    "existing_finished", "wrong_account", "registry_remaining",
+))
+ACCOUNT_REMOVAL_LINE = re.compile(r"^MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION[^\n]*$", re.MULTILINE)
+ACCOUNT_REMOVAL_OBSERVATION = re.compile(
+    r"MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage=([a-z_]{1,48})"
+    r"(?: complete=([01]) credentials=([01]) store=([01]))?",
+)
+ACCOUNT_REMOVAL_MAX_LINES = 8
+ACCOUNT_REMOVAL_MAX_LINE_LENGTH = 160
 # Share the same bounded first-panic header between process and recovery facts.
 NATIVE_PANIC = re.compile(
     r"^thread '[^'\r\n]{1,256}'(?: \([0-9]{1,10}\))? panicked at ([^\r\n]{1,1024})$",
@@ -525,16 +536,36 @@ def drafts_completed(output: str) -> bool:
     return {"fixture", "complete", "recovery_fixture", "recovery_complete"} <= stages
 
 
+def account_removal_observations(output: str, start: int, end: int) -> list[dict] | None:
+    """Only closed diagnostic facts; malformed or excess lines publish nothing."""
+    observations = []
+    for index, match in enumerate(ACCOUNT_REMOVAL_LINE.finditer(output, start, end)):
+        # Check span before copying a potentially oversized captured line.
+        if (index >= ACCOUNT_REMOVAL_MAX_LINES
+                or match.end() - match.start() > ACCOUNT_REMOVAL_MAX_LINE_LENGTH):
+            return None
+        value = ACCOUNT_REMOVAL_OBSERVATION.fullmatch(match[0].removesuffix("\r"))
+        if value is None or value[1] not in ACCOUNT_REMOVAL_STAGES:
+            return None
+        observation = {"stage": value[1]}
+        if value[2] is not None:
+            observation.update(complete=value[2] == "1", credentials=value[3] == "1", store=value[4] == "1")
+        observations.append(observation)
+    return observations
+
+
 def app_recovery_diagnostics(output: str) -> dict:
     panic = NATIVE_PANIC.search(output)
     end = panic.start() if panic else len(output)
     result = {}
+    stage_start = 0
     # Serial libtest cases continue after a panic; later stages are unrelated
     # to the first failure recorded by native_process_diagnostics.
     for match in APP_RECOVERY_PROGRESS.finditer(output, 0, end):
         if match[1] in APP_RECOVERY_CASES:
             result["stage"] = match[1]
             result.pop("boundary", None)
+            stage_start = match.end()
         elif (result.get("stage") == "write_revocation"
               and match[2] in APP_RECOVERY_WRITE_BOUNDARIES):
             result["boundary"] = match[2]
@@ -563,6 +594,9 @@ def app_recovery_diagnostics(output: str) -> dict:
                 "case": "observer_revocation", "operation": "first_account_logout",
                 "category": category,
             }
+            observations = account_removal_observations(output, stage_start, end)
+            if observations:
+                result["account_removal_observations"] = observations
     return result
 
 
