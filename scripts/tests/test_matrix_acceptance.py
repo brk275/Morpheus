@@ -483,7 +483,7 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             arguments = {"ring_case": None, "oauth_checks": None, "element_checks": None}
             record = runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=True, **arguments)
             self.assertEqual(record["passed"], 1)
-            self.assertEqual(len(record["app_timeline_checks"]), 20)
+            self.assertEqual(len(record["app_timeline_checks"]), 23)
             self.assertTrue(all(record["app_timeline_checks"].values()))
             with self.assertRaises(RuntimeError):
                 runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=False, **arguments)
