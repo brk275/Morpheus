@@ -613,6 +613,29 @@ impl UpdateController {
         crate::windows_audio::request_admitted_shutdown(admission)
     }
 
+    /// The UI/native adapter receives only the actual gate receipt while this
+    /// controller's own restart reservation is still held. Release inner before
+    /// synchronous UI withdrawal or cleanup callbacks can reenter this controller.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn request_macos_shutdown(&self, reason: crate::macos_termination::Reason) -> bool {
+        if (self.shared.account_access_busy)() || !crate::macos_termination::coordinator_available()
+        {
+            return false;
+        }
+        let admission = {
+            let Ok(inner) = self.shared.inner.lock() else {
+                return false;
+            };
+            self.shared
+                .security
+                .admit_shutdown(inner.restart_lease.as_ref())
+        };
+        let Some(admission) = admission else {
+            return false;
+        };
+        crate::macos_termination::request_admitted_shutdown(admission, reason)
+    }
+
     pub fn bind_ui(&self, ui: &AppWindow) -> JoinHandle<()> {
         apply_snapshot(ui, self);
         let controller = self.clone();
@@ -789,7 +812,13 @@ fn apply_snapshot(ui: &AppWindow, controller: &UpdateController) {
                 "Wait for the account or security operation before restarting Morpheus.".into(),
             );
         }
-        #[cfg(not(all(windows, feature = "native-calls")))]
+        #[cfg(target_os = "macos")]
+        if !controller.request_macos_shutdown(crate::macos_termination::Reason::Restart) {
+            ui.set_update_status(
+                "Wait for the account or security operation before restarting Morpheus.".into(),
+            );
+        }
+        #[cfg(not(any(target_os = "macos", all(windows, feature = "native-calls"))))]
         if slint::quit_event_loop().is_err() {
             ui.set_update_status(
                 "Update preparation is complete. Close Morpheus to finish restarting.".into(),

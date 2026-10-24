@@ -14,6 +14,7 @@ use morpheus_rtc::{AudioDeviceSelection, CallInfo};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
 
+pub(crate) use super::worker::IncomingDrainError;
 use super::{
     DeclineOutcome,
     audio::IncomingAudio,
@@ -44,6 +45,8 @@ pub(crate) struct IncomingUi {
     decline: Option<JoinHandle<()>>,
     audio: Arc<IncomingAudio>,
     audio_task: Option<JoinHandle<()>>,
+    failure: Result<(), IncomingDrainError>,
+    completion: Option<Result<(), IncomingDrainError>>,
 }
 
 impl IncomingUi {
@@ -324,6 +327,8 @@ impl IncomingUi {
             decline: Some(decline),
             audio,
             audio_task: Some(audio_task),
+            failure: Ok(()),
+            completion: None,
         }
     }
 
@@ -367,20 +372,30 @@ impl IncomingUi {
     }
 
     pub(crate) async fn finish(&mut self) {
+        let _ = self.finish_checked().await;
+    }
+
+    pub(crate) async fn finish_checked(&mut self) -> Result<(), IncomingDrainError> {
         self.shutdown();
-        if let Some(task) = self.presentation.take() {
-            let _ = task.await;
+        if let Some(result) = self.completion {
+            return result;
         }
-        if let Some(task) = self.answer.take() {
-            let _ = task.await;
+        // shutdown deliberately aborts these four UI roles. Observe each
+        // original handle before take, preserving a cancelled observation and
+        // retaining any earlier joined failure across the next await.
+        for task in [
+            &mut self.presentation,
+            &mut self.answer,
+            &mut self.decline,
+            &mut self.audio_task,
+        ] {
+            let joined = super::worker::join_incoming_task(task, true).await;
+            self.failure = super::worker::combine_drain(self.failure, joined);
         }
-        if let Some(task) = self.decline.take() {
-            let _ = task.await;
-        }
-        if let Some(task) = self.audio_task.take() {
-            let _ = task.await;
-        }
-        self.worker.finish().await;
+        let actor = self.worker.finish_checked().await;
+        self.failure = super::worker::combine_drain(self.failure, actor);
+        self.completion = Some(self.failure);
+        self.failure
     }
 }
 

@@ -26,10 +26,17 @@ use std::{
 use slint::{ComponentHandle, Model, Weak};
 use tokio::{
     runtime::Handle,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
 };
 
-use crate::{AppWindow, navigation_target::NavigationTarget};
+use crate::{
+    AppWindow,
+    navigation_target::NavigationTarget,
+    notifications::{
+        DesktopNotifications,
+        owned::{Close, Role},
+    },
+};
 
 const DIALOG_OPEN: &str = "Finish the open account dialog, then open the notification again.";
 const INVITE_OPEN: &str = "Accept or decline this invitation in the room list.";
@@ -38,49 +45,94 @@ const ACCOUNT_GONE: &str = "This notification's account is no longer available."
 const OPEN_WAIT: Duration = Duration::from_secs(2 * 60);
 const OPEN_POLL: Duration = Duration::from_millis(500);
 
+#[derive(Clone)]
+struct Pending {
+    target: NavigationTarget,
+    click: u64,
+    deadline: Instant,
+}
+
 pub(crate) struct Activator {
     ui: Weak<AppWindow>,
-    runtime: Handle,
+    closing: Close,
+    pending: watch::Sender<Option<Pending>>,
     /// Counts clicks; a click waiting for its account is dropped by a newer
     /// one.
     clicks: AtomicU64,
+    #[cfg(test)]
+    executed: AtomicU64,
+    #[cfg(test)]
+    admitted: AtomicU64,
 }
 
 impl Activator {
     pub(crate) fn register(
         ui: &AppWindow,
-        runtime: Handle,
+        runtime: &Handle,
+        notifications: &DesktopNotifications,
         activations: Option<mpsc::Receiver<NavigationTarget>>,
     ) -> Arc<Self> {
+        let (pending, pending_receiver) = watch::channel(None);
         let activator = Arc::new(Self {
             ui: ui.as_weak(),
-            runtime: runtime.clone(),
+            closing: notifications.cancellation(),
+            pending,
             clicks: AtomicU64::new(0),
+            #[cfg(test)]
+            executed: AtomicU64::new(0),
+            #[cfg(test)]
+            admitted: AtomicU64::new(0),
         });
         if let Some(mut activations) = activations {
             let weak = Arc::downgrade(&activator);
-            runtime.spawn(async move {
-                while let Some(target) = activations.recv().await {
+            let closing = activator.closing.clone();
+            notifications.spawn_app_task(Role::Activations, runtime, async move {
+                while let Some(Some(target)) = closing.guard(activations.recv()).await {
                     let Some(activator) = weak.upgrade() else {
                         return;
                     };
-                    let opener = activator.clone();
-                    if activator
-                        .ui
-                        .upgrade_in_event_loop(move |ui| opener.open(&ui, target))
-                        .is_err()
-                    {
+                    if !activator.queue_target(target) {
                         return;
                     }
                 }
             });
         }
+        notifications.spawn_app_task(
+            Role::PendingOpen,
+            runtime,
+            wait_for_account(
+                Arc::downgrade(&activator),
+                pending_receiver,
+                activator.closing.clone(),
+            ),
+        );
         activator
+    }
+
+    /// The same actual callback is used by the retained receiver and the
+    /// disposable generated-window regression. No SDK/controller owner is queued.
+    fn queue_target(self: &Arc<Self>, target: NavigationTarget) -> bool {
+        let opener = Arc::downgrade(self);
+        self.ui
+            .upgrade_in_event_loop(move |ui| {
+                if let Some(opener) = opener.upgrade() {
+                    #[cfg(test)]
+                    opener.executed.fetch_add(1, Ordering::AcqRel);
+                    opener.open(&ui, target);
+                }
+            })
+            .is_ok()
     }
 
     /// Open one clicked banner. UI thread only.
     fn open(self: &Arc<Self>, ui: &AppWindow, target: NavigationTarget) {
+        if self.closing.is_closed() || ui.get_application_closing() {
+            return;
+        }
+        #[cfg(test)]
+        self.admitted.fetch_add(1, Ordering::AcqRel);
         let click = self.clicks.fetch_add(1, Ordering::AcqRel) + 1;
+        self.pending.send_replace(None);
         if ui.window().is_minimized() {
             ui.window().set_minimized(false);
         }
@@ -141,33 +193,154 @@ impl Activator {
     /// Open `target` once its account is open; activating it may first ask
     /// for the app password. A newer click, another account becoming open or
     /// `OPEN_WAIT` drops it.
-    fn open_when_live(self: &Arc<Self>, target: NavigationTarget, click: u64) {
-        let activator = Arc::downgrade(self);
-        self.runtime.spawn(async move {
-            let deadline = Instant::now() + OPEN_WAIT;
-            while Instant::now() < deadline {
-                tokio::time::sleep(OPEN_POLL).await;
-                let Some(this) = activator.upgrade() else {
-                    return;
-                };
-                let (send, receive) = oneshot::channel();
-                let target = target.clone();
-                let opener = this.clone();
-                let asked = this.ui.upgrade_in_event_loop(move |ui| {
-                    let current = opener.clicks.load(Ordering::Acquire) == click;
-                    let waiting = current && !ui.get_live_session();
-                    if current
-                        && !waiting
-                        && ui.get_active_account_local_id().as_str() == target.account_id()
-                    {
-                        opener.open(&ui, target);
-                    }
-                    let _ = send.send(waiting);
-                });
-                if asked.is_err() || !receive.await.unwrap_or(false) {
-                    return;
-                }
+    fn open_when_live(&self, target: NavigationTarget, click: u64) {
+        if !self.closing.is_closed() {
+            // One finite latest intent, not one detached task per click.
+            self.pending.send_replace(Some(Pending {
+                target,
+                click,
+                deadline: Instant::now() + OPEN_WAIT,
+            }));
+        }
+    }
+}
+
+/// Holds only the registered controller while the existing fixture pumps its
+/// real queued callback. Counters observe actual callback/body entry, not a
+/// second copy of either admission predicate.
+#[cfg(test)]
+pub(crate) struct QueuedActivationForTest(Arc<Activator>);
+
+#[cfg(test)]
+impl QueuedActivationForTest {
+    pub(crate) fn observations(&self) -> (u64, u64) {
+        (
+            self.0.executed.load(Ordering::Acquire),
+            self.0.admitted.load(Ordering::Acquire),
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn queue_activation_for_test(
+    ui: &AppWindow,
+    runtime: &Handle,
+    notifications: &DesktopNotifications,
+    target: NavigationTarget,
+) -> Result<QueuedActivationForTest, &'static str> {
+    let activator =
+        Activator::register(ui, runtime, notifications, notifications.take_activations());
+    if !activator.queue_target(target) {
+        return Err("notification activation callback could not be queued");
+    }
+    Ok(QueuedActivationForTest(activator))
+}
+
+async fn wait_for_account(
+    activator: std::sync::Weak<Activator>,
+    mut pending: watch::Receiver<Option<Pending>>,
+    closing: Close,
+) {
+    loop {
+        let intent = pending.borrow_and_update().clone();
+        let Some(intent) = intent else {
+            if closing
+                .guard(pending.changed())
+                .await
+                .is_none_or(|changed| changed.is_err())
+            {
+                return;
             }
+            continue;
+        };
+        tokio::select! {
+            biased;
+            _ = closing.cancelled() => return,
+            changed = pending.changed() => {
+                if changed.is_err() { return; }
+                continue;
+            }
+            _ = tokio::time::sleep(OPEN_POLL) => {},
+        }
+        let Some(this) = activator.upgrade() else {
+            return;
+        };
+        if this.clicks.load(Ordering::Acquire) != intent.click || Instant::now() >= intent.deadline
+        {
+            // A newer value is never cleared by an older observation.
+            this.pending.send_if_modified(|current| {
+                if current
+                    .as_ref()
+                    .is_some_and(|current| current.click == intent.click)
+                {
+                    *current = None;
+                    true
+                } else {
+                    false
+                }
+            });
+            continue;
+        }
+        let (send, receive) = oneshot::channel();
+        let opener = activator.clone();
+        let deadline = intent.deadline;
+        let click = intent.click;
+        let asked = this.ui.upgrade_in_event_loop(move |ui| {
+            let Some(opener) = opener.upgrade() else {
+                return;
+            };
+            if opener.closing.is_closed() || ui.get_application_closing() {
+                return;
+            }
+            let current = opener.clicks.load(Ordering::Acquire) == intent.click
+                && Instant::now() < intent.deadline;
+            let waiting = current && !ui.get_live_session();
+            if current
+                && !waiting
+                && ui.get_active_account_local_id().as_str() == intent.target.account_id()
+            {
+                opener.open(&ui, intent.target);
+            } else if !waiting {
+                opener.pending.send_if_modified(|pending| {
+                    if pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.click == intent.click)
+                    {
+                        *pending = None;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            let _ = send.send(waiting);
         });
+        drop(this);
+        if asked.is_err() {
+            return;
+        }
+        // Close releases the queued reply, never waiting on a stopped UI loop.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let answer = closing
+            .guard(tokio::time::timeout(remaining, receive))
+            .await;
+        if answer.is_none() {
+            return;
+        }
+        if !matches!(answer, Some(Ok(Ok(true)))) {
+            if let Some(this) = activator.upgrade() {
+                this.pending.send_if_modified(|pending| {
+                    if pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.click == click)
+                    {
+                        *pending = None;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+        }
     }
 }

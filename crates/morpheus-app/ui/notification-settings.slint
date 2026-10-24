@@ -2,6 +2,8 @@
 // visible account. Rust (notification_center::rules) owns every value in
 // NotificationRulesState; this file only presents it and reports choices.
 
+import { StyleTokens } from "style-tokens.slint";
+
 // One joined room's rule. `room-id` routes a choice and is never shown;
 // `name` is sanitized in Rust.
 export struct NotificationRoomItem {
@@ -151,7 +153,7 @@ export component RuleAction inherits Rectangle {
         width: root.width;
         height: root.height;
         border-radius: root.border-radius;
-        border-width: 2px;
+        border-width: StyleTokens.focus-width;
         border-color: root.focus-color;
         background: transparent;
     }
@@ -170,8 +172,10 @@ export component RuleOption inherits RuleAction {
     preferred-width: option-layout.preferred-width;
     horizontal-stretch: 0;
     min-height: max(30px, 22px * root.text-scale);
-    border-radius: 7px;
-    border-width: 1px;
+    // Match the shared text-button geometry, including square corners and
+    // high contrast's minimum border, without changing selection or input.
+    border-radius: StyleTokens.control-corner;
+    border-width: StyleTokens.line-width;
     border-color: root.selected ? root.palette.accent : root.palette.divider;
     background: root.selected ? root.palette.selection : (root.enabled && root.has-hover ? root.palette.hover : root.palette.panel);
     option-layout := HorizontalLayout {

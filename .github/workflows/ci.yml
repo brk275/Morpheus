@@ -521,6 +521,77 @@ jobs:
             grep -Fqx -- "$cpal_test: test" "$RUNNER_TEMP/morpheus-cpal-tests.txt"
             cargo test --locked -p morpheus-rtc -p cpal --features morpheus-rtc/native-devices --lib "$cpal_test" -- --exact
           done
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # These exact same-version Winit library cases exercise the typed
+            # quit protocol and timer metadata, without initializing AppKit.
+            winit_tests=(
+              platform_impl::macos::termination::tests::repeated_later_does_not_readmit_and_in_progress_refuses_before_callback
+              platform_impl::macos::termination::tests::native_now_requires_a_new_actual_allow_observation
+              platform_impl::macos::termination::tests::exhausted_or_gone_owner_never_grants_termination
+              platform_impl::macos::termination::tests::native_context_retain_release_never_owns_the_main_thread_payload
+            )
+            cargo test --locked -p winit --lib -- --list > "$RUNNER_TEMP/morpheus-winit-tests.txt"
+            for winit_test in "${winit_tests[@]}"; do
+              grep -Fqx -- "$winit_test: test" "$RUNNER_TEMP/morpheus-winit-tests.txt"
+              cargo test --locked -p winit --lib "$winit_test" -- --exact | tee "$RUNNER_TEMP/morpheus-winit-result.txt"
+              test "$(grep -Fxc -- "test $winit_test ... ok" "$RUNNER_TEMP/morpheus-winit-result.txt")" = 1
+              test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-winit-result.txt")" = 1
+            done
+          fi
+          # Run only the changed native notification library boundaries. The
+          # preserved upstream integration/real-world tests are not selected.
+          notification_tests=(
+            owned::tests::native_identity_is_exact_normalized_and_never_parses_a_path_or_token
+          )
+          case "$RUNNER_OS" in
+            Linux)
+              notification_tests+=(
+                owned::tests::cancelled_wait_uses_actual_wake_and_drops_its_registration
+                owned::linux::tests::only_direct_parsed_session_transports_are_admitted_before_connection
+                owned::linux::tests::signal_requires_exact_daemon_path_interface_id_and_advertised_action
+                owned::linux::tests::absent_owner_activates_only_the_exact_service_then_resolves_without_notify_replay
+                owned::linux::tests::foreign_receipts_invalid_activation_and_cancelled_owner_resolution_never_authorize_send
+              )
+              ;;
+            macOS|Windows) ;;
+            *) echo "Unsupported native notification synthetic-test platform." >&2; exit 1 ;;
+          esac
+          cargo test --locked -p notify-rust --lib -- --list > "$RUNNER_TEMP/morpheus-notify-rust-tests.txt"
+          for notification_test in "${notification_tests[@]}"; do
+            test "$(grep -Fxc -- "$notification_test: test" "$RUNNER_TEMP/morpheus-notify-rust-tests.txt")" = 1
+            cargo test --locked -p notify-rust --lib "$notification_test" -- --exact | tee "$RUNNER_TEMP/morpheus-notify-rust-result.txt"
+            test "$(grep -Fxc -- "test $notification_test ... ok" "$RUNNER_TEMP/morpheus-notify-rust-result.txt")" = 1
+            test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-notify-rust-result.txt")" = 1
+          done
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            mac_notification_tests=(
+              owned::tests::native_abi_receipts_never_classify_unknown_stages_as_release
+              owned::tests::exact_callback_identity_and_unknown_native_kinds_never_authorize_a_click
+              owned::tests::admitted_callback_body_keeps_the_same_reservation_until_real_release_and_join
+            )
+            cargo test --locked -p mac-notification-sys --lib -- --list > "$RUNNER_TEMP/morpheus-mac-notification-tests.txt"
+            for mac_notification_test in "${mac_notification_tests[@]}"; do
+              test "$(grep -Fxc -- "$mac_notification_test: test" "$RUNNER_TEMP/morpheus-mac-notification-tests.txt")" = 1
+              cargo test --locked -p mac-notification-sys --lib "$mac_notification_test" -- --exact | tee "$RUNNER_TEMP/morpheus-mac-notification-result.txt"
+              test "$(grep -Fxc -- "test $mac_notification_test ... ok" "$RUNNER_TEMP/morpheus-mac-notification-result.txt")" = 1
+              test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-mac-notification-result.txt")" = 1
+            done
+          fi
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            winrt_notification_tests=(
+              owned::tests::exact_identity_and_closed_callback_never_admit_a_late_response
+              owned::tests::retirement_facts_preserve_exact_tokens_and_distinguish_unknown_registration
+              owned::tests::retirement_reserves_the_same_identity_before_an_admitted_body_can_return
+              owned::tests::callback_panic_closes_once_before_payload_retention_and_foreign_return
+            )
+            cargo test --locked -p tauri-winrt-notification --lib -- --list > "$RUNNER_TEMP/morpheus-winrt-notification-tests.txt"
+            for winrt_notification_test in "${winrt_notification_tests[@]}"; do
+              test "$(grep -Fxc -- "$winrt_notification_test: test" "$RUNNER_TEMP/morpheus-winrt-notification-tests.txt")" = 1
+              cargo test --locked -p tauri-winrt-notification --lib "$winrt_notification_test" -- --exact | tee "$RUNNER_TEMP/morpheus-winrt-notification-result.txt"
+              test "$(grep -Fxc -- "test $winrt_notification_test ... ok" "$RUNNER_TEMP/morpheus-winrt-notification-result.txt")" = 1
+              test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-winrt-notification-result.txt")" = 1
+            done
+          fi
       - name: Test pinned SDK sticky receipt and redaction regressions
         if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'sdk')
         id: sdk-receipt-tests

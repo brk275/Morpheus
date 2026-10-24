@@ -807,6 +807,7 @@ struct DraftWork {
     closed: bool,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     failed: bool,
+    ownership_failed: bool,
 }
 impl DraftWork {
     fn spawn(
@@ -816,6 +817,11 @@ impl DraftWork {
     ) -> bool {
         let _ = self.poll();
         if self.closed || self.failed {
+            return false;
+        }
+        // Reserve before spawn so registration cannot allocate after creating
+        // the actual task and lose its sole handle during unwinding.
+        if self.tasks.try_reserve(1).is_err() {
             return false;
         }
         self.tasks.push(runtime.spawn(task));
@@ -829,14 +835,21 @@ impl DraftWork {
         while index < self.tasks.len() {
             match std::pin::Pin::new(&mut self.tasks[index]).poll(&mut context) {
                 std::task::Poll::Ready(result) => {
-                    self.failed |= result.is_err();
+                    if let Err(error) = result {
+                        self.failed = true;
+                        if error.is_panic() {
+                            std::mem::forget(error.into_panic());
+                        }
+                    }
                     drop(self.tasks.swap_remove(index));
                 }
                 std::task::Poll::Pending => index += 1,
             }
         }
-        self.tasks.is_empty().then_some(if self.failed {
-            Err(DraftDrainError)
+        self.tasks.is_empty().then_some(if self.ownership_failed {
+            Err(DraftDrainError::Ownership)
+        } else if self.failed {
+            Err(DraftDrainError::Worker)
         } else {
             Ok(())
         })
@@ -884,10 +897,48 @@ mod draft_work_shutdown_tests {
             assert!(matches!(cleanup, Ok(Ok(()))));
         });
     }
+
+    #[test]
+    fn joined_draft_failure_does_not_drop_its_panic_payload_or_lose_its_receipt() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            struct Payload(Arc<AtomicBool>);
+            impl Drop for Payload {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let payload_dropped = Arc::new(AtomicBool::new(false));
+            let payload = Payload(payload_dropped.clone());
+            let mut work = DraftWork::default();
+            let admitted = work.spawn(runtime.handle(), async move {
+                std::panic::panic_any(payload);
+            });
+            work.closed = true;
+            let result = loop {
+                if let Some(result) = work.poll() {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            };
+            let repeated = work.poll();
+            assert!(admitted && work.tasks.is_empty());
+            assert!(!payload_dropped.load(Ordering::Acquire));
+            assert_eq!(result, Err(DraftDrainError::Worker));
+            assert_eq!(repeated, Some(result));
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DraftDrainError;
+pub(crate) enum DraftDrainError {
+    NotClosed,
+    Ownership,
+    Worker,
+}
 impl std::fmt::Display for DraftDrainError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         out.write_str("Draft/send task completion could not be confirmed.")
@@ -1197,10 +1248,7 @@ impl LiveUi {
     pub(crate) fn close_action_admission(&self) {
         self.verification_work.close();
         self.marker_scans.close();
-        let mut work = self
-            .draft_work
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut work = self.draft_work_state();
         work.closed = true;
         self.manager.close_selection_admission();
         // This is the only sender. The existing writer finishes an entered
@@ -1246,11 +1294,23 @@ impl LiveUi {
         self.verification_work.drain().await
     }
 
+    fn draft_work_state(&self) -> std::sync::MutexGuard<'_, DraftWork> {
+        self.draft_work.lock().unwrap_or_else(|error| {
+            let mut work = error.into_inner();
+            work.closed = true;
+            work.ownership_failed = true;
+            work
+        })
+    }
+
+    pub(crate) async fn finish_verification_shutdown(
+        &self,
+    ) -> Result<(), crate::verification_work::VerificationShutdownError> {
+        self.verification_work.finish_shutdown().await
+    }
+
     pub(crate) fn action_admission_closed(&self) -> bool {
-        self.draft_work
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .closed
+        self.draft_work_state().closed
     }
 
     pub(crate) fn spawn_draft_work(
@@ -1258,10 +1318,7 @@ impl LiveUi {
         runtime: &Handle,
         task: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> bool {
-        let mut work = self
-            .draft_work
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut work = self.draft_work_state();
         work.spawn(runtime, task)
     }
 
@@ -1270,12 +1327,9 @@ impl LiveUi {
     pub(crate) async fn drain_draft_work(&self) -> Result<(), DraftDrainError> {
         loop {
             let result = {
-                let mut work = self
-                    .draft_work
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let mut work = self.draft_work_state();
                 if !work.closed {
-                    return Err(DraftDrainError);
+                    return Err(DraftDrainError::NotClosed);
                 }
                 work.poll()
             };
@@ -7821,6 +7875,28 @@ mod stale_observer_tests {
             .await
             .expect("The actual marker owner must finish");
 
+        // Existing fixture only: get_room is a cache lookup, not a fetch.
+        // Return observations until the original account/profile cleanup ends.
+        let notification_revocation = async {
+            let client = manager
+                .active_client()
+                .await
+                .map_err(|_| "notification fixture client unavailable")?;
+            let room_id = matrix_sdk::ruma::RoomId::parse(&a_room)
+                .map_err(|_| "notification fixture room ID invalid")?;
+            let room = client
+                .get_room(&room_id)
+                .ok_or("notification fixture room unavailable")?;
+            drop(client);
+            crate::notifications::exercise_queue_revocation_for_test(
+                &manager,
+                renewed.clone(),
+                room,
+            )
+            .await
+        }
+        .await;
+
         logout_fixture_account(&manager, &a_account.id)
             .await
             .expect("Cannot remove first account");
@@ -7831,6 +7907,9 @@ mod stale_observer_tests {
         drop(manager);
         close_profile(directory, live).await;
         eprintln!("\nMORPHEUS_APP_MARKER_AUTHORITY_CHECK complete=true");
+        notification_revocation
+            .expect("revoked notification queue must release before active publication");
+        eprintln!("MORPHEUS_APP_NOTIFICATION_REVOCATION_CHECK complete=true");
     }
 
     /// A created room opens only through its own owned reveal, and only for

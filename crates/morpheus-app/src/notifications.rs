@@ -8,13 +8,18 @@
 //! it and reading the room can withdraw it. No message text is kept after the
 //! banner is handed to the OS, and nothing is persisted.
 
+mod native;
+pub(crate) mod owned;
 mod presenter;
+
+#[cfg(test)]
+use std::future::Future;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex, RwLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -31,7 +36,7 @@ use serde_json::Value;
 use slint::{ComponentHandle, Weak as UiWeak};
 use tokio::{
     runtime::Handle,
-    sync::{mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot, watch},
 };
 
 // The presenter's report and withdrawal handle, for the one other surface
@@ -40,6 +45,9 @@ use tokio::{
 pub(crate) use self::presenter::{Guarded, Handover};
 pub(crate) use self::presenter::{PresenterEvent, Withdrawal};
 use crate::{AppWindow, navigation_target::NavigationTarget};
+pub(crate) use native::{finish_native_work, observe_retained_native_work, shutdown_native};
+use owned::{Close, NotificationWork, Role};
+pub(crate) use owned::{NotificationDrainFailure, combine_app_work, observe_retained_app_work};
 
 const MAX_NOTIFICATION_AGE: Duration = Duration::from_secs(5 * 60);
 const SEEN_TTL: Duration = Duration::from_secs(15 * 60);
@@ -252,7 +260,7 @@ struct Candidate {
     sdk_sound: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PlannedNotification {
     summary: String,
     body: String,
@@ -262,6 +270,85 @@ struct PlannedNotification {
 struct QueuedNotification {
     candidate: Candidate,
     selection: AccountSelection,
+}
+
+struct PendingNotification {
+    queued: QueuedNotification,
+    room: Room,
+    // The fixture receipt field drops after the actual queued SDK Room clone.
+    #[cfg(test)]
+    _released: Option<QueueRelease>,
+}
+
+#[cfg(test)]
+struct QueueRelease(Option<oneshot::Sender<()>>);
+#[cfg(test)]
+impl Drop for QueueRelease {
+    fn drop(&mut self) {
+        if let Some(send) = self.0.take() {
+            let _ = send.send(());
+        }
+    }
+}
+
+/// Unlike a channel receiver parked behind an entered native show, the
+/// account watcher can synchronously release revoked queued Room/Client owners.
+/// No SDK operation runs under this lock. At most QUEUE_CAPACITY records live.
+#[derive(Default)]
+struct NotificationQueue {
+    pending: Mutex<VecDeque<PendingNotification>>,
+    wake: Notify,
+}
+
+impl NotificationQueue {
+    fn push(&self, item: PendingNotification, close: &Close) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        pending.retain(|item| item.queued.selection.is_current());
+        if !close.is_closed()
+            && item.queued.selection.is_current()
+            && pending.len() < QUEUE_CAPACITY
+        {
+            pending.push_back(item);
+            self.wake.notify_one();
+        }
+    }
+
+    fn discard_revoked(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|item| item.queued.selection.is_current());
+    }
+
+    fn clear(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    async fn next(&self, close: &Close) -> Option<PendingNotification> {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if close.is_closed() {
+                return None;
+            }
+            if let Some(item) = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+            {
+                return Some(item);
+            }
+            close.guard(notified).await?;
+        }
+    }
 }
 
 /// One banner handed to the OS: identifiers only.
@@ -392,8 +479,10 @@ pub struct DesktopNotifications {
     manager: Arc<AccountManager>,
     config: RwLock<Config>,
     ui: UiWeak<AppWindow>,
-    stopped: AtomicBool,
-    queued: mpsc::Sender<QueuedNotification>,
+    work: NotificationWork,
+    native: native::NativeBook,
+    closing: Close,
+    queued: Arc<NotificationQueue>,
     shown: Mutex<ShownBanners>,
     next_token: AtomicU64,
     room_modes: Mutex<HashMap<(String, String), (NotificationMode, Instant)>>,
@@ -412,15 +501,18 @@ impl DesktopNotifications {
         ui: UiWeak<AppWindow>,
         runtime: &Handle,
     ) -> Arc<Self> {
-        let (queued, receiver) = mpsc::channel(QUEUE_CAPACITY);
+        let work = NotificationWork::desktop();
+        let closing = work.cancellation();
         let (presenter_events, presenter_receiver) = mpsc::channel(MAX_SHOWN);
         let (activation_tx, activations) = mpsc::channel(ACTIVATION_CAPACITY);
         let service = Arc::new(Self {
             manager: manager.clone(),
             config: RwLock::new(config),
             ui,
-            stopped: AtomicBool::new(false),
-            queued,
+            work,
+            native: native::NativeBook::desktop(),
+            closing,
+            queued: Arc::new(NotificationQueue::default()),
             shown: Mutex::new(ShownBanners::default()),
             next_token: AtomicU64::new(1),
             room_modes: Mutex::new(HashMap::new()),
@@ -429,12 +521,34 @@ impl DesktopNotifications {
             activation_tx,
             activations: Mutex::new(Some(activations)),
         });
-        runtime.spawn(watch_accounts(manager.clone(), Arc::downgrade(&service)));
-        runtime.spawn(deliver_queued(Arc::downgrade(&service), receiver));
-        runtime.spawn(resolve_presenter_events(
-            Arc::downgrade(&service),
-            presenter_receiver,
-        ));
+        service.spawn_app_task(
+            Role::Accounts,
+            runtime,
+            watch_accounts(
+                manager,
+                Arc::downgrade(&service),
+                service.cancellation(),
+                service.queued.clone(),
+            ),
+        );
+        service.spawn_app_task(
+            Role::Delivery,
+            runtime,
+            deliver_queued(
+                Arc::downgrade(&service),
+                service.queued.clone(),
+                service.cancellation(),
+            ),
+        );
+        service.spawn_app_task(
+            Role::PresenterEvents,
+            runtime,
+            resolve_presenter_events(
+                Arc::downgrade(&service),
+                presenter_receiver,
+                service.cancellation(),
+            ),
+        );
         service
     }
 
@@ -451,13 +565,41 @@ impl DesktopNotifications {
     /// banners are dropped and shown banners are withdrawn where the platform
     /// allows, since a quit app can no longer open them.
     pub fn shutdown(&self) {
-        self.stopped.store(true, Ordering::Release);
+        self.work.close();
+        self.native.close();
+        self.queued.clear();
         self.shown().retain_accounts(None);
     }
 
     /// Morpheus is quitting; no more notification work starts.
     pub(crate) fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        self.closing.is_closed()
+    }
+
+    pub(crate) fn cancellation(&self) -> Close {
+        self.closing.clone()
+    }
+
+    pub(crate) fn spawn_app_task(
+        &self,
+        role: Role,
+        runtime: &Handle,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        self.work.spawn(role, runtime, future)
+    }
+
+    /// Join this service's actual application tasks, including cfg(test)
+    /// local owners. Never infer their completion from empty production slots.
+    /// Native presenter/listener completion is a separate boundary.
+    pub(crate) async fn finish_app_work(&self) -> Result<(), NotificationDrainFailure> {
+        self.shutdown();
+        self.work.finish_app_work().await
+    }
+
+    /// Actual local native owner, including fixture-local constructors.
+    pub(crate) async fn finish_native_work(&self) -> Result<(), NotificationDrainFailure> {
+        self.native.finish().await
     }
 
     /// The single receiver of clicked banners' targets. Each target is
@@ -537,7 +679,11 @@ impl DesktopNotifications {
         // the post of an account's latest change shows anything, and it shows
         // the state as it is when it runs (see `shown_pause`).
         let post = line_post(self.ignore_pause.clone(), account_id.to_owned(), version);
+        let closing = self.cancellation();
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            if closing.is_closed() || ui.get_application_closing() {
+                return;
+            }
             let shown = ui.get_active_account_local_id();
             if let Some(paused) = post(shown.as_str()) {
                 ui.global::<crate::NotificationRulesState>()
@@ -572,7 +718,7 @@ impl DesktopNotifications {
     /// valid configuration each time.
     #[cfg(feature = "native-calls")]
     pub(crate) fn silent_banner_identity(&self, account_id: &str, private: bool) -> Option<bool> {
-        if self.stopped.load(Ordering::Acquire) {
+        if self.is_stopped() {
             return None;
         }
         let config = self
@@ -590,10 +736,10 @@ impl DesktopNotifications {
     /// Morpheus not quitting, are checked right before the backend's actual
     /// send (`presenter::Handover`); refused, nothing reaches the OS. With
     /// every listener taken, this module's oldest withdrawable banner is
-    /// withdrawn first, as for its own. Blocking: call from a blocking
-    /// thread, never from the async runtime's blocking pool.
+    /// withdrawn first, as for its own. The awaited result is only the real
+    /// submission result; the fixed native book owns the worker/listener joins.
     #[cfg(feature = "native-calls")]
-    pub(crate) fn show_silent_banner(
+    pub(crate) async fn show_silent_banner(
         self: &Arc<Self>,
         summary: &str,
         body: &str,
@@ -602,13 +748,14 @@ impl DesktopNotifications {
         runtime: Handle,
         handover: Handover,
     ) -> Result<Guarded, BannerUnavailable> {
-        if self.stopped.load(Ordering::Acquire) || !handover() {
+        if self.is_stopped() {
             return Ok(Guarded::Refused);
         }
+        let full = self.native.listeners_full();
         {
             let mut shown = self.shown();
             shown.prune(Instant::now());
-            if presenter::listeners_full() {
+            if full {
                 shown.withdraw_oldest();
             }
         }
@@ -617,16 +764,23 @@ impl DesktopNotifications {
         let checked: Handover = Arc::new(move || {
             service
                 .upgrade()
-                .is_some_and(|service| !service.stopped.load(Ordering::Acquire))
+                .is_some_and(|service| !service.is_stopped())
                 && handover()
         });
         // The backend's error text is dropped here: it reaches no status or log.
-        let shown =
-            presenter::show_guarded(silent_plan(summary, body), token, events, runtime, checked)
-                .map_err(|_| BannerUnavailable)?;
+        let shown = presenter::show_guarded(
+            &self.native,
+            silent_plan(summary, body),
+            token,
+            events,
+            runtime,
+            checked,
+        )
+        .await
+        .map_err(|_| BannerUnavailable)?;
         match shown {
             // Quitting meanwhile: withdrawn where the platform allows.
-            Guarded::Handed(Some(withdrawal)) if self.stopped.load(Ordering::Acquire) => {
+            Guarded::Handed(Some(withdrawal)) if self.is_stopped() => {
                 withdrawal.withdraw();
                 Ok(Guarded::Handed(None))
             }
@@ -640,8 +794,15 @@ impl DesktopNotifications {
 
     async fn ui_snapshot(&self) -> Option<UiSnapshot> {
         let (send, receive) = oneshot::channel();
+        let closing = self.cancellation();
+        if closing.is_closed() {
+            return None;
+        }
         self.ui
             .upgrade_in_event_loop(move |ui| {
+                if closing.is_closed() || ui.get_application_closing() {
+                    return;
+                }
                 let account_id = ui.get_active_account_local_id().to_string();
                 let room_id = ui.get_active_room_id().to_string();
                 let live = ui.get_live_session();
@@ -677,41 +838,35 @@ impl DesktopNotifications {
             .ok()
     }
 
-    async fn enqueue(
+    /// SDK callbacks capture the exact selection synchronously and only
+    /// enqueue bounded data. No Room/store await is left inside SDK sync.
+    fn enqueue(
         &self,
         account: &AccountInfo,
         selection: AccountSelection,
         notification: MatrixNotification,
         room: Room,
     ) {
-        if self.stopped.load(Ordering::Acquire)
-            || !selection.is_current()
-            || selection.account_id() != account.id
-            || self
-                .manager
-                .active_account()
-                .await
-                .is_none_or(|active| active.id != account.id)
-        {
+        if self.is_stopped() || !selection.is_current() || selection.account_id() != account.id {
             return;
         }
-        let Some(mut candidate) =
+        let Some(candidate) =
             Candidate::from_matrix(account, room.room_id().as_str(), notification)
         else {
             return;
         };
-        candidate.room_name = room
-            .display_name()
-            .await
-            .map(|name| name.to_string())
-            .unwrap_or_else(|_| candidate.room_id.clone());
-        // Never wait for a desktop notification server inside SDK sync.
-        if selection.is_current() {
-            let _ = self.queued.try_send(QueuedNotification {
-                candidate,
-                selection,
-            });
-        }
+        self.queued.push(
+            PendingNotification {
+                queued: QueuedNotification {
+                    candidate,
+                    selection,
+                },
+                room,
+                #[cfg(test)]
+                _released: None,
+            },
+            &self.closing,
+        );
     }
 
     /// Read the account, UI visibility, and current policy together as late as
@@ -719,14 +874,19 @@ impl DesktopNotifications {
     /// setting into the native notification presenter.
     async fn plan_current(&self, queued: &QueuedNotification) -> Option<PlannedNotification> {
         let candidate = &queued.candidate;
-        if self.stopped.load(Ordering::Acquire)
+        if self.is_stopped()
             || !queued.selection.is_current()
             || queued.selection.account_id() != candidate.account_id
         {
             return None;
         }
         // Nothing is looked up for an account no longer live on screen.
-        let ui = self.ui_snapshot().await?;
+        let ui = self
+            .closing
+            .guard(queued.selection.guard(self.ui_snapshot()))
+            .await
+            .flatten()
+            .flatten()?;
         if !ui.live || ui.account_id != candidate.account_id {
             return None;
         }
@@ -757,32 +917,40 @@ impl DesktopNotifications {
         };
         // Account changes can happen during any await. Returning to the same
         // account must not revive this earlier notification.
-        let current = || !self.stopped.load(Ordering::Acquire) && queued.selection.is_current();
-        plan_after_lookup(candidate, noted, lookup, snapshot, config, current, now_ms).await
+        let current = || !self.is_stopped() && queued.selection.is_current();
+        self.closing
+            .guard(queued.selection.guard(plan_after_lookup(
+                candidate, noted, lookup, snapshot, config, current, now_ms,
+            )))
+            .await
+            .flatten()
+            .flatten()
     }
 
     /// Resolve one clicked banner to its target. Only a remembered, unexpired
     /// banner of a still-saved account with the same Matrix user resolves; a
     /// removed account is never brought back by an old banner.
     async fn resolve_activation(&self, token: u64) {
-        if self.stopped.load(Ordering::Acquire) {
+        if self.is_stopped() {
             return;
         }
         let Some(banner) = self.shown().take(token, Instant::now()) else {
             return;
         };
-        let accounts = self.manager.accounts().await;
-        let pending_removal = self
-            .manager
-            .app_password_status()
-            .await
+        let Some(accounts) = self.closing.guard(self.manager.accounts()).await else {
+            return;
+        };
+        let Some(status) = self.closing.guard(self.manager.app_password_status()).await else {
+            return;
+        };
+        let pending_removal = status
             .pending_removals
             .iter()
             .any(|id| id == banner.target.account_id());
         let saved = accounts.iter().any(|account| {
             account.id == banner.target.account_id() && account.user_id == banner.account_user_id
         });
-        if !saved || pending_removal || self.stopped.load(Ordering::Acquire) {
+        if !saved || pending_removal || self.is_stopped() {
             withdraw(banner);
             return;
         }
@@ -791,57 +959,225 @@ impl DesktopNotifications {
     }
 }
 
-async fn watch_accounts(manager: Arc<AccountManager>, service: Weak<DesktopNotifications>) {
+impl Drop for DesktopNotifications {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+async fn watch_accounts(
+    manager: Arc<AccountManager>,
+    service: Weak<DesktopNotifications>,
+    closing: Close,
+    queue: Arc<NotificationQueue>,
+) {
     let mut selected = manager.subscribe_active_account();
     loop {
+        if closing.is_closed() {
+            return;
+        }
+        if let Some(service) = service.upgrade() {
+            service.queued.discard_revoked();
+        }
         let account = selected.borrow().clone();
+        let selection = account
+            .as_ref()
+            .and_then(|account| manager.account_selection(&account.id));
         if let Some(account) = account {
             let weak = service.clone();
             let callback_account = account.clone();
-            // The manager rechecks the exact selected target and owns the
-            // once-only registration slot for this SDK client's lifetime.
-            let _ = manager
-                .register_notification_handler_for(
-                    &account.id,
-                    move |notification, room, _client| {
-                        let account = callback_account.clone();
-                        // Capture at callback invocation, before the async body
-                        // can be queued behind an A → B → A transition.
-                        let service = weak.upgrade();
-                        let selection = service
-                            .as_ref()
-                            .and_then(|service| service.manager.account_selection(&account.id));
-                        async move {
-                            if let (Some(service), Some(selection)) = (service, selection) {
-                                service
-                                    .enqueue(&account, selection, notification, room)
-                                    .await;
-                            }
+            // The SDK invokes this closure before awaiting its returned future.
+            // No old callback can reconstruct authority after returning here.
+            let registration = manager.register_notification_handler_for(
+                &account.id,
+                move |notification, room, _client| {
+                    if let Some(service) = weak.upgrade() {
+                        if let Some(selection) =
+                            service.manager.account_selection(&callback_account.id)
+                        {
+                            service.enqueue(&callback_account, selection, notification, room);
                         }
-                    },
-                )
-                .await;
+                    }
+                    std::future::ready(())
+                },
+            );
+            if closing.guard(registration).await.is_none() {
+                return;
+            }
         }
-        // A removed or signed-out account's banners must not stay clickable.
         if let Some(service) = service.upgrade() {
-            let saved = manager.accounts().await;
-            service.shown().retain_accounts(Some(saved.as_slice()));
+            service.queued.discard_revoked();
+            let saved = match &selection {
+                Some(selection) => closing
+                    .guard(selection.guard(manager.accounts()))
+                    .await
+                    .flatten(),
+                None => closing.guard(manager.accounts()).await,
+            };
+            if let Some(saved) = saved {
+                if !closing.is_closed() {
+                    service.shown().retain_accounts(Some(saved.as_slice()));
+                }
+            }
+            service.queued.discard_revoked();
         }
-        if service.upgrade().is_none() || selected.changed().await.is_err() {
+        if service.upgrade().is_none() {
             return;
+        }
+        match wait_account_change(&queue, &mut selected, selection.as_ref(), &closing).await {
+            None => return,
+            Some(AccountChange::Published) => {}
+            Some(AccountChange::Revoked) => {
+                if closing
+                    .guard(selected.changed())
+                    .await
+                    .is_none_or(|changed| changed.is_err())
+                {
+                    return;
+                }
+            }
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountChange {
+    Published,
+    Revoked,
+}
+
+async fn wait_account_change(
+    queue: &NotificationQueue,
+    selected: &mut watch::Receiver<Option<AccountInfo>>,
+    selection: Option<&AccountSelection>,
+    closing: &Close,
+) -> Option<AccountChange> {
+    let revoked = async {
+        match selection {
+            Some(selection) => selection.revoked().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = closing.cancelled() => None,
+        _ = revoked => {
+            // Release original queued client owners before waiting for core's
+            // later active-feed publication/stop_sync completion.
+            queue.discard_revoked();
+            Some(AccountChange::Revoked)
+        },
+        changed = selected.changed() => changed.ok().map(|()| AccountChange::Published),
+    }
+}
+
+/// Existing disposable-account fixture only, with its real original selection
+/// and cache Room. No display or additional network request runs here.
+#[cfg(test)]
+pub(crate) async fn exercise_queue_revocation_for_test(
+    manager: &AccountManager,
+    selection: AccountSelection,
+    room: Room,
+) -> Result<(), &'static str> {
+    let mut selected = manager.subscribe_active_account();
+    let Some(account) = selected.borrow().clone() else {
+        return Err("notification fixture has no active account");
+    };
+    if !selection.is_current() || selection.account_id() != account.id {
+        return Err("notification fixture selection is not current");
+    }
+    let queue = NotificationQueue::default();
+    let closing = Close::default();
+    let (send, mut released) = oneshot::channel();
+    let candidate = Candidate {
+        account_id: account.id.clone(),
+        account_user_id: account.user_id.clone(),
+        room_id: room.room_id().to_string(),
+        room_name: String::new(),
+        sender_id: "@notification-fixture:example.org".into(),
+        event_key: "notification-owner-probe".into(),
+        event_id: None,
+        thread_root: None,
+        timestamp_ms: None,
+        kind: Kind::Message,
+        body: None,
+        sdk_highlight: false,
+        sdk_sound: false,
+    };
+    queue.push(
+        PendingNotification {
+            queued: QueuedNotification {
+                candidate,
+                selection: selection.clone(),
+            },
+            room,
+            _released: Some(QueueRelease(Some(send))),
+        },
+        &closing,
+    );
+    let held_before = matches!(
+        released.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    );
+    let mut waiting = Box::pin(wait_account_change(
+        &queue,
+        &mut selected,
+        Some(&selection),
+        &closing,
+    ));
+    let first = std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx))).await;
+    // Real synchronous authority revocation precedes active-feed publication;
+    // no test edits or fabricates the selection capability.
+    manager.close_selection_admission();
+    let outcome = tokio::time::timeout(UI_QUERY_TIMEOUT, &mut waiting).await;
+    drop(waiting);
+    let released_before_cleanup = released.try_recv().is_ok();
+    let publication_unchanged = matches!(selected.has_changed(), Ok(false))
+        && selected
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.id == account.id);
+    // Cleanup cannot repair the captured observations and precedes errors.
+    queue.clear();
+    if !held_before
+        || !first.is_pending()
+        || !matches!(outcome, Ok(Some(AccountChange::Revoked)))
+        || !released_before_cleanup
+        || !publication_unchanged
+    {
+        return Err(
+            "notification queue did not release its revoked room before active publication",
+        );
+    }
+    Ok(())
+}
+
 async fn deliver_queued(
     service: Weak<DesktopNotifications>,
-    mut receiver: mpsc::Receiver<QueuedNotification>,
+    queue: Arc<NotificationQueue>,
+    closing: Close,
 ) {
     let mut seen = HashMap::<String, Instant>::new();
-    while let Some(queued) = receiver.recv().await {
+    loop {
+        let Some(PendingNotification {
+            mut queued, room, ..
+        }) = queue.next(&closing).await
+        else {
+            return;
+        };
         let Some(service) = service.upgrade() else {
             return;
         };
+        let name = closing
+            .guard(queued.selection.guard(room.display_name()))
+            .await;
+        drop(room);
+        let Some(Some(name)) = name else {
+            continue;
+        };
+        queued.candidate.room_name = name
+            .map(|name| name.to_string())
+            .unwrap_or_else(|_| queued.candidate.room_id.clone());
         if service.plan_current(&queued).await.is_none() {
             continue;
         }
@@ -859,42 +1195,59 @@ async fn deliver_queued(
             queued.candidate.event_id.as_deref(),
             queued.candidate.thread_root.as_deref(),
         );
-
-        // `show` can block on D-Bus or the OS notification service. Serialize
-        // deliveries and keep the Matrix sync loop free to process events.
-        let runtime = Handle::current();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            // A blocking worker may begin after account switching, room
-            // navigation, or a Settings save. Query all three again directly
-            // before handing the notification to the OS.
-            let Some(plan) = runtime.block_on(service.plan_current(&queued)) else {
-                return Ok(());
-            };
-            let candidate = queued.candidate;
-            // Keep click handling for this banner: forget banners past their
-            // lifetime and, with every listener taken, withdraw the oldest
-            // banner that can be withdrawn, which releases its listener.
-            {
-                let mut shown = service.shown();
-                shown.prune(Instant::now());
-                if presenter::listeners_full() {
-                    shown.withdraw_oldest();
-                }
+        // Preparation has no live Room. The weak handover captures only this
+        // ORIGINAL selection/candidate and never reconstructs same-ID authority.
+        let Some(plan) = service.plan_current(&queued).await else {
+            continue;
+        };
+        let full = service.native.listeners_full();
+        {
+            let mut shown = service.shown();
+            shown.prune(Instant::now());
+            if full {
+                shown.withdraw_oldest();
             }
-            let token = service.next_token.fetch_add(1, Ordering::AcqRel);
-            let withdrawal =
-                presenter::show(plan, token, service.presenter_events.clone(), runtime)?;
-            if service.stopped.load(Ordering::Acquire) {
-                // Quitting: a banner shown meanwhile is withdrawn where possible.
-                if let Some(withdrawal) = withdrawal {
-                    withdrawal.withdraw();
-                }
-            } else {
-                // One banner per room: once shown, a newer message replaces
-                // the room's earlier banners where the platform can withdraw
-                // them. A failed show leaves them in place.
-                service.withdraw_room(&candidate.account_id, &candidate.room_id);
-                if let Some(target) = target {
+        }
+        let token = service.next_token.fetch_add(1, Ordering::AcqRel);
+        let candidate = queued.candidate.clone();
+        let original = Arc::downgrade(&service);
+        let runtime = Handle::current();
+        let checking_runtime = runtime.clone();
+        let expected = plan.clone();
+        let handover: presenter::Handover = Arc::new(move || {
+            let Some(service) = original.upgrade() else {
+                return false;
+            };
+            if service.is_stopped() || !queued.selection.is_current() {
+                return false;
+            }
+            // Revalidate all original policy/privacy/ignore/visibility facts
+            // at native entry. A different plan is refused, never leaked under
+            // a newer privacy ceiling. This future is original-selection guarded.
+            checking_runtime
+                .block_on(service.plan_current(&queued))
+                .as_ref()
+                == Some(&expected)
+        });
+        let shown = presenter::show(
+            &service.native,
+            plan,
+            token,
+            service.presenter_events.clone(),
+            runtime,
+            handover,
+        )
+        .await;
+        match shown {
+            Ok(presenter::Guarded::Refused) => (),
+            Ok(presenter::Guarded::Handed(withdrawal)) => {
+                if service.is_stopped() {
+                    if let Some(withdrawal) = withdrawal {
+                        withdrawal.withdraw();
+                    }
+                } else if let Some(target) = target {
+                    service.withdraw_room(&candidate.account_id, &candidate.room_id);
+                    let publication = withdrawal.as_ref().and_then(Withdrawal::publication);
                     service.shown().insert(ShownBanner {
                         token,
                         target,
@@ -902,15 +1255,16 @@ async fn deliver_queued(
                         shown_at: Instant::now(),
                         withdrawal,
                     });
+                    // Publish only AFTER the real shown record exists and its
+                    // lock is released. An early exact response is delivered once.
+                    if let Some(publication) = publication {
+                        publication.publish();
+                    }
+                } else if let Some(withdrawal) = withdrawal {
+                    withdrawal.withdraw();
                 }
             }
-            // Without a well-formed target the banner stays, and a click on
-            // it resolves to nothing.
-            Ok(())
-        })
-        .await;
-        if let Ok(Err(error)) = result {
-            eprintln!("Could not display a desktop notification: {error}");
+            Err(()) => eprintln!("Could not display a desktop notification."),
         }
     }
 }
@@ -918,15 +1272,14 @@ async fn deliver_queued(
 async fn resolve_presenter_events(
     service: Weak<DesktopNotifications>,
     mut events: mpsc::Receiver<PresenterEvent>,
+    closing: Close,
 ) {
-    while let Some(event) = events.recv().await {
+    while let Some(Some(event)) = closing.guard(events.recv()).await {
         let Some(service) = service.upgrade() else {
             return;
         };
         match event {
             PresenterEvent::Activated(token) => service.resolve_activation(token).await,
-            // A dismissed banner can no longer be opened or withdrawn. Message
-            // banners are never guarded, so their listeners report no failure.
             PresenterEvent::Closed(token) | PresenterEvent::Failed(token) => {
                 let _ = service.shown().take(token, Instant::now());
             }

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 # Keep vendored library development feature sets outside the application workspace.
-exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto"]
+exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto", "vendor/winit", "vendor/notify-rust", "vendor/mac-notification-sys", "vendor/tauri-winrt-notification"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
@@ -32,6 +32,12 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/brk275/Morpheus"
 
 [patch.crates-io]
+# Same-version owned native notification operations; originals preserved.
+notify-rust = { path = "vendor/notify-rust" }
+mac-notification-sys = { path = "vendor/mac-notification-sys" }
+tauri-winrt-notification = { path = "vendor/tauri-winrt-notification" }
+# Same-version existing-delegate owned macOS termination; originals preserved.
+winit = { path = "vendor/winit" }
 # Same-version CPAL: retained, fallible macOS native shutdown.
 cpal = { path = "vendor/cpal" }
 # Same-version ALSA wrapper exposes consuming checked PCM close without a Drop retry.

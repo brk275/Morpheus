@@ -21,6 +21,9 @@ mod room_panel;
 mod rules;
 mod uncertainty;
 
+#[cfg(test)]
+pub(crate) use activation::queue_activation_for_test;
+
 use std::sync::Arc;
 
 use morpheus_config::{Config, ConfigStore};
@@ -60,8 +63,21 @@ pub(crate) fn register(
         store,
         runtime.clone(),
     );
-    let activator = Activator::register(ui, runtime.clone(), notifications.take_activations());
-    runtime.spawn(read_markers::run(live, notifications));
+    let activator = Activator::register(
+        ui,
+        runtime,
+        &notifications,
+        notifications.take_activations(),
+    );
+    notifications.spawn_app_task(
+        crate::notifications::owned::Role::ReadMarkers,
+        runtime,
+        read_markers::run(
+            Arc::downgrade(&live),
+            Arc::downgrade(&notifications),
+            notifications.cancellation(),
+        ),
+    );
     NotificationCenter {
         _activator: activator,
         _rules: rules,

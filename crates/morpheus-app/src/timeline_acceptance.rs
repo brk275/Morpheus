@@ -784,7 +784,19 @@ impl Acceptance {
                     .ui
                     .set_update_status("Security cleanup blocks closing Morpheus.".into());
             }
-            #[cfg(not(all(windows, feature = "native-calls")))]
+            #[cfg(target_os = "macos")]
+            if context
+                .ui
+                .window()
+                .dispatch_event_with_result(slint::platform::WindowEvent::CloseRequested)
+                .is_err()
+            {
+                result.set(Some(false));
+                context
+                    .ui
+                    .set_update_status("The guarded window close request failed.".into());
+            }
+            #[cfg(not(any(target_os = "macos", all(windows, feature = "native-calls"))))]
             let _ = slint::quit_event_loop();
         })?;
         Ok(Running { outcome, done })

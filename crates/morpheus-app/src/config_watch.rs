@@ -3,7 +3,7 @@
 //! completion observes the producer and bridge's actual native joins.
 
 use crate::{AppWindow, LiveUi, apply_loaded_config, apply_notification_settings};
-use morpheus_config::{ConfigStore, LoadedConfig, WatchStop};
+use morpheus_config::{ConfigError, ConfigStore, LoadedConfig, OwnedWatch, WatchStop};
 use slint::ComponentHandle;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -17,6 +17,7 @@ pub(crate) enum ConfigWatchError {
     Producer,
     Bridge,
     Refresh,
+    Admission,
     Ownership,
 }
 
@@ -93,16 +94,23 @@ impl Shared {
 
 type BridgeSlot = Arc<Mutex<Option<JoinHandle<Result<(), ConfigWatchError>>>>>;
 
+type ProducerSlot = Arc<Mutex<Option<OwnedWatch<Result<LoadedConfig, ConfigError>>>>>;
+
 struct BridgeJoined {
-    result: Result<(), ConfigWatchError>,
+    bridge: Result<(), ConfigWatchError>,
+    producer: Result<(), ConfigWatchError>,
 }
 
 pub(crate) struct ConfigWatch {
     shared: Arc<Shared>,
     bridge: BridgeSlot,
+    // The bridge only borrows this native owner. A bridge panic leaves the
+    // actual producer reachable here for the same supervisor's checked join.
+    producer: ProducerSlot,
     refresh: Option<tokio::task::JoinHandle<()>>,
+    refresh_result: Option<Result<(), ConfigWatchError>>,
     supervisor: Option<tokio::task::JoinHandle<Result<BridgeJoined, ConfigWatchError>>>,
-    finished: bool,
+    completion: Option<Result<(), ConfigWatchError>>,
 }
 
 impl ConfigWatch {
@@ -136,11 +144,13 @@ impl ConfigWatch {
             }
         });
         let bridge_shared = shared.clone();
+        let producer: ProducerSlot = Arc::new(Mutex::new(None));
+        let bridge_producer = producer.clone();
         let weak = ui.as_weak();
         let bridge = std::thread::Builder::new()
             .name("morpheus-config-ui".into())
             .spawn(move || {
-                let watch = {
+                {
                     let mut state = bridge_shared.state();
                     if state.closed {
                         return Ok(());
@@ -150,7 +160,9 @@ impl ConfigWatch {
                     match store.watch_with_theme_owned(Duration::from_millis(700)) {
                         Ok(watch) => {
                             state.producer = Some(watch.stop_handle());
-                            watch
+                            *bridge_producer
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner()) = Some(watch);
                         }
                         Err(_) => {
                             state.failed = true;
@@ -167,8 +179,19 @@ impl ConfigWatch {
                             return Err(ConfigWatchError::Start);
                         }
                     }
-                };
-                while watch.recv().is_ok() {
+                }
+                loop {
+                    let received = {
+                        let owner = bridge_producer
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        // Only the supervisor takes the producer, after joining
+                        // this actual bridge. No handle is moved into the loop.
+                        owner.as_ref().ok_or(ConfigWatchError::Ownership)?.recv()
+                    };
+                    if received.is_err() {
+                        break;
+                    }
                     if bridge_shared.state().closed {
                         break;
                     }
@@ -184,9 +207,7 @@ impl ConfigWatch {
                         break;
                     }
                 }
-                let result = watch.finish().map_err(|_| ConfigWatchError::Producer);
-                bridge_shared.state().producer.take();
-                result
+                Ok(())
             });
         let bridge = match bridge {
             Ok(bridge) => Some(bridge),
@@ -200,9 +221,11 @@ impl ConfigWatch {
         Self {
             shared,
             bridge: Arc::new(Mutex::new(bridge)),
+            producer,
             refresh: Some(refresh),
+            refresh_result: None,
             supervisor: None,
-            finished: false,
+            completion: None,
         }
     }
 
@@ -236,73 +259,105 @@ impl ConfigWatch {
         self.shared.close();
     }
 
-    pub(crate) async fn finish(mut self) -> Result<(), ConfigWatchError> {
+    /// Cancellation leaves this same owner and every original join reachable.
+    /// Only Ownership is an unproved receipt; all other errors below follow
+    /// actual refresh, bridge and producer joins (or proven startup refusal).
+    pub(crate) async fn finish(&mut self) -> Result<(), ConfigWatchError> {
         self.shutdown();
-        let refresh_result = match self.refresh.as_mut() {
-            Some(task) => settle_result(task.await),
-            None => Err(ConfigWatchError::Ownership),
-        };
-        self.refresh.take();
-        // The actual std handle remains in this retained slot until a running
-        // supervisor takes it. Pool-spawn failure cannot drop the sole handle.
-        let slot = self.bridge.clone();
-        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tokio::task::spawn_blocking(move || {
-                let worker = slot
-                    .lock()
-                    .map_err(|_| ConfigWatchError::Ownership)?
-                    .take()
-                    .ok_or(ConfigWatchError::Start)?;
-                let result = worker
-                    .join()
-                    .map_err(|payload| {
-                        std::mem::forget(payload);
-                        ConfigWatchError::Bridge
-                    })
-                    .and_then(|result| result);
-                Ok(BridgeJoined { result })
-            })
-        }));
-        self.supervisor = match spawned {
-            Ok(task) => Some(task),
-            Err(payload) => {
-                std::mem::forget(payload);
-                return Err(ConfigWatchError::Ownership);
-            }
-        };
-        let bridge_result = match self
+        if let Some(result) = self.completion {
+            return result;
+        }
+        if self.refresh_result.is_none() {
+            let result = match self.refresh.as_mut() {
+                Some(task) => settle_result(task.await),
+                None => return Err(ConfigWatchError::Ownership),
+            };
+            self.refresh.take();
+            self.refresh_result = Some(result);
+        }
+        if self.supervisor.is_none() {
+            let slot = self.bridge.clone();
+            let producer = self.producer.clone();
+            let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::task::spawn_blocking(move || {
+                    let worker = slot.lock().map_err(|_| ConfigWatchError::Ownership)?.take();
+                    let bridge = match worker {
+                        Some(worker) => worker.join().unwrap_or_else(|payload| {
+                            std::mem::forget(payload);
+                            Err(ConfigWatchError::Bridge)
+                        }),
+                        // Start never created a bridge, so there is no handle
+                        // to join. The producer slot is still checked below.
+                        None => Err(ConfigWatchError::Start),
+                    };
+                    let native = producer
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .take();
+                    let producer = match native {
+                        Some(watch) => watch.finish().map_err(|_| ConfigWatchError::Producer),
+                        None => Ok(()),
+                    };
+                    Ok(BridgeJoined { bridge, producer })
+                })
+            }));
+            self.supervisor = match spawned {
+                Ok(task) => Some(task),
+                Err(payload) => {
+                    std::mem::forget(payload);
+                    return Err(ConfigWatchError::Ownership);
+                }
+            };
+        }
+        let joined = match self
             .supervisor
             .as_mut()
             .expect("supervisor was retained")
             .await
         {
-            Ok(Ok(joined)) => {
-                self.finished = true;
-                joined.result
-            }
-            Ok(Err(error)) => Err(error),
+            Ok(Ok(joined)) => Some(joined),
+            Ok(Err(_)) => None,
             Err(error) => {
                 forget_task_panic(error);
-                Err(ConfigWatchError::Ownership)
+                None
             }
         };
         self.supervisor.take();
-        refresh_result?;
-        bridge_result?;
-        if self.shared.state().failed {
-            return Err(ConfigWatchError::Ownership);
-        }
-        Ok(())
+        let result = match joined {
+            // An independent refresh failure must never mask missing joins.
+            None => Err(ConfigWatchError::Ownership),
+            Some(joined) => {
+                let refresh = self.refresh_result.expect("refresh join was recorded");
+                if joined.bridge == Err(ConfigWatchError::Ownership) {
+                    Err(ConfigWatchError::Ownership)
+                } else {
+                    joined
+                        .producer
+                        .and(joined.bridge)
+                        .and(refresh)
+                        .and_then(|()| {
+                            if self.shared.state().failed {
+                                Err(ConfigWatchError::Admission)
+                            } else {
+                                Ok(())
+                            }
+                        })
+                }
+            }
+        };
+        self.completion = Some(result);
+        result
     }
 }
 
 impl Drop for ConfigWatch {
     fn drop(&mut self) {
         self.shutdown();
-        if !self.finished {
+        if self.completion.is_none() || self.completion == Some(Err(ConfigWatchError::Ownership)) {
             // An interrupted finish is not a receipt. Preserve all remaining
             // actual owners; no timeout, detached replacement or no-op task.
             std::mem::forget(self.bridge.clone());
+            std::mem::forget(self.producer.clone());
             if let Some(task) = self.refresh.take() {
                 std::mem::forget(task);
             }
@@ -407,5 +462,85 @@ mod tests {
             Err(mpsc::error::TryRecvError::Disconnected)
         );
         assert!(!shared.queue_callback());
+    }
+
+    fn fixture(
+        bridge: JoinHandle<Result<(), ConfigWatchError>>,
+        refresh: tokio::task::JoinHandle<()>,
+        producer: Option<OwnedWatch<Result<LoadedConfig, ConfigError>>>,
+    ) -> ConfigWatch {
+        let stop = producer.as_ref().map(OwnedWatch::stop_handle);
+        ConfigWatch {
+            shared: Arc::new(Shared(Mutex::new(State {
+                closed: false,
+                failed: false,
+                queued: false,
+                producer: stop,
+                refresh: None,
+            }))),
+            bridge: Arc::new(Mutex::new(Some(bridge))),
+            producer: Arc::new(Mutex::new(producer)),
+            refresh: Some(refresh),
+            refresh_result: None,
+            supervisor: None,
+            completion: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bridge_panic_still_joins_the_original_native_producer() {
+        // This producer is stopped before its first sample; no fixture config
+        // file or profile is opened. It is the actual owned polling thread.
+        let producer = ConfigStore::at("synthetic-unused-config.toml")
+            .watch_with_theme_owned(Duration::from_secs(3600))
+            .unwrap();
+        let bridge = std::thread::spawn(|| -> Result<(), ConfigWatchError> {
+            panic!("synthetic config bridge panic")
+        });
+        let refresh = tokio::spawn(async { panic!("synthetic config refresh panic") });
+        let mut owner = fixture(bridge, refresh, Some(producer));
+        let joined = owner.finish().await;
+        let repeated = owner.finish().await;
+        let original_owners_joined = owner.producer.lock().unwrap().is_none()
+            && owner.bridge.lock().unwrap().is_none()
+            && owner.refresh.is_none()
+            && owner.supervisor.is_none();
+        assert_eq!(joined, Err(ConfigWatchError::Bridge));
+        assert_eq!(repeated, joined);
+        assert!(original_owners_joined);
+    }
+
+    #[tokio::test]
+    async fn cancelled_finish_keeps_the_original_running_supervisor_for_retry() {
+        let (release, released) = std::sync::mpsc::channel();
+        let bridge = std::thread::spawn(move || {
+            let _ = released.recv();
+            Ok(())
+        });
+        let refresh = tokio::spawn(async {});
+        let mut owner = fixture(bridge, refresh, None);
+        let observed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let mut finishing = Box::pin(owner.finish());
+                let pending = futures_util::poll!(finishing.as_mut()).is_pending();
+                drop(finishing);
+                if !pending {
+                    return false;
+                }
+                if owner.supervisor.is_some() {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let _ = release.send(());
+        let joined = owner.finish().await;
+        let repeated = owner.finish().await;
+        assert!(matches!(observed, Ok(true)));
+        assert_eq!(joined, Ok(()));
+        assert_eq!(repeated, joined);
+        assert!(owner.bridge.lock().unwrap().is_none());
+        assert!(owner.supervisor.is_none());
     }
 }

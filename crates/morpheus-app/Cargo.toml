@@ -47,5 +47,9 @@ sha2 = "=0.10.9"
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Expose the exact backend version already selected by Slint on Mac.
+slint = { version = "=1.18.1", features = ["unstable-winit-030"] }
+
 [dev-dependencies]
 i-slint-backend-testing = { version = "=1.18.1", default-features = false }

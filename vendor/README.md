@@ -6,6 +6,10 @@ provenance and regression tests when updating a dependency.
 
 | Crate | Purpose | Provenance |
 | --- | --- | --- |
+| winit 0.30.13 | Existing macOS delegate termination and modal cleanup observation | [Patch notes](winit/MORPHEUS_PATCH.md) |
+| notify-rust 4.18.2 | Owned notifications on the actual native worker | [Patch notes](notify-rust/MORPHEUS_PATCH.md) |
+| mac-notification-sys 0.6.15 | Retained native banner records and bounded callbacks | [Patch notes](mac-notification-sys/MORPHEUS_PATCH.md) |
+| tauri-winrt-notification 0.8.1 | Same-thread WinRT owners and exact withdrawal observations | [Patch notes](tauri-winrt-notification/MORPHEUS_PATCH.md) |
 | cpal 0.18.2 | Retained macOS native audio owners and checked close; Windows event ownership; Linux close-on-exec wake descriptors | [Patch notes and exact upstream archive](cpal/OWNED_COREAUDIO.md) |
 | lru 0.16.4 | Backport panic-safe cache removal | [Patch notes](lru/MORPHEUS_PATCH.md) |
 | image-webp 0.2.4 | Bound lossless entropy-tree complexity before group allocation | [Patch notes](image-webp/MORPHEUS_PATCH.md) |
@@ -119,3 +123,34 @@ The implementation remains subject to independent source review and fresh
 platform, COM/activation/buffer/error, ordinary-shutdown, installed-update and
 real-device acceptance. Production installation gates remain false. Existing Mac
 and ALSA ownership notes and their explicit native/library limitations still apply.
+
+## Native window and notification dependency graph
+
+These four same-version crates.io patches are explicitly excluded from workspace
+membership. Their original source, normalized manifests, Cargo.toml.orig, upstream
+locks, tests, examples and any supplied license files remain preserved. The
+mac-notification-sys archive omitted its license texts; unmodified LICENSE-MIT and
+LICENSE-Apache are restored from its recorded upstream revision, as bound in that
+crate's MORPHEUS_PATCH.md. This closes that text-collection gap; legal distribution
+approval remains separate. Winit uses the existing
+locked Mac backend through Slint's target-specific interface. No new package
+version or registry source is selected.
+
+The managed normalized notification manifests omit development-tool tables so
+selected nonmember library tests can use the application lock. Full published
+normalized manifests are retained as Cargo.toml.upstream. One notify-rust unit
+expected-map initializer uses standard-library HashMap with the same two pairs
+instead of maplit; src/hints.rs.upstream preserves the original source. No test
+or assertion is removed or skipped. The original examples, integration tests and
+doctests retain their source and original toolchain declarations; these selected
+application checks do not claim their verification.
+
+The unchanged corresponding-source catalogue follows explicit root path patches.
+Portable native notices discover their original license texts and these patch
+notes from committed source. SDK, system/compiler, relinking, installation and
+legal distribution requirements remain separate gates.
+
+The actual presenter, finite native owner book, original native worker/TLS and
+supervisor joins, and all-platform shutdown must be integrated together. Linux
+daemon activation and exact reply-identity corrections remain mandatory inputs.
+A closed gate is not a native withdrawal or completion receipt.

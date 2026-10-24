@@ -53,7 +53,6 @@ use slint::{ComponentHandle, Weak as UiWeak};
 use tokio::{
     runtime::Handle,
     sync::{mpsc, oneshot},
-    task::JoinHandle,
     time,
 };
 
@@ -62,8 +61,9 @@ use crate::{
     AppWindow,
     live::LiveUi,
     notifications::{
-        self, BannerUnavailable, DesktopNotifications, Guarded, Handover, PresenterEvent,
-        Withdrawal,
+        self, BannerUnavailable, DesktopNotifications, Guarded, Handover, NotificationDrainFailure,
+        PresenterEvent, Withdrawal,
+        owned::{Close, NotificationWork, Role},
     },
 };
 
@@ -344,12 +344,14 @@ impl Drop for DeliverySlot {
     }
 }
 
+#[cfg(test)]
 type Shown = Result<Guarded, BannerUnavailable>;
 
 /// Give the delivery thread's result to the show task. When nobody waits any
 /// more (the show gave the banner up, or Morpheus is quitting), a banner
 /// shown late is withdrawn at once if the presenter returned a handle for it
 /// (Linux only); without one it stays, and its record is already gone.
+#[cfg(test)]
 fn hand_back(done: oneshot::Sender<Shown>, shown: Shown) {
     if let Err(Ok(Guarded::Handed(Some(withdrawal)))) = done.send(shown) {
         withdrawal.withdraw();
@@ -382,7 +384,7 @@ struct Screen {
 }
 
 struct Shared {
-    stopped: AtomicBool,
+    closing: Close,
     registry: Mutex<Registry<ActionToken, Origin>>,
     offers: IncomingHandle,
     live: Arc<LiveUi>,
@@ -407,7 +409,7 @@ impl Shared {
     }
 
     fn stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        self.closing.is_closed()
     }
 
     /// The captures still hold: not quitting, the same account selection
@@ -509,6 +511,9 @@ impl Shared {
         let (send, receive) = oneshot::channel();
         self.ui
             .upgrade_in_event_loop(move |ui| {
+                if ui.get_application_closing() {
+                    return;
+                }
                 let _ = send.send(Screen {
                     live: ui.get_live_session(),
                     account_id: ui.get_active_account_local_id().to_string(),
@@ -620,6 +625,9 @@ impl Shared {
         let ui = self.ui.clone();
         sample(UI_QUERY_TIMEOUT, move |answer| {
             ui.upgrade_in_event_loop(move |ui| {
+                if ui.get_application_closing() {
+                    return;
+                }
                 let _ = answer.try_send(Screen {
                     live: ui.get_live_session(),
                     account_id: ui.get_active_account_local_id().to_string(),
@@ -632,42 +640,27 @@ impl Shared {
 
     /// Hand `plan` to the OS on the one delivery thread and wait a bounded
     /// time for it. The thread is owned by its slot, not by the runtime:
-    /// quitting never waits for it.
+    /// the exact presenter book retains it through actual joins.
     async fn deliver(self: &Arc<Self>, token: u64, plan: Plan) -> Delivered {
         let Some(slot) = DeliverySlot::take(&self.delivering) else {
             // The previous OS call has not returned: nothing more starts.
             return Delivered::Unavailable;
         };
-        let (done, result) = oneshot::channel();
-        let notifications = self.notifications.clone();
-        let events = self.events.clone();
-        let runtime = Handle::current();
+        // The presenter book retains the real worker/TLS and supervisor;
+        // timeout cancels this exact pending operation, never drops its owner.
+        let _slot = slot;
         let handover = self.handover(token, plan.named);
-        // On spawn failure the closure is dropped: the plan, unsent, and the
-        // slot, released.
-        let spawned = std::thread::Builder::new()
-            .name("morpheus-call-banner".into())
-            .spawn(move || {
-                let _slot = slot;
-                let shown = notifications.show_silent_banner(
-                    &plan.summary,
-                    &plan.body,
-                    token,
-                    events,
-                    runtime,
-                    handover,
-                );
-                drop(plan);
-                hand_back(done, shown);
-            });
-        if spawned.is_err() {
-            return Delivered::Unavailable;
-        }
-        match time::timeout(DELIVERY_WAIT, result).await {
-            Ok(Ok(Ok(Guarded::Handed(withdrawal)))) => Delivered::Handed(withdrawal),
-            Ok(Ok(Ok(Guarded::Refused))) => Delivered::Refused,
-            // A failed show, or no answer in time: dropping the receiver here
-            // makes a late banner with a handle withdraw itself (`hand_back`).
+        let shown = self.notifications.show_silent_banner(
+            &plan.summary,
+            &plan.body,
+            token,
+            self.events.clone(),
+            Handle::current(),
+            handover,
+        );
+        match time::timeout(DELIVERY_WAIT, shown).await {
+            Ok(Ok(Guarded::Handed(withdrawal))) => Delivered::Handed(withdrawal),
+            Ok(Ok(Guarded::Refused)) => Delivered::Refused,
             _ => Delivered::Unavailable,
         }
     }
@@ -700,9 +693,15 @@ impl Shared {
         if self.status_posted.swap(true, Ordering::AcqRel) {
             return;
         }
-        let this = self.clone();
+        let this = Arc::downgrade(self);
         let posted = self.ui.upgrade_in_event_loop(move |ui| {
+            let Some(this) = this.upgrade() else {
+                return;
+            };
             this.status_posted.store(false, Ordering::Release);
+            if ui.get_application_closing() {
+                return;
+            }
             let mut status = this
                 .status
                 .lock()
@@ -737,8 +736,11 @@ impl Shared {
         if !self.holds(&banner.origin) || self.click_posted.swap(true, Ordering::AcqRel) {
             return;
         }
-        let this = self.clone();
+        let this = Arc::downgrade(self);
         let posted = self.ui.upgrade_in_event_loop(move |ui| {
+            let Some(this) = this.upgrade() else {
+                return;
+            };
             this.click_posted.store(false, Ordering::Release);
             this.reveal(&ui, &banner);
         });
@@ -750,7 +752,8 @@ impl Shared {
     /// UI thread, at the click: everything again, as it is now. Only the
     /// window comes back; the incoming card itself offers Answer and Dismiss.
     fn reveal(&self, ui: &AppWindow, banner: &Banner<ActionToken, Origin>) {
-        let current = Instant::now() < banner.deadline
+        let current = !ui.get_application_closing()
+            && Instant::now() < banner.deadline
             && self.holds(&banner.origin)
             && ui.get_live_session()
             && ui.get_active_account_local_id().as_str() == banner.account_id
@@ -770,7 +773,7 @@ impl Shared {
 /// it; a delivery thread already inside the OS call ends on its own.
 pub(crate) struct CallBanners {
     shared: Arc<Shared>,
-    tasks: Vec<JoinHandle<()>>,
+    work: NotificationWork,
 }
 
 impl CallBanners {
@@ -785,8 +788,9 @@ impl CallBanners {
     ) -> Self {
         let (events, event_receiver) = mpsc::channel(EVENTS);
         let (shows, show_receiver) = mpsc::channel(PENDING_SHOWS);
+        let work = NotificationWork::incoming();
         let shared = Arc::new(Shared {
-            stopped: AtomicBool::new(false),
+            closing: work.cancellation(),
             registry: Mutex::new(Registry::default()),
             offers,
             live,
@@ -799,27 +803,33 @@ impl CallBanners {
             status: Mutex::new(None),
             status_posted: AtomicBool::new(false),
         });
-        let tasks = vec![
-            runtime.spawn(watch(shared.clone())),
-            runtime.spawn(show(shared.clone(), show_receiver)),
-            runtime.spawn(resolve(shared.clone(), event_receiver)),
-        ];
-        Self { shared, tasks }
+        work.spawn(Role::IncomingWatch, runtime, watch(shared.clone()));
+        work.spawn(
+            Role::IncomingShow,
+            runtime,
+            show(shared.clone(), show_receiver),
+        );
+        work.spawn(
+            Role::IncomingEvents,
+            runtime,
+            resolve(shared.clone(), event_receiver),
+        );
+        Self { shared, work }
     }
 
-    /// Morpheus is quitting. In this order: every later handover check fails
-    /// (nothing more is sent, including a macOS listener that has not sent
-    /// yet), every record is forgotten and its banner withdrawn if it has a
-    /// handle (Linux only), and the tasks end without waiting for any OS call.
-    /// A delivery thread already inside the OS call finishes on its own and,
-    /// when nobody waits for it, withdraws its banner if it got a handle. Call
-    /// before the incoming worker and the notifications stop.
+    /// Revoke handovers and clicks synchronously, then wake idle application
+    /// tasks. An entered delivery is not aborted; its async owner stays held.
+    /// Native delivery/listener joins remain a separate presenter boundary.
     pub(crate) fn shutdown(&self) {
-        self.shared.stopped.store(true, Ordering::Release);
+        self.work.close();
         self.shared.registry().clear();
-        for task in &self.tasks {
-            task.abort();
-        }
+    }
+
+    /// Join this exact application's incoming tasks; includes real local
+    /// fixture owners, but excludes the separate native presenter threads.
+    pub(crate) async fn finish_app_work(&self) -> Result<(), NotificationDrainFailure> {
+        self.shutdown();
+        self.work.finish_app_work().await
     }
 }
 
@@ -846,11 +856,15 @@ async fn watch(shared: Arc<Shared>) {
         let due = read.is_none_or(|at| at.elapsed() >= TICK);
         if due && !shared.registry().is_empty() {
             read = Some(Instant::now());
-            if let Some(screen) = shared.screen().await {
-                shared.retire_for(&screen);
+            if let Some(Some(screen)) = shared.closing.guard(shared.screen()).await {
+                if !shared.stopped() {
+                    shared.retire_for(&screen);
+                }
             }
         }
         tokio::select! {
+            biased;
+            _ = shared.closing.cancelled() => break,
             changed = updates.changed() => { if changed.is_err() { break; } },
             _ = tick.tick() => {},
         }
@@ -859,12 +873,12 @@ async fn watch(shared: Arc<Shared>) {
 }
 
 async fn show(shared: Arc<Shared>, mut shows: mpsc::Receiver<u64>) {
-    while let Some(token) = shows.recv().await {
+    while let Some(Some(token)) = shared.closing.guard(shows.recv()).await {
         if shared.stopped() {
             shared.registry().forget(token);
             continue;
         }
-        let Some(plan) = shared.plan(token).await else {
+        let Some(Some(plan)) = shared.closing.guard(shared.plan(token)).await else {
             shared.registry().forget(token);
             continue;
         };
@@ -872,8 +886,22 @@ async fn show(shared: Arc<Shared>, mut shows: mpsc::Receiver<u64>) {
         match shared.deliver(token, plan).await {
             Delivered::Refused => shared.registry().forget(token),
             Delivered::Handed(withdrawal) => {
-                let keep = shared.confirm(token, named).await;
-                shared.registry().shown(token, withdrawal, keep);
+                let keep = shared
+                    .closing
+                    .guard(shared.confirm(token, named))
+                    .await
+                    .unwrap_or(false);
+                let publication = withdrawal.as_ref().and_then(Withdrawal::publication);
+                let admitted =
+                    shared
+                        .registry()
+                        .shown(token, withdrawal, keep && !shared.stopped());
+                // No book/registry mutex is held while queueing an early event.
+                if admitted {
+                    if let Some(publication) = publication {
+                        publication.publish();
+                    }
+                }
             }
             Delivered::Unavailable => {
                 if shared.failed(token) {
@@ -885,7 +913,7 @@ async fn show(shared: Arc<Shared>, mut shows: mpsc::Receiver<u64>) {
 }
 
 async fn resolve(shared: Arc<Shared>, mut events: mpsc::Receiver<PresenterEvent>) {
-    while let Some(event) = events.recv().await {
+    while let Some(Some(event)) = shared.closing.guard(events.recv()).await {
         match event {
             PresenterEvent::Activated(token) => shared.activate(token),
             PresenterEvent::Closed(token) => shared.registry().closed(token),

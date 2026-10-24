@@ -68,7 +68,7 @@ impl SecurityGate {
     /// Atomically close ordinary admission BEFORE the UI yields to another
     /// event. Busy recovery, unsaved keys and credential owners always refuse.
     /// Existing restart/account/recovery lease Drop cannot reset this state.
-    #[cfg(all(windows, feature = "native-calls"))]
+    #[cfg(any(target_os = "macos", all(windows, feature = "native-calls")))]
     pub(crate) fn begin_shutdown(&self, restart: Option<&RestartLease>) -> bool {
         let Ok(owner) = self.2.lock() else {
             return false;
@@ -109,7 +109,7 @@ impl SecurityGate {
         }
     }
 
-    #[cfg(all(windows, feature = "native-calls"))]
+    #[cfg(any(target_os = "macos", all(windows, feature = "native-calls")))]
     pub(crate) fn admit_shutdown(
         &self,
         restart: Option<&RestartLease>,
@@ -211,7 +211,7 @@ impl SecurityGate {
 
 /// Produced only by the actual gate reducer; no caller can forge an owned
 /// Pending reservation from a snapshot. Dropping it never reopens admission.
-#[cfg(all(windows, feature = "native-calls"))]
+#[cfg(any(target_os = "macos", all(windows, feature = "native-calls")))]
 pub(crate) struct ShutdownAdmission<'a> {
     _gate: &'a SecurityGate,
 }
@@ -552,7 +552,7 @@ pub(crate) fn register(
     ui: &AppWindow,
     live: Arc<LiveUi>,
     handle: Handle,
-    #[cfg(all(windows, feature = "native-calls"))]
+    #[cfg(any(target_os = "macos", all(windows, feature = "native-calls")))]
     updates: crate::update_controller::UpdateController,
 ) {
     crate::verification::register(ui, live.clone(), handle.clone());
@@ -599,6 +599,17 @@ pub(crate) fn register(
         #[cfg(all(windows, feature = "native-calls"))]
         if response != CloseRequestResponse::KeepWindowShown {
             if !updates.request_windows_shutdown()
+                && let Some(window) = close_weak.upgrade()
+            {
+                window.set_security_notice(
+                    "Wait for the account or security operation before closing Morpheus.".into(),
+                );
+            }
+            return CloseRequestResponse::KeepWindowShown;
+        }
+        #[cfg(target_os = "macos")]
+        if response != CloseRequestResponse::KeepWindowShown {
+            if !updates.request_macos_shutdown(crate::macos_termination::Reason::Window)
                 && let Some(window) = close_weak.upgrade()
             {
                 window.set_security_notice(

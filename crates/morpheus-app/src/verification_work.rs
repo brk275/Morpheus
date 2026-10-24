@@ -44,6 +44,26 @@ impl std::fmt::Display for VerificationDrainError {
 }
 impl std::error::Error for VerificationDrainError {}
 
+/// Terminal application shutdown only. Account pause/removal retains its
+/// stricter existing Failed result. Worker proves all registered tasks joined;
+/// Unproved also includes native cleanup whose completion was not established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerificationShutdownError {
+    Pending,
+    Worker,
+    Unproved,
+}
+impl std::fmt::Display for VerificationShutdownError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::Pending => "Verification work is still stopping.",
+            Self::Worker => "Verification tasks finished with an error.",
+            Self::Unproved => "Verification cleanup could not be confirmed.",
+        })
+    }
+}
+impl std::error::Error for VerificationShutdownError {}
+
 #[derive(Default)]
 pub(crate) struct VerificationWork {
     owner: Arc<Owner>,
@@ -78,6 +98,8 @@ struct Owner {
 struct State {
     closed: bool,
     ownership_failed: bool,
+    worker_failed: bool,
+    native_failed: bool,
     accounts: HashMap<String, Account>,
     tasks: Vec<Task>,
 }
@@ -199,6 +221,7 @@ impl ScopeLease {
         self.epoch.current.store(false, Ordering::Release);
         self.cancellation.cancel();
         self.owner.with(|state| {
+            state.native_failed = true;
             let Some(account) = state
                 .accounts
                 .get_mut(&self.epoch.account)
@@ -260,7 +283,13 @@ impl State {
             match Pin::new(&mut self.tasks[index].handle).poll(&mut context) {
                 Poll::Ready(result) => {
                     let task = self.tasks.swap_remove(index);
-                    if result.is_err() {
+                    if let Err(error) = result {
+                        // Do not run an arbitrary panic-payload destructor while
+                        // the registry mutex is held (including final Drop).
+                        if error.is_panic() {
+                            std::mem::forget(error.into_panic());
+                        }
+                        self.worker_failed = true;
                         // No abort is requested by this owner. Any JoinError,
                         // including runtime cancellation, is a sticky failure.
                         if let Some(account) = self.accounts.get_mut(&task.epoch.account) {
@@ -362,6 +391,38 @@ impl VerificationWork {
             DRAIN_LIMIT,
         )
         .await
+    }
+
+    /// Reobserve the same whole-session registry after synchronous close. A
+    /// bounded observation expires with Pending while every original handle
+    /// remains reachable; callers may await this same owner again before stop.
+    pub(crate) async fn finish_shutdown(&self) -> Result<(), VerificationShutdownError> {
+        let deadline = tokio::time::Instant::now() + DRAIN_LIMIT;
+        loop {
+            let result = self.owner.with(|state| {
+                if !state.closed {
+                    return Some(Err(VerificationShutdownError::Unproved));
+                }
+                state.poll();
+                if !state.tasks.is_empty() {
+                    return None;
+                }
+                Some(if state.ownership_failed || state.native_failed {
+                    Err(VerificationShutdownError::Unproved)
+                } else if state.worker_failed {
+                    Err(VerificationShutdownError::Worker)
+                } else {
+                    Ok(())
+                })
+            });
+            if let Some(result) = result {
+                return result;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(VerificationShutdownError::Pending);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// The caller holds account_transition and its existing security lease.
@@ -649,9 +710,19 @@ mod tests {
                 .owner
                 .capture("a", &VerificationCancellation::new())
                 .unwrap();
-            let admitted = work.owner.register(&lease, true, runtime.handle(), async {
-                panic!("synthetic verification task panic");
-            });
+            let payload_dropped = Arc::new(AtomicBool::new(false));
+            struct Payload(Arc<AtomicBool>);
+            impl Drop for Payload {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let payload = Payload(payload_dropped.clone());
+            let admitted = work
+                .owner
+                .register(&lease, true, runtime.handle(), async move {
+                    std::panic::panic_any(payload);
+                });
             let result = wait_for_receipt(
                 || work.owner.with(|state| state.receipt(Some("a"))),
                 Duration::from_secs(3),
@@ -662,6 +733,11 @@ mod tests {
                 .register(&lease, true, runtime.handle(), async {});
             let pause_failed = matches!(work.pause("a"), Err(VerificationDrainError::Failed));
             let final_cleanup = cleanup(&work).await;
+            let shutdown = work.finish_shutdown().await;
+            let repeated = work.finish_shutdown().await;
+            assert_eq!(shutdown, Err(VerificationShutdownError::Worker));
+            assert_eq!(repeated, shutdown);
+            assert!(!payload_dropped.load(Ordering::Acquire));
             assert!(admitted && refused && pause_failed);
             assert_eq!(result, Err(VerificationDrainError::Failed));
             assert_eq!(final_cleanup, Err(VerificationDrainError::Failed));
@@ -744,6 +820,8 @@ mod tests {
             )
             .await;
             let final_cleanup = cleanup(&work).await;
+            let shutdown = work.finish_shutdown().await;
+            assert_eq!(shutdown, Err(VerificationShutdownError::Unproved));
             assert!(registered && cancellation.is_cancelled() && !lease.is_current());
             assert!(other_current);
             assert_eq!(pending, None);

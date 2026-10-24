@@ -11,13 +11,16 @@
 //! requests are fenced by the account's selection, and inactive accounts are
 //! never read.
 
-use std::sync::Arc;
+use std::sync::Weak;
 
 use matrix_sdk::sync::RoomUpdates;
 use morpheus_matrix::RoomUnreadCounts;
 use tokio::sync::broadcast;
 
-use crate::{live::LiveUi, notifications::DesktopNotifications};
+use crate::{
+    live::LiveUi,
+    notifications::{DesktopNotifications, owned::Close},
+};
 
 /// One sync batch of the active account, or `None` once its feed ended.
 async fn next_batch(updates: &mut Option<broadcast::Receiver<RoomUpdates>>) -> Option<()> {
@@ -30,36 +33,70 @@ async fn next_batch(updates: &mut Option<broadcast::Receiver<RoomUpdates>>) -> O
     }
 }
 
-pub(super) async fn run(live: Arc<LiveUi>, notifications: Arc<DesktopNotifications>) {
-    let manager = live.manager.clone();
+pub(super) async fn run(
+    live: Weak<LiveUi>,
+    notifications: Weak<DesktopNotifications>,
+    closing: Close,
+) {
+    let Some(manager) = live.upgrade().map(|live| live.manager.clone()) else {
+        return;
+    };
     let mut active = manager.subscribe_active_account();
     loop {
-        // Room updates belong to one account's client; subscribe again
-        // after every account change.
-        let mut updates = manager
-            .subscribe_room_updates()
-            .await
-            .ok()
-            .map(|(_, receiver)| receiver);
+        if closing.is_closed() {
+            return;
+        }
+        let account = active.borrow().clone();
+        let selection = account
+            .as_ref()
+            .and_then(|account| manager.account_selection(&account.id));
+        let Some(selection) = selection else {
+            if closing
+                .guard(active.changed())
+                .await
+                .is_none_or(|changed| changed.is_err())
+            {
+                return;
+            }
+            continue;
+        };
+        // This is a cancellable read on the original client, not fresh
+        // authority reconstructed after an account switch or an await.
+        let subscription = closing
+            .guard(selection.guard(manager.subscribe_room_updates()))
+            .await;
+        let mut updates = match subscription {
+            Some(Some(Ok((id, receiver)))) if id == selection.account_id() => Some(receiver),
+            _ => None,
+        };
         loop {
             tokio::select! {
+                biased;
+                _ = closing.cancelled() => return,
                 changed = active.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
+                    if changed.is_err() { return; }
+                    break;
+                }
+                _ = selection.revoked() => {
+                    // Release this original client's receiver before waiting
+                    // for publication of a replacement account.
+                    drop(updates.take());
+                    // Revocation can precede publication of the next account.
+                    if closing.guard(active.changed()).await.is_none_or(|changed| changed.is_err()) { return; }
                     break;
                 }
                 batch = next_batch(&mut updates) => {
-                    if batch.is_none() {
-                        updates = None;
-                        continue;
-                    }
+                    if batch.is_none() { updates = None; continue; }
                 }
             }
-            if notifications.is_stopped() {
+            let (Some(live), Some(notifications)) = (live.upgrade(), notifications.upgrade())
+            else {
+                return;
+            };
+            let read = withdraw_read_elsewhere(&live, &notifications, &selection);
+            if closing.guard(selection.guard(read)).await.is_none() {
                 return;
             }
-            withdraw_read_elsewhere(&live, &notifications).await;
         }
     }
 }
@@ -75,27 +112,28 @@ fn read_rooms(counts: &[RoomUnreadCounts]) -> impl Iterator<Item = &str> {
 
 /// Withdraw banners of the active account's rooms that were read, here or on
 /// another device or client, whether or not the window is shown.
-async fn withdraw_read_elsewhere(live: &LiveUi, notifications: &DesktopNotifications) {
-    let manager = &live.manager;
-    let Some(account) = manager.active_account().await else {
+async fn withdraw_read_elsewhere(
+    live: &LiveUi,
+    notifications: &DesktopNotifications,
+    selection: &morpheus_matrix::AccountSelection,
+) {
+    if notifications.is_stopped() || !selection.is_current() {
         return;
-    };
-    let rooms = notifications.withdrawable_rooms(&account.id);
+    }
+    let rooms = notifications.withdrawable_rooms(selection.account_id());
     if rooms.is_empty() {
         return;
     }
-    let Some(selection) = manager.account_selection(&account.id) else {
-        return;
-    };
-    let Ok(counts) = manager
-        .room_unread_counts_selected(&selection, &rooms)
+    let Ok(counts) = live
+        .manager
+        .room_unread_counts_selected(selection, &rooms)
         .await
     else {
         return;
     };
     for room_id in read_rooms(&counts) {
-        if selection.is_current() {
-            notifications.withdraw_room(&account.id, room_id);
+        if !notifications.is_stopped() && selection.is_current() {
+            notifications.withdraw_room(selection.account_id(), room_id);
         }
     }
 }

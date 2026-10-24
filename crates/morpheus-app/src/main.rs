@@ -4,6 +4,7 @@
 
 mod account_access;
 mod account_identity;
+mod app_shutdown;
 mod appearance;
 mod appearance_editor;
 mod attachment_workbench;
@@ -34,6 +35,12 @@ mod kept_replies;
 mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
+#[cfg(any(test, target_os = "macos"))]
+mod macos_quit;
+#[cfg(target_os = "macos")]
+mod macos_shutdown;
+#[cfg(target_os = "macos")]
+mod macos_termination;
 mod marker_scans;
 mod matrix_links;
 mod member_privacy;
@@ -133,6 +140,7 @@ use crate::voice_spaces::VoiceSpaces;
 // Do not retain SDK/server errors here: Rust's Result termination prints Debug.
 // These closed categories make failed cleanup visible to the process-exit
 // observer without exposing an underlying account/media error in that output.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShutdownFailure {
     #[cfg(feature = "native-calls")]
@@ -145,6 +153,7 @@ enum ShutdownFailure {
     UpdateWorker,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for ShutdownFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -164,6 +173,7 @@ impl std::fmt::Display for ShutdownFailure {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for ShutdownFailure {}
 
 slint::include_modules!();
@@ -1735,6 +1745,8 @@ fn run_application(
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     morpheus_rtc::install_crypto_provider();
+    #[cfg(target_os = "macos")]
+    let macos_application = macos_termination::Application::install()?;
     let ui = AppWindow::new()?;
     ui.set_login_loading(true);
     ui.show()?;
@@ -1786,6 +1798,13 @@ fn run_application(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    #[cfg(not(target_os = "macos"))]
+    let runtime_owner =
+        app_shutdown::RuntimeOwner::install(runtime).map_err(app_shutdown::ShutdownError)?;
+    #[cfg(not(target_os = "macos"))]
+    let runtime = runtime_owner
+        .borrow_runtime()
+        .map_err(app_shutdown::ShutdownError)?;
     // Subscribed before the startup restore below can start a sync.
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.observe_sync(&manager, runtime.handle());
@@ -1797,7 +1816,7 @@ fn run_application(
     );
     let peer_verification_ui =
         peer_verification::PeerVerificationUi::register(&ui, live.clone(), runtime.handle());
-    #[cfg(not(all(windows, feature = "native-calls")))]
+    #[cfg(not(any(target_os = "macos", all(windows, feature = "native-calls"))))]
     security::register(&ui, live.clone(), runtime.handle().clone());
     let image_previews =
         image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
@@ -1839,7 +1858,7 @@ fn run_application(
         live.security_gate.clone(),
         Arc::new(move || update_accounts.account_access_busy()),
     );
-    #[cfg(all(windows, feature = "native-calls"))]
+    #[cfg(any(target_os = "macos", all(windows, feature = "native-calls")))]
     security::register(&ui, live.clone(), runtime.handle().clone(), updates.clone());
     let update_ui_task = updates.bind_ui(&ui);
     #[cfg(feature = "native-calls")]
@@ -2265,6 +2284,30 @@ fn run_application(
         notifications.clone(),
         runtime.handle(),
     );
+    #[cfg(not(target_os = "macos"))]
+    let shutdown_resources = {
+        let actual = app_shutdown::Resources::new(
+            manager.clone(),
+            live.clone(),
+            store.clone(),
+            updates.clone(),
+            notifications.clone(),
+            config_watch,
+            update_ui_task,
+            #[cfg(feature = "native-calls")]
+            calls.clone(),
+            #[cfg(feature = "native-calls")]
+            incoming_calls,
+            #[cfg(feature = "native-calls")]
+            Arc::new(call_banners),
+            #[cfg(all(windows, feature = "native-calls"))]
+            wasapi_ui.receipt(),
+        );
+        runtime_owner
+            .publish(actual.clone())
+            .map_err(app_shutdown::ShutdownError)?;
+        actual
+    };
 
     {
         let access = account_access.clone();
@@ -4762,6 +4805,28 @@ fn run_application(
 
     #[cfg(morpheus_timeline_acceptance)]
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
+    // Allocate actual cleanup captures before the task can run or panic.
+    // The once-only origin conclusion retains the same pack on uncertainty.
+    #[cfg(target_os = "macos")]
+    let macos_resources = macos_shutdown::Resources::new(
+        manager.clone(),
+        live.clone(),
+        store.clone(),
+        updates.clone(),
+        notifications.clone(),
+        config_watch,
+        update_ui_task,
+        #[cfg(feature = "native-calls")]
+        calls.clone(),
+        #[cfg(feature = "native-calls")]
+        incoming_calls,
+        #[cfg(feature = "native-calls")]
+        Arc::new(call_banners),
+    );
+    #[cfg(target_os = "macos")]
+    let cleanup_resources = macos_resources.clone();
+    #[cfg(not(target_os = "macos"))]
+    let cleanup_resources = shutdown_resources.clone();
     // UI revocation stays on its actual thread; mandatory async cleanup may
     // run on the existing runtime while Windows keeps the origin STA pumping.
     let cleanup_ui = ui.clone_strong();
@@ -4769,7 +4834,7 @@ fn run_application(
         #[cfg(all(windows, feature = "native-calls"))]
         live.security_gate.begin_shutdown(None);
         live.close_action_admission();
-        config_watch.shutdown();
+        cleanup_resources.close_config();
         message_copy::retire(&cleanup_ui);
         verification::shutdown(&cleanup_ui);
         // Actual UI-owned SDK sessions go before any async task/store drain.
@@ -4800,238 +4865,135 @@ fn run_application(
         voice_presence.shutdown(&cleanup_ui);
         // Before the incoming worker and notifications: no call banner outlives
         // them, and those the platform can withdraw are withdrawn.
-        #[cfg(feature = "native-calls")]
-        call_banners.shutdown();
-        #[cfg(feature = "native-calls")]
-        incoming_calls.shutdown();
-        notifications.shutdown();
-        update_ui_task.abort();
-        async move {
-            let (update_result, call_result) = async {
-                let _ = update_ui_task.await;
-                // A cancelled download may still be waiting for its bounded network
-                // timeout. Stop call capture concurrently, never after that wait.
-                #[cfg(feature = "native-calls")]
-                {
-                    let (update_result, call_result, ()) = tokio::join!(
-                        updates.shutdown(),
-                        calls.end_call(),
-                        incoming_calls.finish()
-                    );
-                    let call_result = call_result.map_err(|_| ShutdownFailure::NativeCall);
-                    if call_result.is_err() {
-                        eprintln!("Could not confirm native call shutdown.");
+        cleanup_resources.close_incoming_and_notifications();
+        async move { cleanup_resources.finish().await }
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let concluded_resources = macos_resources.clone();
+        let coordinator = Rc::new(macos_quit::Coordinator::new(
+            runtime,
+            cleanup,
+            move |result| {
+                #[cfg(morpheus_timeline_acceptance)]
+                let acceptance_failed = acceptance.finish().is_err();
+                #[cfg(not(morpheus_timeline_acceptance))]
+                let acceptance_failed = false;
+                match result {
+                    Ok(report) => {
+                        let outcome = report.outcome(acceptance_failed);
+                        if report.retain {
+                            macos_quit::Completion::retain_resources(
+                                outcome.err().unwrap_or(macos_quit::Failure::Ownership),
+                                concluded_resources,
+                            )
+                        } else {
+                            macos_quit::Completion::finalize(outcome)
+                        }
                     }
-                    (update_result, call_result)
+                    Err(failure) => {
+                        let failure = match failure {
+                            macos_quit::TaskFailure::Panicked => {
+                                macos_quit::Failure::CleanupPanicked
+                            }
+                            macos_quit::TaskFailure::Cancelled => {
+                                macos_quit::Failure::CleanupCancelled
+                            }
+                            macos_quit::TaskFailure::Ownership => macos_quit::Failure::Ownership,
+                        };
+                        macos_quit::Completion::retain_resources(failure, concluded_resources)
+                    }
                 }
-                #[cfg(not(feature = "native-calls"))]
-                (updates.shutdown().await, Ok::<(), ShutdownFailure>(()))
+            },
+        ));
+        macos_application.arm(coordinator.clone(), updates.clone(), &ui)?;
+        let ui_result = ui.run();
+        // Never fabricate a successful loop return for native termination.
+        // An unexpected return remains a failure, with actual owners retained.
+        coordinator.after_event_loop_return();
+        let shutdown_result = coordinator.finish_after_event_loop();
+        ui_result?;
+        return shutdown_result.map_err(|failure| {
+            Box::new(macos_shutdown::ShutdownError(failure)) as Box<dyn std::error::Error>
+        });
+    }
+    #[cfg(all(not(target_os = "macos"), windows, feature = "native-calls"))]
+    {
+        let ran = windows_audio::run(&ui, wasapi_ui, &runtime, cleanup);
+        // This is the origin's borrow, not Runtime ownership or an EnterGuard.
+        // The installed root retains the original Runtime on every failure.
+        drop(runtime);
+        #[cfg(morpheus_timeline_acceptance)]
+        let acceptance_failed = acceptance.finish().is_err();
+        #[cfg(not(morpheus_timeline_acceptance))]
+        let acceptance_failed = false;
+        let outcome = ran.map_err(app_shutdown::ShutdownError)?;
+        let completed = match outcome.cleanup {
+            Some(Ok(report)) => Some(report),
+            _ => None,
+        };
+        let finalized = if !outcome.retain {
+            match completed {
+                Some(report) => runtime_owner.finalize(&shutdown_resources, report),
+                None => Err(app_shutdown::Failure::Ownership),
             }
-            .await;
-            #[cfg(feature = "native-calls")]
-            let ring_result = morpheus_rtc::wait_for_ring_audio_release().await;
-            #[cfg(feature = "native-calls")]
-            if let Err(error) = ring_result {
-                // Incoming UI shutdown revoked authority first. Still finish the other
-                // cleanup paths, then return the typed actual-worker release failure.
-                eprintln!("Could not release incoming sound during shutdown: {error}");
-            }
-            #[cfg(feature = "native-calls")]
-            let device_open_result = morpheus_rtc::wait_for_audio_device_release().await;
-            #[cfg(feature = "native-calls")]
-            if let Err(error) = device_open_result {
-                // Preserve this independent join failure while all remaining cleanup
-                // completes; call cleanup failures are also returned below.
-                eprintln!("Could not release audio device opener during shutdown: {error}");
-            }
-            let audio_result = audio_attachments::wait_for_release().await;
-            if let Err(error) = audio_result {
-                // Still flush drafts and stop the manager; failure is returned below.
-                eprintln!("Could not release attachment audio during shutdown: {error}");
-            }
-            #[cfg(feature = "native-calls")]
-            let discovery_result = audio_devices::wait_for_discovery_release().await;
-            #[cfg(all(feature = "native-calls", target_os = "macos"))]
-            let backend_result = Some(
-                morpheus_rtc::wait_for_all_coreaudio_release()
-                    .await
-                    .map_err(|_| ShutdownFailure::AudioBackend),
-            );
-            #[cfg(all(feature = "native-calls", target_os = "linux"))]
-            let backend_result = Some(
-                morpheus_rtc::wait_for_all_alsa_release()
-                    .await
-                    .map_err(|_| ShutdownFailure::AudioBackend),
-            );
-            // Windows' actual native result is returned separately by its UI
-            // apartment coordinator. This tuple slot carries only Mac/ALSA.
-            #[cfg(all(
-                feature = "native-calls",
-                not(any(target_os = "macos", target_os = "linux"))
-            ))]
-            let backend_result: Option<Result<(), ShutdownFailure>> = None;
-            #[cfg(all(
-                feature = "native-calls",
-                any(target_os = "macos", target_os = "linux")
-            ))]
-            if matches!(backend_result, Some(Err(_))) {
-                eprintln!("Could not confirm native audio backend shutdown.");
-            }
-            // Selection/task/edit admission was closed synchronously on the
-            // UI thread. Actual admitted handles must finish before the final
-            // writer sweep, while loaded account stores remain available.
-            let appearance_result = style_profiles::wait_for_appearance_release().await;
-            let draft_task_result = live.drain_draft_work().await;
-            let verification_result = live.drain_verification_work().await;
-            // The producer is woken even when files stay unchanged. The bridge
-            // joins it, and admitted refreshes finish before account stores stop.
-            let config_watch_result = config_watch.finish().await;
-            let marker_scan_result = live.drain_marker_scans().await;
-            let config_drain_result = loop {
-                match store.write_shutdown_confirmed() {
-                    Ok(true) => break Ok(()),
-                    Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
-                    Err(error) => break Err(error),
-                }
-            };
-            let draft_result = live.flush_drafts().await;
-            manager.stop().await;
-            let update_result = update_result.map_err(|_| ShutdownFailure::UpdateWorker);
-            if update_result.is_err() {
-                // Keep diagnostics static and return failure only after all cleanup.
-                eprintln!("Could not confirm update worker shutdown.");
-            }
-            #[cfg(feature = "native-calls")]
-            {
-                (
-                    update_result,
-                    call_result,
-                    ring_result,
-                    device_open_result,
-                    audio_result,
-                    draft_result,
-                    discovery_result,
-                    backend_result,
-                    draft_task_result,
-                    config_drain_result,
-                    appearance_result,
-                    verification_result,
-                    config_watch_result,
-                    marker_scan_result,
-                )
-            }
-            #[cfg(not(feature = "native-calls"))]
-            {
-                (
-                    update_result,
-                    call_result,
-                    audio_result,
-                    draft_result,
-                    draft_task_result,
-                    config_drain_result,
-                    appearance_result,
-                    verification_result,
-                    config_watch_result,
-                    marker_scan_result,
-                )
+        } else {
+            Err(app_shutdown::Failure::Ownership)
+        };
+        // All independent cleanup/finalization attempts precede return, while
+        // the real event-loop failure keeps its original first precedence.
+        outcome.ui?;
+        if let Some(failure) = outcome.failure {
+            return Err(Box::new(app_shutdown::ShutdownError(failure)));
+        }
+        match outcome.cleanup {
+            Some(Ok(report)) => report
+                .outcome(acceptance_failed)
+                .map_err(app_shutdown::ShutdownError)?,
+            Some(Err(failure)) => return Err(Box::new(app_shutdown::ShutdownError(failure))),
+            None => {
+                return Err(Box::new(app_shutdown::ShutdownError(
+                    app_shutdown::Failure::Ownership,
+                )));
             }
         }
-    };
-    #[cfg(all(windows, feature = "native-calls"))]
-    let (
-        ui_result,
-        (
-            update_result,
-            call_result,
-            ring_result,
-            device_open_result,
-            audio_result,
-            draft_result,
-            discovery_result,
-            backend_result,
-            draft_task_result,
-            config_drain_result,
-            appearance_result,
-            verification_result,
-            config_watch_result,
-            marker_scan_result,
-        ),
-        wasapi_result,
-    ) = windows_audio::run(&ui, wasapi_ui, &runtime, cleanup)?;
-    #[cfg(all(not(windows), feature = "native-calls"))]
-    let (
-        ui_result,
-        (
-            update_result,
-            call_result,
-            ring_result,
-            device_open_result,
-            audio_result,
-            draft_result,
-            discovery_result,
-            backend_result,
-            draft_task_result,
-            config_drain_result,
-            appearance_result,
-            verification_result,
-            config_watch_result,
-            marker_scan_result,
-        ),
-    ) = {
-        let result = ui.run();
-        (result, runtime.block_on(cleanup()))
-    };
-    #[cfg(not(feature = "native-calls"))]
-    let (
-        ui_result,
-        (
-            update_result,
-            call_result,
-            audio_result,
-            draft_result,
-            draft_task_result,
-            config_drain_result,
-            appearance_result,
-            verification_result,
-            config_watch_result,
-            marker_scan_result,
-        ),
-    ) = {
-        let result = ui.run();
-        (result, runtime.block_on(cleanup()))
-    };
-    ui_result?;
-    if let Err(error) = draft_result {
-        eprintln!("Could not save drafts during shutdown: {error}");
-        return Err(Box::new(error));
+        finalized.map_err(app_shutdown::ShutdownError)?;
+        Ok(())
     }
-    audio_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    #[cfg(feature = "native-calls")]
-    device_open_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    #[cfg(feature = "native-calls")]
-    ring_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    // UI, draft, attachment, device-opening and ringing errors retain their
-    // precedence. Failed call cleanup or an update drain must also prevent a
-    // successful ordinary-shutdown result.
-    #[cfg(feature = "native-calls")]
-    if let Some(result) = backend_result {
-        result?;
+    #[cfg(all(not(target_os = "macos"), not(all(windows, feature = "native-calls"))))]
+    {
+        let ui_result = ui.run();
+        let drained =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(cleanup())));
+        drop(runtime);
+        #[cfg(morpheus_timeline_acceptance)]
+        let acceptance_failed = acceptance.finish().is_err();
+        #[cfg(not(morpheus_timeline_acceptance))]
+        let acceptance_failed = false;
+        let (report, task_failure) = match drained {
+            Ok(report) => (Some(report), None),
+            Err(payload) => {
+                std::mem::forget(payload);
+                (None, Some(app_shutdown::Failure::CleanupPanicked))
+            }
+        };
+        let finalized = match report {
+            Some(report) if !report.retain => runtime_owner.finalize(&shutdown_resources, report),
+            _ => Err(app_shutdown::Failure::Ownership),
+        };
+        ui_result?;
+        if let Some(failure) = task_failure {
+            return Err(Box::new(app_shutdown::ShutdownError(failure)));
+        }
+        let report = report.ok_or(app_shutdown::ShutdownError(
+            app_shutdown::Failure::Ownership,
+        ))?;
+        report
+            .outcome(acceptance_failed)
+            .map_err(app_shutdown::ShutdownError)?;
+        finalized.map_err(app_shutdown::ShutdownError)?;
+        Ok(())
     }
-    call_result?;
-    update_result?;
-    #[cfg(morpheus_timeline_acceptance)]
-    acceptance.finish()?;
-    draft_task_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    config_drain_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    appearance_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    verification_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    config_watch_result?;
-    marker_scan_result?;
-    #[cfg(feature = "native-calls")]
-    discovery_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    #[cfg(all(windows, feature = "native-calls"))]
-    wasapi_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    Ok(())
 }
 
 #[cfg(test)]

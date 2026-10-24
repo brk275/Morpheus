@@ -309,10 +309,70 @@ fn require_key(key: &str) -> Result<(), ControllerFailure> {
     }
 }
 
+/// Actual returned task receipts, not native audio or descendant/TLS proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IncomingDrainError {
+    Worker,
+    Ownership,
+}
+impl std::fmt::Display for IncomingDrainError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("Incoming call task shutdown could not be confirmed.")
+    }
+}
+impl std::error::Error for IncomingDrainError {}
+
+pub(super) fn combine_drain(
+    first: Result<(), IncomingDrainError>,
+    second: Result<(), IncomingDrainError>,
+) -> Result<(), IncomingDrainError> {
+    match (first, second) {
+        (Err(IncomingDrainError::Ownership), _) | (_, Err(IncomingDrainError::Ownership)) => {
+            Err(IncomingDrainError::Ownership)
+        }
+        (Err(IncomingDrainError::Worker), _) | (_, Err(IncomingDrainError::Worker)) => {
+            Err(IncomingDrainError::Worker)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn joined_incoming_task(
+    result: Result<(), tokio::task::JoinError>,
+    intentional_cancel: bool,
+) -> Result<(), IncomingDrainError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_cancelled() && intentional_cancel => Ok(()),
+        Err(error) if error.is_panic() => {
+            // Do not drop or format an arbitrary panic payload. The actual
+            // task returned; recording this fixed failure is not clean exit.
+            std::mem::forget(error.into_panic());
+            Err(IncomingDrainError::Worker)
+        }
+        Err(_) => Err(IncomingDrainError::Ownership),
+    }
+}
+
+pub(super) async fn join_incoming_task(
+    task: &mut Option<JoinHandle<()>>,
+    intentional_cancel: bool,
+) -> Result<(), IncomingDrainError> {
+    let Some(actual) = task.as_mut() else {
+        return Ok(());
+    };
+    // A cancelled observation keeps the original handle in the same owner.
+    let result = joined_incoming_task(actual.await, intentional_cancel);
+    task.take();
+    result
+}
+
 pub(crate) struct IncomingWorker {
     handle: IncomingHandle,
     task: Option<JoinHandle<()>>,
     _policy: Option<IncomingPolicyRegistration>,
+    completion: Option<Result<(), IncomingDrainError>>,
+    abort_requested: bool,
 }
 impl IncomingWorker {
     pub(crate) fn start(
@@ -355,6 +415,8 @@ impl IncomingWorker {
             handle,
             task,
             _policy: policy,
+            completion: None,
+            abort_requested: false,
         }
     }
     pub(crate) fn handle(&self) -> IncomingHandle {
@@ -364,16 +426,36 @@ impl IncomingWorker {
         self.handle.gate.shutdown();
     }
     pub(crate) async fn finish(&mut self) {
+        let _ = self.finish_checked().await;
+    }
+
+    pub(crate) async fn finish_checked(&mut self) -> Result<(), IncomingDrainError> {
         self.shutdown();
-        if let Some(mut task) = self.task.take() {
-            if time::timeout(Duration::from_secs(2), &mut task)
-                .await
-                .is_err()
-            {
-                task.abort();
-                let _ = task.await;
-            }
+        if let Some(result) = self.completion {
+            return result;
         }
+        let result = if let Some(task) = self.task.as_mut() {
+            let result = match time::timeout(Duration::from_secs(2), &mut *task).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Preserve the request across cancelled observations. It
+                    // is not completion: still await the same actual handle.
+                    self.abort_requested = true;
+                    task.abort();
+                    (&mut *task).await
+                }
+            };
+            let result = joined_incoming_task(result, self.abort_requested);
+            self.task.take();
+            result
+        } else if self._policy.is_none() {
+            // start() refused before spawning an actor when registration failed.
+            Ok(())
+        } else {
+            Err(IncomingDrainError::Ownership)
+        };
+        self.completion = Some(result);
+        result
     }
 }
 impl Drop for IncomingWorker {
@@ -1798,5 +1880,134 @@ mod tests {
         ) = |controller, commands, gate, manager, preferences| {
             require_send(run(controller, commands, gate, manager, preferences))
         };
+    }
+    #[tokio::test]
+    async fn checked_finish_retains_cancelled_observation_and_sticky_joined_panic() {
+        let (_controller, gate) = gate();
+        let (commands, _receiver) = mpsc::channel(COMMANDS);
+        let (release, wait) = oneshot::channel::<()>();
+        let actual = tokio::spawn(async move {
+            let _ = wait.await;
+            panic!("fixed incoming actor test failure");
+        });
+        let mut owner = IncomingWorker {
+            handle: IncomingHandle { commands, gate },
+            task: Some(actual),
+            _policy: None,
+            completion: None,
+            abort_requested: false,
+        };
+        let mut observation = Box::pin(owner.finish_checked());
+        let pending = futures_util::poll!(observation.as_mut()).is_pending();
+        drop(observation);
+        let retained = owner.task.is_some();
+        let incomplete = owner.completion.is_none();
+        let released = release.send(());
+        let first = owner.finish_checked().await;
+        let reaped = owner.task.is_none();
+        let repeated = owner.finish_checked().await;
+        // All assertions follow actual completion of the same retained handle.
+        assert!(pending && retained && incomplete && released.is_ok());
+        assert_eq!(first, Err(IncomingDrainError::Worker));
+        assert!(reaped);
+        assert_eq!(repeated, Err(IncomingDrainError::Worker));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checked_actor_abort_intent_survives_cancelled_join_observation() {
+        struct PausedDrop {
+            entered: Option<oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for PausedDrop {
+            fn drop(&mut self) {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+                let _ = self.release.recv();
+            }
+        }
+        let (_controller, gate) = gate();
+        let (commands, _receiver) = mpsc::channel(COMMANDS);
+        let (entered, ready) = oneshot::channel();
+        let (dropping, drop_started) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let paused = PausedDrop {
+            entered: Some(dropping),
+            release: wait,
+        };
+        let actual = tokio::spawn(async move {
+            let _paused = paused;
+            let _ = entered.send(());
+            std::future::pending::<()>().await;
+        });
+        let mut owner = IncomingWorker {
+            handle: IncomingHandle { commands, gate },
+            task: Some(actual),
+            _policy: None,
+            completion: None,
+            abort_requested: false,
+        };
+        let entered = ready.await;
+        let mut observation = Box::pin(owner.finish_checked());
+        let first_pending = futures_util::poll!(observation.as_mut()).is_pending();
+        // Drive the production timeout and abort, not a test-only stop flag.
+        time::sleep(Duration::from_secs(2)).await;
+        let join_pending = futures_util::poll!(observation.as_mut()).is_pending();
+        drop(observation);
+        let retained = owner.task.is_some() && owner.completion.is_none();
+        let requested = owner.abort_requested;
+        let drop_started = time::timeout(Duration::from_secs(1), drop_started).await;
+        // Release and actually join before evaluating any observations.
+        let released = release.send(());
+        drop(release);
+        let result = owner.finish_checked().await;
+        let reaped = owner.task.is_none();
+        let repeated = owner.finish_checked().await;
+        assert!(entered.is_ok() && first_pending && join_pending);
+        assert!(retained && requested && matches!(drop_started, Ok(Ok(()))));
+        assert!(released.is_ok() && reaped);
+        assert_eq!(result, Ok(()));
+        assert_eq!(repeated, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn checked_role_joins_preserve_panic_and_finish_other_intentional_cancellations() {
+        use std::sync::atomic::AtomicUsize;
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut roles = Vec::new();
+        let mut entered_all = true;
+        for _ in 0..3 {
+            let marker = Dropped(dropped.clone());
+            let (entered, ready) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _marker = marker;
+                let _ = entered.send(());
+                std::future::pending::<()>().await;
+            });
+            entered_all &= ready.await.is_ok();
+            task.abort();
+            roles.push(Some(task));
+        }
+        let mut failed = Some(tokio::spawn(async {
+            panic!("fixed incoming role test failure");
+        }));
+        let mut result = join_incoming_task(&mut failed, true).await;
+        for role in &mut roles {
+            // Invoke the actual production join and aggregation functions.
+            let joined = join_incoming_task(role, true).await;
+            result = combine_drain(result, joined);
+        }
+        assert!(entered_all);
+        assert_eq!(result, Err(IncomingDrainError::Worker));
+        assert!(failed.is_none());
+        assert!(roles.iter().all(Option::is_none));
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
     }
 }

@@ -2869,13 +2869,16 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     // Slint's event-loop proxy is process-global. Keep all real-window account
     // scenarios in this single test; the remaining app tests do not create UI.
     i_slint_backend_testing::init_integration_test_with_mock_time();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .unwrap();
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
     let _entered = runtime.enter();
     let runtime_handle = runtime.handle().clone();
+    let runtime_owner = runtime.clone();
     slint::spawn_local(async move {
         let started = std::time::Instant::now();
         let phase = std::rc::Rc::new(AccountUiProgress::new(started));
@@ -2885,7 +2888,7 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
         let outcome = tokio::select! {
             result = tokio::time::timeout(
                 ACCOUNT_UI_TOTAL_BUDGET,
-                exercise_account_ui(runtime_handle.clone(), phase.clone()),
+                exercise_account_ui(runtime_owner.clone(), phase.clone()),
             ) => result.map_err(|_| ()),
             () = phase.wait_for_stall() => Err(()),
         };
@@ -6062,13 +6065,73 @@ async fn assert_key_file_context_outlives_the_settings_subtree(ui: &AppWindow) {
     settle(ui).await;
 }
 
-async fn assert_queued_config_close_fence(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+// The single generated-window fixture's actual resources, not another task
+// registry. Publishing this pack before any awaited observation also retains
+// its original Runtime/files if the outer scenario timeout cancels the future.
+struct ConfigFenceOwner {
+    _runtime: Arc<tokio::runtime::Runtime>,
+    _profile: Arc<tempfile::TempDir>,
+    _configuration: Arc<tempfile::TempDir>,
+    _live: Arc<LiveUi>,
+    _store: morpheus_config::ConfigStore,
+    _notifications: Arc<crate::notifications::DesktopNotifications>,
+    config: std::sync::Mutex<Option<Arc<tokio::sync::Mutex<crate::config_watch::ConfigWatch>>>>,
+}
+static CONFIG_FENCE_OWNER: std::sync::Mutex<Option<Arc<ConfigFenceOwner>>> =
+    std::sync::Mutex::new(None);
+
+fn publish_config_fence_owner(actual: Arc<ConfigFenceOwner>) {
+    let mut slot = CONFIG_FENCE_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        drop(slot);
+        // Only one scenario/first uncertainty is possible. Never destroy the
+        // rejected actual pack if that construction invariant was violated.
+        std::mem::forget(actual);
+        panic!("the original config-fence resources are still retained");
+    }
+    *slot = Some(actual);
+}
+
+fn release_config_fence_owner(expected: &Arc<ConfigFenceOwner>) {
+    let retired = {
+        let mut slot = CONFIG_FENCE_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|actual| Arc::ptr_eq(actual, expected))
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    // Never run resource destructors while holding the fixed origin slot.
+    assert!(
+        retired.is_some(),
+        "the actual config-fence owner must be retained"
+    );
+    drop(retired);
+}
+
+fn notification_cleanup_unproved(
+    result: &Result<(), crate::notifications::NotificationDrainFailure>,
+) -> bool {
+    use crate::notifications::NotificationDrainFailure::{Ownership, Pending};
+    matches!(result, Err(Pending | Ownership))
+}
+
+async fn assert_queued_config_close_fence(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+    runtime_owner: Arc<tokio::runtime::Runtime>,
+    profile_owner: Arc<tempfile::TempDir>,
+) {
     use futures_util::FutureExt;
     use std::panic::AssertUnwindSafe;
 
     assert!(!live.action_admission_closed());
     assert!(!ui.get_application_closing());
-    let directory = tempfile::tempdir().unwrap();
+    let directory = Arc::new(tempfile::tempdir().unwrap());
     let store = morpheus_config::ConfigStore::at(directory.path().join("config.toml"));
     let previous = (
         ui.get_notifications_enabled(),
@@ -6084,6 +6147,16 @@ async fn assert_queued_config_close_fence(ui: &AppWindow, live: &Arc<LiveUi>, ru
         ui.as_weak(),
         runtime,
     );
+    let resources = Arc::new(ConfigFenceOwner {
+        _runtime: runtime_owner,
+        _profile: profile_owner,
+        _configuration: directory.clone(),
+        _live: live.clone(),
+        _store: store.clone(),
+        _notifications: notifications.clone(),
+        config: std::sync::Mutex::new(None),
+    });
+    publish_config_fence_owner(resources.clone());
     // Each owner has a real positive producer/bridge/callback control before
     // close. Two separate closed lifetimes cover valid policy and invalid read
     // sentinels without resetting a real production admission flag.
@@ -6094,13 +6167,24 @@ async fn assert_queued_config_close_fence(ui: &AppWindow, live: &Arc<LiveUi>, ru
         store.save(&positive).unwrap();
         ui.set_notifications_enabled(false);
         ui.set_config_error("waiting for the real config watcher".into());
-        let owner = crate::config_watch::ConfigWatch::start(
-            ui,
-            store.clone(),
-            live.clone(),
-            notifications.clone(),
-            runtime,
-        );
+        let owner = Arc::new(tokio::sync::Mutex::new(
+            crate::config_watch::ConfigWatch::start(
+                ui,
+                store.clone(),
+                live.clone(),
+                notifications.clone(),
+                runtime,
+            ),
+        ));
+        let previous_owner = resources
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(owner.clone());
+        // The preceding iteration returned an actual ConfigWatch receipt.
+        // Its Drop, if last, occurs without either resource-slot lock held.
+        drop(previous_owner);
+        let mut owner = owner.lock().await;
         let observed = AssertUnwindSafe(async {
             // Same two-second observation bound as the existing worker cases;
             // the std producer uses its real unchanged 700ms interval.
@@ -6123,6 +6207,67 @@ async fn assert_queued_config_close_fence(ui: &AppWindow, live: &Arc<LiveUi>, ru
                     .silent_banner_identity("config-account", false)
                     .is_some()
             );
+            if !invalid {
+                // Same real registered queued callback as the production
+                // activation receiver; service remains open so UI Closing is
+                // the only refusing gate. No OS notification is submitted.
+                assert!(!notifications.is_stopped());
+                let before = (
+                    ui.get_active_account_local_id(),
+                    ui.get_active_room_id(),
+                    ui.get_live_session(),
+                    ui.get_access_open(),
+                    ui.get_leave_call_dialog(),
+                    ui.get_session_error(),
+                    ui.window().is_minimized(),
+                );
+                let target = crate::navigation_target::NavigationTarget::new(
+                    "notification-fixture",
+                    "!notification:example.org",
+                    Some("$notification:example.org"),
+                    None,
+                )
+                .expect("synthetic notification target must be valid");
+                let queued = crate::notification_center::queue_activation_for_test(
+                    ui,
+                    runtime,
+                    &notifications,
+                    target,
+                )
+                .expect("actual activation callback must be queued");
+                let previous_closing = ui.get_application_closing();
+                ui.set_application_closing(true);
+                settle(ui).await;
+                let observation = queued.observations();
+                let after = (
+                    ui.get_active_account_local_id(),
+                    ui.get_active_room_id(),
+                    ui.get_live_session(),
+                    ui.get_access_open(),
+                    ui.get_leave_call_dialog(),
+                    ui.get_session_error(),
+                    ui.window().is_minimized(),
+                );
+                let service_open = !notifications.is_stopped();
+                // Only the test presentation property is restored. No real
+                // security/service close authority is reset or reconstructed.
+                ui.set_application_closing(previous_closing);
+                drop(queued);
+                assert_eq!(
+                    observation,
+                    (1, 0),
+                    "queued callback ran but closed UI admitted no body/effect"
+                );
+                assert_eq!(
+                    after, before,
+                    "closed callback must not restore, authenticate or navigate"
+                );
+                assert!(
+                    service_open,
+                    "service-close must not mask the UI Closing boundary"
+                );
+                eprintln!("MORPHEUS_APP_NOTIFICATION_CLOSE_CHECK complete=true");
+            }
             ui.set_active_account_local_id("config-account".into());
             ui.set_composer_text("untouched config close draft".into());
             ui.set_config_error("keep the closing diagnostic".into());
@@ -6172,15 +6317,68 @@ async fn assert_queued_config_close_fence(ui: &AppWindow, live: &Arc<LiveUi>, ru
         .await;
         owner.shutdown();
         let joined = owner.finish().await;
+        // Both terminal paths drain this actual local notification owner
+        // before config failure/assertion or captured-panic propagation.
+        let notification_joined = if joined.is_err() || observed.is_err() {
+            notifications.shutdown();
+            let app = notifications.finish_app_work().await;
+            let native = notifications.finish_native_work().await;
+            Some((app, native))
+        } else {
+            None
+        };
+        if let Some((app, native)) = &notification_joined {
+            let unproved = notification_cleanup_unproved(app)
+                || notification_cleanup_unproved(native)
+                || matches!(
+                    &joined,
+                    Err(crate::config_watch::ConfigWatchError::Ownership)
+                );
+            if unproved {
+                ui.set_application_closing(true);
+                live.close_action_admission();
+                store.close_write_admission();
+                // Keep the published exact pack on Pending/Ownership. The
+                // original expect/resume below fails; this is no clean receipt.
+            } else {
+                release_config_fence_owner(&resources);
+            }
+        }
         // Even an observation assertion/panic settles the actual producer,
         // bridge and direct-refresh owners before the test reports failure.
         joined.expect("config producer, bridge and refresh must actually finish");
         if let Err(payload) = observed {
-            notifications.shutdown();
+            if notification_joined
+                .as_ref()
+                .is_some_and(|(app, native)| app.is_err() || native.is_err())
+            {
+                eprintln!(
+                    "Could not confirm local notification task cleanup after fixture failure."
+                );
+            }
             std::panic::resume_unwind(payload);
+        }
+        if let Some((joined, native)) = notification_joined {
+            joined.expect("local notification tasks must actually finish before fixture failure");
+            native.expect(
+                "local native notification owners must actually finish before fixture failure",
+            );
         }
     }
     notifications.shutdown();
+    let notification_joined = notifications.finish_app_work().await;
+    let native_joined = notifications.finish_native_work().await;
+    if notification_cleanup_unproved(&notification_joined)
+        || notification_cleanup_unproved(&native_joined)
+    {
+        ui.set_application_closing(true);
+        live.close_action_admission();
+        store.close_write_admission();
+        // The fixed slot still owns the exact original Runtime, profile,
+        // configuration directory, notification book and ConfigWatch owner.
+        panic!("local notification cleanup is unproved; original resources remain owned");
+    }
+    release_config_fence_owner(&resources);
     ui.set_notifications_enabled(previous.0);
     ui.set_notification_show_preview(previous.1);
     ui.set_notification_sounds(previous.2);
@@ -6188,12 +6386,20 @@ async fn assert_queued_config_close_fence(ui: &AppWindow, live: &Arc<LiveUi>, ru
     ui.set_active_account_local_id(previous.4);
     ui.set_composer_text(previous.5);
     settle(ui).await;
+    notification_joined
+        .expect("local notification tasks must actually finish before profile cleanup");
+    native_joined
+        .expect("local native notification owners must actually finish before profile cleanup");
 }
 
-async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgress>) {
+async fn exercise_account_ui(
+    runtime_owner: Arc<tokio::runtime::Runtime>,
+    phase: std::rc::Rc<AccountUiProgress>,
+) {
+    let runtime = runtime_owner.handle().clone();
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
-    let directory = tempfile::tempdir().unwrap();
+    let directory = Arc::new(tempfile::tempdir().unwrap());
     let manager =
         Arc::new(morpheus_matrix::AccountManager::open(directory.path().join("profile")).unwrap());
     let ui = AppWindow::new().unwrap();
@@ -7028,7 +7234,14 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert!(manager.active_account().await.is_none());
 
     assert_removed_account_menu_projection(&ui);
-    assert_queued_config_close_fence(&ui, &live, &runtime).await;
+    assert_queued_config_close_fence(
+        &ui,
+        &live,
+        &runtime,
+        runtime_owner.clone(),
+        directory.clone(),
+    )
+    .await;
     // The real close is deliberately last: its process-thread admission must
     // never be reset just to continue earlier presentation checks.
     ui.set_live_session(true);
@@ -7093,7 +7306,11 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     .await
     .expect("draft worker must release the profile before cleanup");
     drop(manager);
-    directory.close().unwrap();
+    Arc::try_unwrap(directory)
+        .map_err(|_| ())
+        .expect("the actual profile must be released before cleanup")
+        .close()
+        .unwrap();
 }
 
 /// Whether any instantiated item's accessible label contains `needle`.

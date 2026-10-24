@@ -111,10 +111,17 @@ impl Authority {
 }
 
 #[derive(Default)]
+struct Worker {
+    task: Option<JoinHandle<()>>,
+    // A completed failed join stays distinct from an unproved owner on retries.
+    result: Option<Result<(), MarkerDrainError>>,
+}
+
+#[derive(Default)]
 pub(crate) struct MarkerScans {
     admission: Arc<Admission>,
     // Outside admission state: the worker captures only Admission and Weak<LiveUi>.
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Worker>,
 }
 
 impl MarkerScans {
@@ -150,11 +157,11 @@ impl MarkerScans {
         // Newest snapshot replaces at most one pending request; an admitted
         // active request is never dropped to make room for it.
         state.pending = Some(request);
-        if worker.is_none() {
+        if worker.task.is_none() && worker.result.is_none() {
             let admission = self.admission.clone();
             // Tokio spawn never synchronously polls this future. Retention and
             // close admission are atomic under these two fixed owner locks.
-            *worker = Some(runtime.spawn(run(admission, live)));
+            worker.task = Some(runtime.spawn(run(admission, live)));
         }
         self.admission.changed.notify_one();
     }
@@ -170,31 +177,42 @@ impl MarkerScans {
                 Ok(worker) => worker,
                 Err(_) => return Poll::Ready(Err(MarkerDrainError::Ownership)),
             };
-            let Some(task) = worker.as_mut() else {
-                return Poll::Ready(if self.admission.state().failed {
+            if let Some(result) = worker.result {
+                return Poll::Ready(result);
+            }
+            let Some(task) = worker.task.as_mut() else {
+                let result = if self.admission.state().failed {
                     Err(MarkerDrainError::Ownership)
                 } else {
                     Ok(())
-                });
+                };
+                worker.result = Some(result);
+                return Poll::Ready(result);
             };
-            match Pin::new(task).poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(result) => {
-                    worker.take();
-                    if let Err(error) = result {
-                        if error.is_panic() {
-                            std::mem::forget(error.into_panic());
-                        }
-                        self.admission.state().failed = true;
-                        return Poll::Ready(Err(MarkerDrainError::Worker));
-                    }
-                    Poll::Ready(if self.admission.state().failed {
-                        Err(MarkerDrainError::Ownership)
-                    } else {
-                        Ok(())
-                    })
+            let result = match Pin::new(task).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result,
+            };
+            worker.task.take();
+            let result = if let Err(error) = result {
+                if error.is_panic() {
+                    std::mem::forget(error.into_panic());
                 }
-            }
+                let mut state = self.admission.state();
+                let unproved = state.failed;
+                state.failed = true;
+                if unproved {
+                    Err(MarkerDrainError::Ownership)
+                } else {
+                    Err(MarkerDrainError::Worker)
+                }
+            } else if self.admission.state().failed {
+                Err(MarkerDrainError::Ownership)
+            } else {
+                Ok(())
+            };
+            worker.result = Some(result);
+            Poll::Ready(result)
         })
         .await
     }
@@ -207,12 +225,12 @@ impl Drop for MarkerScans {
         // task handle; ordinary main explicitly drains it before manager.stop.
         match self.worker.get_mut() {
             Ok(worker) => {
-                if let Some(task) = worker.take() {
+                if let Some(task) = worker.task.take() {
                     std::mem::forget(task);
                 }
             }
             Err(poison) => {
-                if let Some(task) = poison.into_inner().take() {
+                if let Some(task) = poison.into_inner().task.take() {
                     std::mem::forget(task);
                 }
             }
@@ -260,12 +278,12 @@ mod tests {
     #[tokio::test]
     async fn close_wakes_the_real_idle_worker_and_drain_observes_its_return() {
         let owner = MarkerScans::default();
-        *owner.worker.lock().unwrap() =
+        owner.worker.lock().unwrap().task =
             Some(tokio::spawn(run(owner.admission.clone(), Weak::new())));
         tokio::task::yield_now().await;
         let joined = tokio::time::timeout(Duration::from_secs(1), owner.drain()).await;
         assert!(matches!(joined, Ok(Ok(()))));
-        assert!(owner.worker.lock().unwrap().is_none());
+        assert!(owner.worker.lock().unwrap().task.is_none());
         assert_eq!(Arc::strong_count(&owner.admission), 1);
     }
 
@@ -281,14 +299,14 @@ mod tests {
         let released = Arc::new(AtomicBool::new(false));
         let held = Released(released.clone());
         let (finish, until_finish) = tokio::sync::oneshot::channel::<()>();
-        *owner.worker.lock().unwrap() = Some(tokio::spawn(async move {
+        owner.worker.lock().unwrap().task = Some(tokio::spawn(async move {
             let _held = held;
             let _ = until_finish.await;
         }));
         let mut draining = Box::pin(owner.drain());
         let pending = futures_util::poll!(draining.as_mut()).is_pending();
         drop(draining);
-        let retained = owner.worker.lock().unwrap().is_some();
+        let retained = owner.worker.lock().unwrap().task.is_some();
         let not_released = !released.load(Ordering::Acquire);
         let _ = finish.send(());
         // Settle the same retained task before evaluating observations. A
@@ -297,6 +315,20 @@ mod tests {
         assert!(pending && retained && not_released);
         assert!(matches!(joined, Ok(Ok(()))));
         assert!(released.load(Ordering::Acquire));
-        assert!(owner.worker.lock().unwrap().is_none());
+        assert!(owner.worker.lock().unwrap().task.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_joined_worker_failure_stays_joined_on_repeated_shutdown() {
+        let owner = MarkerScans::default();
+        owner.worker.lock().unwrap().task = Some(tokio::spawn(async {
+            panic!("synthetic marker worker failure");
+        }));
+        let first = owner.drain().await;
+        let second = owner.drain().await;
+        let no_task = owner.worker.lock().unwrap().task.is_none();
+        assert_eq!(first, Err(MarkerDrainError::Worker));
+        assert_eq!(second, first);
+        assert!(no_task);
     }
 }

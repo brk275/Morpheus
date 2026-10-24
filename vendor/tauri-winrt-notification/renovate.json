@@ -1,0 +1,18 @@
+{
+  "extends": ["config:recommended"],
+  "labels": ["type: chore"],
+  "rangeStrategy": "replace",
+  "forkProcessing": "enabled",
+  "packageRules": [
+    {
+      "matchPackageNames": ["*"],
+      "semanticCommitType": "chore",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Group windows-rs crates",
+      "groupName": "windows-rs crates",
+      "matchSourceUrls": ["https://github.com/microsoft/windows-rs"]
+    }
+  ]
+}
