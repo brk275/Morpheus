@@ -33,6 +33,87 @@ use crate::voice_spaces::VoiceSpaces;
 
 use super::*;
 
+// A fresh Sticky fixture must use only the ORIGINAL upper wire slot. A
+// successful own-HS write alone cannot rule out a concealed lower-slot preseed.
+async fn original_sticky_slot_without_lower(
+    client: &Client,
+    room_id: &matrix_sdk::ruma::RoomId,
+    admit: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<(), ()> {
+    use matrix_sdk::{
+        config::RequestConfig,
+        ruma::{
+            api::{client::state::get_state_event_for_key, error::ErrorKind},
+            events::StateEventType,
+        },
+    };
+    let room = client.get_room(room_id).ok_or(())?;
+    for event_type in ["m.rtc.slot", "org.matrix.msc4143.rtc.slot"] {
+        if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+            return Err(());
+        }
+        let response = client
+            .send(get_state_event_for_key::v3::Request::new(
+                room_id.to_owned(),
+                StateEventType::from(event_type),
+                "m.call#room".into(),
+            ))
+            .with_request_config(
+                RequestConfig::new()
+                    .retry_limit(0)
+                    .timeout(Duration::from_secs(5))
+                    .max_response_bytes(64 * 1024),
+            )
+            .await;
+        if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+            return Err(());
+        }
+        match response {
+            Err(error)
+                if error.as_client_api_error().is_some_and(|answer| {
+                    answer.status_code.as_u16() == 404
+                        && answer.error_kind() == Some(&ErrorKind::NotFound)
+                }) => {}
+            _ => return Err(()),
+        }
+    }
+    // The pinned SDK translates its stable slot write to this unstable type.
+    let response = client
+        .send(get_state_event_for_key::v3::Request::new(
+            room_id.to_owned(),
+            StateEventType::from("org.matrix.msc4143.rtc.slot"),
+            "m.call#ROOM".into(),
+        ))
+        .with_request_config(
+            RequestConfig::new()
+                .retry_limit(0)
+                .timeout(Duration::from_secs(5))
+                .max_response_bytes(64 * 1024),
+        )
+        .await
+        .map_err(|_| ())?;
+    if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+        return Err(());
+    }
+    let content: serde_json::Value =
+        serde_json::from_str(response.event_or_content.get()).map_err(|_| ())?;
+    if content.get("status").and_then(serde_json::Value::as_str) != Some("open")
+        || content
+            .pointer("/application/type")
+            .and_then(serde_json::Value::as_str)
+            != Some("m.call")
+        || !matches!(
+            content
+                .pointer("/encryption/type")
+                .and_then(serde_json::Value::as_str),
+            Some("m.per_member" | "org.matrix.msc4143.per_member")
+        )
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 mod actor_tests;
 #[cfg(target_os = "linux")]
 mod alsa_playback;
@@ -315,6 +396,11 @@ impl Session {
             )
             .await
             .map_err(|_| ())?;
+        let slot_selection = if case.mode == InteropMode::Sticky2025 {
+            Some(self.alice.account_selection(&alice.id).ok_or(())?)
+        } else {
+            None
+        };
         let bob = self
             .bob
             .add_password_account(
@@ -374,9 +460,24 @@ impl Session {
         phase(&mut self.stage, Stage::Join);
         self.rtc = Some(RtcService::new(alice_client.clone()));
         let rtc = self.rtc.as_mut().ok_or(())?;
-        rtc.open_slot(case.room_id.as_str(), "m.call#room", true)
+        if case.mode == InteropMode::Sticky2025 {
+            let original_selection = slot_selection.as_ref().ok_or(())?;
+            let admit = || original_selection.is_current();
+            rtc.open_outgoing_slot(
+                case.room_id.as_str(),
+                "m.call#room",
+                true,
+                case.mode,
+                &admit,
+            )
             .await
             .map_err(|_| ())?;
+            original_sticky_slot_without_lower(&alice_client, &case.room_id, &admit).await?;
+        } else {
+            rtc.open_slot(case.room_id.as_str(), "m.call#room", true)
+                .await
+                .map_err(|_| ())?;
+        }
         let options = match case.mode {
             InteropMode::Current => CallOptions::default(),
             InteropMode::Sticky2025 => CallOptions::element_call_matrix_2_0(),

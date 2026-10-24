@@ -48,6 +48,87 @@ impl RosterPhase {
     }
 }
 
+// A fresh Sticky fixture must use only the ORIGINAL upper wire slot. A
+// successful own-HS write alone cannot rule out a concealed lower-slot preseed.
+async fn original_sticky_slot_without_lower(
+    client: &Client,
+    room_id: &matrix_sdk::ruma::RoomId,
+    admit: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<(), ()> {
+    use matrix_sdk::{
+        config::RequestConfig,
+        ruma::{
+            api::{client::state::get_state_event_for_key, error::ErrorKind},
+            events::StateEventType,
+        },
+    };
+    let room = client.get_room(room_id).ok_or(())?;
+    for event_type in ["m.rtc.slot", "org.matrix.msc4143.rtc.slot"] {
+        if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+            return Err(());
+        }
+        let response = client
+            .send(get_state_event_for_key::v3::Request::new(
+                room_id.to_owned(),
+                StateEventType::from(event_type),
+                "m.call#room".into(),
+            ))
+            .with_request_config(
+                RequestConfig::new()
+                    .retry_limit(0)
+                    .timeout(Duration::from_secs(5))
+                    .max_response_bytes(64 * 1024),
+            )
+            .await;
+        if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+            return Err(());
+        }
+        match response {
+            Err(error)
+                if error.as_client_api_error().is_some_and(|answer| {
+                    answer.status_code.as_u16() == 404
+                        && answer.error_kind() == Some(&ErrorKind::NotFound)
+                }) => {}
+            _ => return Err(()),
+        }
+    }
+    // The pinned SDK translates its stable slot write to this unstable type.
+    let response = client
+        .send(get_state_event_for_key::v3::Request::new(
+            room_id.to_owned(),
+            StateEventType::from("org.matrix.msc4143.rtc.slot"),
+            "m.call#ROOM".into(),
+        ))
+        .with_request_config(
+            RequestConfig::new()
+                .retry_limit(0)
+                .timeout(Duration::from_secs(5))
+                .max_response_bytes(64 * 1024),
+        )
+        .await
+        .map_err(|_| ())?;
+    if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+        return Err(());
+    }
+    let content: serde_json::Value =
+        serde_json::from_str(response.event_or_content.get()).map_err(|_| ())?;
+    if content.get("status").and_then(serde_json::Value::as_str) != Some("open")
+        || content
+            .pointer("/application/type")
+            .and_then(serde_json::Value::as_str)
+            != Some("m.call")
+        || !matches!(
+            content
+                .pointer("/encryption/type")
+                .and_then(serde_json::Value::as_str),
+            Some("m.per_member" | "org.matrix.msc4143.per_member")
+        )
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct Fixture {
     accounts: Vec<TestAccount>,
@@ -717,6 +798,15 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
         .await
         .expect("Alice sign-in failed");
+    let slot_selection = if options.interop_mode == morpheus_rtc::InteropMode::Sticky2025 {
+        Some(
+            alice_manager
+                .account_selection(&alice_account.id)
+                .expect("Original Alice slot selection missing"),
+        )
+    } else {
+        None
+    };
     wait_for_sticky_sync(&alice_manager).await;
     wait_for_room(&alice_manager, room_id).await;
     wait_for_room(&alice_manager, unencrypted_room_id).await;
@@ -765,10 +855,26 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .set_voice_space_marker(room_id, true)
         .await
         .expect("Cannot designate shared voice space");
-    alice_rtc
-        .open_slot(room_id, "m.call#room", true)
-        .await
-        .expect("Cannot open encrypted call slot");
+    if options.interop_mode == morpheus_rtc::InteropMode::Sticky2025 {
+        let original_selection = slot_selection
+            .as_ref()
+            .expect("Original Sticky slot selection missing");
+        let admit = || original_selection.is_current();
+        alice_rtc
+            .open_outgoing_slot(room_id, "m.call#room", true, options.interop_mode, &admit)
+            .await
+            .expect("Cannot open original Sticky encrypted slot");
+        let original_room =
+            matrix_sdk::ruma::RoomId::parse(room_id).expect("Invalid owned fixture room");
+        original_sticky_slot_without_lower(&alice_client, &original_room, &admit)
+            .await
+            .expect("Original Sticky slot or no-lower proof failed");
+    } else {
+        alice_rtc
+            .open_slot(room_id, "m.call#room", true)
+            .await
+            .expect("Cannot open encrypted call slot");
+    }
     let join_timeout = std::env::var("MORPHEUS_RTC_JOIN_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())

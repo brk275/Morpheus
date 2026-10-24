@@ -27,6 +27,87 @@ use tokio::time::{sleep, timeout};
 const ELEMENT_ROOM_SLOT_ID: &str = "m.call#ROOM";
 const NATIVE_ROOM_SLOT_ID: &str = "m.call#room";
 
+// A fresh Sticky fixture must use only the ORIGINAL upper wire slot. A
+// successful own-HS write alone cannot rule out a concealed lower-slot preseed.
+async fn original_sticky_slot_without_lower(
+    client: &Client,
+    room_id: &matrix_sdk::ruma::RoomId,
+    admit: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<(), ()> {
+    use matrix_sdk::{
+        config::RequestConfig,
+        ruma::{
+            api::{client::state::get_state_event_for_key, error::ErrorKind},
+            events::StateEventType,
+        },
+    };
+    let room = client.get_room(room_id).ok_or(())?;
+    for event_type in ["m.rtc.slot", "org.matrix.msc4143.rtc.slot"] {
+        if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+            return Err(());
+        }
+        let response = client
+            .send(get_state_event_for_key::v3::Request::new(
+                room_id.to_owned(),
+                StateEventType::from(event_type),
+                "m.call#room".into(),
+            ))
+            .with_request_config(
+                RequestConfig::new()
+                    .retry_limit(0)
+                    .timeout(Duration::from_secs(5))
+                    .max_response_bytes(64 * 1024),
+            )
+            .await;
+        if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+            return Err(());
+        }
+        match response {
+            Err(error)
+                if error.as_client_api_error().is_some_and(|answer| {
+                    answer.status_code.as_u16() == 404
+                        && answer.error_kind() == Some(&ErrorKind::NotFound)
+                }) => {}
+            _ => return Err(()),
+        }
+    }
+    // The pinned SDK translates its stable slot write to this unstable type.
+    let response = client
+        .send(get_state_event_for_key::v3::Request::new(
+            room_id.to_owned(),
+            StateEventType::from("org.matrix.msc4143.rtc.slot"),
+            "m.call#ROOM".into(),
+        ))
+        .with_request_config(
+            RequestConfig::new()
+                .retry_limit(0)
+                .timeout(Duration::from_secs(5))
+                .max_response_bytes(64 * 1024),
+        )
+        .await
+        .map_err(|_| ())?;
+    if !admit() || room.state() != matrix_sdk::RoomState::Joined {
+        return Err(());
+    }
+    let content: serde_json::Value =
+        serde_json::from_str(response.event_or_content.get()).map_err(|_| ())?;
+    if content.get("status").and_then(serde_json::Value::as_str) != Some("open")
+        || content
+            .pointer("/application/type")
+            .and_then(serde_json::Value::as_str)
+            != Some("m.call")
+        || !matches!(
+            content
+                .pointer("/encryption/type")
+                .and_then(serde_json::Value::as_str),
+            Some("m.per_member" | "org.matrix.msc4143.per_member")
+        )
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 fn write_marker(path: impl AsRef<std::path::Path>, value: &[u8]) {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -729,6 +810,9 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
         .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
         .await
         .expect("Alice login failed");
+    let slot_selection = manager
+        .account_selection(&alice_account.id)
+        .expect("Original Alice slot selection missing");
     timeout(Duration::from_secs(90), async {
         let mut status = manager.subscribe_sync_status();
         loop {
@@ -766,13 +850,17 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
     let options = match interop_mode {
         InteropMode::RoomState => CallOptions::room_state_compatibility(),
         InteropMode::Sticky2025 => {
-            // This matches the pinned RTC library's Element Call interop
-            // fixture: its internal session and slot state stay lowercase,
-            // while the compatibility dialect spells member/token uppercase.
-            // Element Call treats an absent uppercase slot as implicitly open.
-            rtc.open_slot(room_id, NATIVE_ROOM_SLOT_ID, true)
+            // Keep the internal id lower, but write ONLY the original stock
+            // upper slot. No Current preseed may conceal the ingest boundary.
+            let admit = || slot_selection.is_current();
+            rtc.open_outgoing_slot(room_id, NATIVE_ROOM_SLOT_ID, true, interop_mode, &admit)
                 .await
-                .expect("Cannot open native encrypted slot");
+                .expect("Cannot open original Sticky encrypted slot");
+            let original_room =
+                matrix_sdk::ruma::RoomId::parse(room_id).expect("Invalid owned fixture room");
+            original_sticky_slot_without_lower(rtc.client(), &original_room, &admit)
+                .await
+                .expect("Original Sticky slot or no-lower proof failed");
             CallOptions::element_call_matrix_2_0()
         }
         InteropMode::Current => {

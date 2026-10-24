@@ -64,7 +64,8 @@ impl Default for CallOptions {
 impl CallOptions {
     /// Element Call's Matrix 2.0 setting still speaks the 2025 sticky dialect.
     /// Keep the core's lowercase slot; the pinned adapter converts its wire
-    /// membership and authorization request together. This is never a fallback.
+    /// membership, slot state and authorization request together. This is never
+    /// a fallback.
     pub fn element_call_matrix_2_0() -> Self {
         Self {
             slot_id: "m.call#room".to_owned(),
@@ -331,7 +332,8 @@ impl RtcService {
                 crate::outgoing_preflight::check(&self.client, &room, mode, true, &handoff_admit),
                 &handoff_admit,
                 || async {
-                    open_slot(&self.client, room_id, slot_id, "m.call", encryption).await?;
+                    let wire_slot_id = MembershipFormat::from(mode).token_slot_id(slot_id);
+                    open_slot(&self.client, room_id, &wire_slot_id, "m.call", encryption).await?;
                     Ok(())
                 },
             )
@@ -634,6 +636,216 @@ mod tests {
             MembershipFormat::Current.token_slot_id(&options.slot_id),
             "m.call#room"
         );
+    }
+
+    fn wire_slot(key: &str, event_type: &str, content: Value) -> matrix_rtc_core::EventIn {
+        matrix_rtc_core::EventIn {
+            event_id: "$original-slot:example.test".into(),
+            sender: "@alice:example.test".into(),
+            event_type: event_type.into(),
+            state_key: Some(key.into()),
+            origin_server_ts: 1,
+            content,
+            encryption: matrix_rtc_core::EventEncryption::Cleartext,
+        }
+    }
+
+    fn stock_open_slot() -> Value {
+        serde_json::json!({
+            "status": "open",
+            "application": { "type": "m.call" },
+            "encryption": { "type": "org.matrix.msc4143.per_member" }
+        })
+    }
+
+    #[tokio::test]
+    async fn sticky_slot_projection_uses_original_upper_authority_and_stable_precedence() {
+        use matrix_rtc_call_sdk::SdkMatrixBackend;
+        use matrix_rtc_core::{BaseRtcRoom, SlotState, feeder::IngestDialect};
+
+        let upper = |content| wire_slot("m.call#ROOM", "m.rtc.slot", content);
+        let lower = |content| wire_slot("m.call#room", "m.rtc.slot", content);
+        let unstable_upper =
+            |content| wire_slot("m.call#ROOM", "org.matrix.msc4143.rtc.slot", content);
+        let closed = serde_json::json!({ "status": "closed" });
+        let cases = [
+            (
+                vec![upper(stock_open_slot()), lower(closed.clone())],
+                vec![],
+                true,
+            ),
+            (
+                vec![upper(closed.clone()), lower(stock_open_slot())],
+                vec![],
+                false,
+            ),
+            (vec![lower(stock_open_slot())], vec![], false),
+            (
+                vec![upper(closed.clone())],
+                vec![unstable_upper(stock_open_slot())],
+                false,
+            ),
+            (
+                vec![upper(stock_open_slot())],
+                vec![unstable_upper(closed.clone())],
+                true,
+            ),
+            (
+                vec![lower(closed.clone())],
+                vec![unstable_upper(stock_open_slot())],
+                true,
+            ),
+            (
+                vec![upper(Value::Null)],
+                vec![unstable_upper(stock_open_slot())],
+                false,
+            ),
+        ];
+        for (stable, unstable, expected_open) in cases {
+            // The production feeder supplies each original type's current
+            // snapshot; the SAME collector projects it before core resolution.
+            let projected =
+                MembershipFormat::Sticky2025.current_slots("!room:example.test", stable, unstable);
+            assert!(projected.iter().all(|event| event.slot_id != "m.call#ROOM"));
+            let mut room = BaseRtcRoom::<SdkMatrixBackend>::new("!room:example.test");
+            room.on_encryption_received(true).await;
+            room.on_slots_received(projected).await;
+            assert_eq!(
+                room.slot_state("m.call#room")
+                    .as_ref()
+                    .map(SlotState::is_open),
+                Some(expected_open),
+            );
+            assert!(!room.has_backend());
+        }
+    }
+
+    #[tokio::test]
+    async fn slot_projection_refresh_removal_and_custom_ids_are_format_and_room_scoped() {
+        use matrix_rtc_call_sdk::SdkMatrixBackend;
+        use matrix_rtc_core::{BaseRtcRoom, SlotState, feeder::IngestDialect};
+
+        let original = vec![
+            wire_slot("m.call#ROOM", "m.rtc.slot", stock_open_slot()),
+            wire_slot(
+                "m.call#room",
+                "m.rtc.slot",
+                serde_json::json!({"status":"closed"}),
+            ),
+            wire_slot("m.call#breakout", "m.rtc.slot", stock_open_slot()),
+            wire_slot("m.call#breakout#ROOM", "m.rtc.slot", stock_open_slot()),
+        ];
+        let mut sticky = BaseRtcRoom::<SdkMatrixBackend>::new("!room:example.test");
+        let mut current = BaseRtcRoom::<SdkMatrixBackend>::new("!room:example.test");
+        sticky.on_encryption_received(true).await;
+        current.on_encryption_received(true).await;
+        sticky
+            .on_slots_received(MembershipFormat::Sticky2025.current_slots(
+                "!room:example.test",
+                original.clone(),
+                vec![],
+            ))
+            .await;
+        current
+            .on_slots_received(MembershipFormat::Current.current_slots(
+                "!room:example.test",
+                original,
+                vec![],
+            ))
+            .await;
+        assert!(sticky.slot_state("m.call#room").unwrap().is_open());
+        assert_eq!(current.slot_state("m.call#room"), Some(SlotState::Closed));
+        assert!(current.slot_state("m.call#ROOM").unwrap().is_open());
+        for custom in ["m.call#breakout", "m.call#breakout#ROOM"] {
+            assert!(sticky.slot_state(custom).unwrap().is_open());
+            assert!(current.slot_state(custom).unwrap().is_open());
+            assert_eq!(MembershipFormat::Sticky2025.token_slot_id(custom), custom);
+        }
+        // Refresh replaces only the original uppercase authority; an open
+        // lower Current slot cannot revive it, including after its removal.
+        sticky
+            .on_slots_received(MembershipFormat::Sticky2025.current_slots(
+                "!room:example.test",
+                vec![wire_slot(
+                    "m.call#ROOM",
+                    "m.rtc.slot",
+                    serde_json::json!({"status":"closed"}),
+                )],
+                vec![wire_slot(
+                    "m.call#room",
+                    "org.matrix.msc4143.rtc.slot",
+                    stock_open_slot(),
+                )],
+            ))
+            .await;
+        assert_eq!(sticky.slot_state("m.call#room"), Some(SlotState::Closed));
+        sticky
+            .on_slots_received(MembershipFormat::Sticky2025.current_slots(
+                "!room:example.test",
+                vec![],
+                vec![wire_slot(
+                    "m.call#room",
+                    "org.matrix.msc4143.rtc.slot",
+                    stock_open_slot(),
+                )],
+            ))
+            .await;
+        assert_eq!(sticky.slot_state("m.call#room"), Some(SlotState::Closed));
+        sticky
+            .on_slots_received(MembershipFormat::Sticky2025.current_slots(
+                "!other:example.test",
+                vec![wire_slot("m.call#ROOM", "m.rtc.slot", stock_open_slot())],
+                vec![],
+            ))
+            .await;
+        assert_eq!(sticky.slot_state("m.call#room"), Some(SlotState::Closed));
+        // RoomState still requests no slot subject: its existing no-slot policy
+        // is distinct from either of these slot-bearing dialects.
+        assert!(!MembershipFormat::RoomState.reads_slots());
+        assert_eq!(
+            MembershipFormat::RoomState.slot_id("m.call#ROOM"),
+            Some("m.call#ROOM".into())
+        );
+        assert!(!sticky.has_backend() && !current.has_backend());
+    }
+
+    #[tokio::test]
+    async fn projected_stock_slot_keeps_application_and_encrypted_room_requirements() {
+        use matrix_rtc_call_sdk::SdkMatrixBackend;
+        use matrix_rtc_core::{BaseRtcRoom, EncryptionMechanism, SlotState, feeder::IngestDialect};
+
+        let stock = stock_open_slot();
+        let projected = MembershipFormat::Sticky2025.current_slots(
+            "!room:example.test",
+            vec![wire_slot("m.call#ROOM", "m.rtc.slot", stock.clone())],
+            vec![],
+        );
+        assert_eq!(serde_json::to_value(&projected[0].content).unwrap(), stock);
+        let mut room = BaseRtcRoom::<SdkMatrixBackend>::new("!room:example.test");
+        room.on_encryption_received(true).await;
+        room.on_slots_received(projected).await;
+        assert_eq!(
+            room.slot_state("m.call#room")
+                .unwrap()
+                .open()
+                .unwrap()
+                .mechanism,
+            Some(EncryptionMechanism::PerMember)
+        );
+        for invalid in [
+            serde_json::json!({"status":"open", "application":{"type":"m.call"}}),
+            serde_json::json!({"status":"open", "application":{"type":"m.call"}, "encryption":{"type":"unknown"}}),
+            serde_json::json!({"status":"open", "application":{"type":"other"}, "encryption":{"type":"org.matrix.msc4143.per_member"}}),
+            serde_json::json!({"status":"unknown", "application":{"type":"m.call"}, "encryption":{"type":"org.matrix.msc4143.per_member"}}),
+        ] {
+            room.on_slots_received(MembershipFormat::Sticky2025.current_slots(
+                "!room:example.test",
+                vec![wire_slot("m.call#ROOM", "m.rtc.slot", invalid)],
+                vec![],
+            ))
+            .await;
+            assert_eq!(room.slot_state("m.call#room"), Some(SlotState::Closed));
+        }
     }
 
     #[test]

@@ -373,6 +373,20 @@ impl IngestDialect for MembershipFormat {
         !self.reads_state_membership()
     }
 
+    fn slot_id(&self, wire_slot_id: &str) -> Option<String> {
+        if *self == MembershipFormat::Sticky2025 {
+            match wire_slot_id.split_once('#') {
+                // This is the ORIGINAL 2025 slot, not a fallback to a Current
+                // lower-case slot when that original is absent or closed.
+                Some((application, "ROOM")) => Some(format!("{application}#room")),
+                Some((_, crate::ROOM_APPLICATION_SLOT_ID)) => None,
+                _ => Some(wire_slot_id.to_owned()),
+            }
+        } else {
+            Some(wire_slot_id.to_owned())
+        }
+    }
+
     fn current_membership(
         &self,
         room_id: &str,
