@@ -764,7 +764,8 @@
     "src/timeline/mod.rs",
     "tests/integration/timeline/decryption.rs",
     "tests/integration/timeline/read_receipts.rs",
-    "tests/integration/timeline/replies.rs"
+    "tests/integration/timeline/replies.rs",
+    "src/sync_service.rs"
   ],
   "additional_files": [
     "Cargo.toml.orig",
@@ -772,7 +773,8 @@
     ".rustfmt.toml",
     "UPSTREAM_FILES.sha256",
     "MORPHEUS_PROVENANCE.json",
-    "MORPHEUS_PATCH.md"
+    "MORPHEUS_PATCH.md",
+    "src/sync_service/owned_lifecycle.rs"
   ],
   "public_fixture_refactoring": [
     {
