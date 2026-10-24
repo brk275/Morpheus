@@ -347,7 +347,7 @@ async fn test_explicit_peer_room_preparation_never_creates_invites_or_substitute
         },
         room_id,
     };
-    use wiremock::matchers::path_regex;
+    use wiremock::matchers::{header, path_regex};
 
     let server = MatrixMockServer::new().await;
     server.mock_crypto_endpoints_preset().await;
@@ -465,7 +465,17 @@ async fn test_explicit_peer_room_preparation_never_creates_invites_or_substitute
         .expect(1)
         .mount(&server)
         .await;
-    server.mock_room_state_encryption().plain().mount().await;
+    // Crypto clients have distinct tokens; the plain-room helper expects the
+    // unrelated default test token. Bind this preflight to Alice and this room.
+    Mock::given(method("GET"))
+        .and(path(format!("/_matrix/client/v3/rooms/{chosen}/state/m.room.encryption/")))
+        .and(header("authorization", format!("Bearer {}", alice.access_token().unwrap())))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_json(&*matrix_sdk_test::test_json::NOT_FOUND),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     let event = event_id!("$explicit-peer-request");
     Mock::given(method("PUT"))
         .and(path_regex(format!("^/_matrix/client/v3/rooms/{chosen}/send/m.room.message/.*")))
