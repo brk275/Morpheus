@@ -516,7 +516,11 @@ impl OutageSession {
         let mut video = self.calls.subscribe_video();
         stage("join");
         self.calls
-            .open_slot(&account.id, case.room.as_str())
+            .open_slot(
+                selection.clone(),
+                case.room.as_str(),
+                CallJoinMode::Standard,
+            )
             .await
             .map_err(|_| ())?;
         let original = self
