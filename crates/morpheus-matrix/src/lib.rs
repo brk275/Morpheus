@@ -1175,6 +1175,7 @@ struct State {
     pending_sso: HashMap<String, PendingSso>,
     sync_task: Option<SyncTask>,
     queue_recovery_task: Option<JoinHandle<()>>,
+    removal_owner: Option<account_access::RemovalOwner>,
 }
 
 struct SyncTask {
@@ -1194,6 +1195,7 @@ pub struct AccountManager {
     access_instance: Uuid,
     access_epoch: std::sync::atomic::AtomicU64,
     access_worker: Arc<tokio::sync::Semaphore>,
+    removal_pending: Arc<std::sync::atomic::AtomicBool>,
     sync_policy: SyncPolicy,
     state: Mutex<State>,
     active_tx: watch::Sender<Option<AccountInfo>>,
@@ -1233,6 +1235,7 @@ impl AccountManager {
             access_instance: Uuid::new_v4(),
             access_epoch: std::sync::atomic::AtomicU64::new(0),
             access_worker: Arc::new(tokio::sync::Semaphore::new(1)),
+            removal_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sync_policy,
             state: Mutex::new(State {
                 action_admission_closed,
@@ -1243,6 +1246,7 @@ impl AccountManager {
                 pending_sso: HashMap::new(),
                 sync_task: None,
                 queue_recovery_task: None,
+                removal_owner: None,
             }),
             active_tx,
             selections: account_selection::Selections::default(),
@@ -1618,7 +1622,9 @@ impl AccountManager {
             self.publish_active_account(None);
             self.sync_tx.send_replace(SyncStatus::Stopped);
         }
-        let client = if let Some(loaded) = state.loaded.remove(id) {
+        let client = if let Some(loaded) = state.loaded.get(id).cloned() {
+            // Keep this actual owner in State across caller cancellation while
+            // draining. A later stop/removal can resume its retained handles.
             // Drain any in-flight token write before deleting the credential.
             // Otherwise a late session refresh could recreate it after logout.
             loaded.stop_owned_tasks().await;
@@ -3230,6 +3236,12 @@ impl AccountManager {
         state.active_account_id = None;
         self.publish_active_account(None);
         self.sync_tx.send_replace(SyncStatus::Stopped);
+        // A timeout/cancelled removal caller did not finish its owned work.
+        // Observe that same task before shutdown can release the profile. A
+        // drain receipt never starts erasure; any pending tombstone stays saved.
+        if let Some(owner) = state.removal_owner.as_mut() {
+            owner.observe().await;
+        }
         // Whole-manager shutdown is an awaited vault-write boundary. An
         // immediately reopened profile must not race a dropped token watcher.
         for loaded in state.loaded.values() {
@@ -3480,37 +3492,17 @@ impl LoadedAccount {
         self.stop_token_persistence().await;
     }
 
-    async fn try_stop_owned_tasks(&self, timeout: Duration) -> bool {
-        tokio::time::timeout(timeout, async {
-            self.e2ee.stop().await;
-            self.try_stop_token_persistence(timeout).await
-        })
-        .await
-        .unwrap_or(false)
-    }
-
     async fn stop_token_persistence(&self) {
-        if let Some(mut token_task) = self.token_task.lock().await.take() {
+        let mut slot = self.token_task.lock().await;
+        if let Some(token_task) = slot.as_mut() {
             if let Some(shutdown) = token_task.shutdown.take() {
                 let _ = shutdown.send(());
             }
-            let _ = token_task.task.await;
-        }
-    }
-
-    async fn try_stop_token_persistence(&self, timeout: Duration) -> bool {
-        let mut slot = self.token_task.lock().await;
-        let Some(task) = slot.as_mut() else {
-            return true;
-        };
-        if let Some(shutdown) = task.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if tokio::time::timeout(timeout, &mut task.task).await.is_err() {
-            return false;
+            if let Err(error) = (&mut token_task.task).await {
+                account_access::retain_join_panic(error);
+            }
         }
         slot.take();
-        true
     }
 
     async fn timeline(&self, room_id: &str) -> Result<Arc<Timeline>> {

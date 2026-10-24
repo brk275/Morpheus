@@ -906,6 +906,7 @@ pub struct LiveUi {
     draft_write_tx: std::sync::Mutex<Option<mpsc::Sender<()>>>,
     draft_work: std::sync::Mutex<DraftWork>,
     verification_work: crate::verification_work::VerificationWork,
+    marker_scans: crate::marker_scans::MarkerScans,
     generation: Arc<AtomicU64>,
     recovery_notices: Arc<crate::timeline_recovery::Notices>,
     render_epoch: Arc<AtomicU64>,
@@ -1164,6 +1165,7 @@ impl LiveUi {
                 ..DraftWork::default()
             }),
             verification_work: crate::verification_work::VerificationWork::default(),
+            marker_scans: crate::marker_scans::MarkerScans::default(),
             generation: Arc::new(AtomicU64::new(0)),
             recovery_notices,
             render_epoch: Arc::new(AtomicU64::new(0)),
@@ -1194,6 +1196,7 @@ impl LiveUi {
     /// drain and final stable flush; resumable manager.stop remains distinct.
     pub(crate) fn close_action_admission(&self) {
         self.verification_work.close();
+        self.marker_scans.close();
         let mut work = self
             .draft_work
             .lock()
@@ -4088,22 +4091,60 @@ impl LiveUi {
                     .await;
             }
         }
-        let marker_account = account_id;
-        let voice_spaces = self.voice_spaces.clone();
-        let live = self.clone();
-        tokio::spawn(async move {
-            if voice_spaces
-                .scan_shared(&live.manager, &marker_account, &marker_rooms)
-                .await
-            {
-                let shared_rooms = voice_spaces.shared_rooms(&marker_account).await;
-                let _ = ui.upgrade_in_event_loop(move |window| {
-                    if window.get_active_account_local_id().as_str() == marker_account {
-                        apply_shared_voice_labels(&window, &shared_rooms);
-                    }
-                });
+        if let Some(selection) = selection {
+            self.marker_scans.queue(
+                Arc::downgrade(self),
+                &Handle::current(),
+                crate::marker_scans::Request {
+                    selection,
+                    rooms: marker_rooms,
+                    ui,
+                },
+            );
+        }
+    }
+
+    pub(crate) async fn drain_marker_scans(
+        &self,
+    ) -> Result<(), crate::marker_scans::MarkerDrainError> {
+        self.marker_scans.drain().await
+    }
+
+    pub(crate) async fn run_marker_scan(
+        self: &Arc<Self>,
+        request: crate::marker_scans::Request,
+        authority: crate::marker_scans::Authority,
+    ) {
+        if !self.is_live.load(Ordering::Acquire)
+            || self.action_admission_closed()
+            || !authority.is_current()
+        {
+            return;
+        }
+        if self
+            .voice_spaces
+            .scan_shared_owned(&self.manager, &authority, &request.rooms)
+            .await
+        {
+            if !authority.is_current() {
+                return;
             }
-        });
+            let shared_rooms = self.voice_spaces.shared_rooms(authority.account_id()).await;
+            let live = Arc::downgrade(self);
+            let _ = request.ui.upgrade_in_event_loop(move |window| {
+                let Some(live) = live.upgrade() else {
+                    return;
+                };
+                if authority.is_current()
+                    && live.is_live.load(Ordering::Acquire)
+                    && !live.action_admission_closed()
+                    && !window.get_application_closing()
+                    && window.get_active_account_local_id().as_str() == authority.account_id()
+                {
+                    apply_shared_voice_labels(&window, &shared_rooms);
+                }
+            });
+        }
     }
 
     /// Publish an error only in the exact navigation it belongs to. The
@@ -7128,6 +7169,49 @@ mod stale_observer_tests {
         directory.close().unwrap();
     }
 
+    /// Logout may return promptly while its already-started native cleanup is
+    /// still owned. Observe only that same operation; never retry the logout or
+    /// infer erasure from a permit/count. A real vault/store failure still fails.
+    async fn logout_fixture_account(
+        manager: &AccountManager,
+        id: &str,
+    ) -> std::result::Result<(), MatrixCoreError> {
+        match manager.logout_account(id).await {
+            Ok(_) => {}
+            Err(MatrixCoreError::AccountRemovalPending) => {
+                let removal = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    manager.finish_pending_account_removal(id),
+                )
+                .await
+                .map_err(|_| MatrixCoreError::AccountRemovalPending)??;
+                if removal.account_id != id
+                    || !removal.complete
+                    || !removal.credentials_removed
+                    || !removal.store_removed
+                {
+                    return Err(MatrixCoreError::AccountRemovalPending);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        if manager
+            .accounts()
+            .await
+            .iter()
+            .any(|account| account.id == id)
+            || manager
+                .app_password_status()
+                .await
+                .pending_removals
+                .iter()
+                .any(|pending| pending == id)
+        {
+            return Err(MatrixCoreError::AccountRemovalPending);
+        }
+        Ok(())
+    }
+
     struct FixtureAccount {
         homeserver_url: String,
         username: String,
@@ -7365,12 +7449,10 @@ mod stale_observer_tests {
         drop(client);
         drop(recovered);
 
-        manager
-            .logout_account(&a_account.id)
+        logout_fixture_account(&manager, &a_account.id)
             .await
             .expect("Cannot remove first account");
-        manager
-            .logout_account(&b_account.id)
+        logout_fixture_account(&manager, &b_account.id)
             .await
             .expect("Cannot remove second account");
         manager.stop().await;
@@ -7407,6 +7489,23 @@ mod stale_observer_tests {
         let selection = manager
             .account_selection(&a_account.id)
             .expect("Selection missing");
+
+        // Use the real marker authority captured before A -> B -> A. Both
+        // destinations change only through its actual synchronous commit gate;
+        // no test-owned predicate mirrors the selection or close checks.
+        let marker = live
+            .marker_scans
+            .authority_for_test(&live, selection.clone());
+        let (mut marker_cache, mut marker_presentation) = (0, 0);
+        assert!(marker.is_current());
+        assert_eq!(
+            marker.with_current(|| {
+                marker_cache = 1;
+                marker_presentation = 1;
+            }),
+            Some(())
+        );
+        assert_eq!((marker_cache, marker_presentation), (1, 1));
 
         // Actual postjoin dispatch must stay withdrawable while the account
         // transition is held. It neither waits for that lock to be released
@@ -7613,6 +7712,15 @@ mod stale_observer_tests {
             .account_selection(&a_account.id)
             .expect("Renewed selection missing");
         assert!(!selection.is_current() && renewed.is_current());
+        assert!(!marker.is_current());
+        assert_eq!(
+            marker.with_current(|| {
+                marker_cache = 9;
+                marker_presentation = 9;
+            }),
+            None
+        );
+        assert_eq!((marker_cache, marker_presentation), (1, 1));
         let gate = SnapshotGate {
             authority: NavigationAuthority::default(),
             selection: selection.clone(),
@@ -7656,6 +7764,35 @@ mod stale_observer_tests {
         assert_eq!(live.render_epoch.load(Ordering::Acquire), render);
         assert!(live.feed_key.lock().await.is_none());
         assert!(live.focused_view(&a_room).is_none());
+
+        // A fresh authority for the renewed epoch admits normally. Closing
+        // only the actual marker owner then refuses it even though this real
+        // account selection and the live/action context remain current.
+        let current_marker = live.marker_scans.authority_for_test(&live, renewed.clone());
+        assert!(current_marker.is_current());
+        assert_eq!(
+            current_marker.with_current(|| {
+                marker_cache = 2;
+                marker_presentation = 2;
+            }),
+            Some(())
+        );
+        live.marker_scans.close();
+        assert!(renewed.is_current());
+        assert!(live.is_live.load(Ordering::Acquire));
+        assert!(!live.action_admission_closed());
+        assert!(!current_marker.is_current());
+        assert_eq!(
+            current_marker.with_current(|| {
+                marker_cache = 9;
+                marker_presentation = 9;
+            }),
+            None
+        );
+        assert_eq!((marker_cache, marker_presentation), (2, 2));
+        live.drain_marker_scans()
+            .await
+            .expect("The actual marker owner must finish");
 
         manager
             .logout_account(&a_account.id)

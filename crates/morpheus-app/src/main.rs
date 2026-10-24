@@ -21,6 +21,7 @@ mod call_stage;
 mod calls;
 mod composer_mentions;
 mod config_cli;
+mod config_watch;
 mod device_sessions;
 mod draft_recovery;
 mod drafts;
@@ -33,6 +34,7 @@ mod kept_replies;
 mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
+mod marker_scans;
 mod matrix_links;
 mod member_privacy;
 mod message_metadata;
@@ -2256,59 +2258,14 @@ fn run_application(
         notifications.clone(),
     );
 
-    let watch = store.watch_with_theme(Duration::from_millis(700));
-    let weak = ui.as_weak();
-    let watch_live = live.clone();
-    let watch_notifications = notifications.clone();
-    let watch_handle = runtime.handle().clone();
-    let watch_store = store.clone();
-    thread::spawn(move || {
-        while watch.recv().is_ok() {
-            // The watcher result can be older than a Settings save. Read the
-            // latest file on the UI event loop, where Settings callbacks also
-            // run, so an older notification policy cannot overwrite a newer
-            // privacy choice. Theme errors must not block a valid policy.
-            let current_store = watch_store.clone();
-            let current_notifications = watch_notifications.clone();
-            let current_live = watch_live.clone();
-            let current_weak = weak.clone();
-            let current_handle = watch_handle.clone();
-            let closed = weak
-                .upgrade_in_event_loop(move |ui| match current_store.load() {
-                    Ok(config) => {
-                        current_notifications.apply_config(&config);
-                        apply_notification_settings(&ui, &config);
-                        shortcuts::apply_config(&ui, &config);
-                        audio_devices::apply_config(&ui, &config);
-                        image_previews::apply_config(&ui, &config);
-                        room_activity::apply_config(&ui, &config);
-                        current_live.voice_spaces.apply_config(&config);
-                        match current_store.load_theme(&config) {
-                            Ok(theme) => apply_loaded_config(
-                                &ui,
-                                &LoadedConfig {
-                                    config: config.clone(),
-                                    theme,
-                                },
-                            ),
-                            Err(error) => ui.set_config_error(error.to_string().into()),
-                        }
-                        let live = current_live.clone();
-                        let weak = current_weak.clone();
-                        current_handle.spawn(async move {
-                            let _ = live.refresh(weak).await;
-                        });
-                    }
-                    Err(error) => {
-                        ui.set_config_error(error.to_string().into());
-                    }
-                })
-                .is_err();
-            if closed {
-                break;
-            }
-        }
-    });
+    let config_watch = config_watch::ConfigWatch::start(
+        &ui,
+        store.clone(),
+        live.clone(),
+        notifications.clone(),
+        runtime.handle(),
+    );
+
     {
         let access = account_access.clone();
         runtime.spawn(async move { access.restore().await });
@@ -4812,6 +4769,7 @@ fn run_application(
         #[cfg(all(windows, feature = "native-calls"))]
         live.security_gate.begin_shutdown(None);
         live.close_action_admission();
+        config_watch.shutdown();
         message_copy::retire(&cleanup_ui);
         verification::shutdown(&cleanup_ui);
         // Actual UI-owned SDK sessions go before any async task/store drain.
@@ -4925,6 +4883,10 @@ fn run_application(
             let appearance_result = style_profiles::wait_for_appearance_release().await;
             let draft_task_result = live.drain_draft_work().await;
             let verification_result = live.drain_verification_work().await;
+            // The producer is woken even when files stay unchanged. The bridge
+            // joins it, and admitted refreshes finish before account stores stop.
+            let config_watch_result = config_watch.finish().await;
+            let marker_scan_result = live.drain_marker_scans().await;
             let config_drain_result = loop {
                 match store.write_shutdown_confirmed() {
                     Ok(true) => break Ok(()),
@@ -4954,6 +4916,8 @@ fn run_application(
                     config_drain_result,
                     appearance_result,
                     verification_result,
+                    config_watch_result,
+                    marker_scan_result,
                 )
             }
             #[cfg(not(feature = "native-calls"))]
@@ -4967,6 +4931,8 @@ fn run_application(
                     config_drain_result,
                     appearance_result,
                     verification_result,
+                    config_watch_result,
+                    marker_scan_result,
                 )
             }
         }
@@ -4987,6 +4953,8 @@ fn run_application(
             config_drain_result,
             appearance_result,
             verification_result,
+            config_watch_result,
+            marker_scan_result,
         ),
         wasapi_result,
     ) = windows_audio::run(&ui, wasapi_ui, &runtime, cleanup)?;
@@ -5006,6 +4974,8 @@ fn run_application(
             config_drain_result,
             appearance_result,
             verification_result,
+            config_watch_result,
+            marker_scan_result,
         ),
     ) = {
         let result = ui.run();
@@ -5023,6 +4993,8 @@ fn run_application(
             config_drain_result,
             appearance_result,
             verification_result,
+            config_watch_result,
+            marker_scan_result,
         ),
     ) = {
         let result = ui.run();
@@ -5053,6 +5025,8 @@ fn run_application(
     config_drain_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     appearance_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     verification_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    config_watch_result?;
+    marker_scan_result?;
     #[cfg(feature = "native-calls")]
     discovery_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     #[cfg(all(windows, feature = "native-calls"))]

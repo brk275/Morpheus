@@ -17,9 +17,11 @@ pub mod diagnostics;
 mod input;
 pub mod registry;
 pub mod style_profiles;
+mod watch;
 
 pub use commit::{CommitError, ConfigRevision};
 pub use input::{InputError, MAX_CONFIG_BYTES, MAX_THEME_BYTES, read_bounded};
+pub use watch::{OwnedWatch, WatchJoinError, WatchStop};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -2287,6 +2289,8 @@ impl ConfigStore {
     }
 
     /// Watch the settings file and its selected theme pack as a single unit.
+    /// Compatibility receiver API; application-lifetime desktop callers use
+    /// `watch_with_theme_owned` to cancel and join unchanged polling.
     /// Callers only apply `Ok` values so a broken external edit leaves the
     /// last valid appearance in place while its error can be shown in the UI.
     pub fn watch_with_theme(
@@ -2311,6 +2315,27 @@ impl ConfigStore {
             }
         });
         receiver
+    }
+
+    /// Owned desktop path. The same sample defines both change detection and
+    /// publication; callers retain its stop handle and actual join receipt.
+    /// Pending notifications coalesce; desktop callers reread current settings
+    /// on the UI thread before applying privacy policy.
+    pub fn watch_with_theme_owned(
+        &self,
+        interval: Duration,
+    ) -> std::io::Result<OwnedWatch<Result<LoadedConfig, ConfigError>>> {
+        let store = self.clone();
+        let mut last_signature: Option<WatchSignature> = None;
+        watch::spawn(interval, move || {
+            let (signature, result) =
+                store.sample_with_theme(read_bounded(store.path(), MAX_CONFIG_BYTES));
+            if last_signature.as_ref() == Some(&signature) {
+                return None;
+            }
+            last_signature = Some(signature);
+            Some(result)
+        })
     }
 }
 

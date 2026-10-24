@@ -245,7 +245,9 @@ impl E2eeReadiness {
         let mut slot = self.task.lock().await;
         if let Some(task) = slot.as_mut() {
             task.abort();
-            let _ = task.await;
+            if let Err(error) = task.await {
+                account_access::retain_join_panic(error);
+            }
         }
         slot.take();
     }
@@ -773,7 +775,9 @@ mod tests {
             assert!(retained.is_some());
             assert!(released.upgrade().is_some());
             assert!(
-                !loaded.try_stop_owned_tasks(Duration::from_millis(20)).await,
+                time::timeout(Duration::from_millis(20), loaded.stop_owned_tasks())
+                    .await
+                    .is_err(),
                 "removal must report pending when the watcher cannot be drained"
             );
             assert!(retained.is_some());

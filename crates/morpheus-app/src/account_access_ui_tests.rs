@@ -6062,6 +6062,134 @@ async fn assert_key_file_context_outlives_the_settings_subtree(ui: &AppWindow) {
     settle(ui).await;
 }
 
+async fn assert_queued_config_close_fence(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    assert!(!live.action_admission_closed());
+    assert!(!ui.get_application_closing());
+    let directory = tempfile::tempdir().unwrap();
+    let store = morpheus_config::ConfigStore::at(directory.path().join("config.toml"));
+    let previous = (
+        ui.get_notifications_enabled(),
+        ui.get_notification_show_preview(),
+        ui.get_notification_sounds(),
+        ui.get_config_error(),
+        ui.get_active_account_local_id(),
+        ui.get_composer_text(),
+    );
+    let notifications = crate::notifications::DesktopNotifications::start(
+        live.manager.clone(),
+        Config::default(),
+        ui.as_weak(),
+        runtime,
+    );
+    // Each owner has a real positive producer/bridge/callback control before
+    // close. Two separate closed lifetimes cover valid policy and invalid read
+    // sentinels without resetting a real production admission flag.
+    for invalid in [false, true] {
+        let mut positive = Config::default();
+        positive.notifications.enabled = true;
+        positive.notifications.show_message_preview = true;
+        store.save(&positive).unwrap();
+        ui.set_notifications_enabled(false);
+        ui.set_config_error("waiting for the real config watcher".into());
+        let owner = crate::config_watch::ConfigWatch::start(
+            ui,
+            store.clone(),
+            live.clone(),
+            notifications.clone(),
+            runtime,
+        );
+        let observed = AssertUnwindSafe(async {
+            // Same two-second observation bound as the existing worker cases;
+            // the std producer uses its real unchanged 700ms interval.
+            let mut applied = false;
+            for _ in 0..400 {
+                settle(ui).await;
+                if ui.get_notifications_enabled() && ui.get_config_error().is_empty() {
+                    applied = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                applied,
+                "real config producer/bridge must apply a live update"
+            );
+            #[cfg(feature = "native-calls")]
+            assert!(
+                notifications
+                    .silent_banner_identity("config-account", false)
+                    .is_some()
+            );
+            ui.set_active_account_local_id("config-account".into());
+            ui.set_composer_text("untouched config close draft".into());
+            ui.set_config_error("keep the closing diagnostic".into());
+            if invalid {
+                std::fs::write(store.path(), "[notifications\nenabled = false\n").unwrap();
+            } else {
+                let mut changed = positive;
+                changed.notifications.enabled = false;
+                changed.notifications.show_message_preview = false;
+                store.save(&changed).unwrap();
+            }
+            // Queue the actual production closure, then close without any
+            // yield. Only this owner closes: live/UI flags remain open, so
+            // removing its closure guard would make these assertions fail.
+            assert!(
+                owner
+                    .queue_latest_for_test(ui, store.clone(), live.clone(), notifications.clone(),)
+                    .is_ok()
+            );
+            owner.shutdown();
+            settle(ui).await;
+            assert_eq!(
+                ui.get_config_error().as_str(),
+                "keep the closing diagnostic"
+            );
+            assert!(ui.get_notifications_enabled());
+            assert!(ui.get_notification_show_preview());
+            assert_eq!(ui.get_active_account_local_id().as_str(), "config-account");
+            assert_eq!(
+                ui.get_composer_text().as_str(),
+                "untouched config close draft"
+            );
+            #[cfg(feature = "native-calls")]
+            assert!(
+                notifications
+                    .silent_banner_identity("config-account", false)
+                    .is_some()
+            );
+            if invalid {
+                assert_eq!(
+                    std::fs::read_to_string(store.path()).unwrap(),
+                    "[notifications\nenabled = false\n"
+                );
+            }
+        })
+        .catch_unwind()
+        .await;
+        owner.shutdown();
+        let joined = owner.finish().await;
+        // Even an observation assertion/panic settles the actual producer,
+        // bridge and direct-refresh owners before the test reports failure.
+        joined.expect("config producer, bridge and refresh must actually finish");
+        if let Err(payload) = observed {
+            notifications.shutdown();
+            std::panic::resume_unwind(payload);
+        }
+    }
+    notifications.shutdown();
+    ui.set_notifications_enabled(previous.0);
+    ui.set_notification_show_preview(previous.1);
+    ui.set_notification_sounds(previous.2);
+    ui.set_config_error(previous.3);
+    ui.set_active_account_local_id(previous.4);
+    ui.set_composer_text(previous.5);
+    settle(ui).await;
+}
+
 async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgress>) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
@@ -6900,6 +7028,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert!(manager.active_account().await.is_none());
 
     assert_removed_account_menu_projection(&ui);
+    assert_queued_config_close_fence(&ui, &live, &runtime).await;
     // The real close is deliberately last: its process-thread admission must
     // never be reset just to continue earlier presentation checks.
     ui.set_live_session(true);
