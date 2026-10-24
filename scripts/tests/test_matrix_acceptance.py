@@ -1333,7 +1333,8 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
         return "".join(
             f"MORPHEUS_APP_RECOVERY_STAGE {name}\nMORPHEUS_APP_RECOVERY_CHECK {name}=true\n"
             for name in sorted(acceptance_module.APP_RECOVERY_CASES)
-        ) + "test result: ok. 12 passed; 0 failed; 0 ignored;\n"
+        ) + (acceptance_module.APP_MARKER_AUTHORITY_COMPLETE + "\n"
+             "test result: ok. 13 passed; 0 failed; 0 ignored;\n")
 
     def test_requires_every_live_case_once_and_no_opt_out(self):
         complete = self.complete()
@@ -1341,13 +1342,13 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
         self.assertEqual(acceptance_module.app_recovery_evidence(complete),
                          dict.fromkeys(sorted(acceptance_module.APP_RECOVERY_CASES), True))
         for output in (
-            "test result: ok. 12 passed; 0 failed; 0 ignored;\n",
+            "test result: ok. 13 passed; 0 failed; 0 ignored;\n",
             complete.replace(f"MORPHEUS_APP_RECOVERY_STAGE {name}\n", ""),
             complete.replace(f"MORPHEUS_APP_RECOVERY_CHECK {name}=true\n", ""),
             complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=true\n",
             complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=false\n",
-            complete.replace("12 passed", "11 passed"),
-            complete.replace("12 passed", "17 passed"),
+            complete.replace("13 passed", "12 passed"),
+            complete.replace("13 passed", "17 passed"),
             complete.replace("0 ignored", "1 ignored"),
             complete + "Skipped local fixture\n",
         ):
@@ -1404,12 +1405,47 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
             self.assertEqual(args, ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
                                     "--bin", "morpheus-app", "--", "--exact",
                                     *("live::stale_observer_tests::" + name for name in self.cases),
+                                    acceptance_module.APP_MARKER_AUTHORITY_TEST,
                                     "--nocapture", "--test-threads=1"])
             self.assertEqual(run.call_args.kwargs, {
                 "extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(Path(folder) / "fixture.json"),
                           "SLINT_EMIT_DEBUG_INFO": "1"},
                 "test": True, "pid_namespace": True,
             })
+
+    def test_marker_authority_requires_exact_once_completion_and_the_same_thirteen_tests(self):
+        complete = self.complete()
+        marker = acceptance_module.APP_MARKER_AUTHORITY_COMPLETE
+        for output in (
+            complete.replace(marker + "\n", ""),
+            complete + marker + "\n",
+            complete.replace(marker, marker.replace("true", "false")),
+            complete.replace(marker, marker + " PRIVATE_VALUE"),
+            complete.replace(marker, "quoted " + marker),
+            complete.replace(marker, "MORPHEUS_APP_MARKER_AUTHORITY_CHECK unknown=true"),
+            complete + "test result: ok. 1 passed; 0 failed; 0 ignored;\n",
+            complete.replace("13 passed", "12 passed"),
+            complete + "Skipped navigation regression; no fixture\n",
+        ):
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                acceptance_module.app_recovery_evidence(output)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            record = runner.validated_record(
+                acceptance_module.APP_RECOVERY_LABEL, complete, test=True,
+                ring_case=None, oauth_checks=(), element_checks=False,
+            )
+            self.assertEqual(record["passed"], 13)
+            self.assertEqual(record["app_recovery_checks"], dict.fromkeys(
+                sorted(acceptance_module.APP_RECOVERY_CASES), True))
+            self.assertEqual(len(record["app_recovery_checks"]), 12)
+            self.assertEqual(record["app_marker_authority_checks"],
+                             {"account_selection_and_close": True})
+            with self.assertRaises(RuntimeError):
+                runner.validated_record(
+                    acceptance_module.APP_RECOVERY_LABEL, complete, test=False,
+                    ring_case=None, oauth_checks=(), element_checks=False,
+                )
 
     def test_scanner_rejection_precedes_any_evidence_publication(self):
         with tempfile.TemporaryDirectory() as folder:

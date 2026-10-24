@@ -7794,17 +7794,16 @@ mod stale_observer_tests {
             .await
             .expect("The actual marker owner must finish");
 
-        manager
-            .logout_account(&a_account.id)
+        logout_fixture_account(&manager, &a_account.id)
             .await
             .expect("Cannot remove first account");
-        manager
-            .logout_account(&b_account.id)
+        logout_fixture_account(&manager, &b_account.id)
             .await
             .expect("Cannot remove second account");
         manager.stop().await;
         drop(manager);
         close_profile(directory, live).await;
+        eprintln!("\nMORPHEUS_APP_MARKER_AUTHORITY_CHECK complete=true");
     }
 
     /// A created room opens only through its own owned reveal, and only for

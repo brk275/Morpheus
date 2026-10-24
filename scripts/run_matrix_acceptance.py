@@ -102,6 +102,11 @@ DRAFTS_STAGES = frozenset((
 ))
 DRAFTS_STAGE = re.compile(r"^MORPHEUS_DRAFTS_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_RECOVERY_LABEL = "app-draft-recovery"
+APP_MARKER_AUTHORITY_TEST = (
+    "live::stale_observer_tests::"
+    "a_departed_selection_neither_reveals_nor_focuses_after_a_switch_back"
+)
+APP_MARKER_AUTHORITY_COMPLETE = "MORPHEUS_APP_MARKER_AUTHORITY_CHECK complete=true"
 APP_TIMELINE_LABEL = "app-live-timeline"
 APP_TIMELINE_CASE = "account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation"
 APP_TIMELINE_CHECKS = frozenset((
@@ -571,7 +576,14 @@ def app_recovery_evidence(output: str) -> dict[str, bool]:
             checks[name] = True
     entered = {match[1] for match in APP_RECOVERY_STAGE.finditer(output)
                if match[1] in APP_RECOVERY_CASES}
-    if (passed_tests(output) != len(APP_RECOVERY_CASES)
+    # One existing real-account authority test shares this exact app/fixture
+    # invocation. Keep its completion separate from the twelve draft protocols;
+    # a default skip, missing selector, duplicate or malformed marker cannot pass.
+    marker = [line for line in output.splitlines() if "MORPHEUS_APP_MARKER_AUTHORITY" in line]
+    expected = len(APP_RECOVERY_TESTS) + 1
+    if (passed_tests(output) != expected
+            or RESULT.findall(output) != [(str(expected), "0", "0")]
+            or marker != [APP_MARKER_AUTHORITY_COMPLETE]
             or entered != APP_RECOVERY_CASES or checks.keys() != APP_RECOVERY_CASES):
         raise RuntimeError("Live app recovery evidence is incomplete")
     return {name: True for name in sorted(APP_RECOVERY_CASES)}
@@ -1157,7 +1169,10 @@ class Acceptance:
                 raise RuntimeError("Draft restart acceptance completion evidence is incomplete")
             record["drafts_diagnostics"] = diagnostics
         if label == APP_RECOVERY_LABEL:
+            if not test:
+                raise RuntimeError("Live app recovery evidence requires native test execution")
             record["app_recovery_checks"] = app_recovery_evidence(output)
+            record["app_marker_authority_checks"] = {"account_selection_and_close": True}
         if label == APP_TIMELINE_LABEL:
             if not test:
                 raise RuntimeError("Live timeline UI evidence is incomplete")
@@ -1206,6 +1221,7 @@ class Acceptance:
             APP_RECOVERY_LABEL,
             ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
              "--bin", "morpheus-app", "--", "--exact", *APP_RECOVERY_TESTS,
+             APP_MARKER_AUTHORITY_TEST,
              "--nocapture", "--test-threads=1"],
             extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture), "SLINT_EMIT_DEBUG_INFO": "1"},
             test=True, pid_namespace=True,
@@ -1526,6 +1542,10 @@ class Acceptance:
                         output.write(f"| {item['check']} | Failed: {item['reason']} |\n")
                     for label, reason in unexecuted.items():
                         output.write(f"| {label} | Not run: {reason} |\n")
+                if any("app_marker_authority_checks" in item for item in self.results):
+                    output.write("\nThe app invocation retains twelve draft-recovery protocol checks and "
+                                 "separately verifies the original marker account selection across switch-back "
+                                 "and close. This is not decoded media or whole transport teardown proof.\n")
                 if any("element_checks" in item for item in self.results):
                     output.write(f"\nElement peer passed: `{ELEMENT_VERSION}`, `{ELEMENT_IMAGE_DIGEST}`. "
                                  "Only its pre-synced Sticky2025 mode was tested, with two-way synthetic video, "
