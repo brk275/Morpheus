@@ -727,6 +727,17 @@ impl Scenario {
             "same-batch page roundtrip refuses old callbacks",
             recording.requests() == before,
         ));
+        // A new current token must work before any deferred changed handler.
+        // Withdrawal still rejects the old token above; renewal may reuse only
+        // this exact row's original account, room and view authority.
+        let returned = Self::copy_token(&ui.get_messages(), root);
+        let before = recording.requests();
+        ui.invoke_copy_message_text(returned.into(), false);
+        observations.push((
+            "same-batch page return immediately admits a fresh current row callback",
+            recording.requests() == before + 1
+                && recording.last_matches("Synthetic replacement display"),
+        ));
         settle(ui).await;
         let menu_token = Self::copy_token(&ui.get_messages(), root);
         let before = recording.requests();

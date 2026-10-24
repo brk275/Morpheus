@@ -428,13 +428,13 @@ async fn test_explicit_peer_room_preparation_never_creates_invites_or_substitute
             factory
                 .event(RoomMemberEventContent::new(MembershipState::Join))
                 .sender(alice_id.as_ref())
-                .state_key(alice_id.as_ref())
-                .into_raw(),
+                .state_key(alice_id.as_str())
+                .into_raw::<ruma::events::room::member::RoomMemberEvent>(),
             factory
                 .event(RoomMemberEventContent::new(membership))
                 .sender(bob_id.as_ref())
-                .state_key(bob_id.as_ref())
-                .into_raw(),
+                .state_key(bob_id.as_str())
+                .into_raw::<ruma::events::room::member::RoomMemberEvent>(),
         ]
     };
     // An invited peer is not joined. Refusal must not turn into an invitation.

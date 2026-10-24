@@ -4215,6 +4215,9 @@ export component AppWindow inherits Window {
             root.withdraw-verification();
         }
         root.page = next;
+        // Rearm only the same original Copy target under the new page state;
+        // a leave-and-return can coalesce its deferred context notification.
+        root.message-copy-context-changed();
         // Returning in the same event batch can coalesce the deferred context
         // change. Reissue retained notices under their original leases now.
         root.timeline-recovery-context-changed();
