@@ -14189,8 +14189,8 @@ async fn assert_room_appearance_scope(ui: &AppWindow, directory: &std::path::Pat
 async fn assert_style_profile_scope_fences(ui: &AppWindow, directory: &std::path::Path) {
     use crate::style_profiles::{finish_export_for_test, finish_import_for_test};
     use crate::theme_studio::scope;
-    use morpheus_config::ConfigStore;
     use morpheus_config::style_profiles::StyleProfile;
+    use morpheus_config::{ConfigStore, ThemeMode};
 
     let folder = directory.join("profile-scopes");
     let store = ConfigStore::at(folder.join("config.toml"));
