@@ -2096,6 +2096,10 @@ mod tests {
             let original = profile.clone();
             let exported = profile.portable_export(Some(&theme)).unwrap();
             let raw = exported.to_toml().unwrap();
+            // The image-viewer backdrop is appearance data; media devices
+            // remain excluded from the exported document.
+            let document: toml::Table = toml::from_str(&raw).unwrap();
+            assert!(!document.contains_key("media"));
             let imported = StyleProfile::parse(&raw).unwrap();
             let mut target = Config::default();
             imported.apply_to(&mut target);
@@ -2118,6 +2122,7 @@ mod tests {
             assert_eq!(target.colors["accent"], "#334455");
             assert_eq!(target.colors["link"], "#335F86");
             assert_eq!(target.colors["canvas"], theme.colors.canvas);
+            assert_eq!(target.colors["media_backdrop"], "#1F2724");
             assert_eq!(target.colors["control_hover"], "#223344AA");
             assert_eq!(
                 target.colors.get("shadow").map(String::as_str),
@@ -2128,7 +2133,7 @@ mod tests {
                 "theme_pack",
                 "account_overrides",
                 "notifications",
-                "media",
+                "microphone_device",
                 "private",
                 "/private/synthetic-owner",
                 "focus_width",

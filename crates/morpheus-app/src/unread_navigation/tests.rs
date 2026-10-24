@@ -485,28 +485,43 @@ fn a_mark_survives_a_room_switch_and_shutdown_retires_it_first() {
         1,
         "the shared cleanup retires unread work exactly once"
     );
-    // Windows keeps its STA pumping while the same mandatory cleanup runs;
-    // the other native and non-native routes both run it after the UI loop.
-    // Guard every route instead of looking for the old ui_result binding.
-    assert_eq!(
-        asynchronous
-            .matches("windows_audio::run(&ui, wasapi_ui, &runtime, cleanup)?")
-            .count(),
-        1
-    );
-    assert_eq!(asynchronous.matches("let result = ui.run();").count(), 2);
+    // The Windows entry keeps its STA pumping; Mac passes the same cleanup
+    // to its origin coordinator; the remaining route drains after ui.run.
+    // Result binding or direct propagation does not change those entry points.
+    assert_eq!(asynchronous.matches("windows_audio::run(").count(), 1);
+    let (_, windows_call) = asynchronous.split_once("windows_audio::run(").unwrap();
+    let (arguments, _) = windows_call.split_once(')').unwrap();
+    assert_eq!(arguments.rsplit(',').next().unwrap().trim(), "cleanup");
+    let (_, macos_capture) = asynchronous
+        .split_once("macos_quit::Coordinator::new(")
+        .unwrap();
+    let (captures, _) = macos_capture.split_once("move |result|").unwrap();
+    assert!(captures.lines().any(|line| line.trim() == "cleanup,"));
+    assert_eq!(asynchronous.matches("ui.run()").count(), 2);
     assert_eq!(
         asynchronous.matches("runtime.block_on(cleanup())").count(),
-        2
+        1
     );
     let windows = include_str!("../windows_audio.rs").replace("\r\n", "\n");
-    let (_, driver) = windows.split_once("pub(crate) fn run<R, F>(").unwrap();
-    let revoke = driver.find("let future = cleanup();").unwrap();
-    let spawn = driver.find("Some(handle.spawn(future))").unwrap();
-    assert!(
-        revoke < spawn,
-        "UI revocation happens before async cleanup is spawned"
-    );
+    let macos = include_str!("../macos_quit.rs").replace("\r\n", "\n");
+    // Both origin drivers invoke the synchronous prefix before they spawn
+    // cleanup, then retain its actual handle before the start gate opens.
+    for (platform, driver) in [
+        (
+            "Windows",
+            windows.split_once("pub(crate) fn run").unwrap().1,
+        ),
+        ("Mac", macos.split_once("fn start(&self,").unwrap().1),
+    ] {
+        let revoke = driver.find("AssertUnwindSafe(cleanup)").unwrap();
+        let spawn = driver.find("match spawn_gated(").unwrap();
+        let retained = driver.find("task = Some(task)").unwrap();
+        let release = driver.find(".send(())").unwrap();
+        assert!(
+            revoke < spawn && spawn < retained && retained < release,
+            "{platform}: UI revocation precedes spawn and retained-handle start"
+        );
+    }
 }
 
 /// U3 and U6: the divider is exactly the row the core placed (the first shown

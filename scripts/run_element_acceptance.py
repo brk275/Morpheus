@@ -31,11 +31,16 @@ CHECKS = frozenset((
     "official_image",
     "browser_identity", "browser_presynced", "browser_roster", "browser_video", "browser_audio", "browser_leave",
     "native_presynced_baseline", "native_roster", "native_audio", "native_video", "native_departure",
+    "native_group_roster", "native_late_join_media", "native_group_departure", "native_key_rotation",
+    "browser_group_roster", "browser_group_audio", "browser_screen", "browser_group_departure",
+    "browser_key_rotation", "browser_post_rotation_screen", "browser_post_rotation_audio",
 ))
 STAGES = frozenset((
     "configuration", "tool_install", "browser_install", "native_test_build", "media_fixture",
     "browser_launch", "browser_login", "browser_identity", "browser_room_sync", "native_join_wait",
     "browser_join", "browser_roster", "browser_receive_video", "browser_receive_audio", "native_media_wait", "browser_leave",
+    "browser_group_roster", "browser_group_audio", "browser_receive_screen",
+    "browser_group_departure", "browser_key_rotation",
     "element_fixture_root", "element_configuration", "element_image_pull", "element_image_verify",
     "element_container_create", "element_container_start", "element_ready", "element_cleanup",
     "native_test", "log_scan", "complete",

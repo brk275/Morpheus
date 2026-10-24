@@ -472,6 +472,8 @@ ELEMENT_TEST_STAGES = frozenset((
     "browser_login", "browser_identity", "browser_room_sync", "native_join_wait",
     "browser_join", "browser_roster", "browser_receive_video", "browser_receive_audio", "native_media_wait",
     "browser_leave", "native_test", "complete",
+    "browser_group_roster", "browser_group_audio", "browser_receive_screen",
+    "browser_group_departure", "browser_key_rotation",
 ))
 RTC_CHECKS = ("unsupported_transport_local", *RING_LABELS, *RTC_LABELS, ELEMENT_LABEL)
 PLANNED_CHECKS = (*CHAT_CHECKS, APP_TIMELINE_LABEL, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
@@ -494,7 +496,7 @@ SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
           "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
           "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS), "oauth-only": OAUTH_LABELS,
-          "rtc-recovery": OUTAGE_LABELS}
+          "rtc-recovery": OUTAGE_LABELS, "element-interop": (ELEMENT_LABEL,)}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1668,7 +1670,7 @@ class Acceptance:
 
     def element_case(self):
         self.require_containment()
-        fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-fixture"), self.root)
+        fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-group-fixture"), self.root)
         root = self.root / "element-interop"
         try:
             self.run("element-call-rc-sticky2025-presynced", [
@@ -1747,6 +1749,10 @@ class Acceptance:
                                  "and complete bounded notification history "
                                  "after a real sync barrier. This is not Sticky/Element, incoming-app automatic rejoin, "
                                  "physical audio/video, installed-package or whole-beta acceptance.\n\n")
+                elif self.suite == "element-interop":
+                    output.write("Focused stock Element interoperability: only the existing Element peer case ran "
+                                 "with disposable Matrix and RTC services. "
+                                 "No other Matrix acceptance cases ran; this is not full acceptance.\n\n")
                 elif self.suite == "oauth-only":
                     output.write("Focused OAuth checks: the existing disposable MAS, Synapse, PostgreSQL and OS Secret Service lifecycle. "
                                  "All cancellation/login-refresh, vaulted restart/automatic refresh and logout phases remain mandatory. "
@@ -1869,6 +1875,14 @@ def main():
             return
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "element-interop":
+            def element_interop_checks():
+                acceptance.script("local_matrix_rtc", "up")
+                acceptance.script("local_matrix_rtc", "probe")
+                acceptance.element_case()
+            acceptance.group((ELEMENT_LABEL,), element_interop_checks)
+            acceptance.finish_checks()
+            return
         if args.suite == "rtc-recovery":
             def outage_checks():
                 acceptance.script("local_matrix_rtc", "up")

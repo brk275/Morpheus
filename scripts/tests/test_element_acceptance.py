@@ -35,6 +35,20 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(reverse_audio=value), self.assertRaisesRegex(RuntimeError, "evidence"):
                 target.evidence(value, complete=True)
 
+        # The original two-peer proof cannot satisfy the independently required
+        # late third participant, same sender screen and post-rotation media.
+        group = (
+            "native_group_roster", "native_late_join_media", "native_group_departure", "native_key_rotation",
+            "browser_group_roster", "browser_group_audio", "browser_screen", "browser_group_departure",
+            "browser_key_rotation", "browser_post_rotation_screen", "browser_post_rotation_audio",
+        )
+        for name in group:
+            self.assertIn(name, target.CHECKS)
+            for value in (complete.replace(f"MORPHEUS_ELEMENT_CHECK {name}=true", ""),
+                          f"MORPHEUS_ELEMENT_CHECK {name}=false\n" + complete):
+                with self.subTest(group_fact=name), self.assertRaisesRegex(RuntimeError, "evidence"):
+                    target.evidence(value, complete=True)
+
     def test_exact_named_nonempty_test_result_is_required(self):
         result = f"test {target.TEST_NAME} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;"
         self.assertTrue(target.exact_native_pass(result))

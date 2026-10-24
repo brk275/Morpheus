@@ -178,3 +178,50 @@ extra workflow or paid runner is introduced. Offline tests exercise pinning,
 ownership, evidence rejection and redaction. Native compilation and the real
 peer run must be evaluated on the affected hosted candidate before recording
 any acceptance result.
+
+## Prepared group, late-participant and screen extension
+
+The same stock fixture and exact named native test now retain the original
+pre-synced two-user checks, then add a third disposable user whose native device
+is first created after the two-user media baseline. The existing
+`rtc-group-fixture` supplies the account and room membership; no new route,
+framework, dependency, browser patch or timeout increase is introduced.
+This source extension is **not yet executed**. Run 39667998555 above proves
+only its original twelve facts. The extended fixed schema requires all
+**twenty-three** facts; old twelve-fact output cannot establish its pass.
+
+The additional checks require exact three-user rosters in the stock browser
+and both native peers, decoded existing Alice microphone/camera at the late
+peer, and the stock browser decoding the late peer's distinct 1700 Hz
+microphone. Alice also publishes a real encrypted `ScreenShare` track using
+synthetic horizontal white/black pictures. The browser binds the actual remote
+screen publication, SID, source, media track and element to Alice's exact
+account, device, membership and backend identity before taking three
+consecutive matching pixel samples. This is transport and stock-renderer evidence;
+it does not claim OS screen capture or physical display behavior.
+
+The pinned core's ten-second key freshness window is allowed to expire inside
+the unchanged outer deadlines before the third arrival. The observer listens
+to the existing stock SDK's key-change event and retains only bounded key
+indices and sender identity, never key material. Before the third departure,
+the native test observes its actual enabled local screen frame cryptor at the
+stock-received arrival index. After departure, a different stock-received
+index must be observed on that same local identity and actual screen and
+microphone SIDs before the native sources generate the reversed picture and a
+distinct 1301 Hz microphone tone. The stock browser must decode the new picture
+from the same bound screen track with three consecutive matching pixel samples,
+and the new tone from the original bound microphone publication. A key callback, provider counter,
+remote participant's key, or configured index alone cannot establish the
+combined pass. The private index receipts contain no keys.
+
+Both publishers are stopped, their actual tasks joined and publications
+unpublished on success. Carol leaves, her store is stopped and removed, and
+both remaining peers must observe her departure. Existing failure containment,
+owned process and container teardown still apply. The original final browser
+leave and native departure checks remain required.
+
+This explicitly selected `matrix_2_0`/`Sticky2025` extension does not establish
+interoperability of Morpheus's `Current` default. The pinned stock RC exposes
+only `compatibility` and `matrix_2_0` configuration modes. Reconnect, actual
+supported-default protocol compatibility, incoming ringing, stock-originated
+screen capture, installed apps and physical devices remain separate gates.
