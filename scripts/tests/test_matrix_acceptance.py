@@ -2073,6 +2073,149 @@ class LiveEvidenceTests(unittest.TestCase):
                 fixture_from_output(str(root / "missing.json"), root)
 
 
+class OwnedSfuRecoveryTests(unittest.TestCase):
+    def prerequisite_output(self, label):
+        selectors = dict(acceptance_module.OUTAGE_HELPER_TESTS)
+        if label.endswith("-list"):
+            selector = (acceptance_module.OUTAGE_TEST if label == "rtc-recovery-exact-test-list"
+                        else selectors.get(label[:-5]))
+            return selector + ": test\n" if selector else ""
+        if label in selectors:
+            return (f"test {selectors[label]} ... ok\n"
+                    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.01s\n")
+        return ""
+
+    def output(self, target="dm"):
+        facts = acceptance_module.OUTAGE_CHECKS | {acceptance_module.OUTAGE_TARGET[target]}
+        return ("\n".join(f"MORPHEUS_RTC_OUTAGE_CHECK {name}=true" for name in sorted(facts))
+                + f"\ntest {acceptance_module.OUTAGE_TEST} ... ok\n"
+                + "MORPHEUS_RTC_OUTAGE_RESULT passed=true\n"
+                + "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 1.00s\n")
+
+    def test_outage_evidence_requires_exact_live_case_all_facts_and_no_extra_markers(self):
+        for target in ("dm", "room"):
+            output = self.output(target)
+            expected = acceptance_module.OUTAGE_CHECKS | {acceptance_module.OUTAGE_TARGET[target]}
+            self.assertEqual(set(acceptance_module.outage_evidence(output, target)), expected)
+            self.assertTrue({"native_audio_before", "native_audio_after"}.issubset(expected))
+            invalid = ["", output.replace(acceptance_module.OUTAGE_TEST, "other::case"),
+                       output.replace("1 passed", "0 passed"), output.replace("0 ignored", "1 ignored"),
+                       output + "MORPHEUS_RTC_OUTAGE_RESULT passed=true\n",
+                       output + "MORPHEUS_RTC_OUTAGE_CHECK private_payload=true\n",
+                       output + "MORPHEUS_RTC_OUTAGE_STAGE private_payload\n",
+                       "Skipped live fixture\n" + output, self.output("room" if target == "dm" else "dm")]
+            for name in expected:
+                marker = f"MORPHEUS_RTC_OUTAGE_CHECK {name}=true"
+                invalid.extend((output.replace(marker, ""), output.replace(marker, marker + " private"),
+                                output + marker + "\n", output.replace(marker, marker.replace("true", "false"))))
+            for bad in invalid:
+                with self.assertRaises(RuntimeError):
+                    acceptance_module.outage_evidence(bad, target)
+
+    def test_only_explicit_suite_mints_capability_and_preserves_default_plan(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
+                "GITHUB_REPOSITORY": "brk275/Morpheus", "MORPHEUS_MATRIX_SFU_RUN_ID": "ambient"}):
+            default = Acceptance(Path(folder), "scanner")
+            self.assertNotIn("MORPHEUS_MATRIX_SFU_RUN_ID", default.env)
+            self.assertIs(default.planned_checks, acceptance_module.PLANNED_CHECKS)
+            self.assertFalse(set(acceptance_module.OUTAGE_LABELS).intersection(default.planned_checks))
+            with patch.object(acceptance_module.secrets, "token_hex", return_value="a" * 32) as nonce:
+                selected = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+            nonce.assert_called_once_with(16)
+            self.assertEqual(selected.env["MORPHEUS_MATRIX_SFU_RUN_ID"], "a" * 32)
+            self.assertEqual(selected.planned_checks, acceptance_module.OUTAGE_LABELS)
+
+    def test_two_cases_compile_once_list_exact_and_use_distinct_fresh_fixtures(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+            runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+            fixtures = [Path(folder) / f"fixture-{index}.json" for index in range(2)]
+            for fixture in fixtures:
+                fixture.write_text("{}")
+                fixture.chmod(0o600)
+            def output(label, *args, **kwargs):
+                return self.prerequisite_output(label)
+            with patch.object(runner, "script", side_effect=[str(path) for path in fixtures]) as script, \
+                    patch.object(runner, "run", side_effect=output) as run:
+                runner.rtc_recovery_cases()
+            self.assertEqual([item.args for item in script.call_args_list], [
+                ("local_matrix_rtc", "rtc-fixture"), ("local_matrix_rtc", "rtc-group-fixture")])
+            prerequisite_count = 2 + 2 * len(acceptance_module.OUTAGE_HELPER_TESTS)
+            self.assertEqual(run.call_count, prerequisite_count + 2)
+            self.assertEqual(run.call_args_list[0].args[1][-1], "--no-run")
+            for index, (label, selector) in enumerate(acceptance_module.OUTAGE_HELPER_TESTS):
+                listed, executed = run.call_args_list[1 + index * 2:3 + index * 2]
+                self.assertEqual(listed.args[0], label + "-list")
+                self.assertEqual(listed.args[1][-4:], [selector, "--", "--list", "--exact"])
+                self.assertEqual(executed.args[0], label)
+                self.assertEqual(executed.args[1][-5:], [selector, "--", "--exact", "--nocapture", "--test-threads=2"])
+                self.assertTrue(executed.kwargs["test"])
+                self.assertTrue(executed.kwargs["pid_namespace"])
+            self.assertEqual(run.call_args_list[prerequisite_count - 1].args[1][-4:], [acceptance_module.OUTAGE_TEST, "--", "--list", "--exact"])
+            for invocation, target, fixture in zip(run.call_args_list[prerequisite_count:], ("dm", "room"), fixtures, strict=True):
+                self.assertEqual(invocation.args[0], f"rtc-recovery-current-{target}")
+                self.assertEqual(invocation.args[1][-6:], [acceptance_module.OUTAGE_TEST, "--", "--ignored", "--exact", "--nocapture", "--test-threads=2"])
+                self.assertTrue(invocation.kwargs["pid_namespace"])
+                self.assertEqual(invocation.kwargs["seconds"], 540)
+                self.assertEqual(invocation.kwargs["outage_target"], target)
+                self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS"], str(fixture.resolve()))
+                audio_root = Path(folder) / f"rtc-playback-{target}"
+                self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_CALL_AUDIO_ROOT"], str(audio_root))
+                self.assertEqual(invocation.kwargs["extra"]["ALSA_CONFIG_PATH"], str(audio_root / "alsa.conf"))
+                self.assertFalse(audio_root.exists())  # Helper exclusively owns creation.
+
+    def test_missing_exact_selector_stops_before_creating_accounts(self):
+        labels = [label + "-list" for label, _ in acceptance_module.OUTAGE_HELPER_TESTS]
+        for missing in labels + ["rtc-recovery-exact-test-list"]:
+            with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+                runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+                def output(label, *args, **kwargs):
+                    return "" if label == missing else self.prerequisite_output(label)
+                with patch.object(runner, "run", side_effect=output), patch.object(runner, "script") as script:
+                    with self.assertRaises(RuntimeError):
+                        runner.rtc_recovery_cases()
+                script.assert_not_called()
+
+    def test_helper_runs_require_exact_named_once_nonzero_completion_before_accounts(self):
+        for label, selector in acceptance_module.OUTAGE_HELPER_TESTS:
+            valid = self.prerequisite_output(label)
+            for bad in (valid.replace(selector, "other::case"),
+                        valid.replace("1 passed", "0 passed"),
+                        valid + f"test {selector} ... ok\n",
+                        valid + "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+                        valid.replace("0 ignored", "1 ignored")):
+                with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+                    runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+                    def output(actual, *args, **kwargs):
+                        return bad if actual == label else self.prerequisite_output(actual)
+                    with patch.object(runner, "run", side_effect=output), patch.object(runner, "script") as script:
+                        with self.assertRaises(RuntimeError):
+                            runner.rtc_recovery_cases()
+                    script.assert_not_called()
+
+    def test_outage_label_cannot_publish_a_generic_success_record(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+            runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+            with self.assertRaises(RuntimeError):
+                runner.validated_record("rtc-recovery-current-dm", self.output(),
+                    test=False, ring_case=None, oauth_checks=(), element_checks=False)
+            with patch.object(acceptance_module.subprocess, "Popen") as spawn, self.assertRaises(RuntimeError):
+                runner.run("rtc-recovery-current-dm", ["no-execution"])
+            spawn.assert_not_called()
+
+    def test_failed_outage_does_not_retry_shared_sfu_in_the_next_case(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+            runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+            def output(label, *args, **kwargs):
+                return self.prerequisite_output(label)
+            with patch.object(runner, "run", side_effect=output), patch.object(runner, "group", return_value=False) as group:
+                runner.rtc_recovery_cases()
+            group.assert_called_once()
+            self.assertEqual(group.call_args.args[0], ("rtc-recovery-current-dm",))
+            self.assertEqual(runner.not_run, {"rtc-recovery-current-room": "dependency_failed"})
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+
+
 class OutgoingRingTests(unittest.TestCase):
     def test_hosted_rust_facts_and_stages_match_public_schema(self):
         source = (acceptance_module.REPO / "crates/morpheus-app/src/outgoing_ring/live_tests.rs").read_text()

@@ -629,6 +629,17 @@ impl Drop for RingRequestLease {
     }
 }
 
+/// A bounded test observer of actual SDK key-import receipts, never key bytes.
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone)]
+pub(crate) struct RecoveryKeyObservation {
+    pub bounded: bool,
+    pub presentation: u64,
+    pub member_id: String,
+    pub identity: String,
+    pub key_index: u8,
+}
+
 struct Shared {
     ring_request: Arc<RingRequestGate>,
     slot: Mutex<CallSlot>,
@@ -660,6 +671,8 @@ struct Shared {
     /// rejoins and retired only by that same call; 0 without a call.
     active_call_token: AtomicU64,
     next_token: AtomicU64,
+    #[cfg(all(test, target_os = "linux"))]
+    recovery_keys: broadcast::Sender<RecoveryKeyObservation>,
 }
 
 impl Shared {
@@ -936,8 +949,15 @@ impl CallController {
                 active_audio_token: AtomicU64::new(0),
                 active_call_token: AtomicU64::new(0),
                 next_token: AtomicU64::new(1),
+                #[cfg(all(test, target_os = "linux"))]
+                recovery_keys: broadcast::channel(64).0,
             }),
         }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn subscribe_recovery_keys(&self) -> broadcast::Receiver<RecoveryKeyObservation> {
+        self.shared.recovery_keys.subscribe()
     }
 
     pub fn subscribe_status(&self) -> watch::Receiver<CallStatus> {
@@ -2400,7 +2420,19 @@ impl CallWorker {
                             break SessionEnd::Rejoin(RejoinCause::SignalingTimeout);
                         }
                         event = call_events.recv() => match event {
-                            Ok(event) => match RtcConnectionSignal::from_event(&event) {
+                            Ok(event) => {
+                                #[cfg(all(test, target_os = "linux"))]
+                                if let morpheus_rtc::RtcCallEvent::KeyImported { member_id, identity, key_index } = &event {
+                                    let bounded = member_id.len() <= 512 && identity.len() <= 512;
+                                    let _ = self.shared.recovery_keys.send(RecoveryKeyObservation {
+                                        bounded,
+                                        presentation: self.presentation,
+                                        member_id: if bounded { member_id.clone() } else { String::new() },
+                                        identity: if bounded { identity.clone() } else { String::new() },
+                                        key_index: *key_index,
+                                    });
+                                }
+                                match RtcConnectionSignal::from_event(&event) {
                                 Some(RtcConnectionSignal::Ended(end)) => break session_end(end),
                                 Some(signal) => {
                                     let degraded = signal == RtcConnectionSignal::MediaDegraded;
@@ -2411,6 +2443,7 @@ impl CallWorker {
                                     }
                                 }
                                 None => {}
+                                }
                             },
                             // A missed health change is re-reported by the next
                             // signal; remote audio and video resynchronise their
@@ -4190,6 +4223,8 @@ mod tests {
             active_audio_token: AtomicU64::new(5),
             active_call_token: AtomicU64::new(5),
             next_token: AtomicU64::new(6),
+            #[cfg(all(test, target_os = "linux"))]
+            recovery_keys: broadcast::channel(64).0,
         };
         shared.invitation.send_replace(InvitationUpdate {
             token: 5,
@@ -4294,6 +4329,8 @@ mod tests {
             active_audio_token: AtomicU64::new(5),
             active_call_token: AtomicU64::new(5),
             next_token: AtomicU64::new(6),
+            #[cfg(all(test, target_os = "linux"))]
+            recovery_keys: broadcast::channel(64).0,
         };
         let state = AudioState {
             microphone_muted: true,

@@ -301,7 +301,7 @@ class ScopeTests(unittest.TestCase):
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "media-only", "app-timeline",
-                                         "outgoing-ring", "native-call", "oauth-only"})
+                                         "outgoing-ring", "native-call", "oauth-only", "rtc-recovery"})
         source = ast.parse((Path(__file__).resolve().parents[1]/"run_matrix_acceptance.py").read_text())
         suites = [node.value for node in source.body if isinstance(node,ast.Assign)
                   and any(isinstance(target,ast.Name) and target.id=="SUITES" for target in node.targets)]
