@@ -2911,11 +2911,21 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
         // loop; it returns at once unless a disposable local fixture is set.
         crate::live::timeline_controller_tests::run_if_configured(runtime_handle.clone()).await;
         // Opt-in too: the People busy path on the real window and fixture.
+        eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_entered");
         crate::people_directory::live_tests::run_if_configured(runtime_handle).await;
+        eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_returned");
         slint::quit_event_loop().unwrap();
+        eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL quit_requested");
     })
     .unwrap();
     slint::run_event_loop_until_quit().unwrap();
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL loop_returned");
+    // Preserve the original local drop order, and identify whether releasing
+    // this Arc returns; this is not a receipt for every runtime descendant.
+    drop(_entered);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_release");
+    drop(runtime);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL runtime_owner_released");
 }
 
 #[cfg(not(morpheus_timeline_acceptance))]

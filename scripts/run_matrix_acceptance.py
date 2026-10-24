@@ -134,6 +134,13 @@ APP_TIMELINE_STAGES = frozenset((
 ))
 APP_TIMELINE_STAGE = re.compile(r"^MORPHEUS_LIVE_TIMELINE_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_TIMELINE_CHECK = re.compile(r"MORPHEUS_LIVE_TIMELINE_CHECK ([a-z_]{1,48})=(true|false)")
+APP_TIMELINE_TAIL_STAGES = frozenset((
+    "people_entered", "people_profile", "people_login", "people_search",
+    "people_known_direct", "people_creation_wait", "people_creation_release",
+    "people_cleanup", "people_profile_wait", "people_returned", "quit_requested",
+    "loop_returned", "runtime_owner_release", "runtime_owner_released",
+))
+APP_TIMELINE_TAIL = re.compile(r"MORPHEUS_LIVE_TIMELINE_TAIL ([a-z_]{1,48})")
 APP_RECOVERY_CASES = frozenset((
     "observer_revocation", "interrupted_prepare", "rollback_race", "writer_transaction",
     "thread_index", "release_revocation", "write_revocation", "writer_lock_revocation",
@@ -646,6 +653,16 @@ def app_timeline_diagnostics(output: str) -> dict:
         if match[1] in APP_TIMELINE_STAGES:
             result["test_entered"] |= match[1] == "setup"
             result["stage"] = match[1]
+    tail_records = 0
+    for line in output.splitlines():
+        if line.startswith("MORPHEUS_LIVE_TIMELINE_TAIL"):
+            tail_records += 1
+            match = APP_TIMELINE_TAIL.fullmatch(line)
+            if (tail_records > 16 or not match
+                    or match[1] not in APP_TIMELINE_TAIL_STAGES):
+                result["tail_stage"] = "invalid"
+                break
+            result["tail_stage"] = match[1]
     return result
 
 

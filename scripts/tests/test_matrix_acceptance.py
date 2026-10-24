@@ -505,6 +505,26 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             self.assertEqual(acceptance_module.app_timeline_diagnostics(prefix + marker + " private-token\n"),
                              {"test_entered": True, "stage": "setup"})
 
+    def test_tail_diagnostics_are_closed_bounded_and_do_not_replace_completion(self):
+        prefix = "MORPHEUS_LIVE_TIMELINE_STAGE setup\nMORPHEUS_LIVE_TIMELINE_STAGE complete\n"
+        for stage in acceptance_module.APP_TIMELINE_TAIL_STAGES:
+            marker = f"MORPHEUS_LIVE_TIMELINE_TAIL {stage}\n"
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(prefix + marker),
+                             {"test_entered": True, "stage": "complete", "tail_stage": stage})
+        for suffix in ("private_token", "people_login private-token", "x" * 49):
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(
+                prefix + f"MORPHEUS_LIVE_TIMELINE_TAIL {suffix}\n")["tail_stage"], "invalid")
+        marker = "MORPHEUS_LIVE_TIMELINE_TAIL people_login\n"
+        self.assertEqual(acceptance_module.app_timeline_diagnostics(prefix + marker * 17)["tail_stage"],
+                         "invalid")
+        # Tail diagnostics cannot manufacture a passed test, missing check or completion.
+        self.assertEqual(acceptance_module.app_timeline_evidence(self.output() + marker),
+                         {name: True for name in sorted(acceptance_module.APP_TIMELINE_CHECKS)})
+        for output in (marker, self.output().replace(
+                "MORPHEUS_LIVE_TIMELINE_STAGE complete", marker)):
+            with self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(output)
+
     def test_validated_record_requires_native_test_mode_and_attaches_safe_facts(self):
         with tempfile.TemporaryDirectory() as folder:
             runner = Acceptance(Path(folder), "scanner", suite="timeline-reads")
