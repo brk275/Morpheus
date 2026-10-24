@@ -22,8 +22,8 @@ use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::{
     ApplicationIntake, BackendError, EventEncryption, EventIn, EventOrigin, KEY_MESSAGE_TYPE,
-    KeyOrigin, MatrixBackend, RawSlotEvent, RawTimelineEvent, ReceivedEncryptionKey, RoomSink,
-    RoomSubjects, SLOT_EVENT_TYPE, Subscription, ToDeviceMessageIn, ToDeviceSink,
+    KeyOrigin, MatrixBackend, RawTimelineEvent, ReceivedEncryptionKey, RoomSink, RoomSubjects,
+    SLOT_EVENT_TYPE, Subscription, ToDeviceMessageIn, ToDeviceSink,
 };
 
 mod dialect;
@@ -220,16 +220,6 @@ fn replace_slot_events(
         *slots.entry(slot_id).or_default().of_type(stable) = Some(event);
     }
     slots.retain(|_, slot| slot.current().is_some());
-}
-
-/// An unparseable slot content resolves closed rather than vanishing: an
-/// unreadable slot is not an open one.
-fn to_slot_event(room_id: &str, event: EventIn) -> Option<RawSlotEvent> {
-    Some(RawSlotEvent {
-        room_id: room_id.to_owned(),
-        slot_id: event.state_key?,
-        content: serde_json::from_value(event.content).unwrap_or_default(),
-    })
 }
 
 enum RoomInput {
@@ -454,13 +444,19 @@ where
     async fn on_state(&mut self, event_type: String, events: Vec<EventIn>) {
         if SLOT_EVENT_TYPES.contains(&event_type.as_str()) {
             replace_slot_events(&mut self.state.slots, event_type == SLOT_EVENT_TYPE, events);
-            let slots: Vec<RawSlotEvent> = self
-                .state
-                .slots
-                .values()
-                .filter_map(SlotEvents::current)
-                .filter_map(|event| to_slot_event(&self.room_id, event.clone()))
-                .collect();
+            let slots = self.dialect.current_slots(
+                &self.room_id,
+                self.state
+                    .slots
+                    .values()
+                    .filter_map(|slot| slot.stable.clone())
+                    .collect(),
+                self.state
+                    .slots
+                    .values()
+                    .filter_map(|slot| slot.unstable.clone())
+                    .collect(),
+            );
             self.room.lock().await.rtc().on_slots_received(slots).await;
             self.state.seen_slots = true;
         } else if self

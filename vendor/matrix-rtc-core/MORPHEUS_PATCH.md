@@ -1,4 +1,4 @@
-# Morpheus encrypted membership renewal patch
+# Morpheus MatrixRTC compatibility patches
 
 This is `matrix-rtc-core` **0.5.0-rc.2** from MatrixRTC revision
 `53880ef1ef66b62df555ce71ccd1d6c85b813596`, under its original
@@ -74,3 +74,25 @@ renewal, with no fixture refresh, key injection or extended roster deadline.
 The original event's absence from the sampled live map is not proof that its
 historical ciphertext can never be decrypted. Source review and formatting
 alone do not establish runtime recovery; see `docs/VERIFICATION.md` for results.
+
+## Original Sticky2025 slot authority
+
+The pinned member adapter maps the original `{application}#ROOM` wire slot into
+its internal `{application}#room` session, while the original feeder used the
+untranslated room-state key. The feeder now asks its existing per-room dialect
+to project the complete slot snapshot. Stable state still wins over unstable
+state for each ORIGINAL wire key before projection; malformed content remains
+closed and removal still replaces the full snapshot.
+
+Only Sticky2025 maps the reserved uppercase `ROOM` to internal `room` and ignores
+the distinct Current lowercase wire slot. An absent or closed uppercase slot
+cannot be opened by the Current slot. Custom IDs and Current projection remain
+unchanged; RoomState still does not subscribe to slots. The existing core
+application, room and encryption resolution remains unchanged. This creates no
+public state, backend, key, task, fallback or incoming authorization.
+
+Focused `morpheus-rtc --features native-devices --lib` regressions call this SAME
+production collector and real backend-free core slot resolution. They cover
+original authority, both type precedences, malformed state, refresh/removal,
+custom IDs, room/format separation and the stock per-member encryption spelling.
+They do not prove native/stock runtime interoperability or historical-key recovery.
