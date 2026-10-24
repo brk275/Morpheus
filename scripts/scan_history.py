@@ -41,14 +41,18 @@ def git(*args, cwd=None, timeout=90):
     ).stdout
 
 
-def fixture_digest(repository, commit, path, query=git):
+def fixture_object(commit, path):
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("invalid fixture commit")
     if not isinstance(path, str) or not path or path.startswith(("/", "-")) or any(
         part in ("", ".", "..") for part in path.split("/")
     ) or any(c in path for c in "\x00\r\n:"):
         raise ValueError("invalid fixture path")
-    obj = f"{commit}:{path}"
+    return f"{commit}:{path}"
+
+
+def fixture_digest(repository, commit, path, query=git):
+    obj = fixture_object(commit, path)
     size = int(query("-C", repository, "cat-file", "-s", obj))
     if not 0 < size <= MAX_FIXTURE:
         raise ValueError("fixture exceeds size bound")
@@ -101,6 +105,7 @@ class MergeProvenance:
         self.queries = 0
         self.proofs = 0
         self.digests = {}
+        self.blob_digests = {}
         self.parents = {}
         self.blobs = {}
         self.ancestors = {}
@@ -113,9 +118,23 @@ class MergeProvenance:
         return git(*args, timeout=remaining)
 
     def digest(self, commit, path):
+        # Validation is required even on a cache hit; a cached object never
+        # authorizes symbolic commits or a different malformed path.
+        fixture_object(commit, path)
         key = (commit, path)
         if key not in self.digests:
-            self.digests[key] = fixture_digest(self.repository, commit, path, self.query)
+            entry = self.blob(commit, path)
+            if entry is None:
+                raise ValueError("fixture is not a blob")
+            _, oid = entry
+            if oid not in self.blob_digests:
+                # The first object still requires the complete original
+                # size/type/SHA256 checks. Only an exact parsed Git blob OID
+                # reuses that verified content, never a path or fingerprint.
+                self.blob_digests[oid] = fixture_digest(
+                    self.repository, commit, path, self.query,
+                )
+            self.digests[key] = self.blob_digests[oid]
         return self.digests[key]
 
     def commit_parents(self, commit):
