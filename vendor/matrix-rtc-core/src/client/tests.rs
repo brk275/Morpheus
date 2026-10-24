@@ -22,7 +22,7 @@ const SLOT: &str = "m.call#room";
 const BOB: &str = "@bob:example.org";
 
 /// What a homeserver delivers for a room: an open slot with Bob in it.
-fn deliver_room(mock: &MockBackend, room_id: &str) {
+fn deliver_room(mock: &MockBackend, room_id: &str, wire_slot: &str) {
     let sink = mock
         .room_subscription(room_id)
         .expect("subscribed")
@@ -35,7 +35,7 @@ fn deliver_room(mock: &MockBackend, room_id: &str) {
             event_id: "$slot".to_owned(),
             sender: BOB.to_owned(),
             event_type: SLOT_EVENT_TYPE.to_owned(),
-            state_key: Some(SLOT.to_owned()),
+            state_key: Some(wire_slot.to_owned()),
             origin_server_ts: 1,
             content: json!({ "status": "open", "application": { "type": "m.call" } }),
             encryption: EventEncryption::Cleartext,
@@ -49,7 +49,7 @@ fn deliver_room(mock: &MockBackend, room_id: &str) {
         state_key: None,
         origin_server_ts: 2,
         content: json!({
-            "slot_id": SLOT,
+            "slot_id": wire_slot,
             "msc4354_sticky_key": "bob-1",
             "member": { "id": "bob-1", "membership": "join" },
             "application": { "type": "m.call" },
@@ -67,7 +67,7 @@ async fn open(
         .room(room_id, RoomOptions::default())
         .await
         .expect("the room opens");
-    deliver_room(mock, room_id);
+    deliver_room(mock, room_id, SLOT);
     room.seeded().await;
     room
 }
@@ -193,7 +193,12 @@ async fn open_in(
         .await
         .expect("the room opens");
     if format != MembershipFormat::RoomState {
-        deliver_room(mock, ROOM);
+        let wire_slot = if format == MembershipFormat::Sticky2025 {
+            "m.call#ROOM"
+        } else {
+            SLOT
+        };
+        deliver_room(mock, ROOM, wire_slot);
     } else {
         let sink = mock
             .room_subscription(ROOM)
@@ -263,13 +268,35 @@ async fn a_room_state_room_reads_its_membership_from_state_and_joins_as_state() 
 async fn a_sticky_2025_join_carries_the_legacy_fields() {
     let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
+    let lower_only = client
+        .room(
+            ROOM,
+            RoomOptions {
+                format: MembershipFormat::Sticky2025,
+            },
+        )
+        .await
+        .expect("the room opens");
+    deliver_room(&mock, ROOM, SLOT);
+    lower_only.seeded().await;
+    let refused = lower_only.join(join_params()).await;
+    let published = !mock.sticky_events.lock().unwrap().is_empty();
+    drop(lower_only);
+    assert!(matches!(
+        refused,
+        Err(JoinError::SlotClosed { slot_id }) if slot_id == SLOT
+    ));
+    assert!(!published, "the Current slot cannot authorize a Sticky join");
+
     let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
+    assert_eq!(room.observe(SLOT).await.borrow().len(), 1);
     room.join(join_params()).await.expect("join");
 
     let sticky = mock.sticky_events.lock().unwrap();
     let (_, _, content, _) = sticky.last().expect("a membership");
     assert_eq!(content["member"]["user_id"], mock.user_id.as_str());
     assert_eq!(content["member"]["device_id"], mock.device_id.as_str());
+    assert_eq!(content["slot_id"], "m.call#ROOM");
 }
 
 #[tokio::test]
