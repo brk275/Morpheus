@@ -654,13 +654,19 @@ fn browser_failure_diagnostics_only_forward_exact_fixed_codes() {
             "delegated_session_missing",
         ),
         ("session has no tokens", "access_token_missing"),
-        ("delegated session has no refresh token", "refresh_token_missing"),
+        (
+            "delegated session has no refresh token",
+            "refresh_token_missing",
+        ),
         ("OAuth logout timed out", "logout_timeout"),
         ("OAuth logout failed", "logout_operation"),
         ("OAuth remote logout failed", "logout_remote"),
         ("OAuth logout did not remove the account", "logout_account"),
         ("vault entry lookup failed", "logout_vault_lookup"),
-        ("OAuth logout retained the vault credential", "logout_vault_retained"),
+        (
+            "OAuth logout retained the vault credential",
+            "logout_vault_retained",
+        ),
         ("browser_callback_state", "browser_callback_state"),
     ] {
         assert_eq!(failure_code(error), code);

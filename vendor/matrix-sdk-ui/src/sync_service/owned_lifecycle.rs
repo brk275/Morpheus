@@ -69,10 +69,7 @@ pub(super) struct SupervisorTask {
 
 impl SupervisorTask {
     pub(super) fn new(task: JoinHandle<()>) -> Self {
-        Self {
-            task: Some(task),
-            failed: false,
-        }
+        Self { task: Some(task), failed: false }
     }
 
     pub(super) async fn join(&mut self) -> bool {
@@ -127,18 +124,12 @@ mod tests {
         });
         let (started, mut ready) = oneshot::channel();
         let mut guarded = Box::pin(after_first_poll(lazy, started));
-        assert!(matches!(
-            ready.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(matches!(ready.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
         let mut cx = Context::from_waker(Waker::noop());
         assert!(guarded.as_mut().poll_next(&mut cx).is_pending());
         assert_eq!(ready.try_recv(), Ok(()));
         assert!(matches!(stop.send(()), Ok(1)));
-        assert_eq!(
-            guarded.as_mut().poll_next(&mut cx),
-            Poll::Ready(Some(Ok(7)))
-        );
+        assert_eq!(guarded.as_mut().poll_next(&mut cx), Poll::Ready(Some(Ok(7))));
         assert_eq!(guarded.as_mut().poll_next(&mut cx), Poll::Ready(None));
         for expected in [Some(Ok(9_u8)), Some(Err(())), None] {
             let (started, mut ready) = oneshot::channel();
@@ -150,10 +141,7 @@ mod tests {
 
     #[test]
     fn early_poll_panic_closes_readiness_and_the_actual_failed_task_is_joined() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let (started, ready) = oneshot::channel();
             let task = tokio::spawn(async move {
@@ -174,10 +162,7 @@ mod tests {
 
     #[test]
     fn cancelled_supervisor_join_keeps_the_same_original_handle_until_actual_join() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let (release, held) = oneshot::channel();
             let task = tokio::spawn(async move {
@@ -200,10 +185,7 @@ mod tests {
 
     #[test]
     fn waiting_for_permit_observes_stop_before_either_child_can_start() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let permit = std::sync::Arc::new(tokio::sync::Mutex::new(()));
             let held = permit.clone().lock_owned().await;
@@ -220,10 +202,7 @@ mod tests {
 
     #[test]
     fn both_original_children_are_stopped_before_expiration_and_join() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let (room_stop, room_stopped) = oneshot::channel();
             let (encryption_stop, encryption_stopped) = oneshot::channel();
@@ -273,10 +252,7 @@ mod tests {
                 panic!("fixed synthetic payload destructor failure");
             }
         }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let payloads: [Box<dyn std::any::Any + Send>; 2] = [
                 Box::new(String::from("fixed owned string panic")),
@@ -325,9 +301,6 @@ mod tests {
         let (started, mut ready) = oneshot::channel();
         let stream = after_first_poll(stream::once(pending::<()>()), started);
         drop(stream);
-        assert!(matches!(
-            ready.try_recv(),
-            Err(oneshot::error::TryRecvError::Closed)
-        ));
+        assert!(matches!(ready.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
     }
 }
