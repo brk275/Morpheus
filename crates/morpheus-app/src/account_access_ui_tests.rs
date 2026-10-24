@@ -9274,6 +9274,68 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
     assert_eq!(ui.get_thread_pending_items().row_count(), 2);
     assert!(ui.get_thread_send_pending());
     assert_details_pane_inside_window(ui);
+    // Full sender IDs reflow at the observed 280 px pane and the supported
+    // 200 px minimum. Measure the real generated text against a short name;
+    // a single clipped line cannot satisfy the height or body-placement checks.
+    let before_sender_layout = (
+        ui.get_details_width(),
+        ui.get_thread_root_sender(),
+        ui.get_thread_root_rich_body(),
+        ui.get_thread_root_rich_accessible_body(),
+    );
+    let long_sender = "@averylongsyntheticthreadsender:long-synthetic-homeserver.example.org";
+    let sender_body = "Synthetic body below the complete thread sender";
+    ui.set_thread_root_rich_body(StyledText::from_plain_text(sender_body));
+    ui.set_thread_root_rich_accessible_body(sender_body.into());
+    for width in [280, 200] {
+        ui.set_details_width(width);
+        ui.set_thread_root_sender("@a:x.org".into());
+        settle(ui).await;
+        let short = control_bounds(ui, "@a:x.org");
+        let short_metrics = text_sizes_and_tops(ui, "@a:x.org");
+        assert_eq!((short.len(), short_metrics.len()), (1, 1));
+        ui.set_thread_root_sender(long_sender.into());
+        settle(ui).await;
+        let sender = control_bounds(ui, long_sender);
+        let metrics = text_sizes_and_tops(ui, long_sender);
+        let body = control_bounds(ui, sender_body);
+        let pane = control_bounds(ui, "Conversation details");
+        assert_eq!(
+            (sender.len(), metrics.len(), body.len(), pane.len()),
+            (1, 1, 1, 1),
+            "the full sender and body remain in the real thread pane"
+        );
+        assert!(
+            sender[0].right > sender[0].left
+                && sender[0].left >= pane[0].left - 0.5
+                && sender[0].right <= pane[0].right + 0.5,
+            "the full sender must fit horizontally at {width} px: {:?}",
+            sender[0]
+        );
+        assert!(
+            sender[0].bottom - sender[0].top > (short[0].bottom - short[0].top) * 1.5
+                && (metrics[0].0 - short_metrics[0].0).abs() < 0.01,
+            "a long ID must grow vertically without shrinking the configured sender font"
+        );
+        assert!(
+            body[0].top >= sender[0].bottom - 0.5,
+            "the message body follows all wrapped sender lines"
+        );
+        // Reflow belongs to scroll content, not the fixed composer/actions.
+        // Real keyboard focus must still reach both; no action is activated.
+        tab_to_control(ui, "Close thread");
+        assert!(inside_window(ui, control_bounds(ui, "Close thread")[0]));
+        let composer_label = format!("Reply in thread started by {long_sender}");
+        tab_to_control(ui, &composer_label);
+        let composer = control_bounds(ui, &composer_label);
+        assert_eq!(composer.len(), 1);
+        assert!(inside_window(ui, composer[0]));
+    }
+    ui.set_details_width(before_sender_layout.0);
+    ui.set_thread_root_sender(before_sender_layout.1);
+    ui.set_thread_root_rich_body(before_sender_layout.2);
+    ui.set_thread_root_rich_accessible_body(before_sender_layout.3);
+    settle(ui).await;
     let window_width = ui
         .window()
         .size()

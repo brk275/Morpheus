@@ -12057,7 +12057,16 @@ export component AppWindow inherits Window {
                                     spacing: 10px;
                                     // The root message follows the message font, the sender size and,
                                     // two pixels smaller as before, the message size.
-                                    Text { text: root.thread-root-sender; color: root.sender-ink(false, root.thread-root-is-own, root.thread-root-palette-index, root.thread-root-accent); font-family: root.message-font-family; font-size: root.sender-font-px > 0px ? root.sender-font-px : 12px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750; vertical-stretch: 0; }
+                                    Text {
+                                        text: root.thread-root-sender;
+                                        color: root.sender-ink(false, root.thread-root-is-own, root.thread-root-palette-index, root.thread-root-accent);
+                                        font-family: root.message-font-family;
+                                        font-size: root.sender-font-px > 0px ? root.sender-font-px : 12px * root.text-scale;
+                                        font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750;
+                                        wrap: word-wrap; min-width: 0px; vertical-stretch: 0;
+                                        accessible-role: text;
+                                        accessible-label: root.thread-root-sender;
+                                    }
                                     if root.thread-root-copy-token != "" : TextAction {
                                         text: "Copy text"; accessible-label: "Copy text from thread root";
                                         ink: root.ink; muted: root.muted; surface: transparent; hover-surface: root.hover;
