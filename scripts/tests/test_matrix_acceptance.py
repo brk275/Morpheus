@@ -2177,6 +2177,115 @@ class LiveEvidenceTests(unittest.TestCase):
 
 
 class OwnedSfuRecoveryTests(unittest.TestCase):
+    def binary(self):
+        binary = Mock()
+        binary.path = Path("/synthetic/target/debug/deps/morpheus_app-0123456789abcdef")
+        binary.cwd = Path("/synthetic/crates/morpheus-app")
+        binary.extra = {"LD_LIBRARY_PATH": "/synthetic/target/debug/deps", "SLINT_EMIT_DEBUG_INFO": "1"}
+        binary.sha256 = "a" * 64
+        binary.identity = (1, 2, 0o100755, 100, 3, 4)
+        binary.command.side_effect = lambda selector, *flags: [str(binary.path), selector, *flags]
+        return binary
+
+    def artifact_fixture(self, folder):
+        repo = Path(folder) / "checkout"
+        package = repo / "crates/morpheus-app"
+        package.mkdir(parents=True)
+        binary = repo / "target/debug/deps/morpheus_app-0123456789abcdef"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"disposable non-executed artifact bytes")
+        binary.chmod(0o755)
+        native = repo / "target/debug/build/native-fixture/out"
+        native.mkdir(parents=True)
+        rust = Path(folder) / "toolchain/lib/rustlib/x86_64-unknown-linux-gnu/lib"
+        rust.mkdir(parents=True)
+        artifact = {
+            "reason": "compiler-artifact", "package_id": "path+" + package.as_uri() + "#0.1.0",
+            "manifest_path": str(package / "Cargo.toml"),
+            "target": {"name": "morpheus-app", "kind": ["bin"], "crate_types": ["bin"],
+                       "edition": "2024", "src_path": str(package / "src/main.rs"), "test": True},
+            "profile": {"test": True, "opt_level": "0", "debuginfo": 0,
+                        "debug_assertions": True, "overflow_checks": True},
+            "features": ["default", "native-calls"], "filenames": [str(binary)],
+            "executable": str(binary), "fresh": False,
+        }
+        linked = {"reason": "build-script-executed", "linked_paths": ["native=" + str(native), "native=/outside/not-added"]}
+        output = "\n".join(map(json.dumps, [linked, artifact, {"reason": "build-finished", "success": True}]))
+        return repo, binary, rust, native, artifact, output
+
+    def test_compiler_artifact_retains_one_exact_native_file_and_cargo_loader_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repo, path, rust, native, _, output = self.artifact_fixture(folder)
+            env = {"CARGO_PROFILE_TEST_DEBUG": "0", "LD_LIBRARY_PATH": "/current/fixture/path"}
+            binary = acceptance_module.RecoveryTestBinary(output, str(rust) + "\n", env, repo=repo)
+            fd = binary.fd
+            try:
+                self.assertEqual(binary.command("exact::case", "--list", "--exact"),
+                                 [str(path), "exact::case", "--list", "--exact"])
+                self.assertEqual(binary.cwd, repo / "crates/morpheus-app")
+                self.assertEqual(binary.extra["LD_LIBRARY_PATH"].split(os.pathsep),
+                                 [str(native), str(repo / "target/debug"), str(path.parent), str(rust), "/current/fixture/path"])
+                self.assertEqual(binary.extra["CARGO_MANIFEST_PATH"], str(binary.cwd / "Cargo.toml"))
+                self.assertEqual(os.fstat(fd).st_ino, path.stat().st_ino)
+                # Same pathname is insufficient: replacement must not be admitted.
+                path.unlink()
+                path.write_bytes(b"different disposable artifact")
+                path.chmod(0o755)
+                with self.assertRaises(RuntimeError):
+                    binary.command("exact::case", "--exact")
+            finally:
+                binary.close()
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_artifact_stream_refuses_foreign_missing_duplicate_malformed_and_wrong_profile(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repo, _, rust, _, artifact, output = self.artifact_fixture(folder)
+            finished = json.dumps({"reason": "build-finished", "success": True})
+            invalid = ["", finished, json.dumps(artifact), output + "\n" + finished,
+                       json.dumps(artifact) + "\n" + json.dumps(artifact) + "\n" + finished,
+                       '{"reason":"build-finished","success":true,"success":false}',
+                       '{malformed', "[]\n" + finished,
+                       json.dumps(artifact) + "\n" + json.dumps({"reason": "build-finished", "success": False})]
+            for field, value in (("package_id", "registry+https://example.invalid#morpheus-app@0.1.0"),
+                                 ("manifest_path", "/foreign/Cargo.toml"), ("features", ["default"]),
+                                 ("executable", "/foreign/morpheus_app-0123456789abcdef"),
+                                 ("fresh", "false"), ("filenames", []), ("executable", None)):
+                invalid.append(json.dumps(artifact | {field: value}) + "\n" + finished)
+            for field, value in (("test", False), ("debug_assertions", False), ("opt_level", "3"), ("debuginfo", False)):
+                invalid.append(json.dumps(artifact | {"profile": artifact["profile"] | {field: value}}) + "\n" + finished)
+            for field, value in (("name", "foreign"), ("kind", ["test"]), ("src_path", "/foreign/main.rs")):
+                invalid.append(json.dumps(artifact | {"target": artifact["target"] | {field: value}}) + "\n" + finished)
+            for stream in invalid:
+                with self.subTest(stream=stream[:40]), self.assertRaises(RuntimeError):
+                    acceptance_module.RecoveryTestBinary(stream, str(rust) + "\n", {"CARGO_PROFILE_TEST_DEBUG": "0"}, repo=repo)
+            for limit in ("MAX_LINE", "MAX_OUTPUT"):
+                with patch.object(acceptance_module.RecoveryTestBinary, limit, 32), self.assertRaises(RuntimeError):
+                    acceptance_module.RecoveryTestBinary(output, str(rust) + "\n", {"CARGO_PROFILE_TEST_DEBUG": "0"}, repo=repo)
+
+    def test_artifact_admission_refuses_symlink_nonexecutable_and_foreign_layout(self):
+        for mode in ("symlink_file", "symlink_deps", "nonexecutable", "foreign_layout"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                repo, path, rust, _, artifact, output = self.artifact_fixture(folder)
+                if mode == "symlink_file":
+                    target = path.with_name("original")
+                    path.rename(target)
+                    path.symlink_to(target)
+                elif mode == "symlink_deps":
+                    original = path.parent.with_name("original-deps")
+                    path.parent.rename(original)
+                    path.parent.symlink_to(original, target_is_directory=True)
+                elif mode == "nonexecutable":
+                    path.chmod(0o644)
+                else:
+                    foreign = repo / "target/x86_64-unknown-linux-gnu/debug/deps" / path.name
+                    foreign.parent.mkdir(parents=True)
+                    path.rename(foreign)
+                    artifact.update(executable=str(foreign), filenames=[str(foreign)])
+                    output = json.dumps(artifact) + '\n{"reason":"build-finished","success":true}'
+                with self.assertRaises(RuntimeError):
+                    acceptance_module.RecoveryTestBinary(output, str(rust) + "\n", {"CARGO_PROFILE_TEST_DEBUG": "0"}, repo=repo)
+
     def prerequisite_output(self, label):
         selectors = dict(acceptance_module.OUTAGE_HELPER_TESTS)
         if label.endswith("-list"):
@@ -2238,25 +2347,40 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
             def output(label, *args, **kwargs):
                 return self.prerequisite_output(label)
             with patch.object(runner, "script", side_effect=[str(path) for path in fixtures]) as script, \
-                    patch.object(runner, "run", side_effect=output) as run:
+                    patch.object(runner, "run", side_effect=output) as run, \
+                    patch.object(acceptance_module, "RecoveryTestBinary", return_value=self.binary()) as artifact:
                 runner.rtc_recovery_cases()
             self.assertEqual([item.args for item in script.call_args_list], [
                 ("local_matrix_rtc", "rtc-fixture"), ("local_matrix_rtc", "rtc-group-fixture")])
-            prerequisite_count = 2 + 2 * len(acceptance_module.OUTAGE_HELPER_TESTS)
+            prerequisite_count = 3 + 2 * len(acceptance_module.OUTAGE_HELPER_TESTS)
             self.assertEqual(run.call_count, prerequisite_count + 2)
-            self.assertEqual(run.call_args_list[0].args[1][-1], "--no-run")
+            self.assertEqual(run.call_args_list[0].args[1], ["rustc", "--print", "target-libdir"])
+            self.assertEqual(run.call_args_list[0].kwargs["seconds"], 60)
+            self.assertEqual(run.call_args_list[1].args[1][-2:], ["--no-run", "--message-format=json"])
+            self.assertEqual(sum(call.args[1][0] == "cargo" for call in run.call_args_list), 1)
+            artifact.assert_called_once()
+            binary = artifact.return_value
+            binary.close.assert_called_once()
+            for invocation in run.call_args_list[2:]:
+                self.assertEqual(invocation.args[1][0], str(binary.path))
+                self.assertEqual(invocation.kwargs["cwd"], binary.cwd)
+                self.assertTrue(invocation.kwargs["pid_namespace"])
+                self.assertEqual(invocation.kwargs["extra"]["LD_LIBRARY_PATH"], binary.extra["LD_LIBRARY_PATH"])
             for index, (label, selector) in enumerate(acceptance_module.OUTAGE_HELPER_TESTS):
-                listed, executed = run.call_args_list[1 + index * 2:3 + index * 2]
+                listed, executed = run.call_args_list[2 + index * 2:4 + index * 2]
                 self.assertEqual(listed.args[0], label + "-list")
-                self.assertEqual(listed.args[1][-4:], [selector, "--", "--list", "--exact"])
+                self.assertEqual(listed.args[1][-3:], [selector, "--list", "--exact"])
                 self.assertEqual(executed.args[0], label)
-                self.assertEqual(executed.args[1][-5:], [selector, "--", "--exact", "--nocapture", "--test-threads=2"])
+                self.assertEqual(executed.args[1][-4:], [selector, "--exact", "--nocapture", "--test-threads=2"])
+                self.assertTrue(listed.kwargs["native_binary"])
+                self.assertEqual(listed.kwargs["seconds"], 60)
+                self.assertEqual(executed.kwargs["seconds"], 60)
                 self.assertTrue(executed.kwargs["test"])
                 self.assertTrue(executed.kwargs["pid_namespace"])
-            self.assertEqual(run.call_args_list[prerequisite_count - 1].args[1][-4:], [acceptance_module.OUTAGE_TEST, "--", "--list", "--exact"])
+            self.assertEqual(run.call_args_list[prerequisite_count - 1].args[1][-3:], [acceptance_module.OUTAGE_TEST, "--list", "--exact"])
             for invocation, target, fixture in zip(run.call_args_list[prerequisite_count:], ("dm", "room"), fixtures, strict=True):
                 self.assertEqual(invocation.args[0], f"rtc-recovery-current-{target}")
-                self.assertEqual(invocation.args[1][-6:], [acceptance_module.OUTAGE_TEST, "--", "--ignored", "--exact", "--nocapture", "--test-threads=2"])
+                self.assertEqual(invocation.args[1][-5:], [acceptance_module.OUTAGE_TEST, "--ignored", "--exact", "--nocapture", "--test-threads=2"])
                 self.assertTrue(invocation.kwargs["pid_namespace"])
                 self.assertEqual(invocation.kwargs["seconds"], 540)
                 self.assertEqual(invocation.kwargs["outage_target"], target)
@@ -2273,10 +2397,12 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                 runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
                 def output(label, *args, **kwargs):
                     return "" if label == missing else self.prerequisite_output(label)
-                with patch.object(runner, "run", side_effect=output), patch.object(runner, "script") as script:
+                with patch.object(runner, "run", side_effect=output), patch.object(runner, "script") as script, \
+                        patch.object(acceptance_module, "RecoveryTestBinary", return_value=self.binary()) as artifact:
                     with self.assertRaises(RuntimeError):
                         runner.rtc_recovery_cases()
                 script.assert_not_called()
+                artifact.return_value.close.assert_called_once()
 
     def test_helper_runs_require_exact_named_once_nonzero_completion_before_accounts(self):
         for label, selector in acceptance_module.OUTAGE_HELPER_TESTS:
@@ -2290,10 +2416,12 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                     runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
                     def output(actual, *args, **kwargs):
                         return bad if actual == label else self.prerequisite_output(actual)
-                    with patch.object(runner, "run", side_effect=output), patch.object(runner, "script") as script:
+                    with patch.object(runner, "run", side_effect=output), patch.object(runner, "script") as script, \
+                        patch.object(acceptance_module, "RecoveryTestBinary", return_value=self.binary()) as artifact:
                         with self.assertRaises(RuntimeError):
                             runner.rtc_recovery_cases()
                     script.assert_not_called()
+                    artifact.return_value.close.assert_called_once()
 
     def test_outage_label_cannot_publish_a_generic_success_record(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
@@ -2310,13 +2438,50 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
             runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
             def output(label, *args, **kwargs):
                 return self.prerequisite_output(label)
-            with patch.object(runner, "run", side_effect=output), patch.object(runner, "group", return_value=False) as group:
+            with patch.object(runner, "run", side_effect=output), patch.object(runner, "group", return_value=False) as group, \
+                    patch.object(acceptance_module, "RecoveryTestBinary", return_value=self.binary()):
                 runner.rtc_recovery_cases()
             group.assert_called_once()
             self.assertEqual(group.call_args.args[0], ("rtc-recovery-current-dm",))
             self.assertEqual(runner.not_run, {"rtc-recovery-current-room": "dependency_failed"})
             with self.assertRaises(RuntimeError):
                 runner.finish_checks()
+
+    def test_bad_compiler_artifact_stops_before_any_native_or_fixture_command(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+            runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+            with (patch.object(runner, "run", return_value="") as run,
+                  patch.object(runner, "script") as script,
+                  patch.object(acceptance_module, "RecoveryTestBinary", side_effect=RuntimeError("invalid artifact")),
+                  self.assertRaises(RuntimeError)):
+                runner.rtc_recovery_cases()
+            self.assertEqual(run.call_count, 2)
+            script.assert_not_called()
+
+    def test_direct_list_failure_keeps_owned_cleanup_scan_and_closed_process_facts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "scanner")
+            runner.containment_verified = True
+            process = Mock(returncode=0, pid=12345)
+            visible = io.StringIO()
+            def child(args, **kwargs):
+                kwargs["stdout"].write(b"private synthetic list text\n")
+                return process
+            with (patch.object(acceptance_module, "namespace_command", return_value=["owned-wrapper"]) as namespace,
+                  patch.object(acceptance_module.subprocess, "Popen", side_effect=child),
+                  patch.object(acceptance_module, "wait_owned", side_effect=subprocess.TimeoutExpired("owned", 60)),
+                  patch.object(acceptance_module, "stop_owned") as stop,
+                  patch.object(acceptance_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as scanner,
+                  contextlib.redirect_stdout(visible), self.assertRaises(RuntimeError)):
+                runner.run("rtc-recovery-audio-spectrum-list", ["/synthetic/original", "exact::case", "--list", "--exact"],
+                           seconds=60, pid_namespace=True, native_binary=True)
+            self.assertEqual(namespace.call_args.args[0][0], "/synthetic/original")
+            stop.assert_called_once_with(process)
+            scanner.assert_called_once()
+            records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+            self.assertEqual(records[-1]["native_process"]["result"], "deadline")
+            self.assertNotIn("private synthetic list text", visible.getvalue())
+
 
 
 class OutgoingRingTests(unittest.TestCase):

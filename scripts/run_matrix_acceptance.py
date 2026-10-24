@@ -9,6 +9,7 @@ uploaded. This checks protocols and persistence, not physical devices or UI.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -915,6 +917,189 @@ def fixture_from_output(output: str, root: Path) -> Path:
     return path
 
 
+class RecoveryTestBinary:
+    """Retain the one Cargo-reported native test file for this recovery run."""
+
+    MAX_OUTPUT = 64 * 1024 * 1024
+    MAX_LINE = 4 * 1024 * 1024
+
+    @staticmethod
+    def _pairs(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate field")
+            value[key] = item
+        return value
+
+    @staticmethod
+    def _identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    @staticmethod
+    def _directory(path):
+        # Do not turn a symlinked output tree into an executable admission.
+        if not path.is_absolute() or ".." in path.parts or os.pathsep in str(path):
+            raise ValueError("non-normal output directory")
+        for part in (path, *path.parents):
+            if not stat.S_ISDIR(part.lstat().st_mode):
+                raise ValueError("non-directory output ancestor")
+
+    def __init__(self, output: str, rust_libdir: str, env: dict[str, str], *, repo=None):
+        self.fd = None
+        repo = REPO if repo is None else repo
+        self.cwd = repo / "crates/morpheus-app"
+        root = repo / "target/debug"
+        manifest = str(self.cwd / "Cargo.toml")
+        package = "path+" + self.cwd.as_uri() + "#0.1.0"
+        artifacts, finished, linked = [], False, set()
+        try:
+            if len(output) > self.MAX_OUTPUT:
+                raise ValueError("oversized artifact stream")
+            for line in output.splitlines():
+                if len(line) > self.MAX_LINE:
+                    raise ValueError("oversized artifact line")
+                # Cargo documents that other build tools can emit non-JSON.
+                if not line.startswith("{"):
+                    continue
+                value = json.loads(line, object_pairs_hook=self._pairs)
+                if not isinstance(value, dict) or finished:
+                    raise ValueError("invalid artifact ordering")
+                reason = value.get("reason")
+                if reason == "build-finished":
+                    if value.get("success") is not True:
+                        raise ValueError("unfinished build")
+                    finished = True
+                elif reason == "build-script-executed":
+                    paths = value.get("linked_paths")
+                    if (not isinstance(paths, list) or len(paths) > 1024
+                            or any(not isinstance(path, str) or not path or len(path) > 4096
+                                   or any(ord(char) < 32 for char in path) for path in paths)):
+                        raise ValueError("invalid linked paths")
+                    linked.update(paths)
+                    if len(linked) > 4096:
+                        raise ValueError("too many linked paths")
+                elif reason == "compiler-artifact":
+                    target, profile = value.get("target"), value.get("profile")
+                    if not isinstance(target, dict) or not isinstance(profile, dict):
+                        raise ValueError("invalid artifact target")
+                    if value.get("executable") is None:
+                        if (profile.get("test") is True
+                                or (target.get("name") == "morpheus-app" and target.get("kind") == ["bin"])):
+                            raise ValueError("test executable is missing")
+                        continue
+                    # Build-script executables are not the requested test binary.
+                    if target.get("kind") == ["custom-build"] and profile.get("test") is False:
+                        continue
+                    debug = env.get("CARGO_PROFILE_TEST_DEBUG", "2")
+                    if (value.get("package_id") != package or value.get("manifest_path") != manifest
+                            or target.get("name") != "morpheus-app" or target.get("kind") != ["bin"]
+                            or target.get("crate_types") != ["bin"] or target.get("edition") != "2024"
+                            or target.get("src_path") != str(self.cwd / "src/main.rs")
+                            or target.get("test") is not True
+                            or profile.get("test") is not True or profile.get("opt_level") != "0"
+                            or profile.get("debug_assertions") is not True
+                            or profile.get("overflow_checks") is not True
+                            or debug not in ("0", "1", "2")
+                            or type(profile.get("debuginfo")) is not int
+                            or profile["debuginfo"] != int(debug)
+                            or value.get("features") != ["default", "native-calls"]
+                            or type(value.get("fresh")) is not bool):
+                        raise ValueError("foreign test artifact")
+                    executable = value.get("executable")
+                    if (not isinstance(executable, str) or len(executable) > 4096
+                            or not isinstance(value.get("filenames"), list)
+                            or value["filenames"] != [executable]):
+                        raise ValueError("invalid executable")
+                    path = Path(executable)
+                    if (str(path) != executable or path.parent != root / "deps"
+                            or not re.fullmatch(r"morpheus_app-[0-9a-f]{16}", path.name)):
+                        raise ValueError("foreign executable path")
+                    artifacts.append(path)
+                elif reason not in ("build-started", "compiler-message"):
+                    raise ValueError("unknown Cargo message")
+            if not finished or len(artifacts) != 1:
+                raise ValueError("missing or multiple test artifacts")
+            self.path = artifacts[0]
+            self._directory(self.path.parent)
+            self._directory(self.cwd)
+            info = self.path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111
+                    or not 0 < info.st_size <= 2 * 1024 * 1024 * 1024):
+                raise ValueError("invalid executable file")
+            self.fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+            self.identity = self._identity(info)
+            if self._identity(os.fstat(self.fd)) != self.identity:
+                raise ValueError("replaced executable")
+            digest = hashlib.sha256()
+            with os.fdopen(os.dup(self.fd), "rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+            self.sha256 = digest.hexdigest()
+            self.verify()
+            # Match pinned Cargo's filtered, ordered native runtime search path;
+            # never glob the target tree or add unreported native directories.
+            search = []
+            for entry in sorted(linked):
+                kind, separator, suffix = entry.partition("=")
+                path = Path(suffix if separator and kind in (
+                    "native", "crate", "dependency", "framework", "all") else entry)
+                if path.is_relative_to(root):
+                    if str(path) != (suffix if separator and kind in (
+                            "native", "crate", "dependency", "framework", "all") else entry):
+                        raise ValueError("non-normal linked path")
+                    self._directory(path)
+                    search.append(str(path))
+            if (len(rust_libdir) > 4096 or rust_libdir.count("\n") != 1 or not rust_libdir.endswith("\n")
+                    or not rust_libdir.startswith("/") or any(ord(char) < 32 for char in rust_libdir[:-1])):
+                raise ValueError("invalid rustc library path")
+            rust_path = Path(rust_libdir[:-1])
+            if (str(rust_path) != rust_libdir[:-1]
+                    or rust_path.parts[-4:] != ("lib", "rustlib", "x86_64-unknown-linux-gnu", "lib")):
+                raise ValueError("foreign rustc library path")
+            self._directory(rust_path)
+            search.extend((str(root), str(root / "deps"), str(rust_path)))
+            existing = env.get("LD_LIBRARY_PATH", "")
+            if existing:
+                old = existing.split(os.pathsep)
+                if search != old[:len(search)]:
+                    search.extend(old)
+                else:
+                    search = old
+            self.extra = {"LD_LIBRARY_PATH": os.pathsep.join(search),
+                          "CARGO_MANIFEST_DIR": str(self.cwd), "CARGO_MANIFEST_PATH": manifest,
+                          "CARGO_PKG_NAME": "morpheus-app", "CARGO_PKG_VERSION": "0.1.0",
+                          "CARGO_PKG_VERSION_MAJOR": "0", "CARGO_PKG_VERSION_MINOR": "1",
+                          "CARGO_PKG_VERSION_PATCH": "0", "CARGO_PKG_VERSION_PRE": "",
+                          "SLINT_EMIT_DEBUG_INFO": "1"}
+        except (OSError, ValueError, TypeError, RecursionError):
+            self.close()
+            raise RuntimeError("Owned SFU recovery test artifact is invalid") from None
+        except BaseException:
+            self.close()
+            raise
+
+    def verify(self):
+        self._directory(self.cwd)
+        self._directory(self.path.parent)
+        if (self.fd is None or self._identity(os.fstat(self.fd)) != self.identity
+                or self._identity(self.path.lstat()) != self.identity):
+            raise ValueError("replaced test executable")
+
+    def command(self, selector, *flags):
+        try:
+            self.verify()
+        except (OSError, ValueError):
+            raise RuntimeError("Owned SFU recovery test artifact changed") from None
+        return [str(self.path), selector, *flags]
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
 class Acceptance:
     def __init__(self, root: Path, gitleaks: str, *, started=None, suite="full"):
         if suite not in SUITES:
@@ -984,7 +1169,8 @@ class Acceptance:
             self.containment_verified = True
 
     def run(self, label: str, args: list[str], *, extra=None, test=False, oauth_checks=(), element_checks=False,
-            ring_case=None, outage_target=None, stdin=None, seconds=900, pid_namespace=False, cleanup=False) -> str:
+            ring_case=None, outage_target=None, stdin=None, seconds=900, pid_namespace=False, cleanup=False,
+            cwd=None, native_binary=False) -> str:
         if ring_case is not None and ring_case not in (
                 ("current", "dm"), ("current", "room"), ("sticky-2025", "dm"), ("sticky-2025", "room")):
             raise RuntimeError("Invalid outgoing ring acceptance case")
@@ -992,6 +1178,8 @@ class Acceptance:
                 or (outage_target is not None and (self.suite != "rtc-recovery" or outage_target not in OUTAGE_TARGET
                     or label != f"rtc-recovery-current-{outage_target}" or not pid_namespace))):
             raise RuntimeError("Invalid owned SFU outage command")
+        if native_binary and not pid_namespace:
+            raise RuntimeError("Native recovery binaries require owned process containment")
         remaining = self.available(cleanup=cleanup)
         if remaining <= 0:
             if cleanup or self.finalizing:
@@ -1015,7 +1203,7 @@ class Acceptance:
         with os.fdopen(fd, "wb") as output:
             try:
                 process = subprocess.Popen(
-                    args, cwd=REPO, env=self.env | (extra or {}),
+                    args, cwd=REPO if cwd is None else cwd, env=self.env | (extra or {}),
                     stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                     stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
                 )
@@ -1042,7 +1230,16 @@ class Acceptance:
                         stop_owned(process)
                     except (OSError, RuntimeError, subprocess.SubprocessError):
                         raise RuntimeError("Acceptance owned process cleanup failed") from None
-        output = log.read_text(errors="replace")
+        if label in ("rtc-recovery-rust-target-libdir", "rtc-recovery-app-test-compile"):
+            limit = 4096 if label == "rtc-recovery-rust-target-libdir" else RecoveryTestBinary.MAX_OUTPUT
+            if log.stat().st_size > limit:
+                raise RuntimeError("Owned SFU recovery compiler metadata is oversized")
+            try:
+                output = log.read_text(encoding="utf-8", errors="strict")
+            except UnicodeDecodeError:
+                raise RuntimeError("Owned SFU recovery compiler metadata is not UTF-8") from None
+        else:
+            output = log.read_text(errors="replace")
         # Scan bytes through stdin: avoid reading the adjacent credential files
         # and avoid source allowlists/inline exclusions applying to fresh logs.
         try:
@@ -1088,7 +1285,7 @@ class Acceptance:
             failed = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. FAILED$", output, re.MULTILINE)
             locations = re.findall(r"panicked at (crates/[A-Za-z0-9_./-]+\.rs:\d+:\d+)", output)
             evidence = {"check": label, "failed_tests": failed, "panic_locations": locations}
-            if test:
+            if test or native_binary:
                 # All entered test binaries need the same bounded process
                 # facts, including aborts without a Rust FAILED/panic record.
                 evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
@@ -1370,44 +1567,58 @@ class Acceptance:
     def rtc_recovery_cases(self):
         if self.suite != "rtc-recovery" or "MORPHEUS_MATRIX_SFU_RUN_ID" not in self.env:
             raise RuntimeError("Owned SFU outage suite is not selected")
-        args = ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
-                "--bin", "morpheus-app"]
-        self.run("rtc-recovery-app-test-compile", args + ["--no-run"],
-                 extra={"SLINT_EMIT_DEBUG_INFO": "1"})
-        for label, selector in OUTAGE_HELPER_TESTS:
-            listing = self.run(label + "-list", args + [selector, "--", "--list", "--exact"],
-                               extra={"SLINT_EMIT_DEBUG_INFO": "1"}, seconds=60)
-            if [line for line in listing.splitlines() if line.endswith(": test")] != [selector + ": test"]:
-                raise RuntimeError("Owned SFU audio helper exact test is unavailable")
-            output = self.run(label,
-                args + [selector, "--", "--exact", "--nocapture", "--test-threads=2"],
-                extra={"SLINT_EMIT_DEBUG_INFO": "1"}, seconds=60, test=True, pid_namespace=True)
-            named = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. ok$", output, re.MULTILINE)
-            if (named != [selector] or RESULT.findall(output) != [("1", "0", "0")]
-                    or passed_tests(output) != 1):
-                raise RuntimeError("Owned SFU audio helper exact completion is incomplete")
-        listing = self.run("rtc-recovery-exact-test-list", args + [OUTAGE_TEST, "--", "--list", "--exact"],
-                           extra={"SLINT_EMIT_DEBUG_INFO": "1"}, seconds=60)
-        if [line for line in listing.splitlines() if line.endswith(": test")] != [OUTAGE_TEST + ": test"]:
-            raise RuntimeError("Owned SFU outage exact test is unavailable")
-        for index, target in enumerate(OUTAGE_TARGET):
-            def case():
-                fixture = fixture_from_output(self.script("local_matrix_rtc",
-                    "rtc-fixture" if target == "dm" else "rtc-group-fixture"), self.root)
-                self.run(f"rtc-recovery-current-{target}",
-                    args + [OUTAGE_TEST, "--", "--ignored", "--exact", "--nocapture", "--test-threads=2"],
-                    extra={"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture),
-                           "MORPHEUS_RTC_OUTAGE_TARGET": target, "SLINT_EMIT_DEBUG_INFO": "1",
-                           "MORPHEUS_CALL_AUDIO_ROOT": str(self.root / f"rtc-playback-{target}"),
-                           "ALSA_CONFIG_PATH": str(self.root / f"rtc-playback-{target}" / "alsa.conf")},
-                    outage_target=target, seconds=540, pid_namespace=True)
-            if not self.group((f"rtc-recovery-current-{target}",), case):
-                # The outage may still own a stopped SFU. Do not turn the next
-                # room case into a retry of failed shared infrastructure.
-                for label in OUTAGE_LABELS[index + 1:]:
-                    self.not_run[label] = "dependency_failed"
-                    print(json.dumps({"check": label, "status": "not_run", "reason": "dependency_failed"}), flush=True)
-                return
+        # A target override would select another layout/ABI than this native route.
+        if self.env.get("CARGO_BUILD_TARGET") or self.env.get("RUSTC"):
+            raise RuntimeError("Owned SFU recovery requires the current native Rust toolchain")
+        rust_libdir = self.run("rtc-recovery-rust-target-libdir",
+                              ["rustc", "--print", "target-libdir"], seconds=60)
+        compiled = self.run("rtc-recovery-app-test-compile",
+            ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+             "--bin", "morpheus-app", "--target-dir", str(REPO / "target"),
+             "--no-run", "--message-format=json"], extra={"SLINT_EMIT_DEBUG_INFO": "1"})
+        binary = RecoveryTestBinary(compiled, rust_libdir, self.env)
+        try:
+            write_private(self.root / "rtc-recovery-test-artifact.json", json.dumps({
+                "executable": str(binary.path), "sha256": binary.sha256,
+                "device": binary.identity[0], "inode": binary.identity[1], "bytes": binary.identity[3],
+                "package": "morpheus-app@0.1.0", "target": "bin", "profile_test": True,
+            }, sort_keys=True) + "\n")
+            for label, selector in OUTAGE_HELPER_TESTS:
+                listing = self.run(label + "-list", binary.command(selector, "--list", "--exact"),
+                                   extra=binary.extra, seconds=60, native_binary=True, pid_namespace=True, cwd=binary.cwd)
+                if [line for line in listing.splitlines() if line.endswith(": test")] != [selector + ": test"]:
+                    raise RuntimeError("Owned SFU audio helper exact test is unavailable")
+                output = self.run(label,
+                    binary.command(selector, "--exact", "--nocapture", "--test-threads=2"),
+                    extra=binary.extra, seconds=60, test=True, pid_namespace=True, cwd=binary.cwd)
+                named = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. ok$", output, re.MULTILINE)
+                if (named != [selector] or RESULT.findall(output) != [("1", "0", "0")]
+                        or passed_tests(output) != 1):
+                    raise RuntimeError("Owned SFU audio helper exact completion is incomplete")
+            listing = self.run("rtc-recovery-exact-test-list", binary.command(OUTAGE_TEST, "--list", "--exact"),
+                               extra=binary.extra, seconds=60, native_binary=True, pid_namespace=True, cwd=binary.cwd)
+            if [line for line in listing.splitlines() if line.endswith(": test")] != [OUTAGE_TEST + ": test"]:
+                raise RuntimeError("Owned SFU outage exact test is unavailable")
+            for index, target in enumerate(OUTAGE_TARGET):
+                def case():
+                    fixture = fixture_from_output(self.script("local_matrix_rtc",
+                        "rtc-fixture" if target == "dm" else "rtc-group-fixture"), self.root)
+                    self.run(f"rtc-recovery-current-{target}",
+                        binary.command(OUTAGE_TEST, "--ignored", "--exact", "--nocapture", "--test-threads=2"),
+                        extra=binary.extra | {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture),
+                               "MORPHEUS_RTC_OUTAGE_TARGET": target, "SLINT_EMIT_DEBUG_INFO": "1",
+                               "MORPHEUS_CALL_AUDIO_ROOT": str(self.root / f"rtc-playback-{target}"),
+                               "ALSA_CONFIG_PATH": str(self.root / f"rtc-playback-{target}" / "alsa.conf")},
+                        outage_target=target, seconds=540, pid_namespace=True, cwd=binary.cwd, native_binary=True)
+                if not self.group((f"rtc-recovery-current-{target}",), case):
+                    # The outage may still own a stopped SFU. Do not turn the next
+                    # room case into a retry of failed shared infrastructure.
+                    for label in OUTAGE_LABELS[index + 1:]:
+                        self.not_run[label] = "dependency_failed"
+                        print(json.dumps({"check": label, "status": "not_run", "reason": "dependency_failed"}), flush=True)
+                    return
+        finally:
+            binary.close()
 
     def oauth_cases(self):
         """Separate processes prove that refresh tokens survive vaulted restart."""
