@@ -568,7 +568,8 @@ pub(crate) mod tests {
         let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
         assert_eq!(stored.copy_projected.borrow().len(), MAX_ROW_NOTIFICATIONS);
         stored.notify_copy_rows();
-        let changes = observer.as_ref().get().changes.borrow();
+        let observed = observer.as_ref().get();
+        let changes = observed.changes.borrow();
         assert_eq!(changes.len(), MAX_ROW_NOTIFICATIONS);
         assert!(
             changes
