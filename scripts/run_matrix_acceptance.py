@@ -264,10 +264,14 @@ OUTAGE_CHECKS = frozenset(("initial_notification", "sfu_stopped", "app_ended_int
     "no_extra_notification", "native_audio_before", "native_audio_after", "cleanup"))
 OUTAGE_TARGET = {"dm": "current_dm", "room": "current_three_participant_room"}
 OUTAGE_STAGES = frozenset(("fixture", "login", "join", "initial_media", "outage", "app_rejoining",
-    "restart", "peer_rejoin", "recovered_media", "initial_audio", "recovered_audio", "sync_barrier", "history", "cleanup"))
+    "restart", "peer_rejoin", "recovered_media", "initial_audio", "recovered_audio", "sync_barrier", "history", "cleanup",
+    "peer_join", "initial_checkpoint", "initial_audio_source", "recovered_checkpoint", "recovered_audio_source"))
 OUTAGE_CHECK = re.compile(r"^MORPHEUS_RTC_OUTAGE_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
 OUTAGE_RESULT = re.compile(r"^MORPHEUS_RTC_OUTAGE_RESULT passed=(true|false)$", re.MULTILINE)
 OUTAGE_STAGE = re.compile(r"^MORPHEUS_RTC_OUTAGE_STAGE ([a-z_]+)$", re.MULTILINE)
+OUTAGE_FAILURE = re.compile(
+    r"^MORPHEUS_RTC_OUTAGE_FAILURE outcome=(error|timeout|panic) "
+    r"call=(idle|opening_slot|starting|joined|reconnecting|ending|cleanup_failed|failed|ended)$", re.MULTILINE)
 
 
 def outage_evidence(output: str, target: str) -> dict[str, bool]:
@@ -297,7 +301,16 @@ def outage_evidence(output: str, target: str) -> dict[str, bool]:
 
 def outage_diagnostics(output: str) -> dict:
     stages = [match[1] for match in OUTAGE_STAGE.finditer(output) if match[1] in OUTAGE_STAGES]
-    result = {"stage": stages[-1]} if stages else {}
+    work = [stage for stage in stages if stage != "cleanup"]
+    result = {"stage": work[-1]} if work else {}
+    if "cleanup" in stages:
+        result["cleanup_started"] = True
+    failures = OUTAGE_FAILURE.findall(output)
+    failure_lines = sum(line.startswith("MORPHEUS_RTC_OUTAGE_FAILURE") for line in output.splitlines())
+    if len(failures) == failure_lines == 1:
+        result["failure"], result["call_state"] = failures[0]
+    elif failure_lines:
+        result["failure"] = "invalid"
     checks = {name: value == "true" for name, value in OUTAGE_CHECK.findall(output)
               if name in OUTAGE_CHECKS or name in OUTAGE_TARGET.values()}
     if checks:

@@ -46,6 +46,35 @@ fn fact(name: &'static str) {
     eprintln!("\nMORPHEUS_RTC_OUTAGE_CHECK {name}=true");
 }
 
+#[derive(Clone, Copy)]
+enum WorkFailure {
+    Error,
+    Timeout,
+    Panic,
+}
+
+fn failed_work(failure: WorkFailure, call: &CallStatus) {
+    // Closed diagnostics only. Never inspect a call's reason, account/room
+    // IDs, an SDK error or the caught panic payload.
+    let outcome = match failure {
+        WorkFailure::Error => "error",
+        WorkFailure::Timeout => "timeout",
+        WorkFailure::Panic => "panic",
+    };
+    let call = match call {
+        CallStatus::Idle => "idle",
+        CallStatus::OpeningSlot { .. } => "opening_slot",
+        CallStatus::Starting { .. } => "starting",
+        CallStatus::Joined { .. } => "joined",
+        CallStatus::Reconnecting { .. } => "reconnecting",
+        CallStatus::Ending { .. } => "ending",
+        CallStatus::CleanupFailed { .. } => "cleanup_failed",
+        CallStatus::Failed { .. } => "failed",
+        CallStatus::Ended { .. } => "ended",
+    };
+    eprintln!("\nMORPHEUS_RTC_OUTAGE_FAILURE outcome={outcome} call={call}");
+}
+
 struct OutageCase {
     fixture: Fixture,
     profile: tempfile::TempDir,
@@ -519,12 +548,15 @@ impl OutageSession {
         let observer_room = observer.get_room(&case.room).ok_or(())?;
         let notification = initial_notification(&observer_room, &account).await?;
         fact("initial_notification");
+        stage("peer_join");
         for index in 0..self.peers.len() {
             if index != owner {
                 self.peers[index].join(&case.room).await?;
             }
         }
+        stage("initial_checkpoint");
         let before_audio = self.playback.checkpoint(Tone::Before).map_err(|_| ())?;
+        stage("initial_audio_source");
         self.start_tones(case, owner, Tone::Before).await?;
         let before_presentation = self.media(case, owner, &mut video, false, None).await?;
         stage("initial_audio");
@@ -613,7 +645,9 @@ impl OutageSession {
         fact("fresh_key_identities");
         // Memberships, native identities and real key-event metadata are now
         // bound. Install a new sink epoch before either new tone publication.
+        stage("recovered_checkpoint");
         let after_audio = self.playback.checkpoint(Tone::After).map_err(|_| ())?;
+        stage("recovered_audio_source");
         self.start_tones(case, owner, Tone::After).await?;
         self.media(case, owner, &mut video, true, Some(before_presentation))
             .await?;
@@ -1174,7 +1208,22 @@ async fn current_call_recovers_from_owned_sfu_restart() {
     let observed = AssertUnwindSafe(time::timeout(CASE_WORK, session.run(&case)))
         .catch_unwind()
         .await;
-    let passed = matches!(observed, Ok(Ok(Ok(()))));
+    let failure = match observed {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(()))) => Some(WorkFailure::Error),
+        Ok(Err(_)) => Some(WorkFailure::Timeout),
+        Err(payload) => {
+            // An arbitrary payload destructor must not run before mandatory
+            // original cleanup or while reporting the fixed failure facts.
+            std::mem::forget(payload);
+            Some(WorkFailure::Panic)
+        }
+    };
+    let passed = failure.is_none();
+    if let Some(failure) = failure {
+        let status = session.calls.subscribe_status();
+        failed_work(failure, &status.borrow());
+    }
     let clean = session.cleanup(&case).await;
     let clean = if clean {
         drop(session);

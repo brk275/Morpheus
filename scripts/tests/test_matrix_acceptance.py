@@ -2315,6 +2315,7 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                        output + "MORPHEUS_RTC_OUTAGE_RESULT passed=true\n",
                        output + "MORPHEUS_RTC_OUTAGE_CHECK private_payload=true\n",
                        output + "MORPHEUS_RTC_OUTAGE_STAGE private_payload\n",
+                       output + "MORPHEUS_RTC_OUTAGE_FAILURE outcome=error call=joined\n",
                        "Skipped live fixture\n" + output, self.output("room" if target == "dm" else "dm")]
             for name in expected:
                 marker = f"MORPHEUS_RTC_OUTAGE_CHECK {name}=true"
@@ -2323,6 +2324,26 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
             for bad in invalid:
                 with self.assertRaises(RuntimeError):
                     acceptance_module.outage_evidence(bad, target)
+
+    def test_outage_failure_keeps_work_phase_and_only_closed_precleanup_facts(self):
+        for phase in ("peer_join", "initial_checkpoint", "initial_audio_source", "initial_media", "initial_audio",
+                      "recovered_checkpoint", "recovered_audio_source"):
+            for outcome in ("error", "timeout", "panic"):
+                output = (f"MORPHEUS_RTC_OUTAGE_STAGE {phase}\n"
+                          f"MORPHEUS_RTC_OUTAGE_FAILURE outcome={outcome} call=joined\n"
+                          "MORPHEUS_RTC_OUTAGE_STAGE cleanup\n"
+                          "MORPHEUS_RTC_OUTAGE_CHECK cleanup=true\nprivate server text\n")
+                self.assertEqual(acceptance_module.outage_diagnostics(output), {
+                    "stage": phase, "cleanup_started": True, "failure": outcome,
+                    "call_state": "joined", "checks": {"cleanup": True}})
+        valid = "MORPHEUS_RTC_OUTAGE_FAILURE outcome=error call=failed\n"
+        for raw in (valid + valid, valid + "MORPHEUS_RTC_OUTAGE_FAILURE outcome=private call=failed\n",
+                    valid.replace("error", "private"), valid.replace("failed", "private"),
+                    valid.rstrip() + " reason=private\n"):
+            self.assertEqual(acceptance_module.outage_diagnostics(raw), {"failure": "invalid"})
+        self.assertEqual(acceptance_module.outage_diagnostics("private server text\n"), {})
+        self.assertEqual(acceptance_module.outage_diagnostics("MORPHEUS_RTC_OUTAGE_STAGE cleanup\n"),
+                         {"cleanup_started": True})
 
     def test_only_explicit_suite_mints_capability_and_preserves_default_plan(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
