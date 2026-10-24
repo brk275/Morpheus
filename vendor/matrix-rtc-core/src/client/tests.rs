@@ -286,7 +286,10 @@ async fn a_sticky_2025_join_carries_the_legacy_fields() {
         refused,
         Err(JoinError::SlotClosed { slot_id }) if slot_id == SLOT
     ));
-    assert!(!published, "the Current slot cannot authorize a Sticky join");
+    assert!(
+        !published,
+        "the Current slot cannot authorize a Sticky join"
+    );
 
     let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
     assert_eq!(room.observe(SLOT).await.borrow().len(), 1);
