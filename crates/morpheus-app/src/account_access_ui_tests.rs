@@ -7064,7 +7064,22 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<AccountUiProgre
     assert!(ui.get_room_key_file_closed());
     assert!(key_file_inputs_empty(&ui));
     // No event-loop settle is allowed to manufacture this quit clear receipt.
+    // Follow the production shutdown boundary before dropping controller owners.
+    // In particular, the config-fence scenario started a real notification
+    // account watcher: stopping the manager wakes its selected-account feed.
+    // A reference count cannot replace any of these actual task receipts.
+    live.close_action_admission();
     pinned.shutdown(&ui);
+    let draft_tasks = live.drain_draft_work().await;
+    let verification_tasks = live.drain_verification_work().await;
+    let marker_scans = live.drain_marker_scans().await;
+    let drafts = live.flush_drafts().await;
+    manager.stop().await;
+    // Complete every mandatory cleanup before reporting an earlier failure.
+    draft_tasks.expect("admitted draft tasks must actually finish before profile cleanup");
+    verification_tasks.expect("verification tasks must actually finish before profile cleanup");
+    marker_scans.expect("marker scans must actually finish before profile cleanup");
+    drafts.expect("the final draft flush must finish before profile cleanup");
     ui.hide().unwrap();
     drop(ui); // Drops the registered controller callbacks.
     drop(pinned); // Release the explicit controller owner before checking profile teardown.
