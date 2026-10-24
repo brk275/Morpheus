@@ -7,8 +7,14 @@
 #![recursion_limit = "512"]
 
 #[cfg(test)]
-#[path = "../../../vendor/matrix-sdk-ui/src/sync_service/owned_lifecycle.rs"]
-mod sdk_sync_lifecycle_contract;
+mod sdk_sync_lifecycle_contract {
+    // Compile the same production source without a second formatter traversal
+    // under this crate's default style.
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../vendor/matrix-sdk-ui/src/sync_service/owned_lifecycle.rs"
+    ));
+}
 
 mod authentication;
 use authentication::{PendingSso, StoredSession};
