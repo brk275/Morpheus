@@ -140,3 +140,9 @@ the pause boundary from token extraction. This patch corrects a source-proven
 lazy stop-subscription race and cancellation ownership gaps; it does not
 establish that those gaps caused that historical run or claim runtime success.
 Independent source review and affected fresh hosted verification remain required.
+
+Native join failure is cached before handling its panic payload. Ordinary
+`String` and `&'static str` payloads are dropped safely; unknown custom
+destructors are contained so they cannot panic across the sibling join.
+Repeated unknown custom panics have no process-lifetime retained-memory bound;
+this amendment adds no quarantine registry or claim of such a bound.

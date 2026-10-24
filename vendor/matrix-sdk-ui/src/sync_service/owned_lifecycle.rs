@@ -82,11 +82,20 @@ impl SupervisorTask {
             self.task.take();
             if let Err(error) = result {
                 self.failed = true;
-                // Cache failure before touching a foreign panic payload. This
-                // one task can retain at most its one payload; never re-await it.
+                // Cache failure before touching a foreign panic payload.
                 #[cfg(not(target_family = "wasm"))]
                 if let Ok(payload) = error.try_into_panic() {
-                    std::mem::forget(payload);
+                    match payload.downcast::<String>() {
+                        Ok(message) => drop(message),
+                        Err(payload) => match payload.downcast::<&'static str>() {
+                            Ok(message) => drop(message),
+                            // Unknown custom Drop may itself panic. Contain it
+                            // without preventing the sibling's actual join.
+                            // Repeated unknown panics have NO process-lifetime
+                            // retained-memory bound; this is not quarantine.
+                            Err(payload) => std::mem::forget(payload),
+                        },
+                    }
                 }
                 #[cfg(target_family = "wasm")]
                 drop(error);
@@ -248,6 +257,66 @@ mod tests {
             )
             .await;
             assert!(joined && both_observed);
+        });
+    }
+
+    #[test]
+    fn ordinary_panics_retire_and_unknown_drop_cannot_prevent_sibling_join() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct UnknownDrop(Arc<AtomicBool>);
+        impl Drop for UnknownDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                panic!("fixed synthetic payload destructor failure");
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let payloads: [Box<dyn std::any::Any + Send>; 2] = [
+                Box::new(String::from("fixed owned string panic")),
+                Box::new("fixed borrowed string panic"),
+            ];
+            let mut ordinary_retired = true;
+            for payload in payloads {
+                let task: JoinHandle<()> = tokio::spawn(async move {
+                    std::panic::resume_unwind(payload);
+                });
+                let mut owner = SupervisorTask::new(task);
+                let failed = !owner.join().await;
+                ordinary_retired &= failed && owner.task.is_none() && !owner.join().await;
+            }
+            let dropped = Arc::new(AtomicBool::new(false));
+            let payload = UnknownDrop(dropped.clone());
+            let failed: JoinHandle<()> = tokio::spawn(async move {
+                std::panic::panic_any(payload);
+            });
+            let (stop, stopped) = oneshot::channel();
+            let finished = Arc::new(AtomicBool::new(false));
+            let completion = finished.clone();
+            let sibling = tokio::spawn(async move {
+                let _ = stopped.await;
+                completion.store(true, Ordering::Release);
+            });
+            let joined_cleanly = stop_children(
+                failed,
+                sibling,
+                || {},
+                || {
+                    let _ = stop.send(());
+                },
+                async {},
+            )
+            .await;
+            // All actual handles have been consumed before these assertions.
+            assert!(ordinary_retired && !joined_cleanly);
+            assert!(finished.load(Ordering::Acquire));
+            assert!(!dropped.load(Ordering::Acquire));
         });
     }
 
