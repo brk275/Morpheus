@@ -193,6 +193,7 @@ impl<R: Send + 'static> Coordinator<R> {
 
     /// Required integration DATA enables this same existing receipt on Mac.
     /// The controller must release its inner mutex before calling this method.
+    #[cfg(target_os = "macos")]
     pub(crate) fn request_admitted(
         &self,
         _admission: crate::security::ShutdownAdmission<'_>,

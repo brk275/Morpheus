@@ -47,7 +47,7 @@ use std::path::PathBuf;
 
 use morpheus_config::style_profiles::{
     InstalledPack, PackError, export_theme_pack, import_theme_pack, install_theme_pack,
-    installed_theme_pack, pack_name_from, read_theme_pack,
+    installed_theme_pack, pack_name_from, theme_pack_with_overrides,
 };
 use morpheus_config::{Config, ConfigStore, ThemePack};
 use slint::ComponentHandle;
@@ -487,27 +487,43 @@ pub(super) fn check_account(ui: &AppWindow) {
     }
 }
 
+/// A minimal export snapshot of the accepted global palette. Drafts/previews,
+/// account/room overrides and unaccepted filesystem edits never enter it.
+fn export_snapshot() -> Result<Option<(String, ThemePack)>, PackError> {
+    super::with(|studio| {
+        let Some((config, theme)) = studio.accepted.as_ref() else {
+            return Ok(None);
+        };
+        let Some(name) = config.appearance.theme_pack.as_ref() else {
+            return Ok(None);
+        };
+        let theme = theme.as_ref().ok_or(PackError::Missing)?;
+        Ok(Some((
+            name.clone(),
+            theme_pack_with_overrides(theme, &config.colors, &config.senders)?,
+        )))
+    })
+}
+
 fn export(ui: &AppWindow) {
-    let Some(store) = with(|state| state.store.clone()) else {
+    if with(|state| state.store.is_none()) {
         return;
-    };
+    }
     // The previewed pack is not installed yet; export the look in use.
     if previewing() {
         message(ui, "Apply or cancel the theme pack preview first.", true);
         return;
     }
-    let Some(name) = crate::appearance::remembered_theme_source()
-        .and_then(|(config, _)| config.appearance.theme_pack)
-    else {
-        message(
-            ui,
-            "The built-in colors are not a theme pack file. Choose a starting point or import a pack first.",
-            true,
-        );
-        return;
-    };
-    let pack = match read_theme_pack(&store, &name) {
-        Ok(pack) => pack,
+    let (name, pack) = match export_snapshot() {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            message(
+                ui,
+                "The built-in colors are not a theme pack file. Choose a starting point or import a pack first.",
+                true,
+            );
+            return;
+        }
         Err(error) => {
             message(
                 ui,
@@ -601,12 +617,10 @@ fn finish_export(
         );
         return;
     }
-    let still_in_use = with(|state| state.store.clone()).is_some_and(|store| {
-        crate::appearance::remembered_theme_source()
-            .and_then(|(config, _)| config.appearance.theme_pack)
-            .is_some_and(|in_use| in_use == name)
-            && read_theme_pack(&store, &name).is_ok_and(|current| current == pack)
-    });
+    let still_in_use = with(|state| state.store.is_some())
+        && export_snapshot().is_ok_and(|snapshot| {
+            snapshot.is_some_and(|(current_name, current)| current_name == name && current == pack)
+        });
     if previewing() || !still_in_use {
         ui.set_studio_pack_busy(false);
         message(
@@ -726,5 +740,44 @@ mod tests {
         assert_eq!(display_name(&pack), "Imported pack");
         pack.name = "x".repeat(80);
         assert_eq!(display_name(&pack).chars().count(), 48);
+    }
+
+    #[test]
+    fn export_snapshot_uses_the_last_accepted_global_palette() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        config.appearance.theme_pack = Some("last-valid".into());
+        config.colors.insert("accent".into(), "#334455".into());
+        config
+            .account_overrides
+            .entry("private-account".into())
+            .or_default()
+            .colors
+            .insert("canvas".into(), "#010101".into());
+        let pack = morpheus_config::BuiltInStylePreset::Paper.theme().unwrap();
+        std::fs::create_dir(directory.path().join("themes")).unwrap();
+        std::fs::write(
+            store.theme_path("last-valid").unwrap(),
+            "invalid external edit",
+        )
+        .unwrap();
+        let previous =
+            super::super::with(|studio| studio.accepted.replace((config, Some(pack.clone()))));
+        let snapshot = export_snapshot();
+        super::super::with(|studio| studio.accepted = previous);
+        let (name, exported) = snapshot.unwrap().unwrap();
+        assert_eq!(name, "last-valid");
+        assert_eq!(exported.colors.accent, "#334455");
+        assert_eq!(exported.colors.canvas, pack.colors.canvas);
+        assert_eq!(
+            std::fs::read_to_string(store.theme_path("last-valid").unwrap()).unwrap(),
+            "invalid external edit"
+        );
+        assert!(
+            !morpheus_config::style_profiles::theme_pack_toml(&exported)
+                .unwrap()
+                .contains("private-account")
+        );
     }
 }

@@ -14250,6 +14250,79 @@ async fn assert_style_profile_scope_fences(ui: &AppWindow, directory: &std::path
     assert!(target.exists());
     assert!(ui.get_style_profile_message().contains("Exported"));
 
+    // UI completion is not the original worker/TLS or supervisor join.
+    crate::style_profiles::wait_for_appearance_release()
+        .await
+        .expect("previous export worker and supervisor joined");
+
+    // Capture a real saved profile and its resolved portable palette BEFORE
+    // the synthetic file changes. The actual admission callback must reject
+    // this stale copy even though the saved profile itself is byte-unchanged.
+    let original_pack = BuiltInStylePreset::Paper.theme().unwrap();
+    morpheus_config::style_profiles::install_theme_pack(
+        &store,
+        "portable-export",
+        &original_pack,
+        None,
+    )
+    .unwrap();
+    let mut portable_profile = StyleProfile::named("Portable export");
+    portable_profile.appearance.theme_pack = Some("portable-export".into());
+    portable_profile.appearance.theme = ThemeMode::HighContrast;
+    portable_profile.geometry.border_width = 0;
+    let opened = scope::begin_dialog(ui);
+    finish_import_for_test(ui, opened, portable_profile.clone());
+    let opened = scope::begin_dialog(ui);
+    let captured = crate::style_profiles::capture_export_for_test(ui)
+        .expect("capture original and portable copy before the dialog interval");
+    let mut changed_pack = original_pack.clone();
+    changed_pack.colors.accent = "#123456".into();
+    std::fs::write(
+        store.theme_path("portable-export").unwrap(),
+        morpheus_config::style_profiles::theme_pack_toml(&changed_pack).unwrap(),
+    )
+    .unwrap();
+    let refused = folder.join("portable-stale.toml");
+    crate::style_profiles::finish_captured_export_for_test(ui, opened, captured, refused.clone());
+    assert!(!refused.exists());
+    assert!(!ui.get_style_profile_busy());
+    assert!(
+        ui.get_style_profile_message()
+            .contains("profile or its theme changed")
+    );
+
+    // A fresh capture uses the changed palette and the same actual owned
+    // worker path; the exported copy needs no original local theme name.
+    let opened = scope::begin_dialog(ui);
+    let captured = crate::style_profiles::capture_export_for_test(ui)
+        .expect("fresh original and portable copy");
+    let exported_path = folder.join("portable-current.toml");
+    crate::style_profiles::finish_captured_export_for_test(
+        ui,
+        opened,
+        captured,
+        exported_path.clone(),
+    );
+    wait_for(ui, |ui| !ui.get_style_profile_busy()).await;
+    crate::style_profiles::wait_for_appearance_release()
+        .await
+        .expect("portable export worker and supervisor joined");
+    let exported = morpheus_config::style_profiles::import_profile(&exported_path).unwrap();
+    assert_eq!(exported.appearance.theme_pack, None);
+    assert_eq!(exported.colors["accent"], "#123456");
+    assert_eq!(exported.appearance.theme, ThemeMode::HighContrast);
+    assert_eq!(exported.geometry.border_width, 0);
+    let saved = morpheus_config::style_profiles::ProfileStore::for_config(&store)
+        .unwrap()
+        .list()
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter_map(|entry| entry.profile.ok())
+        .find(|profile| profile.name == "Portable export")
+        .expect("saved source profile remains installed");
+    assert_eq!(saved, portable_profile);
+
     switch(ui, "");
     apply_config(ui, &initial, None);
     settle(ui).await;

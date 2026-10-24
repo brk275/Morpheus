@@ -35,7 +35,8 @@ use super::{
     reserved_device_name, write_atomic,
 };
 use crate::{
-    BuiltInStylePreset, ConfigError, ConfigStore, ThemePack, diagnostics, is_theme_name, parse_toml,
+    BuiltInStylePreset, Config, ConfigError, ConfigStore, SenderColors, ThemePack, diagnostics,
+    is_theme_name, parse_toml, registry,
 };
 
 /// Most theme packs installed in the themes folder.
@@ -139,6 +140,42 @@ pub fn theme_pack_toml(pack: &ThemePack) -> Result<String, PackError> {
     pack.validate().map_err(PackError::Invalid)?;
     let body = toml::to_string_pretty(pack).map_err(|_| PackError::Write)?;
     Ok(format!("{PACK_HEADER}{body}"))
+}
+
+/// The accepted global palette, without account/room overrides or any other
+/// configuration fields. This changes only an export copy of the pack.
+pub fn theme_pack_with_overrides(
+    pack: &ThemePack,
+    colors: &std::collections::BTreeMap<String, String>,
+    senders: &SenderColors,
+) -> Result<ThemePack, PackError> {
+    pack.validate().map_err(PackError::Invalid)?;
+    let mut checked = Config::default();
+    checked.colors = colors.clone();
+    checked.senders = senders.clone();
+    checked.validate().map_err(PackError::Invalid)?;
+    let mut value = toml::Value::try_from(pack).map_err(|_| PackError::Write)?;
+    let table = value.as_table_mut().ok_or(PackError::Write)?;
+    for (id, color) in colors {
+        let token = registry::color_token(id).ok_or(PackError::Write)?;
+        let group = match token.source {
+            registry::TokenSource::Base => "colors",
+            registry::TokenSource::Role => "roles",
+            registry::TokenSource::State => "states",
+        };
+        table
+            .entry(group.to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or(PackError::Write)?
+            .insert(id.clone(), toml::Value::String(color.clone()));
+    }
+    let mut exported: ThemePack = value.try_into().map_err(|_| PackError::Write)?;
+    if senders.colors.is_some() {
+        exported.senders = senders.clone();
+    }
+    exported.validate().map_err(PackError::Invalid)?;
+    Ok(exported)
 }
 
 /// Read a theme pack the person chose to import: a regular file of at most
@@ -582,5 +619,45 @@ mod tests {
             "themes-folder"
         );
         assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn exported_palette_keeps_global_overrides_and_original_fallthrough() {
+        let mut original = paper();
+        original.roles.link = Some("#112233".into());
+        original.states.control_hover = Some("#223344".into());
+        original.senders.colors = Some(vec!["#123456".into(), "#654321".into()]);
+        let saved = original.clone();
+        let mut config = Config::default();
+        config.colors.insert("accent".into(), "#445566".into());
+        config.colors.insert("link".into(), "#55667788".into());
+        config
+            .colors
+            .insert("control_hover".into(), "#667788".into());
+        config.senders.colors = Some(vec!["#112233".into(), "#778899".into()]);
+        config
+            .account_overrides
+            .entry("private-account".into())
+            .or_default()
+            .colors
+            .insert("canvas".into(), "#010101".into());
+        let exported =
+            theme_pack_with_overrides(&original, &config.colors, &config.senders).unwrap();
+        let raw = theme_pack_toml(&exported).unwrap();
+        assert_eq!(parse_theme_pack(&raw).unwrap(), exported);
+        assert_eq!(original, saved);
+        assert_eq!(exported.schema_version, crate::SCHEMA_VERSION);
+        assert_eq!(exported.colors.accent, "#445566");
+        assert_eq!(exported.colors.canvas, original.colors.canvas);
+        assert_eq!(exported.roles.link.as_deref(), Some("#55667788"));
+        assert_eq!(exported.roles.shadow, None);
+        assert_eq!(exported.states.control_hover.as_deref(), Some("#667788"));
+        assert_eq!(exported.senders, config.senders);
+        assert!(!raw.contains("private-account"));
+        assert!(!raw.contains("account_overrides"));
+        assert_eq!(
+            theme_pack_with_overrides(&original, &Default::default(), &Default::default()).unwrap(),
+            original
+        );
     }
 }

@@ -131,9 +131,19 @@ Windows device names such as `com1` are rejected with a message that names
 the key, never the rejected value; the list shows such a file as invalid, and
 it cannot be previewed or applied until it is fixed or deleted.
 
-A profile names a theme pack but does not contain it. The built-in packs
-(`nocturne`, `terminal`, `paper`) are always available; any other pack must be
+A saved profile can name a theme pack. The built-in packs (`nocturne`,
+`terminal`, `paper`) are always available; any other referenced pack must be
 in your `themes` folder, or preview and Apply report that it is missing.
+
+Export makes a self-contained copy: it includes that pack's palette under the
+profile's global color overrides and keeps its sender-color order, fonts,
+geometry and other appearance choices. The exported copy no longer references
+the local pack file, so importing it on another computer does not need that
+file. The saved profile and your current settings are unchanged. System theme
+mode still follows the other computer; High contrast keeps its border minimum.
+A missing or invalid required pack is refused before the dialog opens. When it
+is the currently accepted pack, export uses its last valid accepted palette,
+including while an invalid external edit remains on disk.
 
 Morpheus writes only keys that differ from the defaults, after a short header
 comment. Comments you add by hand are kept until Morpheus rewrites the file,

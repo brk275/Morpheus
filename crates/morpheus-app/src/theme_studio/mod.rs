@@ -369,6 +369,16 @@ fn copy_behavior(target: &mut Config, source: &Config) {
     }
 }
 
+/// The last accepted pack of this name, even after an invalid external edit.
+/// `None` means this name is not the accepted global selection; `Some(None)`
+/// is an unavailable accepted pack, never permission to reread different bytes.
+pub(crate) fn accepted_theme_pack(name: &str) -> Option<Option<ThemePack>> {
+    with(|studio| {
+        let (config, theme) = studio.accepted.as_ref()?;
+        (config.appearance.theme_pack.as_deref() == Some(name)).then(|| theme.clone())
+    })
+}
+
 /// Record an accepted configuration (startup, a reload or a save). While
 /// the draft holds changes, show them over it and return true; the caller
 /// then applies only its behavior.

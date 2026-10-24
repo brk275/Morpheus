@@ -148,10 +148,15 @@ preferences, and nothing in it is executed or downloaded.
 - A preview saves nothing. It ends without restoring when a settings change
   is accepted, and with restoring on an account switch. It excludes a draft
   and a style profile preview.
-- **Export current pack…** saves the pack in use, installed or built in, to a
-  new file you choose. It never replaces an existing file, even when the
-  system dialog asked about replacing it: choose a new name instead. The
-  built-in colors without a pack have no file to export.
+- **Export current pack…** saves the last accepted global pack palette,
+  installed or built in, with your accepted global color and sender-color
+  overrides. It excludes account and room overrides, drafts and previews;
+  an invalid external edit does not replace the last accepted palette.
+  It writes a new file you choose and never replaces an existing file, even
+  when the system dialog asked about replacing it: choose a new name instead.
+  The built-in colors without a pack have no file to export. For a portable
+  look that also includes fonts, geometry and other appearance choices, use
+  the existing [style profile export](STYLE_PROFILES.md).
 
 Original examples are in [`examples/theme-packs`](../examples/theme-packs):
 Tidepool (dark teal) and Ember (warm light).

@@ -36,15 +36,15 @@ use thiserror::Error;
 
 use crate::{
     ChatStyle, Config, ConfigError, ConfigStore, Conversation, Density, DetailsSide, Geometry,
-    NavigationMode, Problem, SenderColors, ThemeMode, Typography, WindowStyle, diagnostics,
-    parse_toml,
+    NavigationMode, Problem, SenderColors, ThemeMode, ThemePack, Typography, WindowStyle,
+    diagnostics, parse_toml,
 };
 
 mod theme_packs;
 pub use theme_packs::{
     InstalledPack, MAX_THEME_PACKS, PackError, export_theme_pack, import_theme_pack,
     install_theme_pack, installed_theme_pack, pack_name_from, parse_theme_pack, read_theme_pack,
-    theme_pack_installed, theme_pack_toml,
+    theme_pack_installed, theme_pack_toml, theme_pack_with_overrides,
 };
 
 /// The profile format this version reads and writes.
@@ -106,6 +106,8 @@ pub enum ProfileError {
     Write,
     #[error("the profile changed on disk; the list was refreshed")]
     Changed,
+    #[error("the profile's theme pack is unavailable; nothing was exported")]
+    ThemeUnavailable,
 }
 
 /// A configuration error as profile text: the field and its fixed problem,
@@ -139,6 +141,7 @@ impl ProfileError {
             Self::TargetExists => "export-target-exists",
             Self::Write => "write-failed",
             Self::Changed => "changed-on-disk",
+            Self::ThemeUnavailable => "theme-unavailable",
         }
     }
 }
@@ -350,6 +353,45 @@ impl StyleProfile {
             colors: config.colors.clone(),
             senders: config.senders.clone(),
         }
+    }
+
+    /// A self-contained export copy. `theme` is the exact pack selected by
+    /// this profile, resolved by the caller before its file dialog opens.
+    /// Global profile overrides win; absent roles/states keep their fallthrough,
+    /// sender slots keep their order, and the theme mode (including System and
+    /// High contrast) is unchanged. No installed file or source profile changes.
+    pub fn portable_export(&self, theme: Option<&ThemePack>) -> Result<Self, ProfileError> {
+        self.validate()?;
+        let mut exported = self.clone();
+        if self.appearance.theme_pack.is_some() {
+            let theme = theme.ok_or(ProfileError::ThemeUnavailable)?;
+            theme.validate().map_err(ProfileError::Invalid)?;
+            for (id, color) in theme.colors.entries() {
+                exported
+                    .colors
+                    .entry(id.to_owned())
+                    .or_insert_with(|| color.to_owned());
+            }
+            for (id, color) in theme
+                .roles
+                .entries()
+                .into_iter()
+                .chain(theme.states.entries())
+            {
+                if let Some(color) = color {
+                    exported
+                        .colors
+                        .entry(id.to_owned())
+                        .or_insert_with(|| color.to_owned());
+                }
+            }
+            if exported.senders.colors.is_none() {
+                exported.senders = theme.senders.clone();
+            }
+            exported.appearance.theme_pack = None;
+        }
+        exported.validate()?;
+        Ok(exported)
     }
 
     /// Replace the look of `config` with this profile's, keeping every other
@@ -2022,5 +2064,90 @@ mod tests {
             import_profile(&directory.path().join("absent.toml")),
             Err(ProfileError::Missing)
         ));
+    }
+
+    #[test]
+    fn portable_exports_keep_the_whole_global_look_without_the_original_pack() {
+        let mut theme = crate::BuiltInStylePreset::Paper.theme().unwrap();
+        theme.roles.link = Some("#112233".into());
+        theme.states.control_hover = Some("#223344AA".into());
+        theme.senders.colors = Some(vec!["#123456".into(), "#654321".into()]);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = ConfigStore::at(directory.path().join("other/config.toml"));
+        for mode in [
+            ThemeMode::Dark,
+            ThemeMode::Light,
+            ThemeMode::HighContrast,
+            ThemeMode::System,
+        ] {
+            let mut source = styled();
+            source.appearance.theme = mode;
+            source.appearance.font_family = "Family/Variant".into();
+            source.typography.composer_font_family = Some("Noto Sans 日本語".into());
+            source.geometry.input_radius = Some(0);
+            source.geometry.border_width = 0;
+            source.colors.insert("accent".into(), "#334455".into());
+            source.senders.colors = None;
+            source.media.microphone_device = Some("/private/synthetic-owner/device".into());
+            let profile = StyleProfile::from_config("Portable", &source);
+            let original = profile.clone();
+            let exported = profile.portable_export(Some(&theme)).unwrap();
+            let raw = exported.to_toml().unwrap();
+            let imported = StyleProfile::parse(&raw).unwrap();
+            let mut target = Config::default();
+            imported.apply_to(&mut target);
+            assert_eq!(profile, original);
+            assert_eq!(profile.appearance.theme_pack.as_deref(), Some("paper"));
+            assert_eq!(target.appearance.theme, mode);
+            assert_eq!(target.theme_for(None), mode);
+            assert_eq!(target.appearance.theme_pack, None);
+            assert_eq!(destination.load_theme(&target).unwrap(), None);
+            assert_eq!(target.appearance.font_family, source.appearance.font_family);
+            assert_eq!(target.typography, source.typography);
+            assert_eq!(
+                ProfileGeometry::from_geometry(&target.geometry),
+                profile.geometry
+            );
+            assert_eq!(
+                target.geometry.focus_width,
+                Config::default().geometry.focus_width
+            );
+            assert_eq!(target.colors["accent"], "#334455");
+            assert_eq!(target.colors["link"], "#335F86");
+            assert_eq!(target.colors["canvas"], theme.colors.canvas);
+            assert_eq!(target.colors["control_hover"], "#223344AA");
+            assert!(!target.colors.contains_key("shadow"));
+            assert_eq!(target.senders, theme.senders);
+            for excluded in [
+                "theme_pack",
+                "account_overrides",
+                "notifications",
+                "media",
+                "private",
+                "/private/synthetic-owner",
+                "focus_width",
+                "scale_percent",
+            ] {
+                assert!(!raw.contains(excluded), "{excluded}");
+            }
+            let path = directory.path().join(format!(
+                "mode-{}.toml",
+                match mode {
+                    ThemeMode::Dark => 0,
+                    ThemeMode::Light => 1,
+                    ThemeMode::HighContrast => 2,
+                    ThemeMode::System => 3,
+                }
+            ));
+            export_profile(&exported, &path).unwrap();
+            assert_eq!(import_profile(&path).unwrap(), exported);
+        }
+        let plain = StyleProfile::named("Default");
+        assert_eq!(plain.portable_export(None).unwrap(), plain);
+        let required = StyleProfile::from_config("Needs palette", &styled());
+        assert_eq!(
+            required.portable_export(None).unwrap_err().code(),
+            "theme-unavailable"
+        );
     }
 }

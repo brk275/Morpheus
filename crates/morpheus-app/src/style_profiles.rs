@@ -1369,6 +1369,27 @@ fn finish_import(ui: &AppWindow, opened: Scope, result: Option<Result<StyleProfi
     }
 }
 
+/// Resolve only the palette this saved profile names. Prefer the actual last
+/// accepted pack over an invalid/unaccepted edit of its file; other saved looks
+/// use the existing bounded anchored reader. No account/room projection enters.
+fn export_copy(profile: &StyleProfile) -> Result<StyleProfile, String> {
+    let config = with_state(|state| state.config.clone())
+        .ok_or_else(|| "The settings context is no longer available.".to_owned())?;
+    let theme = match profile.appearance.theme_pack.as_deref() {
+        None => None,
+        Some(name) => match crate::theme_studio::accepted_theme_pack(name) {
+            Some(accepted) => accepted,
+            None => Some(
+                style_profiles::read_theme_pack(&config, name)
+                    .map_err(|error| error.to_string())?,
+            ),
+        },
+    };
+    profile
+        .portable_export(theme.as_ref())
+        .map_err(|error| error.to_string())
+}
+
 fn export(ui: &AppWindow) {
     let Some(file) = selected_file(ui) else {
         return;
@@ -1379,6 +1400,14 @@ fn export(ui: &AppWindow) {
         Err(error) => {
             set_message(format!("Could not export the profile: {error}."), true);
             refresh(ui);
+            return;
+        }
+    };
+    let exported = match export_copy(&profile) {
+        Ok(exported) => exported,
+        Err(problem) => {
+            set_message(format!("Could not export the profile: {problem}."), true);
+            project(ui);
             return;
         }
     };
@@ -1413,7 +1442,7 @@ fn export(ui: &AppWindow) {
             // on the UI thread, and the permit goes with it.
             let chosen = dialog.save_file();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                finish_export(&ui, dialog_scope, file, profile, chosen, permit);
+                finish_export(&ui, dialog_scope, file, profile, exported, chosen, permit);
             });
         },
         move || {
@@ -1436,8 +1465,9 @@ fn failed_export_start(ui: &AppWindow, opened: &Scope) {
 /// The export dialog opened in `opened` returned with `chosen`: the
 /// admission boundary.
 ///
-/// The write is admitted only while that scope is current and `file` still
-/// holds exactly `profile`. Otherwise nothing is written, and the message
+/// The write is admitted only while that scope is current, `file` still
+/// holds exactly `profile`, and its portable palette copy is unchanged.
+/// Otherwise nothing is written, and the message
 /// says so. An admitted write runs on a worker with `permit` held and is
 /// reported by [`finish_write`]. Whatever the system dialog asked about an
 /// existing file, the export never replaces one: it asks for a new name
@@ -1447,6 +1477,7 @@ fn finish_export(
     opened: Scope,
     file: ProfileFile,
     profile: StyleProfile,
+    exported: StyleProfile,
     chosen: Option<std::path::PathBuf>,
     permit: DialogPermit,
 ) {
@@ -1464,11 +1495,12 @@ fn finish_export(
         project(ui);
         return;
     }
-    let unchanged = store().is_some_and(|store| store.read(&file).is_ok_and(|now| now == profile));
+    let unchanged = store().is_some_and(|store| store.read(&file).is_ok_and(|now| now == profile))
+        && export_copy(&profile).is_ok_and(|current| current == exported);
     if !unchanged {
         ui.set_style_profile_busy(false);
         set_message(
-            "The profile changed while the file dialog was open. Nothing was written; export again.",
+            "The profile or its theme changed while the file dialog was open. Nothing was written; export again.",
             true,
         );
         project(ui);
@@ -1486,7 +1518,7 @@ fn finish_export(
         "morpheus-style-profile-write",
         move || {
             let result =
-                style_profiles::export_profile(&profile, &path).map_err(|error| error.to_string());
+                style_profiles::export_profile(&exported, &path).map_err(|error| error.to_string());
             drop(permit);
             let _ =
                 weak.upgrade_in_event_loop(move |ui| finish_write(&ui, write_scope, name, result));
@@ -1546,24 +1578,64 @@ pub(crate) fn finish_import_for_test(ui: &AppWindow, opened: Scope, profile: Sty
     finish_import(ui, opened, Some(Ok(profile)));
 }
 
-/// Deliver an export dialog's answer for `opened` and the selected profile,
-/// as the dialog thread does, holding the permit and busy state as export()
-/// does. Returns false when no profile is selected.
+/// Only the existing profile whitelist and its actual operation permit are
+/// retained here; no Config/account/session/path state enters the snapshot.
+#[cfg(test)]
+pub(crate) struct CapturedProfileExport {
+    file: ProfileFile,
+    profile: StyleProfile,
+    exported: StyleProfile,
+    permit: DialogPermit,
+}
+
+/// Capture the same source and portable copy as export(), before the dialog
+/// interval simulated by the existing generated-UI fixture.
+#[cfg(test)]
+pub(crate) fn capture_export_for_test(ui: &AppWindow) -> Option<CapturedProfileExport> {
+    let file = with_state(|state| state.selected.clone())?;
+    let profile = store()?.read(&file).ok()?;
+    let exported = export_copy(&profile).ok()?;
+    let permit = DialogPermit::acquire().expect("no other file dialog in the test");
+    ui.set_style_profile_busy(true);
+    Some(CapturedProfileExport {
+        file,
+        profile,
+        exported,
+        permit,
+    })
+}
+
+/// Deliver that exact captured original+copy through the production admission
+/// callback; only its original owned writer can publish an admitted export.
+#[cfg(test)]
+pub(crate) fn finish_captured_export_for_test(
+    ui: &AppWindow,
+    opened: Scope,
+    captured: CapturedProfileExport,
+    chosen: std::path::PathBuf,
+) {
+    finish_export(
+        ui,
+        opened,
+        captured.file,
+        captured.profile,
+        captured.exported,
+        Some(chosen),
+        captured.permit,
+    );
+}
+
+/// Deliver an export answer in the existing immediate-delivery cases.
 #[cfg(test)]
 pub(crate) fn finish_export_for_test(
     ui: &AppWindow,
     opened: Scope,
     chosen: std::path::PathBuf,
 ) -> bool {
-    let Some(file) = with_state(|state| state.selected.clone()) else {
+    let Some(captured) = capture_export_for_test(ui) else {
         return false;
     };
-    let Some(profile) = store().and_then(|store| store.read(&file).ok()) else {
-        return false;
-    };
-    let permit = DialogPermit::acquire().expect("no other file dialog in the test");
-    ui.set_style_profile_busy(true);
-    finish_export(ui, opened, file, profile, Some(chosen), permit);
+    finish_captured_export_for_test(ui, opened, captured, chosen);
     true
 }
 
@@ -1812,5 +1884,39 @@ mod tests {
         assert!(DialogPermit::acquire().is_none());
         drop(first);
         assert!(DialogPermit::acquire().is_some());
+    }
+
+    #[test]
+    fn export_copy_detects_a_changed_named_palette_before_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        config.appearance.theme_pack = Some("export-boundary".into());
+        let profile = StyleProfile::from_config("Portable", &config);
+        let original = morpheus_config::BuiltInStylePreset::Paper.theme().unwrap();
+        style_profiles::install_theme_pack(&store, "export-boundary", &original, None).unwrap();
+        let previous = with_state(|state| state.config.replace(store.clone()));
+        let before = export_copy(&profile);
+        let mut edited = original.clone();
+        edited.colors.accent = "#123456".into();
+        std::fs::write(
+            store.theme_path("export-boundary").unwrap(),
+            style_profiles::theme_pack_toml(&edited).unwrap(),
+        )
+        .unwrap();
+        let after = export_copy(&profile);
+        std::fs::write(store.theme_path("export-boundary").unwrap(), "invalid").unwrap();
+        let invalid = export_copy(&profile);
+        with_state(|state| state.config = previous);
+        let before = before.unwrap();
+        let after = after.unwrap();
+        assert_ne!(before, after);
+        assert_eq!(before.colors["accent"], original.colors.accent);
+        assert_eq!(after.colors["accent"], "#123456");
+        assert!(invalid.is_err());
+        assert_eq!(
+            profile.appearance.theme_pack.as_deref(),
+            Some("export-boundary")
+        );
     }
 }
