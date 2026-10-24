@@ -462,6 +462,7 @@ fn focused_control_has_label(ui: &impl slint::ComponentHandle, expected: &str) -
     .is_some()
 }
 
+#[track_caller]
 fn control_with_label(
     ui: &AppWindow,
     label: &str,
@@ -3551,7 +3552,11 @@ async fn assert_appearance_workspace_and_search(
             "Dismiss here",
             "Refresh peer verification status",
         ] {
-            let bounds = item_bounds(&control_with_label(ui, label));
+            // TextAction's caption legitimately has the same label as its
+            // button. Geometry belongs to the unique logical Button, not Text.
+            let buttons = button_bounds(ui, label);
+            assert_eq!(buttons.len(), 1, "the peer action must name one Button");
+            let bounds = buttons[0];
             assert!(
                 bounds.right > bounds.left
                     && bounds.left >= -0.5
@@ -3567,8 +3572,14 @@ async fn assert_appearance_workspace_and_search(
             key(ui, Key::Backtab);
             settle(ui).await;
             assert!(focused_control_has_label(ui, label));
+            let buttons = button_bounds(ui, label);
+            assert_eq!(
+                buttons.len(),
+                1,
+                "the focused peer action must name one Button"
+            );
             assert!(
-                inside_window(ui, item_bounds(&control_with_label(ui, label))),
+                inside_window(ui, buttons[0]),
                 "Tab must scroll the complete peer action into view at {scale}%"
             );
         }

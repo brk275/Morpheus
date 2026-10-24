@@ -378,11 +378,14 @@ async fn test_explicit_peer_room_preparation_never_creates_invites_or_substitute
     server
         .mock_sync()
         .ok_and_run(&alice, |builder| {
-            let direct: ruma::events::AnyGlobalAccountDataEvent = serde_json::from_value(json!({
-                "type": "m.direct", "content": {(bob_id.as_str()): [chosen, other, invited_peer]}
-            }))
-            .unwrap();
-            builder.add_global_account_data(ruma::serde::Raw::new(&direct).unwrap());
+            let direct: ruma::serde::Raw<ruma::events::AnyGlobalAccountDataEvent> =
+                ruma::serde::Raw::from_json(
+                    serde_json::value::to_raw_value(&json!({
+                        "type": "m.direct", "content": {(bob_id.as_str()): [chosen, other, invited_peer]}
+                    }))
+                    .unwrap(),
+                );
+            builder.add_global_account_data(direct);
             builder.add_joined_room(JoinedRoomBuilder::new(chosen));
             builder.add_joined_room(JoinedRoomBuilder::new(other));
             builder.add_joined_room(JoinedRoomBuilder::new(invited_peer));
@@ -500,11 +503,14 @@ async fn test_explicit_peer_room_preparation_never_creates_invites_or_substitute
     server
         .mock_sync()
         .ok_and_run(&alice, |builder| {
-            let direct: ruma::events::AnyGlobalAccountDataEvent = serde_json::from_value(json!({
-                "type": "m.direct", "content": {(bob_id.as_str()): [other]}
-            }))
-            .unwrap();
-            builder.add_global_account_data(ruma::serde::Raw::new(&direct).unwrap());
+            let direct: ruma::serde::Raw<ruma::events::AnyGlobalAccountDataEvent> =
+                ruma::serde::Raw::from_json(
+                    serde_json::value::to_raw_value(&json!({
+                        "type": "m.direct", "content": {(bob_id.as_str()): [other]}
+                    }))
+                    .unwrap(),
+                );
+            builder.add_global_account_data(direct);
         })
         .await;
     assert!(matches!(stale.send().await, Err(RequestVerificationError::NotJoinedDirectRoom)));
