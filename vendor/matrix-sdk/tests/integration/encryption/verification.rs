@@ -378,9 +378,11 @@ async fn test_explicit_peer_room_preparation_never_creates_invites_or_substitute
     server
         .mock_sync()
         .ok_and_run(&alice, |builder| {
-            builder.add_global_account_data(ruma::serde::Raw::new(&json!({
-            "type": "m.direct", "content": {(bob_id.as_str()): [chosen, other, invited_peer]}
-        })).unwrap().cast::<ruma::events::AnyGlobalAccountDataEvent>());
+            let direct: ruma::events::AnyGlobalAccountDataEvent = serde_json::from_value(json!({
+                "type": "m.direct", "content": {(bob_id.as_str()): [chosen, other, invited_peer]}
+            }))
+            .unwrap();
+            builder.add_global_account_data(ruma::serde::Raw::new(&direct).unwrap());
             builder.add_joined_room(JoinedRoomBuilder::new(chosen));
             builder.add_joined_room(JoinedRoomBuilder::new(other));
             builder.add_joined_room(JoinedRoomBuilder::new(invited_peer));
@@ -498,13 +500,11 @@ async fn test_explicit_peer_room_preparation_never_creates_invites_or_substitute
     server
         .mock_sync()
         .ok_and_run(&alice, |builder| {
-            builder.add_global_account_data(
-                ruma::serde::Raw::new(&json!({
-                    "type": "m.direct", "content": {(bob_id.as_str()): [other]}
-                }))
-                .unwrap()
-                .cast::<ruma::events::AnyGlobalAccountDataEvent>(),
-            );
+            let direct: ruma::events::AnyGlobalAccountDataEvent = serde_json::from_value(json!({
+                "type": "m.direct", "content": {(bob_id.as_str()): [other]}
+            }))
+            .unwrap();
+            builder.add_global_account_data(ruma::serde::Raw::new(&direct).unwrap());
         })
         .await;
     assert!(matches!(stale.send().await, Err(RequestVerificationError::NotJoinedDirectRoom)));
