@@ -537,17 +537,23 @@ fn slot_allows(state: &StateEvidence, mode: InteropMode, encrypted: bool, room_i
                 SlotState::Open(open) if open.application_type == "m.call")
         }
         InteropMode::Sticky2025 => {
-            // Pinned JS MatrixRTCSession.isSlotClosed: only its ORIGINAL
-            // upper-slot status==closed closes the stock session. Absence is
-            // not proof of departure. This is negative evidence only, never
-            // authority to open/join a slot or to answer an incoming call.
-            !state
+            // Pinned JS isSlotClosed: absence is unspecified/allowed, but a
+            // PRESENT slot is active only when explicitly open for m.call.
+            // This remains negative conflict evidence, never join/Answer or
+            // encryption authority. Native join enforces its own key policy.
+            match state
                 .stable_sticky_slot
                 .as_ref()
                 .or(state.unstable_sticky_slot.as_ref())
-                .is_some_and(|content| {
-                    content.get("status").and_then(Value::as_str) == Some("closed")
-                })
+            {
+                None => true,
+                Some(content) => {
+                    content.get("status").and_then(Value::as_str) == Some("open")
+                        && content.get("application").is_some_and(Value::is_object)
+                        && content.pointer("/application/type").and_then(Value::as_str)
+                            == Some("m.call")
+                }
+            }
         }
         InteropMode::RoomState => true,
     }
@@ -685,13 +691,32 @@ mod tests {
                 .unwrap(),
             vec![InteropMode::Sticky2025]
         );
-        stock.stable_sticky_slot = Some(json!({"status":"closed"}));
-        assert!(
+        stock.stable_sticky_slot = Some(json!({"status":"open","application":{"type":"m.call"}}));
+        assert_eq!(
             normalized_modes(ROOM, true, &stock, &sticky(InteropMode::Sticky2025), NOW)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            vec![InteropMode::Sticky2025]
         );
+        for content in [
+            json!({"status":"closed","application":{"type":"m.call"}}),
+            json!({"status":"unknown","application":{"type":"m.call"}}),
+            json!({"application":{"type":"m.call"}}),
+            json!({"status":"open"}),
+            json!({"status":"open","application":null}),
+            json!({"status":"open","application":"m.call"}),
+            json!({"status":"open","application":[]}),
+            json!({"status":"open","application":{"type":"other"}}),
+            json!({}),
+        ] {
+            stock.stable_sticky_slot = Some(content);
+            assert!(
+                normalized_modes(ROOM, true, &stock, &sticky(InteropMode::Sticky2025), NOW)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         let mut state = state();
         state.add(&legacy(), NOW);
         let modes = normalized_modes(ROOM, true, &state, &sticky(InteropMode::Current), NOW)
