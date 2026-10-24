@@ -542,3 +542,52 @@ f877eb2205818b3ee896d1b95626169f0050b2e3 (sha256
 The upstream record in `MORPHEUS_PROVENANCE.json` is unchanged. No dependency,
 feature, lockfile, workflow or scanner setting changes. The persistence cohort
 changes with this patch because `vendor/` is hashed.
+
+## Explicit peer SAS room routing
+
+The same-version `UserIdentity::prepare_verification_in_room_with_methods`
+prepares a request for one explicit room ID in that client's existing joined
+DM routing set. It requires a joined peer, returns fixed typed refusals for
+empty methods, self identities and ineligible rooms, and does not invite,
+create a room, send verification events or grant trust during preparation.
+The private-field, non-cloneable prepared value is consumed by `send()`, which
+synchronously rechecks the exact joined DM routing (not fresh peer membership) before the existing room
+send and normal crypto request registration for its returned event ID.
+This split lets the caller check account/view/security admission after all
+preparation waits and immediately before SDK handoff. A send error or a
+cancelled in-flight send does not prove an event was unsent; callers must not
+blindly replay it. The existing convenience API and self-verification API
+keep their behavior. A DM flag is a routing hint, not a guarantee of exclusive
+or private membership.
+
+The application retains the exact peer/room/request/SAS while its selected
+view is active. Completion uses the SDK's `SasState::Done` public identity
+receipt, then re-reads the same client's peer identity and compares its full
+`MasterPubkey` and `is_verified` state. Device-only, changed-identity and
+unconfirmed results remain distinct from a verified signing identity. No
+manual `verify()` or automatic SAS confirmation is introduced.
+
+Provenance remains the pinned upstream revision recorded in
+`MORPHEUS_PROVENANCE.json`; its original file hashes are unchanged. The local
+changes are `identities/users.rs`, `identities/mod.rs`, the read-only
+`verification/sas.rs::flow_id` accessor delegating to the existing inner flow ID, and the existing
+`tests/integration/encryption/verification.rs`. The added regression uses the
+existing synthetic MatrixMockServer to exercise exact-room send/cache binding,
+preparation without send, no creation/invitation, invited-peer refusal and a
+stale prepared-room refusal. Source preparation is not hosted, real-account,
+interoperability, native UI or release acceptance.
+
+
+## Prepared bounded encrypted room-key bytes
+
+An opt-in `encryption::room_key_file` seam uses the same-revision path-patched
+crypto byte API. It returns opaque prepared import/export values and exposes an
+explicit import-target preparation await retaining the current machine read
+guard. Callers recheck their captured authority after all preparation awaits,
+then consume the existing store handoff without another client/store lookup.
+No filesystem, UI/account callbacks or hidden blocking tasks are added. Canonical
+key conversion is preflighted before mutation; only fixed errors and counts
+leave this seam. Admitted import is awaited through presentation cancellation;
+errors do not prove unchanged store state or completed remote backup. Complete
+export overflow is an error. See `../matrix-sdk-crypto/MORPHEUS_PATCH.md` for
+bounds, provenance, original fixtures and the still-open application/IO gates.

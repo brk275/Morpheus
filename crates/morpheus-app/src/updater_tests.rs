@@ -30,13 +30,15 @@ fn rejects_formats_before_download_or_install() {
     let current = Version::parse("0.1.0").unwrap();
     for (kind, accepted) in [
         (PackageKind::MacApp, UpdateFormat::App),
-        (PackageKind::WindowsNsis, UpdateFormat::Nsis),
+        (PackageKind::WindowsNsis, UpdateFormat::WindowsPayloadV2),
         (PackageKind::LinuxAppImage, UpdateFormat::AppImage),
     ] {
         validate_candidate(&signed_update(accepted), &current, kind).unwrap();
         for format in [
             UpdateFormat::App,
             UpdateFormat::Nsis,
+            UpdateFormat::WindowsPayloadV1,
+            UpdateFormat::WindowsPayloadV2,
             UpdateFormat::Wix,
             UpdateFormat::AppImage,
         ] {
@@ -172,4 +174,23 @@ fn stage_failure_never_touches_account_data() {
     update.extract_path = account_dir.path().to_path_buf();
     assert!(stage_bytes(update, PackageKind::MacApp, b"invalid").is_err());
     assert_eq!(fs::read(&account_file).unwrap(), b"keep me");
+}
+
+#[test]
+fn shipping_dispatch_rejects_reserved_mac_acceptance_inputs() {
+    use std::ffi::OsString;
+    for (plan, args) in [
+        (true, vec![]),
+        (false, vec![OsString::from("--morpheus-mac-qa-prepare")]),
+        (false, vec![OsString::from("--morpheus-mac-qa-foreign")]),
+    ] {
+        assert_eq!(
+            reject_macos_update_acceptance_inputs(plan, args),
+            Err(UpdateError::InvalidConfiguration)
+        );
+    }
+    assert_eq!(
+        reject_macos_update_acceptance_inputs(false, [OsString::from("--preview")]),
+        Ok(())
+    );
 }

@@ -106,8 +106,9 @@ use crate::{
 };
 
 /// How long `save` and `load_or_create` wait for the writer locks before
-/// giving up with [`CommitError::Busy`]. `commit` does not wait. A writer
-/// holds the file lock only from the comparison through the rename.
+/// giving up with [`CommitError::Busy`]. `commit` does not wait. UI commits
+/// hold their locks through staging and publication; background writers stage
+/// before acquiring them.
 const WRITER_LOCK_WAIT: Duration = Duration::from_secs(2);
 const WRITER_LOCK_POLL: Duration = Duration::from_millis(10);
 
@@ -169,6 +170,8 @@ pub enum CommitError {
     /// settings at that moment. `commit` does not wait for it.
     #[error("another Morpheus window or task is saving settings right now; nothing was written")]
     Busy,
+    #[error("Morpheus is closing; no new settings were written")]
+    Closing,
     #[error(transparent)]
     Config(#[from] ConfigError),
 }
@@ -179,6 +182,10 @@ impl CommitError {
     pub(crate) fn into_config_error(self) -> ConfigError {
         match self {
             Self::Config(error) => error,
+            Self::Closing => ConfigError::Io(std::io::Error::new(
+                ErrorKind::WouldBlock,
+                Self::Closing.to_string(),
+            )),
             Self::Busy => ConfigError::Io(std::io::Error::new(
                 ErrorKind::WouldBlock,
                 Self::Busy.to_string(),
@@ -263,8 +270,8 @@ impl ConfigStore {
         self.publish_placed(config, expected, wait, before_publish, place)
     }
 
-    /// Stage `config`, take the writer locks, then compare with `expected`
-    /// (when given) and move the staged file into place with `place`.
+    /// Take the UI writer locks before staging; background writers stage first.
+    /// Then compare with `expected` (when given) and publish with `place`.
     /// Without `expected`, the file is replaced whatever it holds, but never
     /// between another Morpheus writer's comparison and rename.
     fn publish_placed(
@@ -275,12 +282,47 @@ impl ConfigStore {
         before_publish: impl FnOnce(&Path),
         place: impl FnOnce(tempfile::NamedTempFile, &Path, Placement) -> std::io::Result<()>,
     ) -> Result<ConfigRevision, CommitError> {
-        // Staging (validation, encoding, write and sync) happens before the
-        // locks and the comparison, so the unguarded window below is only a
-        // read and a rename. On every early return, dropping `staging`
-        // removes the temporary file.
+        let _admission = self
+            .write_admission
+            .active
+            .try_read()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => CommitError::Busy,
+                std::sync::TryLockError::Poisoned(_) => CommitError::Config(ConfigError::Invalid(
+                    "Settings writer admission could not be confirmed.".into(),
+                )),
+            })?;
+        if self
+            .write_admission
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(CommitError::Closing);
+        }
+        // A contended UI commit returns Busy before validation, encoding or
+        // staging I/O. Its draft stays with the caller; after contention clears,
+        // the same draft must still pass the ordinary validation below.
+        let early_writer = if wait.is_zero() {
+            Some(lock_writers(&self.path, wait)?)
+        } else {
+            None
+        };
+        // Background writers retain stage-first behavior. The UI's early lock
+        // is held through staging and publication, and drops on any stage error.
+        // On every early return, dropping `staging` removes the temporary file.
         let (staging, raw) = self.stage(config)?;
-        let _writers = lock_writers(&self.path, wait)?;
+        let _writers = match early_writer {
+            Some(mut writer) => {
+                // A missing parent could not hold an advisory lock before
+                // staging created it. Retry now, with the process claim still
+                // held; never reacquire an advisory lock we already own.
+                if writer._file.is_none() {
+                    writer._file = lock_file(&self.path, Instant::now())?;
+                }
+                writer
+            }
+            None => lock_writers(&self.path, wait)?,
+        };
         before_publish(self.path.as_path());
         let placement = match expected {
             None => Placement::Replace,
@@ -439,29 +481,29 @@ fn lock_writers(target: &Path, wait: Duration) -> Result<WriterLock, CommitError
             None => return Err(CommitError::Busy),
         }
     };
-    let unlocked = |process| WriterLock {
-        _file: None,
+    Ok(WriterLock {
+        _file: lock_file(target, deadline)?,
         _process: process,
-    };
+    })
+}
+
+/// Take only the advisory lock, keeping the caller's process claim alive.
+/// A zero-wait retry after staging covers a parent directory just created there.
+fn lock_file(target: &Path, deadline: Instant) -> Result<Option<fs::File>, CommitError> {
     // A lock file that cannot be opened (another user's, a link or a folder
     // in its place) must never stop saves; the comparison still runs.
     let Ok(file) = open_lock_file(&lock_path(target)?) else {
-        return Ok(unlocked(process));
+        return Ok(None);
     };
     loop {
         match file.try_lock() {
-            Ok(()) => {
-                return Ok(WriterLock {
-                    _file: Some(file),
-                    _process: process,
-                });
-            }
+            Ok(()) => return Ok(Some(file)),
             Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 thread::sleep(WRITER_LOCK_POLL);
             }
             Err(fs::TryLockError::WouldBlock) => return Err(CommitError::Busy),
             // A filesystem without locks: the same fallback.
-            Err(fs::TryLockError::Error(_)) => return Ok(unlocked(process)),
+            Err(fs::TryLockError::Error(_)) => return Ok(None),
         }
     }
 }
@@ -494,6 +536,55 @@ fn open_lock_file(path: &Path) -> std::io::Result<fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_close_drains_an_entered_real_publish_and_refuses_clone_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let writer = store.clone();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("morpheus-config-close-regression".into())
+            .spawn(move || {
+                writer.commit_with(&Config::default(), &ConfigRevision::absent(), |_| {
+                    let _ = entered.send(());
+                    let _ = released.recv_timeout(Duration::from_secs(5));
+                })
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(_) => panic!("No config regression worker was created"),
+        };
+        let entered = entering.recv_timeout(Duration::from_secs(3));
+        store.close_write_admission();
+        let during = store.write_shutdown_confirmed();
+        let refused = store
+            .clone()
+            .commit(&Config::default(), &ConfigRevision::absent());
+        let _ = release.send(());
+        let limit = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() && Instant::now() < limit {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if !worker.is_finished() {
+            // Keep both actual writer identity and its temporary directory on
+            // uncertainty; do not drop the only handle or its live file tree.
+            std::mem::forget(worker);
+            std::mem::forget(directory);
+            panic!("Config publish worker cleanup remained unproved");
+        }
+        let joined = worker.join();
+        let after = store.write_shutdown_confirmed();
+        let loaded = store.load();
+        // Every assertion follows the actual owned writer/TLS join.
+        assert!(entered.is_ok());
+        assert!(matches!(during, Ok(false)));
+        assert!(matches!(refused, Err(CommitError::Closing)));
+        assert!(matches!(joined, Ok(Ok(_))));
+        assert!(matches!(after, Ok(true)));
+        assert!(loaded.is_ok());
+    }
 
     fn names(directory: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(directory)
@@ -730,6 +821,74 @@ mod tests {
         );
         assert_eq!(retained, before);
         assert_eq!(names(directory.path()), ["config.toml", "config.toml.lock"]);
+    }
+
+    #[test]
+    fn a_busy_process_claim_never_creates_a_staging_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("not-created");
+        let store = ConfigStore::at(parent.join("config.toml"));
+        let _claim = ProcessClaim::take(store.path()).unwrap();
+
+        let result = store.commit(&Config::default(), &ConfigRevision::absent());
+
+        assert!(matches!(result, Err(CommitError::Busy)), "{result:?}");
+        assert!(!parent.exists(), "a busy commit must not stage on disk");
+    }
+
+    #[test]
+    fn a_busy_advisory_lock_defers_validation_without_losing_the_draft() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        store.load_or_create().unwrap();
+        let (_, revision) = store.load_revision().unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path(store.path()).unwrap())
+            .unwrap();
+        holder.lock().unwrap();
+        let mut draft = Config::default();
+        draft.geometry.corner_radius = u16::MAX;
+
+        let result = store.commit(&draft, &revision);
+
+        assert!(matches!(result, Err(CommitError::Busy)), "{result:?}");
+        assert_eq!(draft.geometry.corner_radius, u16::MAX);
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+        assert_eq!(names(directory.path()), ["config.toml", "config.toml.lock"]);
+        holder.unlock().unwrap();
+        let result = store.commit(&draft, &revision);
+        assert!(matches!(result, Err(CommitError::Config(_))), "{result:?}");
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+        assert_eq!(names(directory.path()), ["config.toml", "config.toml.lock"]);
+    }
+
+    #[test]
+    fn a_new_parent_gets_its_advisory_lock_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("not-created/config.toml"));
+        let config = Config::default();
+        let mut checked = false;
+
+        store
+            .commit_with(&config, &ConfigRevision::absent(), |path| {
+                let competing = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lock_path(path).unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    competing.try_lock(),
+                    Err(fs::TryLockError::WouldBlock)
+                ));
+                checked = true;
+            })
+            .unwrap();
+
+        assert!(checked);
+        assert_eq!(store.load().unwrap(), config);
     }
 
     #[test]

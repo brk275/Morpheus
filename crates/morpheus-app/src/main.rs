@@ -21,6 +21,7 @@ mod call_stage;
 mod calls;
 mod composer_mentions;
 mod config_cli;
+mod config_watch;
 mod device_sessions;
 mod draft_recovery;
 mod drafts;
@@ -33,6 +34,7 @@ mod kept_replies;
 mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
+mod marker_scans;
 mod matrix_links;
 mod member_privacy;
 mod message_metadata;
@@ -45,6 +47,7 @@ mod notification_center;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
+mod peer_verification;
 mod people_directory;
 mod pinned_messages;
 mod polls;
@@ -53,6 +56,7 @@ mod preview_capture;
 mod room_activity;
 mod room_addresses;
 mod room_creation;
+mod room_key_files;
 mod room_leave;
 mod room_media_browser;
 mod room_organization;
@@ -73,6 +77,7 @@ mod theme_studio;
 mod thread_browser;
 mod thread_history;
 // Instrumented release builds only (see build.rs); unit tests cover its pure checks.
+mod message_copy;
 #[cfg(any(test, morpheus_timeline_acceptance))]
 mod timeline_acceptance;
 mod timeline_delivery;
@@ -83,11 +88,14 @@ mod unread_navigation;
 mod update_controller;
 mod updater;
 mod verification;
+mod verification_work;
 #[cfg(feature = "native-calls")]
 mod video_render;
 #[cfg(feature = "native-calls")]
 mod voice_rosters;
 mod voice_spaces;
+#[cfg(all(windows, feature = "native-calls"))]
+mod windows_audio;
 mod workspace_layout;
 
 use std::cell::RefCell;
@@ -121,6 +129,42 @@ use crate::live::{LiveUi, show_error};
 use crate::local_video::{CaptureKind, CapturePhase, CaptureSource, LocalVideoStatus};
 use crate::notifications::DesktopNotifications;
 use crate::voice_spaces::VoiceSpaces;
+
+// Do not retain SDK/server errors here: Rust's Result termination prints Debug.
+// These closed categories make failed cleanup visible to the process-exit
+// observer without exposing an underlying account/media error in that output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownFailure {
+    #[cfg(feature = "native-calls")]
+    NativeCall,
+    #[cfg(all(
+        feature = "native-calls",
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    AudioBackend,
+    UpdateWorker,
+}
+
+impl std::fmt::Display for ShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(feature = "native-calls")]
+            Self::NativeCall => formatter.write_str("Native call shutdown could not be confirmed."),
+            #[cfg(all(
+                feature = "native-calls",
+                any(target_os = "macos", target_os = "linux")
+            ))]
+            Self::AudioBackend => {
+                formatter.write_str("Native audio backend shutdown could not be confirmed.")
+            }
+            Self::UpdateWorker => {
+                formatter.write_str("Update worker shutdown could not be confirmed.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ShutdownFailure {}
 
 slint::include_modules!();
 
@@ -201,6 +245,7 @@ fn message(
 ) -> MessageItem {
     let clocks = message_metadata::ClockLabels::from_preview(time);
     MessageItem {
+        copy_token: Default::default(),
         event_id: SharedString::default(),
         is_own: false,
         sender: sender.into(),
@@ -1606,6 +1651,44 @@ fn continue_account_action(ui: &AppWindow, action: i32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(morpheus_windows_update_acceptance)]
+    {
+        // This section exists only WITH the first-statement dispatch. The
+        // private driver checks it as inert PE data before any installation.
+        const ENTRY_TEXT: &str = concat!(
+            "MORPHEUS-WINDOWS-UPDATE-QA-V1\n",
+            env!("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_NONCE")
+        );
+        #[used]
+        #[unsafe(link_section = ".mrphqa")]
+        static ENTRY: [u8; ENTRY_TEXT.len()] = {
+            let text = ENTRY_TEXT.as_bytes();
+            let mut bytes = [0_u8; ENTRY_TEXT.len()];
+            let mut index = 0;
+            while index < text.len() {
+                bytes[index] = text[index];
+                index += 1;
+            }
+            bytes
+        };
+        std::hint::black_box(&ENTRY);
+        return updater::run_windows_update_acceptance();
+    }
+    // The synthetic transaction variant never enters config, network, UI,
+    // accounts or vault initialization, even with missing/invalid arguments.
+    #[cfg(morpheus_macos_update_acceptance)]
+    return updater::run_macos_update_acceptance().map_err(Into::into);
+    #[cfg(not(morpheus_macos_update_acceptance))]
+    updater::reject_macos_update_acceptance_request()?;
+    #[cfg(not(morpheus_windows_update_acceptance))]
+    if std::env::var_os("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_PLAN").is_some()
+        || std::env::var_os("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_PLAN_SHA256").is_some()
+        || std::env::args_os()
+            .skip(1)
+            .any(|arg| arg.to_string_lossy().starts_with("--morpheus-windows-qa-"))
+    {
+        return Err("Private Windows update acceptance is not compiled into this build".into());
+    }
     // `config validate` and `config schema` run first: before the screenshot
     // preview, the updater, the startup session, the window, the account
     // store, the credential vault, sync and media devices. They write nothing.
@@ -1615,7 +1698,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // An instrumented acceptance build refuses to start without a valid run
     // file, so it never runs as an ordinary app. See tests/TIMELINE_10K.md.
     #[cfg(morpheus_timeline_acceptance)]
-    let mut acceptance = timeline_acceptance::Acceptance::from_environment()?;
+    let acceptance = timeline_acceptance::Acceptance::from_environment()?;
     // Screenshot generation uses only the in-memory offline preview. Dispatch
     // before updater, configuration, credential vault or account initialization.
     #[cfg(debug_assertions)]
@@ -1634,11 +1717,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Ok(());
     }
+    // The root session outlives the entire ordinary application scope. Its
+    // private final-success authority is never emitted by a local destructor.
+    run_application(
+        update_session.clone(),
+        #[cfg(morpheus_timeline_acceptance)]
+        acceptance,
+    )?;
+    #[cfg(target_os = "linux")]
+    updater::complete_linux_shutdown(update_session)?;
+    Ok(())
+}
+
+fn run_application(
+    update_session: Arc<Mutex<updater::StartupSession>>,
+    #[cfg(morpheus_timeline_acceptance)] mut acceptance: timeline_acceptance::Acceptance,
+) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     morpheus_rtc::install_crypto_provider();
     let ui = AppWindow::new()?;
     ui.set_login_loading(true);
     ui.show()?;
+    #[cfg(all(windows, feature = "native-calls"))]
+    let wasapi_ui = windows_audio::attach()?;
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.mark_window_shown();
     update_session
@@ -1694,6 +1795,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.as_weak(),
         voice_spaces.clone(),
     );
+    let peer_verification_ui =
+        peer_verification::PeerVerificationUi::register(&ui, live.clone(), runtime.handle());
+    #[cfg(not(all(windows, feature = "native-calls")))]
     security::register(&ui, live.clone(), runtime.handle().clone());
     let image_previews =
         image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
@@ -1717,6 +1821,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         room_activity::RoomActivityUi::register(&ui, live.clone(), store.clone(), runtime.handle());
     let unread_navigation_ui =
         unread_navigation::UnreadNavigationUi::register(&ui, live.clone(), runtime.handle());
+    room_key_files::register(&ui, live.clone(), runtime.handle().clone());
     let device_sessions =
         device_sessions::DeviceSessionsUi::register(&ui, live.clone(), runtime.handle());
     let member_privacy =
@@ -1734,6 +1839,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         live.security_gate.clone(),
         Arc::new(move || update_accounts.account_access_busy()),
     );
+    #[cfg(all(windows, feature = "native-calls"))]
+    security::register(&ui, live.clone(), runtime.handle().clone(), updates.clone());
     let update_ui_task = updates.bind_ui(&ui);
     #[cfg(feature = "native-calls")]
     let calls = Arc::new(CallController::new(
@@ -2151,59 +2258,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         notifications.clone(),
     );
 
-    let watch = store.watch_with_theme(Duration::from_millis(700));
-    let weak = ui.as_weak();
-    let watch_live = live.clone();
-    let watch_notifications = notifications.clone();
-    let watch_handle = runtime.handle().clone();
-    let watch_store = store.clone();
-    thread::spawn(move || {
-        while watch.recv().is_ok() {
-            // The watcher result can be older than a Settings save. Read the
-            // latest file on the UI event loop, where Settings callbacks also
-            // run, so an older notification policy cannot overwrite a newer
-            // privacy choice. Theme errors must not block a valid policy.
-            let current_store = watch_store.clone();
-            let current_notifications = watch_notifications.clone();
-            let current_live = watch_live.clone();
-            let current_weak = weak.clone();
-            let current_handle = watch_handle.clone();
-            let closed = weak
-                .upgrade_in_event_loop(move |ui| match current_store.load() {
-                    Ok(config) => {
-                        current_notifications.apply_config(&config);
-                        apply_notification_settings(&ui, &config);
-                        shortcuts::apply_config(&ui, &config);
-                        audio_devices::apply_config(&ui, &config);
-                        image_previews::apply_config(&ui, &config);
-                        room_activity::apply_config(&ui, &config);
-                        current_live.voice_spaces.apply_config(&config);
-                        match current_store.load_theme(&config) {
-                            Ok(theme) => apply_loaded_config(
-                                &ui,
-                                &LoadedConfig {
-                                    config: config.clone(),
-                                    theme,
-                                },
-                            ),
-                            Err(error) => ui.set_config_error(error.to_string().into()),
-                        }
-                        let live = current_live.clone();
-                        let weak = current_weak.clone();
-                        current_handle.spawn(async move {
-                            let _ = live.refresh(weak).await;
-                        });
-                    }
-                    Err(error) => {
-                        ui.set_config_error(error.to_string().into());
-                    }
-                })
-                .is_err();
-            if closed {
-                break;
-            }
-        }
-    });
+    let config_watch = config_watch::ConfigWatch::start(
+        &ui,
+        store.clone(),
+        live.clone(),
+        notifications.clone(),
+        runtime.handle(),
+    );
+
     {
         let access = account_access.clone();
         runtime.spawn(async move { access.restore().await });
@@ -3082,6 +3144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    message_copy::register(&ui, &live);
     message_search::register(&ui, live.clone(), runtime.handle().clone());
     space_explorer::register(&ui, live.clone(), runtime.handle().clone());
     room_creation::register(&ui, live.clone(), runtime.handle().clone());
@@ -3655,6 +3718,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let live = thread_live.clone();
             let generation = live.begin_thread_request();
+            message_copy::thread_opened(&ui);
             let weak = weak.clone();
             thread_handle.spawn(async move {
                 let error_account_id = account_id.clone();
@@ -3719,7 +3783,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let live = pending_live.clone();
         let weak = weak.clone();
-        pending_handle.spawn(async move {
+        pending_live.spawn_draft_work(&pending_handle, async move {
             live.cancel_pending_send(selection, scope, target, weak)
                 .await
         });
@@ -3746,7 +3810,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let live = retry_live.clone();
         let weak = weak.clone();
-        retry_handle.spawn(async move {
+        retry_live.spawn_draft_work(&retry_handle, async move {
             live.retry_pending_send(selection, scope, target, weak)
                 .await
         });
@@ -3770,7 +3834,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let live = review_live.clone();
         let weak = weak.clone();
-        review_handle.spawn(async move {
+        review_live.spawn_draft_work(&review_handle, async move {
             live.review_unconfirmed_send(selection, scope, nonce, sent, weak)
                 .await
         });
@@ -3810,7 +3874,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let live = restore_live.clone();
         let weak = weak.clone();
-        restore_handle.spawn(async move {
+        restore_live.spawn_draft_work(&restore_handle, async move {
             live.restore_record_text(selection, scope, nonce, revision, weak)
                 .await
         });
@@ -3862,8 +3926,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let live = discard_live.clone();
         let weak = weak.clone();
-        discard_handle
-            .spawn(async move { live.discard_kept_text(selection, scope, nonce, weak).await });
+        discard_live.spawn_draft_work(&discard_handle, async move {
+            live.discard_kept_text(selection, scope, nonce, weak).await
+        });
     });
     let weak = ui.as_weak();
     let unreadable_live = live.clone();
@@ -3881,8 +3946,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let live = unreadable_live.clone();
         let weak = weak.clone();
-        unreadable_handle
-            .spawn(async move { live.discard_unreadable_status(selection, scope, weak).await });
+        unreadable_live.spawn_draft_work(&unreadable_handle, async move {
+            live.discard_unreadable_status(selection, scope, weak).await
+        });
     });
 
     let weak = ui.as_weak();
@@ -4278,7 +4344,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let Some(_security) = security_gate.try_account_access() else { return; };
+            // Reject an old A -> B -> A selection BEFORE pausing any account ID.
+            // The core repeats its atomic selection check below.
+            if !selection.is_current() {
+                show_error(&ui, "The account changed. Open its menu and request logout again.".into());
+                return;
+            }
             let account_id = selection.account_id().to_owned();
+            let mut verification_pause = match live.pause_verification_work(&account_id) {
+                Ok(pause) => pause,
+                Err(error) => { show_error(&ui, error.to_string()); return; }
+            };
+            // The paused account cannot mint new views. A UI acknowledgement
+            // proves its actual Session was dropped before any store effect.
+            if let Err(error) = peer_verification::withdraw_paused_account(ui.clone(), account_id.clone()).await {
+                show_error(&ui, error.to_string());
+                return;
+            }
+            if let Err(error) = verification_pause.drain().await {
+                show_error(&ui, error.to_string());
+                return;
+            }
+            if !selection.is_current() || live.action_admission_closed() {
+                show_error(&ui, "The account changed. Open its menu and request logout again.".into());
+                return;
+            }
             // The core checks selection identity atomically before any logout
             // effect. A queued A -> B (including A -> B -> A) cannot retarget it.
             let result = live.manager.logout_selected_account(&selection).await;
@@ -4338,6 +4428,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window.invoke_cancel_room_settings();
         window.invoke_close_image_preview();
         window.invoke_stop_attachment_audio();
+        // Drop the already-visible SDK session before any logout work. The
+        // mandatory post-pause UI acknowledgement below closes recreation.
+        window.invoke_withdraw_verification();
         if !logout_live.is_live.load(Ordering::Acquire) {
             if window.get_call_connected() {
                 window.set_pending_account_index(-3);
@@ -4669,73 +4762,312 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(morpheus_timeline_acceptance)]
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
-    let ui_result = ui.run();
-    device_sessions.shutdown(&ui);
-    member_privacy.shutdown(&ui);
-    identity_warnings.shutdown(&ui);
-    pinned_messages.shutdown(&ui);
-    room_media.shutdown(&ui);
-    room_activity.shutdown(&ui);
-    // Before any wait below: no unread-mark write that was not handed over
-    // yet can start while main waits on other cleanup.
-    unread_navigation_ui.shutdown(&ui);
-    room_permissions.shutdown(&ui);
-    room_settings.shutdown(&ui);
-    room_leave.shutdown(&ui);
-    moderation.shutdown();
-    image_previews.shutdown(&ui);
-    attachment_audio.shutdown(&ui);
-    #[cfg(feature = "native-calls")]
-    voice_presence.shutdown(&ui);
-    // Before the incoming worker and notifications: no call banner outlives
-    // them, and those the platform can withdraw are withdrawn.
-    #[cfg(feature = "native-calls")]
-    call_banners.shutdown();
-    #[cfg(feature = "native-calls")]
-    incoming_calls.shutdown();
-    notifications.shutdown();
-    update_ui_task.abort();
-    let update_result = runtime.block_on(async {
-        let _ = update_ui_task.await;
-        // A cancelled download may still be waiting for its bounded network
-        // timeout. Stop call capture concurrently, never after that wait.
+    // UI revocation stays on its actual thread; mandatory async cleanup may
+    // run on the existing runtime while Windows keeps the origin STA pumping.
+    let cleanup_ui = ui.clone_strong();
+    let cleanup = move || {
+        #[cfg(all(windows, feature = "native-calls"))]
+        live.security_gate.begin_shutdown(None);
+        live.close_action_admission();
+        config_watch.shutdown();
+        message_copy::retire(&cleanup_ui);
+        verification::shutdown(&cleanup_ui);
+        // Actual UI-owned SDK sessions go before any async task/store drain.
+        peer_verification_ui.shutdown(&cleanup_ui);
+        store.close_write_admission();
+        room_key_files::close_admission(&cleanup_ui);
+        style_profiles::close_application_admission();
+        cleanup_ui.set_application_closing(true);
+        cleanup_ui.set_update_status("Closing Morpheus. Saving drafts and releasing audio…".into());
         #[cfg(feature = "native-calls")]
-        {
-            let (update_result, call_result, ()) = tokio::join!(
-                updates.shutdown(),
-                calls.end_call(),
-                incoming_calls.finish()
-            );
-            if let Err(error) = call_result {
-                eprintln!("Could not leave native call during shutdown: {error}");
+        audio_devices::shutdown_discovery();
+        device_sessions.shutdown(&cleanup_ui);
+        member_privacy.shutdown(&cleanup_ui);
+        identity_warnings.shutdown(&cleanup_ui);
+        pinned_messages.shutdown(&cleanup_ui);
+        room_media.shutdown(&cleanup_ui);
+        room_activity.shutdown(&cleanup_ui);
+        // Before any wait below: no unread-mark write that was not handed over
+        // yet can start while main waits on other cleanup.
+        unread_navigation_ui.shutdown(&cleanup_ui);
+        room_permissions.shutdown(&cleanup_ui);
+        room_settings.shutdown(&cleanup_ui);
+        room_leave.shutdown(&cleanup_ui);
+        moderation.shutdown();
+        image_previews.shutdown(&cleanup_ui);
+        attachment_audio.shutdown(&cleanup_ui);
+        #[cfg(feature = "native-calls")]
+        voice_presence.shutdown(&cleanup_ui);
+        // Before the incoming worker and notifications: no call banner outlives
+        // them, and those the platform can withdraw are withdrawn.
+        #[cfg(feature = "native-calls")]
+        call_banners.shutdown();
+        #[cfg(feature = "native-calls")]
+        incoming_calls.shutdown();
+        notifications.shutdown();
+        update_ui_task.abort();
+        async move {
+            let (update_result, call_result) = async {
+                let _ = update_ui_task.await;
+                // A cancelled download may still be waiting for its bounded network
+                // timeout. Stop call capture concurrently, never after that wait.
+                #[cfg(feature = "native-calls")]
+                {
+                    let (update_result, call_result, ()) = tokio::join!(
+                        updates.shutdown(),
+                        calls.end_call(),
+                        incoming_calls.finish()
+                    );
+                    let call_result = call_result.map_err(|_| ShutdownFailure::NativeCall);
+                    if call_result.is_err() {
+                        eprintln!("Could not confirm native call shutdown.");
+                    }
+                    (update_result, call_result)
+                }
+                #[cfg(not(feature = "native-calls"))]
+                (updates.shutdown().await, Ok::<(), ShutdownFailure>(()))
             }
-            update_result
+            .await;
+            #[cfg(feature = "native-calls")]
+            let ring_result = morpheus_rtc::wait_for_ring_audio_release().await;
+            #[cfg(feature = "native-calls")]
+            if let Err(error) = ring_result {
+                // Incoming UI shutdown revoked authority first. Still finish the other
+                // cleanup paths, then return the typed actual-worker release failure.
+                eprintln!("Could not release incoming sound during shutdown: {error}");
+            }
+            #[cfg(feature = "native-calls")]
+            let device_open_result = morpheus_rtc::wait_for_audio_device_release().await;
+            #[cfg(feature = "native-calls")]
+            if let Err(error) = device_open_result {
+                // Preserve this independent join failure while all remaining cleanup
+                // completes; call cleanup failures are also returned below.
+                eprintln!("Could not release audio device opener during shutdown: {error}");
+            }
+            let audio_result = audio_attachments::wait_for_release().await;
+            if let Err(error) = audio_result {
+                // Still flush drafts and stop the manager; failure is returned below.
+                eprintln!("Could not release attachment audio during shutdown: {error}");
+            }
+            #[cfg(feature = "native-calls")]
+            let discovery_result = audio_devices::wait_for_discovery_release().await;
+            #[cfg(all(feature = "native-calls", target_os = "macos"))]
+            let backend_result = Some(
+                morpheus_rtc::wait_for_all_coreaudio_release()
+                    .await
+                    .map_err(|_| ShutdownFailure::AudioBackend),
+            );
+            #[cfg(all(feature = "native-calls", target_os = "linux"))]
+            let backend_result = Some(
+                morpheus_rtc::wait_for_all_alsa_release()
+                    .await
+                    .map_err(|_| ShutdownFailure::AudioBackend),
+            );
+            // Windows' actual native result is returned separately by its UI
+            // apartment coordinator. This tuple slot carries only Mac/ALSA.
+            #[cfg(all(
+                feature = "native-calls",
+                not(any(target_os = "macos", target_os = "linux"))
+            ))]
+            let backend_result: Option<Result<(), ShutdownFailure>> = None;
+            #[cfg(all(
+                feature = "native-calls",
+                any(target_os = "macos", target_os = "linux")
+            ))]
+            if matches!(backend_result, Some(Err(_))) {
+                eprintln!("Could not confirm native audio backend shutdown.");
+            }
+            // Selection/task/edit admission was closed synchronously on the
+            // UI thread. Actual admitted handles must finish before the final
+            // writer sweep, while loaded account stores remain available.
+            let appearance_result = style_profiles::wait_for_appearance_release().await;
+            let draft_task_result = live.drain_draft_work().await;
+            let verification_result = live.drain_verification_work().await;
+            // The producer is woken even when files stay unchanged. The bridge
+            // joins it, and admitted refreshes finish before account stores stop.
+            let config_watch_result = config_watch.finish().await;
+            let marker_scan_result = live.drain_marker_scans().await;
+            let config_drain_result = loop {
+                match store.write_shutdown_confirmed() {
+                    Ok(true) => break Ok(()),
+                    Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                    Err(error) => break Err(error),
+                }
+            };
+            let draft_result = live.flush_drafts().await;
+            manager.stop().await;
+            let update_result = update_result.map_err(|_| ShutdownFailure::UpdateWorker);
+            if update_result.is_err() {
+                // Keep diagnostics static and return failure only after all cleanup.
+                eprintln!("Could not confirm update worker shutdown.");
+            }
+            #[cfg(feature = "native-calls")]
+            {
+                (
+                    update_result,
+                    call_result,
+                    ring_result,
+                    device_open_result,
+                    audio_result,
+                    draft_result,
+                    discovery_result,
+                    backend_result,
+                    draft_task_result,
+                    config_drain_result,
+                    appearance_result,
+                    verification_result,
+                    config_watch_result,
+                    marker_scan_result,
+                )
+            }
+            #[cfg(not(feature = "native-calls"))]
+            {
+                (
+                    update_result,
+                    call_result,
+                    audio_result,
+                    draft_result,
+                    draft_task_result,
+                    config_drain_result,
+                    appearance_result,
+                    verification_result,
+                    config_watch_result,
+                    marker_scan_result,
+                )
+            }
         }
-        #[cfg(not(feature = "native-calls"))]
-        updates.shutdown().await
-    });
-    if !runtime.block_on(audio_attachments::wait_for_release()) {
-        eprintln!("Attachment audio worker did not confirm release before shutdown");
-    }
-    let draft_result = runtime.block_on(live.flush_drafts());
-    runtime.block_on(manager.stop());
-    if let Err(error) = update_result {
-        // Static diagnostic only; all other app shutdown work still completes.
-        eprintln!("Could not finish update shutdown safely: {error}");
-    }
+    };
+    #[cfg(all(windows, feature = "native-calls"))]
+    let (
+        ui_result,
+        (
+            update_result,
+            call_result,
+            ring_result,
+            device_open_result,
+            audio_result,
+            draft_result,
+            discovery_result,
+            backend_result,
+            draft_task_result,
+            config_drain_result,
+            appearance_result,
+            verification_result,
+            config_watch_result,
+            marker_scan_result,
+        ),
+        wasapi_result,
+    ) = windows_audio::run(&ui, wasapi_ui, &runtime, cleanup)?;
+    #[cfg(all(not(windows), feature = "native-calls"))]
+    let (
+        ui_result,
+        (
+            update_result,
+            call_result,
+            ring_result,
+            device_open_result,
+            audio_result,
+            draft_result,
+            discovery_result,
+            backend_result,
+            draft_task_result,
+            config_drain_result,
+            appearance_result,
+            verification_result,
+            config_watch_result,
+            marker_scan_result,
+        ),
+    ) = {
+        let result = ui.run();
+        (result, runtime.block_on(cleanup()))
+    };
+    #[cfg(not(feature = "native-calls"))]
+    let (
+        ui_result,
+        (
+            update_result,
+            call_result,
+            audio_result,
+            draft_result,
+            draft_task_result,
+            config_drain_result,
+            appearance_result,
+            verification_result,
+            config_watch_result,
+            marker_scan_result,
+        ),
+    ) = {
+        let result = ui.run();
+        (result, runtime.block_on(cleanup()))
+    };
     ui_result?;
     if let Err(error) = draft_result {
         eprintln!("Could not save drafts during shutdown: {error}");
         return Err(Box::new(error));
     }
+    audio_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    #[cfg(feature = "native-calls")]
+    device_open_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    #[cfg(feature = "native-calls")]
+    ring_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    // UI, draft, attachment, device-opening and ringing errors retain their
+    // precedence. Failed call cleanup or an update drain must also prevent a
+    // successful ordinary-shutdown result.
+    #[cfg(feature = "native-calls")]
+    if let Some(result) = backend_result {
+        result?;
+    }
+    call_result?;
+    update_result?;
     #[cfg(morpheus_timeline_acceptance)]
     acceptance.finish()?;
+    draft_task_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    config_drain_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    appearance_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    verification_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    config_watch_result?;
+    marker_scan_result?;
+    #[cfg(feature = "native-calls")]
+    discovery_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    #[cfg(all(windows, feature = "native-calls"))]
+    wasapi_result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn shutdown_failures_report_only_closed_static_categories() {
+        let failure = ShutdownFailure::UpdateWorker;
+        assert_eq!(format!("{failure:?}"), "UpdateWorker");
+        assert_eq!(
+            failure.to_string(),
+            "Update worker shutdown could not be confirmed."
+        );
+        assert!(std::error::Error::source(&failure).is_none());
+        #[cfg(feature = "native-calls")]
+        {
+            let failure = ShutdownFailure::NativeCall;
+            assert_eq!(format!("{failure:?}"), "NativeCall");
+            assert_eq!(
+                failure.to_string(),
+                "Native call shutdown could not be confirmed."
+            );
+            assert!(std::error::Error::source(&failure).is_none());
+        }
+        #[cfg(all(feature = "native-calls", target_os = "macos"))]
+        {
+            let failure = ShutdownFailure::AudioBackend;
+            assert_eq!(format!("{failure:?}"), "AudioBackend");
+            assert_eq!(
+                failure.to_string(),
+                "Native audio backend shutdown could not be confirmed."
+            );
+            assert!(std::error::Error::source(&failure).is_none());
+        }
+    }
 
     #[test]
     fn highlight_editor_normalizes_input_and_rejects_hidden_controls() {

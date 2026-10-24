@@ -295,27 +295,54 @@ impl VoiceSpaces {
     }
 
     #[cfg(feature = "native-calls")]
-    pub async fn scan_shared(
+    pub(crate) async fn scan_shared_owned(
+        &self,
+        manager: &AccountManager,
+        authority: &crate::marker_scans::Authority,
+        room_ids: &[String],
+    ) -> bool {
+        self.scan_shared_for(manager, ScanScope::Owned(authority), room_ids)
+            .await
+    }
+
+    // Only the existing synthetic scan-lock case has an account-name-only
+    // entry. It is absent from ordinary production builds.
+    #[cfg(all(test, feature = "native-calls"))]
+    async fn scan_shared(
         &self,
         manager: &AccountManager,
         account_id: &str,
         room_ids: &[String],
     ) -> bool {
-        // A refresh for the next account can arrive while the previous
-        // account's marker reads are still finishing. Queue that refresh and
-        // recheck the selected account after acquiring the lock; otherwise its
-        // only discovery pass can be silently lost until another UI refresh.
-        let _scan = self.scan.lock().await;
-        if manager
-            .active_account()
+        self.scan_shared_for(manager, ScanScope::Synthetic(account_id), room_ids)
             .await
-            .is_none_or(|account| account.id != account_id)
+    }
+
+    #[cfg(feature = "native-calls")]
+    async fn scan_shared_for(
+        &self,
+        manager: &AccountManager,
+        scope: ScanScope<'_>,
+        room_ids: &[String],
+    ) -> bool {
+        // One current marker worker coalesces snapshots without blocking UI
+        // navigation. Never substitute a new selection after waiting here.
+        let _scan = self.scan.lock().await;
+        let account_id = scope.account_id();
+        if !scope.is_current()
+            || manager
+                .active_account()
+                .await
+                .is_none_or(|account| account.id != account_id)
         {
             return false;
         }
         let now = Instant::now();
         let due = {
             let cache = self.shared.lock().await;
+            if !scope.is_current() {
+                return false;
+            }
             room_ids
                 .iter()
                 .filter(|room_id| {
@@ -328,31 +355,54 @@ impl VoiceSpaces {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        if due.is_empty() {
+        if due.is_empty() || !scope.is_current() {
             return false;
         }
         let Ok(client) = manager.active_client().await else {
             return false;
         };
+        // active_client is an awaited read. Fence its exact original selection
+        // and account again before admitting any SDK/network request.
+        if !scope.is_current()
+            || manager
+                .active_account()
+                .await
+                .is_none_or(|account| account.id != account_id)
+            || !scope.is_current()
+        {
+            return false;
+        }
         let rtc = RtcService::new(client);
         let mut checks = stream::iter(due.into_iter().map(|room_id| {
             let rtc = &rtc;
+            let scope = &scope;
             async move {
+                if !scope.admit_read() {
+                    return None;
+                }
                 let result =
                     tokio::time::timeout(Duration::from_secs(10), rtc.voice_space_marker(&room_id))
                         .await;
-                (room_id, result)
+                Some((room_id, result))
             }
         }))
         .buffer_unordered(4);
         let mut changed = false;
-        while let Some((room_id, result)) = checks.next().await {
+        while let Some(result) = checks.next().await {
+            let Some((room_id, result)) = result else {
+                continue;
+            };
+            // Revocation refuses new reads and cache commits. Continue draining
+            // all already-admitted bounded reads instead of dropping the stream.
+            if !scope.is_current() {
+                continue;
+            }
             if manager
                 .active_account()
                 .await
                 .is_none_or(|account| account.id != account_id)
             {
-                break;
+                continue;
             }
             let (enabled, retry_after) = match result {
                 Ok(Ok(marker)) => (marker.is_some_and(|marker| marker.enabled), MARKER_REFRESH),
@@ -360,42 +410,81 @@ impl VoiceSpaces {
             };
             let key = (account_id.to_owned(), room_id);
             let mut cache = self.shared.lock().await;
-            // A user action may have written a newer marker while this
-            // background request was in flight. Keep the explicit result.
-            if cache
-                .get(&key)
-                .is_some_and(|marker| marker.checked_at > now)
-            {
-                continue;
-            }
-            let prior = cache.get(&key).is_some_and(|marker| marker.enabled);
-            if retry_after == MARKER_REFRESH && prior != enabled {
-                changed = true;
-            }
-            cache.insert(
-                key,
-                CachedMarker {
-                    enabled: if retry_after == MARKER_REFRESH {
-                        enabled
-                    } else {
-                        prior
+            let committed = scope.commit(|| {
+                // An explicit user action may have installed a newer marker.
+                if cache
+                    .get(&key)
+                    .is_some_and(|marker| marker.checked_at > now)
+                {
+                    return false;
+                }
+                let prior = cache.get(&key).is_some_and(|marker| marker.enabled);
+                let differs = retry_after == MARKER_REFRESH && prior != enabled;
+                cache.insert(
+                    key,
+                    CachedMarker {
+                        enabled: if retry_after == MARKER_REFRESH {
+                            enabled
+                        } else {
+                            prior
+                        },
+                        checked_at: Instant::now(),
+                        retry_after,
                     },
-                    checked_at: Instant::now(),
-                    retry_after,
-                },
-            );
+                );
+                differs
+            });
+            changed |= committed.unwrap_or(false);
         }
         changed
     }
 
     #[cfg(not(feature = "native-calls"))]
-    pub async fn scan_shared(
+    pub(crate) async fn scan_shared_owned(
         &self,
         _manager: &AccountManager,
-        _account_id: &str,
+        _authority: &crate::marker_scans::Authority,
         _room_ids: &[String],
     ) -> bool {
         false
+    }
+}
+
+#[cfg(feature = "native-calls")]
+enum ScanScope<'a> {
+    Owned(&'a crate::marker_scans::Authority),
+    #[cfg(test)]
+    Synthetic(&'a str),
+}
+
+#[cfg(feature = "native-calls")]
+impl ScanScope<'_> {
+    fn account_id(&self) -> &str {
+        match self {
+            Self::Owned(authority) => authority.account_id(),
+            #[cfg(test)]
+            Self::Synthetic(account_id) => account_id,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        match self {
+            Self::Owned(authority) => authority.is_current(),
+            #[cfg(test)]
+            Self::Synthetic(_) => true,
+        }
+    }
+
+    fn admit_read(&self) -> bool {
+        self.commit(|| ()).is_some()
+    }
+
+    fn commit<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        match self {
+            Self::Owned(authority) => authority.with_current(action),
+            #[cfg(test)]
+            Self::Synthetic(_) => Some(action()),
+        }
     }
 }
 

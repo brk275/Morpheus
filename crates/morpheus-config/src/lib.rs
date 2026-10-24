@@ -17,9 +17,11 @@ pub mod diagnostics;
 mod input;
 pub mod registry;
 pub mod style_profiles;
+mod watch;
 
 pub use commit::{CommitError, ConfigRevision};
 pub use input::{InputError, MAX_CONFIG_BYTES, MAX_THEME_BYTES, read_bounded};
+pub use watch::{OwnedWatch, WatchJoinError, WatchStop};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -2122,6 +2124,15 @@ pub fn validate_shortcuts(values: &BTreeMap<String, String>) -> Result<(), Confi
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     path: PathBuf,
+    // Clones used by this application share terminal write admission. Reads,
+    // diagnostics and an independent ConfigStore opened by another process
+    // retain their existing behavior.
+    write_admission: std::sync::Arc<ConfigWriteAdmission>,
+}
+#[derive(Debug, Default)]
+struct ConfigWriteAdmission {
+    closed: std::sync::atomic::AtomicBool,
+    active: std::sync::RwLock<()>,
 }
 
 impl ConfigStore {
@@ -2132,7 +2143,37 @@ impl ConfigStore {
     }
 
     pub fn at(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            write_admission: std::sync::Arc::default(),
+        }
+    }
+
+    /// Close all cloned application writers without waiting on filesystem I/O
+    /// on the UI thread. An already admitted writer keeps its real read guard.
+    pub fn close_write_admission(&self) {
+        self.write_admission
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    /// A real exclusive barrier, not an active-count snapshot. With terminal
+    /// admission closed, it proves every admitted synchronous publish scope
+    /// has returned (including its stage/place/flush and original errors).
+    pub fn write_shutdown_confirmed(&self) -> Result<bool, CommitError> {
+        if !self
+            .write_admission
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(false);
+        }
+        match self.write_admission.active.try_write() {
+            Ok(_exclusive) => Ok(true),
+            Err(std::sync::TryLockError::WouldBlock) => Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(CommitError::Config(
+                ConfigError::Invalid("Settings writer completion could not be confirmed.".into()),
+            )),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -2163,19 +2204,8 @@ impl ConfigStore {
             return Ok(None);
         };
         config.validate()?;
-        let raw = match read_bounded(&self.theme_path(name)?, MAX_THEME_BYTES) {
-            Ok(raw) => raw,
-            Err(InputError::Missing) => {
-                if let Some(preset) = BuiltInStylePreset::from_theme_name(name) {
-                    return preset.theme().map(Some);
-                }
-                return Err(InputError::Missing.into());
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let theme: ThemePack = parse_toml(&raw, diagnostics::FileKind::Theme)?;
-        theme.validate()?;
-        Ok(Some(theme))
+        let raw = read_bounded(&self.theme_path(name)?, MAX_THEME_BYTES);
+        decode_theme_sample(name, &raw).map(Some)
     }
 
     pub fn load_or_create(&self) -> Result<Config, ConfigError> {
@@ -2223,8 +2253,11 @@ impl ConfigStore {
                 if raw == Err(InputError::Missing) || last_raw.as_ref() == Some(&raw) {
                     continue;
                 }
+                // Publish the same bounded bytes used to detect the change.
+                // Reopening here could publish another revision and remember
+                // the first one as if it had already been delivered.
+                let result = decode_config_sample(&raw);
                 last_raw = Some(raw);
-                let result = ConfigStore::at(&path).load();
                 if sender.send(result).is_err() {
                     break;
                 }
@@ -2233,7 +2266,31 @@ impl ConfigStore {
         receiver
     }
 
+    /// Keep change detection and publication bound to the same bounded reads.
+    /// A later file revision is observed on the next poll, never substituted
+    /// after this sample has been marked as delivered.
+    fn sample_with_theme(
+        &self,
+        config_raw: Result<String, InputError>,
+    ) -> (WatchSignature, Result<LoadedConfig, ConfigError>) {
+        let mut theme_raw = None;
+        let result = decode_config_sample(&config_raw).and_then(|config| {
+            let theme = if let Some(name) = config.appearance.theme_pack.as_deref() {
+                let raw = read_bounded(&self.theme_path(name)?, MAX_THEME_BYTES);
+                let theme = decode_theme_sample(name, &raw);
+                theme_raw = Some(raw);
+                Some(theme?)
+            } else {
+                None
+            };
+            Ok(LoadedConfig { config, theme })
+        });
+        ((config_raw, theme_raw), result)
+    }
+
     /// Watch the settings file and its selected theme pack as a single unit.
+    /// Compatibility receiver API; application-lifetime desktop callers use
+    /// `watch_with_theme_owned` to cancel and join unchanged polling.
     /// Callers only apply `Ok` values so a broken external edit leaves the
     /// last valid appearance in place while its error can be shown in the UI.
     pub fn watch_with_theme(
@@ -2243,38 +2300,15 @@ impl ConfigStore {
         let (sender, receiver) = mpsc::channel();
         let store = self.clone();
         thread::spawn(move || {
-            let mut last_signature: Option<(
-                Result<String, InputError>,
-                Option<Result<String, InputError>>,
-            )> = None;
+            let mut last_signature: Option<WatchSignature> = None;
             loop {
                 thread::sleep(interval);
-                let config_raw = read_bounded(store.path(), MAX_CONFIG_BYTES);
-                let config = config_raw
-                    .as_ref()
-                    .ok()
-                    .map(String::as_str)
-                    .map(toml::from_str::<Config>)
-                    .transpose();
-                let theme_raw = config
-                    .as_ref()
-                    .ok()
-                    .and_then(|config| config.as_ref())
-                    .and_then(|config| config.validate().ok().map(|_| config))
-                    .and_then(|config| config.appearance.theme_pack.as_ref())
-                    .and_then(|name| {
-                        let path = store.theme_path(name).ok()?;
-                        Some(read_bounded(&path, MAX_THEME_BYTES))
-                    });
-                let signature = (config_raw, theme_raw);
+                let (signature, result) =
+                    store.sample_with_theme(read_bounded(store.path(), MAX_CONFIG_BYTES));
                 if last_signature.as_ref() == Some(&signature) {
                     continue;
                 }
                 last_signature = Some(signature);
-                let result = store.load().and_then(|config| {
-                    let theme = store.load_theme(&config)?;
-                    Ok(LoadedConfig { config, theme })
-                });
                 if sender.send(result).is_err() {
                     break;
                 }
@@ -2282,6 +2316,58 @@ impl ConfigStore {
         });
         receiver
     }
+
+    /// Owned desktop path. The same sample defines both change detection and
+    /// publication; callers retain its stop handle and actual join receipt.
+    /// Pending notifications coalesce; desktop callers reread current settings
+    /// on the UI thread before applying privacy policy.
+    pub fn watch_with_theme_owned(
+        &self,
+        interval: Duration,
+    ) -> std::io::Result<OwnedWatch<Result<LoadedConfig, ConfigError>>> {
+        let store = self.clone();
+        let mut last_signature: Option<WatchSignature> = None;
+        watch::spawn(interval, move || {
+            let (signature, result) =
+                store.sample_with_theme(read_bounded(store.path(), MAX_CONFIG_BYTES));
+            if last_signature.as_ref() == Some(&signature) {
+                return None;
+            }
+            last_signature = Some(signature);
+            Some(result)
+        })
+    }
+}
+
+type WatchSignature = (
+    Result<String, InputError>,
+    Option<Result<String, InputError>>,
+);
+
+fn decode_config_sample(raw: &Result<String, InputError>) -> Result<Config, ConfigError> {
+    match raw {
+        Ok(raw) => commit::parse_config(raw),
+        Err(error) => Err((*error).into()),
+    }
+}
+
+fn decode_theme_sample(
+    name: &str,
+    raw: &Result<String, InputError>,
+) -> Result<ThemePack, ConfigError> {
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(InputError::Missing) => {
+            if let Some(preset) = BuiltInStylePreset::from_theme_name(name) {
+                return preset.theme();
+            }
+            return Err(InputError::Missing.into());
+        }
+        Err(error) => return Err((*error).into()),
+    };
+    let theme: ThemePack = parse_toml(raw, diagnostics::FileKind::Theme)?;
+    theme.validate()?;
+    Ok(theme)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4059,6 +4145,70 @@ mod tests {
     }
 
     #[test]
+    fn watcher_publication_uses_its_bounded_config_and_theme_samples() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        config.conversation.header = ConversationHeaderMode::Compact;
+        config.appearance.theme_pack = Some("custom".into());
+        store.save(&config).unwrap();
+        fs::create_dir_all(store.themes_dir().unwrap()).unwrap();
+        let theme_path = store.theme_path("custom").unwrap();
+        let theme = BuiltInStylePreset::Nocturne.theme().unwrap();
+        let valid_theme = toml::to_string(&theme).unwrap();
+        fs::write(&theme_path, &valid_theme).unwrap();
+        let config_sample = read_bounded(store.path(), MAX_CONFIG_BYTES);
+        let theme_sample = read_bounded(&theme_path, MAX_THEME_BYTES);
+
+        // Replace the actual config after bounded sampling. The real poll
+        // path must publish its captured valid revision, not reopen this edit.
+        let invalid_config = "[conversation]\nheader = 'hidden'\n";
+        let invalid_theme = "untrusted-theme-value = [\n";
+        fs::write(store.path(), invalid_config).unwrap();
+        let (signature, loaded) = store.sample_with_theme(config_sample.clone());
+        assert_eq!(signature.0, config_sample);
+        assert_eq!(signature.1.as_ref(), Some(&theme_sample));
+        assert_eq!(
+            loaded.unwrap(),
+            LoadedConfig {
+                config: config.clone(),
+                theme: Some(theme.clone()),
+            }
+        );
+
+        // The same rule applies to the theme decoder's captured bytes.
+        fs::write(&theme_path, invalid_theme).unwrap();
+        assert_eq!(decode_config_sample(&config_sample).unwrap(), config);
+        assert_eq!(decode_theme_sample("custom", &theme_sample).unwrap(), theme);
+
+        // The real poll path keeps the captured config revision and the
+        // selected theme's exact error sample together; it never reloads the
+        // now-invalid config path or returns the previously valid theme.
+        let (signature, loaded) = store.sample_with_theme(config_sample.clone());
+        assert_eq!(signature.0, config_sample);
+        assert_eq!(signature.1.as_ref().unwrap().as_deref(), Ok(invalid_theme));
+        assert!(matches!(loaded, Err(ConfigError::Decode(_))));
+        let (signature, invalid) =
+            store.sample_with_theme(read_bounded(store.path(), MAX_CONFIG_BYTES));
+        assert_eq!(signature.0.as_deref(), Ok(invalid_config));
+        assert!(signature.1.is_none());
+        assert!(matches!(invalid, Err(ConfigError::Decode(_))));
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), invalid_config);
+
+        fs::write(&theme_path, valid_theme).unwrap();
+        config.conversation.header = ConversationHeaderMode::Minimal;
+        store.save(&config).unwrap();
+        let (_, restored) = store.sample_with_theme(read_bounded(store.path(), MAX_CONFIG_BYTES));
+        assert_eq!(
+            restored.unwrap(),
+            LoadedConfig {
+                config,
+                theme: Some(theme)
+            }
+        );
+    }
+
+    #[test]
     fn room_header_watcher_reports_invalid_edit_and_recovers() {
         let directory = tempfile::tempdir().unwrap();
         let store = ConfigStore::at(directory.path().join("config.toml"));
@@ -4076,11 +4226,19 @@ mod tests {
                 .header,
             ConversationHeaderMode::Compact
         );
-        fs::write(store.path(), "[conversation]\nheader = 'hidden'\n").unwrap();
+        // Publish the external edit atomically. Truncate-and-write also
+        // exposes an empty (valid-default) file, which is a different edit.
+        let invalid = "[conversation]\nheader = 'hidden'\n";
+        let editing = directory.path().join("edited.toml");
+        fs::write(&editing, invalid).unwrap();
+        fs::rename(&editing, store.path()).unwrap();
         assert!(matches!(
             updates.recv_timeout(Duration::from_secs(2)).unwrap(),
             Err(ConfigError::Decode(_))
         ));
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), invalid);
+        assert!(matches!(store.load(), Err(ConfigError::Decode(_))));
+        // A later valid commit must still produce the recovery publication.
         config.conversation.header = ConversationHeaderMode::Minimal;
         store.save(&config).unwrap();
         assert_eq!(

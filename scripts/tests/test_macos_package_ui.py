@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 from scripts import ci_scope, package_smoke as smoke
 from scripts import macos_package_ui as ui
+from scripts import macos_update_acceptance as update_qa
 
 HOSTED = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted", "RUNNER_OS": "macOS",
           "ImageOS": "macos15"}
@@ -20,6 +21,312 @@ SWIFT = Path(__file__).resolve().parents[1] / "macos_package_ui.swift"
 SOURCE = Path(__file__).resolve().parents[1] / "macos_package_ui.py"
 NONCE = "0123456789abcdef0123456789abcdef"
 PID = 4242
+
+
+class InstalledUpdateTransactionBoundaryTests(unittest.TestCase):
+    def environment(self):
+        return HOSTED | {"GITHUB_REPOSITORY": "brk275/Morpheus", "GITHUB_EVENT_NAME": "workflow_dispatch",
+                         "GITHUB_ACTOR": "brk275", "GITHUB_TRIGGERING_ACTOR": "brk275", "GITHUB_ACTOR_ID": "42"}
+
+    def event(self):
+        return {"repository": {"private": False, "full_name": "brk275/Morpheus",
+                               "owner": {"login": "brk275", "id": 42}}, "sender": {"login": "brk275", "id": 42}}
+
+    def test_synthetic_execution_requires_explicit_public_owned_standard_mac_runner(self):
+        with patch.object(update_qa.sys, "platform", "darwin"), patch.object(update_qa.platform, "machine", return_value="arm64"), \
+                patch.object(update_qa.os, "getuid", return_value=501, create=True), patch.object(update_qa.os, "geteuid", return_value=501, create=True):
+            update_qa.hosted_guard(True, self.environment(), self.event())
+            private = self.event()
+            private["repository"]["private"] = True
+            wrong_sender = self.event()
+            wrong_sender["sender"]["id"] = 43
+            for explicit, environment, event in [
+                (False, self.environment(), self.event()),
+                (True, self.environment() | {"RUNNER_ENVIRONMENT": "self-hosted"}, self.event()),
+                (True, self.environment(), private), (True, self.environment(), wrong_sender),
+                (True, self.environment() | {"CARGO_PACKAGER_SIGN_PRIVATE_KEY": "forbidden"}, self.event()),
+                (True, self.environment() | {"MORPHEUS_MAC_UPDATE_ACCEPTANCE_BUILD": NONCE}, self.event()),
+            ]:
+                with self.assertRaises(update_qa.Refused):
+                    update_qa.hosted_guard(explicit, environment, event)
+
+    def test_actor_environment_does_not_forward_keys_loader_config_or_activation(self):
+        environment = self.environment() | {"PATH": "/fixed/toolchain", "DYLD_IMAGE_SUFFIX": "foreign",
+                                            "MORPHEUS_UPDATE_PUBLIC_KEY": "foreign", "GITHUB_TOKEN": "foreign",
+                                            "MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN": "/foreign"}
+        selected = update_qa.execution_environment(environment)
+        self.assertEqual(selected["PATH"], "/fixed/toolchain")
+        self.assertEqual(selected["GITHUB_ACTOR_ID"], "42")
+        self.assertFalse({"DYLD_IMAGE_SUFFIX", "MORPHEUS_UPDATE_PUBLIC_KEY", "GITHUB_TOKEN",
+                          "MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN"}.intersection(selected))
+
+    def test_actor_deadline_preserves_owned_monitor_without_killing_orphan_pids(self):
+        commands = object.__new__(update_qa.Commands)
+        process, log = Mock(returncode=None), Mock()
+        log.lstat.return_value.st_size = 0
+        with patch.object(update_qa.smoke, "process_status", return_value=None), \
+                patch.object(update_qa.time, "monotonic", side_effect=[0, 500]), \
+                patch.object(update_qa.owned, "stop_group") as stop:
+            with self.assertRaises(update_qa.Refused):
+                commands.finish(process, log, seconds=1)
+            stop.assert_not_called()
+
+    def test_nonactor_log_bound_failure_stops_and_drains_its_retained_group(self):
+        commands = object.__new__(update_qa.Commands)
+        process, log = Mock(returncode=None), Mock()
+        commands.pending, commands.cleanup_failed = [process], False
+        log.lstat.return_value.st_size = update_qa.MAX_LOG + 1
+        with patch.object(update_qa.smoke, "process_status", return_value=None), \
+                patch.object(update_qa.time, "monotonic", return_value=0), \
+                patch.object(update_qa.owned, "stop_group") as stop:
+            with self.assertRaises(update_qa.Refused):
+                commands.finish(process, log, seconds=1, allow_stop=True)
+            stop.assert_called_once_with(process)
+        self.assertEqual(commands.pending, [])
+        self.assertFalse(commands.cleanup_failed)
+
+    def test_nonactor_poll_failure_retains_original_error_and_marks_failed_group_cleanup(self):
+        commands = object.__new__(update_qa.Commands)
+        process, log = Mock(returncode=None), Mock()
+        commands.pending, commands.cleanup_failed = [process], False
+        original, cleanup = OSError("fixture polling error"), OSError("fixture cleanup error")
+        with patch.object(update_qa.smoke, "process_status", side_effect=original), \
+                patch.object(update_qa.owned, "stop_group", side_effect=cleanup) as stop:
+            with self.assertRaises(OSError) as caught:
+                commands.finish(process, log, seconds=1, allow_stop=True)
+            self.assertIs(caught.exception, original)
+            stop.assert_called_once_with(process)
+        self.assertEqual(commands.pending, [process])
+        self.assertTrue(commands.cleanup_failed)
+
+    def test_successful_nonactor_still_fails_when_owned_group_drain_cannot_be_proved(self):
+        commands = object.__new__(update_qa.Commands)
+        process, log = Mock(returncode=None), Mock()
+        commands.pending, commands.cleanup_failed = [process], False
+        log.lstat.return_value.st_size = 0
+        failure = OSError("fixture cleanup error")
+        with patch.object(update_qa.smoke, "process_status", return_value=0), \
+                patch.object(update_qa.owned, "stop_group", side_effect=failure):
+            with self.assertRaises(OSError) as caught:
+                commands.finish(process, log, seconds=1, allow_stop=True)
+            self.assertIs(caught.exception, failure)
+        self.assertEqual(commands.pending, [process])
+        self.assertTrue(commands.cleanup_failed)
+
+    def test_live_actor_log_bound_failure_preserves_its_monitor_and_helper_ownership(self):
+        commands = object.__new__(update_qa.Commands)
+        process, log = Mock(returncode=None), Mock()
+        commands.pending, commands.cleanup_failed = [process], False
+        log.lstat.return_value.st_size = update_qa.MAX_LOG + 1
+        with patch.object(update_qa.smoke, "process_status", return_value=None), \
+                patch.object(update_qa.owned, "stop_group") as stop:
+            with self.assertRaises(update_qa.Refused):
+                commands.finish(process, log, seconds=1)
+            stop.assert_not_called()
+        self.assertEqual(commands.pending, [process])
+
+    def test_final_scan_is_attempted_with_pending_or_failed_cleanup_and_cannot_pass(self):
+        for pending, cleanup_failed in [([Mock()], False), ([], True)]:
+            commands = Mock(pending=pending, helper_observers=[], cleanup_failed=cleanup_failed)
+            result = {"checks": {}}
+            with patch.object(update_qa, "scan_logs") as scan:
+                self.assertFalse(update_qa.scan_final_logs(commands, Path("/fixed/scanner"), result))
+                scan.assert_called_once_with(commands, Path("/fixed/scanner"))
+            self.assertTrue(result["checks"]["bounded_log_scan_attempted"])
+            self.assertFalse(result["checks"]["default_log_scan"])
+
+    def test_pending_helper_observation_blocks_final_scan_acceptance_without_skipping_scan(self):
+        commands = types.SimpleNamespace(pending=[], helper_observers=[object()], cleanup_failed=False)
+        result = {"checks": {}}
+        with patch.object(update_qa, "scan_logs") as scan:
+            self.assertFalse(update_qa.scan_final_logs(commands, Path("/fixed/scanner"), result))
+            scan.assert_called_once()
+        self.assertTrue(result["checks"]["bounded_log_scan_attempted"])
+        self.assertFalse(result["checks"]["default_log_scan"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX owned-child observation")
+    def test_terminal_synthetic_actor_is_reaped_without_group_or_orphan_pid_signal(self):
+        commands = object.__new__(update_qa.Commands)
+        process, log = Mock(pid=PID, returncode=None), Mock()
+        process.wait.return_value = 0
+        log.lstat.return_value.st_size = 0
+        commands.pending, commands.helper_observers, commands.cleanup_failed = [process], [], False
+        with patch.object(update_qa.smoke, "process_status", return_value=0), \
+                patch.object(update_qa.owned, "stop_group") as group, patch.object(update_qa.os, "kill") as kill:
+            commands.finish_actor(process, log)
+        process.wait.assert_called_once_with(timeout=5)
+        group.assert_not_called()
+        kill.assert_not_called()
+        self.assertEqual(commands.pending, [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX private ticket ownership")
+    def test_helper_ticket_is_private_closed_nonce_and_exact_prepared_transaction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / update_qa.STATE).mkdir(mode=0o700)
+            old = {"bundle_sha256": "a" * 64}
+            new = {"bundle_sha256": "b" * 64, "version": "0.1.1", "arch": "aarch64", "persistence": "c" * 64}
+            ticket = {"schema": 1, "nonce": NONCE, "transaction": "FixtureTransaction1", "parent": PID, "helper": PID + 1}
+            journal = {"protocol": 1, "id": ticket["transaction"], "phase": "Prepared", "old_hash": old["bundle_sha256"],
+                       "new_hash": new["bundle_sha256"], "candidate": {"protocol": 2, "product": "io.github.brk275.morpheus",
+                       "version": new["version"], "arch": new["arch"], "persistence": new["persistence"]}}
+            path, journal_path = root / "helper-observer.json", root / update_qa.STATE / "journal.json"
+            path.write_text(json.dumps(ticket)); path.chmod(0o600)
+            journal_path.write_text(json.dumps(journal)); journal_path.chmod(0o600)
+            self.assertEqual(update_qa.helper_ticket(root, NONCE, PID, old, new), ticket)
+            for change in [{"nonce": "f" * 32}, {"schema": True}, {"parent": PID + 2}, {"helper": True}, {"foreign": 1}]:
+                path.write_text(json.dumps(ticket | change))
+                with self.assertRaises(update_qa.Refused):
+                    update_qa.helper_ticket(root, NONCE, PID, old, new)
+            path.write_text(json.dumps(ticket).replace("{", '{"schema":1,', 1))
+            with self.assertRaises(update_qa.Refused):
+                update_qa.helper_ticket(root, NONCE, PID, old, new)
+            path.write_text(json.dumps(ticket)); path.chmod(0o644)
+            with self.assertRaises(update_qa.Refused):
+                update_qa.helper_ticket(root, NONCE, PID, old, new)
+            path.chmod(0o600)
+            journal_path.write_text(json.dumps(journal | {"phase": "AwaitingHealth"}))
+            with self.assertRaises(update_qa.Refused):
+                update_qa.helper_ticket(root, NONCE, PID, old, new)
+
+    def fake_kernel(self):
+        return types.SimpleNamespace(KQ_FILTER_PROC=-5, KQ_EV_ERROR=0x4000, KQ_EV_EOF=0x8000,
+                                     KQ_EV_ONESHOT=0x10, KQ_NOTE_EXIT=0x80000000)
+
+    def helper_observer(self):
+        observer = object.__new__(update_qa.HelperExit)
+        observer.pid, observer.cookie, observer.terminal = PID + 1, 17, False
+        observer.queue = Mock()
+        observer.commands = types.SimpleNamespace(helper_observers=[observer], cleanup_failed=False)
+        return observer
+
+    def kernel_event(self, **changes):
+        event = {"ident": PID + 1, "filter": -5, "udata": 17, "fflags": 0x84000000,
+                 "flags": 0x8010, "data": update_qa.FORCED_AFTER_APPLY_EXIT << 8}
+        return types.SimpleNamespace(**(event | changes))
+
+    def test_failed_helper_registration_preserves_parent_anchor_and_never_signals_helper(self):
+        for failure in [[], [self.kernel_event(flags=0x4040, data=3)]]:
+            queue = Mock()
+            queue.fileno.return_value = 42
+            queue.control.return_value = failure
+            kernel = self.fake_kernel()
+            kernel.kqueue, kernel.kevent = Mock(return_value=queue), Mock()
+            kernel.KQ_EV_ADD, kernel.KQ_EV_ENABLE = 1, 4
+            parent = Mock(pid=PID)
+            commands = types.SimpleNamespace(pending=[parent], helper_observers=[], cleanup_failed=False)
+            with patch.object(update_qa, "select", kernel), patch.object(update_qa.sys, "platform", "darwin"), \
+                    patch.object(update_qa.smoke, "process_status", return_value=None), \
+                    patch.object(update_qa, "helper_ticket", return_value={"helper": PID + 1}), \
+                    patch.object(update_qa.os, "set_inheritable"), patch.object(update_qa.os, "get_inheritable", return_value=False), \
+                    patch.object(update_qa.os, "kill") as kill:
+                with self.assertRaises(update_qa.Refused):
+                    update_qa.HelperExit(commands, parent, Path("/fixed"), NONCE, {}, {})
+            self.assertEqual(commands.pending, [parent])
+            self.assertEqual(commands.helper_observers, [])
+            queue.close.assert_called_once()
+            parent.wait.assert_not_called()
+            kill.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX native wait status encoding")
+    def test_helper_exit_rejects_receipt_foreign_event_and_wrong_forced_status(self):
+        with patch.object(update_qa, "select", self.fake_kernel()), patch.object(update_qa.os, "kill") as kill:
+            observer = self.helper_observer()
+            self.assertTrue(observer.matches(self.kernel_event()))
+            receipt = self.kernel_event(flags=0x4040, data=0)
+            self.assertTrue(observer.matches(receipt, receipt=True))
+            self.assertFalse(observer.matches(receipt))
+            for change in [{"ident": PID + 2}, {"filter": -1}, {"udata": 18}, {"flags": 0xc010},
+                           {"flags": 0x10}, {"fflags": 0x80000000}, {"data": -1}, {"data": 0x10000}]:
+                self.assertFalse(observer.matches(self.kernel_event(**change)))
+            observer.queue.control.return_value = [self.kernel_event(data=0)]
+            with patch.object(update_qa.time, "monotonic", return_value=0):
+                with self.assertRaises(update_qa.Refused):
+                    observer.finish(expected=update_qa.FORCED_AFTER_APPLY_EXIT)
+            self.assertTrue(observer.terminal)
+            self.assertEqual(observer.commands.helper_observers, [])
+            observer.queue.close.assert_called_once()
+            kill.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX native wait status encoding")
+    def test_helper_timeout_keeps_registration_pending_and_forced_exit_requires_exact_status(self):
+        with patch.object(update_qa, "select", self.fake_kernel()), patch.object(update_qa.os, "kill") as kill:
+            pending = self.helper_observer()
+            with patch.object(update_qa.time, "monotonic", side_effect=[0, 2]):
+                with self.assertRaises(update_qa.Refused):
+                    pending.finish(expected=0, seconds=1)
+            self.assertEqual(pending.commands.helper_observers, [pending])
+            self.assertTrue(pending.commands.cleanup_failed)
+            pending.queue.close.assert_not_called()
+            observed = self.helper_observer()
+            observed.queue.control.return_value = [self.kernel_event()]
+            with patch.object(update_qa.time, "monotonic", return_value=0):
+                observed.finish(expected=update_qa.FORCED_AFTER_APPLY_EXIT)
+            self.assertEqual(observed.commands.helper_observers, [])
+            self.assertTrue(observed.terminal)
+            kill.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX private log file contract")
+    def test_oversized_or_failed_scan_does_not_skip_remaining_bounded_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            logs = root / "logs"
+            logs.mkdir(mode=0o700)
+            first, second = logs / "001.log", logs / "002.log"
+            first.write_bytes(b"oversize fixture")
+            second.write_bytes(b"bounded fixture")
+            commands = Mock(root=root, logs=logs)
+            with patch.object(update_qa, "digest", return_value=update_qa.SCANNER_SHA256["arm64"]), \
+                    patch.object(update_qa.platform, "machine", return_value="arm64"), \
+                    patch.object(update_qa, "bounded", side_effect=[update_qa.Refused("fixture bound"), b"bounded fixture"]) as read, \
+                    patch.object(update_qa.subprocess, "run", return_value=Mock(returncode=0)) as scan:
+                with self.assertRaises(update_qa.Refused):
+                    update_qa.scan_logs(commands, Path("/fixed/scanner"))
+                self.assertEqual(read.call_args_list, [unittest.mock.call(first, update_qa.MAX_LOG),
+                                                     unittest.mock.call(second, update_qa.MAX_LOG)])
+                scan.assert_called_once()
+                self.assertEqual(scan.call_args.kwargs["input"], b"bounded fixture")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX no-follow destination boundary")
+    def test_tamper_changes_only_fixed_owned_regular_stage_and_never_link_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "events").mkdir(mode=0o700)
+            resource = root / update_qa.STATE / "next.app/Contents/Resources/aurora.toml"
+            resource.parent.mkdir(parents=True)
+            target = root / "sentinel"
+            target.write_bytes(b"preserved")
+            resource.symlink_to(target)
+            with self.assertRaises(update_qa.Refused):
+                update_qa.tamper_staged_resource(root)
+            self.assertEqual(target.read_bytes(), b"preserved")
+            self.assertEqual(list((root / "events").iterdir()), [])
+            resource.unlink()
+            resource.write_bytes(b"original")
+            resource.chmod(0o600)
+            update_qa.tamper_staged_resource(root)
+            self.assertTrue(resource.read_bytes().startswith(b"original\n"))
+            self.assertEqual((root / "events/continue_tampered_stage").read_bytes(), update_qa.MARKER_BYTES)
+
+    @unittest.skipUnless(os.sys.platform == "darwin", "Darwin no-follow link mode API")
+    def test_case_copy_preserves_complete_modes_and_internal_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, destination = root / "Morpheus.app", root / "copy/Morpheus.app"
+            resource = source / "Contents/Resources/value"
+            for directory in (source, source / "Contents", source / "Contents/Resources"):
+                directory.mkdir(mode=0o700)
+            resource.write_bytes(b"owned synthetic resource")
+            resource.chmod(0o640)
+            link = resource.with_name("alias")
+            link.symlink_to("value")
+            os.chmod(link, 0o700, follow_symlinks=False)
+            destination.parent.mkdir(mode=0o700)
+            expected = update_qa.payload._snapshot(source)["tree_sha256"]
+            update_qa.copy_bundle(source, destination, expected)
+            self.assertEqual(update_qa.payload._snapshot(destination)["tree_sha256"], expected)
+            self.assertEqual((destination / "Contents/Resources/value").stat().st_mode & 0o777, 0o640)
+            self.assertEqual((destination / "Contents/Resources/alias").lstat().st_mode & 0o777, 0o700)
 
 
 def diagnostic(**overrides):

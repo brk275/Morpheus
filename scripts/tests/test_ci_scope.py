@@ -1,13 +1,18 @@
+import ast
+import json
+import tempfile
 import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from scripts import ci_scope
 from scripts.ci_scope import (MACOS, PLATFORMS, WAYLAND_UNRELATED_NATIVE_INPUTS,
                               WAYLAND_UNRELATED_THEME_INPUTS,
                               WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS, changed_paths, classify,
-                              helpers_host_provisioning_only, scanner_step_only)
+                              helpers_host_provisioning_only, scanner_step_only,
+                              event_selection, MANUAL_PLATFORMS, MANUAL_CHECKS, MATRIX_SUITES)
 
 
 class ScopeTests(unittest.TestCase):
@@ -276,6 +281,86 @@ class ScopeTests(unittest.TestCase):
     def test_manual_full_verification(self):
         self.assertEqual(classify([], force_all=True)["native_matrix"]["os"], list(PLATFORMS))
         self.assertEqual(changed_paths({}, "workflow_dispatch"), ([], True))
+
+    def test_manual_defaults_keep_all_four_platforms_and_every_existing_check(self):
+        selected = event_selection({}, "workflow_dispatch")
+        self.assertEqual(selected, {
+            "native": True, "native_matrix": {"os": list(PLATFORMS)}, "config": False,
+            "wayland": True, "manual": True, "manual_platform": "all",
+            "check_route": "all", "matrix_suite": "full",
+        })
+        for platform, platforms in MANUAL_PLATFORMS.items():
+            with self.subTest(platform=platform):
+                result = event_selection({"inputs": {"platform": platform}}, "workflow_dispatch")
+                self.assertEqual(result["native_matrix"], {"os": list(platforms)})
+                self.assertEqual(result["wayland"], "ubuntu-24.04" in platforms)
+                self.assertEqual((result["check_route"], result["matrix_suite"]), ("all", "full"))
+
+    def test_manual_routes_are_exact_existing_checks_and_matrix_suites(self):
+        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "devices", "vendor", "sdk",
+                                        "matrix", "wayland", "config", "helpers"})
+        self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
+                                         "timeline-failures", "media-only", "app-timeline",
+                                         "outgoing-ring", "native-call", "oauth-only", "rtc-recovery"})
+        source = ast.parse((Path(__file__).resolve().parents[1]/"run_matrix_acceptance.py").read_text())
+        suites = [node.value for node in source.body if isinstance(node,ast.Assign)
+                  and any(isinstance(target,ast.Name) and target.id=="SUITES" for target in node.targets)]
+        self.assertEqual(len(suites),1)
+        self.assertIsInstance(suites[0],ast.Dict)
+        self.assertEqual({ast.literal_eval(key) for key in suites[0].keys},MATRIX_SUITES)
+        for route in MANUAL_CHECKS:
+            platform = "linux" if route in {"matrix", "wayland"} else "all"
+            selected = event_selection({"inputs": {"platform": platform, "checks": route}}, "workflow_dispatch")
+            self.assertEqual(selected["config"], route == "config")
+            self.assertEqual(selected["native"], route not in {"config", "helpers"})
+            self.assertEqual(selected["wayland"], route in {"all", "wayland"})
+        for suite in MATRIX_SUITES:
+            selected = event_selection({"inputs": {"platform": "linux", "checks": "matrix", "matrix_suite": suite}},
+                                       "workflow_dispatch")
+            self.assertEqual(selected["matrix_suite"], suite)
+            self.assertEqual(selected["native_matrix"], {"os": ["ubuntu-24.04"]})
+            self.assertFalse(selected["wayland"])
+
+    def test_invalid_or_incompatible_manual_inputs_cannot_select_arbitrary_runner_or_command(self):
+        values = ({"platform": "self-hosted"}, {"platform": "ubuntu-24.04"}, {"checks": "skip"},
+                  {"matrix_suite": "full; echo unsafe"}, {"ref": "main"}, {"platform": []},
+                  {"checks": None}, {"platform": "windows", "checks": "matrix"},
+                  {"checks": "wayland"}, {"checks": "all", "matrix_suite": "drafts-only"},
+                  {"platform": "windows", "checks": "config"}, {"platform": "linux", "checks": "helpers"},
+                  {"platform": "all", "checks": "matrix", "matrix_suite": "oauth-only"},
+                  {"platform": "linux", "checks": "all", "matrix_suite": "oauth-only"})
+        for value in values:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                event_selection({"inputs": value}, "workflow_dispatch")
+        for value in (None, [], "all"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                event_selection({"inputs": value}, "workflow_dispatch")
+
+    @patch("scripts.ci_scope.changed_paths")
+    def test_automatic_events_ignore_manual_inputs_and_preserve_impact_scope(self, changed):
+        for paths in (["README.md"], ["themes/aurora.toml"], ["scripts/run_matrix_acceptance.py"],
+                      ["Cargo.lock"], ["crates/morpheus-app/src/main.rs"], ["unknown-build-input"]):
+            changed.return_value = (paths, False)
+            for event in ("push", "pull_request"):
+                with self.subTest(paths=paths, event=event):
+                    selected = event_selection({"inputs": {"platform": "windows", "checks": "helpers"}}, event)
+                    self.assertEqual(selected, classify(paths) | {"manual": False, "manual_platform": "all",
+                                                               "check_route": "all", "matrix_suite": "full"})
+
+    def test_github_outputs_keep_closed_route_strings_unquoted_and_matrix_as_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            event, output = Path(directory)/"event.json", Path(directory)/"output"
+            event.write_text(json.dumps({"inputs":{"platform":"windows","checks":"vendor"}}))
+            with patch("sys.argv",["ci_scope.py","--github-event"]), patch.dict(ci_scope.os.environ,{
+                    "GITHUB_EVENT_PATH":str(event),"GITHUB_EVENT_NAME":"workflow_dispatch","GITHUB_OUTPUT":str(output)}), \
+                    patch("builtins.print"):
+                ci_scope.main()
+            values=dict(line.split("=",1) for line in output.read_text().splitlines())
+            self.assertEqual(values["check_route"],"vendor")
+            self.assertEqual(values["manual_platform"],"windows")
+            self.assertEqual(values["matrix_suite"],"full")
+            self.assertEqual(values["manual"],"true")
+            self.assertEqual(json.loads(values["native_matrix"]),{"os":["windows-2025"]})
 
     def test_initial_push_selects_all(self):
         self.assertEqual(changed_paths({"before": "0" * 40, "after": "a" * 40}, "push"), ([], True))

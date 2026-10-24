@@ -4,7 +4,8 @@
 //! never read from user-editable TOML. No feed or private signing keys ship in
 //! development builds. Linux has an AppImage transaction and startup recovery;
 //! public activation still requires signed installed-package acceptance.
-//! macOS/Windows installation remains disabled pending platform transactions.
+//! macOS and Windows have gated native transactions. Activation requires
+//! their signed installed-package and recovery acceptance.
 //!
 //! UI integration must share one UpdateActivity with the call controller and
 //! retain its CallLease from the start of joining through final call cleanup.
@@ -33,6 +34,60 @@ const MAX_UPDATE_BYTES: u64 = 512 * 1024 * 1024;
 mod linux_transaction;
 #[cfg(target_os = "linux")]
 pub use linux_transaction::{AppImageSession, PreparedRestart};
+
+#[cfg(target_os = "macos")]
+mod macos_transaction;
+#[cfg(target_os = "macos")]
+pub use macos_transaction::{MacAppSession, PreparedMacRestart};
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_installation_validated() -> bool {
+    macos_transaction::INSTALLATION_VALIDATED
+}
+
+// Shipping binaries reject reserved synthetic requests before any profile or
+// network/UI initialization. No runtime variable enables the instrumented code.
+pub(crate) fn reject_macos_update_acceptance_request() -> Result<(), UpdateError> {
+    reject_macos_update_acceptance_inputs(
+        std::env::var_os("MORPHEUS_MAC_UPDATE_ACCEPTANCE_PLAN").is_some(),
+        std::env::args_os().skip(1),
+    )
+}
+
+fn reject_macos_update_acceptance_inputs(
+    plan_present: bool,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Result<(), UpdateError> {
+    let request = plan_present
+        || args.into_iter().any(|arg| {
+            arg.to_str()
+                .is_some_and(|arg| arg.starts_with("--morpheus-mac-qa-"))
+        });
+    if request {
+        Err(UpdateError::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", morpheus_macos_update_acceptance))]
+pub(crate) fn run_macos_update_acceptance() -> Result<(), UpdateError> {
+    macos_transaction::acceptance::dispatch()
+}
+#[cfg(target_os = "windows")]
+mod windows_transaction;
+#[cfg(target_os = "windows")]
+pub use windows_transaction::{PreparedWindowsRestart, WindowsSession};
+#[cfg(target_os = "windows")]
+pub fn windows_installation_validated() -> bool {
+    windows_transaction::INSTALLATION_VALIDATED
+}
+
+#[cfg(all(target_os = "windows", morpheus_windows_update_acceptance))]
+pub(crate) fn run_windows_update_acceptance() -> Result<(), Box<dyn std::error::Error>> {
+    windows_transaction::acceptance::dispatch()?;
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpdateError {
@@ -97,7 +152,7 @@ impl PackageKind {
         matches!(
             (self, format),
             (Self::MacApp, UpdateFormat::App)
-                | (Self::WindowsNsis, UpdateFormat::Nsis)
+                | (Self::WindowsNsis, UpdateFormat::WindowsPayloadV2)
                 | (Self::LinuxAppImage, UpdateFormat::AppImage)
         )
     }
@@ -141,10 +196,10 @@ impl InstallLocation {
         }
         #[cfg(target_os = "windows")]
         {
-            // A loose EXE is indistinguishable from an NSIS installation.
-            // Packaging must explicitly mark the installer build before the
-            // runtime can offer self-update. WiX is outside Morpheus v1.
-            if option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis") {
+            // Legacy NSIS/loose executables have no complete owned ledger and
+            // stay manual-only. The marked package uses a signed data payload,
+            // never the non-transactional executable NSIS update backend.
+            if option_env!("MORPHEUS_PACKAGE_FORMAT") != Some("nsis-payload-v2") {
                 return Err(UpdateError::UnsupportedPackage);
             }
             Self::writable(
@@ -348,6 +403,22 @@ impl StagedUpdate {
         })
     }
 
+    /// Prepare a signed native Mac bundle using only the exact reverified
+    /// archive. The platform admission gate remains closed until acceptance.
+    #[cfg(target_os = "macos")]
+    pub fn prepare_macos_restart<'a>(
+        &mut self,
+        activity: &UpdateActivity,
+        session: &'a mut MacAppSession,
+    ) -> Result<PreparedMacRestart<'a>, UpdateError> {
+        let lease = activity.try_install()?;
+        if !matches!(self.update.format, UpdateFormat::App) {
+            return Err(UpdateError::UnsupportedFormat);
+        }
+        let bytes = self.verified_bytes()?;
+        macos_transaction::prepare_restart(session, &bytes, &self.update.version, lease)
+    }
+
     /// Prepare a signed, compatible Linux update while the current process
     /// retains its lifetime lock. The caller must explicitly hand off and quit.
     #[cfg(target_os = "linux")]
@@ -363,19 +434,41 @@ impl StagedUpdate {
         let bytes = self.verified_bytes()?;
         linux_transaction::prepare_restart(session, &bytes, &self.update.version, lease)
     }
+
+    #[cfg(target_os = "windows")]
+    pub fn prepare_windows_restart<'a>(
+        &mut self,
+        activity: &UpdateActivity,
+        session: &'a mut WindowsSession,
+    ) -> Result<PreparedWindowsRestart<'a>, UpdateError> {
+        let lease = activity.try_install()?;
+        if !matches!(self.update.format, UpdateFormat::WindowsPayloadV2) {
+            return Err(UpdateError::UnsupportedFormat);
+        }
+        let bytes = self.verified_bytes()?;
+        windows_transaction::prepare_restart(session, &bytes, &self.update.version, lease)
+    }
 }
 
 /// Must be called before constructing UI, runtimes, or account stores.
 pub fn early_dispatch() -> Result<bool, UpdateError> {
     #[cfg(target_os = "linux")]
     return linux_transaction::early_dispatch();
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    return macos_transaction::early_dispatch();
+    #[cfg(target_os = "windows")]
+    return windows_transaction::early_dispatch();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     Ok(false)
 }
 
 pub struct StartupSession {
     #[cfg(target_os = "linux")]
     pub appimage: Option<AppImageSession>,
+    #[cfg(target_os = "macos")]
+    pub macapp: Option<MacAppSession>,
+    #[cfg(target_os = "windows")]
+    pub windows: Option<WindowsSession>,
     pub restarted: bool,
 }
 
@@ -389,7 +482,17 @@ impl StartupSession {
                 restarted,
             })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let (macapp, restarted) = macos_transaction::begin_startup()?;
+            Ok(Self { macapp, restarted })
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let (windows, restarted) = windows_transaction::begin_startup()?;
+            Ok(Self { windows, restarted })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         Ok(Self { restarted: false })
     }
 
@@ -398,8 +501,43 @@ impl StartupSession {
         if let Some(session) = self.appimage.as_mut() {
             session.acknowledge_before_store()?;
         }
+        #[cfg(target_os = "macos")]
+        if let Some(session) = self.macapp.as_mut() {
+            session.acknowledge_before_store()?;
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(session) = self.windows.as_mut() {
+            session.acknowledge_before_store()?;
+        }
         Ok(())
     }
+}
+
+/// Consume the final Linux handoff authority only after the ordinary app
+/// function returned successfully and dropped all UI/runtime/owner locals.
+/// Missing unique ownership is uncertainty, never a successful shutdown receipt.
+#[cfg(target_os = "linux")]
+pub fn complete_linux_shutdown(
+    startup: Arc<std::sync::Mutex<StartupSession>>,
+) -> Result<(), UpdateError> {
+    let pending = startup
+        .lock()
+        .map_err(|_| UpdateError::RecoveryRequired)?
+        .appimage
+        .as_ref()
+        .is_some_and(AppImageSession::shutdown_pending);
+    if !pending {
+        return Ok(());
+    }
+    let mut startup = Arc::try_unwrap(startup)
+        .map_err(|_| UpdateError::RecoveryRequired)?
+        .into_inner()
+        .map_err(|_| UpdateError::RecoveryRequired)?;
+    startup
+        .appimage
+        .take()
+        .ok_or(UpdateError::RecoveryRequired)?
+        .complete_successful_shutdown()
 }
 
 /// One shared exclusion gate for call joins and updater installation.

@@ -1,8 +1,15 @@
 //! Original quiet output-only ringtone. No microphone, media publication or file
-//! is opened. The owner thread holds the process permit through native stream
-//! destruction, even if a platform open/drop cannot be interrupted. Cancellation
+//! is opened. A retained supervisor holds the permit through returned application
+//! stream revocation, checked native close on implemented hosts and real worker/TLS
+//! join. Actual hardware/route acceptance remains a separate requirement.
+//! Native open/drop cannot be interrupted. Cancellation
 //! prevents later startup steps and makes subsequent callback buffers silent;
 //! samples already submitted to the OS cannot be recalled.
+
+#[cfg(target_os = "linux")]
+use crate::alsa_close::close_retired_alsa_on_owned_worker as close_retired_native_audio;
+#[cfg(target_os = "macos")]
+use crate::coreaudio_close::close_retired_coreaudio_on_owned_worker as close_retired_native_audio;
 
 use cpal::{
     SampleFormat, Stream, SupportedStreamConfig,
@@ -10,7 +17,7 @@ use cpal::{
 };
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     thread,
@@ -22,6 +29,8 @@ const MAX_DEVICES: usize = 512;
 const MAX_CONFIGS: usize = 512;
 const MAX_RING: Duration = Duration::from_secs(30);
 static OWNED: AtomicBool = AtomicBool::new(false);
+static RING_WORKERS: RingWorkers = RingWorkers::new();
+const RING_RELEASE_WAIT: Duration = Duration::from_secs(3);
 
 // One actual output owner for both ringtone and attachment PCM. A ringtone
 // reservation retires old PCM before waiting for that owner's native teardown.
@@ -79,6 +88,129 @@ impl Drop for Permit {
     }
 }
 
+// Mac and Linux native teardown is fallible after the PCM producer returns or unwinds.
+// One process-retained slot owns the exact Permit before the first native step;
+// no playback handle, stack unwind or cancelled observer can drop that guard.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static PCM_NATIVE_OWNERS: PcmNativeOwners = PcmNativeOwners::new();
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PCM_FRESH: u8 = 0;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PCM_PRODUCING: u8 = 1;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PCM_TERMINAL: u8 = 2;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PCM_CLOSING: u8 = 3;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PCM_RELEASED: u8 = 4;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PCM_FAILED: u8 = 5;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct PcmNativeIdentity(AtomicU8);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl PcmNativeIdentity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(AtomicU8::new(PCM_FRESH)))
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct PcmNativeOwner {
+    identity: Arc<PcmNativeIdentity>,
+    _permit: Permit,
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct PcmNativeOwners(Mutex<Option<PcmNativeOwner>>);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl PcmNativeOwners {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+    fn admit(
+        &self,
+        identity: &Arc<PcmNativeIdentity>,
+        run: &Run,
+    ) -> Result<PcmProducer, RingAudioError> {
+        let mut owner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if owner.is_some() {
+            return Err(RingAudioError::Busy);
+        }
+        if !run.active() {
+            return Err(RingAudioError::Cancelled);
+        }
+        let permit = Permit::take().ok_or(RingAudioError::Busy)?;
+        // Each playback can produce only once. An old terminal/close observer
+        // can never become the release authority for a later production body.
+        identity
+            .0
+            .compare_exchange(
+                PCM_FRESH,
+                PCM_PRODUCING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| RingAudioError::Busy)?;
+        *owner = Some(PcmNativeOwner {
+            identity: identity.clone(),
+            _permit: permit,
+        });
+        Ok(PcmProducer(identity.clone()))
+    }
+    fn close_with(
+        &self,
+        identity: &Arc<PcmNativeIdentity>,
+        close: impl FnOnce() -> Result<(), ()>,
+    ) -> Result<(), ()> {
+        match identity.0.compare_exchange(
+            PCM_TERMINAL,
+            PCM_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            // Fresh means this playback never admitted native PCM. Released
+            // means its exact checked close already succeeded. Neither path
+            // touches another playback's owner or claims a new native close.
+            Err(PCM_FRESH | PCM_RELEASED) => return Ok(()),
+            // In particular, stop/cancel cannot release a producing body, and
+            // concurrent close, panic or terminal uncertainty never retries it.
+            Err(_) => return Err(()),
+        }
+        // No registry lock is held across native teardown. A panic leaves the
+        // exact owner in PCM_CLOSING and keeps its guard retained indefinitely.
+        if close().is_err() {
+            identity.0.store(PCM_FAILED, Ordering::Release);
+            return Err(());
+        }
+        let mut owner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(&owner.identity, identity))
+        {
+            identity.0.store(PCM_FAILED, Ordering::Release);
+            return Err(());
+        }
+        drop(owner.take());
+        identity.0.store(PCM_RELEASED, Ordering::Release);
+        Ok(())
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct PcmProducer(Arc<PcmNativeIdentity>);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for PcmProducer {
+    fn drop(&mut self) {
+        // This marker is created before open_pcm and destroyed only after its
+        // frame (including stream/sample Drop) has returned or fully unwound.
+        // It grants no cleanup receipt and never releases the actual Permit.
+        let _ = self.0.0.compare_exchange(
+            PCM_PRODUCING,
+            PCM_TERMINAL,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
 /// Fixed categories; backend errors and endpoint IDs are never retained/logged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RingAudioError {
@@ -113,9 +245,248 @@ impl Run {
     }
 }
 
-/// Drop never waits on an OS driver. Its atomic stop survives the owner handle;
-/// the one process permit is released only after the detached thread drops the
-/// device/stream. A stuck driver cannot cause an accumulating opener pool.
+/// The receipt is for the actual application ringtone worker and its TLS.
+/// It does not claim CPAL backend monitor/callback disposal quiescence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingAudioReleaseError {
+    TimedOut,
+    WorkerPanicked,
+    SupervisorFailed,
+    OutputOwnerUnconfirmed,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    NativeClose,
+    #[cfg(windows)]
+    NativeBackend,
+}
+impl std::fmt::Display for RingAudioReleaseError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::TimedOut => "incoming sound worker release was not confirmed before the deadline",
+            Self::WorkerPanicked => "incoming sound worker panicked during playback or release",
+            Self::SupervisorFailed => "incoming sound worker ownership could not be confirmed",
+            #[cfg(target_os = "macos")]
+            Self::NativeClose => "CoreAudio incoming sound cleanup failed and remains owned",
+            #[cfg(target_os = "linux")]
+            Self::NativeClose => "ALSA incoming sound cleanup failed and remains owned",
+            Self::OutputOwnerUnconfirmed => {
+                "the previous output worker release could not be confirmed"
+            }
+            #[cfg(windows)]
+            Self::NativeBackend => "Windows native output retirement could not be confirmed",
+        })
+    }
+}
+impl std::error::Error for RingAudioReleaseError {}
+#[derive(Default)]
+struct RingCompletion(Mutex<Option<Result<(), RingAudioReleaseError>>>);
+impl RingCompletion {
+    fn finish(&self, result: Result<(), RingAudioReleaseError>) {
+        let mut stored = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if stored.is_none() {
+            *stored = Some(result);
+        }
+    }
+    fn result(&self) -> Option<Result<(), RingAudioReleaseError>> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+// The global owner retains both arbitration guards independently of the actual
+// worker. Its body returning, unwinding or dropping TLS cannot release them.
+// A failed receipt keeps this whole owner alive, including any output permit.
+struct RingResources {
+    _reservation: RingReservation<'static>,
+    permit: Mutex<Option<Permit>>,
+}
+impl RingResources {
+    fn retain_permit(&self, permit: Permit) {
+        // Exactly one actual worker acquires once, before its first native
+        // device step; no other path replaces or takes this slot before join.
+        *self.permit.lock().unwrap_or_else(|e| e.into_inner()) = Some(permit);
+    }
+}
+enum RingWorkerError {
+    Playback(RingAudioError),
+    Release(RingAudioReleaseError),
+}
+impl From<RingAudioError> for RingWorkerError {
+    fn from(error: RingAudioError) -> Self {
+        Self::Playback(error)
+    }
+}
+
+struct RingOwner {
+    supervisor: Option<thread::JoinHandle<()>>,
+    completed: Arc<RingCompletion>,
+    run: Arc<Run>,
+    _resources: Arc<RingResources>,
+}
+struct RingWorkers(Mutex<Option<RingOwner>>);
+impl RingWorkers {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+    fn poll_locked(owner: &mut Option<RingOwner>) -> Option<Result<(), RingAudioReleaseError>> {
+        let Some(active) = owner.as_mut() else {
+            return Some(Ok(()));
+        };
+        if let Some(Err(error)) = active.completed.result() {
+            active.run.stopped.store(true, Ordering::Release);
+            active.run.status.store(3, Ordering::Release);
+            return Some(Err(error));
+        }
+        let Some(supervisor) = active.supervisor.as_ref() else {
+            active.run.stopped.store(true, Ordering::Release);
+            active.run.status.store(3, Ordering::Release);
+            return Some(Err(RingAudioReleaseError::SupervisorFailed));
+        };
+        if !supervisor.is_finished() {
+            return None;
+        }
+        // Actual native work and its TLS have already been joined on this
+        // fixed supervisor. std's final join epilogue has no hard OS-time bound.
+        let joined = active
+            .supervisor
+            .take()
+            .expect("retained ringtone supervisor")
+            .join();
+        if joined.is_err() || active.completed.result() != Some(Ok(())) {
+            active
+                .completed
+                .finish(Err(RingAudioReleaseError::SupervisorFailed));
+            active.run.stopped.store(true, Ordering::Release);
+            active.run.status.store(3, Ordering::Release);
+            return Some(Err(RingAudioReleaseError::SupervisorFailed));
+        }
+        *owner = None;
+        Some(Ok(()))
+    }
+    fn poll_release(&self) -> Option<Result<(), RingAudioReleaseError>> {
+        Self::poll_locked(&mut self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    fn start_with(
+        &self,
+        run: Arc<Run>,
+        output: &'static OutputArbitration,
+        work: impl FnOnce(&Arc<Run>, &RingResources) -> Result<(), RingWorkerError> + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
+    ) -> Result<(), RingAudioError> {
+        let mut owner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match Self::poll_locked(&mut owner) {
+            None => return Err(RingAudioError::Busy),
+            Some(Err(_)) => return Err(RingAudioError::Unavailable),
+            Some(Ok(())) => {}
+        }
+        if !run.active() {
+            return Err(RingAudioError::Cancelled);
+        }
+        let reservation = output.reserve_ring().ok_or(RingAudioError::Busy)?;
+        let resources = Arc::new(RingResources {
+            _reservation: reservation,
+            permit: Mutex::new(None),
+        });
+        let completed = Arc::new(RingCompletion::default());
+        let (start, admitted) = std::sync::mpsc::sync_channel(1);
+        let worker_run = run.clone();
+        let worker_resources = resources.clone();
+        let finished = completed.clone();
+        let supervisor = spawn(Box::new(move || {
+            // Before publication/start, no actual native worker exists. Failed
+            // supervisor creation cannot discard the sole native JoinHandle.
+            if admitted.recv().is_err() {
+                drop(work);
+                finished.finish(Ok(()));
+                return;
+            }
+            let actual_run = worker_run.clone();
+            let actual = thread::Builder::new()
+                .name("morpheus-ring-output".into())
+                .spawn(move || run_ring_worker(actual_run, worker_resources, work));
+            let result = match actual {
+                Ok(actual) => actual
+                    .join()
+                    .unwrap_or(Err(RingAudioReleaseError::WorkerPanicked)),
+                Err(_) => {
+                    // No actual worker was created. Keep the original fixed
+                    // unavailable status; there is no native owner left to join.
+                    worker_run.status.store(3, Ordering::Release);
+                    worker_run.stopped.store(true, Ordering::Release);
+                    Ok(())
+                }
+            };
+            finished.finish(result);
+        }))
+        .map_err(|_| RingAudioError::Unavailable)?;
+        *owner = Some(RingOwner {
+            supervisor: Some(supervisor),
+            completed: completed.clone(),
+            run,
+            _resources: resources,
+        });
+        if start.send(()).is_err() {
+            completed.finish(Err(RingAudioReleaseError::SupervisorFailed));
+            return Err(RingAudioError::Unavailable);
+        }
+        Ok(())
+    }
+    async fn wait(&self, bound: Duration) -> Result<(), RingAudioReleaseError> {
+        let until = tokio::time::Instant::now() + bound;
+        loop {
+            if let Some(result) = self.poll_release() {
+                return result;
+            }
+            if tokio::time::Instant::now() >= until {
+                return Err(RingAudioReleaseError::TimedOut);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+fn run_ring_worker(
+    run: Arc<Run>,
+    resources: Arc<RingResources>,
+    work: impl FnOnce(&Arc<Run>, &RingResources) -> Result<(), RingWorkerError>,
+) -> Result<(), RingAudioReleaseError> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !run.active() {
+            return Err(RingWorkerError::Playback(RingAudioError::Cancelled));
+        }
+        work(&run, &resources)
+    }));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let native_close = close_retired_native_audio();
+    let released = match &result {
+        Err(_) => Err(RingAudioReleaseError::WorkerPanicked),
+        Ok(Err(RingWorkerError::Release(error))) => Err(*error),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        _ if native_close.is_err() => Err(RingAudioReleaseError::NativeClose),
+        _ => Ok(()),
+    };
+    let failed = released.is_err()
+        || matches!(
+            &result,
+            Ok(Err(RingWorkerError::Playback(RingAudioError::Unavailable)))
+        )
+        || run.status.load(Ordering::Acquire) == 3;
+    run.status
+        .store(if failed { 3 } else { 2 }, Ordering::Release);
+    run.stopped.store(true, Ordering::Release);
+    released
+}
+/// Call/update reservation or incoming shutdown must revoke sound first. This
+/// bounded observation then requires the retained actual ringtone worker/TLS
+/// join; cancellation/timeout never detach it or release its output guards.
+pub async fn wait_for_ring_audio_release() -> Result<(), RingAudioReleaseError> {
+    RING_WORKERS.wait(RING_RELEASE_WAIT).await?;
+    #[cfg(windows)]
+    crate::audio_device::wait_for_native_audio_release(RING_RELEASE_WAIT)
+        .await
+        .map_err(|_| RingAudioReleaseError::NativeBackend)?;
+    Ok(())
+}
+
+/// Drop only revokes callback authority; it never waits on an OS driver. The
+/// retained process owner keeps the real worker handle and arbitration guards
+/// through actual join/TLS, even after this presentation handle disappears.
 pub struct RingPlayback {
     run: Arc<Run>,
 }
@@ -124,6 +495,19 @@ impl RingPlayback {
         speaker: Option<String>,
         expiry: Instant,
         allowed: RingAudioAuthority,
+    ) -> Result<Self, RingAudioError> {
+        Self::start_after_output_release(speaker, expiry, allowed, || Ok(()))
+    }
+
+    /// The existing application output owner supplies its actual join/TLS
+    /// receipt. The ring reservation retires PCM before this runs, on our
+    /// retained std worker only. The caller must never wait for this same ring
+    /// from that receipt; new PCM admission is rejected while ring-reserved.
+    pub fn start_after_output_release(
+        speaker: Option<String>,
+        expiry: Instant,
+        allowed: RingAudioAuthority,
+        previous_output: impl FnOnce() -> Result<(), RingAudioReleaseError> + Send + 'static,
     ) -> Result<Self, RingAudioError> {
         if speaker
             .as_ref()
@@ -142,38 +526,28 @@ impl RingPlayback {
             deadline,
             allowed,
         });
-        if !run.active() {
-            return Err(RingAudioError::Cancelled);
-        }
-        let reservation = OUTPUT.reserve_ring().ok_or(RingAudioError::Busy)?;
-        let worker = run.clone();
-        thread::Builder::new()
-            .name("morpheus-ring-output".into())
-            .spawn(move || {
-                // This dedicated owner waits; never the UI or Tokio worker. The
-                // reservation already silences/retires old PCM, and the one actual
-                // output permit cannot release before its native stream is gone.
-                let _reservation = reservation;
-                let result =
-                    acquire_output(&worker).and_then(|_permit| play(&worker, speaker.as_deref()));
-                worker.status.store(
-                    if result == Err(RingAudioError::Unavailable)
-                        || worker.status.load(Ordering::Acquire) == 3
-                    {
-                        3
-                    } else {
-                        2
-                    },
-                    Ordering::Release,
-                );
-                worker.stopped.store(true, Ordering::Release);
-            })
-            .map_err(|_| RingAudioError::Unavailable)?;
+        RING_WORKERS.start_with(
+            run.clone(),
+            &OUTPUT,
+            move |worker, resources| {
+                after_output_release(worker, previous_output, || {
+                    let permit = acquire_output(worker)?;
+                    resources.retain_permit(permit);
+                    play(worker, speaker.as_deref()).map_err(RingWorkerError::Playback)
+                })
+            },
+            |supervise| {
+                thread::Builder::new()
+                    .name("morpheus-ring-owner".into())
+                    .spawn(supervise)
+            },
+        )?;
         Ok(Self { run })
     }
     pub fn stop(&self) {
         self.run.stopped.store(true, Ordering::Release);
     }
+    /// Audible authority only, never a native worker-release receipt.
     pub fn is_active(&self) -> bool {
         self.run.active()
     }
@@ -185,6 +559,23 @@ impl Drop for RingPlayback {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn after_output_release(
+    run: &Run,
+    previous_output: impl FnOnce() -> Result<(), RingAudioReleaseError>,
+    native: impl FnOnce() -> Result<(), RingWorkerError>,
+) -> Result<(), RingWorkerError> {
+    if !run.active() {
+        return Err(RingWorkerError::Playback(RingAudioError::Cancelled));
+    }
+    previous_output().map_err(RingWorkerError::Release)?;
+    // An OS/account/Answer/expiry revocation can win while the actual previous
+    // output owner is joining. It must prevent both Permit and CPAL admission.
+    if !run.active() {
+        return Err(RingWorkerError::Playback(RingAudioError::Cancelled));
+    }
+    native()
 }
 
 fn acquire_output(run: &Run) -> Result<Permit, RingAudioError> {
@@ -299,15 +690,116 @@ fn output_config(
     }
     selected.ok_or(RingAudioError::Unavailable)
 }
+#[cfg(windows)]
+struct NativeOutputStream {
+    stream: Option<cpal::Stream>,
+    run: Arc<Run>,
+}
+#[cfg(windows)]
+impl std::ops::Deref for NativeOutputStream {
+    type Target = cpal::Stream;
+    fn deref(&self) -> &cpal::Stream {
+        self.stream.as_ref().expect("retained output proxy")
+    }
+}
+#[cfg(windows)]
+impl Drop for NativeOutputStream {
+    fn drop(&mut self) {
+        self.run.stopped.store(true, Ordering::Release);
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        let Some(ticket) = stream.request_wasapi_close() else {
+            // Shipping Windows selects WASAPI. A different compiled host has
+            // no WASAPI receipt and must never be represented as confirmed.
+            self.run.status.store(3, Ordering::Release);
+            loop {
+                thread::park();
+            }
+        };
+        loop {
+            match ticket.observe() {
+                cpal::WasapiCloseObservation::Released(result) => {
+                    if result.is_err() {
+                        self.run.status.store(3, Ordering::Release);
+                    }
+                    return;
+                }
+                cpal::WasapiCloseObservation::Retained(_) => {
+                    self.run.status.store(3, Ordering::Release);
+                }
+                cpal::WasapiCloseObservation::Pending => {}
+            }
+            thread::park_timeout(Duration::from_millis(10));
+        }
+    }
+}
+#[cfg(windows)]
+fn own_output_stream(stream: cpal::Stream, run: Arc<Run>) -> NativeOutputStream {
+    NativeOutputStream {
+        stream: Some(stream),
+        run,
+    }
+}
+#[cfg(not(windows))]
+fn own_output_stream(stream: cpal::Stream, _run: Arc<Run>) -> cpal::Stream {
+    stream
+}
+
+/// This guard is created only on the already retained application output
+/// owner. It is declared before local Device/Stream values so their drop first
+/// requests retirement, including every format/build/play error and unwind.
+/// Its outer ring/PCM permit stays retained until real backend joins complete.
+#[cfg(windows)]
+struct NativeOutputDrain(Arc<Run>);
+#[cfg(windows)]
+impl Drop for NativeOutputDrain {
+    fn drop(&mut self) {
+        loop {
+            match cpal::observe_wasapi_retiring() {
+                cpal::WasapiCloseObservation::Released(result) => {
+                    if result.is_err() {
+                        self.0.status.store(3, Ordering::Release);
+                    }
+                    return;
+                }
+                cpal::WasapiCloseObservation::Retained(_) => {
+                    self.0.status.store(3, Ordering::Release);
+                }
+                cpal::WasapiCloseObservation::Pending => {}
+            }
+            // No UI/Tokio thread waits here. The caller's bounded observation
+            // can fail while the actual application worker/permit stays owned.
+            thread::park_timeout(Duration::from_millis(10));
+        }
+    }
+}
+
 fn play(run: &Arc<Run>, selected: Option<&str>) -> Result<(), RingAudioError> {
+    #[cfg(windows)]
+    {
+        let authority = run.clone();
+        return cpal::with_wasapi_open_authority(Arc::new(move || authority.active()), || {
+            play_on_owner(run, selected)
+        });
+    }
+    #[cfg(not(windows))]
+    play_on_owner(run, selected)
+}
+fn play_on_owner(run: &Arc<Run>, selected: Option<&str>) -> Result<(), RingAudioError> {
+    #[cfg(windows)]
+    let _native_drain = NativeOutputDrain(run.clone());
     let device = speaker(run, selected)?;
     let config = output_config(run, &device)?;
-    let stream = entered(run, || match config.sample_format() {
-        SampleFormat::F32 => stream::<f32>(&device, &config, run.clone()),
-        SampleFormat::I16 => stream::<i16>(&device, &config, run.clone()),
-        SampleFormat::U16 => stream::<u16>(&device, &config, run.clone()),
-        _ => Err(RingAudioError::Unavailable),
-    })?;
+    let stream = own_output_stream(
+        entered(run, || match config.sample_format() {
+            SampleFormat::F32 => stream::<f32>(&device, &config, run.clone()),
+            SampleFormat::I16 => stream::<i16>(&device, &config, run.clone()),
+            SampleFormat::U16 => stream::<u16>(&device, &config, run.clone()),
+            _ => Err(RingAudioError::Unavailable),
+        })?,
+        run.clone(),
+    );
     entered(run, || {
         stream.play().map_err(|_| RingAudioError::Unavailable)
     })?;
@@ -320,7 +812,7 @@ fn play(run: &Arc<Run>, selected: Option<&str>) -> Result<(), RingAudioError> {
     let failed = run.status.load(Ordering::Acquire) == 3;
     run.stopped.store(true, Ordering::Release);
     // The stream remains entirely on this owner thread and is dropped before
-    // the process permit. Callback cancellation does not wait for this drop.
+    // the retained process permit. Callback cancellation never waits for this drop.
     drop(stream);
     if failed {
         Err(RingAudioError::Unavailable)
@@ -405,6 +897,368 @@ impl Tone {
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) static PERMIT_TEST: Mutex<()> = Mutex::new(());
+    struct RingTlsHold {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Drop for RingTlsHold {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+        }
+    }
+    thread_local! {
+        static RING_TLS_HOLD: std::cell::RefCell<Option<RingTlsHold>> = const { std::cell::RefCell::new(None) };
+    }
+    fn owned_run() -> Arc<Run> {
+        Arc::new(Run {
+            stopped: AtomicBool::new(false),
+            status: AtomicU8::new(0),
+            deadline: Instant::now() + MAX_RING,
+            allowed: Arc::new(|| true),
+        })
+    }
+    fn synthetic_output() -> &'static OutputArbitration {
+        // A bounded fixture with the same process-lifetime as production's
+        // static output owner; it never opens a platform device.
+        Box::leak(Box::new(OutputArbitration::new()))
+    }
+    fn spawn_supervisor(work: Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>> {
+        thread::Builder::new().spawn(work)
+    }
+    #[tokio::test]
+    async fn actual_ring_owner_keeps_output_guards_through_late_drop_tls_and_cancelled_wait() {
+        use std::{
+            future::Future,
+            task::{Context, Waker},
+        };
+        let _exclusive_permit = PERMIT_TEST.lock().unwrap();
+        let workers = RingWorkers::new();
+        let output = synthetic_output();
+        let run = owned_run();
+        let playback = RingPlayback { run: run.clone() };
+        let (entered, body_entered) = std::sync::mpsc::sync_channel(1);
+        let (release_body, body_release) = std::sync::mpsc::channel();
+        let (in_tls, tls_entered) = std::sync::mpsc::sync_channel(1);
+        let (release_tls, tls_release) = std::sync::mpsc::channel();
+        let (dropped, value_dropped) = std::sync::mpsc::sync_channel(1);
+        struct NativeValue(std::sync::mpsc::SyncSender<thread::ThreadId>);
+        impl Drop for NativeValue {
+            fn drop(&mut self) {
+                let _ = self.0.send(thread::current().id());
+            }
+        }
+        workers
+            .start_with(
+                run,
+                output,
+                move |_, resources| {
+                    resources.retain_permit(Permit::take().unwrap());
+                    RING_TLS_HOLD.with(|tls| {
+                        *tls.borrow_mut() = Some(RingTlsHold {
+                            entered: in_tls,
+                            release: tls_release,
+                        })
+                    });
+                    let value = NativeValue(dropped);
+                    entered.send(thread::current().id()).unwrap();
+                    body_release.recv_timeout(Duration::from_secs(2)).unwrap();
+                    drop(value);
+                    Ok(())
+                },
+                spawn_supervisor,
+            )
+            .unwrap();
+        let actual_thread = body_entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(playback);
+        release_body.send(()).unwrap();
+        assert_eq!(
+            value_dropped.recv_timeout(Duration::from_secs(2)).unwrap(),
+            actual_thread
+        );
+        assert_ne!(actual_thread, thread::current().id());
+        tls_entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(output.ringing.load(Ordering::Acquire));
+        assert!(
+            Permit::take().is_none(),
+            "body completion cannot release the actual output permit"
+        );
+        assert_eq!(
+            workers.wait(Duration::from_millis(20)).await,
+            Err(RingAudioReleaseError::TimedOut)
+        );
+        assert_eq!(
+            workers.start_with(
+                owned_run(),
+                output,
+                |_, _| panic!("replacement entered"),
+                spawn_supervisor
+            ),
+            Err(RingAudioError::Busy)
+        );
+        let mut cancelled_wait = Box::pin(workers.wait(Duration::from_secs(2)));
+        assert!(
+            cancelled_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(cancelled_wait);
+        assert!(
+            workers
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .supervisor
+                .is_some()
+        );
+        assert!(output.ringing.load(Ordering::Acquire));
+        assert!(Permit::take().is_none());
+        release_tls.send(()).unwrap();
+        assert_eq!(workers.wait(Duration::from_secs(2)).await, Ok(()));
+        assert!(!output.ringing.load(Ordering::Acquire));
+        assert!(Permit::take().is_some());
+        assert!(workers.0.lock().unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn supervisor_failure_and_stop_before_actual_creation_do_not_detach_a_worker() {
+        let workers = RingWorkers::new();
+        let output = synthetic_output();
+        let entered = Arc::new(AtomicBool::new(false));
+        let called = entered.clone();
+        assert_eq!(
+            workers.start_with(
+                owned_run(),
+                output,
+                move |_, _| {
+                    called.store(true, Ordering::Release);
+                    Ok(())
+                },
+                |_work| Err(std::io::Error::other(
+                    "synthetic supervisor creation failure"
+                ))
+            ),
+            Err(RingAudioError::Unavailable)
+        );
+        assert!(!entered.load(Ordering::Acquire));
+        assert!(workers.0.lock().unwrap().is_none());
+        assert!(!output.ringing.load(Ordering::Acquire));
+        let (release, released) = std::sync::mpsc::channel();
+        let run = owned_run();
+        let playback = RingPlayback { run: run.clone() };
+        let called = entered.clone();
+        workers
+            .start_with(
+                run,
+                output,
+                move |_, _| {
+                    called.store(true, Ordering::Release);
+                    Ok(())
+                },
+                move |supervise| {
+                    Ok(thread::spawn(move || {
+                        released.recv_timeout(Duration::from_secs(2)).unwrap();
+                        supervise();
+                    }))
+                },
+            )
+            .unwrap();
+        assert!(
+            workers
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .supervisor
+                .is_some()
+        );
+        drop(playback);
+        release.send(()).unwrap();
+        assert_eq!(workers.wait(Duration::from_secs(2)).await, Ok(()));
+        assert!(!entered.load(Ordering::Acquire));
+        assert!(!output.ringing.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn native_panic_retains_failed_ring_owner_and_never_admits_replacement() {
+        let workers = RingWorkers::new();
+        let output = synthetic_output();
+        let run = owned_run();
+        workers
+            .start_with(
+                run.clone(),
+                output,
+                |_, _| panic!("synthetic native owner panic"),
+                spawn_supervisor,
+            )
+            .unwrap();
+        assert_eq!(
+            workers.wait(Duration::from_secs(2)).await,
+            Err(RingAudioReleaseError::WorkerPanicked)
+        );
+        assert_eq!(run.status.load(Ordering::Acquire), 3);
+        assert!(!run.active());
+        assert!(output.ringing.load(Ordering::Acquire));
+        assert!(
+            workers
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .supervisor
+                .is_some()
+        );
+        assert_eq!(
+            workers.start_with(
+                owned_run(),
+                output,
+                |_, _| panic!("failed replacement"),
+                spawn_supervisor
+            ),
+            Err(RingAudioError::Unavailable)
+        );
+        // This fixture has no native resource. Explicitly join its finished
+        // supervisor; production's static failed owner is never discarded.
+        let retained = workers.0.lock().unwrap().take().unwrap();
+        retained.supervisor.unwrap().join().unwrap();
+    }
+    #[tokio::test]
+    async fn ring_retires_pcm_before_its_actual_receipt_and_rechecks_cancellation() {
+        let workers = RingWorkers::new();
+        let output = synthetic_output();
+        let old_pcm = output.epoch.load(Ordering::Acquire);
+        assert!(output.allows_pcm(old_pcm));
+        let run = owned_run();
+        let playback = RingPlayback { run: run.clone() };
+        let (waiting, prior_waiting) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::channel();
+        let entered = Arc::new(AtomicBool::new(false));
+        let native = entered.clone();
+        workers
+            .start_with(
+                run,
+                output,
+                move |run, _resources| {
+                    after_output_release(
+                        run,
+                        || {
+                            waiting.send(()).unwrap();
+                            released.recv_timeout(Duration::from_secs(2)).unwrap()
+                        },
+                        || {
+                            native.store(true, Ordering::Release);
+                            Ok(())
+                        },
+                    )
+                },
+                spawn_supervisor,
+            )
+            .unwrap();
+        prior_waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!output.allows_pcm(old_pcm));
+        assert!(
+            !output.allows_pcm(output.epoch.load(Ordering::Acquire)),
+            "new PCM admission must fail, never wait for this ring"
+        );
+        assert!(!entered.load(Ordering::Acquire));
+        drop(playback);
+        release.send(Ok(())).unwrap();
+        assert_eq!(workers.wait(Duration::from_secs(2)).await, Ok(()));
+        assert!(
+            !entered.load(Ordering::Acquire),
+            "cancelled while the prior output joined"
+        );
+        assert!(!output.ringing.load(Ordering::Acquire));
+        assert!(
+            !output.allows_pcm(old_pcm),
+            "an old PCM epoch never revives"
+        );
+    }
+    #[tokio::test]
+    async fn failed_prior_output_receipt_never_opens_ring_and_keeps_typed_failed_owner() {
+        let workers = RingWorkers::new();
+        let output = synthetic_output();
+        let run = owned_run();
+        workers
+            .start_with(
+                run.clone(),
+                output,
+                |run, _| {
+                    after_output_release(
+                        run,
+                        || Err(RingAudioReleaseError::OutputOwnerUnconfirmed),
+                        || panic!("unconfirmed previous owner cannot enter native output"),
+                    )
+                },
+                spawn_supervisor,
+            )
+            .unwrap();
+        assert_eq!(
+            workers.wait(Duration::from_secs(2)).await,
+            Err(RingAudioReleaseError::OutputOwnerUnconfirmed)
+        );
+        assert!(!run.active());
+        assert_eq!(run.status.load(Ordering::Acquire), 3);
+        assert!(output.ringing.load(Ordering::Acquire));
+        assert!(
+            workers
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .supervisor
+                .is_some()
+        );
+        assert_eq!(
+            workers.start_with(
+                owned_run(),
+                output,
+                |_, _| panic!("failed owner replacement"),
+                spawn_supervisor
+            ),
+            Err(RingAudioError::Unavailable)
+        );
+        // No native resource exists in this fixture. Production's static
+        // uncertain owner and arbitration reservation stay retained.
+        let retained = workers.0.lock().unwrap().take().unwrap();
+        retained.supervisor.unwrap().join().unwrap();
+    }
+    #[test]
+    fn missing_ring_supervisor_receipt_retains_reservation_instead_of_clean_completion() {
+        let output = synthetic_output();
+        let resources = Arc::new(RingResources {
+            _reservation: output.reserve_ring().unwrap(),
+            permit: Mutex::new(None),
+        });
+        let supervisor = thread::spawn(|| ());
+        let until = Instant::now() + Duration::from_secs(2);
+        while !supervisor.is_finished() {
+            assert!(Instant::now() < until, "synthetic supervisor completion");
+            thread::yield_now();
+        }
+        let mut owner = Some(RingOwner {
+            supervisor: Some(supervisor),
+            completed: Arc::new(RingCompletion::default()),
+            run: owned_run(),
+            _resources: resources,
+        });
+        assert_eq!(
+            RingWorkers::poll_locked(&mut owner),
+            Some(Err(RingAudioReleaseError::SupervisorFailed))
+        );
+        assert_eq!(
+            RingWorkers::poll_locked(&mut owner),
+            Some(Err(RingAudioReleaseError::SupervisorFailed))
+        );
+        assert!(owner.is_some());
+        assert!(output.ringing.load(Ordering::Acquire));
+    }
+
     #[test]
     fn synthesized_output_is_bounded_with_silent_edges_gaps_and_period() {
         let mut tone = Tone::default();
@@ -477,6 +1331,7 @@ mod tests {
     }
     #[test]
     fn one_opener_permit_survives_until_actual_owner_drop() {
+        let _exclusive_permit = PERMIT_TEST.lock().unwrap();
         let permit = Permit::take().unwrap();
         assert!(Permit::take().is_none());
         let owner = std::thread::spawn(move || {
@@ -558,8 +1413,9 @@ mod tests {
     }
 }
 
-/// One explicit attachment's output state. The caller owns its single worker
-/// permit until play_pcm returns, after destruction of the actual native stream.
+/// One explicit attachment's output state. Mac retains its exact output permit
+/// through terminal production and checked native cleanup, including unwind;
+/// other platforms retain their existing stream-Drop ownership boundary.
 /// These controls never touch microphone capture, a call mixer, route or OS volume.
 pub struct PcmPlayback {
     run: Arc<Run>,
@@ -568,11 +1424,18 @@ pub struct PcmPlayback {
     consumed: AtomicU64,
     total: AtomicU64,
     rate: AtomicU32,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    native_close_failed: AtomicBool,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    native_identity: Arc<PcmNativeIdentity>,
 }
 impl PcmPlayback {
     /// Original output epoch: a ringtone reservation permanently retires it,
     /// including a reservation which later fails to open a native speaker.
     pub fn output_authority() -> RingAudioAuthority {
+        // Explicit admission runs off the callback. Reap only a real completed
+        // ring join; the returned authority remains atomics-only on native I/O.
+        let _ = RING_WORKERS.poll_release();
         let original = OUTPUT.epoch.load(Ordering::Acquire);
         Arc::new(move || OUTPUT.allows_pcm(original))
     }
@@ -591,6 +1454,10 @@ impl PcmPlayback {
             consumed: AtomicU64::new(0),
             total: AtomicU64::new(0),
             rate: AtomicU32::new(0),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            native_close_failed: AtomicBool::new(false),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            native_identity: PcmNativeIdentity::new(),
         })
     }
     pub fn stop(&self) {
@@ -609,6 +1476,28 @@ impl PcmPlayback {
     }
     pub fn unavailable(&self) -> bool {
         self.run.status.load(Ordering::Acquire) == 3
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn native_close_failed(&self) -> bool {
+        self.native_close_failed.load(Ordering::Acquire)
+    }
+    /// On the actual application owner thread only, after play_pcm has
+    /// returned/unwound. An early/concurrent call fails without native teardown
+    /// or releasing the still-producing owner's guard. A terminal native error
+    /// remains owned; only this exact terminal producer's checked success can
+    /// release it. This is separate from the application's actual worker/TLS join.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn close_native_output_on_owned_worker(&self) -> Result<(), RingAudioError> {
+        self.stop();
+        PCM_NATIVE_OWNERS
+            .close_with(&self.native_identity, || {
+                close_retired_native_audio().map_err(|_| ())
+            })
+            .map_err(|()| {
+                self.native_close_failed.store(true, Ordering::Release);
+                self.run.status.store(3, Ordering::Release);
+                RingAudioError::Unavailable
+            })
     }
     pub fn active(&self) -> bool {
         self.run.active()
@@ -654,14 +1543,46 @@ impl PcmPlayback {
             return Err(RingAudioError::Cancelled);
         }
         // No waiting/retry or extra native opener on an explicit Play.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let producer = PCM_NATIVE_OWNERS.admit(&self.native_identity, &self.run)?;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let _permit = Permit::take().ok_or(RingAudioError::Busy)?;
-        if !self.run.active() {
-            return Err(RingAudioError::Cancelled);
+        #[cfg(windows)]
+        let _native_drain = NativeOutputDrain(self.run.clone());
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let result = {
+            if !self.run.active() {
+                return Err(RingAudioError::Cancelled);
+            }
+            self.total
+                .store((samples.len() / count) as u64, Ordering::Release);
+            self.rate.store(rate, Ordering::Release);
+            #[cfg(windows)]
+            let result = {
+                let authority = self.run.clone();
+                cpal::with_wasapi_open_authority(Arc::new(move || authority.active()), || {
+                    self.open_pcm(samples, rate, channels)
+                })
+            };
+            #[cfg(not(windows))]
+            let result = self.open_pcm(samples, rate, channels);
+            result
+        };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let result = if self.run.active() {
+            self.total
+                .store((samples.len() / count) as u64, Ordering::Release);
+            self.rate.store(rate, Ordering::Release);
+            self.open_pcm(samples, rate, channels)
+        } else {
+            Err(RingAudioError::Cancelled)
+        };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        drop(producer);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if self.close_native_output_on_owned_worker().is_err() {
+            return result.and(Err(RingAudioError::Unavailable));
         }
-        self.total
-            .store((samples.len() / count) as u64, Ordering::Release);
-        self.rate.store(rate, Ordering::Release);
-        let result = self.open_pcm(samples, rate, channels);
         if result == Err(RingAudioError::Unavailable) {
             self.run.status.store(3, Ordering::Release);
         } else if self.run.status.load(Ordering::Acquire) != 3 {
@@ -679,33 +1600,36 @@ impl PcmPlayback {
         let device = speaker(&self.run, None)?;
         let config = output_config(&self.run, &device)?;
         let samples = Arc::new(samples);
-        let stream = entered(&self.run, || match config.sample_format() {
-            SampleFormat::F32 => pcm_stream::<f32>(
-                &device,
-                &config,
-                self.clone(),
-                samples.clone(),
-                rate,
-                channels,
-            ),
-            SampleFormat::I16 => pcm_stream::<i16>(
-                &device,
-                &config,
-                self.clone(),
-                samples.clone(),
-                rate,
-                channels,
-            ),
-            SampleFormat::U16 => pcm_stream::<u16>(
-                &device,
-                &config,
-                self.clone(),
-                samples.clone(),
-                rate,
-                channels,
-            ),
-            _ => Err(RingAudioError::Unavailable),
-        })?;
+        let stream = own_output_stream(
+            entered(&self.run, || match config.sample_format() {
+                SampleFormat::F32 => pcm_stream::<f32>(
+                    &device,
+                    &config,
+                    self.clone(),
+                    samples.clone(),
+                    rate,
+                    channels,
+                ),
+                SampleFormat::I16 => pcm_stream::<i16>(
+                    &device,
+                    &config,
+                    self.clone(),
+                    samples.clone(),
+                    rate,
+                    channels,
+                ),
+                SampleFormat::U16 => pcm_stream::<u16>(
+                    &device,
+                    &config,
+                    self.clone(),
+                    samples.clone(),
+                    rate,
+                    channels,
+                ),
+                _ => Err(RingAudioError::Unavailable),
+            })?,
+            self.run.clone(),
+        );
         entered(&self.run, || {
             stream.play().map_err(|_| RingAudioError::Unavailable)
         })?;
@@ -825,6 +1749,153 @@ fn fill_pcm<T: ToneSample>(
 #[cfg(test)]
 mod pcm_tests {
     use super::*;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn pcm_guard_requires_terminal_producer_and_exact_checked_close_before_release() {
+        let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
+        let owners = PcmNativeOwners::new();
+        let state = PcmPlayback::new(Arc::new(|| true));
+        let producer = owners.admit(&state.native_identity, &state.run).unwrap();
+        assert!(Permit::take().is_none());
+        state.stop();
+        assert_eq!(
+            owners.close_with(&state.native_identity, || panic!("producer is still live")),
+            Err(())
+        );
+        assert_eq!(
+            state.native_identity.0.load(Ordering::Acquire),
+            PCM_PRODUCING
+        );
+        assert!(Permit::take().is_none());
+        drop(producer);
+        assert_eq!(
+            state.native_identity.0.load(Ordering::Acquire),
+            PCM_TERMINAL
+        );
+        assert!(
+            Permit::take().is_none(),
+            "terminal is not a cleanup receipt"
+        );
+        let closed = AtomicBool::new(false);
+        assert_eq!(
+            owners.close_with(&state.native_identity, || {
+                closed.store(true, Ordering::Release);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert!(closed.load(Ordering::Acquire));
+        assert!(owners.0.lock().unwrap().is_none());
+        assert!(Permit::take().is_some());
+        // A stale released identity cannot close/release a later generation.
+        let next = PcmPlayback::new(Arc::new(|| true));
+        let next_producer = owners.admit(&next.native_identity, &next.run).unwrap();
+        assert_eq!(
+            owners.close_with(&state.native_identity, || panic!("stale close ran")),
+            Ok(())
+        );
+        assert!(Permit::take().is_none());
+        assert!(Arc::ptr_eq(
+            &owners.0.lock().unwrap().as_ref().unwrap().identity,
+            &next.native_identity
+        ));
+        drop(next_producer);
+        assert_eq!(owners.close_with(&next.native_identity, || Ok(())), Ok(()));
+        assert!(Permit::take().is_some());
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn pcm_producer_panic_keeps_exact_guard_until_authentic_terminal_cleanup() {
+        let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
+        let owners = PcmNativeOwners::new();
+        let state = PcmPlayback::new(Arc::new(|| true));
+        let producer = owners.admit(&state.native_identity, &state.run).unwrap();
+        let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _producer = producer;
+            panic!("synthetic PCM producer failure");
+        }));
+        assert!(
+            operation.is_err(),
+            "cleanup must not replace original panic"
+        );
+        assert_eq!(
+            state.native_identity.0.load(Ordering::Acquire),
+            PCM_TERMINAL
+        );
+        assert!(
+            Permit::take().is_none(),
+            "unwind must not drop the output guard"
+        );
+        assert!(owners.0.lock().unwrap().is_some());
+        assert_eq!(owners.close_with(&state.native_identity, || Ok(())), Ok(()));
+        assert!(Permit::take().is_some());
+        assert!(operation.is_err());
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn pcm_native_close_error_or_panic_retains_single_owner_without_retry() {
+        let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
+        for panic_close in [false, true] {
+            let owners = PcmNativeOwners::new();
+            let state = PcmPlayback::new(Arc::new(|| true));
+            let producer = owners.admit(&state.native_identity, &state.run).unwrap();
+            drop(producer);
+            let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owners.close_with(&state.native_identity, || {
+                    if panic_close {
+                        panic!("synthetic native close panic");
+                    }
+                    Err(())
+                })
+            }));
+            if panic_close {
+                assert!(closed.is_err());
+                assert_eq!(state.native_identity.0.load(Ordering::Acquire), PCM_CLOSING);
+            } else {
+                assert_eq!(closed.unwrap(), Err(()));
+                assert_eq!(state.native_identity.0.load(Ordering::Acquire), PCM_FAILED);
+            }
+            drop(state);
+            assert!(owners.0.lock().unwrap().is_some());
+            assert!(Permit::take().is_none());
+            let next = PcmPlayback::new(Arc::new(|| true));
+            assert!(matches!(
+                owners.admit(&next.native_identity, &next.run),
+                Err(RingAudioError::Busy)
+            ));
+            let identity = owners.0.lock().unwrap().as_ref().unwrap().identity.clone();
+            assert_eq!(
+                owners.close_with(&identity, || panic!("uncertain close must not retry")),
+                Err(())
+            );
+            assert!(Permit::take().is_none());
+            // These injected closures created no native resource. Only this
+            // local test registry is dropped; production's static owner is not.
+            drop(owners);
+            assert!(Permit::take().is_some());
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn pcm_cancel_before_admission_has_no_native_guard_or_close_receipt() {
+        let _exclusive_permit = super::tests::PERMIT_TEST.lock().unwrap();
+        let owners = PcmNativeOwners::new();
+        let state = PcmPlayback::new(Arc::new(|| true));
+        state.stop();
+        assert!(matches!(
+            owners.admit(&state.native_identity, &state.run),
+            Err(RingAudioError::Cancelled)
+        ));
+        assert_eq!(state.native_identity.0.load(Ordering::Acquire), PCM_FRESH);
+        assert_eq!(
+            owners.close_with(&state.native_identity, || panic!(
+                "nothing entered native PCM"
+            )),
+            Ok(())
+        );
+        assert!(owners.0.lock().unwrap().is_none());
+        assert!(Permit::take().is_some());
+    }
     #[test]
     fn ringtone_reservation_retires_pcm_before_native_wait_and_never_revives_it() {
         let state = OutputArbitration::new();

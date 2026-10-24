@@ -10,12 +10,16 @@ disposable Synapse A volume and never changes Synapse B.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
+import re
 import secrets
+import selectors
 import shutil
 import signal
+import stat
 import socket
 import subprocess
 import sys
@@ -38,6 +42,10 @@ SFU_CONFIG = STATE / "livekit.yaml"
 NATIVE_SFU_CONFIG = STATE / "livekit-native.yaml"
 NATIVE_SFU_PID = STATE / "livekit-native.pid"
 NATIVE_SFU_LOG = STATE / "livekit-native.log"
+SFU_OWNER = STATE / "sfu-owner.json"
+SFU_OWNER_LABEL = "io.github.brk275.morpheus.fixture-owner"
+SFU_RUN_LABEL = "io.github.brk275.morpheus.fixture-run"
+SFU_SOURCE_LABEL = "io.github.brk275.morpheus.fixture-source"
 AUTH_ENV = STATE / "auth.env"
 SFU_LOOPBACK_SCRIPT = STATE / "sfu_loopback.py"
 FEDERATION_PROXY = STATE / "federation_proxy.py"
@@ -114,6 +122,235 @@ def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     if check and result.returncode:
         raise matrix_env.DockerFailure(result)
     return result
+
+
+
+def recovery_identity() -> dict[str, str] | None:
+    """Only the fresh hosted owner creates this unguessable per-run identity."""
+    run = os.environ.get("MORPHEUS_MATRIX_SFU_RUN_ID")
+    if run is None:
+        return None
+    source = os.environ.get("GITHUB_SHA", "")
+    if (os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("RUNNER_OS") != "Linux"
+            or os.environ.get("GITHUB_REPOSITORY") != "brk275/Morpheus"
+            or re.fullmatch(r"[0-9a-f]{32}", run) is None
+            or re.fullmatch(r"[0-9a-f]{40}", source) is None):
+        raise RuntimeError("Owned SFU recovery identity unavailable")
+    return {SFU_OWNER_LABEL: "matrixrtc", SFU_RUN_LABEL: run, SFU_SOURCE_LABEL: source}
+
+
+# At most the failed command's actual unreaped client is retained until this
+# short-lived fixture helper exits under the mandatory owned PID namespace.
+# This is terminal uncertainty, never a retryable or successful cleanup receipt.
+_UNREAPED_DOCKER = []
+
+
+def owned_docker(*args: str) -> subprocess.CompletedProcess[str]:
+    """Bound both actual client pipes while retaining its real process owner."""
+    command = ["docker", *args]
+    process = None
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limit = 131072
+    deadline = time.monotonic() + 30
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with selectors.DefaultSelector() as ready:
+            for name in buffers:
+                stream = getattr(process, name)
+                os.set_blocking(stream.fileno(), False)
+                ready.register(stream, selectors.EVENT_READ, name)
+            while ready.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Owned SFU operation deadline exceeded")
+                for key, _ in ready.select(min(0.1, remaining)):
+                    total = sum(len(value) for value in buffers.values())
+                    chunk = os.read(key.fd, min(65536, limit + 1 - total))
+                    if not chunk:
+                        ready.unregister(key.fileobj)
+                        continue
+                    buffers[key.data].extend(chunk)
+                    if sum(len(value) for value in buffers.values()) > limit:
+                        raise RuntimeError("Owned SFU operation output exceeds limit")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Owned SFU operation deadline exceeded")
+        status = process.wait(timeout=remaining)
+        if status:
+            raise RuntimeError("Owned SFU operation failed")
+        return subprocess.CompletedProcess(command, status, buffers["stdout"].decode("utf-8"),
+                                            buffers["stderr"].decode("utf-8"))
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        raise RuntimeError("Owned SFU operation completion unproved") from None
+    finally:
+        if process is not None:
+            cleanup_unproved = False
+            try:
+                if process.poll() is None:
+                    process.kill()  # Actual retained, unreaped Popen only.
+            except ProcessLookupError:
+                pass
+            except OSError:
+                cleanup_unproved = True
+            try:
+                process.wait(timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                _UNREAPED_DOCKER.append(process)
+                cleanup_unproved = True
+            for name in buffers:
+                stream = getattr(process, name)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        cleanup_unproved = True
+            if cleanup_unproved:
+                raise RuntimeError("Owned SFU client cleanup unproved") from None
+
+
+def private_bytes(path: Path, limit: int) -> tuple[bytes, os.stat_result, os.stat_result]:
+    if path.parent != STATE or path.name not in (SFU_CONFIG.name, SFU_OWNER.name):
+        raise RuntimeError("Owned SFU private path rejected")
+    external_path(path)
+    root_fd = os.open(FIXTURE_HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        root = os.fstat(root_fd)
+        if not stat.S_ISDIR(root.st_mode) or root.st_uid != os.getuid() or root.st_mode & 0o077:
+            raise RuntimeError("Owned SFU fixture root rejected")
+        state_fd = os.open("rtc", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+        try:
+            state = os.fstat(state_fd)
+            if not stat.S_ISDIR(state.st_mode) or state.st_uid != os.getuid() or state.st_mode & 0o077:
+                raise RuntimeError("Owned SFU private directory rejected")
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=state_fd)
+            try:
+                before = os.fstat(fd)
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                        or before.st_nlink != 1 or before.st_mode & 0o077 or before.st_size > limit):
+                    raise RuntimeError("Owned SFU private input rejected")
+                data = bytearray()
+                while len(data) <= limit:
+                    chunk = os.read(fd, min(65536, limit + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                after = os.fstat(fd)
+                if (len(data) > limit or len(data) != before.st_size
+                        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                    raise RuntimeError("Owned SFU private input changed")
+                return bytes(data), before, root
+            finally:
+                os.close(fd)
+        finally:
+            os.close(state_fd)
+    finally:
+        os.close(root_fd)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate owned SFU field")
+        result[key] = value
+    return result
+
+
+def inspect_owned_sfu(container: str, labels: dict[str, str], *, image: str | None = None) -> dict:
+    if re.fullmatch(r"[0-9a-f]{64}", container) is None:
+        raise RuntimeError("Owned SFU container identity rejected")
+    response = owned_docker("container", "inspect", container)
+    if len(response.stdout) > 131072:
+        raise RuntimeError("Owned SFU inspection exceeds limit")
+    try:
+        records = json.loads(response.stdout, object_pairs_hook=unique_object)
+        if not isinstance(records, list) or len(records) != 1:
+            raise ValueError
+        item = records[0]
+        mounts = item["Mounts"]
+        expected_ports = {f"{port}/{protocol}": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]
+                          for port, protocol in ((18011, "tcp"), (18012, "udp"), (18013, "tcp"))}
+        if (item["Id"] != container or item["Name"] != "/" + SFU
+                or item["Config"]["Image"] != SFU_IMAGE
+                or any(item["Config"]["Labels"].get(key) != value for key, value in labels.items())
+                or item["Config"]["Cmd"] != ["--config", "/etc/livekit.yaml"]
+                or item["HostConfig"]["NetworkMode"] != NETWORK
+                or item["HostConfig"]["PortBindings"] != expected_ports
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", item["Image"]) is None
+                or (image is not None and item["Image"] != image)
+                or len(mounts) != 1 or mounts[0]["Type"] != "bind"
+                or mounts[0]["Source"] != str(SFU_CONFIG)
+                or mounts[0]["Destination"] != "/etc/livekit.yaml"
+                or mounts[0]["RW"] is not False
+                or type(item["State"]["Running"]) is not bool
+                or type(item["State"]["Pid"]) is not int):
+            raise ValueError
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+        raise RuntimeError("Owned SFU inspection rejected") from None
+    return item
+
+
+def remember_sfu(container: str, labels: dict[str, str]) -> None:
+    config, meta, root = private_bytes(SFU_CONFIG, 65536)
+    if not stat.S_ISDIR(root.st_mode) or root.st_uid != os.getuid() or root.st_mode & 0o077:
+        raise RuntimeError("Owned SFU fixture root rejected")
+    item = inspect_owned_sfu(container, labels)
+    if not item["State"]["Running"] or item["State"]["Pid"] <= 0:
+        raise RuntimeError("Owned SFU did not start")
+    record = {"protocol": 1, "container": container, "image": item["Image"], "labels": labels,
+              "root": [root.st_dev, root.st_ino], "config": [meta.st_dev, meta.st_ino],
+              "config_sha256": hashlib.sha256(config).hexdigest()}
+    write_private(SFU_OWNER, json.dumps(record, sort_keys=True) + "\n", create=True)
+
+
+def recovery_sfu() -> tuple[dict, dict]:
+    labels = recovery_identity()
+    if labels is None:
+        raise RuntimeError("Owned SFU recovery is not admitted")
+    data, _, owned_root = private_bytes(SFU_OWNER, 16384)
+    try:
+        record = json.loads(data, object_pairs_hook=unique_object)
+        if (set(record) != {"protocol", "container", "image", "labels", "root", "config", "config_sha256"}
+                or record["protocol"] != 1 or record["labels"] != labels):
+            raise ValueError
+        config, meta, root = private_bytes(SFU_CONFIG, 65536)
+        if (not stat.S_ISDIR(root.st_mode) or root.st_uid != os.getuid() or root.st_mode & 0o077
+                or (root.st_dev, root.st_ino) != (owned_root.st_dev, owned_root.st_ino)
+                or record["root"] != [root.st_dev, root.st_ino]
+                or record["config"] != [meta.st_dev, meta.st_ino]
+                or record["config_sha256"] != hashlib.sha256(config).hexdigest()):
+            raise ValueError
+        item = inspect_owned_sfu(record["container"], labels, image=record["image"])
+    except (ValueError, TypeError, KeyError):
+        raise RuntimeError("Owned SFU recovery capability rejected") from None
+    return record, item
+
+
+def sfu_outage() -> None:
+    record, before = recovery_sfu()
+    if not before["State"]["Running"] or before["State"]["Pid"] <= 0:
+        raise RuntimeError("Owned SFU was not live before outage")
+    owned_docker("container", "kill", "--signal", "KILL", record["container"])
+    _, after = recovery_sfu()
+    if after["State"]["Running"] or after["State"]["Pid"] != 0:
+        raise RuntimeError("Owned SFU outage is unproved")
+    print("MORPHEUS_SFU_CONTROL stopped", flush=True)
+
+
+def sfu_resume() -> None:
+    record, before = recovery_sfu()
+    if before["State"]["Running"] or before["State"]["Pid"] != 0:
+        raise RuntimeError("Owned SFU was not stopped before restart")
+    owned_docker("container", "start", record["container"])
+    _, after = recovery_sfu()
+    if (not after["State"]["Running"] or after["State"]["Pid"] <= 0
+            or after["State"]["StartedAt"] == before["State"]["StartedAt"]):
+        raise RuntimeError("Owned SFU restart is unproved")
+    wait_http("http://127.0.0.1:18011/", duration=20)
+    print("MORPHEUS_SFU_CONTROL restarted", flush=True)
 
 
 def exists(kind: str, name: str) -> bool:
@@ -498,17 +735,33 @@ def start_authorization(*, native_sfu: bool) -> None:
         raise
 
 
-def rtc_fixture() -> None:
+def room_creation_id(events, sender: str) -> str:
+    """Capture the exact immutable creation ID of this freshly created room."""
+    if not isinstance(events, list) or len(events) > 64:
+        raise RuntimeError("Fresh RTC room creation receipt unavailable")
+    creates = [event for event in events if isinstance(event, dict) and event.get("type") == "m.room.create"]
+    if len(creates) != 1:
+        raise RuntimeError("Fresh RTC room creation receipt unavailable")
+    event = creates[0]
+    identity = event.get("event_id")
+    if (event.get("sender") != sender or event.get("state_key") != ""
+            or not isinstance(identity, str) or not 2 <= len(identity) <= 512
+            or not identity.startswith("$") or any(ord(char) < 33 or ord(char) > 126 for char in identity)):
+        raise RuntimeError("Fresh RTC room creation receipt rejected")
+    return identity
+
+
+def rtc_fixture(*, group: bool = False) -> None:
     """Create a fresh E2EE account pair, separate from message/recovery QA."""
     server = matrix_env.SERVERS[0]
     if not running(SYNAPSE):
         raise RuntimeError("Run scripts/local_matrix_env.py up first")
     nonce = secrets.token_hex(8)
     accounts = []
-    for label, username in (
-        ("a_primary", f"rtcalice{nonce}"),
-        ("a_second_device", f"rtcbob{nonce}"),
-    ):
+    users = [("a_primary", f"rtcalice{nonce}"), ("a_second_device", f"rtcbob{nonce}")]
+    if group:
+        users.append(("a_third_device", f"rtccarol{nonce}"))
+    for label, username in users:
         accounts.append({
             "label": label,
             "username": username,
@@ -520,13 +773,14 @@ def rtc_fixture() -> None:
     path = STATE / f"accounts-{nonce}.json"
     # Keep generated passwords even if account registration is interrupted.
     private_file(path, json.dumps(data, indent=2) + "\n")
-    alice, bob = accounts
-    matrix_env.register(alice)
-    matrix_env.register(bob)
+    alice, bob = accounts[:2]
+    peers = accounts[1:]
+    for account in accounts:
+        matrix_env.register(account)
     room_id = matrix_env.create_room(alice, {
         "name": f"Morpheus native RTC {nonce}",
         "preset": "private_chat",
-        "invite": [bob["user_id"]],
+        "invite": [peer["user_id"] for peer in peers],
         "initial_state": [{
             "type": "m.room.encryption", "state_key": "",
             "content": {"algorithm": "m.megolm.v1.aes-sha2"},
@@ -562,7 +816,7 @@ def rtc_fixture() -> None:
     unencrypted_room_id = matrix_env.create_room(alice, {
         "name": f"Morpheus RTC unencrypted guard {nonce}",
         "preset": "private_chat",
-        "invite": [bob["user_id"]],
+        "invite": [peer["user_id"] for peer in peers],
     })
     data["rooms"]["unencrypted_room"] = unencrypted_room_id
     private_file(path, json.dumps(data, indent=2) + "\n")
@@ -571,6 +825,11 @@ def rtc_fixture() -> None:
         "/_matrix/client/v3/rooms/" + urllib.parse.quote(unencrypted_room_id, safe="") + "/join",
         token=matrix_env.login(bob)["access_token"], body={},
     )
+    if group:
+        for room in (room_id, unencrypted_room_id):
+            matrix_env.api(matrix_env.endpoint(server),
+                           "/_matrix/client/v3/rooms/" + urllib.parse.quote(room, safe="") + "/join",
+                           token=matrix_env.login(peers[1])["access_token"], body={})
     for account in accounts:
         joined = matrix_env.api(
             matrix_env.endpoint(server), "/_matrix/client/v3/joined_rooms",
@@ -578,6 +837,12 @@ def rtc_fixture() -> None:
         )["joined_rooms"]
         if room_id not in joined or unencrypted_room_id not in joined:
             raise RuntimeError(f"RTC fixture room absent for {account['label']}")
+    if recovery_identity() is not None:
+        events = matrix_env.api(matrix_env.endpoint(server),
+            "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="") + "/state",
+            token=alice_token)
+        data["outage_creation_event_id"] = room_creation_id(events, alice["user_id"])
+        private_file(path, json.dumps(data, indent=2) + "\n")
     print(path)
 
 
@@ -589,15 +854,22 @@ def up() -> None:
     if not exists("network", NETWORK):
         raise RuntimeError("Run scripts/local_matrix_env.py up first")
     matrix_env.stage("rtc_stop_native")
-    stop_native_sfu()
+    labels = recovery_identity()
+    if labels is None:
+        stop_native_sfu()
+    elif NATIVE_SFU_PID.exists():
+        raise RuntimeError("Owned SFU cannot take over a native process")
     matrix_env.stage("rtc_configs")
     write_configs()
     matrix_env.stage("rtc_federation")
     start_federation_bridge()
     matrix_env.stage("rtc_sfu")
+    if labels is not None and exists("container", SFU):
+        raise RuntimeError("Owned SFU creation requires an absent container")
     if not exists("container", SFU):
-        docker(
-            "run", "-d", "--name", SFU, "--network", NETWORK,
+        label_args = [part for key, value in (labels or {}).items() for part in ("--label", f"{key}={value}")]
+        created = docker(
+            "run", "-d", "--name", SFU, "--network", NETWORK, *label_args,
             "--network-alias", "morpheus-rtc.localhost",
             "--publish", "127.0.0.1:18011:18011/tcp",
             "--publish", "127.0.0.1:18012:18012/udp",
@@ -605,6 +877,16 @@ def up() -> None:
             "--mount", f"type=bind,src={SFU_CONFIG},dst=/etc/livekit.yaml,readonly",
             SFU_IMAGE, "--config", "/etc/livekit.yaml",
         )
+        if labels is not None:
+            container = created.stdout.strip()
+            try:
+                remember_sfu(container, labels)
+            except BaseException:
+                # The full ID was returned by this fresh creation, not recovered
+                # from a name. Refuse unknown identity instead of deleting by name.
+                inspect_owned_sfu(container, labels)
+                owned_docker("container", "rm", "--force", container)
+                raise
     elif not running(SFU):
         docker("start", SFU)
     start_authorization(native_sfu=False)
@@ -661,19 +943,41 @@ def status() -> None:
 
 
 def down() -> None:
-    stop_native_sfu()
-    for name in (AUTH, SFU_LOOPBACK, SFU, FEDERATION):
-        if exists("container", name):
-            docker("rm", "-f", name)
+    labels = recovery_identity()
+    if labels is None:
+        stop_native_sfu()
+        for name in (AUTH, SFU_LOOPBACK, SFU, FEDERATION):
+            if exists("container", name):
+                docker("rm", "-f", name)
+    else:
+        failures = []
+        if NATIVE_SFU_PID.exists():
+            failures.append("native_owner")
+        for name in (AUTH, SFU_LOOPBACK, SFU, FEDERATION):
+            try:
+                if name == SFU:
+                    if exists("container", SFU):
+                        record, _ = recovery_sfu()
+                        owned_docker("container", "rm", "--force", record["container"])
+                        SFU_OWNER.unlink()
+                elif exists("container", name):
+                    docker("rm", "-f", name)
+            except BaseException:
+                # Keep trying the other fresh fixture resources, then reject a
+                # clean receipt. Never delete a replacement SFU by its name.
+                failures.append("container_owner")
+        if failures:
+            raise RuntimeError("Owned RTC fixture teardown incomplete")
     print("Local RTC containers stopped; private config retained. Synapse A remains running.")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("up", "up-native", "rtc-fixture", "probe", "status", "down"))
+    parser.add_argument("command", choices=("up", "up-native", "rtc-fixture", "rtc-group-fixture", "sfu-outage", "sfu-resume", "probe", "status", "down"))
     args = parser.parse_args()
     {"up": up, "up-native": up_native, "rtc-fixture": rtc_fixture,
-     "probe": probe, "status": status, "down": down}[args.command]()
+     "rtc-group-fixture": lambda: rtc_fixture(group=True), "sfu-outage": sfu_outage,
+     "sfu-resume": sfu_resume, "probe": probe, "status": status, "down": down}[args.command]()
 
 
 def run_cli() -> int:

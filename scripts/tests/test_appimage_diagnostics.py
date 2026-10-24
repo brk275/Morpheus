@@ -17,6 +17,36 @@ import package_appimage as P
 
 
 class ProgressTests(unittest.TestCase):
+    def test_native_source_phase_commands_and_reasons_are_closed_and_scan_gated(self):
+        from corresponding_source import SourceFailure
+        commands = {"source-cargo-version", "source-rustc-version", "source-cargo-fetch", "cache-git-commit",
+                    "source-commit", "source-tree", "source-objects"}
+        self.assertTrue(commands <= D.COMMANDS)
+        reasons = {"input", "path", "bounds", "identity", "lock", "missing", "archive",
+                   "link", "submodule", "git", "manifest", "output"}
+        for reason in reasons:
+            self.assertEqual(D.reason(SourceFailure(reason)), "source_" + reason)
+        class ForeignFailure(SourceFailure):
+            @property
+            def reason(self):
+                raise AssertionError("foreign properties must never be inspected")
+        foreign = ForeignFailure.__new__(ForeignFailure)
+        self.assertEqual(D.reason(foreign), "unknown")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress = D.Progress(root)
+            progress.wrapper("source")
+            progress.command("source-cargo-fetch")
+            progress.failed(SourceFailure("missing"))
+            self.assertTrue(D.valid_record(progress.value))
+            self.assertEqual(progress.value["failure"]["wrapper_phase"], "source")
+            self.assertEqual(progress.value["failure"]["command_stage"], "source-cargo-fetch")
+            self.assertEqual(progress.value["failure"]["reason"], "source_missing")
+            withheld = D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="source_missing")
+            self.assertEqual(withheld, {"diagnostics": "withheld", "passed": False})
+            visible = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="source_missing")
+            self.assertEqual(visible["failure"]["reason"], "source_missing")
+
     def test_first_failure_position_survives_later_commands_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -203,6 +233,97 @@ class ProgressTests(unittest.TestCase):
                     if call in ("run", "command", "mark") and isinstance(node.args[0].value, str):
                         names.add(node.args[0].value)
         self.assertTrue(names <= D.COMMANDS, names - D.COMMANDS)
+
+    def package_failure_fixture(self, root, *, stdout=b"", stderr=b""):
+        progress = D.Progress(root)
+        progress.wrapper("build")
+        progress.command("package")
+        progress.failed(C.CommandFailure("exit"))
+        logs = root / "command-logs"
+        logs.mkdir(mode=0o700)
+        for name, data in (("stdout", stdout), ("stderr", stderr)):
+            path = logs / ("0042-package." + name + ".log")
+            path.write_bytes(data)
+            path.chmod(0o600)
+        return progress, logs
+
+    def test_packager_markers_require_scan_and_never_publish_raw_captured_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            secret = b"synthetic-confidential-filename-and-server-body"
+            trace = (b"Error running bundle_appimage.sh script: " + secret + b"\n"
+                     b"+ cp -r ../appimage_deb/data/usr morpheus-app.AppDir\n"
+                     b"+ cp /bounded/cache/AppRun-x86_64 AppRun\n"
+                     b"+ cp usr/share/icons/morpheus-app.png .DirIcon\n"
+                     b"+ ln -sf usr/share/icons/morpheus-app.png morpheus-app.png\n"
+                     b"+ ln -sf usr/share/applications/morpheus-app.desktop morpheus-app.desktop\n"
+                     b"+ dd if=/dev/zero bs=1 count=3 seek=8 conv=notrunc of=/bounded/cache/linuxdeploy-x86_64.AppImage\n"
+                     b"+ /bounded/cache/linuxdeploy-x86_64.AppImage --appimage-extract-and-run --appdir morpheus-app.AppDir --output appimage\n")
+            self.package_failure_fixture(root, stdout=secret, stderr=trace)
+            with mock.patch.object(D, "package_failure_markers", side_effect=AssertionError("not before scan")):
+                self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                                 {"diagnostics": "withheld", "passed": False})
+            facts = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(facts["failure"]["reason"], "command_exit")
+            markers = facts["package_failure_markers"]
+            self.assertEqual(markers["status"], "scanned_private_pair")
+            self.assertEqual(markers["error_markers"], ["appimage_script"])
+            self.assertEqual(markers["script_markers"], sorted(D.PACKAGER_SCRIPT_MARKERS))
+            encoded = json.dumps(facts)
+            self.assertNotIn(secret.decode(), encoded)
+            self.assertNotIn("/bounded/", encoded)
+            self.assertNotIn("bundle_appimage.sh", encoded)
+            self.assertNotIn("--appdir", encoded)
+
+    def test_packager_marker_reducer_is_closed_and_does_not_claim_a_cause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.package_failure_fixture(root, stderr=b"unknown arbitrary child output\n" + b"x" * 9000)
+            facts = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(facts["package_failure_markers"],
+                             {"status": "scanned_private_pair", "error_markers": [], "script_markers": []})
+            for token, literal in D.PACKAGER_ERROR_MARKERS.items():
+                path = root / "command-logs/0042-package.stderr.log"
+                path.write_bytes(literal + b" synthetic-not-published")
+                facts = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+                self.assertIn(token, facts["package_failure_markers"]["error_markers"])
+                self.assertTrue(set(facts["package_failure_markers"]["error_markers"]) <= set(D.PACKAGER_ERROR_MARKERS))
+                self.assertNotIn("synthetic-not-published", json.dumps(facts))
+
+    def test_packager_missing_logs_are_unavailable_and_unsafe_or_ambiguous_logs_withhold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, logs = self.package_failure_fixture(root)
+            stdout = logs / "0042-package.stdout.log"
+            stderr = logs / "0042-package.stderr.log"
+            stdout.unlink()
+            facts = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(facts["package_failure_markers"]["status"], "unavailable")
+            stdout.symlink_to(stderr)
+            self.assertEqual(D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit"),
+                             {"diagnostics": "withheld", "passed": False})
+            stdout.unlink()
+            stdout.write_bytes(b"")
+            stdout.chmod(0o644)
+            self.assertEqual(D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit"),
+                             {"diagnostics": "withheld", "passed": False})
+            stdout.chmod(0o600)
+            (logs / "0043-package.stdout.log").write_bytes(b"")
+            self.assertEqual(D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit"),
+                             {"diagnostics": "withheld", "passed": False})
+
+    def test_packager_log_reader_does_not_run_for_other_command_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress = D.Progress(root)
+            progress.command("native-build")
+            progress.failed(C.CommandFailure("exit"))
+            with mock.patch.object(D, "package_failure_markers", side_effect=AssertionError("wrong command")):
+                facts = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertNotIn("package_failure_markers", facts)
+        with mock.patch.object(D.Path, "lstat", side_effect=AssertionError("not before scan")):
+            self.assertEqual(D.package_failure_markers(Path("/unused"), scan_passed=False),
+                             {"status": "withheld", "error_markers": [], "script_markers": []})
 
 
 class OuterPublicationTests(unittest.TestCase):

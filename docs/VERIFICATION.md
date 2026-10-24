@@ -1,5 +1,47 @@
 # Verification log
 
+## Explicit manual CI selection
+
+Canonical `CI` manual dispatch defaults to `platform=all`, `checks=all` and
+`matrix_suite=full`: the complete Apple Silicon, Intel Mac, Windows and Linux
+native matrix and every existing check. Shared native changes and release
+acceptance still require that full scope. Automatic PR/main impact selection is
+unchanged and cannot consume manual narrowing inputs.
+
+After source review, a focused retry may select `linux`, `windows`, `macos-arm`
+or `macos-intel`, and one existing route: `models`, `desktop`, `devices`, `vendor`,
+`sdk`, `matrix` or `wayland`. `helpers` runs only the existing Linux validation
+helper job; `config` selects the existing Linux configuration job. Security
+history scanning and helper tests remain mandatory for every route. Focused
+Matrix/Wayland require explicit `platform=linux`. Only the Matrix route accepts
+one of the harness's existing non-full `--suite` choices; all other routes
+require `matrix_suite=full`. Unknown or incompatible choices fail closed.
+
+Routes select existing commands and their required setup/build inputs. Matrix
+and owned capture drivers compile their own existing test targets; focused
+routes omit unrelated desktop builds. The three core-only Matrix suites
+(`drafts-only`, `timeline-failures`, `media-only`) also omit the unrelated owned
+native screen client build. These partial results do not establish production
+app linkage or omitted tests. Routes do not create new test suites or relax assertions, deadlines, containment, cleanup
+or private log scans. The native outcome gate requires each selected command to
+run and pass and each omitted command to remain skipped. Preview publication
+remains limited to its existing reviewed automatic route. Manual invocations
+are public-repository, owner-only, standard hosted runs, with read-only tokens,
+no persisted checkout credentials and unchanged trusted-main-only cache writes.
+A focused result is partial evidence, never full matrix or beta acceptance.
+Focused native jobs and the aggregate use distinct names; they do not emit the
+canonical full `CI acceptance` status.
+Per-source/per-OS concurrency serializes runs of the same candidate and platform;
+inspect active jobs/results before dispatch rather than queueing a duplicate.
+
+PR and main runs are not automatically interchangeable. PR jobs test GitHub's
+synthetic merge revision using the reviewed base classifier and restore-only
+caches; main jobs test the actual merged revision, current classifier and main
+cache/provenance context. A green PR alone does not establish equal source,
+dependency, toolchain, build and verification inputs. This workflow keeps both
+triggers until exact producing-source/input equivalence and immutable results
+can be safely established; no merge verification is skipped on that inference.
+
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 

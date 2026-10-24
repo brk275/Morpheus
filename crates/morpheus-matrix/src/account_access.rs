@@ -13,6 +13,99 @@ const ACCESS_FILE: &str = "account-access.json";
 const GRANT_LIFETIME: Duration = Duration::from_secs(120);
 const VAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// One already-authorized local removal, never a source of new delete authority.
+/// The readiness/token drain and vault/store erasure have distinct receipts.
+pub(super) struct RemovalOwner {
+    account_id: String,
+    work: RemovalWork,
+    pending: Arc<AtomicBool>,
+}
+
+enum RemovalWork {
+    Draining(JoinHandle<()>),
+    Deleting(JoinHandle<(bool, bool)>),
+    Finished(RemovalReceipt),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum RemovalReceipt {
+    Drained,
+    Deleted { credentials: bool, store: bool },
+    Failed,
+}
+
+impl RemovalOwner {
+    fn poll_completion(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<RemovalReceipt> {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::Poll;
+        let receipt = match &mut self.work {
+            RemovalWork::Draining(task) => match Pin::new(task).poll(cx) {
+                Poll::Ready(Ok(())) => RemovalReceipt::Drained,
+                Poll::Ready(Err(error)) => failed_removal(error),
+                Poll::Pending => return Poll::Pending,
+            },
+            RemovalWork::Deleting(task) => match Pin::new(task).poll(cx) {
+                Poll::Ready(Ok((credentials, store))) => {
+                    RemovalReceipt::Deleted { credentials, store }
+                }
+                Poll::Ready(Err(error)) => failed_removal(error),
+                Poll::Pending => return Poll::Pending,
+            },
+            RemovalWork::Finished(receipt) => return Poll::Ready(*receipt),
+        };
+        // The real JoinHandle output, including task destructors, has been
+        // observed. No fallible drop/await precedes caching this exact receipt.
+        self.work = RemovalWork::Finished(receipt);
+        self.pending.store(false, Ordering::Release);
+        Poll::Ready(receipt)
+    }
+
+    pub(super) async fn observe(&mut self) -> RemovalReceipt {
+        std::future::poll_fn(|cx| self.poll_completion(cx)).await
+    }
+}
+
+fn failed_removal(error: tokio::task::JoinError) -> RemovalReceipt {
+    retain_join_panic(error);
+    RemovalReceipt::Failed
+}
+
+pub(super) fn retain_join_panic(error: tokio::task::JoinError) {
+    // A contribution's panic payload may itself panic on Drop. It must never
+    // unwind between consuming a task output and recording its joined receipt.
+    if let Ok(payload) = error.try_into_panic() {
+        std::mem::forget(payload);
+    }
+}
+
+impl Drop for RemovalOwner {
+    fn drop(&mut self) {
+        if !matches!(self.work, RemovalWork::Finished(_)) {
+            // A manager abandoned without stop has no clean shutdown receipt.
+            // Retain this exact task, its permit and profile lock rather than
+            // detach/abort it. This terminal retention is not a retryable drain.
+            let work = std::mem::replace(
+                &mut self.work,
+                RemovalWork::Finished(RemovalReceipt::Failed),
+            );
+            std::mem::forget(work);
+        }
+    }
+}
+
+fn incomplete_removal(id: &str) -> RemovalResult {
+    RemovalResult {
+        account_id: id.into(),
+        credentials_removed: false,
+        store_removed: false,
+        complete: false,
+    }
+}
 pub(super) struct AccessPermit {
     _worker: OwnedSemaphorePermit,
     _profile_lock: Arc<fs::File>,
@@ -223,10 +316,28 @@ fn entry(profile: &str) -> Result<keyring::Entry> {
 }
 
 impl AccountManager {
-    /// Includes detached OS workers after a read or removal timeout. Updaters
-    /// must not restart while this is true.
+    /// Includes OS workers after a read timeout and retained removal tasks
+    /// until their actual join is observed. This is refusal, not a completion
+    /// receipt; updaters must not restart while it is true.
     pub fn account_access_busy(&self) -> bool {
-        self.access_worker.available_permits() == 0
+        self.observe_ready_removal();
+        self.removal_pending.load(Ordering::Acquire) || self.access_worker.available_permits() == 0
+    }
+
+    fn observe_ready_removal(&self) {
+        if !self.removal_pending.load(Ordering::Acquire) {
+            return;
+        }
+        // UI/updater refusal queries never block, advance a provider future,
+        // write a registry, or start erasure. Only the actual retained task's
+        // Ready output can retire the admission bit. An active async waiter
+        // holds State, so this cannot replace its live waker with the noop one.
+        if let Ok(mut state) = self.state.try_lock()
+            && let Some(owner) = state.removal_owner.as_mut()
+        {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let _ = owner.poll_completion(&mut cx);
+        }
     }
 
     /// Explicit lost-password recovery is permitted only after verified local
@@ -443,11 +554,18 @@ impl AccountManager {
     }
 
     pub(super) fn access_permit(&self) -> Result<Arc<AccessPermit>> {
+        self.observe_ready_removal();
+        if self.removal_pending.load(Ordering::Acquire) {
+            return Err(MatrixCoreError::AccountAccessBusy);
+        }
         let worker = self
             .access_worker
             .clone()
             .try_acquire_owned()
             .map_err(|_| MatrixCoreError::AccountAccessBusy)?;
+        if self.removal_pending.load(Ordering::Acquire) {
+            return Err(MatrixCoreError::AccountAccessBusy);
+        }
         Ok(Arc::new(AccessPermit {
             _worker: worker,
             _profile_lock: self._access_lock.clone(),
@@ -474,8 +592,47 @@ impl AccountManager {
     /// account activation is performed. Incomplete cleanup remains visible and
     /// cannot be activated, including after restart.
     pub async fn remove_account(&self, id: &str) -> Result<RemovalResult> {
-        let permit = self.access_permit()?;
+        // Preserve the existing prompt Busy result for unrelated access work.
+        // Only a retained removal may be observed without a new permit.
+        self.observe_ready_removal();
+        let permit = if self.removal_pending.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(self.access_permit()?)
+        };
         let mut state = self.state.lock().await;
+        let mut drained = false;
+        if let Some(owner) = state.removal_owner.as_ref()
+            && owner.account_id != id
+        {
+            let RemovalWork::Finished(receipt) = &owner.work else {
+                return Err(MatrixCoreError::AccountAccessBusy);
+            };
+            let receipt = *receipt;
+            let original = owner.account_id.clone();
+            // This is only an already-joined A result. Settle A's authorized
+            // erasure, or retain its pending row/loaded owner after drain or
+            // failure. B's action never starts/retries any A deletion.
+            self.apply_removal_receipt(&mut state, &original, receipt)?;
+            state.removal_owner.take();
+        }
+        if let Some(owner) = state.removal_owner.as_mut() {
+            let receipt = match tokio::time::timeout(CLEANUP_TIMEOUT, owner.observe()).await {
+                Ok(receipt) => receipt,
+                Err(_) => return Ok(incomplete_removal(id)),
+            };
+            if !matches!(receipt, RemovalReceipt::Drained) {
+                return self.apply_removal_receipt(&mut state, id, receipt);
+            }
+            // Only this explicit remove request may advance a completed drain
+            // to erasure. A completion-only waiter never enters this path.
+            state.removal_owner.take();
+            drained = true;
+        }
+        let permit = match permit {
+            Some(permit) => permit,
+            None => self.access_permit()?,
+        };
         if !state
             .registry
             .accounts
@@ -510,30 +667,34 @@ impl AccountManager {
             self.publish_active_account(None);
             self.sync_tx.send_replace(SyncStatus::Stopped);
         }
-        // Drain the owned readiness watcher and any started refresh write
-        // before deletion. Keep the existing total shutdown bound and retain
-        // both join handles if that wait is cancelled or runs out of time.
-        if let Some(loaded) = state.loaded.get(id) {
-            if !loaded.try_stop_owned_tasks(CLEANUP_TIMEOUT).await {
-                let loaded = loaded.clone();
-                // The API can report pending cleanup promptly, while the
-                // retained permit keeps updater restart and another cleanup
-                // from racing the in-flight vault write.
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    loaded.stop_owned_tasks().await;
-                });
-                return Ok(RemovalResult {
-                    account_id: id.into(),
-                    credentials_removed: false,
-                    store_removed: false,
-                    complete: false,
-                });
+        if !drained && let Some(loaded) = state.loaded.get(id).cloned() {
+            let account_id = id.to_owned();
+            let drain_permit = permit.clone();
+            self.removal_pending.store(true, Ordering::Release);
+            let task = tokio::spawn(async move {
+                let _permit = drain_permit;
+                loaded.stop_owned_tasks().await;
+            });
+            state.removal_owner = Some(RemovalOwner {
+                account_id,
+                work: RemovalWork::Draining(task),
+                pending: self.removal_pending.clone(),
+            });
+            let owner = state.removal_owner.as_mut().expect("removal drain owner");
+            let receipt = match tokio::time::timeout(CLEANUP_TIMEOUT, owner.observe()).await {
+                Ok(receipt) => receipt,
+                Err(_) => return Ok(incomplete_removal(id)),
+            };
+            if !matches!(receipt, RemovalReceipt::Drained) {
+                return self.apply_removal_receipt(&mut state, id, receipt);
             }
+            state.removal_owner.take();
         }
         state.loaded.remove(id);
         let account_id = id.to_owned();
+        let owner_id = account_id.clone();
         let account_dir = self.data_dir.join("accounts").join(id);
+        self.removal_pending.store(true, Ordering::Release);
         let worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let credentials_removed = vault_entry(KEYRING_SERVICE, &account_id)
@@ -553,10 +714,59 @@ impl AccountManager {
             };
             (credentials_removed, store_removed)
         });
-        let result = tokio::time::timeout(CLEANUP_TIMEOUT, worker).await;
-        let (credentials_removed, store_removed) = match result {
-            Ok(Ok(value)) => value,
-            _ => (false, false),
+        // No await between native task creation and publishing its sole owner.
+        state.removal_owner = Some(RemovalOwner {
+            account_id: owner_id,
+            work: RemovalWork::Deleting(worker),
+            pending: self.removal_pending.clone(),
+        });
+        let owner = state.removal_owner.as_mut().expect("removal erasure owner");
+        match tokio::time::timeout(CLEANUP_TIMEOUT, owner.observe()).await {
+            Ok(receipt) => self.apply_removal_receipt(&mut state, id, receipt),
+            Err(_) => Ok(incomplete_removal(id)),
+        }
+    }
+
+    /// Observe only an already-started removal for this exact account. This
+    /// never starts/retries a vault operation or deletes a store. A completed
+    /// readiness/token drain is still incomplete; a later explicit remove is
+    /// needed to authorize erasure. Caller cancellation retains the real task.
+    pub async fn finish_pending_account_removal(&self, id: &str) -> Result<RemovalResult> {
+        let mut state = self.state.lock().await;
+        let owner = state
+            .removal_owner
+            .as_mut()
+            .ok_or(MatrixCoreError::AccountRemovalPending)?;
+        if owner.account_id != id {
+            return Err(MatrixCoreError::AccountAccessBusy);
+        }
+        let receipt = owner.observe().await;
+        self.apply_removal_receipt(&mut state, id, receipt)
+    }
+
+    fn apply_removal_receipt(
+        &self,
+        state: &mut State,
+        id: &str,
+        receipt: RemovalReceipt,
+    ) -> Result<RemovalResult> {
+        if !state
+            .registry
+            .pending_removals
+            .iter()
+            .any(|pending| pending == id)
+            || !state
+                .registry
+                .accounts
+                .iter()
+                .any(|account| account.id == id)
+        {
+            return Err(MatrixCoreError::AccountRemovalPending);
+        }
+        let (credentials_removed, store_removed) = match receipt {
+            RemovalReceipt::Drained => return Ok(incomplete_removal(id)),
+            RemovalReceipt::Deleted { credentials, store } => (credentials, store),
+            RemovalReceipt::Failed => (false, false),
         };
         let complete = credentials_removed && store_removed;
         if complete {
@@ -566,6 +776,9 @@ impl AccountManager {
             save_registry(&self.data_dir, &next)?;
             state.registry = next;
         }
+        // A failed final registry save leaves the observed result reachable;
+        // retry then commits that result without another vault/store deletion.
+        state.removal_owner.take();
         Ok(RemovalResult {
             account_id: id.into(),
             credentials_removed,
@@ -614,6 +827,7 @@ mod tests {
     use super::*;
 
     use keyring::credential::CredentialApi;
+    use std::future::Future;
     use std::sync::{Mutex as StdMutex, OnceLock};
 
     type MockEntries = HashMap<(String, String), Arc<keyring::mock::MockCredential>>;
@@ -706,6 +920,7 @@ mod tests {
     struct ControlledCredential {
         backing: Arc<keyring::mock::MockCredential>,
         before_write: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+        before_delete: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     }
     impl CredentialApi for ControlledCredential {
         fn set_secret(&self, value: &[u8]) -> std::result::Result<(), keyring::Error> {
@@ -718,6 +933,10 @@ mod tests {
             self.backing.get_secret()
         }
         fn delete_credential(&self) -> std::result::Result<(), keyring::Error> {
+            let before_delete = self.before_delete.lock().unwrap().take();
+            if let Some(before_delete) = before_delete {
+                before_delete();
+            }
             self.backing.delete_credential()
         }
         fn as_any(&self) -> &dyn std::any::Any {
@@ -734,10 +953,27 @@ mod tests {
             Arc::new(ControlledCredential {
                 backing: backing.clone(),
                 before_write: StdMutex::new(Some(Box::new(before_write))),
+                before_delete: StdMutex::new(None),
             }),
         );
         backing
     }
+    fn controlled_removal_credential(
+        id: &str,
+        before_delete: impl FnOnce() + Send + 'static,
+    ) -> Arc<keyring::mock::MockCredential> {
+        let backing = Arc::new(keyring::mock::MockCredential::default());
+        overrides().lock().unwrap().insert(
+            (KEYRING_SERVICE.into(), id.into()),
+            Arc::new(ControlledCredential {
+                backing: backing.clone(),
+                before_write: StdMutex::new(None),
+                before_delete: StdMutex::new(Some(Box::new(before_delete))),
+            }),
+        );
+        backing
+    }
+
     fn login_secret(account: &AccountInfo) -> StoredSecret {
         StoredSecret {
             version: SECRET_VERSION,
@@ -1439,6 +1675,389 @@ mod tests {
     }
 
     #[test]
+    fn pending_erasure_retains_the_same_worker_through_cancel_retry_and_stop() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let saved = account();
+            let other = account();
+            let path = directory.0.join("accounts").join(&saved.id);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("keep"), b"owned cleanup fixture").unwrap();
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts = vec![saved.clone(), other.clone()];
+                save_registry(&directory.0, &state.registry).unwrap();
+            }
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            let (entered, waiting) = oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let credential = controlled_removal_credential(&saved.id, move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = entered.send(());
+                // Disconnect also releases the fixture during unwinding. The
+                // normal path explicitly releases and joins before asserting.
+                let _ = held.recv();
+            });
+            credential.set_password("owned cleanup fixture").unwrap();
+            let observations = async {
+                let first =
+                    tokio::time::timeout(Duration::from_secs(5), manager.remove_account(&saved.id))
+                        .await
+                        .map_err(|_| "removal did not return its bounded pending result")?
+                        .map_err(|_| "initial removal failed before observation")?;
+                tokio::time::timeout(Duration::from_secs(2), waiting)
+                    .await
+                    .map_err(|_| "native removal did not enter")?
+                    .map_err(|_| "native removal observation closed")?;
+                let mut waiter = Box::pin(manager.finish_pending_account_removal(&saved.id));
+                let waiter_pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(waiter.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                drop(waiter);
+                let mut retry = Box::pin(manager.remove_account(&saved.id));
+                let retry_pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(retry.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                drop(retry);
+                let foreign_refused = matches!(
+                    manager.remove_account(&other.id).await,
+                    Err(MatrixCoreError::AccountAccessBusy)
+                );
+                let still_blocked = manager
+                    .app_password_status()
+                    .await
+                    .pending_removals
+                    .contains(&saved.id);
+                Ok::<_, &'static str>((
+                    first,
+                    waiter_pending,
+                    retry_pending,
+                    foreign_refused,
+                    still_blocked,
+                ))
+            }
+            .await;
+            let mut stopping = Box::pin(manager.stop());
+            let stop_pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(stopping.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            let released = release.send(()).is_ok();
+            let stopped = tokio::time::timeout(Duration::from_secs(5), stopping).await;
+            if stopped.is_err() {
+                // There is no joined receipt. Keep both the actual manager
+                // owner and its profile; never repair the test by deleting it.
+                std::mem::forget(manager);
+                std::mem::forget(directory);
+                panic!("owned removal shutdown did not join");
+            }
+            let completion = manager.finish_pending_account_removal(&saved.id).await;
+            let remaining = manager.accounts().await;
+            let store_removed = !path.exists();
+            let credential_removed =
+                matches!(credential.get_secret(), Err(keyring::Error::NoEntry));
+            let (first, waiter_pending, retry_pending, foreign_refused, still_blocked) =
+                observations.expect("held removal observations failed");
+            assert!(!first.complete && !first.credentials_removed && !first.store_removed);
+            assert!(waiter_pending && retry_pending && foreign_refused && still_blocked);
+            assert!(stop_pending && released);
+            let completion = completion.expect("actual erasure receipt missing");
+            assert!(
+                completion.complete && completion.credentials_removed && completion.store_removed
+            );
+            assert_eq!(completion.account_id, saved.id);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "retry must observe the original worker"
+            );
+            assert!(store_removed && credential_removed);
+            assert_eq!(remaining, [other]);
+        });
+    }
+
+    #[test]
+    fn cancelled_token_drain_is_retained_and_its_receipt_never_authorizes_erasure() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let saved = account();
+            let other = account();
+            let other_path = directory.0.join("accounts").join(&other.id);
+            fs::create_dir(&other_path).unwrap();
+            vault_entry(KEYRING_SERVICE, &other.id)
+                .set_password("owned other fixture")
+                .unwrap();
+            let path = directory.0.join("accounts").join(&saved.id);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("keep"), b"owned drain fixture").unwrap();
+            let client = Client::builder()
+                .homeserver_url("http://127.0.0.1:9")
+                .build()
+                .await
+                .unwrap();
+            let loaded = Arc::new(LoadedAccount::new(
+                client,
+                saved.id.clone(),
+                String::new(),
+                manager._access_lock.clone(),
+            ));
+            loaded.stop_owned_tasks().await;
+            let (release, held) = oneshot::channel();
+            let lock = manager._access_lock.clone();
+            let task = tokio::spawn(async move {
+                let _lock = lock;
+                let _ = held.await;
+            });
+            *loaded.token_task.lock().await = Some(SyncTask {
+                shutdown: None,
+                task,
+            });
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts = vec![saved.clone(), other.clone()];
+                state.loaded.insert(saved.id.clone(), loaded.clone());
+                save_registry(&directory.0, &state.registry).unwrap();
+            }
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            let credential = controlled_removal_credential(&saved.id, move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+            credential.set_password("owned drain fixture").unwrap();
+            let observations = async {
+                let mut token_wait = Box::pin(loaded.stop_token_persistence());
+                let token_pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(token_wait.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                drop(token_wait);
+                let token_still_owned = loaded.token_task.lock().await.is_some();
+                let removal =
+                    tokio::time::timeout(Duration::from_secs(5), manager.remove_account(&saved.id))
+                        .await
+                        .map_err(|_| "drain did not return its bounded pending result")?
+                        .map_err(|_| "drain failed before observation")?;
+                let mut waiter = Box::pin(manager.finish_pending_account_removal(&saved.id));
+                let waiter_pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(waiter.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                drop(waiter);
+                Ok::<_, &'static str>((token_pending, token_still_owned, removal, waiter_pending))
+            }
+            .await;
+            let released = release.send(()).is_ok();
+            let completion = tokio::time::timeout(
+                Duration::from_secs(5),
+                manager.finish_pending_account_removal(&saved.id),
+            )
+            .await;
+            if completion.is_err() {
+                std::mem::forget(loaded);
+                std::mem::forget(manager);
+                std::mem::forget(directory);
+                panic!("owned token drain did not join");
+            }
+            let completion = completion.unwrap();
+            let credential_preserved = credential.get_secret().is_ok();
+            let store_preserved = path.join("keep").is_file();
+            let no_delete = calls.load(Ordering::SeqCst) == 0;
+            let token_joined = loaded.token_task.lock().await.is_none();
+            let unrelated = manager.remove_account(&other.id).await;
+            let original_preserved_after_b = credential.get_secret().is_ok()
+                && path.join("keep").is_file()
+                && calls.load(Ordering::SeqCst) == 0
+                && manager
+                    .app_password_status()
+                    .await
+                    .pending_removals
+                    .contains(&saved.id)
+                && manager.state.lock().await.loaded.contains_key(&saved.id);
+            let explicit_removal = manager.remove_account(&saved.id).await;
+            manager.stop().await;
+            let (token_pending, token_still_owned, first, waiter_pending) =
+                observations.expect("held token observations failed");
+            assert!(released && token_pending && token_still_owned && waiter_pending);
+            assert!(!first.complete && !first.credentials_removed && !first.store_removed);
+            let completion = completion.expect("actual drain receipt missing");
+            assert!(
+                !completion.complete
+                    && !completion.credentials_removed
+                    && !completion.store_removed
+            );
+            assert!(credential_preserved && store_preserved && no_delete && token_joined);
+            assert!(
+                unrelated
+                    .expect("unrelated removal after an actual drain failed")
+                    .complete
+            );
+            assert!(original_preserved_after_b);
+            assert!(
+                explicit_removal
+                    .expect("explicit post-drain removal failed")
+                    .complete
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn busy_query_joins_completed_erasure_without_runtime_or_foreign_account_lockout() {
+        let runtime = runtime();
+        let directory = TestDirectory::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let saved = account();
+        let other = account();
+        for account in [&saved, &other] {
+            fs::create_dir(directory.0.join("accounts").join(&account.id)).unwrap();
+        }
+        runtime.block_on(async {
+            let mut state = manager.state.lock().await;
+            state.registry.accounts = vec![saved.clone(), other.clone()];
+            save_registry(&directory.0, &state.registry).unwrap();
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let (entered, waiting) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let credential = controlled_removal_credential(&saved.id, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = entered.send(());
+            let _ = held.recv();
+        });
+        credential.set_password("owned busy query fixture").unwrap();
+        vault_entry(KEYRING_SERVICE, &other.id)
+            .set_password("owned unrelated fixture")
+            .unwrap();
+        let observations = runtime.block_on(async {
+            let pending =
+                tokio::time::timeout(Duration::from_secs(5), manager.remove_account(&saved.id))
+                    .await
+                    .map_err(|_| "initial erasure did not return its bounded result")?
+                    .map_err(|_| "initial erasure failed")?;
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .map_err(|_| "owned provider did not enter")?
+                .map_err(|_| "owned provider observation closed")?;
+            Ok::<_, &'static str>(pending)
+        });
+        let before_release_busy = manager.account_access_busy();
+        let released = release.send(()).is_ok();
+        // This is the synchronous production UI/updater query, outside every
+        // runtime context. Every iteration polls the actual retained handle;
+        // the later typed receipt is mandatory, never a time/count inference.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut joined_by_query = false;
+        while Instant::now() < deadline {
+            if !manager.account_access_busy() {
+                joined_by_query = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let actual_receipt = runtime.block_on(async {
+            let state = manager.state.lock().await;
+            state.removal_owner.as_ref().is_some_and(|owner| {
+                owner.account_id == saved.id
+                    && matches!(
+                        owner.work,
+                        RemovalWork::Finished(RemovalReceipt::Deleted {
+                            credentials: true,
+                            store: true
+                        })
+                    )
+            })
+        });
+        let unrelated = runtime.block_on(manager.remove_account(&other.id));
+        let stopped = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), manager.stop()).await });
+        if stopped.is_err() {
+            std::mem::forget(manager);
+            std::mem::forget(directory);
+            std::mem::forget(runtime);
+            panic!("owned busy-query cleanup did not join");
+        }
+        let (accounts, pending) = runtime.block_on(async {
+            (
+                manager.accounts().await,
+                manager.app_password_status().await.pending_removals,
+            )
+        });
+        let removed = !directory.0.join("accounts").join(&saved.id).exists()
+            && !directory.0.join("accounts").join(&other.id).exists()
+            && matches!(credential.get_secret(), Err(keyring::Error::NoEntry));
+        let first = observations.expect("owned busy-query observations failed");
+        assert!(!first.complete);
+        assert!(before_release_busy && released && joined_by_query && actual_receipt);
+        assert!(
+            unrelated
+                .expect("joined foreign receipt must not block unrelated removal")
+                .complete
+        );
+        assert!(removed && accounts.is_empty() && pending.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn panicked_erasure_stays_incomplete_and_completion_cannot_retry_it() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let saved = account();
+            let path = directory.0.join("accounts").join(&saved.id);
+            fs::create_dir(&path).unwrap();
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts.push(saved.clone());
+                save_registry(&directory.0, &state.registry).unwrap();
+            }
+            struct PanicOnDrop(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for PanicOnDrop {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    panic!("owned panic payload must be retained");
+                }
+            }
+            let payload_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = payload_drops.clone();
+            let credential = controlled_removal_credential(&saved.id, move || {
+                std::panic::panic_any(PanicOnDrop(counted));
+            });
+            credential.set_password("owned failure fixture").unwrap();
+            let failed = manager.remove_account(&saved.id).await;
+            let completion = manager.finish_pending_account_removal(&saved.id).await;
+            let blocked = manager
+                .app_password_status()
+                .await
+                .pending_removals
+                .contains(&saved.id);
+            let preserved = path.is_dir() && credential.get_secret().is_ok();
+            // The failed worker has actually joined. Clean the disposable
+            // fixture only through a separately requested removal.
+            let explicit = manager.remove_account(&saved.id).await;
+            manager.stop().await;
+            let failed = failed.expect("panic must have a fixed incomplete result");
+            assert!(!failed.complete && !failed.credentials_removed && !failed.store_removed);
+            assert!(matches!(
+                completion,
+                Err(MatrixCoreError::AccountRemovalPending)
+            ));
+            assert!(blocked && preserved);
+            assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+            assert!(
+                explicit
+                    .expect("explicit removal after a joined failure failed")
+                    .complete
+            );
+        });
+    }
+
+    #[test]
     fn removal_is_local_and_partial_cleanup_stays_retryable() {
         runtime().block_on(async {
             let directory = TestDirectory::new();
@@ -1802,6 +2421,7 @@ mod tests {
                 recovery_ready: watch::channel(false).0,
                 incoming_verification_tx,
                 verification_book: Default::default(),
+                peer_verifications: Default::default(),
                 notification_handler_registered: Mutex::new(false),
                 token_task: Mutex::new(Some(SyncTask {
                     shutdown: Some(shutdown),

@@ -24,7 +24,10 @@ mod audio_device;
 #[cfg(feature = "device-audio")]
 mod ring_audio;
 #[cfg(feature = "device-audio")]
-pub use ring_audio::{PcmPlayback, RingAudioAuthority, RingAudioError, RingPlayback};
+pub use ring_audio::{
+    PcmPlayback, RingAudioAuthority, RingAudioError, RingAudioReleaseError, RingPlayback,
+    wait_for_ring_audio_release,
+};
 #[cfg(all(feature = "device-screen", target_os = "linux"))]
 mod linux_portal;
 #[cfg(feature = "native-rtc")]
@@ -42,8 +45,9 @@ mod video_device;
 
 #[cfg(feature = "device-audio")]
 pub use audio_device::{
-    AudioControls, AudioDevice, AudioDeviceCatalog, AudioDeviceSelection, AudioOutput, AudioResume,
-    AudioRoute, AudioState, DeviceRoute, MicrophoneCapture, RouteNotice, audio_devices,
+    AudioControls, AudioDevice, AudioDeviceCatalog, AudioDeviceReleaseError, AudioDeviceSelection,
+    AudioOutput, AudioResume, AudioRoute, AudioState, DeviceRoute, MicrophoneCapture, RouteNotice,
+    audio_devices, wait_for_audio_device_release,
 };
 #[cfg(feature = "native-rtc")]
 pub use matrix_rtc_call_sdk::CallEvent as RtcCallEvent;
@@ -297,3 +301,21 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(target_os = "macos", feature = "device-audio"))]
+mod coreaudio_close;
+#[cfg(all(target_os = "macos", feature = "device-audio"))]
+pub use coreaudio_close::{
+    CoreAudioCloseError, close_retired_coreaudio_on_owned_worker, wait_for_all_coreaudio_release,
+    wait_for_retired_coreaudio_release,
+};
+
+#[cfg(all(target_os = "linux", feature = "device-audio"))]
+mod alsa_close;
+#[cfg(all(target_os = "linux", feature = "device-audio"))]
+pub use alsa_close::{
+    AlsaBackendCloseError, close_retired_alsa_on_owned_worker, wait_for_all_alsa_release,
+    wait_for_retired_alsa_release,
+};
+#[cfg(all(windows, feature = "device-audio"))]
+pub use cpal::{WasapiCloseError, WasapiCloseObservation, WasapiUiContext, begin_wasapi_shutdown};

@@ -466,12 +466,47 @@ fn a_mark_survives_a_room_switch_and_shutdown_retires_it_first() {
     assert!(shutdown.contains("state.stopping = true"));
     assert!(shutdown.contains("cancellation.cancel()"));
     let main = include_str!("../main.rs").replace("\r\n", "\n");
-    let (_, after_run) = main.split_once("let ui_result = ui.run();").unwrap();
-    let stop = after_run
-        .find("unread_navigation_ui.shutdown(&ui);")
-        .unwrap();
-    let first_wait = after_run.find(".await").unwrap();
-    assert!(stop < first_wait, "retired before any wait");
+    let (_, application) = main
+        .split_once("fn run_application(")
+        .expect("ordinary application lifecycle");
+    let (_, cleanup) = application
+        .split_once("let cleanup = move || {")
+        .expect("shared UI-thread cleanup closure");
+    let (synchronous, asynchronous) = cleanup
+        .split_once("async move {")
+        .expect("mandatory async cleanup follows synchronous revocation");
+    assert!(
+        synchronous.contains("unread_navigation_ui.shutdown(&cleanup_ui);"),
+        "unread shutdown stays in the actual synchronous UI revocation prefix"
+    );
+    assert!(!synchronous.contains(".await"), "retired before any wait");
+    assert_eq!(
+        cleanup.matches("unread_navigation_ui.shutdown(").count(),
+        1,
+        "the shared cleanup retires unread work exactly once"
+    );
+    // Windows keeps its STA pumping while the same mandatory cleanup runs;
+    // the other native and non-native routes both run it after the UI loop.
+    // Guard every route instead of looking for the old ui_result binding.
+    assert_eq!(
+        asynchronous
+            .matches("windows_audio::run(&ui, wasapi_ui, &runtime, cleanup)?")
+            .count(),
+        1
+    );
+    assert_eq!(asynchronous.matches("let result = ui.run();").count(), 2);
+    assert_eq!(
+        asynchronous.matches("runtime.block_on(cleanup())").count(),
+        2
+    );
+    let windows = include_str!("../windows_audio.rs").replace("\r\n", "\n");
+    let (_, driver) = windows.split_once("pub(crate) fn run<R, F>(").unwrap();
+    let revoke = driver.find("let future = cleanup();").unwrap();
+    let spawn = driver.find("Some(handle.spawn(future))").unwrap();
+    assert!(
+        revoke < spawn,
+        "UI revocation happens before async cleanup is spawned"
+    );
 }
 
 /// U3 and U6: the divider is exactly the row the core placed (the first shown

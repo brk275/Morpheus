@@ -454,3 +454,77 @@ python3 scripts/local_matrix_env.py down
 Stop RTC first so the shared Docker network can be removed. The private
 credential/config files and Synapse volumes remain for repeat runs. The RTC
 script never stops Synapse B or deletes its data.
+# Explicit Current app outage/restart gate
+
+The permanent Linux Matrix selector `rtc-recovery` is a separately required
+release check. It is opt-in: the existing `full`, transport reconnect,
+invitation, and Element cases keep their original composition. Neither a green
+default run nor source inspection proves this outage gate passed.
+
+After independent source review, an owner-selected standard hosted run uses the
+existing CI inputs `platform=linux`, `checks=matrix`, and
+`matrix_suite=rtc-recovery`. The existing private disposable Synapse/Secret
+Service/LiveKit lifecycle, scanner-first diagnostics, PID namespace and
+unconditional container/network cleanup remain mandatory. No installer,
+credential, raw log, key or token is uploaded.
+
+The selector compiles the existing app test binary once, proves its exact
+ignored test is listed, lists and executes all five fixed spectral/checkpoint
+and loaded-library refusal regressions with exact once/nonzero evidence, and requires one real
+executed outage case for each fresh fixture: Current DM with two participants and Current room with three. The
+exact test is
+`outgoing_ring::live_tests::outage_tests::current_call_recovers_from_owned_sfu_restart`.
+Only this selector mints the private per-run SFU identity. The helper binds the
+fresh full container ID, source/run labels, pinned image, private config inode
+and digest, network and loopback-only mounts/ports before each kill/start/remove
+operation. It never falls back to a name or native PID-file signal target.
+
+The app must enter its real bounded end-to-rejoin path before that exact SFU is
+restarted. Its original account selection and call token stay current, while
+the actual membership, native session identity and video presentation change.
+Fixture peers explicitly leave/rejoin their own transports. Both remote peers
+in the room case must appear as distinct current roster memberships and deliver
+new bright synthetic camera frames, replacing dark pre-outage frames. Actual
+key-event metadata must name the new peer identities; key indices need not
+increase across a new session and no key bytes are observed. These real events
+alone do not prove native key installation: fresh decoded camera and actual
+native speaker output remain mandatory.
+
+The original authenticated encrypted invitation is discovered through sync.
+After recovery a new encrypted message must cross an actual observer sync
+callback barrier; the complete bounded room history is then fetched and
+decrypted through its actual `m.room.create` boundary (the exact creation event
+ID captured from the fresh fixture, creator and empty state key). A missing pagination token alone is not completeness.
+Missing, undecryptable, duplicate, truncated or cycling history fails.
+Exactly the original notification must remain in that interval, including its
+known ID if the app retracted it. Sampled keyless cache absence is not this proof.
+
+The explicit Ubuntu 24.04 child also exclusively creates a private ALSA config
+before native device access. Its selected paced-silence microphone and speaker
+are built-in plug/file/null endpoints backed by retained descriptors; there is
+no hardware/default fallback and no PCM is saved. Actual Alice and Carol RTC
+publications feed the app's real per-remote mixer and CPAL speaker. Three fresh
+100ms output windows must contain Alice's 500Hz before / 1100Hz after tone and,
+for the room, Carol's distinct 700Hz before / 1700Hz after tone. Both new tones
+are required and old frequencies rejected. Old producers stop and actually join
+before outage; new tones start only after new call identities and key-event
+checks, with a fresh sink checkpoint. Cleanup retains every producer handle and
+waits actual app/peer/native retirement before stopping the drainer, joining its
+real I/O worker and closing borrowed descriptors. Any unproved operation fails.
+This is synthetic native mixed remote playback, not physical audibility or
+microphone capture/resumption. Before any native PCM open, the fixture binds all
+five actual linked ALSA entrypoint/getter addresses to the same opened,
+root-owned, non-writable mapped object and its exact reviewed package bytes,
+then checks the bounded same-object version literal. The admitted object is
+Ubuntu 24.04 amd64 `libasound2t64_1.2.11-1ubuntu0.3`, not an arbitrary library
+with the same SONAME or version. It rechecks this identity before evidence and
+retirement; a different or uncertain object fails instead of falling back.
+The private identity record is checked and removed with the owned config.
+The separate Ubuntu 22 compatibility route is not this evidence.
+
+This source prepares Current outgoing-app recovery coverage only. Until fresh
+hosted execution succeeds it supplies no outage, key rotation or group recovery
+acceptance. It does not establish Sticky/Element, incoming-app automatic rejoin,
+physical microphone/speaker/camera, general native backend/device acceptance,
+installed-package, or whole-beta readiness. Source preparation is not an outage,
+key rotation, group voice recovery or cleanup result.

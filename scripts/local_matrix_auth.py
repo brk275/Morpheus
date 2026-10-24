@@ -73,6 +73,10 @@ class Stage(str, Enum):
 
 class Failure(str, Enum):
     FIXTURE_OPERATION = "fixture_operation"
+    REGISTRATION_COMMAND = "registration_command"
+    REGISTRATION_EXIT_TWO = "registration_exit_two"
+    REGISTRATION_EXIT_EXEC = "registration_exit_exec"
+    REGISTRATION_EXIT_OTHER = "registration_exit_other"
     BROWSER_PROTOCOL = "browser_protocol"
     CALLBACK_FRAGMENT = "browser_callback_fragment"
     CALLBACK_QUERY = "browser_callback_query"
@@ -103,6 +107,16 @@ def set_stage(stage: Stage):
 
 class FixtureError(RuntimeError):
     """Internal descriptions never leave the CLI's fixed-enum failure boundary."""
+
+
+class RegistrationError(FixtureError):
+    def __init__(self, failure: Failure):
+        if not isinstance(failure, Failure) or failure not in (
+                Failure.REGISTRATION_COMMAND, Failure.REGISTRATION_EXIT_TWO,
+                Failure.REGISTRATION_EXIT_EXEC, Failure.REGISTRATION_EXIT_OTHER):
+            raise TypeError("registration failure must be a fixed registration enum")
+        self.failure = failure
+        super().__init__("OAuth fixture registration did not complete")
 
 
 class BrowserCallbackError(FixtureError):
@@ -457,6 +471,27 @@ def wait_ready(url: str, *, expected_issuer: str | None = None):
     raise FixtureError("OAuth fixture service did not become ready")
 
 
+def register_fixture_user(docker: Docker, mas: str, account: dict):
+    # An URL-safe generated password may start with '-'. Keep the value in the
+    # same argv item as its option so clap never treats it as a new flag. The
+    # password, command and raw service diagnostics stay in the private fixture.
+    try:
+        result = docker.run(
+            "exec", mas, "/usr/local/bin/mas-cli", "--config", "/fixture/mas.yaml",
+            "manage", "register-user", account["username"], "--password=" + account["password"],
+            "--yes", "--no-admin", output=docker.root / "registration.log", check=False,
+        )
+    except FixtureError:
+        raise RegistrationError(Failure.REGISTRATION_COMMAND) from None
+    # These categories identify only the observed command boundary. Exit two
+    # is not proof of an argument error, and 126/127 do not expose engine text.
+    if result.returncode:
+        failure = (Failure.REGISTRATION_EXIT_TWO if result.returncode == 2 else
+                   Failure.REGISTRATION_EXIT_EXEC if result.returncode in (126, 127) else
+                   Failure.REGISTRATION_EXIT_OTHER)
+        raise RegistrationError(failure)
+
+
 def up(root: Path) -> Path:
     set_stage(Stage.ROOT)
     if sys.platform != "linux":
@@ -534,9 +569,7 @@ def up(root: Path) -> Path:
         # The modern MAS CLI has a positional username. --yes avoids interactive
         # command echo; output and diagnostics remain private and are not uploaded.
         set_stage(Stage.REGISTRATION)
-        docker.run("exec", mas, "/usr/local/bin/mas-cli", "--config", "/fixture/mas.yaml",
-                   "manage", "register-user", account["username"], "--password", account["password"],
-                   "--yes", "--no-admin", output=root / "registration.log")
+        register_fixture_user(docker, mas, account)
         return root / FIXTURE_FILE
     except BaseException:
         # Preserve private diagnostics on failure, but never leave live services.
@@ -802,7 +835,7 @@ def run_cli() -> int:
     except (Exception, KeyboardInterrupt) as error:
         # JSON, HTTP and OS exception text may contain credentials or callback
         # URLs. Only literal enum values reach the public job log.
-        failure = error.failure if isinstance(error, BrowserCallbackError) else _failure
+        failure = error.failure if isinstance(error, (BrowserCallbackError, RegistrationError)) else _failure
         print("MORPHEUS_OAUTH_FAILURE " + failure.value, file=sys.stderr, flush=True)
         return 1
     return 0

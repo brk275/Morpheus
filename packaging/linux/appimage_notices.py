@@ -22,6 +22,11 @@ MAX_ELF = 512 * 1024 * 1024
 MAX_NOTICE = 4 * 1024 * 1024
 MAX_COMPONENTS = 256
 NOTICE_ROOT = "usr/share/doc/morpheus-app/bundled-components"
+CPAL_LICENSE_SHA256 = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+ALSA_LICENSES = {
+    "LICENSE-APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+    "LICENSE-MIT": "3cc33f8e76680b9cba2e2a5bc94de5a92420045863ab2fadbef290a55b4d8530",
+}
 SYSTEM_DIRS = (Path("/usr/lib/x86_64-linux-gnu"), Path("/lib/x86_64-linux-gnu"),
                Path("/usr/lib"), Path("/lib"))
 PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?")
@@ -222,6 +227,25 @@ def add_notice(directory, config, notices, name, data):
     return destination
 
 
+def cpal_notices(directory, config, notices):
+    """Copy pinned local audio licenses/provenance, not a compliance claim."""
+    source = client.ROOT / "vendor/cpal"
+    license_text = regular(source / "LICENSE", MAX_NOTICE)
+    provenance = regular(source / "OWNED_COREAUDIO.md", MAX_NOTICE)
+    alsa_provenance = regular(source / "OWNED_ALSA.md", MAX_NOTICE)
+    alsa_licenses = {name: regular(client.ROOT / "vendor/alsa" / name, MAX_NOTICE)
+                     for name in ALSA_LICENSES}
+    # Validate every required source before staging any local-audio notice.
+    if (digest(license_text) != CPAL_LICENSE_SHA256
+            or any(digest(data) != ALSA_LICENSES[name] for name, data in alsa_licenses.items())):
+        raise InventoryFailure("notice")
+    add_notice(directory, config, notices, "CPAL-0.18.2-LICENSE", license_text)
+    add_notice(directory, config, notices, "CPAL-0.18.2-PATCH.md", provenance)
+    add_notice(directory, config, notices, "ALSA-0.11.0-PATCH.md", alsa_provenance)
+    for name, data in alsa_licenses.items():
+        add_notice(directory, config, notices, "ALSA-0.11.0-" + name, data)
+
+
 def prepare(runner, root, binary, stage, source_metadata, config, environment, *, runtime_metadata):
     root = client.private_directory(root)
     stage = Path(stage)
@@ -265,6 +289,7 @@ def prepare(runner, root, binary, stage, source_metadata, config, environment, *
         components[name] = record
         pending.extend(record["needed"])
     add_notice(directory, config, notices, "Morpheus-LICENSE", regular(client.ROOT / "LICENSE", MAX_NOTICE))
+    cpal_notices(directory, config, notices)
     # PipeWire provenance/notices are staged by appimage_config; pin every byte.
     for source, destination in config["appimage"]["files"].items():
         if destination.startswith((client.NOTICE_DIR + "/", "usr/share/doc/morpheus-app/appimage-runtime/")):

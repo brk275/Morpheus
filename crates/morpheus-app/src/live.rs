@@ -798,6 +798,103 @@ struct RevealOwner<'a> {
     admitted: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+/// Actual draft/send task ownership for this application session. Terminal
+/// admission and task registration share one mutex; no task can appear after
+/// close/drain. Completion is the retained JoinHandle's actual poll receipt,
+/// never a delivered UI result, lease/count snapshot or `is_finished` hint.
+#[derive(Default)]
+struct DraftWork {
+    closed: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    failed: bool,
+}
+impl DraftWork {
+    fn spawn(
+        &mut self,
+        runtime: &Handle,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let _ = self.poll();
+        if self.closed || self.failed {
+            return false;
+        }
+        self.tasks.push(runtime.spawn(task));
+        true
+    }
+
+    fn poll(&mut self) -> Option<Result<(), DraftDrainError>> {
+        use std::future::Future;
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut index = 0;
+        while index < self.tasks.len() {
+            match std::pin::Pin::new(&mut self.tasks[index]).poll(&mut context) {
+                std::task::Poll::Ready(result) => {
+                    self.failed |= result.is_err();
+                    drop(self.tasks.swap_remove(index));
+                }
+                std::task::Poll::Pending => index += 1,
+            }
+        }
+        self.tasks.is_empty().then_some(if self.failed {
+            Err(DraftDrainError)
+        } else {
+            Ok(())
+        })
+    }
+}
+#[cfg(test)]
+mod draft_work_shutdown_tests {
+    use super::*;
+    #[test]
+    fn terminal_task_close_keeps_the_actual_entered_task_until_join_receipt() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut work = DraftWork::default();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let (started, beginning) = tokio::sync::oneshot::channel();
+            let admitted = work.spawn(runtime.handle(), async move {
+                let _ = started.send(());
+                let _ = released.await;
+            });
+            let entered = tokio::time::timeout(Duration::from_secs(3), beginning).await;
+            work.closed = true;
+            let polled = work.poll();
+            let refused = !work.spawn(runtime.handle(), async {});
+            let _ = release.send(());
+            let cleanup = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(result) = work.poll() {
+                        return result;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            if cleanup.is_err() {
+                std::mem::forget(work);
+                panic!("Actual draft task cleanup remained unproved");
+            }
+            assert!(admitted);
+            assert!(matches!(entered, Ok(Ok(()))));
+            assert!(polled.is_none());
+            assert!(refused);
+            assert!(matches!(cleanup, Ok(Ok(()))));
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DraftDrainError;
+impl std::fmt::Display for DraftDrainError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("Draft/send task completion could not be confirmed.")
+    }
+}
+impl std::error::Error for DraftDrainError {}
+
 pub struct LiveUi {
     pub manager: Arc<AccountManager>,
     pub(crate) voice_spaces: Arc<VoiceSpaces>,
@@ -806,7 +903,10 @@ pub struct LiveUi {
     /// Joins whose outcome no UI may still show (see JoinOutcomes).
     join_outcomes: JoinOutcomes,
     drafts: Arc<DraftStore>,
-    draft_write_tx: mpsc::Sender<()>,
+    draft_write_tx: std::sync::Mutex<Option<mpsc::Sender<()>>>,
+    draft_work: std::sync::Mutex<DraftWork>,
+    verification_work: crate::verification_work::VerificationWork,
+    marker_scans: crate::marker_scans::MarkerScans,
     generation: Arc<AtomicU64>,
     recovery_notices: Arc<crate::timeline_recovery::Notices>,
     render_epoch: Arc<AtomicU64>,
@@ -1004,7 +1104,7 @@ impl LiveUi {
         let drafts = Arc::new(DraftStore::default());
         let draft_worker_store = drafts.clone();
         let draft_worker_manager = manager.clone();
-        runtime.spawn(async move {
+        let draft_writer = runtime.spawn(async move {
             let mut error_reported = false;
             while draft_write_rx.recv().await.is_some() {
                 // A single bounded worker coalesces typing bursts. Account
@@ -1059,7 +1159,13 @@ impl LiveUi {
             security_gate: Arc::new(crate::security::SecurityGate::default()),
             join_outcomes: JoinOutcomes::default(),
             drafts,
-            draft_write_tx,
+            draft_write_tx: std::sync::Mutex::new(Some(draft_write_tx)),
+            draft_work: std::sync::Mutex::new(DraftWork {
+                tasks: vec![draft_writer],
+                ..DraftWork::default()
+            }),
+            verification_work: crate::verification_work::VerificationWork::default(),
+            marker_scans: crate::marker_scans::MarkerScans::default(),
             generation: Arc::new(AtomicU64::new(0)),
             recovery_notices,
             render_epoch: Arc::new(AtomicU64::new(0)),
@@ -1083,6 +1189,101 @@ impl LiveUi {
             #[cfg(test)]
             pauses: TestPauses::default(),
         })
+    }
+
+    /// Permanent application action boundary, called synchronously on the UI
+    /// thread before it yields. Loaded stores stay owned for the admitted work
+    /// drain and final stable flush; resumable manager.stop remains distinct.
+    pub(crate) fn close_action_admission(&self) {
+        self.verification_work.close();
+        self.marker_scans.close();
+        let mut work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        work.closed = true;
+        self.manager.close_selection_admission();
+        // This is the only sender. The existing writer finishes an entered
+        // write, observes EOF, processes its last dirty sweep and exits.
+        self.draft_write_tx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
+    /// Capture synchronously with a verification UI intent. Reusing a local
+    /// account ID after a removal pause never revives an older lease.
+    pub(crate) fn verification_work_lease(
+        &self,
+        selection: &AccountSelection,
+        cancellation: &morpheus_matrix::VerificationCancellation,
+    ) -> Option<crate::verification_work::VerificationWorkLease> {
+        self.verification_work.lease(selection, cancellation)
+    }
+
+    pub(crate) fn spawn_verification_work(
+        &self,
+        runtime: &Handle,
+        lease: &crate::verification_work::VerificationWorkLease,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        self.verification_work.spawn(runtime, lease, task)
+    }
+
+    pub(crate) fn pause_verification_work(
+        &self,
+        account: &str,
+    ) -> Result<
+        crate::verification_work::VerificationWorkPause,
+        crate::verification_work::VerificationDrainError,
+    > {
+        self.verification_work.pause(account)
+    }
+
+    pub(crate) async fn drain_verification_work(
+        &self,
+    ) -> Result<(), crate::verification_work::VerificationDrainError> {
+        self.verification_work.drain().await
+    }
+
+    pub(crate) fn action_admission_closed(&self) -> bool {
+        self.draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+    }
+
+    pub(crate) fn spawn_draft_work(
+        &self,
+        runtime: &Handle,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let mut work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        work.spawn(runtime, task)
+    }
+
+    /// No timeout drops/takes the sole task handles. The UI keeps pumping;
+    /// an entered store operation must actually return before stable flush.
+    pub(crate) async fn drain_draft_work(&self) -> Result<(), DraftDrainError> {
+        loop {
+            let result = {
+                let mut work = self
+                    .draft_work
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if !work.closed {
+                    return Err(DraftDrainError);
+                }
+                work.poll()
+            };
+            if let Some(result) = result {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Cancel queued presentation work as soon as the user requests a new
@@ -1176,6 +1377,13 @@ impl LiveUi {
         thread: Option<&str>,
         text: ComposeText,
     ) -> Result<(), MatrixCoreError> {
+        let work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if work.closed {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
         if !account.is_empty() && !room.is_empty() {
             self.drafts
                 .set_composed_scoped(account, room, thread, text)?;
@@ -1194,6 +1402,13 @@ impl LiveUi {
     }
 
     pub fn remember_draft(&self, account_id: &str, room_id: &str, body: &str) {
+        let work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if work.closed {
+            return;
+        }
         if !account_id.is_empty() && !room_id.is_empty() {
             self.drafts.set(account_id, room_id, body);
             self.queue_draft_write();
@@ -1201,12 +1416,26 @@ impl LiveUi {
     }
 
     pub fn remember_markdown(&self, account_id: &str, room_id: &str, enabled: bool) {
+        let work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if work.closed {
+            return;
+        }
         if !account_id.is_empty() && !room_id.is_empty() {
             self.drafts.set_markdown(account_id, room_id, enabled);
         }
     }
 
     pub fn remember_thread_draft(&self, account_id: &str, room_id: &str, root: &str, body: &str) {
+        let work = self
+            .draft_work
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if work.closed {
+            return;
+        }
         if !account_id.is_empty() && !room_id.is_empty() && !root.is_empty() {
             self.drafts
                 .set_scoped(account_id, room_id, Some(root), body);
@@ -1260,6 +1489,9 @@ impl LiveUi {
     /// The current selection for an account, captured synchronously at the
     /// user's action so every later step can be checked against it.
     pub fn account_selection(&self, account: &str) -> Option<AccountSelection> {
+        if self.action_admission_closed() {
+            return None;
+        }
         self.manager.account_selection(account)
     }
 
@@ -2135,14 +2367,23 @@ impl LiveUi {
                 room: draft.room_id,
                 thread: draft.thread_root,
             };
-            self.drafts.seed_recovered(
-                &scope.account,
-                &scope.room,
-                scope.thread(),
-                draft.restored,
-                &attached,
-                epoch,
-            );
+            {
+                let work = self
+                    .draft_work
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if work.closed {
+                    return;
+                }
+                self.drafts.seed_recovered(
+                    &scope.account,
+                    &scope.room,
+                    scope.thread(),
+                    draft.restored,
+                    &attached,
+                    epoch,
+                );
+            }
             for send in draft.sends {
                 if let (Some(queued), Some(transaction_id)) = (send.queued, send.transaction_id) {
                     draft_recovery::spawn_observer(
@@ -2191,7 +2432,14 @@ impl LiveUi {
     fn queue_draft_write(&self) {
         // One queued signal is enough: the worker scans the latest dirty
         // cache, coalescing fast typing without creating a task per keypress.
-        let _ = self.draft_write_tx.try_send(());
+        if let Some(sender) = self
+            .draft_write_tx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            let _ = sender.try_send(());
+        }
     }
 
     pub async fn restore(self: &Arc<Self>, ui: Weak<AppWindow>) {
@@ -3843,22 +4091,60 @@ impl LiveUi {
                     .await;
             }
         }
-        let marker_account = account_id;
-        let voice_spaces = self.voice_spaces.clone();
-        let live = self.clone();
-        tokio::spawn(async move {
-            if voice_spaces
-                .scan_shared(&live.manager, &marker_account, &marker_rooms)
-                .await
-            {
-                let shared_rooms = voice_spaces.shared_rooms(&marker_account).await;
-                let _ = ui.upgrade_in_event_loop(move |window| {
-                    if window.get_active_account_local_id().as_str() == marker_account {
-                        apply_shared_voice_labels(&window, &shared_rooms);
-                    }
-                });
+        if let Some(selection) = selection {
+            self.marker_scans.queue(
+                Arc::downgrade(self),
+                &Handle::current(),
+                crate::marker_scans::Request {
+                    selection,
+                    rooms: marker_rooms,
+                    ui,
+                },
+            );
+        }
+    }
+
+    pub(crate) async fn drain_marker_scans(
+        &self,
+    ) -> Result<(), crate::marker_scans::MarkerDrainError> {
+        self.marker_scans.drain().await
+    }
+
+    pub(crate) async fn run_marker_scan(
+        self: &Arc<Self>,
+        request: crate::marker_scans::Request,
+        authority: crate::marker_scans::Authority,
+    ) {
+        if !self.is_live.load(Ordering::Acquire)
+            || self.action_admission_closed()
+            || !authority.is_current()
+        {
+            return;
+        }
+        if self
+            .voice_spaces
+            .scan_shared_owned(&self.manager, &authority, &request.rooms)
+            .await
+        {
+            if !authority.is_current() {
+                return;
             }
-        });
+            let shared_rooms = self.voice_spaces.shared_rooms(authority.account_id()).await;
+            let live = Arc::downgrade(self);
+            let _ = request.ui.upgrade_in_event_loop(move |window| {
+                let Some(live) = live.upgrade() else {
+                    return;
+                };
+                if authority.is_current()
+                    && live.is_live.load(Ordering::Acquire)
+                    && !live.action_admission_closed()
+                    && !window.get_application_closing()
+                    && window.get_active_account_local_id().as_str() == authority.account_id()
+                {
+                    apply_shared_voice_labels(&window, &shared_rooms);
+                }
+            });
+        }
     }
 
     /// Publish an error only in the exact navigation it belongs to. The
@@ -4360,6 +4646,11 @@ impl LiveUi {
                                 return;
                             };
                             let messages = presentation.messages;
+                            let copy_scope = crate::message_copy::capture_publication(
+                                &ui,
+                                &selected_account,
+                                false,
+                            );
                             if selected_account.is_current()
                                 && live_flag.load(Ordering::Acquire)
                                 && current_generation.load(Ordering::Acquire) == generation
@@ -4372,7 +4663,11 @@ impl LiveUi {
                                     &room_id,
                                 )
                             {
-                                publish_live_messages(&ui, messages.as_ref().clone());
+                                publish_live_messages_scoped(
+                                    &ui,
+                                    messages.as_ref().clone(),
+                                    copy_scope,
+                                );
                                 recovery.publish(
                                     &ui,
                                     crate::timeline_recovery::Pane::Room,
@@ -4577,6 +4872,8 @@ impl LiveUi {
                             back.give_back(selected_account, room_id);
                             return;
                         }
+                        let copy_scope =
+                            crate::message_copy::capture_publication(&ui, &selected_account, false);
                         if selected_account.is_current()
                             && live_flag.load(Ordering::Acquire)
                             && current_generation.load(Ordering::Acquire) == generation
@@ -4589,9 +4886,10 @@ impl LiveUi {
                             )
                         {
                             unshown.store(false, Ordering::Release);
-                            ui.set_messages(crate::timeline_model::update_shared(
+                            ui.set_messages(crate::timeline_model::update_scoped(
                                 ui.get_messages(),
                                 messages.as_ref().clone(),
+                                copy_scope,
                             ));
                             ui.set_conversation_focused(true);
                             recovery.publish(
@@ -4790,6 +5088,11 @@ impl LiveUi {
                                 return;
                             };
                             let messages = presentation.messages;
+                            let copy_scope = crate::message_copy::capture_publication(
+                                &ui,
+                                &selected_account,
+                                true,
+                            );
                             if selected_account.is_current()
                                 && is_live.load(Ordering::Acquire)
                                 && current_generation.load(Ordering::Acquire) == generation
@@ -4797,7 +5100,12 @@ impl LiveUi {
                                 && ui.get_active_room_id().as_str() == room_id
                                 && ui.get_thread_root_id().as_str() == root_event_id
                             {
-                                message_search::show_thread_root(&ui, &messages, &root_event_id);
+                                message_search::show_thread_root(
+                                    &ui,
+                                    &messages,
+                                    &root_event_id,
+                                    copy_scope.clone(),
+                                );
                                 let replies = messages
                                     .iter()
                                     .filter(|message| {
@@ -4805,9 +5113,10 @@ impl LiveUi {
                                     })
                                     .cloned()
                                     .collect();
-                                ui.set_thread_messages(crate::timeline_model::update_shared(
+                                ui.set_thread_messages(crate::timeline_model::update_scoped(
                                     ui.get_thread_messages(),
                                     replies,
+                                    copy_scope,
                                 ));
                                 recovery.publish(
                                     &ui,
@@ -5301,6 +5610,7 @@ fn apply_snapshot(
         crate::kept_replies::leaving_room(ui);
     }
     if selection_changed {
+        crate::message_copy::retire(ui);
         ui.set_room_admin_open(false);
         ui.set_room_admin_operation(ui.get_room_admin_operation().wrapping_add(1));
         ui.set_room_admin_busy(false);
@@ -5541,6 +5851,7 @@ fn apply_snapshot(
 }
 
 fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::SecurityGate) {
+    crate::message_copy::retire(ui);
     crate::security::clear_ui(ui, security_gate);
     // Calls cannot outlive their account, so its call authority is already
     // revoked here. Its call tiles, pictures and roster must not wait for
@@ -5846,6 +6157,7 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
     };
     let rich_body = styled_markdown.unwrap_or_else(|| StyledText::from_plain_text(display_body));
     MessageItem {
+        copy_token: Default::default(),
         event_id: info.event_id.as_deref().unwrap_or("").into(),
         is_own: info.is_own,
         sender: sender.into(),
@@ -5919,10 +6231,20 @@ fn visible_feed_target(
 /// not an authority token: even a same-length replacement with the same newest
 /// event must place the unread marker again. Focused feeds and divider writes
 /// do not call it.
+#[cfg(test)]
 pub(crate) fn publish_live_messages(ui: &AppWindow, messages: Vec<Arc<MessageInfo>>) {
-    ui.set_messages(crate::timeline_model::update_shared(
+    publish_live_messages_scoped(ui, messages, None);
+}
+
+fn publish_live_messages_scoped(
+    ui: &AppWindow,
+    messages: Vec<Arc<MessageInfo>>,
+    scope: Option<std::rc::Rc<crate::message_copy::CopyScope>>,
+) {
+    ui.set_messages(crate::timeline_model::update_scoped(
         ui.get_messages(),
         messages,
+        scope,
     ));
     // Live rows replace any focused view, and with it that view's history
     // paging state. Notify only after both the model and that state are final.
@@ -6710,6 +7032,16 @@ mod stale_observer_tests {
             eprintln!("\nMORPHEUS_APP_RECOVERY_STAGE {}", stringify!($case));
         };
     }
+    // Additional fixed diagnostics for the one unresolved rollback-write case.
+    // These are observations only; the twelve completion checks stay unchanged.
+    macro_rules! write_revocation_boundary {
+        ($boundary:ident) => {
+            eprintln!(
+                "\nMORPHEUS_APP_RECOVERY_BOUNDARY write_revocation {}",
+                stringify!($boundary)
+            );
+        };
+    }
     macro_rules! recovery_check {
         ($case:ident) => {
             eprintln!("\nMORPHEUS_APP_RECOVERY_CHECK {}=true", stringify!($case));
@@ -6835,6 +7167,49 @@ mod stale_observer_tests {
         .expect("the draft worker must release the profile");
         drop(manager);
         directory.close().unwrap();
+    }
+
+    /// Logout may return promptly while its already-started native cleanup is
+    /// still owned. Observe only that same operation; never retry the logout or
+    /// infer erasure from a permit/count. A real vault/store failure still fails.
+    async fn logout_fixture_account(
+        manager: &AccountManager,
+        id: &str,
+    ) -> std::result::Result<(), MatrixCoreError> {
+        match manager.logout_account(id).await {
+            Ok(_) => {}
+            Err(MatrixCoreError::AccountRemovalPending) => {
+                let removal = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    manager.finish_pending_account_removal(id),
+                )
+                .await
+                .map_err(|_| MatrixCoreError::AccountRemovalPending)??;
+                if removal.account_id != id
+                    || !removal.complete
+                    || !removal.credentials_removed
+                    || !removal.store_removed
+                {
+                    return Err(MatrixCoreError::AccountRemovalPending);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        if manager
+            .accounts()
+            .await
+            .iter()
+            .any(|account| account.id == id)
+            || manager
+                .app_password_status()
+                .await
+                .pending_removals
+                .iter()
+                .any(|pending| pending == id)
+        {
+            return Err(MatrixCoreError::AccountRemovalPending);
+        }
+        Ok(())
     }
 
     struct FixtureAccount {
@@ -7074,12 +7449,10 @@ mod stale_observer_tests {
         drop(client);
         drop(recovered);
 
-        manager
-            .logout_account(&a_account.id)
+        logout_fixture_account(&manager, &a_account.id)
             .await
             .expect("Cannot remove first account");
-        manager
-            .logout_account(&b_account.id)
+        logout_fixture_account(&manager, &b_account.id)
             .await
             .expect("Cannot remove second account");
         manager.stop().await;
@@ -7116,6 +7489,23 @@ mod stale_observer_tests {
         let selection = manager
             .account_selection(&a_account.id)
             .expect("Selection missing");
+
+        // Use the real marker authority captured before A -> B -> A. Both
+        // destinations change only through its actual synchronous commit gate;
+        // no test-owned predicate mirrors the selection or close checks.
+        let marker = live
+            .marker_scans
+            .authority_for_test(&live, selection.clone());
+        let (mut marker_cache, mut marker_presentation) = (0, 0);
+        assert!(marker.is_current());
+        assert_eq!(
+            marker.with_current(|| {
+                marker_cache = 1;
+                marker_presentation = 1;
+            }),
+            Some(())
+        );
+        assert_eq!((marker_cache, marker_presentation), (1, 1));
 
         // Actual postjoin dispatch must stay withdrawable while the account
         // transition is held. It neither waits for that lock to be released
@@ -7322,6 +7712,15 @@ mod stale_observer_tests {
             .account_selection(&a_account.id)
             .expect("Renewed selection missing");
         assert!(!selection.is_current() && renewed.is_current());
+        assert!(!marker.is_current());
+        assert_eq!(
+            marker.with_current(|| {
+                marker_cache = 9;
+                marker_presentation = 9;
+            }),
+            None
+        );
+        assert_eq!((marker_cache, marker_presentation), (1, 1));
         let gate = SnapshotGate {
             authority: NavigationAuthority::default(),
             selection: selection.clone(),
@@ -7366,17 +7765,45 @@ mod stale_observer_tests {
         assert!(live.feed_key.lock().await.is_none());
         assert!(live.focused_view(&a_room).is_none());
 
-        manager
-            .logout_account(&a_account.id)
+        // A fresh authority for the renewed epoch admits normally. Closing
+        // only the actual marker owner then refuses it even though this real
+        // account selection and the live/action context remain current.
+        let current_marker = live.marker_scans.authority_for_test(&live, renewed.clone());
+        assert!(current_marker.is_current());
+        assert_eq!(
+            current_marker.with_current(|| {
+                marker_cache = 2;
+                marker_presentation = 2;
+            }),
+            Some(())
+        );
+        live.marker_scans.close();
+        assert!(renewed.is_current());
+        assert!(live.is_live.load(Ordering::Acquire));
+        assert!(!live.action_admission_closed());
+        assert!(!current_marker.is_current());
+        assert_eq!(
+            current_marker.with_current(|| {
+                marker_cache = 9;
+                marker_presentation = 9;
+            }),
+            None
+        );
+        assert_eq!((marker_cache, marker_presentation), (2, 2));
+        live.drain_marker_scans()
+            .await
+            .expect("The actual marker owner must finish");
+
+        logout_fixture_account(&manager, &a_account.id)
             .await
             .expect("Cannot remove first account");
-        manager
-            .logout_account(&b_account.id)
+        logout_fixture_account(&manager, &b_account.id)
             .await
             .expect("Cannot remove second account");
         manager.stop().await;
         drop(manager);
         close_profile(directory, live).await;
+        eprintln!("\nMORPHEUS_APP_MARKER_AUTHORITY_CHECK complete=true");
     }
 
     /// A created room opens only through its own owned reveal, and only for
@@ -8453,6 +8880,67 @@ mod stale_observer_tests {
         recovery_check!(rollback_race);
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum WriteRevocationPause {
+        Reached,
+        WorkerEnded,
+        TimedOut,
+    }
+
+    // A worker that exits before the named pause must fail the test instead of
+    // leaving its observer waiting forever. Never release the pause here: the
+    // caller must still prove the original pre-write interleaving itself.
+    async fn wait_for_write_revocation_pause(
+        point: &PausePoint,
+        rollback: &mut tokio::task::JoinHandle<()>,
+    ) -> WriteRevocationPause {
+        let reached = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                biased;
+                _ = point.entered() => true,
+                _ = &mut *rollback => false,
+            }
+        })
+        .await;
+        match reached {
+            Ok(true) => WriteRevocationPause::Reached,
+            Ok(false) => WriteRevocationPause::WorkerEnded,
+            Err(_) => {
+                rollback.abort();
+                let _ = (&mut *rollback).await;
+                WriteRevocationPause::TimedOut
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_pause_wait_rejects_an_early_ended_worker() {
+        let pauses = TestPauses::default();
+        let point = pauses.install("rollback.before_write");
+        let mut rollback = tokio::spawn(async {});
+        assert_eq!(
+            wait_for_write_revocation_pause(&point, &mut rollback).await,
+            WriteRevocationPause::WorkerEnded
+        );
+        assert!(rollback.is_finished());
+    }
+
+    #[tokio::test]
+    async fn rollback_pause_wait_does_not_release_the_reached_write_boundary() {
+        let pauses = TestPauses::default();
+        let point = pauses.install("rollback.before_write");
+        let mut rollback = tokio::spawn(async move {
+            pauses.reach("rollback.before_write").await;
+        });
+        assert_eq!(
+            wait_for_write_revocation_pause(&point, &mut rollback).await,
+            WriteRevocationPause::Reached
+        );
+        assert!(!rollback.is_finished());
+        point.proceed();
+        rollback.await.unwrap();
+    }
+
     /// Shared setup for the forced-interleaving tests: one logged-in account,
     /// discovery complete, the room selected.
     async fn prepared_live(
@@ -8792,6 +9280,7 @@ mod stale_observer_tests {
             return;
         };
         recovery_phase!(write_revocation);
+        write_revocation_boundary!(setup);
         let (directory, manager, live, a_account, selection) = prepared_live(&alice, &a_room).await;
         let scope = SendScope {
             account: a_account.id.clone(),
@@ -8801,6 +9290,7 @@ mod stale_observer_tests {
         let text = unique_text("rollback-write");
         live.drafts.set(&a_account.id, &a_room, &text.body);
         let revision = live.drafts.revision(&a_account.id, &a_room).unwrap();
+        write_revocation_boundary!(prepare_record);
         let handle = live
             .prepare_pending_send(&selection, &scope, &text, revision)
             .await
@@ -8813,8 +9303,11 @@ mod stale_observer_tests {
             scope.clone(),
             nonce.clone(),
         );
-        let rollback = tokio::spawn(async move {
+        write_revocation_boundary!(rollback_pause);
+        let mut rollback = tokio::spawn(async move {
+            write_revocation_boundary!(rollback_writer_lock);
             let tx = rb_live.drafts.begin_write_transaction().await;
+            write_revocation_boundary!(rollback_release);
             rb_live
                 .rollback_pending(
                     &tx,
@@ -8829,27 +9322,41 @@ mod stale_observer_tests {
                 )
                 .await;
         });
-        point.entered().await;
+        match wait_for_write_revocation_pause(&point, &mut rollback).await {
+            WriteRevocationPause::Reached => {}
+            WriteRevocationPause::WorkerEnded => {
+                write_revocation_boundary!(rollback_ended_before_pause);
+                panic!("the rollback ended before its pre-write pause");
+            }
+            WriteRevocationPause::TimedOut => {
+                write_revocation_boundary!(rollback_pause_timeout);
+                panic!("the rollback did not reach its pre-write pause");
+            }
+        }
         assert!(
             live.drafts
                 .record_status(&a_account.id, &a_room, None, &nonce)
                 .is_none(),
             "released and removed from the cache"
         );
+        write_revocation_boundary!(row_before_switch);
         assert!(
             row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await,
             "not yet written"
         );
+        write_revocation_boundary!(switch_account);
         let b_account = manager
             .add_password_account(&carol.homeserver_url, &carol.username, &carol.password)
             .await
             .expect("Second login failed");
         assert!(!selection.is_current());
         point.proceed();
+        write_revocation_boundary!(rollback_join);
         tokio::time::timeout(Duration::from_secs(30), rollback)
             .await
             .expect("the rollback must finish")
             .unwrap();
+        write_revocation_boundary!(row_after_write);
         assert!(
             !row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await,
             "the release authorized the write"
@@ -8859,27 +9366,36 @@ mod stale_observer_tests {
                 .record_status(&a_account.id, &a_room, None, &nonce)
                 .is_none()
         );
+        write_revocation_boundary!(switch_back);
         manager
             .switch_to(&a_account.id)
             .await
             .expect("Cannot switch back");
         let renewed = manager.account_selection(&a_account.id).unwrap();
+        write_revocation_boundary!(recovery_discovery);
         live.adopt_recovered_sends(renewed, Weak::default()).await;
+        write_revocation_boundary!(flush);
         live.flush_drafts().await.expect("the flush succeeds");
         assert!(live.drafts.dirty_keys().is_empty());
+        write_revocation_boundary!(row_after_flush);
         assert!(!row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await);
 
+        write_revocation_boundary!(logout_first);
         manager
             .logout_account(&a_account.id)
             .await
             .expect("Cannot remove first account");
+        write_revocation_boundary!(logout_second);
         manager
             .logout_account(&b_account.id)
             .await
             .expect("Cannot remove second account");
+        write_revocation_boundary!(manager_stop);
         manager.stop().await;
         drop(manager);
+        write_revocation_boundary!(profile_close);
         close_profile(directory, live).await;
+        write_revocation_boundary!(complete);
         recovery_check!(write_revocation);
     }
 

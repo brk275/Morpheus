@@ -124,11 +124,17 @@ def verify_versioned_export(root, archive, version):
                 if len(names) > 5000 or member.size > 8 * 1024 * 1024:
                     raise SourceRevisionError("checkout")
                 if member.isfile():
+                    # Git's default tar.umask=0002 emits 0664/0775;
+                    # explicit umask=0022 emits 0644/0755. Both retain the
+                    # original Git mode; NTFS stat cannot reconstruct that bit.
+                    if member.mode not in (0o644, 0o664, 0o755, 0o775):
+                        raise SourceRevisionError("checkout")
                     data = source.extractfile(member).read(member.size + 1)
                     expanded += len(data)
                     if len(data) != member.size or expanded > MAX_EXPORT_BYTES:
                         raise SourceRevisionError("checkout")
-                    expected[str(pure)] = (versioned_source_bytes(str(pure), data, version), bool(member.mode & 0o111))
+                    expected[str(pure)] = (versioned_source_bytes(str(pure), data, version),
+                                           "100755" if member.mode in (0o755, 0o775) else "100644")
         if not UPDATE_VERSION_PATHS <= expected.keys():
             raise SourceRevisionError("checkout")
         actual = set()
@@ -137,16 +143,20 @@ def verify_versioned_export(root, archive, version):
             if index > 5000:
                 raise SourceRevisionError("checkout")
             info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise SourceRevisionError("checkout")
             if stat.S_ISDIR(info.st_mode):
                 continue
             name = path.relative_to(root).as_posix()
             if not stat.S_ISREG(info.st_mode) or name not in expected:
                 raise SourceRevisionError("checkout")
-            data, executable = expected[name]
-            if info.st_size != len(data) or bool(info.st_mode & 0o111) != executable or path.read_bytes() != data:
+            data, git_mode = expected[name]
+            if (info.st_size != len(data) or path.read_bytes() != data
+                    or os.name != "nt" and bool(info.st_mode & 0o111) != (git_mode == "100755")):
                 raise SourceRevisionError("checkout")
             actual.add(name)
-            records.append((name, "100755" if executable else "100644", hashlib.sha256(data).hexdigest()))
+            # Always bind the source's original Git mode, including on Windows.
+            records.append((name, git_mode, hashlib.sha256(data).hexdigest()))
         if actual != expected.keys():
             raise SourceRevisionError("checkout")
     except (OSError, ValueError, tarfile.TarError):

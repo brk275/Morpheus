@@ -89,7 +89,7 @@ mod users;
 
 pub use devices::{Device, DeviceUpdates, UserDevices};
 pub use matrix_sdk_base::crypto::types::MasterPubkey;
-pub use users::{IdentityUpdates, UserIdentity};
+pub use users::{IdentityUpdates, PreparedRoomVerification, UserIdentity};
 
 /// Error for the manual verification step, when we manually sign users or
 /// devices.
@@ -106,6 +106,15 @@ pub enum ManualVerifyError {
 /// Error when requesting a verification.
 #[derive(thiserror::Error, Debug)]
 pub enum RequestVerificationError {
+    /// Explicit-room preparation requires at least one verification method.
+    #[error("At least one verification method is required")]
+    EmptyMethods,
+    /// The explicit-room API verifies other users only.
+    #[error("This operation requires another user's identity")]
+    NotOtherIdentity,
+    /// The exact room must already be a joined DM with a joined peer.
+    #[error("The selected room is not an eligible joined direct conversation")]
+    NotJoinedDirectRoom,
     /// An ordinary error coming from the SDK, i.e. when we fail to send out a
     /// HTTP request or if there's an error with the storage layer.
     #[error(transparent)]

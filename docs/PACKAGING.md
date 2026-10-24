@@ -59,6 +59,72 @@ SDK downloader from legacy extraction caches. Select only the
 affected platforms and check active runs first. QA installers remain on the
 runner; signing, licensing and installed-package release gates still apply.
 
+## Explicit synthetic native update transactions
+
+After source/dependency review and stable affected native checks, the existing
+**Package validation** workflow can explicitly select `native_updates=true`
+with `platform=macos` or `platform=windows`. Keep `linux_formats=appimage` (its
+neutral default), `appimage_updates=false`, `appimage_capture=false` and
+`source_bundle=false`. Linux, all-platform, Debian/both-format and mixed mode
+selections are rejected before emitting runner/cache outputs. The new option is
+off by default; ordinary DMG/NSIS/AppImage package and installed UI behavior is
+unchanged when it is off. Supply the exact reviewed `source_revision` as above.
+
+The selected package workers retain the public, owner-only, main-only guard,
+independent source/history scan, candidate/OS concurrency lock, read-only token,
+no persisted credentials and trusted-main-only shared cache writes. They install
+the existing pinned Rust 1.99.0, Cargo Packager 0.11.8 and Windows NSIS tools.
+Before compilers, a preflight requires the matching native architecture and
+preinstalled Python 3.12+ with the actual archive/kernel APIs used by the driver;
+an unsupported image fails without starting either package build.
+A bounded HTTPS download authenticates both the official Gitleaks 8.30.1 archive
+and native executable before any driver log scan. No candidate scanner settings
+or release signing credentials are passed to the drivers.
+
+The existing Mac driver receives the exact selected checkout and a newly owned
+external target directory; the Windows driver owns its target in its private
+fixture root and receives the exact reviewed scanner hash. Each driver exports
+the selected tree twice and changes only app/lockfile versions to
+`-updateqa.1` and `-updateqa.2`, using one fresh compiled nonce/cohort and the
+existing generated disposable signing route. There are exactly two necessary
+version-only package builds per architecture: four for the explicit Mac request
+(Apple Silicon and Intel), or two for Windows. The ordinary package build,
+keyboard preflight and package smoke are omitted in this mode, so no third
+package or normal UI launch is added. Driver failure, missing observation,
+private log scan failure or cleanup failure remains a failed job; this route
+has a distinct synthetic/partial job name and no automatic retry.
+
+Only the drivers' existing synthetic installed transaction contracts are tested.
+Mac parent/helper kernel exit and recovery observations do not establish normal
+AppWindow/shipping shutdown or production group cleanup. Windows retains actual
+NSIS install/uninstall and retained Job/handle checks. Native backend/device and
+live-call release, ordinary UI/account/homeserver behavior, feed/download/TLS,
+release signing/notarization and power-loss gates remain separate. Production
+installation stays disabled. No installer, key, raw log or artifact is uploaded,
+no release is published, and passing this route alone cannot establish beta
+readiness. Adoption of this workflow/scope/docs change needs only its affected
+existing helper checks; actual installed runs remain an explicit later reviewed
+selection after the native application candidate is stable.
+
+## Vendored CPAL source and notices
+
+The workspace uses the reviewed same-version CPAL 0.18.2 patch documented in
+[`vendor/cpal/OWNED_COREAUDIO.md`](../vendor/cpal/OWNED_COREAUDIO.md). The complete
+committed vendor tree, including its Apache-2.0 license, original manifest,
+upstream lock, examples and preserved hardware tests, enters `workspace.tar.gz`
+through the existing source export. Its local package record binds the declared
+license, candidate license-text hashes and build-script identity; the original
+registry archive SHA256 is recorded in the patch provenance.
+
+The Linux AppImage inventory also copies the hash-verified CPAL license and
+patch provenance as immutable notices and verifies their deployed hashes.
+Broader Rust/static notices, SDK/system/compiler sources, relinking and license
+obligations remain release gates. Mac/Windows use the separate candidate-bound
+notice pair and versioned resource contract described below. Synthetic CPAL CI selects only named
+library cases and does not replace actual call/leave/rejoin, attachment handoff,
+backend disposal, installed-package or device acceptance. Distribution and
+installation approval remain unchanged.
+
 ## Preparing corresponding source evidence
 
 An explicit source-only path prepares the committed Rust workspace, local
@@ -672,3 +738,146 @@ Space, tabbing to Manage accounts, opening that dialog, its Tab/Shift-Tab order,
 and closing it. These tokens contain no account labels or focused control text.
 A timeout at one boundary remains a failed installed check; these diagnostics
 do not substitute for keyboard or screen-reader acceptance.
+
+
+### Synthetic installed Mac transaction milestone (not release activation)
+
+`scripts/macos_update_acceptance.py` extends the private native package/update QA
+route. It requires explicit `--execute-on-free-hosted-runner`, a reviewed clean
+source revision, an external target directory, and the pinned default Gitleaks 8.30.1
+scanner for the native Mac architecture. The permanent workflow calls it only
+through the explicit `native_updates` selection above; it is never automatic.
+Its source and runner invocation must be independently reviewed before execution.
+
+It exports the exact reviewed tree twice, allowing only the existing app manifest
+and lockfile version substitutions (`-updateqa.1` and `-updateqa.2`). Each version
+uses one unchanged native-calls release build through pinned Cargo Packager 0.11.8
+and the normal Mac package configuration and bounded unsigned payload producer.
+The two builds share a fresh build-time nonce and an instrumented persistence
+cohort that cannot match shipping binaries or another run. In-memory package
+version/output/binary-directory overrides do not alter shipping configuration.
+Initial DMG packaging and installed UI QA remain separate and unchanged.
+
+The instrumented variant accepts only a closed nonce-bound plan in a fresh private
+runner temporary root. It exits through its synthetic dispatcher before config,
+profile, vault, network, media or UI initialization. Ordinary binaries reject
+reserved plan/command inputs before initialization and cannot activate this code
+through runtime environment or CLI flags. Production installation stays disabled.
+Only generated disposable signing keys are used, privately with the official
+signer after both builds; no Developer ID or release credentials are accepted.
+
+Six scenarios launch the actual packaged old/new executables and share production
+signature re-verification, extraction, complete bundle identity/tree checks,
+install/call exclusion, readiness, atomic swap, journal, startup recovery and
+pre-store health commit: successful upgrade plus committed restart, invalid
+signature, staged resource tampering, restart from Prepared, helper interruption
+after replacement before trial, and a trial that fails before health. Fixed event
+markers and exact trees/journal cleanup must agree. The old actor retains its
+actual helper `Child` while publishing a private nonce/transaction/parent/helper
+ticket. The external driver arms an exact kernel `NOTE_EXIT|NOTE_EXITSTATUS`
+observer before acknowledging it. Only then does the old actor release its
+synthetic session and actually exit; the production helper independently waits
+for that parent's registered `NOTE_EXIT` before acquiring the app lock/applying.
+The driver observes/reaps its actual old actor and requires the retained helper
+event/status. A registration receipt or lease release alone cannot pass.
+The after-apply case uses nonce-gated compile-only `_exit(86)` after observer
+acknowledgment and before any trial child, deliberately bypassing Rust cleanup.
+The external observer must report exactly that code before real startup recovery;
+a cooperative error return is not equivalent interruption coverage. The external
+Prepared stop signals only its still-owned direct child before any helper exists.
+Failed or timed-out fixtures remain private;
+there is no orphan PID kill, profile cleanup or automatic unchanged retry.
+Raw logs are bounded, private and default-scanned before inspection; only fixed
+result fields and exact source/artifact/cohort hashes are public.
+
+This milestone observes actual exit of the synthetic parent process and its
+helper. It does **not** prove normal AppWindow shutdown or ordinary shipping
+process cleanup; those report gates remain false. Its single-member synthetic actor
+completion/reap and retained kernel helper event are harness observations, not acceptance of production group-stop
+behavior (including the open Darwin zombie-only-group EPERM concern). Feed and
+download/TLS behavior, ordinary shipping-process handoff, Developer ID/notarization,
+physical-device/media behavior and actual storage/power-loss durability remain
+separate gates. Passing this route alone must not enable installation or mark the
+beta ready. Shared build/main/updater source changes also require ordinary native
+compilation on Apple Silicon, Intel Mac, Windows and Linux; the instrumented
+installed transaction scenarios require both native Mac labels.
+
+
+## Candidate-bound Mac and Windows third-party notices
+
+The existing explicit package QA job prepares a Rust/workspace corresponding-source
+archive and receipt on each affected fresh standard Mac/Windows runner before a
+package build. `scripts/native_notice_source.py --prepare --gitleaks <pinned-tool>`
+uses a new private HOME/CARGO_HOME, the already pinned Rust toolchain, and only
+`cargo fetch --locked` against an exact private regular-file export of the
+authenticated workspace for the existing public locked origins. Untracked or
+modified checkout manifests cannot select fetch origins. No build script,
+proc macro, source archive program or dependency setup runs during acquisition.
+Registry archives must match every Cargo.lock checksum; Git source objects and
+all tree/blob identities are authenticated. Raw stdout is separate from stderr,
+with nonblocking bounded raw pipes, retained process-group or Windows Job
+ownership, stop/drain and a final EOF receipt. Raw Git object stdout is held only
+on a bounded private temporary descriptor, read after the actual command cleanup,
+and deleted on every outcome; it is source data rather than a diagnostic log.
+Complete stderr and ordinary diagnostic stdout stay in the default scan. Source
+content publication remains separately unverified. Output overruns are failures;
+a capped prefix is never called a complete raw log and is retained on failure.
+Windows private fetch exports additionally refuse drive/ADS, device/reserved,
+case-prefix aliases, non-ASCII names and depths beyond 32; the current source tree
+fits this explicit portable subset. Roots have a protected inheritable
+current-user/System write ACL. A private child may be owned by the exact current
+process TokenOwner copied from the same token as TokenUser; Windows can assign
+that default owner while inheriting a user/System-only DACL. This is an ownership
+exception, never a group write-ACE exception or an arbitrary Administrators SID
+allowance. Administrators/System remain the OS administrator trust boundary:
+an administrator able to take ownership or replace the runner/toolchain is not
+isolated by this source acquisition route. Reparse,
+remote-volume, foreign-writer and unstable-file inputs are refused. Linux retains
+its existing namespace acquisition and packaging route.
+
+The portable reader requires Git identity schema 2: the bounded raw commit object
+must hash to the pinned commit and contain the exact authenticated tree header.
+The outer archive/receipt schema remains 1; old readers accepted additive source
+identity fields, but new notice generation refuses legacy evidence lacking this
+proof. Existing immutable evidence is not rewritten. Source revision, the whole
+committed workspace, root lock, local patches and every locked registry/Git archive
+are bound before any notice or package payload is published. The two existing
+`-updateqa.1`/`.2` exports may change only the original app-version fields; all
+other source bytes and their identities remain exact. Both synthetic versions
+share the same source archive and original-lock evidence, and bind their actual
+version-only lock hash separately.
+
+The actual package resource pair is exactly:
+
+- `THIRD-PARTY-NOTICES.txt`: readable exact source license/NOTICE text, factual
+  Slint attribution, package references and local patch provenance (including CPAL).
+- `THIRD-PARTY-NOTICES.json`: immutable source/archive/lock/version/platform and
+  per-text byte-offset, length and SHA-256 inventory; no commands or URLs to execute.
+
+Mac installs the pair in `Contents/Resources`; Windows installs it under
+`licenses/`, using its reviewed fixed seven-resource V2 payload/marker contract.
+The original Mac app/DMG build and single Windows NSIS build remain. The full
+signed Mac bundle and Windows payload hashes cover these bytes. Package smoke
+requires both installed files to equal the exact generated pair and verifies their
+source/version/platform/lock identity. Existing install, signature, rollback,
+source/relink and update activation gates stay in force. V1 Windows markers and
+payloads are not silently upgraded or reinterpreted; see
+[Windows transition](../packaging/windows/UPDATES.md).
+
+Direct native packaging requires both explicit local inputs:
+`--native-source-bundle <archive> --native-source-receipt <receipt>`.
+The permanent job supplies them to ordinary packaging and the existing two-version
+installed-update drivers. The always-step scans and removes only its own exact
+private source tree after the command cleanup receipt; an unproved process stop,
+scan or ownership result fails and retains evidence. Caller-owned scanner and
+Mac target directories retain their existing ephemeral-runner lifetime; no full
+host disposal claim is made. Nothing is uploaded or published, and acquisition
+uses no shared Cargo cache or credential-bearing configuration.
+
+All locked packages are included, even target-conditional or unused packages;
+this is source evidence, not an exact static-link map. Missing license text is
+explicitly recorded. Unknown native/prebuilt SDK, compiler/system runtime,
+preferred-source, relinking/install and legal obligations keep
+`distribution_ready=false` and `license_compliance_verified=false`. Copied notices
+never select a license route, authorize distribution, prove native SDK acceptance
+or close real-device/ordinary UI/installed migration/signing release gates.

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-# Keep upstream decoder dev tools outside the application workspace.
-exclude = ["vendor/image-webp"]
+# Keep vendored library development feature sets outside the application workspace.
+exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
@@ -32,6 +32,10 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/brk275/Morpheus"
 
 [patch.crates-io]
+# Same-version CPAL: retained, fallible macOS native shutdown.
+cpal = { path = "vendor/cpal" }
+# Same-version ALSA wrapper exposes consuming checked PCM close without a Drop retry.
+alsa = { path = "vendor/alsa" }
 # Bound lossless WebP entropy-tree amplification before allocating groups.
 image-webp = { path = "vendor/image-webp" }
 # Isolate pinned WebRTC PipeWire stubs from the system PipeWire API on Linux.
@@ -67,3 +71,6 @@ matrix-sdk-ui = { path = "vendor/matrix-sdk-ui" }
 # Dependency resolution and compatibility remain subject to hosted verification.
 matrix-sdk = { path = "vendor/matrix-sdk" }
 matrix-sdk-search = { path = "vendor/matrix-sdk-search" }
+
+# Same-revision bounded encrypted room-key preparation; upstream tests preserved.
+matrix-sdk-crypto = { path = "vendor/matrix-sdk-crypto" }

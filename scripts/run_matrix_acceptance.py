@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -101,10 +102,16 @@ DRAFTS_STAGES = frozenset((
 ))
 DRAFTS_STAGE = re.compile(r"^MORPHEUS_DRAFTS_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_RECOVERY_LABEL = "app-draft-recovery"
+APP_MARKER_AUTHORITY_TEST = (
+    "live::stale_observer_tests::"
+    "a_departed_selection_neither_reveals_nor_focuses_after_a_switch_back"
+)
+APP_MARKER_AUTHORITY_COMPLETE = "MORPHEUS_APP_MARKER_AUTHORITY_CHECK complete=true"
 APP_TIMELINE_LABEL = "app-live-timeline"
 APP_TIMELINE_CASE = "account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation"
 APP_TIMELINE_CHECKS = frozenset((
     "room_delivery", "thread_delivery", "thread_root_excluded", "feeds_running",
+    "message_copy_callbacks", "message_copy_account_aba", "message_copy_renewed_delivery",
     "old_lease_revoked", "idle_feeds_stopped", "late_events_in_core",
     "stale_room_rejected", "stale_thread_rejected", "renewed_thread_delivery",
     "renewed_room_delivery", "queued_callbacks_observed", "queued_room_rejected",
@@ -116,6 +123,7 @@ APP_TIMELINE_STAGES = frozenset((
     "setup_profile", "setup_config", "setup_window", "setup_controller",
     "setup_dispatch", "setup_login", "setup_rooms", "setup_ready",
     "setup", "activation", "room_open", "room_delivery", "thread_delivery",
+    "message_copy_callbacks",
     "revocation", "renewal", "reopen", "queued_revocation", "queued_drain",
     "queued_reopen", "link_continuation", "member_publication", "cleanup", "complete",
     "cleanup_logout_primary", "cleanup_logout_other", "cleanup_manager_stop",
@@ -145,6 +153,17 @@ APP_RECOVERY_TESTS = tuple("live::stale_observer_tests::" + name for name in (
     "a_thread_submission_typed_over_during_preparation_is_kept_with_its_index",
 ))
 APP_RECOVERY_STAGE = re.compile(r"^MORPHEUS_APP_RECOVERY_STAGE ([a-z_]{1,48})$", re.MULTILINE)
+APP_RECOVERY_WRITE_BOUNDARIES = frozenset((
+    "setup", "prepare_record", "rollback_pause", "rollback_writer_lock", "rollback_release",
+    "rollback_ended_before_pause", "rollback_pause_timeout",
+    "row_before_switch", "switch_account", "rollback_join", "row_after_write", "switch_back",
+    "recovery_discovery", "flush", "row_after_flush", "logout_first", "logout_second",
+    "manager_stop", "profile_close", "complete",
+))
+APP_RECOVERY_PROGRESS = re.compile(
+    r"^(?:MORPHEUS_APP_RECOVERY_STAGE ([a-z_]{1,48})|"
+    r"MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation ([a-z_]{1,48}))$", re.MULTILINE,
+)
 APP_RECOVERY_CHECK = re.compile(r"^MORPHEUS_APP_RECOVERY_CHECK ([a-z_]{1,48})=(true|false)$", re.MULTILINE)
 # Share the same bounded first-panic header between process and recovery facts.
 NATIVE_PANIC = re.compile(
@@ -207,6 +226,7 @@ OAUTH_STAGES = frozenset((
     "logout_remote", "logout_account", "logout_vault",
 ))
 OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_acceptance", "deadline",
+                           "registration_command", "registration_exit_two", "registration_exit_exec", "registration_exit_other",
                            "logout_timeout", "logout_operation", "logout_remote", "logout_account",
                            "logout_vault_lookup", "logout_vault_retained",
                            "browser_callback_fragment", "browser_callback_query", "browser_callback_state",
@@ -217,6 +237,61 @@ OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_accep
                            "browser_callback_url", "browser_callback_match"))
 OAUTH_STAGE = re.compile(r"^MORPHEUS_OAUTH_STAGE ([a-z_]+)$", re.MULTILINE)
 OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
+OUTAGE_TEST = "outgoing_ring::live_tests::outage_tests::current_call_recovers_from_owned_sfu_restart"
+OUTAGE_LABELS = ("rtc-recovery-current-dm", "rtc-recovery-current-room")
+OUTAGE_HELPER_TESTS = (
+    ("rtc-recovery-audio-spectrum", "outgoing_ring::live_tests::alsa_playback::tests::group_oracle_requires_both_distinct_new_tones_and_refuses_old_or_silent_audio"),
+    ("rtc-recovery-audio-checkpoint", "outgoing_ring::live_tests::alsa_playback::tests::checkpoint_retires_old_windows_and_reassembles_partial_stereo_frames"),
+    ("rtc-recovery-audio-library-path", "outgoing_ring::live_tests::alsa_playback::loaded::tests::malformed_ambiguous_and_foreign_loaded_objects_are_refused"),
+    ("rtc-recovery-audio-library-version", "outgoing_ring::live_tests::alsa_playback::loaded::tests::version_bytes_require_exact_supported_value_and_bounded_readable_span"),
+    ("rtc-recovery-audio-library-digest", "outgoing_ring::live_tests::alsa_playback::loaded::tests::wrong_object_bytes_are_refused_at_the_exact_supported_length"),
+)
+OUTAGE_CHECKS = frozenset(("initial_notification", "sfu_stopped", "app_ended_into_rejoin",
+    "sfu_restarted", "automatic_new_join", "fresh_key_identities", "new_epoch_media_all_peers",
+    "no_extra_notification", "native_audio_before", "native_audio_after", "cleanup"))
+OUTAGE_TARGET = {"dm": "current_dm", "room": "current_three_participant_room"}
+OUTAGE_STAGES = frozenset(("fixture", "login", "join", "initial_media", "outage", "app_rejoining",
+    "restart", "peer_rejoin", "recovered_media", "initial_audio", "recovered_audio", "sync_barrier", "history", "cleanup"))
+OUTAGE_CHECK = re.compile(r"^MORPHEUS_RTC_OUTAGE_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
+OUTAGE_RESULT = re.compile(r"^MORPHEUS_RTC_OUTAGE_RESULT passed=(true|false)$", re.MULTILINE)
+OUTAGE_STAGE = re.compile(r"^MORPHEUS_RTC_OUTAGE_STAGE ([a-z_]+)$", re.MULTILINE)
+
+
+def outage_evidence(output: str, target: str) -> dict[str, bool]:
+    if target not in OUTAGE_TARGET:
+        raise RuntimeError("Invalid owned SFU outage target")
+    expected = OUTAGE_CHECKS | {OUTAGE_TARGET[target]}
+    checks = {}
+    for line in output.splitlines():
+        if "MORPHEUS_RTC_OUTAGE_" not in line:
+            continue
+        if match := OUTAGE_CHECK.fullmatch(line):
+            name, value = match.groups()
+            if name not in expected or name in checks or value != "true":
+                raise RuntimeError("Owned SFU outage evidence is incomplete")
+            checks[name] = True
+        elif match := OUTAGE_STAGE.fullmatch(line):
+            if match[1] not in OUTAGE_STAGES:
+                raise RuntimeError("Owned SFU outage stage is invalid")
+        elif not OUTAGE_RESULT.fullmatch(line):
+            raise RuntimeError("Owned SFU outage evidence is malformed")
+    named = re.findall(rf"^test {re.escape(OUTAGE_TEST)} \.\.\. ok$", output, re.MULTILINE)
+    if (set(checks) != expected or OUTAGE_RESULT.findall(output) != ["true"]
+            or len(named) != 1 or len(RESULT.findall(output)) != 1 or passed_tests(output) != 1):
+        raise RuntimeError("Owned SFU outage evidence is incomplete")
+    return checks
+
+
+def outage_diagnostics(output: str) -> dict:
+    stages = [match[1] for match in OUTAGE_STAGE.finditer(output) if match[1] in OUTAGE_STAGES]
+    result = {"stage": stages[-1]} if stages else {}
+    checks = {name: value == "true" for name, value in OUTAGE_CHECK.findall(output)
+              if name in OUTAGE_CHECKS or name in OUTAGE_TARGET.values()}
+    if checks:
+        result["checks"] = checks
+    return result
+
+
 RING_TEST = "outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction"
 RING_CHECKS = frozenset((
     "sticky_sync", "own_crypto", "peer_trust", "joined_without_media", "encrypted_membership",
@@ -392,7 +467,8 @@ SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
           "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS,
           "app-timeline": APP_TIMELINE_ONLY_CHECKS, "outgoing-ring": RING_LABELS,
-          "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS)}
+          "native-call": (*APP_TIMELINE_ONLY_CHECKS, *RING_LABELS), "oauth-only": OAUTH_LABELS,
+          "rtc-recovery": OUTAGE_LABELS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -406,7 +482,7 @@ class CheckFailure(RuntimeError):
     """Only a scanned test failure after verified process containment/cleanup."""
 
     def __init__(self, label: str, reason: str):
-        if label not in PLANNED_CHECKS or reason not in ("test_failed", "deadline", "evidence_incomplete"):
+        if label not in (*PLANNED_CHECKS, *OUTAGE_LABELS) or reason not in ("test_failed", "deadline", "evidence_incomplete"):
             raise RuntimeError("Invalid acceptance failure classification")
         self.label, self.reason = label, reason
         super().__init__(f"Acceptance check failed: {label} ({reason})")
@@ -455,9 +531,13 @@ def app_recovery_diagnostics(output: str) -> dict:
     result = {}
     # Serial libtest cases continue after a panic; later stages are unrelated
     # to the first failure recorded by native_process_diagnostics.
-    for match in APP_RECOVERY_STAGE.finditer(output, 0, end):
+    for match in APP_RECOVERY_PROGRESS.finditer(output, 0, end):
         if match[1] in APP_RECOVERY_CASES:
             result["stage"] = match[1]
+            result.pop("boundary", None)
+        elif (result.get("stage") == "write_revocation"
+              and match[2] in APP_RECOVERY_WRITE_BOUNDARIES):
+            result["boundary"] = match[2]
     if (panic and result.get("stage") == "observer_revocation"
             and panic[0].startswith("thread '" + APP_RECOVERY_TESTS[0] + "'")
             and re.fullmatch(r"crates/morpheus-app/src/live\.rs:[0-9]+:[0-9]+:?", panic[1])):
@@ -496,7 +576,14 @@ def app_recovery_evidence(output: str) -> dict[str, bool]:
             checks[name] = True
     entered = {match[1] for match in APP_RECOVERY_STAGE.finditer(output)
                if match[1] in APP_RECOVERY_CASES}
-    if (passed_tests(output) != len(APP_RECOVERY_CASES)
+    # One existing real-account authority test shares this exact app/fixture
+    # invocation. Keep its completion separate from the twelve draft protocols;
+    # a default skip, missing selector, duplicate or malformed marker cannot pass.
+    marker = [line for line in output.splitlines() if "MORPHEUS_APP_MARKER_AUTHORITY" in line]
+    expected = len(APP_RECOVERY_TESTS) + 1
+    if (passed_tests(output) != expected
+            or RESULT.findall(output) != [(str(expected), "0", "0")]
+            or marker != [APP_MARKER_AUTHORITY_COMPLETE]
             or entered != APP_RECOVERY_CASES or checks.keys() != APP_RECOVERY_CASES):
         raise RuntimeError("Live app recovery evidence is incomplete")
     return {name: True for name in sorted(APP_RECOVERY_CASES)}
@@ -810,6 +897,13 @@ class Acceptance:
             "XDG_CACHE_HOME": str(private_directory(root / "desktop-cache")),
             "RUST_BACKTRACE": "0",
         })
+        if suite == "rtc-recovery":
+            if self.env.get("GITHUB_REPOSITORY") != "brk275/Morpheus":
+                raise RuntimeError("Owned SFU outage requires the public project fixture")
+            self.env["MORPHEUS_MATRIX_SFU_RUN_ID"] = secrets.token_hex(16)
+        else:
+            # A host-supplied recovery capability must never alter legacy runs.
+            self.env.pop("MORPHEUS_MATRIX_SFU_RUN_ID", None)
         self.results = []
         self.failures = []
         self.not_run = {}
@@ -856,10 +950,14 @@ class Acceptance:
             self.containment_verified = True
 
     def run(self, label: str, args: list[str], *, extra=None, test=False, oauth_checks=(), element_checks=False,
-            ring_case=None, stdin=None, seconds=900, pid_namespace=False, cleanup=False) -> str:
+            ring_case=None, outage_target=None, stdin=None, seconds=900, pid_namespace=False, cleanup=False) -> str:
         if ring_case is not None and ring_case not in (
                 ("current", "dm"), ("current", "room"), ("sticky-2025", "dm"), ("sticky-2025", "room")):
             raise RuntimeError("Invalid outgoing ring acceptance case")
+        if ((label in OUTAGE_LABELS and outage_target is None)
+                or (outage_target is not None and (self.suite != "rtc-recovery" or outage_target not in OUTAGE_TARGET
+                    or label != f"rtc-recovery-current-{outage_target}" or not pid_namespace))):
+            raise RuntimeError("Invalid owned SFU outage command")
         remaining = self.available(cleanup=cleanup)
         if remaining <= 0:
             if cleanup or self.finalizing:
@@ -934,8 +1032,11 @@ class Acceptance:
                                      or "actor_cleanup" in INCOMING_FAILURE.findall(output)
                                      or "cleanup" in INCOMING_ERROR.findall(output)):
             raise RuntimeError("Outgoing invitation acceptance cleanup failed")
+        if outage_target is not None and any(value == "false" for name, value in OUTAGE_CHECK.findall(output)
+                                               if name == "cleanup"):
+            raise RuntimeError("Owned SFU outage cleanup failed")
         recoverable = pid_namespace and (
-            ((test or ring_case is not None) and ran_native_test(output))
+            ((test or ring_case is not None or outage_target is not None) and ran_native_test(output))
             or (element_checks and element_diagnostics(output).get("stage") in ELEMENT_TEST_STAGES)
         )
         if process.returncode or timed_out:
@@ -997,6 +1098,8 @@ class Acceptance:
                 evidence["element_diagnostics"] = element_diagnostics(output)
                 if timed_out:
                     evidence["element_diagnostics"]["failure"] = "deadline"
+            if outage_target is not None:
+                evidence["outage_diagnostics"] = outage_diagnostics(output)
             if ring_case is not None:
                 evidence["ring_diagnostics"] = ring_diagnostics(output)
                 if timed_out:
@@ -1009,7 +1112,7 @@ class Acceptance:
             raise RuntimeError(f"{label} failed with exit status {process.returncode}")
         try:
             record = self.validated_record(label, output, test=test, ring_case=ring_case,
-                                           oauth_checks=oauth_checks, element_checks=element_checks)
+                                           oauth_checks=oauth_checks, element_checks=element_checks, outage_target=outage_target)
         except RuntimeError:
             if recoverable:
                 raise CheckFailure(label, "evidence_incomplete") from None
@@ -1020,9 +1123,19 @@ class Acceptance:
         write_private(self.root / "results.json", json.dumps(self.results, indent=2) + "\n")
         return output
 
-    def validated_record(self, label, output, *, test, ring_case, oauth_checks, element_checks):
+    def validated_record(self, label, output, *, test, ring_case, oauth_checks, element_checks, outage_target=None):
         record = {"check": label}
-        if ring_case is not None:
+        if label in OUTAGE_LABELS and (self.suite != "rtc-recovery" or outage_target not in OUTAGE_TARGET
+                                      or label != f"rtc-recovery-current-{outage_target}"):
+            raise RuntimeError("Owned SFU outage record requires its exact target")
+        if outage_target is not None:
+            record["outage_checks"] = outage_evidence(output, outage_target)
+            record["passed"] = 1
+            record["call_mode"] = "current"
+            record["participants"] = 2 if outage_target == "dm" else 3
+            record["media_scope"] = "synthetic_remote_camera_and_native_alsa_mixed_playback"
+            record["notification_scope"] = "complete_bounded_decrypted_history_after_sync_barrier"
+        elif ring_case is not None:
             try:
                 record["passed"] = ring_passed_tests(output, ring_case)
             except RuntimeError:
@@ -1056,7 +1169,10 @@ class Acceptance:
                 raise RuntimeError("Draft restart acceptance completion evidence is incomplete")
             record["drafts_diagnostics"] = diagnostics
         if label == APP_RECOVERY_LABEL:
+            if not test:
+                raise RuntimeError("Live app recovery evidence requires native test execution")
             record["app_recovery_checks"] = app_recovery_evidence(output)
+            record["app_marker_authority_checks"] = {"account_selection_and_close": True}
         if label == APP_TIMELINE_LABEL:
             if not test:
                 raise RuntimeError("Live timeline UI evidence is incomplete")
@@ -1105,6 +1221,7 @@ class Acceptance:
             APP_RECOVERY_LABEL,
             ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
              "--bin", "morpheus-app", "--", "--exact", *APP_RECOVERY_TESTS,
+             APP_MARKER_AUTHORITY_TEST,
              "--nocapture", "--test-threads=1"],
             extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture), "SLINT_EMIT_DEBUG_INFO": "1"},
             test=True, pid_namespace=True,
@@ -1216,6 +1333,48 @@ class Acceptance:
                 )
             self.group((label,), case)
 
+    def rtc_recovery_cases(self):
+        if self.suite != "rtc-recovery" or "MORPHEUS_MATRIX_SFU_RUN_ID" not in self.env:
+            raise RuntimeError("Owned SFU outage suite is not selected")
+        args = ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+                "--bin", "morpheus-app"]
+        self.run("rtc-recovery-app-test-compile", args + ["--no-run"],
+                 extra={"SLINT_EMIT_DEBUG_INFO": "1"})
+        for label, selector in OUTAGE_HELPER_TESTS:
+            listing = self.run(label + "-list", args + [selector, "--", "--list", "--exact"],
+                               extra={"SLINT_EMIT_DEBUG_INFO": "1"}, seconds=60)
+            if [line for line in listing.splitlines() if line.endswith(": test")] != [selector + ": test"]:
+                raise RuntimeError("Owned SFU audio helper exact test is unavailable")
+            output = self.run(label,
+                args + [selector, "--", "--exact", "--nocapture", "--test-threads=2"],
+                extra={"SLINT_EMIT_DEBUG_INFO": "1"}, seconds=60, test=True, pid_namespace=True)
+            named = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. ok$", output, re.MULTILINE)
+            if (named != [selector] or RESULT.findall(output) != [("1", "0", "0")]
+                    or passed_tests(output) != 1):
+                raise RuntimeError("Owned SFU audio helper exact completion is incomplete")
+        listing = self.run("rtc-recovery-exact-test-list", args + [OUTAGE_TEST, "--", "--list", "--exact"],
+                           extra={"SLINT_EMIT_DEBUG_INFO": "1"}, seconds=60)
+        if [line for line in listing.splitlines() if line.endswith(": test")] != [OUTAGE_TEST + ": test"]:
+            raise RuntimeError("Owned SFU outage exact test is unavailable")
+        for index, target in enumerate(OUTAGE_TARGET):
+            def case():
+                fixture = fixture_from_output(self.script("local_matrix_rtc",
+                    "rtc-fixture" if target == "dm" else "rtc-group-fixture"), self.root)
+                self.run(f"rtc-recovery-current-{target}",
+                    args + [OUTAGE_TEST, "--", "--ignored", "--exact", "--nocapture", "--test-threads=2"],
+                    extra={"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture),
+                           "MORPHEUS_RTC_OUTAGE_TARGET": target, "SLINT_EMIT_DEBUG_INFO": "1",
+                           "MORPHEUS_CALL_AUDIO_ROOT": str(self.root / f"rtc-playback-{target}"),
+                           "ALSA_CONFIG_PATH": str(self.root / f"rtc-playback-{target}" / "alsa.conf")},
+                    outage_target=target, seconds=540, pid_namespace=True)
+            if not self.group((f"rtc-recovery-current-{target}",), case):
+                # The outage may still own a stopped SFU. Do not turn the next
+                # room case into a retry of failed shared infrastructure.
+                for label in OUTAGE_LABELS[index + 1:]:
+                    self.not_run[label] = "dependency_failed"
+                    print(json.dumps({"check": label, "status": "not_run", "reason": "dependency_failed"}), flush=True)
+                return
+
     def oauth_cases(self):
         """Separate processes prove that refresh tokens survive vaulted restart."""
         services = self.root / "oauth-services"
@@ -1323,6 +1482,17 @@ class Acceptance:
                 if self.suite == "full":
                     output.write("Full suite: real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
                                  "synthetic call media and OAuth browser-form protocol automation.\n\n")
+                elif self.suite == "rtc-recovery":
+                    output.write("Explicit Current-only owned SFU kill/restart checks: actual app automatic bounded rejoin, "
+                                 "two DM participants and three room participants, fresh key-event identities, "
+                                 "new post-restart synthetic camera epochs, both group tones through actual native ALSA mixed playback, "
+                                 "and complete bounded notification history "
+                                 "after a real sync barrier. This is not Sticky/Element, incoming-app automatic rejoin, "
+                                 "physical audio/video, installed-package or whole-beta acceptance.\n\n")
+                elif self.suite == "oauth-only":
+                    output.write("Focused OAuth checks: the existing disposable MAS, Synapse, PostgreSQL and OS Secret Service lifecycle. "
+                                 "All cancellation/login-refresh, vaulted restart/automatic refresh and logout phases remain mandatory. "
+                                 "No chat, RTC, Element, device, desktop or installed-package acceptance is implied.\n\n")
                 elif self.suite == "timeline-reads":
                     output.write("Focused timeline-read checks: real Synapse and an ephemeral OS Secret Service. "
                                  "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths, key recovery, chat without a call service and generated-window model delivery/revocation. "
@@ -1372,6 +1542,10 @@ class Acceptance:
                         output.write(f"| {item['check']} | Failed: {item['reason']} |\n")
                     for label, reason in unexecuted.items():
                         output.write(f"| {label} | Not run: {reason} |\n")
+                if any("app_marker_authority_checks" in item for item in self.results):
+                    output.write("\nThe app invocation retains twelve draft-recovery protocol checks and "
+                                 "separately verifies the original marker account selection across switch-back "
+                                 "and close. This is not decoded media or whole transport teardown proof.\n")
                 if any("element_checks" in item for item in self.results):
                     output.write(f"\nElement peer passed: `{ELEMENT_VERSION}`, `{ELEMENT_IMAGE_DIGEST}`. "
                                  "Only its pre-synced Sticky2025 mode was tested, with two-way synthetic video, "
@@ -1428,8 +1602,23 @@ def main():
     try:
         acceptance.start_keyring()
         acceptance.require_containment()
+        if args.suite == "oauth-only":
+            # OAuth owns its MAS/Postgres/Synapse lifecycle; no seeded chat or RTC
+            # services are a prerequisite. The same outer cleanup/inventory/scan
+            # remains unconditional, including on incomplete evidence or failure.
+            acceptance.group(OAUTH_LABELS, acceptance.oauth_cases)
+            acceptance.finish_checks()
+            return
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "rtc-recovery":
+            def outage_checks():
+                acceptance.script("local_matrix_rtc", "up")
+                acceptance.script("local_matrix_rtc", "probe")
+                acceptance.rtc_recovery_cases()
+            acceptance.group(OUTAGE_LABELS, outage_checks)
+            acceptance.finish_checks()
+            return
         if args.suite == "native-call":
             def native_call_checks():
                 acceptance.app_timeline(fixture)

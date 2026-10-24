@@ -3,6 +3,7 @@
 mod linux_native_pipewire;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=MORPHEUS_PACKAGE_FORMAT");
     #[cfg(target_os = "linux")]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
         && std::env::var_os("CARGO_FEATURE_NATIVE_CALLS").is_some()
@@ -10,7 +11,23 @@ fn main() {
         linux_native_pipewire::configure("bins");
     }
     let timeline_acceptance = timeline_acceptance_build();
-    persistence_fingerprint(timeline_acceptance);
+    let macos_update_acceptance = macos_update_acceptance_build();
+    let windows_update_acceptance = windows_update_acceptance_build();
+    assert!(
+        !timeline_acceptance
+            || (macos_update_acceptance.is_none() && windows_update_acceptance.is_none()),
+        "Acceptance variants cannot be combined"
+    );
+    assert!(
+        macos_update_acceptance.is_none() || windows_update_acceptance.is_none(),
+        "Acceptance variants cannot be combined"
+    );
+    let persistence = persistence_fingerprint(
+        timeline_acceptance,
+        macos_update_acceptance.as_deref(),
+        windows_update_acceptance.as_deref(),
+    );
+    write_update_identity(&persistence);
     slint_build::compile("ui/app-window.slint").expect("failed to compile Morpheus UI");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
         && std::env::var_os("CARGO_FEATURE_NATIVE_CALLS").is_some()
@@ -18,6 +35,28 @@ fn main() {
         // Keep WebRTC's Objective-C categories in the final macOS executable.
         println!("cargo:rustc-link-arg-bins=-ObjC");
     }
+}
+
+// Only an explicitly instrumented release build contains the synthetic Mac
+// transaction entry point. A shipping binary cannot enable it by runtime
+// environment or command line. Its run nonce also separates its cohort from
+// shipping and from every other acceptance build.
+fn macos_update_acceptance_build() -> Option<String> {
+    println!("cargo::rustc-check-cfg=cfg(morpheus_macos_update_acceptance)");
+    println!("cargo:rerun-if-env-changed=MORPHEUS_MAC_UPDATE_ACCEPTANCE_BUILD");
+    let nonce = match std::env::var("MORPHEUS_MAC_UPDATE_ACCEPTANCE_BUILD") {
+        Err(std::env::VarError::NotPresent) => return None,
+        Ok(nonce) => nonce,
+        Err(_) => panic!("Invalid Mac update acceptance build nonce"),
+    };
+    assert!(nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(std::env::var("PROFILE").as_deref(), Ok("release"));
+    assert_eq!(std::env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("macos"));
+    assert!(std::env::var_os("CARGO_FEATURE_NATIVE_CALLS").is_some());
+    assert!(std::env::var_os("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD").is_none());
+    println!("cargo::rustc-cfg=morpheus_macos_update_acceptance");
+    println!("cargo:rustc-env=MORPHEUS_MAC_UPDATE_ACCEPTANCE_NONCE={nonce}");
+    Some(nonce)
 }
 
 /// The instrumented real-room timeline acceptance build (see
@@ -46,10 +85,42 @@ fn timeline_acceptance_build() -> bool {
     }
 }
 
+// A private release-only nonce; ordinary builds neither compile the actor nor
+// change their existing persistence fingerprint. Runtime env cannot enable it.
+fn windows_update_acceptance_build() -> Option<String> {
+    println!("cargo::rustc-check-cfg=cfg(morpheus_windows_update_acceptance)");
+    println!("cargo:rerun-if-env-changed=MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD");
+    match std::env::var("MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_BUILD") {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(nonce) => {
+            assert!(nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(std::env::var("PROFILE").as_deref(), Ok("release"));
+            assert_eq!(
+                std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
+                Ok("windows")
+            );
+            assert_eq!(
+                std::env::var("CARGO_CFG_TARGET_ARCH").as_deref(),
+                Ok("x86_64")
+            );
+            assert!(std::env::var_os("CARGO_FEATURE_NATIVE_CALLS").is_some());
+            assert!(std::env::var_os("MORPHEUS_MAC_UPDATE_ACCEPTANCE_BUILD").is_none());
+            println!("cargo::rustc-cfg=morpheus_windows_update_acceptance");
+            println!("cargo:rustc-env=MORPHEUS_WINDOWS_UPDATE_ACCEPTANCE_NONCE={nonce}");
+            Some(nonce)
+        }
+        Err(_) => panic!("Invalid private Windows update acceptance nonce"),
+    }
+}
+
 // Conservative rollback cohort: source and locked dependencies that can write
 // account/config data must match. App version alone is intentionally excluded.
 // Changing these inputs requires a separately validated migration release.
-fn persistence_fingerprint(timeline_acceptance: bool) {
+fn persistence_fingerprint(
+    timeline_acceptance: bool,
+    macos_update_acceptance: Option<&str>,
+    windows_update_acceptance: Option<&str>,
+) -> String {
     use sha2::{Digest, Sha256};
     use std::{fs, path::Path};
     fn hash_tree(path: &Path, root: &Path, hash: &mut Sha256) {
@@ -127,6 +198,16 @@ fn persistence_fingerprint(timeline_acceptance: bool) {
     if timeline_acceptance {
         hash.update(b"morpheus-timeline-acceptance-instrumented\n");
     }
+    if let Some(nonce) = macos_update_acceptance {
+        hash.update(b"morpheus-macos-update-acceptance-instrumented-v1\n");
+        hash.update(nonce.as_bytes());
+        hash.update(b"\n");
+    }
+    if let Some(nonce) = windows_update_acceptance {
+        hash.update(b"morpheus-windows-update-acceptance-v1\0");
+        hash.update(nonce.as_bytes());
+        hash.update([0]);
+    }
     for file in ["src/drafts.rs", "src/voice_spaces.rs"] {
         println!("cargo:rerun-if-changed={file}");
         hash.update(fs::read(file).unwrap());
@@ -142,8 +223,37 @@ fn persistence_fingerprint(timeline_acceptance: bool) {
             }
         }
     }
-    println!(
-        "cargo:rustc-env=MORPHEUS_PERSISTENCE_COHORT={:x}",
-        hash.finalize()
+    let persistence = format!("{:x}", hash.finalize());
+    println!("cargo:rustc-env=MORPHEUS_PERSISTENCE_COHORT={persistence}");
+    persistence
+}
+
+// One immutable v2 record for native executable sections on Mac and Windows.
+// The closed protocol separates helpers with ordinary-shutdown handoff guards
+// from legacy helpers. It does not change the persistence cohort or journals.
+// No runtime file or user setting can select a persistence cohort. Keep the
+// existing cohort calculation above byte-for-byte equivalent.
+fn write_update_identity(persistence: &str) {
+    use std::{fs, path::PathBuf};
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    assert!(!version.is_empty() && version.len() <= 128);
+    assert!(
+        version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
     );
+    assert!(matches!(
+        arch.as_str(),
+        "aarch64" | "x86_64" | "x86" | "arm"
+    ));
+    assert!(persistence.len() == 64 && persistence.bytes().all(|b| b.is_ascii_hexdigit()));
+    // All interpolated scalars passed the closed ASCII checks above, so they
+    // cannot inject JSON quoting, escapes or additional fields.
+    let identity = format!(
+        "{{\"protocol\":2,\"product\":\"io.github.brk275.morpheus\",\"version\":\"{version}\",\"arch\":\"{arch}\",\"persistence\":\"{persistence}\"}}"
+    );
+    let output =
+        PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("morpheus-update-identity.json");
+    fs::write(output, identity).unwrap();
 }

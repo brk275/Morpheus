@@ -37,14 +37,25 @@ The signed footer binds product identifier, version, architecture, updater
 protocol, and a conservative persistence fingerprint. The latter includes
 Matrix/configuration source, app draft/voice-space persistence code, Cargo
 manifests, enabled app features, vendored dependency patches, and the dependency
-lock. Only the app package version is excluded. A dependency, feature, or
+lock. The app package version and ordinary UI/updater implementation are not
+persistence inputs. A dependency, feature, or
 persistence-source change therefore requires a separately verified migration
 release rather than an automatic update in this initial implementation.
 
 The updater checks the signed bytes and footer without executing a downloaded
 application to discover compatibility. It also checks that the installed
 AppImage's footer matches the running application's embedded metadata. Older
-packages without this protocol need a manual installation first.
+packages without the current protocol need a manual installation first.
+Protocol **2** requires the successful ordinary-shutdown authority and original
+process capability described below. Both forward directions between protocol1
+and protocol2 fail before preparation; a new candidate cannot silently use an
+older lock-only helper. The existing `METADATA-V1` footer marker still identifies
+the bounded footer encoding, not the forward-update protocol. Existing Linux
+journal1 records remain readable only for the original hash-bound interrupted
+rollback or committed cleanup, never as a new forward authorization. An unknown
+manual replacement, mismatched bytes or an unresolved legacy state preserves
+recovery material and requires explicit manual recovery; this is not a general
+promise of automatic migration from legacy installations.
 
 **The updater never copies, snapshots, restores, or migrates Matrix databases,
 cryptographic state, credentials, drafts, or user configuration.** Rollback is
@@ -61,7 +72,26 @@ limited to application bytes before the new process opens account storage.
 - Dropping or cancelling a prepared restart removes the owned preparation and
   releases the call/update exclusion. The helper must signal readiness before
   the old application is asked to quit; launch failure leaves it running.
-- The helper waits for the old process's lifetime lock, writes durable intent,
+- Before readiness, the helper captures a kernel pidfd for the original socket
+  creator's complete thread group and binds the full prepared journal to an
+  unnamed private socket. Kernel socket credentials must match the original
+  preparing process and effective owner. `SO_PEERPIDFD` is preferred; a kernel
+  without it requires an exact direct-parent check before and after
+  `pidfd_open(..., 0)`. A runtime wrapper or unavailable capability fails closed
+  rather than permitting a numeric-PID wait. Older-kernel/runtime acceptance
+  remains unproved until exercised on that exact installed route.
+- The complete ordinary application function must return success and drop its
+  UI/runtime/owner locals, including all mandatory typed cleanup results and
+  acceptance completion. Unique startup-session ownership is then recovered
+  and the full prepared journal and all three image hashes are rechecked before
+  consuming a one-shot success authority. An error, panic, failed unique-owner
+  recovery, partial write or ordinary Drop never generates that authority.
+- The helper requires the exact transaction-bound token and EOF, then actual
+  original thread-group death, independently reacquires the lifetime lock and
+  rechecks the complete original journal and image hashes. Missing authority
+  leaves preparation recoverable. The token is a successful application-scope
+  receipt, **not** a kernel exit-status or complete SDK/backend-disposal proof.
+  It writes durable intent only after these requirements,
   and atomically renames the verified sibling over the installed AppImage on
   the same filesystem. The application path is never removed first. Both
   affected directories are flushed, and the previous binary remains available.

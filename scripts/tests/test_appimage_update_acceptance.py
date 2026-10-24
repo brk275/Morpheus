@@ -20,7 +20,7 @@ def image(path, version="0.1.0-updateqa.2"):
     header[8:11] = b"AI\x02"
     header[18:20] = b"\x3e\x00"
     struct.pack_into("<H", header, 54, 56)
-    metadata = {"protocol": 1, "product": "io.github.brk275.morpheus", "version": version,
+    metadata = {"protocol": 2, "product": "io.github.brk275.morpheus", "version": version,
                 "arch": "x86_64", "persistence": "a" * 64}
     footer = json.dumps(metadata).encode()
     path.write_bytes(header + b"squashfs-fixture-bytes" + footer + struct.pack("<I", len(footer)) + target.FOOTER)
@@ -125,7 +125,7 @@ class AppImageAcceptanceTests(unittest.TestCase):
             commands.env = {"PATH": "/usr/bin:/bin", "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux",
                             "MORPHEUS_FREE_HOSTED_UPDATE_QA": "1", "CARGO_PACKAGER_SIGN_PRIVATE_KEY": "must-not-cross",
                             "RUSTFLAGS": "must-not-cross", "GITHUB_TOKEN": "must-not-cross"}
-            metadata = {"protocol": 1, "product": "io.github.brk275.morpheus", "version": "0.1.0-updateqa.1",
+            metadata = {"protocol": 2, "product": "io.github.brk275.morpheus", "version": "0.1.0-updateqa.1",
                         "arch": "x86_64", "persistence": "a" * 64}
             def namespace(args, directory, env):
                 self.assertEqual(args[:3], ["/usr/bin/python3", "-I", "-B"])
@@ -176,6 +176,19 @@ class AppImageAcceptanceTests(unittest.TestCase):
                           b"invalid" + data[7:]):
                 path.write_bytes(value)
                 with self.assertRaises((RuntimeError, ValueError)):
+                    target.image_metadata(path)
+
+    def test_legacy_or_non_integer_protocol_cannot_enter_installed_acceptance(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "candidate.AppImage"
+            metadata = image(path)
+            original = path.read_bytes()
+            tail_size = len(json.dumps(metadata).encode()) + 4 + len(target.FOOTER)
+            payload = original[:-tail_size]
+            for protocol in [1, True, 2.0, 3]:
+                footer = json.dumps(dict(metadata, protocol=protocol)).encode()
+                path.write_bytes(payload + footer + struct.pack("<I", len(footer)) + target.FOOTER)
+                with self.subTest(protocol=protocol), self.assertRaises(RuntimeError):
                     target.image_metadata(path)
 
     def test_signer_receives_private_key_path_in_env_never_argv(self):

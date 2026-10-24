@@ -34,6 +34,10 @@ use crate::voice_spaces::VoiceSpaces;
 use super::*;
 
 mod actor_tests;
+#[cfg(target_os = "linux")]
+mod alsa_playback;
+#[cfg(target_os = "linux")]
+mod outage_tests;
 use actor_tests::ActorAcceptance;
 use std::sync::Arc;
 

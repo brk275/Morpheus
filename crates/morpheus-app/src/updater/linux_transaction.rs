@@ -10,8 +10,10 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        net::UnixStream,
         process::CommandExt,
     },
     path::{Path, PathBuf},
@@ -22,6 +24,9 @@ use std::{
 pub(super) const FOOTER_MAGIC: &[u8] = b"\nMORPHEUS-APPIMAGE-METADATA-V1\n";
 const JOURNAL_LIMIT: u64 = 16 * 1024;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(45);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(120);
+const REQUEST_PREFIX: &[u8] = b"MORPHEUS-LINUX-HANDOFF-V2\n";
+const SUCCESS_PREFIX: &[u8] = b"MORPHEUS-LINUX-CLEAN-V2\n";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +41,7 @@ pub(super) struct PackageMetadata {
 impl PackageMetadata {
     pub(super) fn embedded() -> Self {
         Self {
-            protocol: 1,
+            protocol: 2,
             product: "io.github.brk275.morpheus".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             arch: std::env::consts::ARCH.into(),
@@ -45,7 +50,8 @@ impl PackageMetadata {
     }
 
     fn compatible(&self, installed: &Self) -> bool {
-        self.protocol == 1
+        self.protocol == 2
+            && installed.protocol == 2
             && self.product == installed.product
             && self.arch == installed.arch
             && self.persistence == installed.persistence
@@ -85,7 +91,7 @@ enum Phase {
     RollbackIntent,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Journal {
     protocol: u8,
@@ -94,6 +100,252 @@ struct Journal {
     old_hash: String,
     new_hash: String,
     candidate: PackageMetadata,
+    // Legacy journals remain readable for rollback/committed recovery only.
+    // This numeric identity is checked solely against kernel socket credentials
+    // before acquiring the nonreusable process capability; never poll/signal it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<Origin>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Origin {
+    pid: u32,
+    uid: u32,
+}
+
+fn transaction_digest(journal: &Journal) -> Result<String, UpdateError> {
+    if journal.protocol != 2
+        || journal.phase != Phase::Prepared
+        || journal.candidate.protocol != 2
+        || journal.origin.is_none()
+    {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    serde_json::to_vec(journal)
+        .map(|bytes| hash(&bytes))
+        .map_err(|_| UpdateError::RecoveryRequired)
+}
+
+fn authority_frame(prefix: &[u8], digest: &str) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(prefix.len() + digest.len());
+    frame.extend_from_slice(prefix);
+    frame.extend_from_slice(digest.as_bytes());
+    frame
+}
+
+/// A private, single-use authority. Dropping it never authorizes installation.
+/// It is retained with the original lifetime lock through ordinary shutdown.
+struct ShutdownAuthority {
+    channel: UnixStream,
+    prepared: Journal,
+}
+
+/// A kernel process capability, not a reusable numeric PID or exit-status
+/// receipt. With flags zero this becomes readable only after the entire
+/// original thread group has exited. The original process is not our child.
+struct ParentExitMonitor(OwnedFd);
+
+fn close_on_exec(fd: libc::c_int) -> Result<(), UpdateError> {
+    // SAFETY: the caller retains this live descriptor; fcntl has no pointers.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    Ok(())
+}
+
+impl ParentExitMonitor {
+    fn capture(channel: &UnixStream, origin: &Origin) -> Result<Self, UpdateError> {
+        if !cfg!(target_arch = "x86_64") {
+            return Err(UpdateError::UnsupportedPackage);
+        }
+        let fd = channel.as_raw_fd();
+        for (option, expected) in [
+            (libc::SO_TYPE, libc::SOCK_STREAM),
+            (libc::SO_DOMAIN, libc::AF_UNIX),
+        ] {
+            let mut value: libc::c_int = 0;
+            let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+            // SAFETY: each output has its exact initialized allocation size.
+            if unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    option,
+                    (&mut value as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            } != 0
+                || len as usize != std::mem::size_of_val(&value)
+                || value != expected
+            {
+                return Err(UpdateError::RecoveryRequired);
+            }
+        }
+        // SAFETY: ucred is initialized and getsockopt receives the exact size.
+        let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&peer) as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut peer as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        } != 0
+            || len as usize != std::mem::size_of_val(&peer)
+            || peer.pid <= 1
+            || peer.uid != unsafe { libc::geteuid() }
+            || peer.pid as u32 != origin.pid
+            || peer.uid != origin.uid
+        {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        // Linux 6.5 SO_PEERPIDFD: the kernel retains task_tgid of the process
+        // that made socketpair, even through the AppImage runtime's exec/fork.
+        // The package protocol admits only Linux x86_64, whose UAPI value is77.
+        let mut pidfd: libc::c_int = -1;
+        let mut len = std::mem::size_of_val(&pidfd) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                77,
+                (&mut pidfd as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        let pidfd = if result == 0 {
+            if pidfd < 0 {
+                return Err(UpdateError::RecoveryRequired);
+            }
+            // SAFETY: successful SO_PEERPIDFD transfers a newly allocated fd.
+            let owned = unsafe { OwnedFd::from_raw_fd(pidfd) };
+            if len as usize != std::mem::size_of::<libc::c_int>() {
+                return Err(UpdateError::RecoveryRequired);
+            }
+            owned
+        } else {
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOPROTOOPT) {
+                return Err(UpdateError::RecoveryRequired);
+            }
+            // Older kernels may be used only when the socket creator remains
+            // our exact direct parent across acquisition. Runtime wrappers or
+            // reparenting fail closed; there is no numeric-PID polling fallback.
+            if unsafe { libc::getppid() } != peer.pid {
+                return Err(UpdateError::RecoveryRequired);
+            }
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, peer.pid, 0_u32) };
+            if raw < 0 {
+                return Err(UpdateError::RecoveryRequired);
+            }
+            // SAFETY: successful pidfd_open transfers a new owned descriptor.
+            let owned = unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) };
+            if unsafe { libc::getppid() } != peer.pid {
+                return Err(UpdateError::RecoveryRequired);
+            }
+            owned
+        };
+        for fd in [fd, pidfd.as_raw_fd()] {
+            close_on_exec(fd)?;
+        }
+        let monitor = Self(pidfd);
+        if monitor.exited(Duration::ZERO)? {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        Ok(monitor)
+    }
+
+    fn exited(&self, wait: Duration) -> Result<bool, UpdateError> {
+        let deadline = Instant::now() + wait;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut descriptor = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let milliseconds = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+            // SAFETY: poll receives one live, writable descriptor structure.
+            let result = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+            if result >= 0 {
+                if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                    return Err(UpdateError::RecoveryRequired);
+                }
+                return Ok(descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0);
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return Err(UpdateError::RecoveryRequired);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+        }
+    }
+}
+
+fn receive_exact_frame(
+    channel: &mut UnixStream,
+    frame: &[u8],
+    eof: bool,
+    deadline: Instant,
+) -> Result<(), UpdateError> {
+    let mut actual = vec![0; frame.len()];
+    let mut offset = 0;
+    while offset < actual.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(UpdateError::RecoveryRequired)?;
+        channel
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| UpdateError::RecoveryRequired)?;
+        match channel.read(&mut actual[offset..]) {
+            Ok(0) => return Err(UpdateError::RecoveryRequired),
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(UpdateError::RecoveryRequired),
+        }
+    }
+    if actual != frame {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    if eof {
+        let mut extra = [0_u8; 1];
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(UpdateError::RecoveryRequired)?;
+            channel
+                .set_read_timeout(Some(remaining))
+                .map_err(|_| UpdateError::RecoveryRequired)?;
+            match channel.read(&mut extra) {
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                _ => return Err(UpdateError::RecoveryRequired),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn await_original_shutdown(
+    channel: &mut UnixStream,
+    parent: &ParentExitMonitor,
+    digest: &str,
+    deadline: Instant,
+) -> Result<(), UpdateError> {
+    receive_exact_frame(
+        channel,
+        &authority_frame(SUCCESS_PREFIX, digest),
+        true,
+        deadline,
+    )?;
+    if !parent.exited(deadline.saturating_duration_since(Instant::now()))? {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    Ok(())
 }
 
 /// Held for the entire app lifetime, including shutdown of Matrix/call tasks.
@@ -104,6 +356,7 @@ pub struct AppImageSession {
     _lock: File,
     trial: Option<String>,
     install_lease: Option<InstallLease>,
+    shutdown_authority: Option<ShutdownAuthority>,
 }
 
 fn private_directory(path: &Path) -> Result<(), UpdateError> {
@@ -259,6 +512,7 @@ impl AppImageSession {
             _lock: lock,
             trial: None,
             install_lease: None,
+            shutdown_authority: None,
         })
     }
 
@@ -277,7 +531,7 @@ impl AppImageSession {
             .map_err(|_| UpdateError::RecoveryRequired)?;
         let valid_hash =
             |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit());
-        if journal.protocol != 1
+        if !matches!(journal.protocol, 1 | 2)
             || journal.id.is_empty()
             || journal.id.len() > 64
             || !journal.id.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -356,12 +610,16 @@ impl AppImageSession {
             .into_owned();
         drop(random);
         self.save(&Journal {
-            protocol: 1,
+            protocol: 2,
             id,
             phase: Phase::Prepared,
             old_hash: hash(&old),
             new_hash: hash(bytes),
             candidate,
+            origin: Some(Origin {
+                pid: std::process::id(),
+                uid: unsafe { libc::geteuid() },
+            }),
         })
     }
 
@@ -380,7 +638,45 @@ impl AppImageSession {
         sync_directory(&self.state)
     }
 
+    fn validate_prepared(&self, prepared: &Journal) -> Result<(), UpdateError> {
+        if self.journal()?.as_ref() != Some(prepared) {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        validate_prepared_files(&self.installed, &self.state, prepared)
+    }
+
+    pub(super) fn shutdown_pending(&self) -> bool {
+        self.shutdown_authority.is_some()
+    }
+
+    /// Called only after the complete ordinary app scope returned success and
+    /// its UI/runtime/owner locals have dropped. Never called by Drop. The
+    /// caller must have recovered unique ownership of StartupSession first.
+    pub(super) fn complete_successful_shutdown(mut self) -> Result<(), UpdateError> {
+        let Some(mut authority) = self.shutdown_authority.take() else {
+            return Ok(());
+        };
+        self.validate_prepared(&authority.prepared)?;
+        if authority.prepared.origin.as_ref()
+            != Some(&Origin {
+                pid: std::process::id(),
+                uid: unsafe { libc::geteuid() },
+            })
+        {
+            return Err(UpdateError::RecoveryRequired);
+        }
+        let digest = transaction_digest(&authority.prepared)?;
+        // Last fallible operation. A failed/partial write cannot produce the
+        // complete terminal frame. Drop merely closes the socket, including on
+        // error; EOF alone is never authority. There is no success-on-Drop.
+        authority
+            .channel
+            .write_all(&authority_frame(SUCCESS_PREFIX, &digest))
+            .map_err(|_| UpdateError::RecoveryRequired)
+    }
+
     fn apply(&self, journal: &mut Journal) -> Result<(), UpdateError> {
+        transaction_digest(journal)?;
         if journal.phase != Phase::Prepared
             || hash_file(&self.installed)? != journal.old_hash
             || hash_file(&self.state.join("previous.AppImage"))? != journal.old_hash
@@ -449,6 +745,21 @@ impl AppImageSession {
     }
 }
 
+fn validate_prepared_files(
+    installed: &Path,
+    state: &Path,
+    prepared: &Journal,
+) -> Result<(), UpdateError> {
+    transaction_digest(prepared)?;
+    if hash_file(installed)? != prepared.old_hash
+        || hash_file(&state.join("previous.AppImage"))? != prepared.old_hash
+        || hash_file(&state.join("next.AppImage"))? != prepared.new_hash
+    {
+        return Err(UpdateError::RecoveryRequired);
+    }
+    Ok(())
+}
+
 #[must_use = "Explicitly hand off the restart; dropping this handle cancels preparation."]
 pub struct PreparedRestart<'a> {
     session: &'a mut AppImageSession,
@@ -461,12 +772,33 @@ impl PreparedRestart<'_> {
     /// On success, close the UI and finish all workers before dropping the
     /// startup session. Failure leaves the current app running and untouched.
     pub fn launch_supervisor(mut self) -> Result<(), UpdateError> {
-        let mut child = OwnedChild::spawn(
-            image_command(&self.session.state.join("previous.AppImage"))
-                .arg("--morpheus-update-supervise")
-                .arg(&self.session.installed)
-                .arg(&self.id),
-        )?;
+        let prepared = self
+            .session
+            .journal()?
+            .ok_or(UpdateError::RecoveryRequired)?;
+        self.session.validate_prepared(&prepared)?;
+        let digest = transaction_digest(&prepared)?;
+        let (mut parent, helper) = UnixStream::pair().map_err(|_| UpdateError::RestartFailed)?;
+        // Explicitly enforce inheritance rather than depending on std's socket
+        // defaults. Stdio installs only the child endpoint at fd0 for exec.
+        close_on_exec(parent.as_raw_fd())?;
+        close_on_exec(helper.as_raw_fd())?;
+        parent
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .map_err(|_| UpdateError::RestartFailed)?;
+        parent
+            .write_all(&authority_frame(REQUEST_PREFIX, &digest))
+            .map_err(|_| UpdateError::RestartFailed)?;
+        let mut command = image_command(&self.session.state.join("previous.AppImage"));
+        command
+            .arg("--morpheus-update-supervise")
+            .arg(&self.session.installed)
+            .arg(&self.id)
+            .stdin(Stdio::from(OwnedFd::from(helper)));
+        let mut child = OwnedChild::spawn(&mut command)?;
+        // Command retains its stdio configuration after spawn. Close that
+        // child-end alias in the parent before any readiness observation.
+        drop(command);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             if child.exited()? {
@@ -474,11 +806,16 @@ impl PreparedRestart<'_> {
                 return Err(UpdateError::RestartFailed);
             }
             if bounded_read(&self.session.state.join("supervisor-ready"), 64)
-                .is_ok_and(|bytes| bytes == self.id.as_bytes())
+                .is_ok_and(|bytes| bytes == digest.as_bytes())
             {
-                // The helper is now live and waiting for the old app's lock.
+                // The helper owns the original process capability and awaits
+                // our one-shot successful-scope authority, then actual death.
                 // Retain call exclusion through all subsequent UI shutdown.
                 self.session.install_lease = self.lease.take();
+                self.session.shutdown_authority = Some(ShutdownAuthority {
+                    channel: parent,
+                    prepared,
+                });
                 self.handed_off = true;
                 drop(child.handoff());
                 return Ok(());
@@ -669,10 +1006,34 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
     {
         return Err(UpdateError::RecoveryRequired);
     }
+    let digest = transaction_digest(&journal)?;
+    let origin = journal
+        .origin
+        .as_ref()
+        .ok_or(UpdateError::RecoveryRequired)?;
+    // Duplicating stdin keeps RAII ownership explicit. Only an inherited
+    // connected private AF_UNIX stream with the original creator is admitted.
+    let mut channel = UnixStream::from(
+        std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|_| UpdateError::RecoveryRequired)?,
+    );
+    let parent = ParentExitMonitor::capture(&channel, origin)?;
+    // The cloned RAII channel and original inherited stdin are distinct fd
+    // aliases. Neither may leak through any later trial/recovery exec.
+    close_on_exec(libc::STDIN_FILENO)?;
+    receive_exact_frame(
+        &mut channel,
+        &authority_frame(REQUEST_PREFIX, &digest),
+        false,
+        Instant::now() + Duration::from_secs(15),
+    )?;
+    validate_prepared_files(&installed, &state, &journal)?;
     let mut ready =
         tempfile::NamedTempFile::new_in(&state).map_err(|_| UpdateError::RecoveryRequired)?;
     ready
-        .write_all(id.as_bytes())
+        .write_all(digest.as_bytes())
         .and_then(|_| ready.as_file().sync_all())
         .map_err(|_| UpdateError::RecoveryRequired)?;
     // The old app must never see "ready" until helper setup and the write have
@@ -680,11 +1041,14 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
     ready
         .persist_noclobber(state.join("supervisor-ready"))
         .map_err(|_| UpdateError::RecoveryRequired)?;
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    await_original_shutdown(&mut channel, &parent, &digest, deadline)?;
+    // These descriptors never reach a trial/recovery process. CLOEXEC also
+    // covers the original stdin alias retained by the AppImage runtime.
+    drop((channel, parent));
     let session = AppImageSession::lock(&installed, Duration::from_secs(120))?;
-    let mut journal = session.journal()?.ok_or(UpdateError::RecoveryRequired)?;
-    if journal.id != id {
-        return Err(UpdateError::RecoveryRequired);
-    }
+    session.validate_prepared(&journal)?;
+    let mut journal = journal;
     session.apply(&mut journal)?;
     let installed = session.installed.clone();
     let state = session.state.clone();
@@ -753,8 +1117,15 @@ fn supervise(installed: &Path, id: &str) -> Result<(), UpdateError> {
 /// Runs before Slint and all storage. Returns true for a handled helper mode.
 pub(super) fn early_dispatch() -> Result<bool, UpdateError> {
     let args: Vec<_> = std::env::args_os().collect();
+    dispatch_args(&args)
+}
+
+fn dispatch_args(args: &[std::ffi::OsString]) -> Result<bool, UpdateError> {
     match args.get(1).and_then(|arg| arg.to_str()) {
-        Some("--morpheus-update-metadata") if args.len() == 2 => {
+        Some("--morpheus-update-metadata") => {
+            if args.len() != 2 {
+                return Err(UpdateError::RecoveryRequired);
+            }
             println!(
                 "{}",
                 serde_json::to_string(&PackageMetadata::embedded())
@@ -762,7 +1133,10 @@ pub(super) fn early_dispatch() -> Result<bool, UpdateError> {
             );
             Ok(true)
         }
-        Some("--morpheus-update-supervise") if args.len() == 4 => {
+        Some("--morpheus-update-supervise") => {
+            if args.len() != 4 {
+                return Err(UpdateError::RecoveryRequired);
+            }
             supervise(
                 Path::new(&args[2]),
                 args[3].to_str().ok_or(UpdateError::RecoveryRequired)?,

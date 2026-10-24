@@ -3,8 +3,10 @@ import io
 import tarfile
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts import package_revision as revision
@@ -40,7 +42,7 @@ class RevisionIdentityTests(unittest.TestCase):
                     path = root / "Cargo.lock"
                     path.write_bytes(path.read_bytes().replace(b'name = "other"\nversion = "0.1.0"', b'name = "other"\nversion = "0.2.0"'))
                 if mutation == "executable": (root / "scripts/unchanged.py").chmod(0o700)
-                if mutation is None:
+                if mutation is None or mutation == "executable" and os.name == "nt":
                     result = revision.verify_versioned_export(root, archive.getvalue(), "0.1.0-updateqa.1")
                     self.assertEqual(result["variant"], "updateqa-version-only")
                     self.assertEqual(result["files"], 3)
@@ -69,6 +71,88 @@ class RevisionIdentityTests(unittest.TestCase):
                     stream.addfile(invalid)
                 with self.assertRaises(revision.SourceRevisionError):
                     revision.verify_versioned_export(root, archive.getvalue(), "0.1.0-updateqa.1")
+
+    def test_native_windows_binds_archive_modes_and_exact_bytes_without_inventing_ntfs_exec_bits(self):
+        originals = {"crates/morpheus-app/Cargo.toml": b'[package]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+                     "Cargo.lock": b'[[package]]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+                     "scripts/executable.py": b"exact reviewed executable source\n"}
+        def archive(mode):
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w") as stream:
+                for name, content in originals.items():
+                    member = tarfile.TarInfo(name)
+                    member.size = len(content)
+                    member.mode = mode if name.endswith("executable.py") else 0o644
+                    stream.addfile(member, io.BytesIO(content))
+            return buffer.getvalue()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, content in originals.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(revision.versioned_source_bytes(name, content, "0.1.0-updateqa.1"))
+                path.chmod(0o600)
+            with patch.object(revision, "os", SimpleNamespace(name="nt")):
+                windows = revision.verify_versioned_export(root, archive(0o755), "0.1.0-updateqa.1")
+                for mode in (0o755, 0o775):
+                    self.assertEqual(windows, revision.verify_versioned_export(root, archive(mode), "0.1.0-updateqa.1"))
+                nonexec = revision.verify_versioned_export(root, archive(0o644), "0.1.0-updateqa.1")
+                self.assertEqual(nonexec, revision.verify_versioned_export(root, archive(0o664), "0.1.0-updateqa.1"))
+                self.assertNotEqual(windows["inventory_sha256"], nonexec["inventory_sha256"])
+                # Neither a malformed archive mode nor changed source is waived.
+                for mode in (0o600, 0o777, 0o4755):
+                    with self.subTest(mode=mode), self.assertRaises(revision.SourceRevisionError):
+                        revision.verify_versioned_export(root, archive(mode), "0.1.0-updateqa.1")
+                (root / "scripts/executable.py").write_bytes(b"unreviewed replacement")
+                with self.assertRaises(revision.SourceRevisionError):
+                    revision.verify_versioned_export(root, archive(0o755), "0.1.0-updateqa.1")
+                (root / "scripts/executable.py").write_bytes(originals["scripts/executable.py"])
+            if os.name == "posix":
+                with self.assertRaises(revision.SourceRevisionError):
+                    revision.verify_versioned_export(root, archive(0o755), "0.1.0-updateqa.1")
+                (root / "scripts/executable.py").chmod(0o700)
+                self.assertEqual(windows, revision.verify_versioned_export(root, archive(0o755), "0.1.0-updateqa.1"))
+
+    @unittest.skipUnless(shutil.which("git"), "Default archive headers require installed Git")
+    def test_actual_default_git_tar_headers_preserve_original_git_mode_identity(self):
+        # Trusted Git writes/reads only synthetic inert objects. No checkout,
+        # repository helper, hook, build or executable source is run.
+        contents = {"crates/morpheus-app/Cargo.toml": b'[package]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+                    "Cargo.lock": b'[[package]]\nname = "morpheus-app"\nversion = "0.1.0"\n',
+                    "scripts/executable.py": b"inert reviewed source\n"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            objects, exported = root / "objects", root / "exported"
+            objects.mkdir(); exported.mkdir()
+            environment = {k:v for k,v in os.environ.items() if not k.startswith(("GIT_", "SSH_"))}
+            environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                               GIT_ATTR_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0",
+                               GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
+                               GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid",
+                               GIT_AUTHOR_DATE="1700000000 +0000", GIT_COMMITTER_DATE="1700000000 +0000")
+            def git(*args, data=None):
+                result = subprocess.run([shutil.which("git"), "--no-pager", "-c", "core.hooksPath=" + os.devnull,
+                    "-c", "core.attributesFile=" + os.devnull, "-c", "core.fsmonitor=false", "-C", str(objects), *args],
+                    input=data, capture_output=True, env=environment, timeout=20, check=True)
+                return result.stdout
+            git("init", "--bare", "--quiet")
+            for name, data in contents.items():
+                mode = "100755" if name.endswith("executable.py") else "100644"
+                blob = git("hash-object", "-w", "--stdin", data=data).decode().strip()
+                git("update-index", "--add", "--cacheinfo", mode, blob, name)
+                path = exported / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(revision.versioned_source_bytes(name, data, "0.1.0-updateqa.1"))
+                path.chmod(0o700 if mode == "100755" else 0o600)
+            tree = git("write-tree").decode().strip()
+            commit = git("commit-tree", tree, data=b"Synthetic source identity\n").decode().strip()
+            default = git("archive", "--format=tar", commit)
+            explicit = git("-c", "tar.umask=0022", "archive", "--format=tar", commit)
+            with tarfile.open(fileobj=io.BytesIO(default), mode="r:") as archive:
+                modes = {entry.name:entry.mode for entry in archive if entry.isfile()}
+            self.assertEqual(modes, {name:0o775 if name.endswith("executable.py") else 0o664 for name in contents})
+            self.assertEqual(revision.verify_versioned_export(exported, default, "0.1.0-updateqa.1"),
+                             revision.verify_versioned_export(exported, explicit, "0.1.0-updateqa.1"))
 
     def test_default_and_explicit_sources_keep_workflow_identity_separate(self):
         workflow, source = "a" * 40, "b" * 40

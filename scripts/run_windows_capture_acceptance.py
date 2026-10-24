@@ -255,9 +255,29 @@ class WindowsJob:
             code = ctypes.get_last_error(); kernel.CloseHandle(self.job); self.job = None
             raise Failure("job_setup", code, "job_configure")
 
-    def spawn(self, command, environment, log, *, stdin_stream=None):
+    def spawn(self, command, environment, log, *, stdin_stream=None, cwd=None, stderr_stream=None):
         import msvcrt
         from ctypes import wintypes as w
+        directory = REPO
+        if cwd is not None:
+            # Explicit source exports only; the default invocation is unchanged.
+            # No drive-relative path, reparse ancestor or environment-block
+            # injection may redirect the suspended, Job-owned launch.
+            value = os.fspath(cwd)
+            if (type(value) is not str or not value or "\0" in value
+                    or any(type(k) is not str or not k or "=" in k or "\0" in k
+                           or type(v) is not str or "\0" in v for k, v in environment.items())):
+                raise Failure("process_start", operation="process_create")
+            directory = Path(value)
+            try:
+                invalid = (not directory.is_absolute() or directory.resolve(strict=True) != directory
+                           or not directory.is_dir()
+                           or any(getattr(p.lstat(), "st_file_attributes", 0) & 0x400
+                                  for p in (directory, *directory.parents)))
+            except OSError:
+                invalid = True
+            if invalid:
+                raise Failure("process_start", operation="process_create")
         executable = str(Path(command[0]).resolve())
         command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline([executable, *map(str, command[1:])]))
         env_block = ctypes.create_unicode_buffer("\0".join(f"{key}={value}" for key, value in sorted(environment.items(), key=lambda item: item[0].upper())) + "\0")
@@ -269,15 +289,15 @@ class WindowsJob:
             with (open(os.devnull, "rb") if stdin_stream is None
                   else contextlib.nullcontext(stdin_stream)) as input_stream:
                 current = self.kernel.GetCurrentProcess()
-                for stream in (input_stream, log):
+                for stream in ((input_stream, log) if stderr_stream is None else (input_stream, log, stderr_stream)):
                     duplicate = w.HANDLE()
                     if not self.kernel.DuplicateHandle(current, msvcrt.get_osfhandle(stream.fileno()),
                             current, ctypes.byref(duplicate), 0, True, 2):  # DUPLICATE_SAME_ACCESS
                         raise Failure("process_start", ctypes.get_last_error(), "handle_duplicate")
                     duplicates.append(duplicate.value)
-                startup.stdin, startup.stdout, startup.stderr = duplicates[0], duplicates[1], duplicates[1]
+                startup.stdin, startup.stdout, startup.stderr = duplicates[0], duplicates[1], duplicates[1 if stderr_stream is None else 2]
                 created = self.kernel.CreateProcessW(executable, command_line, None, None, True,
-                    0x4 | 0x400 | 0x08000000, env_block, str(REPO), ctypes.byref(startup), ctypes.byref(process))
+                    0x4 | 0x400 | 0x08000000, env_block, str(directory), ctypes.byref(startup), ctypes.byref(process))
                 if not created:
                     raise Failure("process_start", ctypes.get_last_error(), "process_create")
                 # Retain ownership before assignment/cleanup can fail. close()

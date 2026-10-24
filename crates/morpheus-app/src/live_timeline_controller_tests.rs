@@ -5,8 +5,9 @@
 //! tests calls `run_if_configured` on its event loop after its own scenario.
 //! Without MORPHEUS_MATRIX_TEST_ACCOUNTS (a disposable local fixture from
 //! `scripts/local_matrix_env.py`) it returns at once, so ordinary CI runs are
-//! unchanged. With a fixture it needs real local homeservers; it is not part of
-//! any hosted selector yet. Opt in with:
+//! unchanged. With a fixture it needs real local homeservers. The existing
+//! Matrix acceptance app-timeline selector supplies them and requires all
+//! fixed checks below, so a fixture-gated no-op is not acceptance. Opt in with:
 //!
 //! ```text
 //! MORPHEUS_MATRIX_TEST_ACCOUNTS=<fixture.json> cargo test --locked -p morpheus-app \
@@ -368,6 +369,12 @@ async fn exercise(runtime: Handle, alice: FixtureAccount, carol: FixtureAccount,
     let ui = AppWindow::new().unwrap();
     stage!(setup_controller);
     let live = LiveUi::new(manager.clone(), runtime.clone(), ui.as_weak(), voices);
+    // Same generated-window/controller path as main, but the Copy callback's
+    // final clipboard handoff is recorded; this scenario never touches a real
+    // clipboard. Authentic selections still come from the disposable manager.
+    let copy_requests = crate::message_copy::RecordingClipboard::start();
+    crate::message_copy::register(&ui, &live);
+    crate::matrix_links::register(&ui, live.clone(), runtime.clone());
     stage!(setup_dispatch);
     let account = {
         let manager = manager.clone();
@@ -393,7 +400,7 @@ async fn exercise(runtime: Handle, alice: FixtureAccount, carol: FixtureAccount,
         account,
         room,
     };
-    let other = scenario.run(carol).await;
+    let other = scenario.run(carol, &copy_requests).await;
     scenario.close(directory, other).await;
 }
 
@@ -407,7 +414,11 @@ struct Scenario {
 }
 
 impl Scenario {
-    async fn run(&self, other: FixtureAccount) -> String {
+    async fn run(
+        &self,
+        other: FixtureAccount,
+        copy_requests: &crate::message_copy::RecordingClipboard,
+    ) -> String {
         stage!(activation);
         self.activate().await;
 
@@ -451,6 +462,8 @@ impl Scenario {
             "The thread list must exclude its root"
         );
         check!(thread_root_excluded);
+        self.copy_callback_boundaries(&root, &reply_text, &root_text, copy_requests)
+            .await;
 
         // Exact live account/view ownership on the generated recovery entry.
         // Only the loaded UTD boolean is synthetic; no capability is fabricated.
@@ -469,6 +482,20 @@ impl Scenario {
             lease.is_current(),
             "The lease must be current before revocation"
         );
+
+        let copy_aba_model = self.ui.get_messages();
+        let copy_aba_token = Self::copy_token(&copy_aba_model, &root);
+        let copy_aba_navigation = self.live.current_navigation_epoch();
+        let copy_aba_feed = self.live.feed_generation();
+        let copy_before_aba = copy_requests.requests();
+        self.ui
+            .invoke_copy_message_text(copy_aba_token.clone().into(), false);
+        assert!(
+            copy_requests.requests() == copy_before_aba + 1
+                && copy_requests.last_matches(&root_text),
+            "the original real account callback copies once before revocation"
+        );
+        let copy_after_positive = copy_requests.requests();
 
         // Idle case, A -> B without the controller: another account signs in
         // on this profile and becomes active. Both waiting feeds must end.
@@ -504,6 +531,20 @@ impl Scenario {
             renewed.is_current() && !lease.is_current(),
             "Renewal is a new lease"
         );
+        assert!(
+            self.ui.get_messages() == copy_aba_model
+                && self.live.current_navigation_epoch() == copy_aba_navigation
+                && self.live.feed_generation() == copy_aba_feed,
+            "ABA leaves the original shown model/navigation intact for this boundary"
+        );
+        self.ui
+            .invoke_copy_message_text(copy_aba_token.into(), false);
+        assert!(
+            copy_requests.requests() == copy_after_positive,
+            "a same-ID renewed account cannot revive the original registered Copy callback"
+        );
+        check!(message_copy_account_aba);
+
         let late_room = marker("live-timeline-late-room");
         let late_reply = marker("live-timeline-late-reply");
         self.send_room(&late_room).await;
@@ -546,6 +587,14 @@ impl Scenario {
         let room_back = |ui: &AppWindow| delivered(&ui.get_messages(), &late_room);
         wait_for_ui(&self.ui, "The reselected room did not publish", room_back).await;
         check!(renewed_room_delivery);
+        let renewed_copy = Self::copy_token(&self.ui.get_messages(), &root);
+        let before = copy_requests.requests();
+        self.ui.invoke_copy_message_text(renewed_copy.into(), false);
+        assert!(
+            copy_requests.requests() == before + 1 && copy_requests.last_matches(&root_text),
+            "a fresh actual publication copies under the renewed account selection"
+        );
+        check!(message_copy_renewed_delivery);
         self.open_thread(&root).await;
         let reply_back = |ui: &AppWindow| delivered(&ui.get_thread_messages(), &late_reply);
         wait_for_ui(&self.ui, "The reopened thread did not publish", reply_back).await;
@@ -559,6 +608,173 @@ impl Scenario {
         self.queued_across_revocation(&root, &other_id).await;
         self.link_continuation(&root).await;
         other_id
+    }
+
+    fn copy_token(model: &ModelRc<MessageItem>, event: &str) -> String {
+        crate::timeline_model::index_of_event(model, event)
+            .and_then(|index| model.row_data(index))
+            .map(|row| row.copy_token.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Actual registered Copy callback with an authentic manager selection.
+    /// Source replacements below are local presentation fixtures; no edit/send
+    /// or synthetic account capability is introduced. Feeds are actually joined
+    /// before model replacement and restored before assertion of observations.
+    async fn copy_callback_boundaries(
+        &self,
+        root: &str,
+        reply: &str,
+        root_text: &str,
+        recording: &crate::message_copy::RecordingClipboard,
+    ) {
+        stage!(message_copy_callbacks);
+        self.pause_recovery_feeds().await;
+        let ui = &self.ui;
+        let selection = self
+            .manager
+            .account_selection(&self.account)
+            .expect("actual account selection");
+        let source = crate::timeline_model::info_of_event(&ui.get_messages(), root)
+            .expect("actual accepted root row");
+        let scope = crate::message_copy::capture_publication(ui, &selection, false);
+        let admitted = selection.is_current()
+            && self.shows_scope(ui)
+            && self.live.is_live.load(Ordering::Acquire);
+        let mut observations = Vec::new();
+        observations.push((
+            "authentic original Copy publication admission",
+            admitted && scope.is_some(),
+        ));
+        if admitted {
+            ui.set_messages(crate::timeline_model::update_scoped(
+                ui.get_messages(),
+                vec![source.clone()],
+                scope,
+            ));
+        }
+        let token = Self::copy_token(&ui.get_messages(), root);
+        let before = recording.requests();
+        ui.invoke_copy_message_text(token.clone().into(), false);
+        observations.push((
+            "current accepted row copies exactly once",
+            recording.requests() == before + 1 && recording.last_matches(root_text),
+        ));
+
+        // The actual main thread-root transfer admits only this exact clicked
+        // row; no lookup by event ID supplies a substitute capability.
+        let item = crate::live::message_item(&source);
+        ui.set_thread_root_id(item.event_id.clone());
+        ui.set_thread_root_sender(item.sender);
+        ui.set_thread_root_body(item.body);
+        ui.set_thread_root_rich_body(item.rich_body);
+        ui.set_thread_root_rich_accessible_body(item.rich_accessible_body);
+        ui.set_thread_root_copy_token(token.clone().into());
+        self.live.begin_thread_request();
+        crate::message_copy::thread_opened(ui);
+        let root_token = ui.get_thread_root_copy_token();
+        let before = recording.requests();
+        ui.invoke_copy_message_text(root_token.clone(), true);
+        observations.push((
+            "current thread root copies exactly once",
+            recording.requests() == before + 1 && recording.last_matches(root_text),
+        ));
+        ui.set_thread_root_id("$copy-replaced-root:example.org".into());
+        let before = recording.requests();
+        ui.invoke_copy_message_text(root_token, true);
+        observations.push((
+            "replaced root refuses its old callback",
+            recording.requests() == before,
+        ));
+        self.live.begin_thread_request();
+        ui.set_thread_root_id(root.into());
+
+        let mut replacement = source.as_ref().clone();
+        replacement.body = "Synthetic replacement display".into();
+        replacement.rich_markdown = None;
+        replacement.rich_accessible = None;
+        let scope = crate::message_copy::capture_publication(ui, &selection, false);
+        if selection.is_current() && self.shows_scope(ui) {
+            ui.set_messages(crate::timeline_model::update_scoped(
+                ui.get_messages(),
+                vec![Arc::new(replacement)],
+                scope,
+            ));
+        }
+        let before = recording.requests();
+        ui.invoke_copy_message_text(token.into(), false);
+        observations.push((
+            "same-ID replaced row refuses its old callback",
+            recording.requests() == before,
+        ));
+
+        // No await, timer tick or changed-handler delivery between leaving and
+        // returning: deferred UI context notifications cannot be the authority.
+        let page_token = Self::copy_token(&ui.get_messages(), root);
+        let before = recording.requests();
+        ui.invoke_copy_message_text(page_token.clone().into(), false);
+        observations.push((
+            "page roundtrip starts with a usable actual row callback",
+            recording.requests() == before + 1
+                && recording.last_matches("Synthetic replacement display"),
+        ));
+        let before = recording.requests();
+        ui.invoke_navigate_page(1);
+        ui.invoke_copy_message_text(page_token.clone().into(), false);
+        ui.invoke_navigate_page(0);
+        ui.invoke_copy_message_text(page_token.into(), false);
+        observations.push((
+            "same-batch page roundtrip refuses old callbacks",
+            recording.requests() == before,
+        ));
+        // A new current token must work before any deferred changed handler.
+        // Withdrawal still rejects the old token above; renewal may reuse only
+        // this exact row's original account, room and view authority.
+        let returned = Self::copy_token(&ui.get_messages(), root);
+        let before = recording.requests();
+        ui.invoke_copy_message_text(returned.into(), false);
+        observations.push((
+            "same-batch page return immediately admits a fresh current row callback",
+            recording.requests() == before + 1
+                && recording.last_matches("Synthetic replacement display"),
+        ));
+        settle(ui).await;
+        let menu_token = Self::copy_token(&ui.get_messages(), root);
+        let before = recording.requests();
+        ui.invoke_copy_message_text(menu_token.clone().into(), false);
+        observations.push((
+            "menu roundtrip starts with a usable actual row callback",
+            recording.requests() == before + 1
+                && recording.last_matches("Synthetic replacement display"),
+        ));
+        let before = recording.requests();
+        ui.invoke_open_account_menu();
+        ui.invoke_copy_message_text(menu_token.clone().into(), false);
+        ui.set_account_menu_open(false);
+        ui.invoke_copy_message_text(menu_token.into(), false);
+        observations.push((
+            "same-batch protected menu roundtrip refuses old callbacks",
+            recording.requests() == before,
+        ));
+        settle(ui).await;
+        let fresh = Self::copy_token(&ui.get_messages(), root);
+        let before = recording.requests();
+        ui.invoke_copy_message_text(fresh.into(), false);
+        observations.push((
+            "fresh current callback remains usable after withdrawal",
+            recording.requests() == before + 1
+                && recording.last_matches("Synthetic replacement display"),
+        ));
+
+        // Restore real owned feeds and their actual source before assertions;
+        // no paused fixture task or local model is accepted as a drain receipt.
+        ui.set_thread_root_sender("".into());
+        ui.set_thread_root_copy_token("".into());
+        self.restore_recovery_feeds(root, reply).await;
+        for (name, success) in observations {
+            assert!(success, "{name}");
+        }
+        check!(message_copy_callbacks);
     }
 
     /// Quiesce only this fixture's already-owned feed tasks. No SDK cache or
@@ -1501,6 +1717,7 @@ impl Scenario {
     /// root and cleared the reply list (see `open-thread` in the window).
     async fn open_thread(&self, root: &str) {
         let ui = &self.ui;
+        ui.invoke_show_thread_panel();
         ui.set_thread_root_id(root.into());
         ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
         let request = self.live.begin_thread_request();

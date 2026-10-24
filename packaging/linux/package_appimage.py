@@ -75,7 +75,8 @@ def controlled_environment(environment):
     # dynamic-loader, package plugin and inherited signing/capture override.
     allowed = {"HOME", "USER", "LOGNAME", "TMPDIR", "CARGO_HOME", "RUSTUP_HOME", "RUNNER_TEMP",
                "GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "RUNNER_OS", "GITHUB_REPOSITORY", "GITHUB_REF",
-               "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SHA", "MORPHEUS_PACKAGE_SOURCE_REVISION",
+               "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SHA", "GITHUB_ACTOR",
+               "GITHUB_TRIGGERING_ACTOR", "MORPHEUS_PACKAGE_SOURCE_REVISION",
                "MORPHEUS_ELEMENT_NAMESPACE_CONTROL"}
     result = client.R.clean_environment({name: value for name, value in environment.items() if name in allowed})
     result["APPIMAGE_EXTRACT_AND_RUN"] = "1"
@@ -253,13 +254,148 @@ def bounded_file_log(path, maximum=8 * 1024 * 1024):
 def scan_private_logs(root, scanner):
     # Child logs are private even after a clean scan. A scan does not prove an
     # arbitrary server error is safe to print; publish only our fixed receipt.
-    for path in sorted(root.rglob("*.log")):
-        value = bounded_file_log(path)
-        result = subprocess.run([scanner, "stdin", "--redact=100", "--ignore-gitleaks-allow", "--no-banner"],
-                                input=value, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                timeout=30, check=False)
-        if result.returncode:
+    # An independently specified default configuration and empty ignore file
+    # prevent checkout config, annotations or ambient ignores weakening this gate.
+    with tempfile.TemporaryDirectory(prefix="default-scan-", dir=root) as temporary:
+        scan = Path(temporary)
+        client.write_new(scan / "gitleaks.toml", b"[extend]\nuseDefault = true\n")
+        client.write_new(scan / "empty.ignore", b"")
+        failed = False
+        for path in sorted(root.rglob("*.log")):
+            try:
+                value = bounded_file_log(path)
+                result = subprocess.run([scanner, "stdin", "--config", str(scan / "gitleaks.toml"),
+                                        "--gitleaks-ignore-path", str(scan / "empty.ignore"),
+                                        "--redact=100", "--ignore-gitleaks-allow", "--no-banner"],
+                                        input=value, cwd=scan, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, timeout=30, check=False)
+                if result.returncode:
+                    failed = True
+            except (PackageFailure, OSError, subprocess.SubprocessError):
+                # Retained data after failed child cleanup must not prevent
+                # attempts to scan later actual command logs. Every invalid
+                # entry or scanner failure still makes the complete gate fail.
+                failed = True
+        if failed:
             raise PackageFailure("scan")
+
+
+class NativeSourceCache:
+    """The outer owner's anchored identity for one consumed Cargo cache.
+
+    These non-inherited descriptors prevent inode reuse or a child-supplied
+    marker from authorizing deletion. Command logs live beside this cache and
+    are never removed by discard(). The caller must first drain all children.
+    """
+    def __init__(self, root):
+        self.root = client.private_directory(root)
+        self.descriptors = []
+        try:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            self.root_fd = os.open(self.root, flags)
+            self.descriptors.append(self.root_fd)
+            self.check(self.root.lstat(), os.fstat(self.root_fd))
+            os.mkdir("native-source-inputs", mode=0o700, dir_fd=self.root_fd)
+            self.work_fd = os.open("native-source-inputs", flags, dir_fd=self.root_fd)
+            self.descriptors.append(self.work_fd)
+            os.mkdir("cargo", mode=0o700, dir_fd=self.work_fd)
+            self.cache_fd = os.open("cargo", flags, dir_fd=self.work_fd)
+            self.descriptors.append(self.cache_fd)
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def check(current, anchor):
+        if (not stat.S_ISDIR(current.st_mode) or current.st_uid != os.getuid()
+                or current.st_mode & 0o077
+                or (current.st_dev, current.st_ino) != (anchor.st_dev, anchor.st_ino)):
+            raise PackageFailure("cleanup")
+
+    def discard(self):
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise PackageFailure("cleanup")
+        self.check(self.root.lstat(), os.fstat(self.root_fd))
+        self.check(os.stat("native-source-inputs", dir_fd=self.root_fd, follow_symlinks=False),
+                   os.fstat(self.work_fd))
+        self.check(os.stat("cargo", dir_fd=self.work_fd, follow_symlinks=False),
+                   os.fstat(self.cache_fd))
+        # Python's descriptor-relative, symlink-resistant implementation checks
+        # each traversal. Only the exact consumed cache is removed; all command
+        # and containment logs retain the full strict independent-default scan.
+        shutil.rmtree("cargo", dir_fd=self.work_fd)
+        try:
+            os.stat("cargo", dir_fd=self.work_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise PackageFailure("cleanup")
+
+    def close(self):
+        failed = False
+        while self.descriptors:
+            try:
+                os.close(self.descriptors.pop())
+            except OSError:
+                failed = True
+        if failed:
+            raise PackageFailure("cleanup")
+
+
+def assemble_native_sources(root, artifact, appdir, environment, *, progress=None):
+    """Use this build's still-owned inputs; never rebuild, upload or retain them.
+
+    The native package route was already explicitly selected. Complete Cargo
+    sources use the existing Cargo-fetch-only acquisition, in this namespace and
+    a new private cache. Source-only selection never reaches this function.
+    """
+    import corresponding_source as sources
+    import source_bundle_qa as acquisition
+    containment.assert_contained()
+    acquisition.guard_native(environment)
+    root = client.private_directory(root)
+    if artifact != exact_artifact(root / "packages") or appdir != root / "extracted/squashfs-root":
+        raise PackageFailure("identity")
+    if appdir.resolve(strict=True) != appdir:
+        raise PackageFailure("identity")
+    # The outer owner created and anchored only the cache before spawning.
+    # Reuse that private layout; never replace a preexisting identity marker.
+    work = client.private_directory(root / "native-source-inputs")
+    client.private_directory(work / "cargo")
+    for name in ("home", "fetch", "logs"):
+        (work / name).mkdir(mode=0o700)
+    cargo, rustc = acquisition.source_tools(environment)
+    controlled = acquisition.environment_for_acquisition(environment, work, cargo, rustc)
+    acquisition.acquire_inputs(work, cargo, rustc, controlled, progress=progress)
+    plan = sources.unique_json(sources.read_owned(work / "plan.json", 65536, private=True))
+    sources.require(type(plan) is dict and set(plan) == {"schema", "registry_cache", "git_mirrors"}
+                    and type(plan["schema"]) is int and plan["schema"] == 1, "input")
+    plan.update(schema=2, native_inputs={
+        "coverage": "known-components", "package_artifact": str(artifact),
+        "package_receipt": str(root / "build-receipt.json"),
+        "runtime_notices": str(appdir / sources.RUNTIME_DOC),
+        "pipewire_notices": str(appdir / sources.PIPEWIRE_DOC),
+    })
+    inputs = root / "native-source-inputs.json"
+    client.write_new(inputs, json.dumps(plan, sort_keys=True).encode() + b"\n")
+    receipt = sources.build(OwnedRunner(root / "native-source-commands", progress=progress), root, ROOT,
+                            expected_revision(environment), owned_tool("/usr/bin/git", root_owned=True),
+                            environment, inputs)
+    private_receipt(root / "source-receipt.json", receipt)
+    return receipt
+
+
+def verify_native_sources(root, receipt, environment):
+    """After namespace exit/scanning, bind closed evidence to the exact owned bytes."""
+    import corresponding_source as sources
+    revision = expected_revision(environment)
+    actual = sources.unique_json(sources.read_owned(root / "source-receipt.json", 32768, private=True))
+    _, artifact_hash, _ = sources.hash_owned_file(exact_artifact(root / "packages"), MAX_APPIMAGE)
+    _, build_hash, _ = sources.hash_owned_file(root / "build-receipt.json", sources.MAX_NATIVE_RECEIPT, private=True)
+    sources.require(artifact_hash == receipt.get("appimage_sha256"), "identity")
+    sources.validate_receipt(actual, revision, native_artifact=artifact_hash, native_receipt=build_hash)
+    _, bundle_hash, _ = sources.hash_owned_file(root / sources.BUNDLE_NAME, sources.MAX_BUNDLE, private=True)
+    sources.require(bundle_hash == actual["bundle_sha256"], "identity")
+    return actual
 
 
 def inside(root, tools, environment):
@@ -285,6 +421,12 @@ def inside(root, tools, environment):
             raise PackageFailure("capture")
         record["installed_capture"] = evidence
         record["installed_capture_passed"] = True
+        # Source assembly consumes this exact installed-QA build before the
+        # namespace or notice inputs are removed. No source plan may select a
+        # second native build, an alternative artifact or a replacement receipt.
+        progress.wrapper("source")
+        progress.command("none")
+        assemble_native_sources(root, artifact, appdir, environment, progress=progress)
         private_receipt(root / "capture-receipt.json", record)
         progress.wrapper("complete")
     except BaseException as error:
@@ -316,23 +458,26 @@ def cleanup_owned_fixture(root, environment):
 def contained(root, scanner, tools, environment):
     global DIAGNOSTICS_PUBLISHED
     diagnostics.Progress(root, outer=True)
-    command = containment.namespace_command(
-        [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
-         "--inside", str(root), "--cargo", tools["cargo"]], root / "namespace", environment)
+    source_cache = NativeSourceCache(root)
     process = None
     failed = None
     outer_reason = "unknown"
     cleanup_passed = True
     scan_passed = False
     log = root / "namespace.log"
-    descriptor = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    namespace_stopped = True
     try:
+        command = containment.namespace_command(
+            [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
+             "--inside", str(root), "--cargo", tools["cargo"]], root / "namespace", environment)
+        descriptor = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         # No caller-controlled output goes to the terminal. The namespace
         # contains even detached AppImage/native descendants after failure.
         with os.fdopen(descriptor, "wb") as output:
             process = subprocess.Popen(command, cwd=ROOT, env=environment,
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
+            namespace_stopped = False
         deadline = time.monotonic() + 7200
         while (code := containment.status(process)) is None:
             if time.monotonic() >= deadline:
@@ -353,6 +498,7 @@ def contained(root, scanner, tools, environment):
         if process is not None:
             try:
                 containment.stop_owned(process)
+                namespace_stopped = True
             except BaseException:
                 cleanup_passed = False
                 if failed is None:
@@ -366,16 +512,33 @@ def contained(root, scanner, tools, environment):
                 failed = PackageFailure("cleanup")
                 outer_reason = "cleanup"
         try:
+            if namespace_stopped and cleanup_passed:
+                source_cache.discard()
+        except BaseException:
+            cleanup_passed = False
+            if failed is None:
+                failed = PackageFailure("cleanup")
+                outer_reason = "cleanup"
+        try:
             scan_private_logs(root, scanner)
             scan_passed = True
         except BaseException:
             if failed is None:
                 failed = PackageFailure("scan")
+        finally:
+            try:
+                source_cache.close()
+            except BaseException:
+                cleanup_passed = False
+                if failed is None:
+                    failed = PackageFailure("cleanup")
+                    outer_reason = "cleanup"
     if failed is None:
         try:
             receipt = json.loads(client.read_regular(root / "capture-receipt.json", 1024 * 1024))
             if receipt.get("installed_capture_passed") is not True:
                 raise PackageFailure("capture")
+            receipt["corresponding_source"] = verify_native_sources(root, receipt, environment)
         except BaseException as error:
             failed = error
             outer_reason = diagnostics.reason(error)
@@ -643,19 +806,7 @@ def source_bundle_mode(args):
             finally:
                 scan_private_logs(root, scanner)
         receipt = sources.unique_json(sources.read_owned(root / "source-receipt.json", 32768, private=True))
-        expected_fields = {"schema", "source_revision", "source_tree", "bundle_sha256", "manifest_sha256",
-                           "registry_packages", "git_sources", "locked_packages", "distribution_ready",
-                           "unresolved_release_requirements"}
-        sources.require(type(receipt) is dict and set(receipt) == expected_fields
-                        and type(receipt["schema"]) is int and receipt["schema"] == 1
-                        and receipt["source_revision"] == expected_revision(os.environ)
-                        and type(receipt["source_tree"]) is str and sources.OID.fullmatch(receipt["source_tree"])
-                        and receipt["distribution_ready"] is False
-                        and receipt["unresolved_release_requirements"] == list(sources.UNRESOLVED), "identity")
-        for key in ("bundle_sha256", "manifest_sha256"):
-            sources.require(type(receipt[key]) is str and sources.HASH.fullmatch(receipt[key]), "identity")
-        for key in ("registry_packages", "git_sources", "locked_packages"):
-            sources.require(type(receipt[key]) is int and 0 <= receipt[key] <= 4096, "identity")
+        sources.validate_receipt(receipt, expected_revision(os.environ))
         data = sources.read_owned(root / sources.BUNDLE_NAME, sources.MAX_BUNDLE, private=True)
         sources.require(sources.digest(data) == receipt["bundle_sha256"], "identity")
     # The namespace, child groups, log scan and temporary tree have completed
@@ -711,6 +862,10 @@ def main(argv=None):
         verify_checkout(ROOT, expected_revision(os.environ))
     except SourceRevisionError:
         raise PackageFailure("identity") from None
+    # Every native entry, including the fixed internal worker, must retain the
+    # selected-owner guard before it can start downloads or native commands.
+    import source_bundle_qa as acquisition
+    acquisition.guard_native(environment)
     if args.inside:
         containment.assert_contained()
         tools = {"cargo": owned_tool(args.cargo), "curl": owned_tool("/usr/bin/curl", root_owned=True),
@@ -737,7 +892,8 @@ def main(argv=None):
             handed = retain_qa_image(output, data, receipt)
         print(json.dumps({"format": FORMAT, "installed_capture_passed": True,
                           "distribution_ready": receipt.get("distribution_ready") is True,
-                          "appimage_sha256": receipt["appimage_sha256"]}, sort_keys=True), flush=True)
+                          "appimage_sha256": receipt["appimage_sha256"],
+                          "corresponding_source": receipt["corresponding_source"]}, sort_keys=True), flush=True)
     except BaseException:
         if handed is not None:
             remove_qa_image(output, handed)

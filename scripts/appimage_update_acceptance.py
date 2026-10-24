@@ -196,7 +196,7 @@ def image_metadata(path):
         source.seek(-len(tail) - length, os.SEEK_END)
         metadata = json.loads(source.read(length))
     require(set(metadata) == {"protocol", "product", "version", "arch", "persistence"})
-    require(metadata["protocol"] == 1 and metadata["product"] == "io.github.brk275.morpheus"
+    require(type(metadata["protocol"]) is int and metadata["protocol"] == 2 and metadata["product"] == "io.github.brk275.morpheus"
             and metadata["arch"] == "x86_64" and re.fullmatch(r"[0-9a-f]{64}", metadata["persistence"]))
     return metadata
 

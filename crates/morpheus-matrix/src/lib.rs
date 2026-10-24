@@ -186,6 +186,16 @@ pub use account_recovery::{
     AccountRecoveryError, AccountRecoveryResult, CrossSigningKeys, EnabledRecovery,
     RecoveryOverview, RecoveryProgress, SetupConfirmation,
 };
+mod room_key_file;
+pub use room_key_file::{
+    EncryptedRoomKeyFile, RoomKeyFileError, RoomKeyFileScope, RoomKeyImportCounts,
+};
+mod peer_verification;
+pub use peer_verification::{
+    MAX_PEER_REQUESTS, PeerVerificationInfo, PeerVerificationOutcome, PeerVerificationRequest,
+    PeerVerificationSession, PeerVerificationTarget, PendingPeerVerifications,
+};
+
 mod own_verification;
 pub use own_verification::{
     MAX_PENDING_VERIFICATIONS, MAX_VERIFICATION_DEVICE_NAME_CHARS, OwnVerification,
@@ -1143,6 +1153,7 @@ struct LoadedAccount {
     /// belongs to this exact loaded account. A late completion can update
     /// only its captured book, never a replacement loaded account's book.
     verification_book: Arc<own_verification::VerificationBook>,
+    peer_verifications: Arc<peer_verification::PeerVerificationBook>,
     token_task: Mutex<Option<SyncTask>>,
     notification_handler_registered: Mutex<bool>,
 }
@@ -1156,6 +1167,7 @@ impl Drop for LoadedAccount {
 }
 
 struct State {
+    action_admission_closed: Arc<std::sync::atomic::AtomicBool>,
     registry: Registry,
     active_account_id: Option<String>,
     access: account_access::AccessFence,
@@ -1163,6 +1175,7 @@ struct State {
     pending_sso: HashMap<String, PendingSso>,
     sync_task: Option<SyncTask>,
     queue_recovery_task: Option<JoinHandle<()>>,
+    removal_owner: Option<account_access::RemovalOwner>,
 }
 
 struct SyncTask {
@@ -1176,11 +1189,13 @@ struct SyncTask {
 /// after constructing the UI so a locked/unavailable keyring can be handled
 /// without losing access to the account picker.
 pub struct AccountManager {
+    action_admission_closed: Arc<std::sync::atomic::AtomicBool>,
     data_dir: PathBuf,
     _access_lock: Arc<fs::File>,
     access_instance: Uuid,
     access_epoch: std::sync::atomic::AtomicU64,
     access_worker: Arc<tokio::sync::Semaphore>,
+    removal_pending: Arc<std::sync::atomic::AtomicBool>,
     sync_policy: SyncPolicy,
     state: Mutex<State>,
     active_tx: watch::Sender<Option<AccountInfo>>,
@@ -1212,14 +1227,18 @@ impl AccountManager {
         authentication::cleanup_pending_stores(&data_dir, &registry)?;
         let (active_tx, _) = watch::channel(None);
         let (sync_tx, _) = watch::channel(SyncStatus::Stopped);
+        let action_admission_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Ok(Self {
+            action_admission_closed: action_admission_closed.clone(),
             data_dir,
             _access_lock: Arc::new(access_lock),
             access_instance: Uuid::new_v4(),
             access_epoch: std::sync::atomic::AtomicU64::new(0),
             access_worker: Arc::new(tokio::sync::Semaphore::new(1)),
+            removal_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sync_policy,
             state: Mutex::new(State {
+                action_admission_closed,
                 registry,
                 active_account_id: None,
                 access,
@@ -1227,6 +1246,7 @@ impl AccountManager {
                 pending_sso: HashMap::new(),
                 sync_task: None,
                 queue_recovery_task: None,
+                removal_owner: None,
             }),
             active_tx,
             selections: account_selection::Selections::default(),
@@ -1602,7 +1622,9 @@ impl AccountManager {
             self.publish_active_account(None);
             self.sync_tx.send_replace(SyncStatus::Stopped);
         }
-        let client = if let Some(loaded) = state.loaded.remove(id) {
+        let client = if let Some(loaded) = state.loaded.get(id).cloned() {
+            // Keep this actual owner in State across caller cancellation while
+            // draining. A later stop/removal can resume its retained handles.
             // Drain any in-flight token write before deleting the credential.
             // Otherwise a late session refresh could recreate it after logout.
             loaded.stop_owned_tasks().await;
@@ -3197,6 +3219,16 @@ impl AccountManager {
         Ok(())
     }
 
+    /// End application selection admission synchronously while retaining all
+    /// loaded stores for admitted send/draft ownership drain and final flush.
+    /// `stop` remains resumable when this distinct terminal method was not used.
+    /// Revocation alone never claims completion of already entered SDK work.
+    pub fn close_selection_admission(&self) {
+        self.action_admission_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.selections.close();
+    }
+
     pub async fn stop(&self) {
         let mut state = self.state.lock().await;
         self.selections.replace(None);
@@ -3204,6 +3236,12 @@ impl AccountManager {
         state.active_account_id = None;
         self.publish_active_account(None);
         self.sync_tx.send_replace(SyncStatus::Stopped);
+        // A timeout/cancelled removal caller did not finish its owned work.
+        // Observe that same task before shutdown can release the profile. A
+        // drain receipt never starts erasure; any pending tombstone stays saved.
+        if let Some(owner) = state.removal_owner.as_mut() {
+            owner.observe().await;
+        }
         // Whole-manager shutdown is an awaited vault-write boundary. An
         // immediately reopened profile must not race a dropped token watcher.
         for loaded in state.loaded.values() {
@@ -3267,6 +3305,12 @@ impl AccountManager {
 
     async fn active_loaded(&self) -> Result<Arc<LoadedAccount>> {
         let state = self.state.lock().await;
+        if state
+            .action_admission_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
         let id = state
             .active_account_id
             .as_ref()
@@ -3342,6 +3386,8 @@ impl LoadedAccount {
         let e2ee = account_recovery::E2eeReadiness::of(&client);
         let (incoming_verification_tx, _) = watch::channel(Vec::<VerificationInfo>::new());
         let verification_book = Arc::new(own_verification::VerificationBook::default());
+        let peer_verifications = Arc::new(peer_verification::PeerVerificationBook::default());
+        peer_verification::register(&client, peer_verifications.clone());
         if let Some(own_user_id) = client.user_id().map(ToOwned::to_owned) {
             let incoming_tx = incoming_verification_tx.clone();
             let book = verification_book.clone();
@@ -3432,6 +3478,7 @@ impl LoadedAccount {
             recovery_ready: watch::channel(false).0,
             incoming_verification_tx,
             verification_book,
+            peer_verifications,
             notification_handler_registered: Mutex::new(false),
             token_task: Mutex::new(Some(SyncTask {
                 shutdown: Some(shutdown),
@@ -3445,37 +3492,17 @@ impl LoadedAccount {
         self.stop_token_persistence().await;
     }
 
-    async fn try_stop_owned_tasks(&self, timeout: Duration) -> bool {
-        tokio::time::timeout(timeout, async {
-            self.e2ee.stop().await;
-            self.try_stop_token_persistence(timeout).await
-        })
-        .await
-        .unwrap_or(false)
-    }
-
     async fn stop_token_persistence(&self) {
-        if let Some(mut token_task) = self.token_task.lock().await.take() {
+        let mut slot = self.token_task.lock().await;
+        if let Some(token_task) = slot.as_mut() {
             if let Some(shutdown) = token_task.shutdown.take() {
                 let _ = shutdown.send(());
             }
-            let _ = token_task.task.await;
-        }
-    }
-
-    async fn try_stop_token_persistence(&self, timeout: Duration) -> bool {
-        let mut slot = self.token_task.lock().await;
-        let Some(task) = slot.as_mut() else {
-            return true;
-        };
-        if let Some(shutdown) = task.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if tokio::time::timeout(timeout, &mut task.task).await.is_err() {
-            return false;
+            if let Err(error) = (&mut token_task.task).await {
+                account_access::retain_join_panic(error);
+            }
         }
         slot.take();
-        true
     }
 
     async fn timeline(&self, room_id: &str) -> Result<Arc<Timeline>> {
@@ -3675,6 +3702,12 @@ fn selected_loaded_for<'a>(
 }
 
 fn selected_loaded(state: &State) -> Result<&Arc<LoadedAccount>> {
+    if state
+        .action_admission_closed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(MatrixCoreError::SelectedAccountChanged);
+    }
     let id = state
         .active_account_id
         .as_ref()

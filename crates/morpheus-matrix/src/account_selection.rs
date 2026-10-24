@@ -72,29 +72,50 @@ impl AccountSelection {
 }
 
 #[derive(Default)]
-pub(crate) struct Selections(RwLock<Option<AccountSelection>>);
+pub(crate) struct Selections(RwLock<SelectionState>);
+
+#[derive(Default)]
+struct SelectionState {
+    current: Option<AccountSelection>,
+    closed: bool,
+}
 
 impl Selections {
     pub fn for_account(&self, account_id: &str) -> Option<AccountSelection> {
         self.0
             .read()
             .unwrap_or_else(|error| error.into_inner())
+            .current
             .as_ref()
             .filter(|selection| selection.account_id == account_id)
             .cloned()
     }
 
-    pub fn replace(&self, account_id: Option<&str>) {
+    /// Permanent application-shutdown admission. Unlike replace(None), no
+    /// subsequent restore/switch can mint a fresh selection in this manager.
+    /// This revokes authority; it is not a receipt for already entered work.
+    pub fn close(&self) {
         let mut selected = self.0.write().unwrap_or_else(|error| error.into_inner());
-        if let Some(previous) = selected.take() {
+        selected.closed = true;
+        if let Some(previous) = selected.current.take() {
             previous.current.store(false, Ordering::Release);
             previous.revocation.notify_waiters();
         }
-        *selected = account_id.map(|account_id| AccountSelection {
-            account_id: account_id.to_owned(),
-            current: Arc::new(AtomicBool::new(true)),
-            revocation: Arc::new(Notify::new()),
-        });
+    }
+
+    pub fn replace(&self, account_id: Option<&str>) {
+        let mut selected = self.0.write().unwrap_or_else(|error| error.into_inner());
+        if let Some(previous) = selected.current.take() {
+            previous.current.store(false, Ordering::Release);
+            previous.revocation.notify_waiters();
+        }
+        if !selected.closed {
+            selected.current = account_id.map(|account_id| AccountSelection {
+                account_id: account_id.to_owned(),
+                current: Arc::new(AtomicBool::new(true)),
+                revocation: Arc::new(Notify::new()),
+            });
+        }
     }
 }
 
@@ -306,6 +327,25 @@ mod tests {
         assert!(!bob.is_current());
         assert!(selections.for_account("bob").is_none());
         assert!(selections.for_account("alice").unwrap().is_current());
+    }
+
+    #[test]
+    fn permanent_shutdown_refuses_new_selections_without_changing_resumable_replace() {
+        let selections = Selections::default();
+        selections.replace(Some("a"));
+        let first = selections.for_account("a").unwrap();
+        selections.replace(None);
+        selections.replace(Some("a"));
+        let resumed = selections.for_account("a").unwrap();
+        assert!(!first.is_current());
+        assert!(resumed.is_current());
+        selections.close();
+        assert!(!resumed.is_current());
+        selections.replace(Some("a"));
+        selections.replace(Some("b"));
+        selections.close();
+        assert!(selections.for_account("a").is_none());
+        assert!(selections.for_account("b").is_none());
     }
 
     #[test]

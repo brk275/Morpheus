@@ -116,6 +116,7 @@ pub mod dehydrated_devices;
 pub mod futures;
 pub mod identities;
 pub mod recovery;
+pub mod room_key_file;
 pub mod secret_storage;
 pub(crate) mod tasks;
 pub mod verification;

@@ -354,12 +354,16 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             "STAGE activation", "STAGE room_open",
             "STAGE room_delivery", "CHECK room_delivery=true",
             "STAGE thread_delivery", "CHECK thread_delivery=true",
-            "CHECK thread_root_excluded=true", "CHECK feeds_running=true",
+            "CHECK thread_root_excluded=true",
+            "STAGE message_copy_callbacks", "CHECK message_copy_callbacks=true",
+            "CHECK feeds_running=true",
             "STAGE revocation", "CHECK old_lease_revoked=true",
             "CHECK idle_feeds_stopped=true", "STAGE renewal",
+            "CHECK message_copy_account_aba=true",
             "CHECK late_events_in_core=true", "CHECK stale_room_rejected=true",
             "CHECK stale_thread_rejected=true", "STAGE reopen",
-            "CHECK renewed_room_delivery=true", "CHECK renewed_thread_delivery=true",
+            "CHECK renewed_room_delivery=true", "CHECK message_copy_renewed_delivery=true",
+            "CHECK renewed_thread_delivery=true",
             "STAGE queued_revocation", "CHECK queued_callbacks_observed=true",
             "STAGE queued_drain", "CHECK queued_room_rejected=true",
             "CHECK queued_thread_rejected=true", "STAGE queued_reopen",
@@ -378,9 +382,9 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         lines.append("test result: ok. 1 passed; 0 failed; 0 ignored;")
         return "\n".join(lines) + "\n"
 
-    def test_one_harness_requires_all_twenty_observable_facts_and_cleanup(self):
+    def test_one_harness_requires_all_twenty_three_observable_facts_and_cleanup(self):
         checks = acceptance_module.app_timeline_evidence(self.output())
-        self.assertEqual(len(checks), 20)
+        self.assertEqual(len(checks), 23)
         self.assertEqual(set(checks), acceptance_module.APP_TIMELINE_CHECKS)
         self.assertTrue(all(checks.values()))
         self.assertIn("queued_callbacks_observed", checks)
@@ -389,6 +393,9 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         self.assertIn("link_follow_up_stale_retry_rejected", checks)
         self.assertIn("link_follow_up_held_focus_rejected", checks)
         self.assertIn("member_publication", checks)
+        self.assertIn("message_copy_callbacks", checks)
+        self.assertIn("message_copy_account_aba", checks)
+        self.assertIn("message_copy_renewed_delivery", checks)
         self.assertIn("member_publication", acceptance_module.APP_TIMELINE_STAGES)
         self.assertIn("cleanup_complete", checks)
 
@@ -476,7 +483,7 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             arguments = {"ring_case": None, "oauth_checks": None, "element_checks": None}
             record = runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=True, **arguments)
             self.assertEqual(record["passed"], 1)
-            self.assertEqual(len(record["app_timeline_checks"]), 20)
+            self.assertEqual(len(record["app_timeline_checks"]), 23)
             self.assertTrue(all(record["app_timeline_checks"].values()))
             with self.assertRaises(RuntimeError):
                 runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=False, **arguments)
@@ -636,6 +643,34 @@ class FinalizationTests(unittest.TestCase):
         runner.rtc_cases.assert_not_called()
         runner.element_case.assert_not_called()
         self.assert_both_cleanups(runner)
+
+    def test_oauth_only_runs_all_existing_phases_without_seeded_or_rtc_services_and_keeps_cleanup(self):
+        for failure_at in (None, "oauth_cases", "finish_checks"):
+            with self.subTest(failure_at=failure_at), self.mocked_main() as (runner, _):
+                failure = RuntimeError("fixed incomplete OAuth result")
+                if failure_at:
+                    getattr(runner, failure_at).side_effect = failure
+                with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner", "--suite", "oauth-only"]):
+                    if failure_at:
+                        with self.assertRaises(RuntimeError) as caught:
+                            acceptance_module.main()
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        self.assertIsNone(acceptance_module.main())
+                runner.group.assert_called_once_with(acceptance_module.OAUTH_LABELS, runner.oauth_cases)
+                runner.oauth_cases.assert_called_once_with()
+                runner.start_keyring.assert_called_once_with()
+                runner.require_containment.assert_called_once_with()
+                self.assertEqual(acceptance_module.SUITES["oauth-only"], acceptance_module.OAUTH_LABELS)
+                self.assertEqual([call.args for call in runner.script.call_args_list],
+                                 [("local_matrix_rtc", "down"), ("local_matrix_env", "down")])
+                runner.test.assert_not_called()
+                runner.app_timeline.assert_not_called()
+                runner.app_recovery.assert_not_called()
+                runner.rtc_cases.assert_not_called()
+                runner.outgoing_ring_cases.assert_not_called()
+                runner.element_case.assert_not_called()
+                self.assert_both_cleanups(runner)
 
     def test_drafts_only_main_runs_only_drafts_and_preserves_cleanup(self):
         with self.mocked_main() as (runner, _):
@@ -1298,7 +1333,8 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
         return "".join(
             f"MORPHEUS_APP_RECOVERY_STAGE {name}\nMORPHEUS_APP_RECOVERY_CHECK {name}=true\n"
             for name in sorted(acceptance_module.APP_RECOVERY_CASES)
-        ) + "test result: ok. 12 passed; 0 failed; 0 ignored;\n"
+        ) + (acceptance_module.APP_MARKER_AUTHORITY_COMPLETE + "\n"
+             "test result: ok. 13 passed; 0 failed; 0 ignored;\n")
 
     def test_requires_every_live_case_once_and_no_opt_out(self):
         complete = self.complete()
@@ -1306,13 +1342,13 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
         self.assertEqual(acceptance_module.app_recovery_evidence(complete),
                          dict.fromkeys(sorted(acceptance_module.APP_RECOVERY_CASES), True))
         for output in (
-            "test result: ok. 12 passed; 0 failed; 0 ignored;\n",
+            "test result: ok. 13 passed; 0 failed; 0 ignored;\n",
             complete.replace(f"MORPHEUS_APP_RECOVERY_STAGE {name}\n", ""),
             complete.replace(f"MORPHEUS_APP_RECOVERY_CHECK {name}=true\n", ""),
             complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=true\n",
             complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=false\n",
-            complete.replace("12 passed", "11 passed"),
-            complete.replace("12 passed", "17 passed"),
+            complete.replace("13 passed", "12 passed"),
+            complete.replace("13 passed", "17 passed"),
             complete.replace("0 ignored", "1 ignored"),
             complete + "Skipped local fixture\n",
         ):
@@ -1329,13 +1365,15 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
             self.assertIsNotNone(name)
             self.assertNotIn(name[1], tests)
             tests[name[1]] = body
-        # These five native regressions share the module but have no recovery protocol.
+        # These native regressions share the module but have no recovery protocol.
         other_cases = {
             "a_departed_selection_neither_reveals_nor_focuses_after_a_switch_back",
             "a_created_room_opens_only_for_its_own_click_and_admitted_snapshot",
             "a_stale_snapshots_member_load_never_claims_over_a_newer_one",
             "stale_creation_follow_ups_keep_a_newer_rooms_feed_and_transition",
             "a_withdrawn_created_room_open_gives_up_held_waits_and_its_locks",
+            "rollback_pause_wait_rejects_an_early_ended_worker",
+            "rollback_pause_wait_does_not_release_the_reached_write_boundary",
         }
         self.assertEqual(tests.keys(), self.cases.keys() | other_cases)
         for name in other_cases:
@@ -1367,12 +1405,47 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
             self.assertEqual(args, ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
                                     "--bin", "morpheus-app", "--", "--exact",
                                     *("live::stale_observer_tests::" + name for name in self.cases),
+                                    acceptance_module.APP_MARKER_AUTHORITY_TEST,
                                     "--nocapture", "--test-threads=1"])
             self.assertEqual(run.call_args.kwargs, {
                 "extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(Path(folder) / "fixture.json"),
                           "SLINT_EMIT_DEBUG_INFO": "1"},
                 "test": True, "pid_namespace": True,
             })
+
+    def test_marker_authority_requires_exact_once_completion_and_the_same_thirteen_tests(self):
+        complete = self.complete()
+        marker = acceptance_module.APP_MARKER_AUTHORITY_COMPLETE
+        for output in (
+            complete.replace(marker + "\n", ""),
+            complete + marker + "\n",
+            complete.replace(marker, marker.replace("true", "false")),
+            complete.replace(marker, marker + " PRIVATE_VALUE"),
+            complete.replace(marker, "quoted " + marker),
+            complete.replace(marker, "MORPHEUS_APP_MARKER_AUTHORITY_CHECK unknown=true"),
+            complete + "test result: ok. 1 passed; 0 failed; 0 ignored;\n",
+            complete.replace("13 passed", "12 passed"),
+            complete + "Skipped navigation regression; no fixture\n",
+        ):
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                acceptance_module.app_recovery_evidence(output)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            record = runner.validated_record(
+                acceptance_module.APP_RECOVERY_LABEL, complete, test=True,
+                ring_case=None, oauth_checks=(), element_checks=False,
+            )
+            self.assertEqual(record["passed"], 13)
+            self.assertEqual(record["app_recovery_checks"], dict.fromkeys(
+                sorted(acceptance_module.APP_RECOVERY_CASES), True))
+            self.assertEqual(len(record["app_recovery_checks"]), 12)
+            self.assertEqual(record["app_marker_authority_checks"],
+                             {"account_selection_and_close": True})
+            with self.assertRaises(RuntimeError):
+                runner.validated_record(
+                    acceptance_module.APP_RECOVERY_LABEL, complete, test=False,
+                    ring_case=None, oauth_checks=(), element_checks=False,
+                )
 
     def test_scanner_rejection_precedes_any_evidence_publication(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1397,6 +1470,50 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
         self.assertTrue(process["panic_observed"])
         self.assertEqual(process["panic_family"], "morpheus")
         self.assertNotIn("PRIVATE", json.dumps((result, process)))
+
+    def test_write_revocation_boundaries_are_closed_and_belong_to_the_current_case(self):
+        stage = "MORPHEUS_APP_RECOVERY_STAGE write_revocation\n"
+        for boundary in acceptance_module.APP_RECOVERY_WRITE_BOUNDARIES:
+            marker = "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation " + boundary + "\n"
+            with self.subTest(boundary=boundary):
+                self.assertEqual(acceptance_module.app_recovery_diagnostics(stage + marker),
+                                 {"stage": "write_revocation", "boundary": boundary})
+                self.assertEqual(acceptance_module.app_recovery_diagnostics(marker), {})
+                self.assertEqual(acceptance_module.app_recovery_diagnostics(
+                    stage + marker + "MORPHEUS_APP_RECOVERY_STAGE typed_retention\n"),
+                    {"stage": "typed_retention"})
+        for marker in (
+                "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation PRIVATE_ACCOUNT\n",
+                "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation unknown_boundary\n",
+                "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation rollback_pause PRIVATE_TEXT\n",
+                "MORPHEUS_APP_RECOVERY_BOUNDARY other_case rollback_pause\n"):
+            with self.subTest(marker=marker):
+                result = acceptance_module.app_recovery_diagnostics(stage + marker)
+                self.assertEqual(result, {"stage": "write_revocation"})
+                self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_write_revocation_boundary_stops_at_first_panic_and_deadline_is_scan_gated(self):
+        output = ("MORPHEUS_APP_RECOVERY_STAGE write_revocation\n"
+                  "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation rollback_pause\n")
+        panic = ("thread 'worker' panicked at crates/morpheus-app/src/live.rs:42:7:\n"
+                 "PRIVATE_SERVER_RESPONSE\n"
+                 "MORPHEUS_APP_RECOVERY_BOUNDARY write_revocation complete\n")
+        expected = {"stage": "write_revocation", "boundary": "rollback_pause"}
+        self.assertEqual(acceptance_module.app_recovery_diagnostics(output + panic), expected)
+        for scanner_code in (0, 1):
+            with self.subTest(scanner_code=scanner_code), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                with self.child(runner, output, timeout=True, scanner_code=scanner_code) as (visible, _):
+                    with self.assertRaisesRegex(RuntimeError, "deadline" if scanner_code == 0 else "credential scanning"):
+                        runner.run(acceptance_module.APP_RECOVERY_LABEL, ["mock-test"], test=True, seconds=1)
+                records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                if scanner_code == 0:
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["app_recovery_diagnostics"], expected)
+                else:
+                    self.assertEqual(records, [])
+                self.assertNotIn("PRIVATE", visible.getvalue())
+                self.assertEqual(runner.results, [])
 
     def test_logout_panic_exposes_only_exact_variant_categories_not_payloads(self):
         header = ("MORPHEUS_APP_RECOVERY_STAGE observer_revocation\nthread '"
@@ -1635,6 +1752,20 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(oauth_diagnostics(output), {"stage": "login_finish", "failure": "rust_acceptance"})
         self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE password_value\n"
                                            "MORPHEUS_OAUTH_FAILURE https://example.org/private"), {})
+
+    def test_registration_outcomes_survive_only_the_existing_closed_oauth_reducer(self):
+        import local_matrix_auth
+        expected = {"registration_command", "registration_exit_two", "registration_exit_exec", "registration_exit_other"}
+        helper = {failure.value for failure in local_matrix_auth.Failure if failure.value.startswith("registration_")}
+        self.assertEqual(helper, expected)
+        self.assertLessEqual(helper, acceptance_module.OAUTH_FAILURES)
+        for code in expected:
+            self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE registration\n"
+                                              f"MORPHEUS_OAUTH_FAILURE {code}\n"
+                                              f"MORPHEUS_OAUTH_FAILURE {code} private-body\n"),
+                             {"stage": "registration", "failure": code})
+        self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_FAILURE registration_exit_two_unknown\n"
+                                          "MORPHEUS_OAUTH_FAILURE registration_exit_other private-token\n"), {})
 
     def test_incoming_discovery_counters_are_bounded_and_never_relay_unknown_values(self):
         for name in acceptance_module.INCOMING_DIAGNOSTICS:
@@ -1976,6 +2107,149 @@ class LiveEvidenceTests(unittest.TestCase):
                 fixture_from_output(str(outside), root)
             with self.assertRaises(RuntimeError):
                 fixture_from_output(str(root / "missing.json"), root)
+
+
+class OwnedSfuRecoveryTests(unittest.TestCase):
+    def prerequisite_output(self, label):
+        selectors = dict(acceptance_module.OUTAGE_HELPER_TESTS)
+        if label.endswith("-list"):
+            selector = (acceptance_module.OUTAGE_TEST if label == "rtc-recovery-exact-test-list"
+                        else selectors.get(label[:-5]))
+            return selector + ": test\n" if selector else ""
+        if label in selectors:
+            return (f"test {selectors[label]} ... ok\n"
+                    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.01s\n")
+        return ""
+
+    def output(self, target="dm"):
+        facts = acceptance_module.OUTAGE_CHECKS | {acceptance_module.OUTAGE_TARGET[target]}
+        return ("\n".join(f"MORPHEUS_RTC_OUTAGE_CHECK {name}=true" for name in sorted(facts))
+                + f"\ntest {acceptance_module.OUTAGE_TEST} ... ok\n"
+                + "MORPHEUS_RTC_OUTAGE_RESULT passed=true\n"
+                + "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 1.00s\n")
+
+    def test_outage_evidence_requires_exact_live_case_all_facts_and_no_extra_markers(self):
+        for target in ("dm", "room"):
+            output = self.output(target)
+            expected = acceptance_module.OUTAGE_CHECKS | {acceptance_module.OUTAGE_TARGET[target]}
+            self.assertEqual(set(acceptance_module.outage_evidence(output, target)), expected)
+            self.assertTrue({"native_audio_before", "native_audio_after"}.issubset(expected))
+            invalid = ["", output.replace(acceptance_module.OUTAGE_TEST, "other::case"),
+                       output.replace("1 passed", "0 passed"), output.replace("0 ignored", "1 ignored"),
+                       output + "MORPHEUS_RTC_OUTAGE_RESULT passed=true\n",
+                       output + "MORPHEUS_RTC_OUTAGE_CHECK private_payload=true\n",
+                       output + "MORPHEUS_RTC_OUTAGE_STAGE private_payload\n",
+                       "Skipped live fixture\n" + output, self.output("room" if target == "dm" else "dm")]
+            for name in expected:
+                marker = f"MORPHEUS_RTC_OUTAGE_CHECK {name}=true"
+                invalid.extend((output.replace(marker, ""), output.replace(marker, marker + " private"),
+                                output + marker + "\n", output.replace(marker, marker.replace("true", "false"))))
+            for bad in invalid:
+                with self.assertRaises(RuntimeError):
+                    acceptance_module.outage_evidence(bad, target)
+
+    def test_only_explicit_suite_mints_capability_and_preserves_default_plan(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
+                "GITHUB_REPOSITORY": "brk275/Morpheus", "MORPHEUS_MATRIX_SFU_RUN_ID": "ambient"}):
+            default = Acceptance(Path(folder), "scanner")
+            self.assertNotIn("MORPHEUS_MATRIX_SFU_RUN_ID", default.env)
+            self.assertIs(default.planned_checks, acceptance_module.PLANNED_CHECKS)
+            self.assertFalse(set(acceptance_module.OUTAGE_LABELS).intersection(default.planned_checks))
+            with patch.object(acceptance_module.secrets, "token_hex", return_value="a" * 32) as nonce:
+                selected = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+            nonce.assert_called_once_with(16)
+            self.assertEqual(selected.env["MORPHEUS_MATRIX_SFU_RUN_ID"], "a" * 32)
+            self.assertEqual(selected.planned_checks, acceptance_module.OUTAGE_LABELS)
+
+    def test_two_cases_compile_once_list_exact_and_use_distinct_fresh_fixtures(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+            runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+            fixtures = [Path(folder) / f"fixture-{index}.json" for index in range(2)]
+            for fixture in fixtures:
+                fixture.write_text("{}")
+                fixture.chmod(0o600)
+            def output(label, *args, **kwargs):
+                return self.prerequisite_output(label)
+            with patch.object(runner, "script", side_effect=[str(path) for path in fixtures]) as script, \
+                    patch.object(runner, "run", side_effect=output) as run:
+                runner.rtc_recovery_cases()
+            self.assertEqual([item.args for item in script.call_args_list], [
+                ("local_matrix_rtc", "rtc-fixture"), ("local_matrix_rtc", "rtc-group-fixture")])
+            prerequisite_count = 2 + 2 * len(acceptance_module.OUTAGE_HELPER_TESTS)
+            self.assertEqual(run.call_count, prerequisite_count + 2)
+            self.assertEqual(run.call_args_list[0].args[1][-1], "--no-run")
+            for index, (label, selector) in enumerate(acceptance_module.OUTAGE_HELPER_TESTS):
+                listed, executed = run.call_args_list[1 + index * 2:3 + index * 2]
+                self.assertEqual(listed.args[0], label + "-list")
+                self.assertEqual(listed.args[1][-4:], [selector, "--", "--list", "--exact"])
+                self.assertEqual(executed.args[0], label)
+                self.assertEqual(executed.args[1][-5:], [selector, "--", "--exact", "--nocapture", "--test-threads=2"])
+                self.assertTrue(executed.kwargs["test"])
+                self.assertTrue(executed.kwargs["pid_namespace"])
+            self.assertEqual(run.call_args_list[prerequisite_count - 1].args[1][-4:], [acceptance_module.OUTAGE_TEST, "--", "--list", "--exact"])
+            for invocation, target, fixture in zip(run.call_args_list[prerequisite_count:], ("dm", "room"), fixtures, strict=True):
+                self.assertEqual(invocation.args[0], f"rtc-recovery-current-{target}")
+                self.assertEqual(invocation.args[1][-6:], [acceptance_module.OUTAGE_TEST, "--", "--ignored", "--exact", "--nocapture", "--test-threads=2"])
+                self.assertTrue(invocation.kwargs["pid_namespace"])
+                self.assertEqual(invocation.kwargs["seconds"], 540)
+                self.assertEqual(invocation.kwargs["outage_target"], target)
+                self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS"], str(fixture.resolve()))
+                audio_root = Path(folder) / f"rtc-playback-{target}"
+                self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_CALL_AUDIO_ROOT"], str(audio_root))
+                self.assertEqual(invocation.kwargs["extra"]["ALSA_CONFIG_PATH"], str(audio_root / "alsa.conf"))
+                self.assertFalse(audio_root.exists())  # Helper exclusively owns creation.
+
+    def test_missing_exact_selector_stops_before_creating_accounts(self):
+        labels = [label + "-list" for label, _ in acceptance_module.OUTAGE_HELPER_TESTS]
+        for missing in labels + ["rtc-recovery-exact-test-list"]:
+            with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+                runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+                def output(label, *args, **kwargs):
+                    return "" if label == missing else self.prerequisite_output(label)
+                with patch.object(runner, "run", side_effect=output), patch.object(runner, "script") as script:
+                    with self.assertRaises(RuntimeError):
+                        runner.rtc_recovery_cases()
+                script.assert_not_called()
+
+    def test_helper_runs_require_exact_named_once_nonzero_completion_before_accounts(self):
+        for label, selector in acceptance_module.OUTAGE_HELPER_TESTS:
+            valid = self.prerequisite_output(label)
+            for bad in (valid.replace(selector, "other::case"),
+                        valid.replace("1 passed", "0 passed"),
+                        valid + f"test {selector} ... ok\n",
+                        valid + "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+                        valid.replace("0 ignored", "1 ignored")):
+                with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+                    runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+                    def output(actual, *args, **kwargs):
+                        return bad if actual == label else self.prerequisite_output(actual)
+                    with patch.object(runner, "run", side_effect=output), patch.object(runner, "script") as script:
+                        with self.assertRaises(RuntimeError):
+                            runner.rtc_recovery_cases()
+                    script.assert_not_called()
+
+    def test_outage_label_cannot_publish_a_generic_success_record(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+            runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+            with self.assertRaises(RuntimeError):
+                runner.validated_record("rtc-recovery-current-dm", self.output(),
+                    test=False, ring_case=None, oauth_checks=(), element_checks=False)
+            with patch.object(acceptance_module.subprocess, "Popen") as spawn, self.assertRaises(RuntimeError):
+                runner.run("rtc-recovery-current-dm", ["no-execution"])
+            spawn.assert_not_called()
+
+    def test_failed_outage_does_not_retry_shared_sfu_in_the_next_case(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"GITHUB_REPOSITORY": "brk275/Morpheus"}):
+            runner = Acceptance(Path(folder), "scanner", suite="rtc-recovery")
+            def output(label, *args, **kwargs):
+                return self.prerequisite_output(label)
+            with patch.object(runner, "run", side_effect=output), patch.object(runner, "group", return_value=False) as group:
+                runner.rtc_recovery_cases()
+            group.assert_called_once()
+            self.assertEqual(group.call_args.args[0], ("rtc-recovery-current-dm",))
+            self.assertEqual(runner.not_run, {"rtc-recovery-current-room": "dependency_failed"})
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
 
 
 class OutgoingRingTests(unittest.TestCase):

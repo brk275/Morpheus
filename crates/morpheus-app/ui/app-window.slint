@@ -13,6 +13,8 @@ import { AttachmentItem, AttachmentQueue } from "attachment-workbench.slint";
 import { TransferCenterPanel, TransferItem } from "transfer-center.slint";
 import { MediaViewer } from "media-viewer.slint";
 import { StyleTokens } from "style-tokens.slint";
+import { PeerVerification, PeerVerificationPanel } from "peer-verification.slint";
+export { PeerVerification, PeerVerificationRow, PeerVerificationView } from "peer-verification.slint";
 import { MorpheusIcon, MorpheusIcons } from "icons.slint";
 import { ActionRect, ControlColors, HoverSurface, TextAction, TokenButton, TokenSelect, TokenSlider } from "controls.slint";
 // Rust projects every accepted configuration into StyleTokens; the screen
@@ -42,6 +44,7 @@ export { SpaceRoomEntry, SpaceRooms } from "space-management.slint";
 import { RoomAddresses, RoomAddressesPanel } from "room-addresses.slint";
 export { RoomAddressEntry, RoomAddresses } from "room-addresses.slint";
 import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "device-sessions.slint";
+import { RoomKeyFilesPanel } from "room-key-files.slint";
 import { ThreadBrowser, ThreadBrowserPanel } from "thread-browser.slint";
 export { ThreadBrowser, ThreadBrowserRow } from "thread-browser.slint";
 import { NotificationRules, RoomNotificationPanel, RoomNotificationState } from "notification-settings.slint";
@@ -354,6 +357,7 @@ export struct StudioVariation {
 }
 
 export struct MessageItem {
+    copy-token: string,
     event-id: string,
     is-own: bool,
     sender: string,
@@ -3381,6 +3385,9 @@ component TimelineRecoveryNotice inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
+    // Presentation only. Rust closes real selection/draft/task/config/native
+    // authority before setting this; queued callbacks are still gated there.
+    in property <bool> application-closing: false;
     title: "Morpheus";
     preferred-width: 1310px;
     preferred-height: 820px;
@@ -3499,6 +3506,9 @@ export component AppWindow inherits Window {
     changed room-permissions-scope => { RoomPermissions.context-changed(); }
     in-out property <string> room-settings-form-id;
     in-out property <bool> room-settings-loaded: false;
+    // Display only: Rust resolves the typed target from the owned SDK session.
+    in-out property <string> room-settings-replacement-id;
+    in-out property <string> room-settings-replacement-reason;
     in-out property <bool> room-settings-dirty: false;
     in-out property <bool> room-settings-refresh-required: false;
     in-out property <bool> room-settings-name-allowed: false;
@@ -4188,20 +4198,26 @@ export component AppWindow inherits Window {
     // their visible state. A changed handler is only a deferred fallback;
     // a leave-and-return in one event batch must still retire the old view.
     public function withdraw-verification() {
+        root.clear-room-key-file-inputs();
+        root.room-key-file-withdraw();
         root.stop-attachment-audio();
         root.sas-compared = false;
         root.sas-emoji = "";
         root.sas-decimals = "";
         root.verification-protected();
+        PeerVerification.protect();
     }
     public function navigate-page(next: int) {
-        if next != root.page { root.stop-attachment-audio(); }
+        if next != root.page { root.message-copy-withdraw(); root.stop-attachment-audio(); }
         if next != 1 {
             root.cancel-settings-reveal();
             root.settings-controls-mounted = false;
             root.withdraw-verification();
         }
         root.page = next;
+        // Rearm only the same original Copy target under the new page state;
+        // a leave-and-return can coalesce its deferred context notification.
+        root.message-copy-context-changed();
         // Returning in the same event batch can coalesce the deferred context
         // change. Reissue retained notices under their original leases now.
         root.timeline-recovery-context-changed();
@@ -4211,12 +4227,36 @@ export component AppWindow inherits Window {
         || root.account-switch-pending || root.show-sign-in || !root.live-session
         || root.security-recovery-key != "";
     changed sas-protected => {
+        root.clear-room-key-file-inputs();
+        root.room-key-file-context-changed();
         if root.sas-protected {
             root.withdraw-verification();
         }
     }
+    out property <bool> peer-verification-protected: root.sas-protected || root.settings-reveal-protected || root.page != 1 || root.sas-busy || root.sas-stage != 0;
+    changed peer-verification-protected => {
+        if root.peer-verification-protected { PeerVerification.protect(); }
+    }
     // Settings › Security & recovery › Devices: device-sessions.slint, owned
     // by device_sessions.rs. Row keys only route requests to that controller.
+    in-out property <bool> room-key-file-closed;
+    in-out property <bool> room-key-file-busy;
+    in-out property <string> room-key-file-message;
+    // Private backing values outlive the conditional Settings subtree. They
+    // are cleared at synchronous withdrawal before any Rust context callback.
+    property <string> room-key-file-passphrase;
+    property <string> room-key-file-confirmation;
+    function clear-room-key-file-inputs() {
+        root.room-key-file-passphrase = "";
+        root.room-key-file-confirmation = "";
+    }
+    // These hooks live on the persistent window, outside the conditional
+    // Settings subtree. Unmounting/reopening that subtree never revives work.
+    changed live-session => { root.clear-room-key-file-inputs(); root.room-key-file-context-changed(); }
+    changed sas-busy => { root.clear-room-key-file-inputs(); root.room-key-file-context-changed(); }
+    changed sas-stage => { root.clear-room-key-file-inputs(); root.room-key-file-context-changed(); }
+    changed application-closing => { root.clear-room-key-file-inputs(); root.room-key-file-context-changed(); }
+    changed room-key-file-closed => { root.clear-room-key-file-inputs(); root.room-key-file-context-changed(); }
     in-out property <DeviceSessionsView> device-sessions-view;
     in-out property <[DeviceSessionRow]> device-session-rows;
     in-out property <string> device-sessions-query;
@@ -4394,6 +4434,16 @@ export component AppWindow inherits Window {
     changed viewport-seek-allowed => {
         if !root.viewport-seek-allowed { root.viewport-seek-withdrawn(); }
     }
+    // Opaque row capabilities only: callback payload never supplies text.
+    callback copy-message-text(string, bool);
+    callback message-copy-context-changed();
+    callback message-copy-withdraw();
+    in-out property <string> message-copy-notice;
+    in-out property <string> thread-root-copy-token;
+    property <string> message-copy-context: root.active-account-local-id + "\n" + root.active-room-id
+        + "\n" + (root.live-session && root.viewport-seek-allowed && !root.settings-reveal-protected ? "1" : "0")
+        + "\n" + (root.show-side-panel && root.side-panel-tab == 1 ? root.thread-root-id : "");
+    changed message-copy-context => { root.message-copy-context-changed(); }
     callback viewport-seek-withdrawn();
     // Rust publishes only these opaque serials beside the loaded rows. The
     // retained account/view/security leases stay in timeline_recovery.rs.
@@ -4495,7 +4545,8 @@ export component AppWindow inherits Window {
     callback open-room-settings();
     callback cancel-room-settings();
     // 0 refresh, 1 choose, 2 preview, 3 save avatar, 4 discard, 5 remove,
-    // 6 confirm, 7 cancel confirmation, 8 save join rule, 9 select join rule.
+    // 6 confirm, 7 cancel confirmation, 8 save join rule, 9 select join rule,
+    // 10 review the exact currently listed replacement room (no join/leave).
     callback room-settings-action(int);
     callback room-settings-edit(int);
     public function dismiss-room-settings() {
@@ -4940,6 +4991,11 @@ export component AppWindow inherits Window {
     callback copy-recovery-key();
     callback dismiss-recovery-key();
     callback request-own-verification();
+    callback room-key-file-import(string);
+    callback room-key-file-export(string, string);
+    callback room-key-file-cancel();
+    callback room-key-file-context-changed();
+    callback room-key-file-withdraw();
     callback device-sessions-scope-changed();
     callback device-sessions-refresh();
     callback device-sessions-search(string);
@@ -5465,6 +5521,9 @@ export component AppWindow inherits Window {
         if !root.unread-jump-allowed { UnreadNavigation.withdraw-jump(); }
     }
     changed page => {
+        // Deferred fallback; navigation/protection withdraws explicitly below.
+        root.clear-room-key-file-inputs();
+        root.room-key-file-context-changed();
         if root.page != 0 { root.details-reveal-open = false; }
         root.cancel-room-settings();
         root.close-image-preview();
@@ -5787,6 +5846,8 @@ export component AppWindow inherits Window {
         if root.room-admin-mode != 2 { root.moderation-context-changed(2); }
     }
     changed active-account-local-id => {
+        root.clear-room-key-file-inputs();
+        root.room-key-file-context-changed();
         root.close-people();
         MemberPrivacy.close-inspector();
         root.moderation-context-changed(0);
@@ -6030,6 +6091,7 @@ export component AppWindow inherits Window {
     background: root.window-translucent ? transparent : canvas;
 
     shortcut-scope := FocusScope {
+    visible: !root.application-closing;
     width: parent.width;
     height: parent.height;
     focus-on-tab-navigation: false;
@@ -7539,7 +7601,7 @@ export component AppWindow inherits Window {
                             // may change it, and as a disabled marker on pinned messages.
                             property <bool> pin-action: message.event-id != "" && root.pinned-state-loaded && (root.pinned-can-edit || message.pinned);
                             // The last 36 px hold Seen by (room activity).
-                            property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px) + (self.pin-action ? 36px : 0px) + 36px;
+                            property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px) + (self.pin-action ? 36px : 0px) + 36px + (message.copy-token != "" ? 36px : 0px);
                             property <length> column-width: self.columns ? min(root.nickname-width-px * 1px, self.width * 0.2) : 0px;
                             property <bool> tight-header: !self.columns && self.body-width < self.action-width + 180px * root.text-scale;
                             // The tallest header text: name, message size and, when shown, the
@@ -7766,6 +7828,13 @@ export component AppWindow inherits Window {
                                 x: parent.width - root.content-inset - message-row.action-width;
                                 y: root.message-row-gap + (message-row.tight-header ? message-row.header-height : 0px); width: message-row.action-width; height: 26px;
                                 spacing: 8px; alignment: end;
+                                if message.copy-token != "" : IconAction {
+                                    quiet: true; context-hover: message-hover.has-hover;
+                                    width: 28px; height: 26px; icon: "⧉"; label: "Copy text from " + message.sender;
+                                    ink: root.icon-message-ink; surface: transparent; hover-surface: root.hover;
+                                    enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
+                                    activated => { root.copy-message-text(message.copy-token, false); }
+                                }
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "↩"; label: "Reply to " + message.sender;
@@ -7803,6 +7872,7 @@ export component AppWindow inherits Window {
                                         root.thread-root-body = message.body;
                                         root.thread-root-rich-body = message.rich-body;
                                         root.thread-root-rich-accessible-body = message.rich-accessible-body;
+                                        root.thread-root-copy-token = message.copy-token;
                                         root.thread-composer-text = "";
                                         root.thread-send-pending = false;
                                         root.thread-messages = [];
@@ -7874,6 +7944,11 @@ export component AppWindow inherits Window {
                             root.timeline-seek-pass += 1;
                             timeline-list.approach-seek(false);
                         }
+                    }
+                    if root.message-copy-notice != "" : Text {
+                        text: root.message-copy-notice; color: root.muted;
+                        font-size: 11px * root.text-scale; wrap: word-wrap;
+                        accessible-live-region: polite;
                     }
                     // Who is typing in this room, or a Mark as read result.
                     TypingFooter {
@@ -10713,6 +10788,15 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+                            PeerVerificationPanel {
+                                colors: root.button-colors;
+                                surface: root.elevated; text-scale: root.text-scale;
+                                allowed: !root.peer-verification-protected;
+                                scope-key: root.live-session ? root.active-account-local-id : "";
+                                reveal-request: root.reveal-request("security.peer_verification");
+                                reveal-at(y) => { settings-scroll.reveal(y - settings-content.absolute-position.y); }
+                                revealed(id) => { root.settings-revealed-id = id; }
+                            }
                             Rectangle {
                                 height: 108px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                                 VerticalLayout {
@@ -10770,6 +10854,24 @@ export component AppWindow inherits Window {
                                 border-radius: StyleTokens.radius * 1; background: root.elevated;
                                 VerticalLayout {
                                     padding: 14px;
+                                    RoomKeyFilesPanel {
+                                        colors: root.button-colors;
+                                        text-scale: root.text-scale;
+                                        available: root.live-session && root.page == 1 && !root.room-key-file-closed && !root.application-closing;
+                                        security-busy: root.sas-protected || root.sas-busy || root.sas-stage != 0;
+                                        scope-key: root.active-account-local-id;
+                                        busy: root.room-key-file-busy;
+                                        message: root.room-key-file-message;
+                                        reveal-request: root.reveal-request("security.room_key_files");
+                                        reveal-at(y) => { settings-scroll.reveal(y - settings-content.absolute-position.y); }
+                                        revealed(id) => { root.settings-revealed-id = id; }
+                                        passphrase <=> root.room-key-file-passphrase;
+                                        confirmation <=> root.room-key-file-confirmation;
+                                        import-file(secret) => { root.room-key-file-import(secret); }
+                                        export-file(secret, confirmation) => { root.room-key-file-export(secret, confirmation); }
+                                        cancel => { root.room-key-file-cancel(); }
+                                        context-changed => { root.clear-room-key-file-inputs(); root.room-key-file-context-changed(); }
+                                    }
                                     DeviceSessionsPanel {
                                         view: root.device-sessions-view;
                                         rows: root.device-session-rows;
@@ -11958,7 +12060,23 @@ export component AppWindow inherits Window {
                                     spacing: 10px;
                                     // The root message follows the message font, the sender size and,
                                     // two pixels smaller as before, the message size.
-                                    Text { text: root.thread-root-sender; color: root.sender-ink(false, root.thread-root-is-own, root.thread-root-palette-index, root.thread-root-accent); font-family: root.message-font-family; font-size: root.sender-font-px > 0px ? root.sender-font-px : 12px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750; vertical-stretch: 0; }
+                                    Text {
+                                        text: root.thread-root-sender;
+                                        color: root.sender-ink(false, root.thread-root-is-own, root.thread-root-palette-index, root.thread-root-accent);
+                                        font-family: root.message-font-family;
+                                        font-size: root.sender-font-px > 0px ? root.sender-font-px : 12px * root.text-scale;
+                                        font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750;
+                                        wrap: word-wrap; min-width: 0px; vertical-stretch: 0;
+                                        accessible-role: text;
+                                        accessible-label: root.thread-root-sender;
+                                    }
+                                    if root.thread-root-copy-token != "" : TextAction {
+                                        text: "Copy text"; accessible-label: "Copy text from thread root";
+                                        ink: root.ink; muted: root.muted; surface: transparent; hover-surface: root.hover;
+                                        outline: root.divider; text-scale: root.text-scale;
+                                        enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
+                                        activated => { root.copy-message-text(root.thread-root-copy-token, true); }
+                                    }
                                     StyledText {
                                         text: root.thread-root-rich-body;
                                         default-color: root.body-ink(false, root.thread-root-is-own);
@@ -12080,6 +12198,13 @@ export component AppWindow inherits Window {
                                             font-size: root.timestamp-font-px; vertical-alignment: top; horizontal-stretch: 0; accessible-label: thread-reply.time-label;
                                         }
                                         Rectangle { horizontal-stretch: 1; min-width: 0px; }
+                                        if reply.copy-token != "" : IconAction {
+                                            quiet: true; width: 24px; height: 20px; icon: "⧉";
+                                            label: "Copy text from " + reply.sender;
+                                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                            enabled: root.viewport-seek-allowed && !root.settings-reveal-protected;
+                                            activated => { root.copy-message-text(reply.copy-token, false); }
+                                        }
                                         // This thread's read receipts at or after the reply (room activity).
                                         // Focus comes back here when the view it opened closes.
                                         if reply.event-id != "" : IconAction {
@@ -12803,7 +12928,7 @@ export component AppWindow inherits Window {
                     cancel-on-escape: true;
                     label: "Manage accounts";
                     cancelled => { root.account-menu-open = false; account-trigger.focus(); }
-                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); RoomAddresses.context-changed(); root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
+                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); RoomAddresses.context-changed(); root.withdraw-verification(); root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
                     HorizontalLayout {
                         padding-left: 9px; padding-right: 9px; spacing: 9px;
                         VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "manage-accounts"; ink: root.ink; } }
@@ -13908,6 +14033,23 @@ export component AppWindow inherits Window {
 
                                 Text { x: 12px; width: parent.width - 24px; text: "Roles and permissions…"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                             }
+                            if root.room-settings-replacement-id != "" : VerticalLayout {
+                                spacing: 8px;
+                                Text { text: "Replacement room"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
+                                Text { text: "This room lists a replacement: " + root.room-settings-replacement-id; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                                if root.room-settings-replacement-reason != "" : Text { text: root.room-settings-replacement-reason; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                                Text { text: "Review the new room before joining. Opening it does not join it or leave this room. Save or refresh any details edits first."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                                TextAction {
+                                    text: "Open replacement room"; wrap-caption: true;
+                                    label: "Open replacement room " + root.room-settings-replacement-id;
+                                    ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                    enabled: root.live-session && root.page == 0 && !root.sas-protected && !root.manage-accounts-open
+                                        && !RoomLeave.view.open && !RoomAddresses.open && !RoomAccessState.open
+                                        && root.room-settings-editable && !root.room-settings-dirty && !root.room-settings-staged
+                                        && root.room-admin-account-id == root.active-account-local-id && root.room-admin-room-id == root.active-room-id;
+                                    activated => { root.room-settings-action(10); }
+                                }
+                            }
                             Text { text: "Room name"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
                             Rectangle {
                                 min-height: 42px * root.text-scale; background: root.elevated; border-radius: StyleTokens.radius * 0.8;
@@ -14700,7 +14842,7 @@ export component AppWindow inherits Window {
                     height: 38px * root.text-scale; vertical-stretch: 0;
                     text: "Choose a saved account"; ink: root.ink; muted: root.muted;
                     surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.manage-accounts-open = true; root.manage-accounts(); }
+                    activated => { if RoomLeave.view.open { return; } CallBar.withdraw(); MatrixLink.withdraw(); UnreadNavigation.withdraw-jump(); IdentityWarnings.withdraw(); ThreadBrowser.withdraw(); root.withdraw-verification(); root.manage-accounts-open = true; root.manage-accounts(); }
                 }
                 if root.account-access-notice != "" : Text {
                     text: root.account-access-notice; color: root.muted; font-size: 11px * root.text-scale;
@@ -15306,6 +15448,15 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    if root.application-closing : Rectangle {
+        background: root.dialog-surface;
+        VerticalLayout {
+            padding: 32px; spacing: 18px; alignment: center;
+            Text { text: "Closing Morpheus"; color: root.ink; font-size: 22px; horizontal-alignment: center; }
+            Text { text: root.update-status; color: root.ink; wrap: word-wrap; horizontal-alignment: center; }
         }
     }
 

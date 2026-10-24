@@ -1,0 +1,179 @@
+// Explicit peer SAS. Rust owns raw identifiers, sessions, admission and results.
+// Display labels never route an operation or grant trust.
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TextAction, TokenField, TokenCheck } from "controls.slint";
+
+export struct PeerVerificationView {
+    // 0 idle, 1 incoming needs acceptance, 2 waiting/ready to continue,
+    // 3 values, 4 waiting for completion, 5 terminal result, 6 outgoing review.
+    stage: int,
+    busy: bool,
+    peer: string,
+    room: string,
+    detail: string,
+    emoji: string,
+    decimals: string,
+    error: string,
+    uncertain: bool,
+}
+export struct PeerVerificationRow { key: int, peer: string, room: string }
+export global PeerVerification {
+    in-out property <PeerVerificationView> view;
+    in-out property <[PeerVerificationRow]> requests;
+    in-out property <string> peer-input;
+    in-out property <bool> compared: false;
+    in-out property <bool> checked-uncertain: false;
+    in-out property <string> inbox-note;
+    callback request();
+    callback send();
+    callback refresh();
+    callback review(int);
+    callback accept();
+    callback advance();
+    callback confirm();
+    callback cancel();
+    callback dismiss();
+    callback protect();
+    callback withdraw-account(string) -> bool;
+    callback open-conversations();
+}
+// Reuse the wrapped, stacked Settings action so long labels and enlarged text
+// stay inside the pane without losing their caption or keyboard behavior.
+component PeerAction inherits TextAction {
+    in property <ControlColors> colors;
+    in property <bool> primary: false;
+    wrap-caption: true;
+    ink: root.primary ? root.colors.accent-ink : root.colors.ink;
+    muted: root.colors.muted;
+    surface: root.primary ? (root.enabled ? root.colors.accent : root.colors.accent.transparentize(0.45)) : root.colors.surface;
+    hover-surface: root.primary ? root.colors.accent-ink.transparentize(0.85) : root.colors.hover;
+    outline: root.colors.outline;
+}
+
+export component PeerVerificationPanel inherits Rectangle {
+    in property <ControlColors> colors;
+    in property <color> surface;
+    in property <float> text-scale: 1;
+    in property <bool> allowed: false;
+    in property <string> scope-key;
+    in property <int> reveal-request;
+    callback reveal-at(length);
+    callback revealed(string);
+    property <int> retired-reveal-request: 0;
+    property <PeerVerificationView> view: PeerVerification.view;
+    // Returning from a protected surface or switching accounts never replays
+    // an old focus intent. Only a fresh explicit search supplies a new serial.
+    changed scope-key => { root.retired-reveal-request = root.reveal-request; }
+    changed allowed => {
+        if !root.allowed { root.retired-reveal-request = root.reveal-request; }
+    }
+    changed reveal-request => {
+        if root.allowed && root.reveal-request > 0 && root.reveal-request != root.retired-reveal-request {
+            if root.view.busy || root.view.stage == 6 {
+                root.reveal-at(status-field.absolute-position.y);
+                status-field.focus();
+                if status-field.has-focus { root.revealed("security.peer_verification:status"); }
+            } else if root.view.stage != 0 {
+                // Never focus Send/Accept/Confirm or replace an open flow.
+                root.reveal-at(refresh-action.absolute-position.y);
+                refresh-action.focus();
+                if refresh-action.has-focus { root.revealed("security.peer_verification"); }
+            }
+        }
+    }
+    background: root.surface;
+    border-radius: StyleTokens.radius * 1;
+    preferred-height: body.preferred-height + 28px;
+    min-height: self.preferred-height;
+    accessible-role: region;
+    accessible-label: "Verify a person's Matrix identity";
+    Timer {
+        interval: 3s;
+        running: root.allowed && !root.view.busy;
+        triggered => { PeerVerification.refresh(); }
+    }
+    body := VerticalLayout {
+        padding: 14px; spacing: 8px;
+        Text { text: "Verify a person"; color: root.colors.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+        Text {
+            text: "Compare emoji or numbers with this person using another trusted channel. Check the conversation’s member list before sharing verification details; a direct conversation may include other people.";
+            color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        }
+        if root.view.stage == 0 : VerticalLayout {
+            spacing: 8px;
+            Text {
+                text: "Open or create a direct conversation using the ordinary chat controls, then return here. Verification uses that selected conversation; it never creates a room or sends an invitation.";
+                color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+            }
+            person-id := TokenField {
+                colors: root.colors; text-scale: root.text-scale;
+                text <=> PeerVerification.peer-input;
+                placeholder-text: "@person:homeserver"; label: "Exact Matrix ID of the person to verify";
+                enabled: root.allowed && !root.view.busy;
+                property <int> requested-reveal: root.reveal-request;
+                changed requested-reveal => {
+                    if root.allowed && !root.view.busy && root.reveal-request > 0 && root.reveal-request != root.retired-reveal-request {
+                        root.reveal-at(self.absolute-position.y);
+                        self.focus();
+                        if self.has-focus { root.revealed("security.peer_verification"); }
+                    }
+                }
+                changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } }
+            }
+            TokenCheck { colors: root.colors; text-scale: root.text-scale;
+                visible: root.view.uncertain;
+                text: "I checked with this person before requesting again";
+                checked <=> PeerVerification.checked-uncertain;
+                enabled: root.allowed && !root.view.busy;
+                changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } }
+            }
+            VerticalLayout {
+                spacing: 8px;
+                PeerAction { text: "Review request"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy && PeerVerification.peer-input != ""; activated => { PeerVerification.request(); } focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } } }
+                PeerAction { text: "Open conversations"; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.open-conversations(); } focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } } }
+            }
+            Text { text: "Incoming requests"; color: root.colors.ink; font-size: 12px * root.text-scale; }
+            for item in PeerVerification.requests : VerticalLayout {
+                spacing: 8px;
+                Text { text: item.peer + "\nRoom: " + item.room; color: root.colors.ink; font-size: 11px * root.text-scale; wrap: word-wrap; horizontal-stretch: 1; }
+                PeerAction { text: "Review"; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.review(item.key); } focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } } }
+            }
+            if PeerVerification.inbox-note != "" : Text { text: PeerVerification.inbox-note; color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+        }
+        if root.view.peer != "" : Text { text: "Person: " + root.view.peer; color: root.colors.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+        if root.view.room != "" : Text { text: "Conversation: " + root.view.room; color: root.colors.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+        // A real read-only focus destination when the action is unavailable.
+        status-field := TextInput {
+            text: root.view.detail != "" ? root.view.detail : root.view.busy ? "Working…" : "No verification is open.";
+            read-only: true; single-line: false; wrap: word-wrap;
+            color: root.colors.muted; font-size: 12px * root.text-scale;
+            accessible-label: "Peer verification status";
+            accessible-live-region: polite;
+            changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } }
+        }
+        if root.allowed && root.view.stage == 3 : VerticalLayout {
+            spacing: 8px;
+            Text { text: root.view.emoji; color: root.colors.ink; font-size: 14px * root.text-scale; wrap: word-wrap; accessible-label: "Compare these SAS emoji: " + root.view.emoji; }
+            Text { text: root.view.decimals; color: root.colors.ink; font-size: 14px * root.text-scale; wrap: word-wrap; accessible-label: "Compare these SAS numbers: " + root.view.decimals; }
+            TokenCheck { colors: root.colors; text-scale: root.text-scale; text: "I compared all values with this exact person and they match"; checked <=> PeerVerification.compared; enabled: root.allowed && !root.view.busy; changed has-focus => { if self.has-focus { root.reveal-at(self.absolute-position.y); } } }
+        }
+        if root.view.error != "" : Text { text: root.view.error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+        VerticalLayout {
+            spacing: 8px;
+            if root.view.stage == 6 : PeerAction { text: "Send this exact request"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.send(); } focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } } }
+            if root.view.stage == 1 : PeerAction { text: "Accept this request"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.accept(); } focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } } }
+            if root.view.stage == 2 : PeerAction { text: "Continue comparison"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.advance(); } focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } } }
+            if root.view.stage == 3 : PeerAction { text: "Values match — confirm"; primary: true; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy && PeerVerification.compared; activated => { PeerVerification.confirm(); } focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } } }
+            if root.view.stage > 0 && root.view.stage < 5 : PeerAction { text: "Values differ / cancel"; colors: root.colors; text-scale: root.text-scale; enabled: root.allowed && !root.view.busy; activated => { PeerVerification.cancel(); } focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } } }
+            if root.view.stage > 0 : PeerAction { text: "Dismiss here"; colors: root.colors; text-scale: root.text-scale; enabled: !root.view.busy; activated => { PeerVerification.dismiss(); } focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } } }
+            refresh-action := PeerAction {
+                text: root.view.busy ? "Working…" : "Refresh status";
+                label: "Refresh peer verification status";
+                colors: root.colors; text-scale: root.text-scale;
+                enabled: root.allowed && !root.view.busy;
+                activated => { PeerVerification.refresh(); }
+                focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
+            }
+        }
+    }
+}

@@ -302,6 +302,21 @@ class FixtureTests(unittest.TestCase):
             self.assertTrue(synapse["matrix_authentication_service"]["enabled"])
             self.assertEqual(synapse["matrix_authentication_service"]["endpoint"], "http://127.0.0.1:12003/")
 
+    def test_registration_preserves_leading_hyphen_password_as_one_option_value(self):
+        account = {"username": "morpheus_fixture", "password": ""}
+        docker = mock.Mock(root=Path("/private/fixture"))
+        docker.run.return_value = subprocess.CompletedProcess([], 0)
+        for password in ("-fixture-value", "--fixture-value", "ordinary_fixture_value"):
+            account["password"] = password
+            auth.register_fixture_user(docker, "owned-container", account)
+            args, options = docker.run.call_args
+            self.assertIn("--password=" + password, args)
+            self.assertNotIn("--password", args)
+            self.assertNotIn(password, args)
+            self.assertEqual(args[-2:], ("--yes", "--no-admin"))
+            self.assertNotIn("--ignore-password-complexity", args)
+            self.assertEqual(options, {"output": Path("/private/fixture/registration.log"), "check": False})
+
     def test_checkout_root_and_symlink_output_are_rejected(self):
         with self.assertRaises(ValueError):
             auth.private_directory(SCRIPTS / "oauth-test-secret")
@@ -608,6 +623,37 @@ class CliDiagnosticsTests(unittest.TestCase):
         with mock.patch.object(auth, "up", side_effect=failed_up):
             result = self.invoke(["up", "--root", "/private/fixture"])
         self.assert_failure(result, "registration", "fixture_operation")
+
+    def test_registration_exit_diagnostics_are_closed_and_never_echo_command_or_body(self):
+        for status, code in ((2, "registration_exit_two"), (126, "registration_exit_exec"),
+                             (127, "registration_exit_exec"), (1, "registration_exit_other"),
+                             (-9, "registration_exit_other")):
+            with self.subTest(status=status):
+                docker = mock.Mock(root=Path("/private/fixture"))
+                docker.run.return_value = subprocess.CompletedProcess(
+                    ["private-command"], status, stdout=b"private-token", stderr=b"private-body")
+                def failed_up(root):
+                    auth.set_stage(auth.Stage.REGISTRATION)
+                    auth.register_fixture_user(docker, "owned-container", {"username": "fixture", "password": "-fixture-value"})
+                with mock.patch.object(auth, "up", side_effect=failed_up):
+                    result = self.invoke(["up", "--root", "/private/fixture"])
+                self.assert_failure(result, "registration", code)
+                self.assertNotIn("private", result[1] + result[2])
+                self.assertNotIn("fixture-value", result[1] + result[2])
+
+    def test_registration_command_failure_is_private_and_requires_its_fixed_enum(self):
+        docker = mock.Mock(root=Path("/private/fixture"))
+        docker.run.side_effect = auth.FixtureError("private-command password=private-value")
+        def failed_up(root):
+            auth.set_stage(auth.Stage.REGISTRATION)
+            auth.register_fixture_user(docker, "owned-container", {"username": "fixture", "password": "-fixture-value"})
+        with mock.patch.object(auth, "up", side_effect=failed_up):
+            result = self.invoke(["up", "--root", "/private/fixture"])
+        self.assert_failure(result, "registration", "registration_command")
+        self.assertNotIn("private", result[1] + result[2])
+        for value in ("registration_exit_other", auth.Failure.BROWSER_PROTOCOL):
+            with self.assertRaises(TypeError):
+                auth.RegistrationError(value)
 
     def test_browser_failure_has_fixed_category_and_stage(self):
         def failed_browser(request):

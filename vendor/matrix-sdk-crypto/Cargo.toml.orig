@@ -1,0 +1,137 @@
+[package]
+authors = ["Damir Jelić <poljar@termina.org.uk>"]
+description = "Matrix encryption library"
+edition = "2024"
+keywords = ["matrix", "chat", "messaging", "ruma", "nio"]
+license = "Apache-2.0"
+name = "matrix-sdk-crypto"
+repository = "https://github.com/matrix-org/matrix-rust-sdk"
+rust-version = { workspace = true }
+version = "0.19.1"
+include = [".cargo/mermaid.html", "**/*.rs"]
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs", "--generate-link-to-definition"]
+
+# rustls-wbpki: `cargo-machete` doesn't consider lib renames unless
+# `--with-metadata` is passed, but this errors CI further.
+
+# rustls-pki-types: this is an indirect dependency, but we need to add this to
+# control its feature flags.
+# See https://github.com/bnjbvr/cargo-machete/issues/170
+[package.metadata.cargo-machete]
+ignored = ["rustls-webpki", "rustls-pki-types"]
+
+[features]
+default = []
+automatic-room-key-forwarding = []
+experimental-send-custom-to-device = []
+
+# Enable experimental support for encrypting state events; see
+# https://github.com/matrix-org/matrix-rust-sdk/issues/5397.
+experimental-encrypted-state-events = [
+    "matrix-sdk-common/experimental-encrypted-state-events",
+    "ruma/unstable-msc4362"
+]
+
+js = ["ruma/js", "vodozemac/wasm_js", "matrix-sdk-common/js"]
+qrcode = ["dep:matrix-sdk-qrcode"]
+experimental-algorithms = []
+uniffi = ["dep:uniffi"]
+_disable-minimum-rotation-period-ms = []
+
+# Private feature, see
+# https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823 for the gory
+# details.
+test-send-sync = []
+
+# Testing helpers for implementations based upon this
+testing = ["matrix-sdk-test"]
+
+# Enable experimental support for pushing secrets; see
+# https://github.com/matrix-org/matrix-spec-proposals/pull/4385
+experimental-push-secrets = []
+
+# Enable experimental support for verifying user identities via X.509 certificates
+experimental-x509-identity-verification = ["dep:cms", "dep:pkcs1", "dep:sha2_0_10"]
+
+# Enable a pure-rust implementation of the X.509 signer and verifier, via `rustls`.
+rust-x509-verifier-impl = ["experimental-x509-identity-verification", "dep:rustls", "dep:rustls-pki-types", "dep:rustls-webpki", "dep:ring"]
+
+[dependencies]
+aes = { version = "0.9.3", default-features = false }
+as_variant.workspace = true
+async-trait.workspace = true
+bs58 = { version = "0.5.1", default-features = false, features = ["std"] }
+byteorder.workspace = true
+cfg-if.workspace = true
+cms = { version = "0.2.3", default-features = false, features = ["std"], optional = true }
+ctr = { version = "0.10.1", default-features = false }
+eyeball.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+itertools.workspace = true
+js_option = { version = "0.2.0", default-features = false }
+matrix-sdk-common.workspace = true
+matrix-sdk-qrcode = { workspace = true, optional = true }
+matrix-sdk-test = { workspace = true, optional = true }  # feature = testing only
+pbkdf2.workspace = true
+pkcs1 = { version = "0.7.5", default-features = false, optional = true }
+rand.workspace = true
+ring = { version = "0.17.14", optional = true, features = ["wasm32_unknown_unknown_js"] }
+rmp-serde.workspace = true
+ruma = { workspace = true, features = ["rand", "unstable-msc3814"] }
+rustls = { workspace = true, optional = true, default-features = false, features = ["std", "ring"] }
+rustls-pki-types = { version = "1.15.1", optional = true, default-features = false, features = ["alloc", "web"] }
+rustls-webpki = { version = "0.103.15", default-features = false, optional = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json.workspace = true
+sha2.workspace = true
+# This copy of the sha2 crate is necessary because we require an older version
+# of the const-oid crate for it to be compatible with the rest of the x509 deps
+sha2_0_10 = { package = "sha2", version = "0.10.9", features = ["oid"], optional = true }
+subtle = { version = "2.6.1", default-features = false, features = ["std", "i128"] }
+thiserror.workspace = true
+time = { version = "0.3.55", default-features = false, features = ["std", "formatting"] }
+tokio.workspace = true
+tokio-stream = { workspace = true, features = ["sync"] }
+tracing = { workspace = true, features = ["attributes"] }
+ulid = { version = "3.0.0", default-features = false, features = ["std"] }
+uniffi = { workspace = true, optional = true }
+url.workspace = true
+vodozemac.workspace = true
+zeroize = { workspace = true, features = ["zeroize_derive"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["time"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+assert_matches.workspace = true
+futures-executor.workspace = true
+http.workspace = true
+insta.workspace = true
+matrix-sdk-test.workspace = true
+matrix-sdk-test-utils.workspace = true
+proptest.workspace = true
+rmp-serde.workspace = true
+rcgen = { workspace = true, features = ["pem", "aws_lc_rs", "x509-parser"] }
+similar-asserts.workspace = true
+strass.workspace = true
+# required for async_test macro
+stream_assert.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# The x509 tests use rust-x509-verifier-impl, so we need its dependencies
+ring = { version = "0.17.14", features = ["wasm32_unknown_unknown_js"] }
+rustls = { workspace = true, default-features = false, features = ["std", "ring"] }
+rustls-webpki = { version = "0.103.15", default-features = false }
+rustls-pki-types = { version = "1.15.1", default-features = false, features = ["alloc", "web"] }
+
+[lints]
+workspace = true

@@ -20,6 +20,12 @@ on:
         required: true
         default: appimage
         options: [both, appimage, deb]
+      native_updates:
+        description: Synthetic installed update transactions (explicit macos or windows only; two version-only packages)
+        type: boolean
+        required: true
+        default: false
+
       appimage_updates:
         description: Run installed signed AppImage update QA instead of ordinary Linux packaging
         type: boolean
@@ -64,6 +70,7 @@ jobs:
       source_revision: ${{ steps.scope.outputs.source_revision }}
       cache_write: ${{ steps.scope.outputs.cache_write }}
       source_bundle: ${{ steps.scope.outputs.source_bundle }}
+      native_updates: ${{ steps.scope.outputs.native_updates }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -77,6 +84,7 @@ jobs:
           APPIMAGE_UPDATES: ${{ inputs.appimage_updates }}
           APPIMAGE_CAPTURE: ${{ inputs.appimage_capture }}
           SOURCE_BUNDLE: ${{ inputs.source_bundle }}
+          NATIVE_UPDATES: ${{ inputs.native_updates }}
         shell: bash
         run: |
           set -euo pipefail
@@ -112,7 +120,7 @@ jobs:
             git -C "$GITHUB_WORKSPACE" show --no-ext-diff --no-textconv \
               "$GITHUB_SHA:scripts/$input" > "$trusted/$input"
           done
-          echo "4acde7ed74259339d9494b5e2d52aff42e1317bbdf23400cc67bf7bf3085caef  $trusted/scan_history.py" | sha256sum --check --status
+          echo "dcd5d9a2dfafaf50adb63f294eba982778b67dade562def4e0e32bf38941285c  $trusted/scan_history.py" | sha256sum --check --status
           archive="$RUNNER_TEMP/package-source-gitleaks.tar.gz"
           curl --fail --silent --show-error --location \
             https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
@@ -141,7 +149,7 @@ jobs:
           ' "$evidence/summary.json" "$SELECTED_SOURCE"
 
   package:
-    name: Package validation (${{ matrix.label }})
+    name: ${{ needs.scope.outputs.native_updates == 'true' && format('Synthetic installed updates ({0}, partial)', matrix.label) || format('Package validation ({0})', matrix.label) }}
     needs: scope
     if: needs.scope.outputs.source_bundle != 'true' && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false && github.event_name == 'workflow_dispatch' && github.actor == 'brk275' && github.triggering_actor == 'brk275' && github.event.sender.id == github.event.repository.owner.id
     runs-on: ${{ matrix.os }}
@@ -183,8 +191,37 @@ jobs:
             sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS /usr/bin/python3 -I -B -
       - name: Verify exact reviewed source checkout
         run: python3 scripts/package_revision.py --verify-checkout .
+      - name: Check synthetic update runtime before building
+        if: needs.scope.outputs.native_updates == 'true'
+        env:
+          NATIVE_UPDATE_TARGET: ${{ matrix.label }}
+        shell: bash
+        run: |
+          python3 -I -B - <<'NATIVE_UPDATE_RUNTIME'
+          import json, os, platform, select, struct, sys, tarfile
+          try:
+              targets = {"macos-arm64": ("darwin", "arm64", "macOS"),
+                         "macos-x64": ("darwin", "x86_64", "macOS"),
+                         "windows-x64": ("win32", "AMD64", "Windows")}
+              host, machine, runner = targets[os.environ["NATIVE_UPDATE_TARGET"]]
+              assert (sys.platform, platform.machine(), os.environ.get("RUNNER_OS")) == (host, machine, runner)
+              assert sys.version_info >= (3, 12) and struct.calcsize("P") == 8 and callable(tarfile.data_filter)
+              assert os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+              if host == "darwin":
+                  assert os.environ.get("ImageOS") == "macos15"
+                  assert hasattr(select, "kqueue") and hasattr(select, "KQ_FILTER_PROC")
+                  assert all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "WEXITED", "WNOHANG", "P_PID"))
+                  assert os.chmod in os.supports_follow_symlinks
+              else:
+                  assert os.environ.get("ImageOS") in {"win25", "win25-vs2026"}
+              print(json.dumps({"check":"native_update_runtime", "passed":True, "target":os.environ["NATIVE_UPDATE_TARGET"],
+                                "python":[sys.version_info.major, sys.version_info.minor]}, sort_keys=True))
+          except BaseException:
+              print("Synthetic native update runtime requirements are unavailable; no build was started.", file=sys.stderr)
+              raise SystemExit(1) from None
+          NATIVE_UPDATE_RUNTIME
       - name: Check Windows keyboard host before building
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.scope.outputs.native_updates != 'true'
         shell: powershell
         run: |
           if (-not [Environment]::UserInteractive) {
@@ -446,14 +483,128 @@ jobs:
       - name: Prepare verified Windows NSIS tools
         if: runner.os == 'Windows'
         run: python3 scripts/windows_package_tools.py
-      - name: Build unsigned QA package
+      - name: Prepare pinned native notice and update scanner
         if: runner.os != 'Linux'
-        run: python3 scripts/package.py --formats ${{ matrix.formats }}
+        timeout-minutes: 3
+        env:
+          MORPHEUS_NATIVE_UPDATES_SELECTED: ${{ needs.scope.outputs.native_updates }}
+        shell: bash
+        run: |
+          python3 -I -B - <<'NATIVE_UPDATE_SCANNER'
+          import hashlib, io, json, os, pathlib, platform, sys, tarfile, tempfile, urllib.parse, urllib.request, zipfile
+
+          MAX_SCANNER_BYTES = 32 * 1024 * 1024
+
+          def checked_scanner(data, archive_sha256, binary_sha256, kind):
+              if (type(data) is not bytes or not 0 < len(data) <= MAX_SCANNER_BYTES
+                      or hashlib.sha256(data).hexdigest() != archive_sha256):
+                  raise ValueError("Scanner archive identity rejected")
+              # Authenticate before opening an archive; copy one bounded regular member,
+              # never extract paths or use candidate scanner configuration/suppressions.
+              if kind == "tar":
+                  with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+                      entries = archive.getmembers()
+                      chosen = [entry for entry in entries if entry.name == "gitleaks"]
+                      if (not 0 < len(entries) <= 16 or sum(entry.size for entry in entries) > 2 * MAX_SCANNER_BYTES
+                              or len(chosen) != 1 or not chosen[0].isfile()
+                              or not 0 < chosen[0].size <= MAX_SCANNER_BYTES):
+                          raise ValueError("Scanner archive member rejected")
+                      binary = archive.extractfile(chosen[0]).read(MAX_SCANNER_BYTES + 1)
+                      if len(binary) != chosen[0].size:
+                          raise ValueError("Scanner member length changed")
+              elif kind == "zip":
+                  with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                      entries = archive.infolist()
+                      chosen = [entry for entry in entries if entry.filename == "gitleaks.exe"]
+                      if (not 0 < len(entries) <= 16 or sum(entry.file_size for entry in entries) > 2 * MAX_SCANNER_BYTES
+                              or len(chosen) != 1 or chosen[0].is_dir()
+                              or (chosen[0].external_attr >> 16) & 0o170000 not in (0, 0o100000)
+                              or not 0 < chosen[0].file_size <= MAX_SCANNER_BYTES):
+                          raise ValueError("Scanner archive member rejected")
+                      with archive.open(chosen[0]) as stream:
+                          binary = stream.read(MAX_SCANNER_BYTES + 1)
+                      if len(binary) != chosen[0].file_size:
+                          raise ValueError("Scanner member length changed")
+              else:
+                  raise ValueError("Unknown scanner archive kind")
+              if not 0 < len(binary) <= MAX_SCANNER_BYTES or hashlib.sha256(binary).hexdigest() != binary_sha256:
+                  raise ValueError("Scanner executable identity rejected")
+              return binary
+
+          class ScannerRedirect(urllib.request.HTTPRedirectHandler):
+              count = 0
+              def redirect_request(self, request, fp, code, message, headers, url):
+                  self.count += 1
+                  parsed = urllib.parse.urlsplit(url)
+                  if (self.count > 3 or parsed.scheme != "https" or parsed.username or parsed.password or parsed.fragment
+                          or parsed.port not in (None, 443)
+                          or parsed.hostname not in {"github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}):
+                      raise ValueError("Scanner redirect rejected")
+                  return super().redirect_request(request, fp, code, message, headers, url)
+
+          try:
+              pins = {
+                  ("darwin", "arm64"): ("gitleaks_8.30.1_darwin_arm64.tar.gz", "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5", "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f", "tar"),
+                  ("darwin", "x86_64"): ("gitleaks_8.30.1_darwin_x64.tar.gz", "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709", "cee01fea7173f1b779dff188e1c26ecbcb4027d394acc573b23aaf0be260e291", "tar"),
+                  ("win32", "AMD64"): ("gitleaks_8.30.1_windows_x64.zip", "d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e", "17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c", "zip"),
+              }
+              asset, archive_hash, binary_hash, kind = pins[(sys.platform, platform.machine())]
+              temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
+              assert temporary.is_dir() and not any(c in str(temporary) for c in "\r\n")
+              root = pathlib.Path(tempfile.mkdtemp(prefix="morpheus-native-update-scanner-", dir=temporary))
+              root.chmod(0o700)
+              opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), ScannerRedirect())
+              request = urllib.request.Request("https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/" + asset)
+              with opener.open(request, timeout=120) as response:
+                  data = response.read(MAX_SCANNER_BYTES + 1)
+              binary = checked_scanner(data, archive_hash, binary_hash, kind)
+              scanner = root / ("gitleaks.exe" if sys.platform == "win32" else "gitleaks")
+              with scanner.open("xb") as output:
+                  output.write(binary)
+              scanner.chmod(0o500)
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+                  output.write("MORPHEUS_NATIVE_QA_SCANNER=" + str(scanner) + "\n")
+                  if sys.platform == "darwin" and os.environ.get("MORPHEUS_NATIVE_UPDATES_SELECTED") == "true":
+                      target = pathlib.Path(tempfile.mkdtemp(prefix="morpheus-mac-update-target-", dir=temporary))
+                      target.chmod(0o700)
+                      output.write("MORPHEUS_MAC_UPDATE_TARGET=" + str(target) + "\n")
+              print(json.dumps({"check":"native_update_scanner", "passed":True, "version":"8.30.1", "sha256":binary_hash}, sort_keys=True))
+          except BaseException:
+              print('Native update scanner preparation failed; raw diagnostics withheld.', file=sys.stderr)
+              raise SystemExit(1) from None
+          NATIVE_UPDATE_SCANNER
+      - name: Prepare candidate-bound portable source notice inputs
+        if: runner.os != 'Linux'
+        timeout-minutes: 35
+        shell: bash
+        run: python3 -I -B scripts/native_notice_source.py --prepare --gitleaks "$MORPHEUS_NATIVE_QA_SCANNER"
+      - name: Verify synthetic installed Mac update transactions
+        if: needs.scope.outputs.native_updates == 'true' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/macos_update_acceptance.py \
+            --source "$GITHUB_WORKSPACE" --target-dir "$MORPHEUS_MAC_UPDATE_TARGET" \
+            --native-source-bundle "$MORPHEUS_NATIVE_SOURCE_BUNDLE" --native-source-receipt "$MORPHEUS_NATIVE_SOURCE_RECEIPT" \
+            --gitleaks "$MORPHEUS_NATIVE_QA_SCANNER" --execute-on-free-hosted-runner
+      - name: Verify synthetic installed Windows update transactions
+        if: needs.scope.outputs.native_updates == 'true' && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          python3 scripts/windows_update_acceptance.py `
+            --source "$env:GITHUB_WORKSPACE" --gitleaks "$env:MORPHEUS_NATIVE_QA_SCANNER" `
+            --native-source-bundle "$env:MORPHEUS_NATIVE_SOURCE_BUNDLE" --native-source-receipt "$env:MORPHEUS_NATIVE_SOURCE_RECEIPT" `
+            --gitleaks-sha256 "17157e2ee8b76fc8b1d8bee607a250e34b8a8023c8bc81822d4b5ee4d78fcb7c" --execute-on-free-hosted-runner
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic installed Windows update acceptance failed' }
+      - name: Build unsigned QA package
+        if: runner.os != 'Linux' && needs.scope.outputs.native_updates != 'true'
+        shell: bash
+        run: python3 scripts/package.py --formats ${{ matrix.formats }} --native-source-bundle "$MORPHEUS_NATIVE_SOURCE_BUNDLE" --native-source-receipt "$MORPHEUS_NATIVE_SOURCE_RECEIPT"
       - name: Build and inspect canonical Linux QA AppImage
         if: runner.os == 'Linux' && !inputs.appimage_updates
         run: /usr/bin/python3 scripts/package.py --formats ${{ matrix.formats }} --gitleaks "$MORPHEUS_QA_GITLEAKS"
       - name: Install, inspect, launch and remove unsigned packages
-        if: runner.os != 'Linux' || !inputs.appimage_updates
+        if: needs.scope.outputs.native_updates != 'true' && (runner.os != 'Linux' || !inputs.appimage_updates)
         timeout-minutes: 35
         run: python3 scripts/package_smoke.py --target ${{ matrix.label }} --formats ${{ matrix.formats }}
       - name: Test installed AppImage update and rollback
@@ -466,6 +617,11 @@ jobs:
           /usr/bin/python3 scripts/appimage_update_acceptance.py \
             --source "$GITHUB_WORKSPACE" --target-dir "$GITHUB_WORKSPACE/target" \
             --gitleaks "$MORPHEUS_QA_GITLEAKS" --execute-on-free-hosted-runner
+      - name: Scan and remove owned native notice source inputs
+        if: always() && runner.os != 'Linux' && env.MORPHEUS_NATIVE_SOURCE_ROOT != ''
+        timeout-minutes: 5
+        shell: bash
+        run: python3 -I -B scripts/native_notice_source.py --finish --gitleaks "$MORPHEUS_NATIVE_QA_SCANNER"
       # Installers deliberately stay on the ephemeral runner. Public artifact
       # uploads and releases require the separate release acceptance gates.
 

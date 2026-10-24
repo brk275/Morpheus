@@ -1636,6 +1636,7 @@ fn load_newer(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
 /// timeline's seeks and thread keeper end too (timeline_viewport::withdraw).
 /// Nothing is recaptured; a later open takes its own new authority.
 pub(crate) fn surface_entered(window: &AppWindow) {
+    crate::message_copy::withdraw(window);
     with(|controller| {
         if let Some((navigation, _)) = controller.navigation.take() {
             navigation.withdraw();
@@ -1768,6 +1769,7 @@ fn open_thread(window: &AppWindow, room_id: &str, root_id: &str) {
     window.set_thread_root_body(root.body.clone());
     window.set_thread_root_rich_body(root.rich_body);
     window.set_thread_root_rich_accessible_body(root.rich_accessible_body);
+    window.set_thread_root_copy_token(root.copy_token);
     window.set_thread_composer_text("".into());
     window.set_thread_send_pending(false);
     window.set_thread_messages(ModelRc::new(VecModel::<MessageItem>::default()));
@@ -1778,13 +1780,20 @@ fn open_thread(window: &AppWindow, room_id: &str, root_id: &str) {
 /// Present a thread root that was opened from search before its message was
 /// known, from the thread feed's own copy of the root event. A root shown
 /// from the conversation already has its sender and is left unchanged.
-pub(crate) fn show_thread_root(window: &AppWindow, messages: &[Arc<MessageInfo>], root_id: &str) {
-    if !window.get_thread_root_sender().is_empty() {
-        return;
-    }
-    let mut rows = messages.iter();
-    if let Some(root) = rows.find(|row| row.event_id.as_deref() == Some(root_id)) {
-        present_thread_root(window, root);
+pub(crate) fn show_thread_root(
+    window: &AppWindow,
+    messages: &[Arc<MessageInfo>],
+    root_id: &str,
+    copy_scope: Option<std::rc::Rc<crate::message_copy::CopyScope>>,
+) {
+    let root = messages
+        .iter()
+        .find(|row| row.event_id.as_deref() == Some(root_id));
+    if window.get_thread_root_sender().is_empty() {
+        if let Some(root) = root {
+            present_thread_root(window, root);
+            crate::message_copy::publish_thread_root(window, Some(root), copy_scope);
+        }
     }
 }
 

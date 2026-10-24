@@ -139,6 +139,8 @@ struct Form {
     selection: AccountSelection,
     room: String,
     navigation: u64,
+    // A security operation permanently retires a queued replacement-room click.
+    replacement_security: u64,
     cancellation: RoomSettingsCancellation,
     wake: Notify,
     content: Mutex<Content>,
@@ -252,6 +254,8 @@ impl RoomSettingsUi {
         ui.set_room_settings_access_description("".into());
         ui.set_room_settings_avatar_present(false);
         ui.set_room_settings_form_id("".into());
+        ui.set_room_settings_replacement_id("".into());
+        ui.set_room_settings_replacement_reason("".into());
         // These fields belong only to settings, even while the shared admin
         // modal is showing a redaction. Never retain another form's text while
         // the next room's authoritative snapshot is still loading.
@@ -338,6 +342,7 @@ impl RoomSettingsUi {
             selection,
             room,
             navigation: self.live.current_navigation_epoch(),
+            replacement_security: self.live.security_gate.ringing_generation(),
             cancellation: RoomSettingsCancellation::new(),
             wake: Notify::new(),
             content: Mutex::new(Content::default()),
@@ -349,6 +354,8 @@ impl RoomSettingsUi {
         ui.set_room_admin_room_id(form.room.clone().into());
         ui.set_room_settings_form_id(form.id.to_string().into());
         ui.set_room_settings_loaded(false);
+        ui.set_room_settings_replacement_id("".into());
+        ui.set_room_settings_replacement_reason("".into());
         ui.set_room_settings_name_allowed(false);
         ui.set_room_settings_topic_allowed(false);
         ui.set_room_settings_avatar_allowed(false);
@@ -482,7 +489,13 @@ impl RoomSettingsUi {
             Some(Confirmation::Refresh) => 3,
         });
         ui.set_room_settings_loaded(snapshot.is_some());
+        ui.set_room_settings_replacement_id("".into());
+        ui.set_room_settings_replacement_reason("".into());
         if let Some(snapshot) = snapshot {
+            if let Some(room) = snapshot.replacement_room.as_ref() {
+                ui.set_room_settings_replacement_id(replacement_label(room.as_str()).into());
+                ui.set_room_settings_replacement_reason(snapshot.replacement_reason.clone().into());
+            }
             ui.set_room_settings_name_allowed(snapshot.permissions.name);
             ui.set_room_settings_topic_allowed(snapshot.permissions.topic);
             ui.set_room_settings_avatar_allowed(snapshot.permissions.avatar);
@@ -530,6 +543,10 @@ impl RoomSettingsUi {
             self.close(ui);
             return;
         };
+        if action == 10 {
+            self.open_replacement(ui, form);
+            return;
+        }
         if action == 0 {
             let mut state = form.content.lock().expect("Room settings state poisoned");
             if state.progress.busy {
@@ -632,6 +649,97 @@ impl RoomSettingsUi {
             _ => {}
         }
     }
+    fn open_replacement(&self, ui: &AppWindow, form: Arc<Form>) {
+        if ui.get_room_admin_busy()
+            || ui.get_room_settings_dirty()
+            || ui.get_room_settings_refresh_required()
+            || ui.get_room_settings_staged()
+            || ui.get_room_settings_confirmation() != 0
+            || ui.get_manage_accounts_open()
+            || ui.get_account_switch_pending()
+            || ui.get_access_open()
+            || ui.get_show_sign_in()
+            || ui.get_security_busy()
+            || !ui.get_security_recovery_key().is_empty()
+            || ui.get_sas_busy()
+            || ui.get_sas_stage() != 0
+            || ui.get_page() != 0
+        {
+            return;
+        }
+        let (session, expected) = {
+            let state = form.content.lock().expect("Room settings state poisoned");
+            if !replacement_ready(&state) {
+                return;
+            }
+            let Some(session) = state.session.clone() else {
+                return;
+            };
+            let Some(expected) = state
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.replacement_room.clone())
+            else {
+                return;
+            };
+            (session, expected)
+        };
+        if !self.matches_ui(&form, ui)
+            || self.live.action_admission_closed()
+            || !self
+                .live
+                .security_gate
+                .ringing_allowed(form.replacement_security)
+            || crate::room_addresses::is_open(ui)
+            || ui.global::<crate::RoomAccessState>().get_open()
+            || crate::room_leave::is_open(ui)
+        {
+            return;
+        }
+        // A worker may finish before its queued render reaches this window.
+        // The label is an injective display encoding, used only to refuse a
+        // mismatched presentation; routing still comes exclusively from SDK ID.
+        if ui.get_room_settings_replacement_id().as_str() != replacement_label(expected.as_str()) {
+            return;
+        }
+        // Resolve from the original SDK room, never the Slint ID/reason strings.
+        let current = session.replacement_room();
+        if !self.matches_ui(&form, ui)
+            || !self
+                .live
+                .security_gate
+                .ringing_allowed(form.replacement_security)
+            || self.live.action_admission_closed()
+        {
+            return;
+        }
+        if !matches!(current, Ok(Some(ref room)) if room == &expected) {
+            ui.set_room_admin_error("The replacement room changed or is unavailable. Refresh room settings before opening it.".into());
+            return;
+        }
+        if !self.matches_ui(&form, ui)
+            || !self
+                .live
+                .security_gate
+                .ringing_allowed(form.replacement_security)
+            || self.live.action_admission_closed()
+        {
+            return;
+        }
+        // Clean details only: no discarded edits or pending writes. Its queued
+        // renders/watcher cannot match after close; the link keeps this exact
+        // selection rather than looking up a fresh same-ID account epoch.
+        self.close(ui);
+        crate::matrix_links::open_room_for_selection(
+            ui,
+            &self.live,
+            &self.runtime,
+            &form.selection,
+            form.replacement_security,
+            &expected,
+        );
+    }
+
     fn choose(self: &Arc<Self>, ui: &AppWindow, form: Arc<Form>) {
         let Some(generation) = self.begin(ui, &form, false) else {
             return;
@@ -850,6 +958,34 @@ fn clear_image(ui: &AppWindow) {
     ui.set_room_settings_image_visible(false);
     ui.set_room_settings_staged(false);
 }
+fn replacement_ready(state: &Content) -> bool {
+    state.dirty == 0
+        && !state.progress.busy
+        && !state.progress.refresh_required
+        && state.confirmation.is_none()
+        && !state.staged
+        && state
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.replacement_room.is_some())
+}
+
+fn replacement_label(value: &str) -> String {
+    let mut label = String::new();
+    for c in value.chars() {
+        if c == '\\' {
+            label.push_str("\\\\");
+        } else if c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            label.extend(c.escape_unicode());
+        } else {
+            label.push(c);
+        }
+    }
+    label
+}
+
 fn scope_active(
     current: Option<u64>,
     id: u64,
@@ -1346,6 +1482,8 @@ mod tests {
             },
             room_version: "12".into(),
             encrypted: false,
+            replacement_room: None,
+            replacement_reason: String::new(),
         };
         assert_eq!(
             rule_from_input(&snapshot, 1, "!allow").unwrap(),
@@ -1361,6 +1499,59 @@ mod tests {
         snapshot.permissions.join_rule = false;
         assert!(rule_from_input(&snapshot, 0, "").is_err());
     }
+    #[test]
+    fn replacement_navigation_keeps_dirty_busy_uncertain_and_staged_details() {
+        let mut state = Content::default();
+        assert!(!replacement_ready(&state));
+        state.snapshot = Some(RoomSettingsSnapshot {
+            name: String::new(),
+            topic: String::new(),
+            avatar: morpheus_matrix::RoomAvatarSummary {
+                present: false,
+                preview_available: false,
+                width: None,
+                height: None,
+            },
+            join_rule: CurrentJoinRule::Editable(EditableJoinRule::Invite),
+            available_join_rules: vec![],
+            permissions: Default::default(),
+            room_version: "10".into(),
+            encrypted: true,
+            replacement_room: Some(
+                matrix_sdk::ruma::room_id!("!replacement:example.org").to_owned(),
+            ),
+            replacement_reason: "Moved".into(),
+        });
+        assert!(replacement_ready(&state));
+        state.dirty = Field::Topic.bit();
+        assert!(!replacement_ready(&state));
+        state.dirty = 0;
+        state.progress.busy = true;
+        assert!(!replacement_ready(&state));
+        state.progress.busy = false;
+        state.progress.refresh_required = true;
+        assert!(!replacement_ready(&state));
+        state.progress.refresh_required = false;
+        state.confirmation = Some(Confirmation::Refresh);
+        assert!(!replacement_ready(&state));
+        state.confirmation = None;
+        state.staged = true;
+        assert!(!replacement_ready(&state));
+        state.staged = false;
+        assert!(replacement_ready(&state));
+        let original = state.snapshot.as_ref().unwrap().replacement_room.clone();
+        assert_eq!(
+            replacement_label("!new\u{202e}\n:example.org"),
+            "!new\\u{202e}\\u{a}:example.org"
+        );
+        assert_ne!(
+            replacement_label("!new\u{202e}:example.org"),
+            replacement_label("!new\\u{202e}:example.org")
+        );
+        // Display escaping cannot mutate the typed reference used for routing.
+        assert_eq!(state.snapshot.as_ref().unwrap().replacement_room, original);
+    }
+
     #[test]
     fn controller_and_private_worker_state_are_send_sync() {
         fn check<T: Send + Sync>() {}

@@ -51,6 +51,28 @@ def guard(environment, *, checkout=True):
         P.verify_checkout(ROOT, P.expected_revision(environment))
 
 
+def guard_native(environment):
+    """Admit source assembly only inside an already selected native package run.
+
+    This does not select, schedule or start native work. The source_bundle=true
+    job retains its separate Cargo-only guard and can never enter this route.
+    """
+    P.public_hosted_environment(environment)
+    S.require(environment.get("GITHUB_ACTOR") == "brk275"
+              and environment.get("GITHUB_TRIGGERING_ACTOR") == "brk275")
+    event = S.unique_json(P.client.read_regular(Path(environment["GITHUB_EVENT_PATH"]), 1024 * 1024))
+    owner = event.get("repository", {}).get("owner", {}).get("id")
+    S.require(type(owner) is int and owner > 0 and event.get("sender", {}).get("id") == owner)
+    selected = event.get("inputs", {})
+    def boolean(value, expected):
+        return value is expected or type(value) is str and value == str(expected).lower()
+    S.require(boolean(selected.get("source_bundle"), False)
+              and selected.get("platform") in {"linux", "all"}
+              and selected.get("linux_formats") == "appimage"
+              and boolean(selected.get("appimage_updates"), False)
+              and any(boolean(selected.get("appimage_capture"), value) for value in (False, True)))
+
+
 def environment_for_acquisition(environment, root, cargo, rustc):
     result = S.clean_git_environment(P.controlled_environment(environment))
     # No account, credential helper, ambient Cargo configuration, shared cache,
@@ -162,10 +184,22 @@ def private_root(value, environment):
 def acquire(root, cargo, rustc, environment):
     P.containment.assert_contained()
     root = private_root(root, environment)
+    return acquire_inputs(root, cargo, rustc, environment)
+
+
+def acquire_inputs(root, cargo, rustc, environment, *, progress=None):
+    """Reuse the same bounded no-build fetch in an existing owner namespace.
+
+    The caller exclusively created the private layout and owns its lifetime.
+    Both the source-only route and native package route delete it on every exit.
+    No namespace, package build, source script or provider hook is started here.
+    """
+    P.containment.assert_contained()
+    root = P.client.private_directory(root)
     cargo, rustc = P.owned_tool(cargo), P.owned_tool(rustc)
     S.require(Path(cargo).parent == Path(rustc).parent and Path(cargo).name == "cargo"
               and Path(rustc).name == "rustc", "input")
-    runner = OwnedRunner(root / "logs/commands")
+    runner = OwnedRunner(root / "logs/commands", progress=progress)
     for label, tool, prefix in (("source-cargo-version", cargo, b"cargo 1.99.0 "),
                                 ("source-rustc-version", rustc, b"rustc 1.99.0 ")):
         version = runner.run(label, [tool, "--version"], cwd=root / "fetch", env=environment,
@@ -204,9 +238,15 @@ def github_root(root, environment):
         stream.write(("MORPHEUS_SOURCE_QA_ROOT=" + str(root) + "\n").encode())
 
 
-def prepare(environment):
+def source_tools(environment):
+    # Actual pinned toolchain files, not rustup proxy names whose default HOME
+    # changes when acquisition enters its fresh, credential-free home.
     toolchain = Path(environment.get("RUSTUP_HOME", str(Path(environment["HOME"]) / ".rustup"))) / "toolchains/1.99.0-x86_64-unknown-linux-gnu/bin"
-    cargo, rustc = P.owned_tool(toolchain / "cargo"), P.owned_tool(toolchain / "rustc")
+    return P.owned_tool(toolchain / "cargo"), P.owned_tool(toolchain / "rustc")
+
+
+def prepare(environment):
+    cargo, rustc = source_tools(environment)
     root = Path(tempfile.mkdtemp(prefix="morpheus-source-qa-", dir=environment["RUNNER_TEMP"])).resolve()
     try:
         root.chmod(0o700)

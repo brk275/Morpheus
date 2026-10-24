@@ -1,0 +1,1443 @@
+{
+  "revision": "c6ad52ecc09eaa36601f55effb0a48a533eb87dd",
+  "package": "matrix-sdk-crypto",
+  "source_files": 152,
+  "total_bytes": 2825585,
+  "entries": [
+    {
+      "path": ".cargo/mermaid.html",
+      "original_path": "crates/matrix-sdk-crypto/.cargo/mermaid.html",
+      "mode": "120000",
+      "type": "blob",
+      "blob": "3d84ee221773b90e809c1841e654b3ed4164ba69",
+      "bytes": 28,
+      "sha256": "a11696763b59605d93c55ee6a31d8a892f5483916d82653dd58faf4c26aea82b"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "original_path": "crates/matrix-sdk-crypto/CHANGELOG.md",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "4d56151a51c35ccb2d5678c79d15dfe4d0070c5e",
+      "bytes": 39696,
+      "sha256": "af482773af44a17900595fd0d8c0fa3fa497218a15550611244f1068b98e6e50"
+    },
+    {
+      "path": "Cargo.toml",
+      "original_path": "crates/matrix-sdk-crypto/Cargo.toml",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "9e5ff822c420868785de5e997339b8358ed48bb6",
+      "bytes": 5665,
+      "sha256": "f130a200b584003dd5dc7e89ee0b22242578db469f151336ec022ba0ca6480cf"
+    },
+    {
+      "path": "README.md",
+      "original_path": "crates/matrix-sdk-crypto/README.md",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "8599056cc7be96044b83c4decb11f06fd3d36281",
+      "bytes": 5729,
+      "sha256": "5979f1542caa62413d6b37a38917faf117deb39fab3a84bca935628f6bfe92ac"
+    },
+    {
+      "path": "changelog.d/.gitkeep",
+      "original_path": "crates/matrix-sdk-crypto/changelog.d/.gitkeep",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "changelog.d/7058.fixed.md",
+      "original_path": "crates/matrix-sdk-crypto/changelog.d/7058.fixed.md",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "3d3be291deb2a055c3d783fe2ac31d4a03c8f717",
+      "bytes": 347,
+      "sha256": "a8dda50e9cc8fc0c9f3e0ed9f6dad43df2b2fa499d9e4915e9de442c2662b78e"
+    },
+    {
+      "path": "changelog.d/7064.fixed.md",
+      "original_path": "crates/matrix-sdk-crypto/changelog.d/7064.fixed.md",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d3174304edbf7fb1f28c0280b0b48cb7f9b99fa3",
+      "bytes": 74,
+      "sha256": "5c4d291ee1f85b1f87a71a8f1580b84bc5860de66163b7ee7374d2077079f6eb"
+    },
+    {
+      "path": "src/backups/keys/backup.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/backups/keys/backup.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "662fac241680fd3d3ac8e3c6b6d111288aabb3c5",
+      "bytes": 4985,
+      "sha256": "9fd9c6aa97e83e1dab227cfb7a7636371d9ceafbbf9664f1c0d0c438ad49ddbf"
+    },
+    {
+      "path": "src/backups/keys/decryption.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/backups/keys/decryption.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "b9ed5ffe66a7818a3788fabac59797c1bed1b9aa",
+      "bytes": 15633,
+      "sha256": "336c875f4b0d74d3ad89fe3ab73012bf630aba6344592f61bb2371c7fb14df36"
+    },
+    {
+      "path": "src/backups/keys/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/backups/keys/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "a197f30f520a38410e348b43ebffe9af38ac11e2",
+      "bytes": 2330,
+      "sha256": "da18c9fbe68817b4aa6a7f8b928106056d75b5c787b9d4ba4273e7d43a916b73"
+    },
+    {
+      "path": "src/backups/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/backups/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "fd84ecb16ebfbd54e2c0ea04fcfbb1186293e626",
+      "bytes": 34710,
+      "sha256": "aefc5108b95042b7ba2435d1315de8a0e22e43cbabe89906489e81e51e70d96c"
+    },
+    {
+      "path": "src/ciphers.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/ciphers.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d5b0301dc4ab735fb521e13f4ff3b64e2ed23e85",
+      "bytes": 11027,
+      "sha256": "f2357d0d9c14321435a14dc5bdbb721f569ce3b74c737f8ff38f4c24df1690ea"
+    },
+    {
+      "path": "src/dehydrated_devices.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/dehydrated_devices.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "a9c6fcbe56fe18bd5585ff010e28d27cee5f5767",
+      "bytes": 28287,
+      "sha256": "6dfe43f3d4e92344d361bcf112c8fd34e648e8293acd89cbf1c4ebf49205913d"
+    },
+    {
+      "path": "src/error.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/error.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "6ab53026143c0893f3e5f0b3ab56a3b68e892fcd",
+      "bytes": 18512,
+      "sha256": "35162b18a3acd5f402b6747ca3ba7b40fea3eb087b0e6df932a25cb8e68b22d7"
+    },
+    {
+      "path": "src/file_encryption/attachments.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/file_encryption/attachments.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "ae44143dbdee9013b62e1dd77fd2a719f378273e",
+      "bytes": 11527,
+      "sha256": "caa628e598d4cb7b45ea0a4a95f3ca8c73d52516da96977583783122c71849e9"
+    },
+    {
+      "path": "src/file_encryption/key_export.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/file_encryption/key_export.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d2ba1286a656cb599636bd8582de8db2ad7bb720",
+      "bytes": 12804,
+      "sha256": "f72dd6421ba730066510c3a18bb818ac96c4843e11a2cc42ceae78777b5ea9b0"
+    },
+    {
+      "path": "src/file_encryption/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/file_encryption/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "dfdf9206e9b37e1c3b1d28761ea0e8d773df1709",
+      "bytes": 231,
+      "sha256": "e49502b3c6d5b422eda4380abcc7e71b7295505b43f47eb352ce503680345bd8"
+    },
+    {
+      "path": "src/gossiping/machine.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/gossiping/machine.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "71bdc3171beac1afc14d56220a8bcde390309ba5",
+      "bytes": 97161,
+      "sha256": "f84d3fe720c7826c9df6164558fdde75961a42bc914afca97cf73eb9be4a4b92"
+    },
+    {
+      "path": "src/gossiping/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/gossiping/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "6daab320412066ae79e13aa7e622b94bb762f286",
+      "bytes": 12423,
+      "sha256": "19b6ff78dfd259bece954d3f408a8e1aaf25ef420a34883074202fa105d92b54"
+    },
+    {
+      "path": "src/identities/device.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/identities/device.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "de773acb0006694f7a84e18547963aabcb7a1cba",
+      "bytes": 50879,
+      "sha256": "3513ac4d97a00256bbede07dfac224225b15d69d62db7433fe3a97337d39cb85"
+    },
+    {
+      "path": "src/identities/manager.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/identities/manager.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "425b5cecffcecbb1c8f353a7e9fa194dfef4465d",
+      "bytes": 115377,
+      "sha256": "c0b5c5eaea7cd11bdfdd162f8616f2397b3b64a9e3ea75965f638bca2d47470f"
+    },
+    {
+      "path": "src/identities/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/identities/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "abe706cfeefa93a1b6f799fe9661133c4aced9e0",
+      "bytes": 2767,
+      "sha256": "e9053ecb75c71c38c4b379740be465e67aa8385a6c808a78c4a00215a0a1d4c6"
+    },
+    {
+      "path": "src/identities/room_identity_state.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/identities/room_identity_state.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "5af1fa3ef07423ca2a99cc9606f64f9cf4497743",
+      "bytes": 44633,
+      "sha256": "dde09393738bfef02d259b14f3b005df58b06a90b605b9a0fd84c567defd52c5"
+    },
+    {
+      "path": "src/identities/user.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/identities/user.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d2e185d9b6e191d949a5de6fb49689661fdbbec0",
+      "bytes": 94294,
+      "sha256": "a1a06efffc5034ba3434d9d753d116a5402583715da9a3f8259d2cc01271c3f5"
+    },
+    {
+      "path": "src/lib.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/lib.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "c19bef213dc89b8a0476a1c9bd3e8e013c140f78",
+      "bytes": 44289,
+      "sha256": "fbdac7c7ff6956957b14f20e5610db665b85476c0137120bd66c6d19c61c713a"
+    },
+    {
+      "path": "src/machine/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "8fe7e2367440fd33a559074c9f83dd9ad29fb254",
+      "bytes": 136223,
+      "sha256": "e155d7f55951f4ddfeb04ce9c622b9a7993298c4e44c6925057160690aa55d09"
+    },
+    {
+      "path": "src/machine/test_helpers.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/test_helpers.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "b21ee98298776ef390ffbd62332a3271bc7adc4d",
+      "bytes": 17685,
+      "sha256": "629ee1f923473398bb710de798372711fb89528ca8883192c0dda5339d3373c4"
+    },
+    {
+      "path": "src/machine/tests/decryption_verification_state.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/decryption_verification_state.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "3f3a803bea8e5167bfdbfb07aee4bb2af46dfe07",
+      "bytes": 25568,
+      "sha256": "2a39d30c13bb9341fbf0ec85eba6b1d0a34410a2fce8261b713189e25a7e1788"
+    },
+    {
+      "path": "src/machine/tests/interactive_verification.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/interactive_verification.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "9dca7dba4dbecccef169c170c814cbe96704fcbe",
+      "bytes": 10164,
+      "sha256": "26cceb1369efa8e6b6ef04da727e59da004c7afeb44d058477b59e6b4bcac066"
+    },
+    {
+      "path": "src/machine/tests/megolm_sender_data.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/megolm_sender_data.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "3522a031931c959933d8a20de3b98d00c1dbf920",
+      "bytes": 18698,
+      "sha256": "54b47da621500cff0b1367a8b39225c0c677dc6ebcd286b50a5b9550ededc18f"
+    },
+    {
+      "path": "src/machine/tests/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "a9bc9a2ac5dc02d6a83b3742db5599594dac0414",
+      "bytes": 80889,
+      "sha256": "7261893626baeb8a85c4178d32377832c98e3d36f150634d2e36f723b9a652c7"
+    },
+    {
+      "path": "src/machine/tests/olm_encryption.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/olm_encryption.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "a81588df7aeb113b775d03774cb002ffc6230b77",
+      "bytes": 10728,
+      "sha256": "5e6d7e62cec118e4c852423a51d687b42ae0f486a5c8869dcd249ad4efddb5f5"
+    },
+    {
+      "path": "src/machine/tests/room_settings.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/room_settings.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "3b569169d13d35003d0b9f62d92bd0dac8ca467e",
+      "bytes": 3222,
+      "sha256": "1cc3c8383fa9f6cf760a9a3fb2defa1d8dc98fd0893190f2788f086a7962d098"
+    },
+    {
+      "path": "src/machine/tests/send_encrypted_to_device.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/send_encrypted_to_device.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "c3e68c0c3d82843271fd12b8a43105c7832fea69",
+      "bytes": 31771,
+      "sha256": "c1a4417695fa345c5be7785840d2b81702d860d75db2acda8e6ccb4f22d43607"
+    },
+    {
+      "path": "src/machine/tests/snapshots/processed_to_device_variants-2.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/snapshots/processed_to_device_variants-2.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "7ae52e4175f05dbebbc08dcb71bdb8053c542703",
+      "bytes": 342,
+      "sha256": "25e2665777734e0d5eaa48fb00c0b457eebe768c9c9a2f1c1d82b5fbb2f31466"
+    },
+    {
+      "path": "src/machine/tests/snapshots/processed_to_device_variants-3.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/snapshots/processed_to_device_variants-3.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "258800d121ff0308ebe14563e12e4707786d6494",
+      "bytes": 316,
+      "sha256": "39298d322ee950897ee2d1535df3d84870ffa250ab2b246a24dd9498c1fc1f85"
+    },
+    {
+      "path": "src/machine/tests/snapshots/processed_to_device_variants-4.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/snapshots/processed_to_device_variants-4.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d30232c99d7ef1a37b8fa165b863ec1fa3066a42",
+      "bytes": 452,
+      "sha256": "e19779fa1e1bdd67fbbd6cb1741ceb9eda8cbbd02443fe8dc9b7f2ae00b29144"
+    },
+    {
+      "path": "src/machine/tests/snapshots/processed_to_device_variants.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/machine/tests/snapshots/processed_to_device_variants.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "b0078b4a56ca712cc08d9f61633143f138c746dc",
+      "bytes": 751,
+      "sha256": "166f7077d916932c71a296c3f903d5a3e7cd7a1b01b03727cc49d9e0c710bfcc"
+    },
+    {
+      "path": "src/olm/account.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/account.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "50b19f2dbfb021a47ff61d47c4257ea50682fd0d",
+      "bytes": 84851,
+      "sha256": "6ba674bc529ac5bed722ac8e99730bb2de08a301ee867ba6a47bb3ab53a7d511"
+    },
+    {
+      "path": "src/olm/group_sessions/forwarder_data.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/forwarder_data.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "ccfcaeb03e48578df2c4cad910350773ebbf60a1",
+      "bytes": 6279,
+      "sha256": "423975f12ebb697a3803586148731e650574b15817115275ba4f864f4b8c8e53"
+    },
+    {
+      "path": "src/olm/group_sessions/inbound.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/inbound.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "21eac89a0d4e17388c2fa135163878c829c830d6",
+      "bytes": 61949,
+      "sha256": "729cb59f3c672e194cf45639bf1525a9c3e720ed51fcd7cc1baef81cc091722a"
+    },
+    {
+      "path": "src/olm/group_sessions/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "22f902aae69d9d93f74844b56ca0a5820e189685",
+      "bytes": 13905,
+      "sha256": "edf045d89333be9c110fa9c47c4b9bbb6d21c10dccbb4db83115c089a114495c"
+    },
+    {
+      "path": "src/olm/group_sessions/outbound.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/outbound.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "31c44fd9b366cc05fa0d9d28952b8240336f2813",
+      "bytes": 43657,
+      "sha256": "49ec48fa0169dba56ac849668582abb37e89c3a373ada06818b22fb0c60196f2"
+    },
+    {
+      "path": "src/olm/group_sessions/sender_data.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/sender_data.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d77982f9af43d64e787faa1f7efff623c663a3b0",
+      "bytes": 34469,
+      "sha256": "8635c267636387b7d89729f795bd2de11facda717f5af2c0fa994e93ec03e715"
+    },
+    {
+      "path": "src/olm/group_sessions/sender_data_finder.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/sender_data_finder.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "ecb00631edc63d8b604e95249dbecd87d7415d89",
+      "bytes": 43676,
+      "sha256": "d4daf550df52dac6bf731b6781b44fdc8f27a80ef66fd720f9356b4a3ead562f"
+    },
+    {
+      "path": "src/olm/group_sessions/snapshots/InboundGroupSession__test_pickle_snapshot__regression.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/snapshots/InboundGroupSession__test_pickle_snapshot__regression.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "3ca8da7da82ec271c170285980bebeeb6bee3c97",
+      "bytes": 679,
+      "sha256": "0331ef018dfce7f74aa7eaccad93b438bc5d0a591d8dfe611c44d33c2f69cd58"
+    },
+    {
+      "path": "src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-2.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-2.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "ffb7eccfa7f86a709d7f0a6c3ee5a69a22af95e6",
+      "bytes": 228,
+      "sha256": "3fb8722d57411c5e41b7043156fe15c98e1bfb10d3369bceadb64d4e1a0fda09"
+    },
+    {
+      "path": "src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-3.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-3.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "e1671d4e2369c2616607a53cce0895bee3ba07f8",
+      "bytes": 938,
+      "sha256": "90f9158ac6e8805ad584a4907ed8f9f2e3e970570470341d1846befdeefb52bb"
+    },
+    {
+      "path": "src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-4.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-4.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d1fb11f19022d1889a88a7bb224534f695d9a378",
+      "bytes": 481,
+      "sha256": "677ab14912f8a9c765ab5bb77cb628bae455ae0d4b7e92ca8b5d56adb5e2c2b5"
+    },
+    {
+      "path": "src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-5.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-5.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "2a737872f75b04e05511c286702a54db4e620877",
+      "bytes": 438,
+      "sha256": "8fa12528319abb06dfb60ed757508e4cb833b45734c057fae44612caed27a7f8"
+    },
+    {
+      "path": "src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-6.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data-6.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "b2d09e4f345b1f484242ff94d2e4496f37cd28a0",
+      "bytes": 434,
+      "sha256": "51fda8a818e9f1b056663850b00ca53ddbafb565f3e3622c1a0fdf68d5caeaa2"
+    },
+    {
+      "path": "src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/snapshots/matrix_sdk_crypto__olm__group_sessions__sender_data__tests__snapshot_sender_data.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "44cf973f6adc51ac523283bc8f4a62f7f122561b",
+      "bytes": 261,
+      "sha256": "df791dd0ea480e46d35ca802117f24cf85c0e3a356204973acd8d456f35f9120"
+    },
+    {
+      "path": "src/olm/group_sessions/snapshots/snapshot_forwarder_data-2.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/snapshots/snapshot_forwarder_data-2.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d4b7b8c815b21c3f2d433292ac2853095a6e7673",
+      "bytes": 440,
+      "sha256": "8f39c1e79c8e87e7a265b10063743dbf047adde0456eb067f4f5e9fbfdaf4ed0"
+    },
+    {
+      "path": "src/olm/group_sessions/snapshots/snapshot_forwarder_data.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/group_sessions/snapshots/snapshot_forwarder_data.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "203aa4c539629d5d79a5ca1720722befdf8d3204",
+      "bytes": 444,
+      "sha256": "40a8abf8a5c2702d07c840841d92c3bf478714e60965b1594a339378735f26ba"
+    },
+    {
+      "path": "src/olm/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "7ee6a2e7539be3d918377383c721cd9a89875703",
+      "bytes": 12170,
+      "sha256": "e0efd71330ce87a0038a736145c60a5484e2d9dbcea53203b302572d151928d8"
+    },
+    {
+      "path": "src/olm/session.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/session.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "13b6773f724157e88d3ad5dffe1611b630e14167",
+      "bytes": 15027,
+      "sha256": "3709191e016a9337ff2091eb10491710bb10acb08e0d8397a98450bd3b006462"
+    },
+    {
+      "path": "src/olm/signing/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/signing/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "ea89cf02b84bc8760ce7ef1e38c89bbe7ea6f824",
+      "bytes": 35044,
+      "sha256": "02313ed2cf0b19b0ac51e503688f936ea5d59c6462fb69f818de5ddd4b86580d"
+    },
+    {
+      "path": "src/olm/signing/pk_signing.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/signing/pk_signing.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "07d0880c52b550308aacde8fe1dfb19bbf794b56",
+      "bytes": 11868,
+      "sha256": "4cded1aa14c9f8c9653b40c7c6e4b6034f6c9f1a2fab4318fb5c3eab12df23a8"
+    },
+    {
+      "path": "src/olm/utility.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/olm/utility.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "e655f74ef782f52ac45239c4d81394d8c63d08d2",
+      "bytes": 8117,
+      "sha256": "16eff314dfda9c1a72be4ba98d1f9571874f6ce2b0a86eb2453df0feb32dfafb"
+    },
+    {
+      "path": "src/secret_storage.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/secret_storage.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "f2c80320d450b5f78051bc8b38c743101426d3fe",
+      "bytes": 36590,
+      "sha256": "40ec17385c62da26db859562d979aac5bcf85dada4e29ff019c9e488aad6f1dd"
+    },
+    {
+      "path": "src/session_manager/group_sessions/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/group_sessions/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "c2715d7672f0b0f0dbd1ec8b80ace9cadacedebd",
+      "bytes": 71626,
+      "sha256": "bd1ebfec8185b4eb60cf12738fa458296186920859e7b35a3f7a14629292b15c"
+    },
+    {
+      "path": "src/session_manager/group_sessions/share_strategy.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/group_sessions/share_strategy.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "84ab071cef3ef27bb6bad5d21425490e06b9c28c",
+      "bytes": 136205,
+      "sha256": "e39def752d60daf8f0e24bbe7992952acab8ef5cc16ce24472c8b6b9faac7503"
+    },
+    {
+      "path": "src/session_manager/group_sessions/snapshots/prepare_machine_with_dehydrated_device_of_verification_violation_user.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/group_sessions/snapshots/prepare_machine_with_dehydrated_device_of_verification_violation_user.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "5eed92a5f5f96bde3acb9c69c4342f134f0cdf9d",
+      "bytes": 2513,
+      "sha256": "a26d642e2cbf88fbc8e88558c2e8a275d205483c23c7e611a4f292961423c3b8"
+    },
+    {
+      "path": "src/session_manager/group_sessions/snapshots/serialize_device_based_strategy.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/group_sessions/snapshots/serialize_device_based_strategy.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "add8ae3d08675cd61baf9359cb03f1037d1480ff",
+      "bytes": 287,
+      "sha256": "10167b1a46278919b580ff3cdcf206be3c4fec05de537328eeaefa0785fb20b4"
+    },
+    {
+      "path": "src/session_manager/group_sessions/snapshots/serialize_strategy_with_encrypted_state.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/group_sessions/snapshots/serialize_strategy_with_encrypted_state.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "7426d7dd4e5ac13fb201428c40232d8539114758",
+      "bytes": 316,
+      "sha256": "8456fa64dbdd637c0dcb934fadb5ba4709b66eb78ec20d39c61d54bb1a0a702c"
+    },
+    {
+      "path": "src/session_manager/group_sessions/snapshots/should_not_share_with_unverified_dehydrated_device.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/group_sessions/snapshots/should_not_share_with_unverified_dehydrated_device.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "7fbb6b8061c4f0b287c1ec0605f85597d4dc9056",
+      "bytes": 2356,
+      "sha256": "5fcdc6df725288c28eb5e5ae8b519f2552cc2100e1747197adb917f9af924b39"
+    },
+    {
+      "path": "src/session_manager/group_sessions/snapshots/should_share_with_verified_dehydrated_device.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/group_sessions/snapshots/should_share_with_verified_dehydrated_device.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "2b54d5200a42f0c4459533ba83257e5f7fdba2be",
+      "bytes": 2513,
+      "sha256": "24b3a64652ff110803af8e9f9e7415cc5ad7bfe9ed6f8d3c9cd60359416f27fc"
+    },
+    {
+      "path": "src/session_manager/group_sessions/snapshots/should_share_with_verified_device_of_pin_violation_user.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/group_sessions/snapshots/should_share_with_verified_device_of_pin_violation_user.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "5eed92a5f5f96bde3acb9c69c4342f134f0cdf9d",
+      "bytes": 2513,
+      "sha256": "a26d642e2cbf88fbc8e88558c2e8a275d205483c23c7e611a4f292961423c3b8"
+    },
+    {
+      "path": "src/session_manager/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "20067e2614d1cdff97d0cc91ad2334073cc7d011",
+      "bytes": 972,
+      "sha256": "d907e9cc3221e366157c14d378d92fa438ba0e76aaa418a8277bfd2427c3f5e0"
+    },
+    {
+      "path": "src/session_manager/sessions.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/session_manager/sessions.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "6865568f4e8b195684da2b2d5e0b5f74440ac02e",
+      "bytes": 40916,
+      "sha256": "8d8502c351887d303037d8c714bf327b727a215b4555d8cb7edc3f76b0743a1a"
+    },
+    {
+      "path": "src/snapshots/matrix_sdk_crypto__test__snapshot_decryption_settings.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/snapshots/matrix_sdk_crypto__test__snapshot_decryption_settings.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "6beabaeac11cd7a682e27e703526ee5fa828729e",
+      "bytes": 205,
+      "sha256": "9d93bed310201eb6069d3c3a0bf53ed0f823813a0fa20562ba42d02e20fdfe75"
+    },
+    {
+      "path": "src/snapshots/matrix_sdk_crypto__test__snapshot_trust_requirement-2.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/snapshots/matrix_sdk_crypto__test__snapshot_trust_requirement-2.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "bf435f10d7d32130cf568d77a70bb5abad9973ad",
+      "bytes": 126,
+      "sha256": "410d4e55978060904c84b5edcb2b6d566630f2d7feb2031783f654beabdded75"
+    },
+    {
+      "path": "src/snapshots/matrix_sdk_crypto__test__snapshot_trust_requirement-3.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/snapshots/matrix_sdk_crypto__test__snapshot_trust_requirement-3.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "ed4cf22019c7af148a1509949083993248f95b02",
+      "bytes": 110,
+      "sha256": "310c3dea9da830572dcfe8d47bab4a4ae6bd6468c2cf7ffad532a737caf407ab"
+    },
+    {
+      "path": "src/snapshots/matrix_sdk_crypto__test__snapshot_trust_requirement.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/snapshots/matrix_sdk_crypto__test__snapshot_trust_requirement.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "1cf676489d3c7ed49dea4a413f6fa80117fd6402",
+      "bytes": 106,
+      "sha256": "cef6aebadbfd4e20e9e566d7843189b4bafd269cdfb012ebcc64cc8fc1b07386"
+    },
+    {
+      "path": "src/store/caches.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/store/caches.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "96bf0244253097d9af7c8ecbd09e1c765d2b31ce",
+      "bytes": 17148,
+      "sha256": "e04ccd5d49dfe36873401d4a8c35d14e6f5f4248566542aaab2b164eee653bc6"
+    },
+    {
+      "path": "src/store/crypto_store_wrapper.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/store/crypto_store_wrapper.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "780b5c09b3c6c9bb14d30c8453a46779cfe7e1c6",
+      "bytes": 18165,
+      "sha256": "56ac26328e4b0c922789eaf5def6f053801d84f427d3b09ed87616135c328b46"
+    },
+    {
+      "path": "src/store/error.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/store/error.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "f663c5cdabd02fb98bd5635f51e66c8de8da02c8",
+      "bytes": 3617,
+      "sha256": "df90f1b74b30989c9809668290031507a6762ff6984e620c0aa3b7814cb2f6c0"
+    },
+    {
+      "path": "src/store/integration_tests.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/store/integration_tests.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "209f2a7c0e017c6106bbfa28bb98eca1ea3710f5",
+      "bytes": 77334,
+      "sha256": "8857ec8352283f42b296ef4433fec8b70dd93d71ace26cd8130ce753747b1043"
+    },
+    {
+      "path": "src/store/memorystore.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/store/memorystore.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "92536e5d26998f3243a87a56d0cade920a0c137c",
+      "bytes": 61887,
+      "sha256": "49a3873dd9a5cacf713b97564ef0537ef19a6f30e31bccca009ea147e08509a2"
+    },
+    {
+      "path": "src/store/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/store/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "860b1690cf0fbf813fcc6e6ef6c2d0dea5c5f798",
+      "bytes": 101307,
+      "sha256": "e42fcd07611c130f1dd6b55d70e8a8bba506f1279a7c9e50bb2dc3e02715e39f"
+    },
+    {
+      "path": "src/store/snapshots/matrix_sdk_crypto__store__tests__build_room_key_bundle.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/store/snapshots/matrix_sdk_crypto__store__tests__build_room_key_bundle.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "73b724d9efd033b2c7a54811b329d8be1a68e609",
+      "bytes": 1478,
+      "sha256": "809bd9144e3ddab3cb7854f14ee38e18a9862a4a9718fb727f7db4b334996c25"
+    },
+    {
+      "path": "src/store/traits.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/store/traits.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "a573c147b78f665e0cd3da98840051a855505f42",
+      "bytes": 27287,
+      "sha256": "40d4fc9c07533240c62800e9c2e4dd026a4ad4f768feb0b1786f79c73711a09d"
+    },
+    {
+      "path": "src/store/types.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/store/types.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "ca22cdb8e833da740bf815477bb3db60ffb835fa",
+      "bytes": 21442,
+      "sha256": "675d4ed37a25538cb2ca7b49b3ffd6d2d01223fe467f27b11bdce869bff4424a"
+    },
+    {
+      "path": "src/types/backup.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/backup.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "97c58201057a44ccf7be6a2a78a6e960281ba9d6",
+      "bytes": 6846,
+      "sha256": "8889461493eb520c2a8f8f5d46ef0e00a6842c7f002c12908b160343d5fbce2a"
+    },
+    {
+      "path": "src/types/cross_signing/common.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/cross_signing/common.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "14a529c42c1f3cb01f8ba7f82e58601b3ed52bcf",
+      "bytes": 6063,
+      "sha256": "cf65d2ff2128e56909c5a80a4dec52dcc431a5df1947e77b8a9be9c50e9df6ac"
+    },
+    {
+      "path": "src/types/cross_signing/master.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/cross_signing/master.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "6779467cb5158bfb438da80b49ee4f674553e4a5",
+      "bytes": 5131,
+      "sha256": "6b5c00dd8c5dbe5914d4441f2c73d049e64562a5f517c0e540122453f8749afd"
+    },
+    {
+      "path": "src/types/cross_signing/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/cross_signing/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "8a9cf8a37cd51057e81fc82fa39fc3b36ea721a0",
+      "bytes": 6612,
+      "sha256": "fa7c1e1735c4ba05cada895ed5c742e616fe75ecd1323c413e9d73f0320996f1"
+    },
+    {
+      "path": "src/types/cross_signing/self_signing.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/cross_signing/self_signing.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "c6ee02418aa670e883fb85c8a1c00b10314ae6cd",
+      "bytes": 3180,
+      "sha256": "1b492e81432131c44a43ba7d9b1c9fe8c4c92802d5ffb8d6ae9846bdac4bdcea"
+    },
+    {
+      "path": "src/types/cross_signing/user_signing.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/cross_signing/user_signing.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "70dcddc657cca2c65f2e23086114bdf1725d7d84",
+      "bytes": 2967,
+      "sha256": "67b8f479b586266ea95a3138181c6e353cd037939ceb0184225772dc4b8e4512"
+    },
+    {
+      "path": "src/types/device_keys.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/device_keys.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "654eb066adf9f3caf571cde3699991a6618231f4",
+      "bytes": 12833,
+      "sha256": "5e188eb34a329b3c109082cd04151703582dccc792480c0ef3c65f6f1533cb82"
+    },
+    {
+      "path": "src/types/events/dummy.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/dummy.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "a298a98f29d91d628a99c8ac60d6abd09c099ebd",
+      "bytes": 2029,
+      "sha256": "60ebb620a48d3a16539c807820d42dbb8d951ccd95c9311240a428b2661def39"
+    },
+    {
+      "path": "src/types/events/forwarded_room_key.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/forwarded_room_key.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "898f13392c4d01875631ad04bc967dd8ea38cfd6",
+      "bytes": 10313,
+      "sha256": "718349f5a96f2190e61dc4175d006a72d2afaee96d9543817aab93a652da5b11"
+    },
+    {
+      "path": "src/types/events/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "abdae5832c68f788abfd5748d0e3932fb5551e70",
+      "bytes": 2041,
+      "sha256": "380b5d901c83de1f58236ca01f074239eb1c7a846283ddbd9240bba09ecfc76e"
+    },
+    {
+      "path": "src/types/events/olm_v1.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/olm_v1.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "c747c14af65d7c7601b18318cbe7cd4a1862453f",
+      "bytes": 28522,
+      "sha256": "852b409f12ac63d5c1f7833d035c046179487b2dfac74c17aa13c24f89536ba9"
+    },
+    {
+      "path": "src/types/events/room/encrypted.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/room/encrypted.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "c88261184e1a069088669d308231afa7240a09b9",
+      "bytes": 20317,
+      "sha256": "5d305270ca55f06c14d1119ac131b563e3d3e4aadcc59a829eb38755167a98e4"
+    },
+    {
+      "path": "src/types/events/room/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/room/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "582bbfe7f9e72f75c7eb2f6e1d13fdcea6035e9a",
+      "bytes": 2964,
+      "sha256": "c0c08b652e9a5550673f1bf1c8c29145060bb4eda76976fac3a7224bec9c4930"
+    },
+    {
+      "path": "src/types/events/room_key.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/room_key.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "fd704365fce3e64dda346c119be13c4fb1f7fdc3",
+      "bytes": 10397,
+      "sha256": "0f9344f3d2ae6187931caf0b8a77b78b959e78702876eca2bde66522814bc297"
+    },
+    {
+      "path": "src/types/events/room_key_bundle.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/room_key_bundle.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "dc69b6ec86447ea7251c810fd652d966af5ba02b",
+      "bytes": 1543,
+      "sha256": "21439a76c6d1672f3c424ca8d455062f7d4acff04c067f0853cd9e0e4a129028"
+    },
+    {
+      "path": "src/types/events/room_key_request.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/room_key_request.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "eeec434f586bd7b0e6d340118492464ed319cf81",
+      "bytes": 14244,
+      "sha256": "9ec938d3b55959e0b46773dbdc95901ac4c73ab350f66eb79664673459c89ced"
+    },
+    {
+      "path": "src/types/events/room_key_withheld.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/room_key_withheld.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "027d8529431b7e969571a5cb5493cebd73173b38",
+      "bytes": 27834,
+      "sha256": "bbd4891cfd1581f87e26597dce5ab2c619bdaa775d78807d26f196b40eeb42ce"
+    },
+    {
+      "path": "src/types/events/secret_push.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/secret_push.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "e47480ed827b79103cdff1457648b7504526171c",
+      "bytes": 3289,
+      "sha256": "c1a8d6445e76a8a28fd1935d993e2340ad9bc6f5d81f04f4a1aec9eccf17246b"
+    },
+    {
+      "path": "src/types/events/secret_send.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/secret_send.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "7fc7f0e7420c56a8ad84e5ffa28e7055f89bce53",
+      "bytes": 3494,
+      "sha256": "b0218bf091da853f2aca6db39356649b1df2f2ef5c4383463ea46412b8a2753f"
+    },
+    {
+      "path": "src/types/events/snapshots/decrypted_to_device_event_snapshot.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/snapshots/decrypted_to_device_event_snapshot.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "13a660618e74f372f06bb4306c03ff62270ec3b5",
+      "bytes": 875,
+      "sha256": "f3fa443195a420122fa754f46a40bfdf4188ed9d89c0732fd68fc75d12ba31bb"
+    },
+    {
+      "path": "src/types/events/snapshots/sender_device_keys_are_deserialized.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/snapshots/sender_device_keys_are_deserialized.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "5ab44a23c52f7b0322e6ae7d1215df5668488087",
+      "bytes": 1457,
+      "sha256": "5a9e6de9666b1515700a6635a42a8d39731c3627838db58ac6425d38c3bc17a4"
+    },
+    {
+      "path": "src/types/events/to_device.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/to_device.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "376058e0831b3599b14e075494a7b996fbdde028",
+      "bytes": 23208,
+      "sha256": "ecd8420ef20c13638535ba0617055b93329d529492a76e20ffc16ca33fe06ec3"
+    },
+    {
+      "path": "src/types/events/utd_cause.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/events/utd_cause.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "603d86a7376d5b9e011a97683c5869793c8d25fe",
+      "bytes": 23342,
+      "sha256": "c95a1b916ad66ba98bcc9cf29b6d08efe5c89f8474898557eed16c10a7d27a2f"
+    },
+    {
+      "path": "src/types/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "1a677da9404b72e6d04fb479098f5358e9fdeea2",
+      "bytes": 14540,
+      "sha256": "35ab863954ebb67c9b20d21b78899021a9884906755410b9f15058fcbf7b8292"
+    },
+    {
+      "path": "src/types/one_time_keys.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/one_time_keys.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "829f890aff9ea37f95075b0f08695dde5e937eb6",
+      "bytes": 6614,
+      "sha256": "cd5871140eded48827ef4e6e817f4eee9d4ccd65b6a966b1d88b7706548a4e15"
+    },
+    {
+      "path": "src/types/qr_login/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/qr_login/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "3cda5d1c9f58678377792f8e687e58fabf55902d",
+      "bytes": 10003,
+      "sha256": "d559eb95dfc72249adc9b6af6d9dd944b4f99e5263bcd07b94ea0188adfa6428"
+    },
+    {
+      "path": "src/types/qr_login/msc_4108.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/qr_login/msc_4108.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "854e0a53a3a9ce6dba6b9603b29cdcce0c827c18",
+      "bytes": 15284,
+      "sha256": "1afff09ba2e977ecb43b13d6d6ffc6950e043b3d86d6ab88fdec0060c77bff97"
+    },
+    {
+      "path": "src/types/qr_login/msc_4388.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/qr_login/msc_4388.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "b417ba1ddd9032f68f42b8907e81a2d04a14e644",
+      "bytes": 13188,
+      "sha256": "2862cc0bf0b78d2dcfcfb8d6fb2659af85e0650c20073f500f3303bbde032e65"
+    },
+    {
+      "path": "src/types/requests/enums.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/requests/enums.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d6b589b1552be39a74ffe339214a084471cfd753",
+      "bytes": 7205,
+      "sha256": "5c48c1e5cd6d3dba5aff05242ceeca647f6641d78d3ff581ea45178c508b4317"
+    },
+    {
+      "path": "src/types/requests/keys_backup.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/requests/keys_backup.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "ca4678367e7d780ec6f3ececf2dab316dde698a0",
+      "bytes": 1078,
+      "sha256": "fcfb5d3c85ba57e806fd44e95fd18a969b0dfb355c8079e61db97619d70505cc"
+    },
+    {
+      "path": "src/types/requests/keys_query.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/requests/keys_query.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "71c79a9a2133c183791b826ee6423ca26401e3d5",
+      "bytes": 1420,
+      "sha256": "61085f1ce7b03692922efe00579b4354526421c0b7f0f92c498bff8e34422531"
+    },
+    {
+      "path": "src/types/requests/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/requests/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "11d48156d9f0e8fc4befb745e5e4363bfbeb0743",
+      "bytes": 1652,
+      "sha256": "19807caa939f8ebecb2d1e4a3029b8e85c765b33f1d320e9cff4e5b77f496675"
+    },
+    {
+      "path": "src/types/requests/room_message.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/requests/room_message.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d0e69c9aa2aefe4c4b157e1424f72bb19fec0eb6",
+      "bytes": 1228,
+      "sha256": "c3a6497cb5e08e6c018f265a7601956a75a8e6528716dce31502f64545c1e1d7"
+    },
+    {
+      "path": "src/types/requests/signing_keys.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/requests/signing_keys.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "f1b5ab8b1bfcc79065398da3580a4dfb98e264df",
+      "bytes": 1389,
+      "sha256": "92230ad3e63ab99a12f4c23c4a10dbab5e1ba399b01d28fee56d116b2ff11263"
+    },
+    {
+      "path": "src/types/requests/to_device.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/requests/to_device.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "c3712ff06de1569acc75dd38b05f62327c5500ff",
+      "bytes": 5123,
+      "sha256": "a66bc61ebb6f62354ea56da5fc4c0b596c068f3736697d0f20e0fe83f080ddb8"
+    },
+    {
+      "path": "src/types/requests/verification.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/requests/verification.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "7c9db88e11468e595e871100999117322b4f0526",
+      "bytes": 1696,
+      "sha256": "d15439572344e1bf8ef7a57bb1859404783b0cb06f133ca439636e7764f19883"
+    },
+    {
+      "path": "src/types/room_history.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/room_history.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d3fd6ae4155ad5a3c17cf00ccfd21c602f2ed001",
+      "bytes": 5627,
+      "sha256": "119eb329a60080ba96d0d259a32981069840e2aafbe800927c05dc0ad59bc1ad"
+    },
+    {
+      "path": "src/types/signatures/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/signatures/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "a255a351dbfb1c968d9f5205069db51fe72d100a",
+      "bytes": 6768,
+      "sha256": "e7ac10a32772fd0094fa50f9ee51970bcf3dc35ec852af6b38c79b91386aec30"
+    },
+    {
+      "path": "src/types/signatures/signature.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/signatures/signature.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "9a6346905b8f0650e9673904fc8b3099b9f69d96",
+      "bytes": 4676,
+      "sha256": "8f707d83507c5dc04833c8c407946b8edd751f915659ffbf3886accbb3fedced"
+    },
+    {
+      "path": "src/types/signatures/snapshots/snapshot_signatures.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/signatures/snapshots/snapshot_signatures.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "59c91fea0f029a21199073e9386fba91066df3a0",
+      "bytes": 437,
+      "sha256": "44771578e89a57d76f6dc1a2501b818f93519b040becc99437b7644c98605530"
+    },
+    {
+      "path": "src/types/signatures/x509_signature.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/types/signatures/x509_signature.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "b9761fea5d3846cd341946f8e715623d2268fec7",
+      "bytes": 3431,
+      "sha256": "42597fcfa85c866876a6af54c71a72cf3c8b70a1589de3ac671cd3d7ad9f92b2"
+    },
+    {
+      "path": "src/types/snapshots/matrix_sdk_crypto__types__backup__tests__snapshot_room_key_backup_info-2.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/snapshots/matrix_sdk_crypto__types__backup__tests__snapshot_room_key_backup_info-2.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "e83f1a24e0a092fe9b1df4136bdcc15811a05f8a",
+      "bytes": 152,
+      "sha256": "0672b144439cb85cb0641ea664c06b34d593bb3bb33f292cc5584cc0f9965df1"
+    },
+    {
+      "path": "src/types/snapshots/matrix_sdk_crypto__types__backup__tests__snapshot_room_key_backup_info.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/snapshots/matrix_sdk_crypto__types__backup__tests__snapshot_room_key_backup_info.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "f8e7084d0300941abab45b945be4bfec2b6d49f5",
+      "bytes": 421,
+      "sha256": "50fb5b74ae28aae24ffafd8c4cae466bf49659b47b8236daa48952a2a39b736d"
+    },
+    {
+      "path": "src/types/snapshots/matrix_sdk_crypto__types__room_history__tests__historic_room_key_debug.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/snapshots/matrix_sdk_crypto__types__room_history__tests__historic_room_key_debug.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "f676403cd50ba972214be491342605539c3b1334",
+      "bytes": 456,
+      "sha256": "ebe55ba84f8d67311e7bffdb9390764c3ac8a80692f79be979befad3ff8cb06e"
+    },
+    {
+      "path": "src/types/snapshots/matrix_sdk_crypto__types__test__snapshot_backup_decryption_key-2.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/snapshots/matrix_sdk_crypto__types__test__snapshot_backup_decryption_key-2.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "f144f74d23fd53eab435c735cb698b4ad5c563e1",
+      "bytes": 119,
+      "sha256": "cef87ac7d071216c262eead113be04ca1bd2879269ec039c78bf3fd04c59cfbc"
+    },
+    {
+      "path": "src/types/snapshots/matrix_sdk_crypto__types__test__snapshot_backup_decryption_key.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/snapshots/matrix_sdk_crypto__types__test__snapshot_backup_decryption_key.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "3e84e7de8301db5c5da32c8006b1660d7fa918d9",
+      "bytes": 285,
+      "sha256": "6e910d195fc797b72d7fa2ff165cf187991bde94217a43609172abf6e8ced8a6"
+    },
+    {
+      "path": "src/types/snapshots/matrix_sdk_crypto__types__test__snapshot_secret_bundle-2.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/snapshots/matrix_sdk_crypto__types__test__snapshot_secret_bundle-2.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "b4d49cdbd52b7f2a04ed32ad0653d7e7b314e1c4",
+      "bytes": 313,
+      "sha256": "20cd8951cfdd34071a4d1493cca002f7cb54e4ec6782b5cad248690912e375d8"
+    },
+    {
+      "path": "src/types/snapshots/matrix_sdk_crypto__types__test__snapshot_secret_bundle.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/types/snapshots/matrix_sdk_crypto__types__test__snapshot_secret_bundle.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "20a6b23772ede076a8c735b6510ddbdafc19fd57",
+      "bytes": 460,
+      "sha256": "8367eaa1602fe6b01208e9dc79ae7763f68be117e18d820f4bb07b32614b9ab1"
+    },
+    {
+      "path": "src/utilities.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/utilities.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "07e7bda98c4b77012c769a0f33d9a2672a92311a",
+      "bytes": 3156,
+      "sha256": "0bfa51037c6c97c32c75c286ce1665e5804d3bad8f156c4fb0d8575bafbe68e1"
+    },
+    {
+      "path": "src/verification/cache.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/cache.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "9802b8e4627297ac5927c4a4b7066dc14a7e8103",
+      "bytes": 9454,
+      "sha256": "f0df5abfeb2d1ddea891a6b01fcd14be19d40320a1d45c52ad58fc4959f60652"
+    },
+    {
+      "path": "src/verification/event_enums.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/event_enums.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "0d120cb5f9caa5ab48389911b420f6302a6ea397",
+      "bytes": 27373,
+      "sha256": "f33db34646f7e05b03a9447b0da1c88d79ce0d7f1941481753e0c9352c17e70d"
+    },
+    {
+      "path": "src/verification/machine.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/machine.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "7ff9754eaa7f7b3f7ae192f9dd4a429664ac5562",
+      "bytes": 31382,
+      "sha256": "69c83a7af77bbd810f91e883aca9e22f431fa2c3851eed497254ad090463daf9"
+    },
+    {
+      "path": "src/verification/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "73b19e9b15f3b8c0fcc456ea285901387f5af910",
+      "bytes": 31744,
+      "sha256": "6404ad9976a3eecc99ef83ee2fcad790f787adf83ceb94bb73522e0394eda266"
+    },
+    {
+      "path": "src/verification/qrcode.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/qrcode.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "13f37925edbde720110a947a9a45d56770511503",
+      "bytes": 39850,
+      "sha256": "823ad729bd215f9ad84f0d3448e068970b9935fb5f5cd857e5abfdcd9e73ceef"
+    },
+    {
+      "path": "src/verification/requests.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/requests.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "3703da3d630733ef9981555b1ce4217cddd8263f",
+      "bytes": 80453,
+      "sha256": "2e473b61f96fcea282ca5a5d760e39d1009e2c1765878459986f6435648ebee0"
+    },
+    {
+      "path": "src/verification/sas/helpers.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/sas/helpers.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "e0d8b829896613438fa63c9b2a14023834c4a235",
+      "bytes": 19005,
+      "sha256": "21b4fc5468ea5527c2cd596d3aeebf9e9bdb70fb847e040cdafb3d717c24a029"
+    },
+    {
+      "path": "src/verification/sas/inner_sas.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/sas/inner_sas.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "37bfb70a17ea48c1a4ec4d3f290e142eff135557",
+      "bytes": 17688,
+      "sha256": "8fd88f243eb8871790bb014d7446c193fc78bd54c0f9f6164ca1728414319e4e"
+    },
+    {
+      "path": "src/verification/sas/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/sas/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "6188e463d023c7d60754b7e5a56fad601017823e",
+      "bytes": 39211,
+      "sha256": "f5dad49c358fc263de7b9a631904cb2d61bac79bb37cf3f7d9193ca43c534364"
+    },
+    {
+      "path": "src/verification/sas/sas_state.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/verification/sas/sas_state.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d95e98a42b5c1ade86e3490c1e441b869d1969c5",
+      "bytes": 65545,
+      "sha256": "ffc0181cffc469268492da5d7a5d7aa364c74a5cbab09b5c953b1ec35a7458f9"
+    },
+    {
+      "path": "src/x509/errors.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/x509/errors.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "8d35191f406c09b4ffe3091edd4b1ab8d8e2ce17",
+      "bytes": 9436,
+      "sha256": "bf541bbed9d5e3d7271be540e460144f68621c4de2107c64b4e30917d09d5bd0"
+    },
+    {
+      "path": "src/x509/mod.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/x509/mod.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "e7466f887ac56be57ddcc26451cdad9d147a819b",
+      "bytes": 16418,
+      "sha256": "e279198c6d5dbb835221170881cdeb038fb63254ecafef3e7032e9cb77f3cfe2"
+    },
+    {
+      "path": "src/x509/raw_x509_signature.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/x509/raw_x509_signature.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "59fd24f6b0054f8abb27ac80ae45856ec2e21c2a",
+      "bytes": 20860,
+      "sha256": "83d73d259b152f3b2f833be524b28b39774204f6a5b11f278fc6269b9d42463c"
+    },
+    {
+      "path": "src/x509/rust_raw_x509_signer.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/x509/rust_raw_x509_signer.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "9ea47cc3e5bd73dc8c44f877619a9861c18619fb",
+      "bytes": 12020,
+      "sha256": "6eb565bf8ce0521d96cde07b4a69dfcba085639280a0a49c3773a1950618eb6a"
+    },
+    {
+      "path": "src/x509/rust_raw_x509_verifier.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/x509/rust_raw_x509_verifier.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "7cbdf456e2ca9462d5321a9a608e37abe950eec8",
+      "bytes": 7141,
+      "sha256": "234171313425133294ed5664d51d43a493dec86e3b89c4149e5f070a19e99393"
+    },
+    {
+      "path": "src/x509/snapshots/matrix_sdk_crypto__x509__raw_x509_signature__test__sig_to_raw.snap",
+      "original_path": "crates/matrix-sdk-crypto/src/x509/snapshots/matrix_sdk_crypto__x509__raw_x509_signature__test__sig_to_raw.snap",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "133c5cca1989d3b5e5d026852df9c8fb005849f1",
+      "bytes": 39647,
+      "sha256": "dd50d23610960d33312de375664b23277e4cf1d97d83a4757b61939892476ac8"
+    },
+    {
+      "path": "src/x509/test_cms.pem",
+      "original_path": "crates/matrix-sdk-crypto/src/x509/test_cms.pem",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "99ad59e6876e57e0ebda9fe90b9d6bf6850ff477",
+      "bytes": 3975,
+      "sha256": "71d5660af5f717a7708e4fab4f12c16606707d65c16d829583fa9fb65439f757"
+    },
+    {
+      "path": "src/x509/x509_signer.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/x509/x509_signer.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "94968da3c735b9ae45464441f4f2865a24b2163b",
+      "bytes": 16262,
+      "sha256": "5dcf51d727fb9065f7cd9bd8b3545ff7c4264503f3815aff02943ae059eaf1eb"
+    },
+    {
+      "path": "src/x509/x509_verify.rs",
+      "original_path": "crates/matrix-sdk-crypto/src/x509/x509_verify.rs",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "2f029d2c2ccea6ab4eccf50a7febd0cc589c4550",
+      "bytes": 19267,
+      "sha256": "16adfc1fe1411f0b446aab0ddae267ffa2c63e4507663e8e9e38f21bb8cbdca8"
+    },
+    {
+      "path": "uniffi.toml",
+      "original_path": "crates/matrix-sdk-crypto/uniffi.toml",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "78c3b3620be59b28294a67a49191f7bb84d586dc",
+      "bytes": 41,
+      "sha256": "f7eebf1967c0f24783a1c8e31b2a77d1975a55203261f336629d5323c0703cf3"
+    }
+  ],
+  "external_context": {
+    "context": [
+      {
+        "path": ".cargo/mermaid.html",
+        "bytes": 440,
+        "sha256": "c5100b33b9943979e893294fd5b71ed7c33816981b907d6f0e9537b50bcda813",
+        "blob": "d81fc99efab9b06d2dedb48ea02eb76a3ce7e87f"
+      },
+      {
+        "path": "benchmarks/benches/crypto_bench/keys_query.json",
+        "bytes": 74816,
+        "sha256": "7406244f3d19a5e33a2fba34f0a472077940b6f8efd134b437a1f5967fdd84f0",
+        "blob": "048f7eb8f63fd1c8208bc7bdea0bffdef5aa43df"
+      },
+      {
+        "path": "benchmarks/benches/crypto_bench/keys_claim.json",
+        "bytes": 39855,
+        "sha256": "d3e6e54bc78a1022feb82196f4d54a553582bcca2e55e79508ab65fe2afde34b",
+        "blob": "58aa4669fd4d15c6cc6052ea9863b0d3c6225417"
+      }
+    ],
+    "source_references": [
+      {
+        "path": "src/lib.rs",
+        "line": 16,
+        "source": "#![doc = include_str!(\"../README.md\")]"
+      },
+      {
+        "path": "src/lib.rs",
+        "line": 167,
+        "source": "#[cfg_attr(doc, doc = include_str!(\"../.cargo/mermaid.html\"))]"
+      },
+      {
+        "path": "src/session_manager/group_sessions/mod.rs",
+        "line": 1136,
+        "source": "let data = include_bytes!(\"../../../../../benchmarks/benches/crypto_bench/keys_query.json\");"
+      },
+      {
+        "path": "src/session_manager/group_sessions/mod.rs",
+        "line": 1195,
+        "source": "let data = include_bytes!(\"../../../../../benchmarks/benches/crypto_bench/keys_claim.json\");"
+      },
+      {
+        "path": "src/x509/raw_x509_signature.rs",
+        "line": 492,
+        "source": "const SIG: &str = include_str!(\"test_cms.pem\");"
+      },
+      {
+        "path": "src/x509/raw_x509_signature.rs",
+        "line": 503,
+        "source": "const SIG: &str = include_str!(\"test_cms.pem\");"
+      }
+    ],
+    "build_rs_present": false,
+    "original_docs_symlink": {
+      "path": ".cargo/mermaid.html",
+      "mode": "120000",
+      "target_bytes": "../../../.cargo/mermaid.html",
+      "target_source": ".cargo/mermaid.html",
+      "handling_proposal": "Preserve original link bytes/mode in inventory; vendor a regular file containing exact pinned target bytes and document the one mode/materialization change. Do not create a link escaping the vendored package."
+    },
+    "test_fixture_path_proposal": "Preserve both original external benchmark JSON bytes in explicit source context. Select exact root paths or an explicitly reviewed two include-path correction during source preparation; do not remove fixture tests."
+  },
+  "upstream_root_license_sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+  "original_manifest_sha256": "f130a200b584003dd5dc7e89ee0b22242578db469f151336ec022ba0ca6480cf",
+  "source_only_preparation": true,
+  "publication_or_execution_admitted": false
+}
