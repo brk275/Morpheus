@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 # Keep vendored library development feature sets outside the application workspace.
-exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto", "vendor/winit", "vendor/notify-rust", "vendor/mac-notification-sys", "vendor/tauri-winrt-notification", "vendor/i-slint-backend-winit"]
+exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto", "vendor/winit", "vendor/notify-rust", "vendor/mac-notification-sys", "vendor/tauri-winrt-notification", "vendor/i-slint-backend-winit", "vendor/matrix-rtc-call-sdk"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
@@ -64,6 +64,8 @@ nokhwa = { path = "vendor/nokhwa" }
 nokhwa-bindings-macos = { path = "vendor/nokhwa-bindings-macos" }
 
 [patch."https://github.com/element-hq/matrix-rust-rtc"]
+# Retain the original bounded attachment stream for the first facade subscriber.
+matrix-rtc-call-sdk = { path = "vendor/matrix-rtc-call-sdk" }
 # Validate every local/remote focus before exchanging Matrix OpenID credentials.
 matrix-rtc-livekit = { path = "vendor/matrix-rtc-livekit" }
 # Renew encrypted call membership for a newly observed peer using normal room sends.

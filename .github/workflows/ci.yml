@@ -466,6 +466,18 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          rtc_retained_event_tests=(
+            held_events::tests::buffered_events_reach_one_first_subscriber_and_later_subscribers_start_fresh
+            held_events::tests::retained_receiver_preserves_original_lag_instead_of_resubscribing
+            held_events::tests::separate_calls_keep_their_own_receiver_and_drop_unclaimed_history
+          )
+          cargo test --locked -p morpheus-app --features native-calls --test rtc_retained_events -- --list > "$RUNNER_TEMP/morpheus-rtc-retained-event-tests.txt"
+          for rtc_retained_event_test in "${rtc_retained_event_tests[@]}"; do
+            test "$(grep -Fxc -- "$rtc_retained_event_test: test" "$RUNNER_TEMP/morpheus-rtc-retained-event-tests.txt")" = 1
+            cargo test --locked -p morpheus-app --features native-calls --test rtc_retained_events "$rtc_retained_event_test" -- --exact | tee "$RUNNER_TEMP/morpheus-rtc-retained-event-result.txt"
+            test "$(grep -Fxc -- "test $rtc_retained_event_test ... ok" "$RUNNER_TEMP/morpheus-rtc-retained-event-result.txt")" = 1
+            test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-rtc-retained-event-result.txt")" = 1
+          done
           gl_config_tests=(
             config_preference::tests::known_transparency_outranks_samples_in_both_native_orders
             config_preference::tests::unknown_opaque_fallbacks_and_sample_ties_preserve_order
