@@ -2242,14 +2242,18 @@ impl ConfigStore {
     /// keep the last valid `Config` until a later valid edit arrives.
     pub fn watch(&self, interval: Duration) -> Receiver<Result<Config, ConfigError>> {
         let (sender, receiver) = mpsc::channel();
-        let path = self.path.clone();
+        let store = self.clone();
         thread::spawn(move || {
             let mut last_raw: Option<Result<String, InputError>> = None;
             loop {
                 thread::sleep(interval);
                 // A missing file is not reported here; any other unreadable,
                 // oversized or special file reports once per change.
-                let raw = read_bounded(&path, MAX_CONFIG_BYTES);
+                let Some(raw) =
+                    store.read_while_idle(|| read_bounded(store.path(), MAX_CONFIG_BYTES))
+                else {
+                    continue;
+                };
                 if raw == Err(InputError::Missing) || last_raw.as_ref() == Some(&raw) {
                     continue;
                 }
@@ -2288,6 +2292,14 @@ impl ConfigStore {
         ((config_raw, theme_raw), result)
     }
 
+    /// Keep a whole bounded config/theme sample outside an admitted Morpheus
+    /// publication. No signature is remembered when the path claim is busy.
+    fn sample_with_theme_while_idle(
+        &self,
+    ) -> Option<(WatchSignature, Result<LoadedConfig, ConfigError>)> {
+        self.read_while_idle(|| self.sample_with_theme(read_bounded(self.path(), MAX_CONFIG_BYTES)))
+    }
+
     /// Watch the settings file and its selected theme pack as a single unit.
     /// Compatibility receiver API; application-lifetime desktop callers use
     /// `watch_with_theme_owned` to cancel and join unchanged polling.
@@ -2303,8 +2315,9 @@ impl ConfigStore {
             let mut last_signature: Option<WatchSignature> = None;
             loop {
                 thread::sleep(interval);
-                let (signature, result) =
-                    store.sample_with_theme(read_bounded(store.path(), MAX_CONFIG_BYTES));
+                let Some((signature, result)) = store.sample_with_theme_while_idle() else {
+                    continue;
+                };
                 if last_signature.as_ref() == Some(&signature) {
                     continue;
                 }
@@ -2328,8 +2341,7 @@ impl ConfigStore {
         let store = self.clone();
         let mut last_signature: Option<WatchSignature> = None;
         watch::spawn(interval, move || {
-            let (signature, result) =
-                store.sample_with_theme(read_bounded(store.path(), MAX_CONFIG_BYTES));
+            let (signature, result) = store.sample_with_theme_while_idle()?;
             if last_signature.as_ref() == Some(&signature) {
                 return None;
             }
@@ -4670,6 +4682,74 @@ mod tests {
     }
 
     #[test]
+    fn watcher_samples_defer_same_path_publish_but_keep_external_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let original = Config::default();
+        store.save(&original).unwrap();
+        let (_, revision) = store.load_revision().unwrap();
+        let mut changed = original.clone();
+        changed
+            .set_metric("geometry.focus_width", MetricValue::Set(4))
+            .unwrap();
+        let other = ConfigStore::at(directory.path().join("other.toml"));
+        let mut before_publish = None;
+        let committed = store.commit_with(&changed, &revision, |_| {
+            // This real publisher owns the path claim and both writer locks.
+            // An independent ConfigStore for the same path must also defer.
+            let same_path = ConfigStore::at(store.path());
+            before_publish = Some((
+                same_path.sample_with_theme_while_idle().is_none(),
+                same_path
+                    .read_while_idle(|| read_bounded(same_path.path(), MAX_CONFIG_BYTES))
+                    .is_none(),
+                matches!(
+                    other.sample_with_theme_while_idle(),
+                    Some((_, Err(ConfigError::Input(InputError::Missing))))
+                ),
+            ));
+        });
+        assert_eq!(before_publish, Some((true, true, true)));
+        committed.unwrap();
+        assert_eq!(
+            store
+                .sample_with_theme_while_idle()
+                .unwrap()
+                .1
+                .unwrap()
+                .config,
+            changed
+        );
+
+        // Outside publication, actual missing and invalid edits are still
+        // errors, with their exact bounded signature, never accepted defaults.
+        fs::remove_file(store.path()).unwrap();
+        let (signature, missing) = store.sample_with_theme_while_idle().unwrap();
+        assert_eq!(signature.0, Err(InputError::Missing));
+        assert!(matches!(
+            missing,
+            Err(ConfigError::Input(InputError::Missing))
+        ));
+        let invalid = "[geometry]\nfocus_width = 0\n";
+        fs::write(store.path(), invalid).unwrap();
+        let (signature, rejected) = store.sample_with_theme_while_idle().unwrap();
+        assert_eq!(signature.0.as_deref(), Ok(invalid));
+        assert!(matches!(rejected, Err(ConfigError::Field { .. })));
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), invalid);
+        assert!(matches!(store.load(), Err(ConfigError::Field { .. })));
+        store.save(&changed).unwrap();
+        assert_eq!(
+            store
+                .sample_with_theme_while_idle()
+                .unwrap()
+                .1
+                .unwrap()
+                .config,
+            changed
+        );
+    }
+
+    #[test]
     fn metric_edits_reject_invalid_files_without_repeating_values_and_recover() {
         let directory = tempfile::tempdir().unwrap();
         let store = ConfigStore::at(directory.path().join("config.toml"));
@@ -4703,7 +4783,11 @@ mod tests {
             let shown = error.to_string();
             assert!(matches!(error, ConfigError::Field { .. }), "{raw}");
             assert!(!shown.contains(rejected), "{raw}: {shown}");
-            fs::write(store.path(), raw).unwrap();
+            // Publish the one complete invalid edit, not an intermediate empty
+            // file (which is valid TOML with the built-in defaults).
+            let editing = directory.path().join("metric-edit.toml");
+            fs::write(&editing, raw).unwrap();
+            fs::rename(&editing, store.path()).unwrap();
             assert!(next().is_err(), "{raw}");
             // A rejected external edit stays as written for correction.
             assert_eq!(fs::read_to_string(store.path()).unwrap(), raw);

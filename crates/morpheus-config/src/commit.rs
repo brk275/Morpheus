@@ -112,11 +112,11 @@ use crate::{
 const WRITER_LOCK_WAIT: Duration = Duration::from_secs(2);
 const WRITER_LOCK_POLL: Duration = Duration::from_millis(10);
 
-/// The settings files this process is publishing right now, on any thread.
-/// A writer claims its path before the file lock and releases it after, so
-/// this process holds at most one file lock per path. Writers of different
-/// paths never wait for each other. The mutex itself is held only to look
-/// up, add or remove a path.
+/// The settings paths claimed by this process for publication or one bounded
+/// watch sample. A writer claims its path before the file lock and releases it
+/// after, so this process holds at most one file lock per path. Different paths
+/// never wait for each other. The mutex itself is held only to look up, add or
+/// remove a path.
 static PUBLISHING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// The exact text of the settings file as one read found it, or its
@@ -166,9 +166,9 @@ pub enum CommitError {
     /// written over, so the caller can show it next to its own change.
     #[error("the settings file changed after it was read; nothing was written")]
     Changed { current: ConfigRevision },
-    /// Another Morpheus writer (a window or a background task) was saving
-    /// settings at that moment. `commit` does not wait for it.
-    #[error("another Morpheus window or task is saving settings right now; nothing was written")]
+    /// Another Morpheus task was publishing or sampling this settings path.
+    /// `commit` does not wait for its process claim or writer lock.
+    #[error("another Morpheus window or task is using settings right now; nothing was written")]
     Busy,
     #[error("Morpheus is closing; no new settings were written")]
     Closing,
@@ -356,6 +356,15 @@ impl ConfigStore {
             // staged file already removed by `place`.
             Err(error) => Err(ConfigError::Io(error).into()),
         }
+    }
+
+    /// Take the same process-local path claim as a publisher for one bounded
+    /// watch sample. A busy path claim has no missing or invalid sample: leave
+    /// the watch signature unchanged and sample on its next ordinary poll.
+    /// External editors do not take this claim; their errors remain visible.
+    pub(super) fn read_while_idle<T>(&self, read: impl FnOnce() -> T) -> Option<T> {
+        let _process = ProcessClaim::take(&self.path)?;
+        Some(read())
     }
 
     /// The file as it is now. An absent file is a revision. A file that
