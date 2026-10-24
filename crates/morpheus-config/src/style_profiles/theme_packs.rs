@@ -624,6 +624,7 @@ mod tests {
     #[test]
     fn exported_palette_keeps_global_overrides_and_original_fallthrough() {
         let mut original = paper();
+        assert_eq!(original.roles.shadow.as_deref(), Some("#25342F33"));
         original.roles.link = Some("#112233".into());
         original.states.control_hover = Some("#223344".into());
         original.senders.colors = Some(vec!["#123456".into(), "#654321".into()]);
@@ -650,7 +651,7 @@ mod tests {
         assert_eq!(exported.colors.accent, "#445566");
         assert_eq!(exported.colors.canvas, original.colors.canvas);
         assert_eq!(exported.roles.link.as_deref(), Some("#55667788"));
-        assert_eq!(exported.roles.shadow, None);
+        assert_eq!(exported.roles.shadow.as_deref(), Some("#25342F33"));
         assert_eq!(exported.states.control_hover.as_deref(), Some("#667788"));
         assert_eq!(exported.senders, config.senders);
         assert!(!raw.contains("private-account"));
@@ -659,5 +660,21 @@ mod tests {
             theme_pack_with_overrides(&original, &Default::default(), &Default::default()).unwrap(),
             original
         );
+        // Absence must still fall through, while a global RGBA override must
+        // survive export/import without changing the original sparse pack.
+        for (pack_shadow, shadow) in [(None, None), (Some("#25342F33"), Some("#0A1B2C44"))] {
+            let mut source = original.clone();
+            source.roles.shadow = pack_shadow.map(str::to_owned);
+            let mut colors = config.colors.clone();
+            if let Some(shadow) = shadow {
+                colors.insert("shadow".into(), shadow.into());
+            }
+            let exported = theme_pack_with_overrides(&source, &colors, &config.senders).unwrap();
+            let imported = parse_theme_pack(&theme_pack_toml(&exported).unwrap()).unwrap();
+            assert_eq!(imported, exported);
+            assert_eq!(imported.roles.shadow.as_deref(), shadow);
+            assert_eq!(source.roles.shadow.as_deref(), pack_shadow);
+        }
+        assert_eq!(original, saved);
     }
 }

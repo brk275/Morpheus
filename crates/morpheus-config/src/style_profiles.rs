@@ -2069,6 +2069,9 @@ mod tests {
     #[test]
     fn portable_exports_keep_the_whole_global_look_without_the_original_pack() {
         let mut theme = crate::BuiltInStylePreset::Paper.theme().unwrap();
+        // Paper explicitly supplies this translucent shadow; it is not an
+        // omitted role that should fall through to the native default.
+        assert_eq!(theme.roles.shadow.as_deref(), Some("#25342F33"));
         theme.roles.link = Some("#112233".into());
         theme.states.control_hover = Some("#223344AA".into());
         theme.senders.colors = Some(vec!["#123456".into(), "#654321".into()]);
@@ -2116,7 +2119,10 @@ mod tests {
             assert_eq!(target.colors["link"], "#335F86");
             assert_eq!(target.colors["canvas"], theme.colors.canvas);
             assert_eq!(target.colors["control_hover"], "#223344AA");
-            assert!(!target.colors.contains_key("shadow"));
+            assert_eq!(
+                target.colors.get("shadow").map(String::as_str),
+                Some("#25342F33")
+            );
             assert_eq!(target.senders, theme.senders);
             for excluded in [
                 "theme_pack",
@@ -2142,6 +2148,34 @@ mod tests {
             export_profile(&exported, &path).unwrap();
             assert_eq!(import_profile(&path).unwrap(), exported);
         }
+        // A genuinely omitted role stays absent after a real file round trip;
+        // a global override instead preserves its exact RGBA value. Neither
+        // imported profile can require the source pack on the destination.
+        for (name, pack_shadow, shadow) in [
+            ("fallback", None, None),
+            ("override", Some("#25342F33"), Some("#0A1B2C44")),
+        ] {
+            let mut shadow_theme = theme.clone();
+            shadow_theme.roles.shadow = pack_shadow.map(str::to_owned);
+            let mut source = styled();
+            if let Some(shadow) = shadow {
+                source.colors.insert("shadow".into(), shadow.into());
+            }
+            let profile = StyleProfile::from_config("Shadow", &source);
+            let original = profile.clone();
+            let exported = profile.portable_export(Some(&shadow_theme)).unwrap();
+            let path = directory.path().join(format!("shadow-{name}.toml"));
+            export_profile(&exported, &path).unwrap();
+            let imported = import_profile(&path).unwrap();
+            let mut target = Config::default();
+            imported.apply_to(&mut target);
+            assert_eq!(profile, original);
+            assert_eq!(target.appearance.theme_pack, None);
+            assert_eq!(destination.load_theme(&target).unwrap(), None);
+            assert_eq!(target.colors.get("shadow").map(String::as_str), shadow);
+            assert_eq!(shadow_theme.roles.shadow.as_deref(), pack_shadow);
+        }
+        assert_eq!(theme.roles.shadow.as_deref(), Some("#25342F33"));
         let plain = StyleProfile::named("Default");
         assert_eq!(plain.portable_export(None).unwrap(), plain);
         let required = StyleProfile::from_config("Needs palette", &styled());
