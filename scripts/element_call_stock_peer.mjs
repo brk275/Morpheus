@@ -2,7 +2,7 @@
 // Observe the stock official Element Call image. No RTC refresh, membership
 // injection, SDK patch, or getUserMedia replacement belongs in this harness.
 // Cross-signing bootstraps only the disposable account's real SDK identity.
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -105,6 +105,76 @@ async function main() {
     check("browser_presynced");
     mark("native_join_wait");
     await poll(() => existsSync(join(root, "go")), "Native join did not become ready", 150_000);
+    // These two new content-bearing receipts must become visible only after
+    // their complete bounded JSON has been written and its exact file closed.
+    // A hard link publishes without replacing an existing destination.
+    const writeKeyReceipt = (name, index) => {
+      if (!["group-observed.json", "new-key-observed.json"].includes(name) ||
+          !Number.isInteger(index) || index < 0 || index > 255)
+        throw new Error("Invalid key receipt");
+      const bytes = Buffer.from(JSON.stringify({ key_index: index }), "utf8");
+      if (bytes.length > 256) throw new Error("Key receipt exceeded bound");
+      const ownerUid = BigInt(process.getuid());
+      const parent = lstatSync(root, { bigint: true });
+      const sameParent = () => {
+        const current = lstatSync(root, { bigint: true });
+        if (!current.isDirectory() || current.isSymbolicLink() || current.uid !== ownerUid ||
+            (current.mode & 0o077n) !== 0n || current.dev !== parent.dev || current.ino !== parent.ino)
+          throw new Error("Private receipt parent changed");
+      };
+      sameParent();
+      const temporary = join(root, `${name}.pending`);
+      const final = join(root, name);
+      let descriptor;
+      let created = false;
+      let linked = false;
+      let identity;
+      let closeUnproved = false;
+      const close = () => {
+        const current = descriptor;
+        descriptor = undefined; // A failed close is not retried on a possibly reused descriptor.
+        try { closeSync(current); } catch { closeUnproved = true; throw new Error("Key receipt close unproved"); }
+      };
+      const exactFile = (path, links, complete = true) => {
+        sameParent();
+        const stat = lstatSync(path, { bigint: true });
+        if (!identity || !stat.isFile() || stat.isSymbolicLink() || stat.uid !== ownerUid ||
+            (stat.mode & 0o777n) !== 0o600n || stat.dev !== identity.dev || stat.ino !== identity.ino ||
+            (complete ? stat.size !== BigInt(bytes.length) : stat.size > BigInt(bytes.length)) ||
+            (links !== undefined && stat.nlink !== links))
+          throw new Error("Owned key receipt identity changed");
+      };
+      try {
+        descriptor = openSync(temporary,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
+        created = true;
+        identity = fstatSync(descriptor, { bigint: true });
+        if (!identity.isFile() || identity.uid !== ownerUid || (identity.mode & 0o777n) !== 0o600n ||
+            identity.nlink !== 1n || identity.size !== 0n)
+          throw new Error("Invalid exclusive key receipt");
+        writeFileSync(descriptor, bytes);
+        const written = fstatSync(descriptor, { bigint: true });
+        if (written.dev !== identity.dev || written.ino !== identity.ino || written.size !== BigInt(bytes.length) || written.nlink !== 1n)
+          throw new Error("Incomplete key receipt write");
+        close();
+        exactFile(temporary, 1n);
+        linkSync(temporary, final);
+        linked = true;
+        exactFile(final, 2n);
+        unlinkSync(temporary);
+        created = false;
+        exactFile(final, 1n);
+      } catch {
+        let cleaned = !closeUnproved;
+        if (descriptor !== undefined) { try { close(); } catch { cleaned = false; } }
+        // Remove only names whose actual inode still belongs to this attempt.
+        // Never remove the existing target when no-clobber publication failed.
+        for (const path of [...(linked ? [final] : []), ...(created ? [temporary] : [])]) {
+          try { exactFile(path, undefined, false); unlinkSync(path); } catch { cleaned = false; }
+        }
+        throw new Error(cleaned ? "Key receipt publication failed" : "Key receipt cleanup unproved");
+      }
+    };
     const readOwner = (name, expectedUser, screen = false) => {
       const bytes = readFileSync(join(root, name));
       if (bytes.length > 8_192) throw new Error("Media owner exceeded bound");
@@ -429,7 +499,7 @@ async function main() {
       return true;
     }), "Late arrival did not deliver a new exact-sender key");
     const beforeLeave = await page.evaluate(() => window.__morpheusInteropKeys.group);
-    writeFileSync(join(root, "group-observed.json"), JSON.stringify({ key_index: beforeLeave }), { mode: 0o600, flag: "wx" });
+    writeKeyReceipt("group-observed.json", beforeLeave);
     mark("browser_group_departure");
     await poll(() => roster([native.user_id, account.user_id]), "Late peer did not depart stock roster");
     check("browser_group_departure");
@@ -440,7 +510,7 @@ async function main() {
       return state.last !== null && state.last !== state.group;
     }), "Departure did not deliver a new exact-sender key");
     const afterLeave = await page.evaluate(() => window.__morpheusInteropKeys.last);
-    writeFileSync(join(root, "new-key-observed.json"), JSON.stringify({ key_index: afterLeave }), { mode: 0o600, flag: "wx" });
+    writeKeyReceipt("new-key-observed.json", afterLeave);
     await poll(() => existsSync(join(root, "screen-changed")), "Actual sender key activation did not finish");
     await observeScreen(true, 2);
     await observeAudio(owner, 1301, 2, true);
