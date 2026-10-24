@@ -2765,6 +2765,51 @@ mod tests {
                 .sync_once(matrix_sdk::config::SyncSettings::default())
                 .await
                 .unwrap();
+            // The pinned SDK rejects a self-loop before changing its room
+            // info or stored state; it retains the last accepted target.
+            assert_eq!(
+                session.replacement_room().unwrap().as_deref(),
+                Some(room_id!("!changed:example.org"))
+            );
+            // A canonical redacted tombstone is accepted without a successor.
+            // Redeliver the current event as redacted, not an invalid original
+            // event with missing required content that the SDK would ignore.
+            let mut redacted: Value =
+                serde_json::from_str(&full_event("m.room.tombstone", "", "{}")).unwrap();
+            redacted["event_id"] = "$replacement-replacement-2".into();
+            redacted["unsigned"] = json!({"redacted_because": {
+                "type": "m.room.redaction",
+                "event_id": "$redaction-replacement",
+                "sender": ME,
+                "origin_server_ts": 2,
+                "redacts": "$replacement-replacement-2",
+                "content": {}
+            }});
+            let decoded: matrix_sdk::ruma::events::AnySyncStateEvent =
+                serde_json::from_value(redacted.clone()).unwrap();
+            assert!(matches!(
+                decoded,
+                matrix_sdk::ruma::events::AnySyncStateEvent::RoomTombstone(event)
+                    if event.as_original().is_none()
+            ));
+            let mut cleared = joined_room();
+            cleared["next_batch"] = "replacement-redacted".into();
+            cleared["rooms"]["join"][ROOM]["state"]["events"]
+                .as_array_mut()
+                .unwrap()
+                .push(redacted);
+            server.served.syncs.lock().unwrap().push_back(cleared);
+            client
+                .sync_once(matrix_sdk::config::SyncSettings::default())
+                .await
+                .unwrap();
+            assert!(
+                client
+                    .get_room(room_id!("!settings:example.org"))
+                    .unwrap()
+                    .successor_room()
+                    .is_none()
+            );
             assert!(session.replacement_room().unwrap().is_none());
             cancellation.cancel();
             assert_eq!(

@@ -5819,14 +5819,19 @@ fn key_file_inputs_empty(ui: &AppWindow) -> bool {
             .is_empty()
     })
 }
+#[track_caller]
 fn fill_key_file_inputs(ui: &AppWindow) {
-    use slint::private_unstable_api::re_exports::{FocusReason, TextInput, WindowInner};
+    use slint::private_unstable_api::re_exports::TextInput;
     assert!(key_file_inputs_empty(ui));
     for label in KEY_FILE_INPUT_LABELS {
+        // These real Settings inputs may start below the scroll viewport. Use
+        // the existing keyboard route so focus admission also reveals them.
+        tab_to_control(ui, label);
         let target = control_with_label(ui, label);
-        let window = WindowInner::from_pub(ui.window());
-        window.set_focus_item(&target, true, FocusReason::PointerClick);
-        assert!(focused_control_has_label(ui, label));
+        assert!(
+            focused_control_has_label(ui, label),
+            "the real key-file input must receive keyboard focus: {label}"
+        );
         assert!(
             target
                 .downcast::<TextInput>()
