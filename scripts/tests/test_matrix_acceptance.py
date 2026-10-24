@@ -1820,6 +1820,19 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE password_value\n"
                                            "MORPHEUS_OAUTH_FAILURE https://example.org/private"), {})
 
+    def test_oauth_pause_and_token_failures_remain_exact_closed_diagnostics(self):
+        for code in ("sync_pause_selection", "sync_pause_timeout", "sync_pause_operation",
+                     "delegated_session_missing", "access_token_missing", "refresh_token_missing"):
+            with self.subTest(code=code):
+                self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE restore_identity\n"
+                                                  f"MORPHEUS_OAUTH_FAILURE {code}\n"
+                                                  f"MORPHEUS_OAUTH_FAILURE {code} private-body\n"),
+                                 {"stage": "restore_identity", "failure": code})
+                self.assertEqual(oauth_diagnostics(f"MORPHEUS_OAUTH_FAILURE {code}_unknown\n"
+                                                  f"MORPHEUS_OAUTH_FAILURE {code} private-token\n"), {})
+        self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_FAILURE access_token_value\n"
+                                          "MORPHEUS_OAUTH_FAILURE https://example.org/private\n"), {})
+
     def test_registration_outcomes_survive_only_the_existing_closed_oauth_reducer(self):
         import local_matrix_auth
         expected = {"registration_command", "registration_exit_two", "registration_exit_exec", "registration_exit_other"}
