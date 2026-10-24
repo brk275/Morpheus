@@ -6,6 +6,7 @@ provenance and regression tests when updating a dependency.
 
 | Crate | Purpose | Provenance |
 | --- | --- | --- |
+| i-slint-backend-winit 1.18.1 | Prefer known-transparent OpenGL configs before sample count | [Patch notes](i-slint-backend-winit/MORPHEUS_PATCH.md) |
 | winit 0.30.13 | Existing macOS delegate termination and modal cleanup observation | [Patch notes](winit/MORPHEUS_PATCH.md) |
 | notify-rust 4.18.2 | Owned notifications on the actual native worker | [Patch notes](notify-rust/MORPHEUS_PATCH.md) |
 | mac-notification-sys 0.6.15 | Retained native banner records and bounded callbacks | [Patch notes](mac-notification-sys/MORPHEUS_PATCH.md) |

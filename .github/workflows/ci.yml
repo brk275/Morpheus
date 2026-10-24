@@ -466,6 +466,17 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
+          gl_config_tests=(
+            config_preference::tests::known_transparency_outranks_samples_in_both_native_orders
+            config_preference::tests::unknown_opaque_fallbacks_and_sample_ties_preserve_order
+          )
+          cargo test --locked -p morpheus-app --features native-calls --test gl_config_preference -- --list > "$RUNNER_TEMP/morpheus-gl-config-tests.txt"
+          for gl_config_test in "${gl_config_tests[@]}"; do
+            test "$(grep -Fxc -- "$gl_config_test: test" "$RUNNER_TEMP/morpheus-gl-config-tests.txt")" = 1
+            cargo test --locked -p morpheus-app --features native-calls --test gl_config_preference "$gl_config_test" -- --exact | tee "$RUNNER_TEMP/morpheus-gl-config-result.txt"
+            test "$(grep -Fxc -- "test $gl_config_test ... ok" "$RUNNER_TEMP/morpheus-gl-config-result.txt")" = 1
+            test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-gl-config-result.txt")" = 1
+          done
           cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
           cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
           cargo test --locked -p matrix-rtc-livekit --lib

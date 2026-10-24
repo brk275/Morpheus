@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 # Keep vendored library development feature sets outside the application workspace.
-exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto", "vendor/winit", "vendor/notify-rust", "vendor/mac-notification-sys", "vendor/tauri-winrt-notification"]
+exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto", "vendor/winit", "vendor/notify-rust", "vendor/mac-notification-sys", "vendor/tauri-winrt-notification", "vendor/i-slint-backend-winit"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
@@ -32,6 +32,8 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/brk275/Morpheus"
 
 [patch.crates-io]
+# Same-version OpenGL config preference; complete upstream source retained.
+i-slint-backend-winit = { path = "vendor/i-slint-backend-winit" }
 # Same-version owned native notification operations; originals preserved.
 notify-rust = { path = "vendor/notify-rust" }
 mac-notification-sys = { path = "vendor/mac-notification-sys" }
