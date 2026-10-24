@@ -1404,9 +1404,14 @@ impl CallController {
     /// not closed by `end_call()`, because other members may still be using it.
     pub async fn open_slot(
         &self,
-        expected_account_id: &str,
+        selection: AccountSelection,
         room_id: &str,
+        mode: CallJoinMode,
     ) -> Result<(), CallControllerError> {
+        if !selection.is_current() {
+            return Err(CallControllerError::AccountChanged);
+        }
+        let expected_account_id = selection.account_id();
         // Reserve before any account, encryption, or network await. The
         // operation runs independently of its UI caller so dropping that
         // caller cannot release the switch block while a state write runs.
@@ -1419,11 +1424,12 @@ impl CallController {
             shared: Arc::clone(&self.shared),
         };
         let shared = Arc::clone(&self.shared);
-        let account_id = expected_account_id.to_owned();
         let room_id = room_id.to_owned();
         let (result_tx, result_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let result = controller.open_slot_reserved(&account_id, &room_id).await;
+            let result = controller
+                .open_slot_reserved(&selection, &room_id, mode)
+                .await;
             let cleanup = shared.finish_open_slot(token).await;
             done.send_replace(true);
             // Preserve an earlier network error; the slot still retains any
@@ -1437,15 +1443,26 @@ impl CallController {
 
     async fn open_slot_reserved(
         &self,
-        expected_account_id: &str,
+        selection: &AccountSelection,
         room_id: &str,
+        mode: CallJoinMode,
     ) -> Result<(), CallControllerError> {
+        if !selection.is_current() {
+            return Err(CallControllerError::AccountChanged);
+        }
+        let expected_account_id = selection.account_id();
         self.ensure_account(expected_account_id).await?;
         let account_id = self.ready_account_id().await?;
         if account_id != expected_account_id {
             return Err(CallControllerError::AccountChanged);
         }
+        if !selection.is_current() {
+            return Err(CallControllerError::AccountChanged);
+        }
         let client = self.manager.active_client().await?;
+        if !selection.is_current() {
+            return Err(CallControllerError::AccountChanged);
+        }
         self.ensure_account(&account_id).await?;
         let rtc = RtcService::new(client);
         let room = rtc
@@ -1465,10 +1482,19 @@ impl CallController {
         let slot_id = CallOptions::default().slot_id;
         timeout(
             JOIN_TIMEOUT,
-            rtc.open_slot(room_id, &slot_id, encryption.is_encrypted()),
+            rtc.open_outgoing_slot(
+                room_id,
+                &slot_id,
+                encryption.is_encrypted(),
+                mode.options().interop_mode,
+                &|| selection.is_current(),
+            ),
         )
         .await
         .map_err(|_| CallControllerError::TimedOut("opening MatrixRTC call slot"))??;
+        if !selection.is_current() {
+            return Err(CallControllerError::AccountChanged);
+        }
         self.ensure_account(&account_id).await
     }
 
@@ -2753,7 +2779,18 @@ impl CallWorker {
         // been published. The same existing bound applies, then cleanup leaves
         // any returned handle before releasing the call slot/update lease.
         let joined = {
-            let join = timeout(JOIN_TIMEOUT, rtc.join(&room_id, self.options.clone()));
+            let outgoing = self.accepted.is_none();
+            let selection_admission = self.selection.clone();
+            let stop_admission = Arc::clone(&self.capture_stop);
+            let admit = || selection_admission.is_current() && !stop_admission.requested();
+            let options = self.options.clone();
+            let join = timeout(JOIN_TIMEOUT, async {
+                if outgoing {
+                    rtc.join_outgoing(&room_id, options, &admit).await
+                } else {
+                    rtc.join(&room_id, options).await
+                }
+            });
             let cancel = &mut self.cancel;
             let selection = &self.selection;
             let offer_cancelled = accepted_cancelled(self.accepted.as_ref());

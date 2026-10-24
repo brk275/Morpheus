@@ -2339,6 +2339,14 @@ fn run_application(
             if account_id.is_empty() || room_id.is_empty() {
                 return;
             }
+            let Some(selection) = call_live.manager.account_selection(&account_id) else {
+                return;
+            };
+            let mode =
+                CallJoinMode::from(call_live.voice_spaces.room_call_mode(&account_id, &room_id));
+            if mode == CallJoinMode::ElementCallRoomState {
+                return;
+            }
             let Some(ring_request) = calls.reserve_ringing_request() else {
                 return;
             };
@@ -2348,11 +2356,12 @@ fn run_application(
             let weak = weak.clone();
             handle.spawn(async move {
                 let _transition = call_live.account_transition.lock().await;
-                let result = calls.open_slot(&account_id, &room_id).await;
+                let result = calls.open_slot(selection.clone(), &room_id, mode).await;
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     drop(ring_request);
                     ui.set_native_call_request_pending(false);
-                    if ui.get_active_account_local_id().as_str() != account_id
+                    if !selection.is_current()
+                        || ui.get_active_account_local_id().as_str() != account_id
                         || ui.get_active_room_id().as_str() != room_id
                         || ui.get_room_call_mode() == RoomCallMode::ElementCallLegacy.index()
                     {

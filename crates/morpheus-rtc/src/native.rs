@@ -268,6 +268,31 @@ impl RtcService {
         slot_id: &str,
         encrypted: bool,
     ) -> Result<(), RtcError> {
+        self.open_slot_inner(room_id, slot_id, encrypted, None)
+            .await
+    }
+
+    /// Explicit app action with original account-operation authority. The
+    /// mode is captured from that room's saved preference, never inferred.
+    pub async fn open_outgoing_slot(
+        &self,
+        room_id: &str,
+        slot_id: &str,
+        encrypted: bool,
+        mode: InteropMode,
+        admit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), RtcError> {
+        self.open_slot_inner(room_id, slot_id, encrypted, Some((mode, admit)))
+            .await
+    }
+
+    async fn open_slot_inner(
+        &self,
+        room_id: &str,
+        slot_id: &str,
+        encrypted: bool,
+        outgoing: Option<(InteropMode, &(dyn Fn() -> bool + Send + Sync))>,
+    ) -> Result<(), RtcError> {
         let room = self.ensure_loaded_room(room_id)?;
         let encryption_state = room
             .latest_encryption_state()
@@ -300,7 +325,20 @@ impl RtcService {
             encryption_type: "m.per_member".to_owned(),
             extra: Default::default(),
         });
-        open_slot(&self.client, room_id, slot_id, "m.call", encryption).await?;
+        if let Some((mode, admit)) = outgoing {
+            let handoff_admit = || admit() && room.state() == matrix_sdk::RoomState::Joined;
+            crate::outgoing_preflight::handover(
+                crate::outgoing_preflight::check(&self.client, &room, mode, true, &handoff_admit),
+                &handoff_admit,
+                || async {
+                    open_slot(&self.client, room_id, slot_id, "m.call", encryption).await?;
+                    Ok(())
+                },
+            )
+            .await?;
+        } else {
+            open_slot(&self.client, room_id, slot_id, "m.call", encryption).await?;
+        }
         Ok(())
     }
 
@@ -318,6 +356,26 @@ impl RtcService {
         &mut self,
         room_id: &str,
         options: CallOptions,
+    ) -> Result<CallInfo, RtcError> {
+        self.join_inner(room_id, options, None).await
+    }
+
+    /// Ordinary outgoing admission only. Incoming Answer and reconnect keep
+    /// their original call authorization and never choose another format.
+    pub async fn join_outgoing(
+        &mut self,
+        room_id: &str,
+        options: CallOptions,
+        admit: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<CallInfo, RtcError> {
+        self.join_inner(room_id, options, Some(admit)).await
+    }
+
+    async fn join_inner(
+        &mut self,
+        room_id: &str,
+        options: CallOptions,
+        outgoing: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> Result<CallInfo, RtcError> {
         let room = self.ensure_loaded_room(room_id)?;
         if self.calls.contains_key(room_id) {
@@ -353,18 +411,35 @@ impl RtcService {
             .to_string();
 
         install_crypto_provider();
-        let call = LiveKitCall::join(
-            &room,
-            LiveKitCallOptions {
-                slot_id: options.slot_id.clone(),
-                format: options.interop_mode.into(),
-                livekit_transport: Some(LiveKitTransport {
-                    livekit_service_url: service_url,
-                }),
-                ..LiveKitCallOptions::default()
-            },
-        )
-        .await?;
+        let call_options = LiveKitCallOptions {
+            slot_id: options.slot_id.clone(),
+            format: options.interop_mode.into(),
+            livekit_transport: Some(LiveKitTransport {
+                livekit_service_url: service_url,
+            }),
+            ..LiveKitCallOptions::default()
+        };
+        let call = if let Some(admit) = outgoing {
+            let handoff_admit = || admit() && room.state() == matrix_sdk::RoomState::Joined;
+            crate::outgoing_preflight::handover(
+                crate::outgoing_preflight::check(
+                    &self.client,
+                    &room,
+                    options.interop_mode,
+                    encryption_state.is_encrypted(),
+                    &handoff_admit,
+                ),
+                &handoff_admit,
+                || async {
+                    LiveKitCall::join(&room, call_options)
+                        .await
+                        .map_err(RtcError::from)
+                },
+            )
+            .await?
+        } else {
+            LiveKitCall::join(&room, call_options).await?
+        };
         let info = CallInfo {
             room_id: room_id.to_owned(),
             slot_id: options.slot_id,

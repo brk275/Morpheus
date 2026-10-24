@@ -39,6 +39,8 @@ mod observer;
 #[cfg(feature = "native-rtc")]
 mod outgoing_notification;
 #[cfg(feature = "native-rtc")]
+mod outgoing_preflight;
+#[cfg(feature = "native-rtc")]
 pub mod ringing;
 #[cfg(any(feature = "device-camera", feature = "device-screen"))]
 mod video_device;
@@ -70,6 +72,8 @@ pub use native::{
 pub use observer::{ObservedCall, ObservedParticipant, ObserverError, PassiveCallObserver};
 #[cfg(feature = "native-rtc")]
 pub use outgoing_notification::NotificationDialect;
+#[cfg(feature = "native-rtc")]
+pub use outgoing_preflight::OutgoingCallError;
 pub use reconnect::{
     ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd, RtcConnectionSignal,
 };
@@ -229,6 +233,9 @@ pub enum RtcError {
         "this device is not ready for encrypted calls; complete cross-signing verification or recovery"
     )]
     EncryptionIdentityNotReady,
+    #[cfg(feature = "native-rtc")]
+    #[error("{0}")]
+    OutgoingPreflight(#[from] OutgoingCallError),
     #[cfg(feature = "native-rtc")]
     #[error("MatrixRTC call failed: {0}")]
     Call(#[from] matrix_rtc_call_sdk::LiveKitCallError),
