@@ -2994,8 +2994,21 @@ mod tests {
         assert_eq!(target.route, Route::Settings);
         assert_eq!(target.requires, Requirement::LiveSession);
         let offline = |requirement| requirement == Requirement::Always;
-        assert!(search_settings("room keys", offline).is_empty());
-        assert!(search_settings("encrypted key file", offline).is_empty());
+        // Room keyboard shortcuts legitimately match both words offline.
+        // The account-bound key-file control must remain unavailable.
+        assert!(
+            search_settings("room keys", offline)
+                .iter()
+                .any(|result| result.id == "shortcuts")
+        );
+        for query in ["room keys", "encrypted key file"] {
+            assert!(
+                search_settings(query, offline).iter().all(|result| {
+                    result.requires == Requirement::Always && result.id != target.id
+                }),
+                "{query}"
+            );
+        }
         assert_eq!(
             search_settings("recovery key", all)
                 .first()

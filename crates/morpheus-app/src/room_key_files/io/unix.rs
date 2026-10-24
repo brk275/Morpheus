@@ -173,8 +173,9 @@ pub(super) fn read_encrypted(path: &Path) -> Result<Zeroizing<Vec<u8>>, IoError>
                 let capacity = needed
                     .max(bytes.capacity().saturating_mul(2))
                     .min(MAX_FILE_BYTES);
+                let additional = capacity - bytes.len();
                 bytes
-                    .try_reserve_exact(capacity - bytes.len())
+                    .try_reserve_exact(additional)
                     .map_err(|_| IoError::Limit)?;
             }
             bytes.extend_from_slice(&buffer[..count]);

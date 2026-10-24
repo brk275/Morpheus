@@ -2683,7 +2683,7 @@ mod tests {
 
     #[test]
     fn a_synced_replacement_is_typed_rechecked_and_never_changes_membership() {
-        runtime().block_on(async {
+        history_runtime().block_on(async {
             let server = SettingsServer::start();
             let (directory, manager, account) = signed_in(&server).await;
             let client = manager.state.lock().await.loaded[&account.id]
