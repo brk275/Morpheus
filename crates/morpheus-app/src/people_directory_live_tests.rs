@@ -170,6 +170,7 @@ fn held(ui: &AppWindow) -> Held {
 }
 
 async fn exercise(runtime: Handle, fixture: Fixture) {
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_profile");
     let directory = tempfile::tempdir().unwrap();
     let manager =
         Arc::new(morpheus_matrix::AccountManager::open(directory.path().join("profile")).unwrap());
@@ -181,6 +182,7 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     let ui = AppWindow::new().unwrap();
     let live = LiveUi::new(manager.clone(), runtime.clone(), ui.as_weak(), voices);
     register(&ui, live.clone(), runtime.clone());
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_login");
     let account = {
         let manager = manager.clone();
         let (url, user, password) = (
@@ -206,6 +208,7 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
         .dispatch_event(WindowEvent::WindowActiveChanged(true));
     settle(&ui).await;
 
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_search");
     // Open, then an exact ID: its row is offered at once.
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -230,6 +233,7 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
 
     // Choose it: the local lookup knows no conversation, so a start is
     // offered and confirmed.
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_known_direct");
     ui.invoke_people_choose(0);
     wait_for_ui(&ui, "the known-direct lookup must finish", |ui| {
         ui.get_people_known() == KNOWN_NONE
@@ -256,6 +260,7 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
         before.wrapping_add(1)
     );
     assert_eq!(ui.get_people_status().as_str(), CREATING);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_creation_wait");
     point.entered().await;
     settle(&ui).await;
     let admitted = held(&ui);
@@ -294,6 +299,7 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     assert_eq!(held(&ui), admitted);
 
     // Released: the creation's own completion applies and clears busy.
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_creation_release");
     point.proceed();
     wait_for_ui(&ui, "the creation's completion must clear busy", |ui| {
         !ui.get_people_busy()
@@ -336,6 +342,7 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     clear_presentation(&ui);
     ui.hide().unwrap();
 
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_cleanup");
     on_runtime(&runtime, {
         let manager = manager.clone();
         async move {
@@ -347,6 +354,7 @@ async fn exercise(runtime: Handle, fixture: Fixture) {
     .await;
     drop(live);
     drop(ui);
+    eprintln!("MORPHEUS_LIVE_TIMELINE_TAIL people_profile_wait");
     let deadline = Instant::now() + Duration::from_secs(60);
     while Arc::strong_count(&manager) != 1 {
         assert!(
