@@ -4,7 +4,15 @@
 
 #![cfg(feature = "native-rtc")]
 
-use std::{fs, io::Write, time::Duration};
+use std::{
+    fs,
+    io::{Read, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use matrix_sdk::{Client, ruma::api::client::uiaa};
@@ -69,12 +77,12 @@ fn native_video_frame(index: u32) -> VideoFrame {
 
 // The browser's real fake-capture microphone is 440 Hz. Only the native
 // microphone publication below supplies this distinct, phase-continuous tone.
-fn native_audio_frame(index: u32) -> AudioFrame {
+fn native_audio_frame(index: u32, frequency: f64) -> AudioFrame {
     AudioFrame {
         data: (0..480)
             .map(|sample| {
                 let position = u64::from(index) * 480 + sample;
-                let phase = std::f64::consts::TAU * 997.0 * position as f64 / 48_000.0;
+                let phase = std::f64::consts::TAU * frequency * position as f64 / 48_000.0;
                 (8_000.0 * phase.sin()) as i16
             })
             .collect(),
@@ -90,16 +98,28 @@ fn native_audio_frame(index: u32) -> AudioFrame {
 struct NativeTone {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     sender: tokio::task::JoinHandle<Publication>,
+    changed: Arc<AtomicBool>,
 }
 
 impl NativeTone {
     fn start(publication: Publication) -> Self {
+        Self::with_frequency(publication, 997.0)
+    }
+
+    fn with_frequency(publication: Publication, frequency: f64) -> Self {
         let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let changed = Arc::new(AtomicBool::new(false));
+        let phase = changed.clone();
         let sender = tokio::spawn(async move {
             for index in 0..36_000 {
+                let frequency = if phase.load(Ordering::Acquire) {
+                    1301.0
+                } else {
+                    frequency
+                };
                 tokio::select! {
                     _ = &mut stopped => return publication,
-                    result = publication.push_audio(native_audio_frame(index)) => {
+                    result = publication.push_audio(native_audio_frame(index, frequency)) => {
                         result.expect("Native interop microphone send failed");
                     },
                 }
@@ -113,6 +133,7 @@ impl NativeTone {
         Self {
             stop: Some(stop),
             sender,
+            changed,
         }
     }
 
@@ -137,6 +158,398 @@ impl Drop for NativeTone {
     fn drop(&mut self) {
         self.sender.abort();
     }
+}
+
+// A real ScreenShare publication with a picture that changes only after the
+// stock receiver acknowledges a new exact-sender key notification. Neither the
+// camera fixture nor a queued old screen picture can satisfy the second phase.
+struct NativeScreen {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    sender: tokio::task::JoinHandle<Publication>,
+    changed: Arc<AtomicBool>,
+}
+
+impl NativeScreen {
+    fn start(publication: Publication) -> Self {
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let changed = Arc::new(AtomicBool::new(false));
+        let phase = changed.clone();
+        let sender = tokio::spawn(async move {
+            for index in 0..3_600 {
+                let mut frame = native_video_frame(index);
+                let changed = phase.load(Ordering::Acquire);
+                for (row, pixels) in frame.buffer.data_y.chunks_exact_mut(640).enumerate() {
+                    let white = (row < 180) != changed;
+                    pixels.fill(if white { 235 } else { 16 });
+                }
+                publication
+                    .push_video(frame)
+                    .expect("Native screen send failed");
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = sleep(Duration::from_millis(66)) => {},
+                }
+            }
+            publication
+        });
+        Self {
+            stop: Some(stop),
+            sender,
+            changed,
+        }
+    }
+
+    async fn finish(mut self) {
+        self.stop
+            .take()
+            .expect("Screen stop missing")
+            .send(())
+            .expect("Screen stopped early");
+        let publication = timeout(Duration::from_secs(5), &mut self.sender)
+            .await
+            .expect("Screen stop timed out")
+            .expect("Screen sender panicked");
+        timeout(Duration::from_secs(5), publication.unpublish())
+            .await
+            .expect("Screen unpublish timed out")
+            .expect("Screen unpublish failed");
+    }
+}
+
+impl Drop for NativeScreen {
+    fn drop(&mut self) {
+        self.sender.abort();
+    }
+}
+
+fn write_owner(root: &std::path::Path, name: &str, publication: &Publication, sid: Option<&str>) {
+    let call = publication.call_info();
+    let mut owner = serde_json::json!({
+        "room_id": call.room_id,
+        "user_id": publication.account_user_id(),
+        "device_id": publication.account_device_id(),
+        "member_id": call.membership_id,
+        "identity": call.local_identity,
+    });
+    if let Some(sid) = sid {
+        owner["track_sid"] = sid.into();
+    }
+    write_marker(
+        root.join(name),
+        &serde_json::to_vec(&owner).expect("Cannot encode interop media owner"),
+    );
+}
+
+// Read only the enabled cryptor for our unique actual local media publication.
+// This is the native sender's index, not the provider's optimistic latest-key
+// atomic or a remote participant's imported-key event. No key bytes are read.
+fn native_sender(
+    rtc: &RtcService,
+    room: &str,
+    source: livekit::track::TrackSource,
+    sid: Option<&str>,
+) -> Option<(String, u8)> {
+    let call = rtc.call(room)?;
+    let room = call.session().room();
+    let local = room.local_participant();
+    let identity = local.identity();
+    if identity.as_str() != call.local_identity() || !room.e2ee_manager().enabled() {
+        return None;
+    }
+    let mut publications = local
+        .track_publications()
+        .into_iter()
+        .filter(|(_, publication)| publication.source() == source);
+    let (track_sid, publication) = publications.next()?;
+    if publications.next().is_some()
+        || publication.sid() != track_sid
+        || sid.is_some_and(|expected| expected != track_sid.as_str())
+    {
+        return None;
+    }
+    let cryptors = room.e2ee_manager().frame_cryptors();
+    let cryptor = cryptors.get(&(identity.clone(), track_sid.clone()))?;
+    if !cryptor.enabled() || cryptor.participant_id() != identity.as_str() {
+        return None;
+    }
+    let index = u8::try_from(cryptor.key_index()).ok()?;
+    Some((track_sid.to_string(), index))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivedKey {
+    key_index: u8,
+}
+
+fn received_key(path: &std::path::Path) -> u8 {
+    let metadata = fs::symlink_metadata(path).expect("Key receipt metadata missing");
+    assert!(
+        metadata.file_type().is_file() && metadata.len() <= 256,
+        "Invalid private key receipt"
+    );
+    let file = fs::File::open(path).expect("Cannot open private key receipt");
+    let metadata = file.metadata().expect("Cannot inspect private key receipt");
+    assert!(
+        metadata.is_file() && metadata.len() <= 256,
+        "Invalid opened key receipt"
+    );
+    let mut bytes = Vec::new();
+    file.take(257)
+        .read_to_end(&mut bytes)
+        .expect("Cannot read private key receipt");
+    assert!(bytes.len() <= 256, "Key receipt exceeded bound");
+    serde_json::from_slice::<ReceivedKey>(&bytes)
+        .expect("Invalid key receipt shape")
+        .key_index
+}
+
+fn exact_roster(rtc: &RtcService, room: &str, users: &[&str]) -> bool {
+    let mut actual = rtc
+        .participants(room)
+        .expect("Group roster missing")
+        .into_iter()
+        .map(|member| member.user_id)
+        .collect::<Vec<_>>();
+    actual.sort();
+    let mut expected = users
+        .iter()
+        .map(|user| (*user).to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    actual == expected
+}
+
+async fn group_and_screen(
+    rtc: &mut RtcService,
+    root: &std::path::Path,
+    alice: &TestAccount,
+    bob: &TestAccount,
+    carol: &TestAccount,
+    room: &str,
+    microphone: &NativeTone,
+) {
+    let (microphone_sid, _) =
+        native_sender(rtc, room, livekit::track::TrackSource::Microphone, None)
+            .expect("Actual original microphone sender cryptor missing");
+    write_marker(
+        root.join("native-microphone-sid"),
+        microphone_sid.as_bytes(),
+    );
+    // The unmodified pinned core keeps keys fresh for ten seconds. Make the
+    // late arrival occur outside that window rather than asking a test-only
+    // API to rotate keys or assuming a fast bulk join has to rotate them.
+    sleep(Duration::from_secs(11)).await;
+    let profile = root.join("late-native-profile");
+    fs::create_dir(&profile).expect("Cannot create fresh late-peer profile");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o700))
+            .expect("Cannot protect late-peer profile");
+    }
+    let manager = AccountManager::open(profile.join("carol")).expect("Cannot open late-peer store");
+    let account = manager
+        .add_password_account(&carol.homeserver_url, &carol.username, &carol.password)
+        .await
+        .expect("Late-peer login failed");
+    timeout(Duration::from_secs(90), async {
+        let status = manager.subscribe_sync_status();
+        loop {
+            let running = matches!(
+                &*status.borrow(),
+                SyncStatus::Running {
+                    backend: SyncBackend::SlidingSticky
+                }
+            );
+            if running
+                && manager
+                    .rooms_snapshot()
+                    .await
+                    .expect("Late-peer room list failed")
+                    .iter()
+                    .any(|value| value.room_id == room)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Late-peer sync timed out");
+    let client = manager
+        .active_client()
+        .await
+        .expect("Late-peer client missing");
+    bootstrap_identity(&client, carol).await;
+    let mut late = RtcService::new(client);
+    late.join(room, CallOptions::element_call_matrix_2_0())
+        .await
+        .expect("Late-peer join failed");
+    timeout(Duration::from_secs(90), async {
+        while !exact_roster(rtc, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
+            || !exact_roster(&late, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
+        {
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Three-member native rosters did not converge");
+    eprintln!("MORPHEUS_ELEMENT_CHECK native_group_roster=true");
+
+    // A newly created device must actually decrypt the already-running sender,
+    // not just appear in the signalling roster or receive RTP counters.
+    timeout(Duration::from_secs(45), async {
+        let member = late
+            .participants(room)
+            .expect("Late roster missing")
+            .into_iter()
+            .find(|member| member.user_id == alice.user_id)
+            .expect("Alice not in late roster");
+        let call = late.call(room).expect("Late call missing");
+        let audio = loop {
+            if let Some(track) = call.remote_track(&member.member_id, MediaStreamKind::Microphone) {
+                break track;
+            }
+            sleep(Duration::from_millis(200)).await;
+        };
+        let video = loop {
+            if let Some(track) = call.remote_track(&member.member_id, MediaStreamKind::Camera) {
+                break track;
+            }
+            sleep(Duration::from_millis(200)).await;
+        };
+        let mut audio = audio.audio_frames().expect("Late-peer PCM missing");
+        let mut video = video.video_frames().expect("Late-peer picture missing");
+        let sound = async {
+            while let Some(frame) = audio.next().await {
+                if frame.data.iter().any(|sample| sample.unsigned_abs() > 100) {
+                    return true;
+                }
+            }
+            false
+        };
+        let picture = async {
+            while let Some(frame) = video.next().await {
+                let b = frame.buffer;
+                let width = b.width as usize;
+                let height = b.height as usize;
+                let stride = b.stride_y as usize;
+                if width >= 160
+                    && height >= 90
+                    && stride >= width
+                    && b.data_y.len() >= stride * height
+                    && b.data_y[(height / 2) * stride + width / 4] > 190
+                    && b.data_y[(height / 2) * stride + width * 3 / 4] < 55
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        let (sound, picture) = tokio::join!(sound, picture);
+        assert!(sound && picture, "Late peer did not decrypt Alice media");
+    })
+    .await
+    .expect("Late-peer decoded media timed out");
+    eprintln!("MORPHEUS_ELEMENT_CHECK native_late_join_media=true");
+    let microphone = late
+        .publish_microphone(room, 48_000, 1, false)
+        .await
+        .expect("Late microphone failed");
+    assert_eq!(microphone.account_user_id(), carol.user_id);
+    write_owner(root, "group-audio-owner.json", &microphone, None);
+    let tone = NativeTone::with_frequency(microphone, 1700.0);
+    let screen = rtc
+        .publish_screen(room, 640, 360, false)
+        .await
+        .expect("Native screen publish failed");
+    assert_eq!(screen.account_user_id(), alice.user_id);
+    let (screen_sid, _) = timeout(Duration::from_secs(45), async {
+        loop {
+            if let Some(value) =
+                native_sender(rtc, room, livekit::track::TrackSource::Screenshare, None)
+            {
+                break value;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Actual screen sender cryptor missing");
+    write_owner(root, "screen-owner.json", &screen, Some(&screen_sid));
+    let screen = NativeScreen::start(screen);
+    write_marker(root.join("group-ready"), b"ready\n");
+    wait_for_marker(&root.join("group-observed.json")).await;
+    let before_leave = received_key(&root.join("group-observed.json"));
+    timeout(Duration::from_secs(45), async {
+        while native_sender(
+            rtc,
+            room,
+            livekit::track::TrackSource::Screenshare,
+            Some(&screen_sid),
+        )
+        .map(|(_, index)| index)
+            != Some(before_leave)
+        {
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Screen sender did not adopt the arrival key");
+    tone.finish().await;
+    late.leave(room).await.expect("Late-peer leave failed");
+    drop(late);
+    manager
+        .logout_account(&account.id)
+        .await
+        .expect("Late-peer logout failed");
+    manager.stop().await;
+    drop(manager);
+    fs::remove_dir_all(profile).expect("Cannot remove late-peer store");
+    timeout(Duration::from_secs(45), async {
+        while !exact_roster(rtc, room, &[&alice.user_id, &bob.user_id]) {
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Late-peer departure missing from native roster");
+    eprintln!("MORPHEUS_ELEMENT_CHECK native_group_departure=true");
+    wait_for_marker(&root.join("new-key-observed.json")).await;
+    let after_leave = received_key(&root.join("new-key-observed.json"));
+    assert_ne!(
+        after_leave, before_leave,
+        "Departure did not produce a new sender index"
+    );
+    timeout(Duration::from_secs(45), async {
+        while native_sender(
+            rtc,
+            room,
+            livekit::track::TrackSource::Screenshare,
+            Some(&screen_sid),
+        )
+        .map(|(_, index)| index)
+            != Some(after_leave)
+            || native_sender(
+                rtc,
+                room,
+                livekit::track::TrackSource::Microphone,
+                Some(&microphone_sid),
+            )
+            .map(|(_, index)| index)
+                != Some(after_leave)
+        {
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Actual same media senders did not adopt the departure key");
+    eprintln!("MORPHEUS_ELEMENT_CHECK native_key_rotation=true");
+    microphone.changed.store(true, Ordering::Release);
+    screen.changed.store(true, Ordering::Release);
+    write_marker(root.join("screen-changed"), b"changed\n");
+    wait_for_marker(&root.join("screen-change-observed")).await;
+    screen.finish().await;
 }
 
 #[derive(Deserialize)]
@@ -509,6 +922,23 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
 
     if let Some(root) = &stock_root {
         wait_for_marker(&root.join("browser-observed")).await;
+        let carol = fixture
+            .accounts
+            .iter()
+            .find(|account| account.label == "a_third_device")
+            .expect("Late group peer fixture missing");
+        group_and_screen(
+            &mut rtc,
+            root,
+            alice,
+            bob,
+            carol,
+            room_id,
+            outgoing_audio
+                .as_ref()
+                .expect("Original native microphone missing"),
+        )
+        .await;
     }
 
     write_marker(&done_path, b"leave\n");
