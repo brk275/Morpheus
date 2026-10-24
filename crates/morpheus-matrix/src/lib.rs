@@ -6,6 +6,10 @@
 
 #![recursion_limit = "512"]
 
+#[cfg(test)]
+#[path = "../../../vendor/matrix-sdk-ui/src/sync_service/owned_lifecycle.rs"]
+mod sdk_sync_lifecycle_contract;
+
 mod authentication;
 use authentication::{PendingSso, StoredSession};
 
@@ -1183,6 +1187,23 @@ struct SyncTask {
     task: JoinHandle<()>,
 }
 
+impl SyncTask {
+    /// Cancellation retains this exact handle and the once-only stop request.
+    /// The containing slot is taken only after this actual join returns.
+    fn request_stop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+
+    async fn stop(&mut self) {
+        self.request_stop();
+        if let Err(error) = (&mut self.task).await {
+            account_access::retain_join_panic(error);
+        }
+    }
+}
+
 /// Owns account switching and the sole live Matrix sync loop.
 ///
 /// `open` only reads the non-secret account list. Call `restore_last_active`
@@ -1495,7 +1516,7 @@ impl AccountManager {
             && state
                 .sync_task
                 .as_ref()
-                .is_some_and(|sync| !sync.task.is_finished())
+                .is_some_and(|sync| sync.shutdown.is_some() && !sync.task.is_finished())
         {
             // Re-selecting the active account is an explicit retry of any
             // room queue paused by a recoverable send error. No new message
@@ -3269,9 +3290,13 @@ impl AccountManager {
         // unknown, never as sent. Stale grants from an earlier selection die.
         {
             let mut gate = loaded.recovery_gate.lock().await;
-            if let Some(previous) = gate.scan.take() {
+            if let Some(previous) = gate.scan.as_mut() {
                 previous.abort();
+                if let Err(error) = previous.await {
+                    account_access::retain_join_panic(error);
+                }
             }
+            gate.scan.take();
             gate.epoch = gate.epoch.wrapping_add(1);
             gate.complete = false;
             gate.scanned.clear();
@@ -3495,12 +3520,7 @@ impl LoadedAccount {
     async fn stop_token_persistence(&self) {
         let mut slot = self.token_task.lock().await;
         if let Some(token_task) = slot.as_mut() {
-            if let Some(shutdown) = token_task.shutdown.take() {
-                let _ = shutdown.send(());
-            }
-            if let Err(error) = (&mut token_task.task).await {
-                account_access::retain_join_panic(error);
-            }
+            token_task.stop().await;
         }
         slot.take();
     }
@@ -4557,31 +4577,42 @@ fn start_event_cache(client: &Client) -> Result<()> {
 }
 
 async fn stop_sync(state: &mut State) {
+    // Publish stop intent synchronously, before any recovery/queue await. A
+    // cancelled pause cannot make a stopping owner pass the active shortcut.
+    if let Some(sync) = state.sync_task.as_mut() {
+        sync.request_stop();
+    }
     if let Some(loaded) = state
         .active_account_id
         .as_ref()
         .and_then(|id| state.loaded.get(id))
     {
         // Discovery must not enable the queue after this pause.
-        let scan = loaded.recovery_gate.lock().await.scan.take();
-        if let Some(scan) = scan {
-            scan.abort();
-            let _ = scan.await;
+        {
+            let mut gate = loaded.recovery_gate.lock().await;
+            if let Some(scan) = gate.scan.as_mut() {
+                scan.abort();
+                if let Err(error) = scan.await {
+                    account_access::retain_join_panic(error);
+                }
+            }
+            gate.scan.take();
         }
         // The SDK lets an already in-flight request finish, then holds all
         // later queued requests. This is the closest safe pause boundary.
         loaded.client.send_queue().set_enabled(false).await;
     }
-    if let Some(recovery) = state.queue_recovery_task.take() {
+    if let Some(recovery) = state.queue_recovery_task.as_mut() {
         recovery.abort();
-        let _ = recovery.await;
-    }
-    if let Some(mut sync) = state.sync_task.take() {
-        if let Some(shutdown) = sync.shutdown.take() {
-            let _ = shutdown.send(());
+        if let Err(error) = recovery.await {
+            account_access::retain_join_panic(error);
         }
-        let _ = sync.task.await;
     }
+    state.queue_recovery_task.take();
+    if let Some(sync) = state.sync_task.as_mut() {
+        sync.stop().await;
+    }
+    state.sync_task.take();
 }
 
 /// The pinned SDK pauses a room queue after a recoverable send error. Retry
@@ -4640,6 +4671,20 @@ async fn recover_room_queues(
                 }
             }
         }
+    }
+}
+
+/// Initial permit acquisition has no spawned children. Cancel its original
+/// start future on shutdown; any already-installed supervisor is then joined
+/// by the caller's service.stop(), including a start/stop readiness race.
+async fn start_sync_unless_stopped(
+    service: &SyncService,
+    shutdown: &mut oneshot::Receiver<()>,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown => false,
+        () = service.start() => true,
     }
 }
 
@@ -4717,7 +4762,11 @@ async fn run_sync(
         };
         if let Some(service) = service {
             let mut states = service.state();
-            service.start().await;
+            if !start_sync_unless_stopped(&service, &mut shutdown).await {
+                service.stop().await;
+                status.send_replace(SyncStatus::Stopped);
+                return;
+            }
             retry_seconds = 2;
             let mut should_fallback = false;
             loop {
@@ -4745,7 +4794,9 @@ async fn run_sync(
                                 _ = tokio::time::sleep(Duration::from_secs(retry_seconds)) => {},
                             }
                             retry_seconds = (retry_seconds * 2).min(60);
-                            service.start().await;
+                            if !start_sync_unless_stopped(&service, &mut shutdown).await {
+                                break;
+                            }
                         }
                         None => { should_fallback = true; break; }
                         Some(ServiceState::Error(e)) if service_error_is_unsupported(&e) => {
@@ -4763,7 +4814,9 @@ async fn run_sync(
                                 _ = tokio::time::sleep(Duration::from_secs(retry_seconds)) => {},
                             }
                             retry_seconds = (retry_seconds * 2).min(60);
-                            service.start().await;
+                            if !start_sync_unless_stopped(&service, &mut shutdown).await {
+                                break;
+                            }
                         }
                     },
                 }
@@ -5012,6 +5065,43 @@ async fn load_secret(id: &str, profile_lock: Arc<fs::File>) -> Result<StoredSecr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_sync_stop_retains_original_handle_and_does_not_resend_shutdown() {
+        use futures_util::FutureExt;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (shutdown, stopped) = oneshot::channel();
+            let (release, held) = oneshot::channel();
+            let (observed, request) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = stopped.await;
+                let _ = observed.send(());
+                let _ = held.await;
+            });
+            let original = task.id();
+            let mut slot = Some(SyncTask {
+                shutdown: Some(shutdown),
+                task,
+            });
+            let mut first = Box::pin(slot.as_mut().unwrap().stop());
+            let pending = first.as_mut().now_or_never().is_none();
+            drop(first);
+            let retained = slot.as_ref().map(|owner| owner.task.id());
+            let requested_once = slot.as_ref().unwrap().shutdown.is_none();
+            let actual_request = request.await.is_ok();
+            // Release and join the same worker before assertions can unwind.
+            let released = release.send(()).is_ok();
+            slot.as_mut().unwrap().stop().await;
+            slot.take();
+            assert!(pending && requested_once && actual_request && released);
+            assert_eq!(retained, Some(original));
+            assert!(slot.is_none());
+        });
+    }
 
     #[cfg(windows)]
     #[test]

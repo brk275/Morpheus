@@ -156,3 +156,16 @@ The actual presenter, finite native owner book, original native worker/TLS and
 supervisor joins, and all-platform shutdown must be integrated together. Linux
 daemon activation and exact reply-identity corrections remain mandatory inputs.
 A closed gate is not a native withdrawal or completion receipt.
+
+## Matrix SDK UI owned sync lifecycle amendment
+
+The existing same-revision `matrix-sdk-ui` 0.19.1 patch retains actual sync
+supervisor/child ownership across cancelled stops and waits for each pinned
+lazy stream's first actual poll before using its broadcast stop authority.
+Both original children are signalled before either is joined; later permit
+acquisition remains stoppable before spawning children. See that package's
+`MORPHEUS_PATCH.md` for the exact source scope, unchanged initial-permit
+contract, ordinary Matrix model regression route and historical OAuth-cause
+limitation. The original upstream inventory, license, manifests, features and
+locked dependencies are preserved. No source-only receipt establishes hosted
+OAuth, native lifecycle or release acceptance.

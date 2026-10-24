@@ -52,6 +52,9 @@ use crate::{
     },
 };
 
+mod owned_lifecycle;
+use owned_lifecycle::{SupervisorTask, after_first_poll, permit_or_stop, stop_children};
+
 /// Current state of the application.
 ///
 /// This is a high-level state indicating what's the status of the underlying
@@ -121,10 +124,11 @@ impl MaybeAcquiredPermit {
 /// allowing for them to be shutdown in unison.
 struct SyncTaskSupervisor {
     /// The supervising task that manages and contains the two sync child tasks.
-    task: JoinHandle<()>,
+    task: SupervisorTask,
     /// [`TerminationReport`] sender for the [`SyncTaskSupervisor::shutdown()`]
     /// function.
-    termination_sender: Sender<TerminationReport>,
+    termination_sender: Option<Sender<TerminationReport>>,
+    stop_requested: bool,
 }
 
 impl SyncTaskSupervisor {
@@ -136,7 +140,11 @@ impl SyncTaskSupervisor {
         let (task, termination_sender) =
             Self::spawn_supervisor_task(inner, room_list_service, encryption_sync_permit).await;
 
-        Self { task, termination_sender }
+        Self {
+            task: SupervisorTask::new(task),
+            termination_sender: Some(termination_sender),
+            stop_requested: false,
+        }
     }
 
     /// Check if a homeserver is reachable.
@@ -257,24 +265,51 @@ impl SyncTaskSupervisor {
 
         let future = async move {
             loop {
-                let (room_list_task, encryption_sync_task) = Self::spawn_child_tasks(
-                    room_list_service.clone(),
-                    encryption_sync.clone(),
-                    sync_permit_guard,
-                    sender.clone(),
-                    parent_span.clone(),
-                )
-                .await;
-
+                // Do not start either child while a retained/external owner
+                // holds the permit. A queued stop still ends this startup.
+                let permit = match permit_or_stop(sync_permit_guard.acquire(), async {
+                    loop {
+                        let report = receiver
+                            .recv()
+                            .await
+                            .unwrap_or_else(TerminationReport::supervisor_error);
+                        if matches!(report.origin, TerminationOrigin::Supervisor) {
+                            break report;
+                        }
+                        // Both prior-iteration children have already joined.
+                    }
+                })
+                .await
+                {
+                    Either::Left(permit) => permit,
+                    Either::Right(report) => {
+                        if let Some(error) = report.error {
+                            state.set(State::Error(Arc::new(error)));
+                        } else {
+                            state.set(State::Idle);
+                        }
+                        break;
+                    }
+                };
+                let (room_list_task, encryption_sync_task, room_ready, encryption_ready) =
+                    Self::spawn_child_tasks(
+                        room_list_service.clone(),
+                        encryption_sync.clone(),
+                        permit,
+                        sender.clone(),
+                        parent_span.clone(),
+                    );
                 sync_permit_guard = MaybeAcquiredPermit::Unacquired(encryption_sync_permit.clone());
 
-                let report = if let Some(report) = receiver.recv().await {
-                    report
-                } else {
-                    info!("internal channel has been closed?");
-                    // We should still stop the child tasks in the unlikely
-                    // scenario that our receiver died.
+                // These exact lazy wrappers synchronously subscribe to the
+                // SlidingSync stop channel before their first awaited operation.
+                // Keep both original handles while observing both actual polls.
+                let (room_ready, encryption_ready) =
+                    futures_util::future::join(room_ready, encryption_ready).await;
+                let report = if room_ready.is_err() || encryption_ready.is_err() {
                     TerminationReport::supervisor_error()
+                } else {
+                    receiver.recv().await.unwrap_or_else(TerminationReport::supervisor_error)
                 };
 
                 // If one service failed, make sure to request stopping the
@@ -290,32 +325,34 @@ impl SyncTaskSupervisor {
                 // their infinite loops, and their tasks will gracefully
                 // terminate.
 
-                if stop_room_list {
-                    if let Err(err) = room_list_service.stop_sync() {
-                        warn!(?report, "unable to stop room list service: {err:#}");
-                    }
-
-                    if report.has_expired() {
-                        room_list_service.expire_sync_session().await;
-                    }
-                }
-
-                if let Err(err) = room_list_task.await {
-                    error!("when awaiting room list service: {err:#}");
-                }
-
-                if stop_encryption {
-                    if let Err(err) = encryption_sync.stop_sync() {
-                        warn!(?report, "unable to stop encryption sync: {err:#}");
-                    }
-
-                    if report.has_expired() {
-                        encryption_sync.expire_sync_session().await;
-                    }
-                }
-
-                if let Err(err) = encryption_sync_task.await {
-                    error!("when awaiting encryption sync: {err:#}");
+                let children_joined = stop_children(
+                    room_list_task,
+                    encryption_sync_task,
+                    || {
+                        if stop_room_list && room_list_service.stop_sync().is_err() {
+                            warn!("unable to signal room list sync stop");
+                        }
+                    },
+                    || {
+                        if stop_encryption && encryption_sync.stop_sync().is_err() {
+                            warn!("unable to signal encryption sync stop");
+                        }
+                    },
+                    async {
+                        if report.has_expired() {
+                            if stop_room_list {
+                                room_list_service.expire_sync_session().await;
+                            }
+                            if stop_encryption {
+                                encryption_sync.expire_sync_session().await;
+                            }
+                        }
+                    },
+                )
+                .await;
+                if !children_joined {
+                    state.set(State::Error(Arc::new(Error::Supervisor)));
+                    break;
                 }
 
                 if let Some(error) = report.error {
@@ -354,16 +391,23 @@ impl SyncTaskSupervisor {
         (task, termination_sender)
     }
 
-    async fn spawn_child_tasks(
+    fn spawn_child_tasks(
         room_list_service: Arc<RoomListService>,
         encryption_sync_service: Arc<EncryptionSyncService>,
-        sync_permit_guard: MaybeAcquiredPermit,
+        sync_permit_guard: OwnedMutexGuard<EncryptionSyncPermit>,
         sender: Sender<TerminationReport>,
         parent_span: Span,
-    ) -> (JoinHandle<()>, JoinHandle<()>) {
+    ) -> (
+        JoinHandle<()>,
+        JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (room_started, room_ready) = tokio::sync::oneshot::channel();
+        let (encryption_started, encryption_ready) = tokio::sync::oneshot::channel();
         // First, take care of the room list.
         let room_list_task = spawn(
-            Self::room_list_sync_task(room_list_service, sender.clone())
+            Self::room_list_sync_task(room_list_service, sender.clone(), room_started)
                 .instrument(parent_span.clone()),
         );
 
@@ -372,20 +416,23 @@ impl SyncTaskSupervisor {
             Self::encryption_sync_task(
                 encryption_sync_service,
                 sender.clone(),
-                sync_permit_guard.acquire().await,
+                sync_permit_guard,
+                encryption_started,
             )
             .instrument(parent_span),
         );
 
-        (room_list_task, encryption_sync_task)
+        (room_list_task, encryption_sync_task, room_ready, encryption_ready)
     }
 
     async fn encryption_sync_task(
         encryption_sync: Arc<EncryptionSyncService>,
         sender: Sender<TerminationReport>,
         sync_permit_guard: OwnedMutexGuard<EncryptionSyncPermit>,
+        started: tokio::sync::oneshot::Sender<()>,
     ) {
-        let encryption_sync_stream = encryption_sync.sync(sync_permit_guard);
+        let encryption_sync_stream =
+            after_first_poll(encryption_sync.sync(sync_permit_guard), started);
         pin_mut!(encryption_sync_stream);
 
         let termination_report = loop {
@@ -420,8 +467,9 @@ impl SyncTaskSupervisor {
     async fn room_list_sync_task(
         room_list_service: Arc<RoomListService>,
         sender: Sender<TerminationReport>,
+        started: tokio::sync::oneshot::Sender<()>,
     ) {
-        let room_list_stream = room_list_service.sync();
+        let room_list_stream = after_first_poll(room_list_service.sync(), started);
         pin_mut!(room_list_stream);
 
         let termination_report = loop {
@@ -453,26 +501,18 @@ impl SyncTaskSupervisor {
         }
     }
 
-    async fn shutdown(self) {
-        match self.termination_sender.send(TerminationReport::supervisor()).await {
-            Ok(_) => {
-                let _ = self.task.await.inspect_err(|err| {
-                    // A `JoinError` indicates that the task was already dead,
-                    // either because it got cancelled or because it panicked.
-                    // We only cancel the task in the Err branch below and the
-                    // task shouldn't be able to panic.
-                    //
-                    // So let's log an error and return.
-                    error!("The supervisor task has stopped unexpectedly: {err:?}");
-                });
-            }
-            Err(err) => {
-                error!("Couldn't send the termination report to the supervisor task: {err}");
-                // Let's abort the task if it won't shut down properly,
-                // otherwise we would have left it as a detached task.
-                self.task.abort();
+    async fn shutdown(&mut self) -> bool {
+        self.stop_requested = true;
+        if let Some(sender) = self.termination_sender.as_ref() {
+            let requested = sender.send(TerminationReport::supervisor()).await;
+            // A cancelled send has not returned, so retains this exact sender.
+            // After an admitted send, never enqueue a duplicate stop on retry.
+            self.termination_sender.take();
+            if requested.is_err() {
+                trace!("sync supervisor stop channel already closed; joining original task");
             }
         }
+        self.task.join().await
     }
 }
 
@@ -511,6 +551,11 @@ impl SyncServiceInner {
     ) {
         trace!("starting sync service");
 
+        // Idle/Terminated/Error may still own an unobserved supervisor after
+        // a cancelled stop. Retire that SAME owner before installing another.
+        if self.supervisor.is_some() {
+            self.stop().await;
+        }
         self.supervisor =
             Some(SyncTaskSupervisor::new(self, room_list_service, encryption_sync_permit).await);
         self.state.set(State::Running);
@@ -519,10 +564,13 @@ impl SyncServiceInner {
     async fn stop(&mut self) {
         trace!("pausing sync service");
 
-        // Remove the supervisor from our state and request the tasks to be
-        // shutdown.
-        if let Some(supervisor) = self.supervisor.take() {
-            supervisor.shutdown().await;
+        // Cancellation keeps the same supervisor, admitted stop and handle.
+        if let Some(supervisor) = self.supervisor.as_mut() {
+            let joined = supervisor.shutdown().await;
+            self.supervisor.take();
+            if !joined {
+                self.state.set(State::Error(Arc::new(Error::Supervisor)));
+            }
         } else {
             error!("The sync service was not properly started, the supervisor task doesn't exist");
         }
@@ -642,7 +690,13 @@ impl SyncService {
         // mode.
         match inner.state.get() {
             // If we're already running, there's nothing to do.
-            State::Running => {}
+            State::Running
+                if !inner.supervisor.as_ref().is_some_and(|owner| owner.stop_requested) => {}
+            State::Running => {
+                inner
+                    .restart(self.room_list_service.clone(), self.encryption_sync_permit.clone())
+                    .await
+            }
             // If we're in the offline mode, first stop the service and then start it again.
             State::Offline => {
                 inner
@@ -668,11 +722,11 @@ impl SyncService {
         let mut inner = self.inner.lock().await;
 
         match inner.state.get() {
-            State::Idle | State::Terminated | State::Error(_) => {
-                // No need to stop if we were not running.
+            State::Idle | State::Terminated | State::Error(_) if inner.supervisor.is_none() => {
                 return;
             }
-            State::Running | State::Offline => {}
+            State::Idle | State::Terminated | State::Error(_) | State::Running | State::Offline => {
+            }
         }
 
         inner.stop().await;
