@@ -249,6 +249,8 @@ OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_accep
                            "registration_command", "registration_exit_two", "registration_exit_exec", "registration_exit_other",
                            "logout_timeout", "logout_operation", "logout_remote", "logout_account",
                            "logout_vault_lookup", "logout_vault_retained",
+                           "sync_pause_selection", "sync_pause_timeout", "sync_pause_operation",
+                           "delegated_session_missing", "access_token_missing", "refresh_token_missing",
                            "browser_callback_fragment", "browser_callback_query", "browser_callback_state",
                            "browser_callback_code", "browser_oauth_access_denied", "browser_oauth_login_required",
                            "browser_oauth_consent_required", "browser_oauth_interaction_required",

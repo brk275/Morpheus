@@ -108,3 +108,41 @@ are added to `modified_upstream_files` in `MORPHEUS_PROVENANCE.json`; their
 upstream records and `UPSTREAM_FILES.sha256` are unchanged. No dependency,
 feature, lockfile, workflow or scanner setting changes. Hosted unit and
 integration verification are required before this patch is accepted.
+
+## Owned sync startup and shutdown
+
+`src/sync_service.rs` keeps the original supervisor handle until its actual
+join, including after a cancelled stop or a terminal state publication. Stop
+intent and completed channel submission are distinct; a cancelled submission
+retains the same sender, and restart first joins the original stopping owner.
+
+Both child streams acknowledge their first actual poll through the local
+`src/sync_service/owned_lifecycle.rs` helper. In these exact pinned wrappers,
+that poll constructs `SlidingSync::sync()` and its stop receiver before any
+await. The helper preserves the first item, error, EOF or Pending. The
+supervisor waits for both receipts, signals both required stops before any
+expiration or join, and actually joins both original children even when one
+failed. A later encryption-permit wait is stop-selectable before either child
+is spawned; the initial start still acquires the permit before returning.
+
+The same helper source is included only in Morpheus Matrix unit tests, in the
+existing configuration/Matrix/RTC model step. Its deterministic tests use
+local streams, channels, mutex permits and retained Tokio handles, with no
+server, credential, device or extra dependency. Morpheus also retains its
+original sync/recovery handles through cancelled joins, makes the initial and
+retry SDK starts shutdown-selectable, and excludes stopping owners from its
+already-active shortcut. No authentication, protocol, retry budget, deadline,
+feature, manifest, lockfile, workflow or incoming-call policy changes.
+
+The Linux OAuth restore run reported successful restore and authenticated
+identity, then failed before its next phase. Its final marker cannot separate
+the pause boundary from token extraction. This patch corrects a source-proven
+lazy stop-subscription race and cancellation ownership gaps; it does not
+establish that those gaps caused that historical run or claim runtime success.
+Independent source review and affected fresh hosted verification remain required.
+
+Native join failure is cached before handling its panic payload. Ordinary
+`String` and `&'static str` payloads are dropped safely; unknown custom
+destructors are contained so they cannot panic across the sibling join.
+Repeated unknown custom panics have no process-lifetime retained-memory bound;
+this amendment adds no quarantine registry or claim of such a bound.

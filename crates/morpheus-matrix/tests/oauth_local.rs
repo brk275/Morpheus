@@ -51,6 +51,27 @@ fn browser_failure_marker(line: &str) -> Option<&'static str> {
         .find(|known| *known == value)
 }
 
+// Only exact local static errors can become public failure codes. Unknown
+// errors retain the existing generic category without reflecting their text.
+fn failure_code(error: &'static str) -> &'static str {
+    match error {
+        value if BROWSER_FAILURES.contains(&value) => value,
+        "OAuth selected account unavailable" => "sync_pause_selection",
+        "OAuth sync pause timed out" => "sync_pause_timeout",
+        "OAuth sync pause failed" => "sync_pause_operation",
+        "login did not create a delegated OAuth session" => "delegated_session_missing",
+        "session has no tokens" => "access_token_missing",
+        "delegated session has no refresh token" => "refresh_token_missing",
+        "OAuth logout timed out" => "logout_timeout",
+        "OAuth logout failed" => "logout_operation",
+        "OAuth remote logout failed" => "logout_remote",
+        "OAuth logout did not remove the account" => "logout_account",
+        "vault entry lookup failed" => "logout_vault_lookup",
+        "OAuth logout retained the vault credential" => "logout_vault_retained",
+        _ => "rust_acceptance",
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Stage {
     FixtureLoad,
@@ -608,16 +629,7 @@ fn delegated_oauth_success_refresh_and_vaulted_restart() {
         })
     })();
     if let Err(error) = result {
-        let failure = match error {
-            value if BROWSER_FAILURES.contains(&value) => value,
-            "OAuth logout timed out" => "logout_timeout",
-            "OAuth logout failed" => "logout_operation",
-            "OAuth remote logout failed" => "logout_remote",
-            "OAuth logout did not remove the account" => "logout_account",
-            "vault entry lookup failed" => "logout_vault_lookup",
-            "OAuth logout retained the vault credential" => "logout_vault_retained",
-            _ => "rust_acceptance",
-        };
+        let failure = failure_code(error);
         println!("\nMORPHEUS_OAUTH_FAILURE {failure}");
     }
     // Only our static stage identifiers can reach a panic/public test output.
@@ -633,6 +645,33 @@ fn browser_failure_diagnostics_only_forward_exact_fixed_codes() {
         browser_failure_marker("MORPHEUS_OAUTH_FAILURE browser_callback_state"),
         Some("browser_callback_state")
     );
+    for (error, code) in [
+        ("OAuth selected account unavailable", "sync_pause_selection"),
+        ("OAuth sync pause timed out", "sync_pause_timeout"),
+        ("OAuth sync pause failed", "sync_pause_operation"),
+        (
+            "login did not create a delegated OAuth session",
+            "delegated_session_missing",
+        ),
+        ("session has no tokens", "access_token_missing"),
+        ("delegated session has no refresh token", "refresh_token_missing"),
+        ("OAuth logout timed out", "logout_timeout"),
+        ("OAuth logout failed", "logout_operation"),
+        ("OAuth remote logout failed", "logout_remote"),
+        ("OAuth logout did not remove the account", "logout_account"),
+        ("vault entry lookup failed", "logout_vault_lookup"),
+        ("OAuth logout retained the vault credential", "logout_vault_retained"),
+        ("browser_callback_state", "browser_callback_state"),
+    ] {
+        assert_eq!(failure_code(error), code);
+    }
+    for error in [
+        "OAuth sync pause failed private-value",
+        "session has no tokens private-value",
+        "https://example.org/callback?code=private",
+    ] {
+        assert_eq!(failure_code(error), "rust_acceptance");
+    }
     for line in [
         "MORPHEUS_OAUTH_FAILURE browser_callback_state private-value",
         "MORPHEUS_OAUTH_FAILURE unknown_provider_error",
