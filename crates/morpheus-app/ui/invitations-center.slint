@@ -4,6 +4,7 @@
 // this file only presents it and reports choices.
 
 import { ListView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
 import { NotificationPalette, RuleAction, RuleOption } from "notification-settings.slint";
 
 // One invitation. Every text is sanitized in Rust and shows only what the
@@ -81,6 +82,8 @@ export component InvitationsCenter inherits Rectangle {
     in property <NotificationPalette> palette;
     in property <float> text-scale: 1;
     in property <length> radius: 10px;
+    // Inner cards keep their own proportion when the modal uses a larger outer corner.
+    in property <length> content-corner: root.radius * 0.8;
     in property <bool> live;
     in property <string> account-handle;
     // The window's size; the center never grows past it.
@@ -181,7 +184,7 @@ export component InvitationsCenter inherits Rectangle {
     height: min(root.available-height - 24px, max(420px, 360px * root.text-scale + 160px));
     clip: true;
     border-radius: root.radius;
-    border-width: 1px;
+    border-width: StyleTokens.line-width;
     border-color: root.palette.divider;
     background: root.palette.elevated;
     accessible-role: region;
@@ -242,9 +245,9 @@ export component InvitationsCenter inherits Rectangle {
                     spacing: 10px;
                     search-box := Rectangle {
                         height: max(38px, 26px * root.text-scale);
-                        border-radius: 8px;
+                        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-corner : root.content-corner;
                         background: root.palette.panel;
-                        border-width: 1px;
+                        border-width: StyleTokens.line-width;
                         border-color: search-input.has-focus ? root.palette.accent : root.palette.divider;
                         // Arrows, Page Up and Page Down move the highlight before the
                         // field edits with them.
@@ -372,8 +375,8 @@ export component InvitationsCenter inherits Rectangle {
                         property <bool> highlighted: row == InvitationsState.index;
                         width: list.visible-width;
                         height: root.row-height;
-                        border-radius: 8px;
-                        border-width: self.highlighted ? 1px : 0px;
+                        border-radius: root.content-corner;
+                        border-width: self.highlighted ? StyleTokens.line-width : 0px;
                         border-color: root.palette.accent;
                         background: self.highlighted ? root.palette.selection : transparent;
                         accessible-role: list-item;
@@ -518,9 +521,9 @@ export component InvitationsCenter inherits Rectangle {
                         }
                     }
                     if InvitationsState.bulk-count > 0: confirm-box := Rectangle {
-                        border-radius: 8px;
+                        border-radius: root.content-corner;
                         background: root.palette.panel;
-                        border-width: 1px;
+                        border-width: StyleTokens.line-width;
                         border-color: root.palette.error;
                         height: confirm-layout.preferred-height;
                         // An unanswered confirmation expires; Rust refuses a late one too.

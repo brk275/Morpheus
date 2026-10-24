@@ -9,3 +9,6 @@ Startup/unregistered/missing/reentrant/backend/panic uncertainty refuses. Actual
 This patch does not establish full native/app notification retirement, all Rust destructors or OS callbacks, real device behavior, actual Cmd-Q/Dock/logout/modal success, installation/update acceptance, signing, or distribution readiness. The coherent app main/lease/runtime/notification source cohort and independent unsafe/supply-chain review are required before any execution. Tests here exercise actual protocol state only and do not call AppKit.
 
 Original license text is unchanged. This explanation is corresponding-source provenance, not invented license text or a legal/relink/native SDK acceptance claim. Root excludes this same-version dependency from workspace development feature resolution and retains all original development metadata in the two original manifest copies and upstream lock. The omitted development tools serve preserved upstream examples/integration targets; those targets are not selected or claimed verified by the four exact managed Mac library regressions. Actual Cmd-Q/Dock/modal/logout behavior remains a separate acceptance gate.
+
+The public macOS termination API uses the existing `platform_impl::termination`
+re-export. The internal `platform` alias retains its original visibility.

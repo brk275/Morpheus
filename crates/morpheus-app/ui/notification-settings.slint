@@ -698,9 +698,9 @@ export component NotificationRules inherits VerticalLayout {
         spacing: 8px;
         Rectangle {
             horizontal-stretch: 1;
-            border-radius: 8px;
+            border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-corner : root.radius * 0.8;
             background: root.palette.panel;
-            border-width: 1px;
+            border-width: StyleTokens.line-width;
             border-color: keyword-input.has-focus ? root.palette.accent : root.palette.divider;
             keyword-input := TextInput {
                 x: 10px;
@@ -762,7 +762,7 @@ export component NotificationRules inherits VerticalLayout {
     }
     for keyword in NotificationRulesState.keywords: Rectangle {
         min-height: max(36px, 26px * root.text-scale);
-        border-radius: 8px;
+        border-radius: root.radius * 0.8;
         background: root.palette.elevated;
         HorizontalLayout {
             padding-left: 12px;
@@ -837,9 +837,9 @@ export component NotificationRules inherits VerticalLayout {
     }
     Rectangle {
         height: max(38px, 26px * root.text-scale);
-        border-radius: 8px;
+        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-corner : root.radius * 0.8;
         background: root.palette.panel;
-        border-width: 1px;
+        border-width: StyleTokens.line-width;
         border-color: search-input.has-focus ? root.palette.accent : root.palette.divider;
         search-input := TextInput {
             x: 10px;
@@ -1073,7 +1073,7 @@ export component RoomNotificationPanel inherits Rectangle {
     height: min(root.natural-height, max(min(root.natural-height, 160px), root.available-height));
     clip: true;
     border-radius: root.radius;
-    border-width: 1px;
+    border-width: StyleTokens.line-width;
     border-color: root.palette.divider;
     background: root.palette.elevated;
     accessible-role: region;

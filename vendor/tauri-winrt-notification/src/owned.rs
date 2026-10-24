@@ -287,7 +287,7 @@ impl CallbackState {
         let Ok(arguments) = args.Arguments() else {
             return Response::Dismissed(None);
         };
-        let units = arguments.as_wide();
+        let units: &[u16] = &arguments;
         if units.is_empty() {
             return Response::Default;
         }
@@ -412,7 +412,10 @@ impl NativeOwner {
                 template.Activated(owner.activated.as_ref().expect("owned activation delegate"))?,
             );
             let state = Arc::clone(&owner.callbacks);
-            owner.dismissed = Some(TypedEventHandler::new(move |_, args| {
+            owner.dismissed = Some(TypedEventHandler::<
+                ToastNotification,
+                ToastDismissedEventArgs,
+            >::new(move |_, args| {
                 state.deliver(|| {
                     Response::Dismissed(args.as_ref().and_then(|args| args.Reason().ok()))
                 });

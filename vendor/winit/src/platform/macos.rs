@@ -531,7 +531,7 @@ pub enum OptionAsAlt {
 }
 /// Opt-in owned application termination using Winit's existing delegate.
 /// Registration does not replace the delegate or replay a nested event loop.
-pub use crate::platform_impl::platform::termination::{
+pub use crate::platform_impl::termination::{
     install_application_termination_handler, ApplicationTerminationHandler,
     ApplicationTerminationInstallError, ApplicationTerminationProgress,
     ApplicationTerminationRequest,
