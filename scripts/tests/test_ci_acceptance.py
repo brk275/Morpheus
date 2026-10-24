@@ -156,6 +156,23 @@ class AcceptanceTests(unittest.TestCase):
             changed["compile"]["result"] = outcome
             self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
 
+    def test_element_interop_is_partial_and_requires_the_selected_linux_result(self):
+        value = snapshot(True, platforms=["ubuntu-24.04"], wayland=False)
+        value["scope"]["outputs"].update(manual="true", manual_platform="linux",
+                                         check_route="matrix", matrix_suite="element-interop")
+        self.assertIsNone(acceptance_error(value, "workflow_dispatch"))
+        self.assertIsNotNone(acceptance_error(value, "pull_request"))
+        self.assertIsNotNone(acceptance_error(value, "push"))
+        for key, bad in (("manual_platform", "all"), ("check_route", "all"),
+                         ("matrix_suite", "element-interop-extra"), ("wayland", "true")):
+            changed = json.loads(json.dumps(value))
+            changed["scope"]["outputs"][key] = bad
+            self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
+        for outcome in ("skipped", "failure", "cancelled", "neutral", None):
+            changed = json.loads(json.dumps(value))
+            changed["compile"]["result"] = outcome
+            self.assertIsNotNone(acceptance_error(changed, "workflow_dispatch"))
+
     def test_selected_wayland_requires_linux_native_job(self):
         self.assertIsNone(acceptance_error(snapshot(True, wayland=True)))
         self.assertIsNone(acceptance_error(snapshot(True, platforms=["ubuntu-24.04"], wayland=True)))

@@ -301,7 +301,7 @@ class ScopeTests(unittest.TestCase):
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "media-only", "app-timeline",
-                                         "outgoing-ring", "native-call", "oauth-only", "rtc-recovery"})
+                                         "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop"})
         source = ast.parse((Path(__file__).resolve().parents[1]/"run_matrix_acceptance.py").read_text())
         suites = [node.value for node in source.body if isinstance(node,ast.Assign)
                   and any(isinstance(target,ast.Name) and target.id=="SUITES" for target in node.targets)]
@@ -320,6 +320,18 @@ class ScopeTests(unittest.TestCase):
             self.assertEqual(selected["matrix_suite"], suite)
             self.assertEqual(selected["native_matrix"], {"os": ["ubuntu-24.04"]})
             self.assertFalse(selected["wayland"])
+
+    def test_element_interop_requires_explicit_linux_matrix_selection(self):
+        inputs = {"platform": "linux", "checks": "matrix", "matrix_suite": "element-interop"}
+        self.assertEqual(event_selection({"inputs": inputs}, "workflow_dispatch"), {
+            "native": True, "native_matrix": {"os": ["ubuntu-24.04"]}, "config": False,
+            "wayland": False, "manual": True, "manual_platform": "linux",
+            "check_route": "matrix", "matrix_suite": "element-interop",
+        })
+        for change in ({"platform": "all"}, {"platform": "windows"}, {"checks": "all"},
+                       {"checks": "helpers"}, {"matrix_suite": "element-interop-extra"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                event_selection({"inputs": inputs | change}, "workflow_dispatch")
 
     def test_invalid_or_incompatible_manual_inputs_cannot_select_arbitrary_runner_or_command(self):
         values = ({"platform": "self-hosted"}, {"platform": "ubuntu-24.04"}, {"checks": "skip"},
