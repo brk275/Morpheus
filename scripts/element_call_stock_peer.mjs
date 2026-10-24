@@ -411,7 +411,7 @@ async function main() {
               const decoded = changed ? black(top) && white(bottom) : white(top) && black(bottom);
               consecutive = decoded ? consecutive + 1 : 0;
               if (consecutive >= 3) return;
-            }
+            } else consecutive = 0;
           } else consecutive = 0;
           await new Promise((resolve) => setTimeout(resolve, 200));
         }
