@@ -132,3 +132,61 @@ capture run was performed. Hosted build/link/origin/capture evidence remains
 required, as do the separate physical-device and compositor release gates.
 Re-review the archive and remove or adapt this patch when upstream eliminates
 the public stub collision; never broaden the digest check as a fallback.
+
+## Notices from the pinned native archives
+
+The four `LICENSE.libwebrtc-*.md` files preserve the unmodified `LICENSE.md`
+member of each supported pinned native release archive. They add the native
+component notices to the existing wrapper attribution. Source-based packaging can include these committed license files without
+executing the archives. Their presence does not prove that a particular
+installer carries the notices.
+
+Each source archive is from the `webrtc-51ef663` release, authenticated against
+`vendor/webrtc-sys-build/src/pins.rs` before reading its notice. The exact inputs
+are recorded below.
+
+- `LICENSE.libwebrtc-linux-x64-release.md`
+
+  Source: [linux-x64-release/LICENSE.md](https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-linux-x64-release.zip)
+
+  Archive: `149683670` bytes, SHA-256
+  `dce9d9414cd8e2cc9a471c054481851b257ad2a879112ce5be56369b4fefdaed`.
+
+  Unmodified notice: `176356` bytes, SHA-256
+  `babbfff10dadd0c657bde5e5e2b83eece9ef8cee4e3b35d1c2db514a84587284`.
+
+- `LICENSE.libwebrtc-mac-arm64-release.md`
+
+  Source: [mac-arm64-release/LICENSE.md](https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-mac-arm64-release.zip)
+
+  Archive: `265849959` bytes, SHA-256
+  `f9be49b9fee9cd1588da8a40c85bda21f5ea49c4ed82662dc889b1c919569a08`.
+
+  Unmodified notice: `178927` bytes, SHA-256
+  `f85e1d2d1706111522d29b3cdfc2c180bd1afd3d6735901b1e6b9e420a731163`.
+
+- `LICENSE.libwebrtc-mac-x64-release.md`
+
+  Source: [mac-x64-release/LICENSE.md](https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-mac-x64-release.zip)
+
+  Archive: `223690324` bytes, SHA-256
+  `171f1ba0866e5947e0d420ecc1c33814476e1919131b81bb87c8729d45d72127`.
+
+  Unmodified notice: `212865` bytes, SHA-256
+  `1ded950864279f62b36a98de2b7b15f9ef38c0555dd1d1c3484d3b9f724a873f`.
+
+- `LICENSE.libwebrtc-win-x64-release.md`
+
+  Source: [win-x64-release/LICENSE.md](https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-win-x64-release.zip)
+
+  Archive: `110167699` bytes, SHA-256
+  `0a56a5c91b3b7b4222082b8a09388d16a802cde22d67295beb24c55700755b30`.
+
+  Unmodified notice: `197167` bytes, SHA-256
+  `7b039d5e54336caa5bbb4d228ded62db5f686d9d3258def87c2146eeaa3cf5ef`.
+
+These notices identify the pinned archive texts. They do not establish which
+archive or custom build supplied a particular package, complete matching native
+preferred source, or permission to distribute a release. Custom SDK builds need
+their own notice and source evidence. The existing linked-input, source,
+relinking, attribution and distribution checks remain required.
