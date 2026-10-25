@@ -18,7 +18,9 @@ use matrix_sdk::{
     room::MessagesOptions,
     ruma::events::room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
 };
-use morpheus_rtc::{AudioDeviceSelection, I420Buffer, Publication, VideoFrame, VideoRotation};
+use morpheus_rtc::{
+    AudioDeviceSelection, I420Buffer, MediaError, Publication, VideoFrame, VideoRotation,
+};
 use tokio::sync::broadcast;
 
 use crate::{
@@ -44,6 +46,31 @@ fn stage(name: &'static str) {
 
 fn fact(name: &'static str) {
     eprintln!("\nMORPHEUS_RTC_OUTAGE_CHECK {name}=true");
+}
+
+// Fixed source categories only: never format a media/SDK error or peer identity.
+fn media_failure(site: &'static str) {
+    eprintln!("\nMORPHEUS_RTC_OUTAGE_MEDIA_FAILURE {site}");
+}
+
+fn video_push_failure(error: MediaError) {
+    let site = match error {
+        MediaError::NotJoined => "push_not_joined",
+        MediaError::InvalidFormat => "push_invalid_format",
+        MediaError::FrameFormatMismatch => "push_frame_format_mismatch",
+        MediaError::InvalidVideoPlanes => "push_invalid_video_planes",
+        MediaError::WrongMediaKind => "push_wrong_media_kind",
+        MediaError::CallEnded => "push_call_ended",
+        MediaError::WrongCall => "push_wrong_call",
+        MediaError::ControlNotRunning => "push_control_not_running",
+        MediaError::ControlAlreadyRunning => "push_control_already_running",
+        MediaError::MicrophoneUnavailable => "push_microphone_unavailable",
+        MediaError::SpeakerUnavailable => "push_speaker_unavailable",
+        MediaError::Device(_) => "push_device",
+        MediaError::Call(_) => "push_call",
+        MediaError::Transport(_) => "push_transport",
+    };
+    media_failure(site);
 }
 
 #[derive(Clone, Copy)]
@@ -752,12 +779,14 @@ impl OutageSession {
                         let level = (if recovered { 180u8 } else { 45 }) + index as u8 * 12;
                         peer.publication
                             .as_ref()
-                            .ok_or(())?
+                            .ok_or_else(|| media_failure("publication_missing"))?
                             .push_video(frame(sequence, level))
-                            .map_err(|_| ())?;
+                            .map_err(video_push_failure)?;
                     }
                 }
-                sequence = sequence.checked_add(1).ok_or(())?;
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| media_failure("sequence_overflow"))?;
                 let snapshot = video.borrow_and_update().clone();
                 if let VideoUpdate::Stage { token, stage } = snapshot {
                     if token == generation && old_presentation != Some(stage.presentation) {
@@ -778,8 +807,14 @@ impl OutageSession {
                                 if index == owner {
                                     continue;
                                 }
-                                let info = peer.info.as_ref().ok_or(())?;
-                                let account = peer.account.as_ref().ok_or(())?;
+                                let info = peer
+                                    .info
+                                    .as_ref()
+                                    .ok_or_else(|| media_failure("peer_info_missing"))?;
+                                let account = peer
+                                    .account
+                                    .as_ref()
+                                    .ok_or_else(|| media_failure("peer_account_missing"))?;
                                 if tile.user_id == account.user_id
                                     && tile.key.member_id == info.membership_id
                                 {
@@ -789,7 +824,10 @@ impl OutageSession {
                                     let Some(frame_slot) = tile.frame_slot else {
                                         continue;
                                     };
-                                    let slot = stage.frames.get(frame_slot).ok_or(())?;
+                                    let slot = stage
+                                        .frames
+                                        .get(frame_slot)
+                                        .ok_or_else(|| media_failure("frame_slot_invalid"))?;
                                     if slot.epoch == 0 || slot.sequence == 0 {
                                         continue;
                                     }
@@ -850,18 +888,20 @@ impl OutageSession {
                                     })
                             });
                             if complete {
-                                require(case.dm == (matched.len() == 1))?;
+                                require(case.dm == (matched.len() == 1))
+                                    .map_err(|()| media_failure("participant_count"))?;
                                 return Ok::<_, ()>(stage.presentation);
                             }
                         }
                     }
                 }
-                require(self.calls.video_token() == generation)?;
+                require(self.calls.video_token() == generation)
+                    .map_err(|()| media_failure("generation_changed"))?;
                 time::sleep(Duration::from_millis(67)).await;
             }
         })
         .await
-        .map_err(|_| ())?
+        .map_err(|_| media_failure("deadline"))?
     }
 
     async fn key_receipts(

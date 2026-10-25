@@ -2496,6 +2496,7 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                        output + "MORPHEUS_RTC_OUTAGE_CHECK private_payload=true\n",
                        output + "MORPHEUS_RTC_OUTAGE_STAGE private_payload\n",
                        output + "MORPHEUS_RTC_OUTAGE_FAILURE outcome=error call=joined\n",
+                       output + "MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE push_transport\n",
                        "Skipped live fixture\n" + output, self.output("room" if target == "dm" else "dm")]
             for name in expected:
                 marker = f"MORPHEUS_RTC_OUTAGE_CHECK {name}=true"
@@ -2521,6 +2522,14 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                     valid.replace("error", "private"), valid.replace("failed", "private"),
                     valid.rstrip() + " reason=private\n"):
             self.assertEqual(acceptance_module.outage_diagnostics(raw), {"failure": "invalid"})
+        for site in acceptance_module.OUTAGE_MEDIA_FAILURE_SITES:
+            marker = f"MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE {site}\n"
+            self.assertEqual(acceptance_module.outage_diagnostics(marker), {"media_failure": site})
+        marker = "MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE push_transport\n"
+        for raw in (marker + marker, marker + "MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE private_payload\n",
+                    marker.replace("push_transport", "private_payload"), marker.rstrip() + " private_payload\n",
+                    "MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE\n"):
+            self.assertEqual(acceptance_module.outage_diagnostics(raw), {"media_failure": "invalid"})
         self.assertEqual(acceptance_module.outage_diagnostics("private server text\n"), {})
         self.assertEqual(acceptance_module.outage_diagnostics("MORPHEUS_RTC_OUTAGE_STAGE cleanup\n"),
                          {"cleanup_started": True})

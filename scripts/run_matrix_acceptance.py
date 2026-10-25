@@ -289,6 +289,17 @@ OUTAGE_FAILURE = re.compile(
     r"call=(idle|opening_slot|starting|joined|reconnecting|ending|cleanup_failed|failed|ended)$", re.MULTILINE)
 
 
+OUTAGE_MEDIA_FAILURE_SITES = frozenset((
+    "publication_missing", "push_not_joined", "push_invalid_format", "push_frame_format_mismatch",
+    "push_invalid_video_planes", "push_wrong_media_kind", "push_call_ended", "push_wrong_call",
+    "push_control_not_running", "push_control_already_running", "push_microphone_unavailable", "push_speaker_unavailable",
+    "push_device", "push_call", "push_transport", "sequence_overflow",
+    "peer_info_missing", "peer_account_missing", "frame_slot_invalid", "participant_count",
+    "generation_changed", "deadline",
+))
+OUTAGE_MEDIA_FAILURE = re.compile(r"^MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE ([a-z_]+)$", re.MULTILINE)
+
+
 def outage_evidence(output: str, target: str) -> dict[str, bool]:
     if target not in OUTAGE_TARGET:
         raise RuntimeError("Invalid owned SFU outage target")
@@ -326,6 +337,12 @@ def outage_diagnostics(output: str) -> dict:
         result["failure"], result["call_state"] = failures[0]
     elif failure_lines:
         result["failure"] = "invalid"
+    media_lines = [line for line in output.splitlines()
+                   if line.startswith("MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE")]
+    if media_lines:
+        match = OUTAGE_MEDIA_FAILURE.fullmatch(media_lines[0])
+        result["media_failure"] = (match[1] if len(media_lines) == 1 and match is not None
+                                   and match[1] in OUTAGE_MEDIA_FAILURE_SITES else "invalid")
     checks = {name: value == "true" for name, value in OUTAGE_CHECK.findall(output)
               if name in OUTAGE_CHECKS or name in OUTAGE_TARGET.values()}
     if checks:
