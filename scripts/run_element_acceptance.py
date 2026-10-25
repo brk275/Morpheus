@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -46,6 +47,12 @@ STAGES = frozenset((
     "native_test", "log_scan", "complete",
 ))
 FAILURES = frozenset(("fixture_operation", "browser_acceptance", "native_acceptance", "deadline", "evidence", "log_scan"))
+NATIVE_STAGES = ("microphone_cryptor", "late_login", "late_sync", "late_bootstrap", "late_join", "group_roster")
+NATIVE_STAGE_PREFIX = "MORPHEUS_ELEMENT_NATIVE_STAGE "
+MAX_LOG_BYTES = 64 * 1024 * 1024
+MAX_LOG_FILES = 128
+MAX_LOG_ENTRIES = 65_536
+MAX_LOG_DEPTH = 32
 CHECK_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
 STAGE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_STAGE ([a-z_]+)$", re.MULTILINE)
 FAILURE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_FAILURE ([a-z_]+)$", re.MULTILINE)
@@ -62,7 +69,24 @@ def evidence(output: str, *, complete=False) -> dict[str, bool]:
     return result
 
 
-def diagnostics(output: str) -> dict[str, str]:
+def native_stages(output: str) -> tuple[str, ...]:
+    """Bound each candidate line before copying a fixed native stage."""
+    result = []
+    cursor = 0
+    while (start := output.find("MORPHEUS_ELEMENT_NATIVE_STAGE", cursor)) >= 0:
+        cursor = start + len("MORPHEUS_ELEMENT_NATIVE_STAGE")
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if (len(result) >= len(NATIVE_STAGES) or end - start > 96
+                or output[start:end] != NATIVE_STAGE_PREFIX + NATIVE_STAGES[len(result)]):
+            return ("invalid",)
+        result.append(NATIVE_STAGES[len(result)])
+    return tuple(result)
+
+
+def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
     failures = [value for value in FAILURE_PATTERN.findall(output) if value in FAILURES]
@@ -70,6 +94,8 @@ def diagnostics(output: str) -> dict[str, str]:
         result["stage"] = stages[-1]
     if failures:
         result["failure"] = failures[-1]
+    if include_native and (native := native_stages(output)):
+        result["native_stage"] = native[-1]
     return result
 
 
@@ -124,11 +150,30 @@ class Child:
     def __init__(self, args, log: Path, env, cwd):
         self.log = log
         self.started = time.monotonic()
-        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as output:
-            self.process = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                            stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        self.log_anchor = fd
+        try:
+            self.log_identity = self.file_identity(os.fstat(fd))
+            with os.fdopen(os.dup(fd), "wb") as output:
+                self.process = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                                stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        except BaseException:
+            os.close(fd)
+            self.log_anchor = None
+            raise
         self.closed = False
+        self.joined = False
+
+    @staticmethod
+    def file_identity(info):
+        return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode, info.st_nlink)
+
+    def release_log_anchor(self):
+        if self.log_anchor is not None:
+            if self.file_identity(os.fstat(self.log_anchor))[:2] != self.log_identity[:2]:
+                raise RuntimeError("fixture_operation")
+            os.close(self.log_anchor)
+            self.log_anchor = None
 
     def status(self):
         result = os.waitid(os.P_PID, self.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
@@ -155,6 +200,7 @@ class Child:
             pass
         finally:
             self.process.wait(timeout=10)
+            self.joined = True
             self.closed = True
 
 
@@ -186,6 +232,7 @@ class Runner:
         self.stage = "configuration"
         self.sequence = 0
         self.children = []
+        self.root_identity = Child.file_identity(self.root.stat())[:-1]
 
     def mark(self, value):
         assert value in STAGES
@@ -193,6 +240,8 @@ class Runner:
         print("MORPHEUS_ELEMENT_STAGE " + value, flush=True)
 
     def start(self, args, *, extra=None, cwd=REPO):
+        if len(self.children) >= MAX_LOG_FILES:
+            raise RuntimeError("fixture_operation")
         self.sequence += 1
         child = Child(args, self.logs / f"{self.sequence:02}.log", self.env | (extra or {}), cwd)
         self.children.append(child)
@@ -224,19 +273,112 @@ class Runner:
                 child.close()
             except BaseException:
                 failed = True
+        if failed or any(child.joined is not True for child in self.children):
+            raise RuntimeError("fixture_operation")
+
+    def release_log_anchors(self):
+        failed = False
+        for child in self.children:
+            try:
+                child.release_log_anchor()
+            except BaseException:
+                failed = True
         if failed:
             raise RuntimeError("fixture_operation")
 
-    def scan(self):
-        combined = "\n".join(path.read_text(errors="replace") for path in sorted(self.root.rglob("*.log")))
+    def log_snapshots(self):
+        """Read only bounded regular logs through pinned no-follow directory FDs."""
+        expected = {child.log.relative_to(self.root).as_posix(): child for child in self.children}
+        found = set()
+        snapshots = []
+        total = entries = 0
+
+        def stable(info):
+            return (*Child.file_identity(info), info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+        def visit(directory, relative, depth):
+            nonlocal total, entries
+            if depth > MAX_LOG_DEPTH:
+                raise RuntimeError("log_scan")
+            with os.scandir(directory) as listing:
+                for entry in listing:
+                    entries += 1
+                    if entries > MAX_LOG_ENTRIES:
+                        raise RuntimeError("log_scan")
+                    info = entry.stat(follow_symlinks=False)
+                    name = relative + entry.name
+                    if stat.S_ISDIR(info.st_mode):
+                        fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                     dir_fd=directory)
+                        try:
+                            if Child.file_identity(os.fstat(fd)) != Child.file_identity(info):
+                                raise RuntimeError("log_scan")
+                            visit(fd, name + "/", depth + 1)
+                        finally:
+                            os.close(fd)
+                    elif entry.name.endswith(".log"):
+                        if len(snapshots) >= MAX_LOG_FILES or not stat.S_ISREG(info.st_mode):
+                            raise RuntimeError("log_scan")
+                        fd = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                     dir_fd=directory)
+                        try:
+                            before = os.fstat(fd)
+                            if (not stat.S_ISREG(before.st_mode) or stable(before) != stable(info)
+                                    or not 0 <= before.st_size <= MAX_LOG_BYTES - total - bool(snapshots)):
+                                raise RuntimeError("log_scan")
+                            if child := expected.get(name):
+                                if (child.log_anchor is None
+                                        or Child.file_identity(os.fstat(child.log_anchor)) != child.log_identity
+                                        or Child.file_identity(before) != child.log_identity):
+                                    raise RuntimeError("log_scan")
+                                found.add(name)
+                            chunks, size = [], 0
+                            while chunk := os.read(fd, min(65_536, before.st_size - size + 1)):
+                                size += len(chunk)
+                                if size > before.st_size:
+                                    raise RuntimeError("log_scan")
+                                chunks.append(chunk)
+                            if (size != before.st_size or stable(os.fstat(fd)) != stable(before)
+                                    or stable(os.stat(entry.name, dir_fd=directory, follow_symlinks=False)) != stable(before)):
+                                raise RuntimeError("log_scan")
+                            data = b"".join(chunks)
+                            total += size + bool(snapshots)
+                            snapshots.append((name, data))
+                        finally:
+                            os.close(fd)
+
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            if Child.file_identity(os.fstat(fd))[:-1] != self.root_identity:
+                raise RuntimeError("log_scan")
+            visit(fd, "", 0)
+            if found != set(expected):
+                raise RuntimeError("log_scan")
+        finally:
+            os.close(fd)
+        return sorted(snapshots)
+
+    def scan(self, native=None):
+        if any(child.joined is not True for child in self.children):
+            raise RuntimeError("fixture_operation")
+        if native is not None and not any(child is native for child in self.children):
+            raise RuntimeError("log_scan")
+        try:
+            snapshots = self.log_snapshots()
+        except (OSError, ValueError):
+            raise RuntimeError("log_scan") from None
+        combined = b"\n".join(data for _, data in snapshots)
+        native_output = next((data for name, data in snapshots
+                              if native is not None and name == native.log.relative_to(self.root).as_posix()), b"")
         try:
             result = subprocess.run([self.gitleaks, "stdin", "--redact=100", "--ignore-gitleaks-allow", "--no-banner"],
-                                    input=combined, text=True, capture_output=True, timeout=30, cwd=self.root)
+                                    input=combined, capture_output=True, timeout=30, cwd=self.root)
         except (subprocess.TimeoutExpired, OSError):
             raise RuntimeError("log_scan") from None
         if result.returncode:
             raise RuntimeError("log_scan")
-        return combined
+        return (combined.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n"),
+                native_output.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n"))
 
 
 def execute(root: Path, fixture: Path, gitleaks: str):
@@ -252,7 +394,10 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     runner = Runner(root, gitleaks)
     failure = None
     failed_stage = "configuration"
-    native_output = ""
+    native = None
+    peers_complete = False
+    children_joined = False
+    cleanup_failure = None
     try:
         runner.mark("tool_install")
         tool = private_directory(root / "tool")
@@ -288,32 +433,47 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         runner.mark("native_test")
         native = runner.start([str(binary), "--exact", TEST_NAME, "--show-output", "--test-threads=1"], extra=extra)
         wait_peers(native, browser)
-        native_output = native.log.read_text(errors="replace")
-        if not exact_native_pass(native_output):
-            raise RuntimeError("evidence")
+        peers_complete = True
     except BaseException as error:
         failed_stage = runner.stage
         failure = str(error) if isinstance(error, RuntimeError) and str(error) in FAILURES else "fixture_operation"
     finally:
         try:
             runner.close()
+            children_joined = True
         except BaseException:
-            failure = failure or "fixture_operation"
+            cleanup_failure = "fixture_operation"
         try:
             runner.service(lambda: down(root / "service", keep_data=True))
         except BaseException:
-            failure = failure or "fixture_operation"
+            cleanup_failure = "fixture_operation"
     try:
-        output = runner.scan()
+        if not children_joined or cleanup_failure is not None:
+            raise RuntimeError("fixture_operation")
+        output, native_output = runner.scan(native)
+        # This is the exact native log snapshot included in the successful
+        # scan, inspected only after owned group teardown and actual waits.
+        if peers_complete and children_joined and not exact_native_pass(native_output):
+            failure = "evidence"
+        failure = failure or cleanup_failure
         facts = evidence(output, complete=not failure)
     except RuntimeError as error:
         failure = str(error)
-        output, facts = "", {}
+        output, native_output, facts = "", "", {}
+    finally:
+        try:
+            runner.release_log_anchors()
+        except BaseException:
+            failure = "fixture_operation"
+            output, native_output, facts = "", "", {}
     for key, value in sorted(facts.items()):
         print(f"MORPHEUS_ELEMENT_CHECK {key}={str(value).lower()}", flush=True)
+    if children_joined and cleanup_failure is None:
+        for value in native_stages(native_output):
+            print(NATIVE_STAGE_PREFIX + value, flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
-    if found := diagnostics(diagnostic_output):
+    if found := diagnostics(diagnostic_output, include_native=False):
         if "stage" in found:
             runner.mark(found["stage"])
     elif failure:

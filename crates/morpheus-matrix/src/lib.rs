@@ -1716,6 +1716,15 @@ impl AccountManager {
         drop(state);
         drop(_permit);
         let removal = self.remove_account(id).await?;
+        #[cfg(debug_assertions)]
+        account_access::fixture_removal_observation(
+            "logout_result",
+            Some((
+                removal.complete,
+                removal.credentials_removed,
+                removal.store_removed,
+            )),
+        );
         if !removal.complete {
             return Err(MatrixCoreError::AccountRemovalPending);
         }

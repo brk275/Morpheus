@@ -1728,6 +1728,30 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
                        "MORPHEUS_APP_RECOVERY_STAGE typed_retention\n" + observed + panic):
             self.assertNotIn("account_removal_observations", acceptance_module.app_recovery_diagnostics(output))
 
+    def test_native_partial_removal_receipt_remains_diagnostic_and_cannot_pass_recovery(self):
+        stage = "MORPHEUS_APP_RECOVERY_STAGE observer_revocation\n"
+        marker = "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage="
+        panic = ("thread '" + acceptance_module.APP_RECOVERY_TESTS[0]
+                 + "' panicked at crates/morpheus-app/src/live.rs:42:7:\n"
+                 "Cannot remove first account: AccountRemovalPending\n")
+        output = (stage + marker + "owned_store_not_empty\n"
+                  + marker + "owned_delete_finished complete=0 credentials=1 store=0\n"
+                  + marker + "logout_result complete=0 credentials=1 store=0\n"
+                  + marker + "logout_pending\n"
+                  + marker + "existing_observation_error\n" + panic)
+        result = acceptance_module.app_recovery_diagnostics(output)
+        self.assertEqual(result["account_removal_observations"], [
+            {"stage": "owned_store_not_empty"},
+            {"stage": "owned_delete_finished", "complete": False, "credentials": True, "store": False},
+            {"stage": "logout_result", "complete": False, "credentials": True, "store": False},
+            {"stage": "logout_pending"}, {"stage": "existing_observation_error"},
+        ])
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            acceptance_module.app_recovery_evidence(output)
+        contaminated = output.replace("owned_store_not_empty\n", "owned_store_not_empty PRIVATE_RESPONSE\n")
+        self.assertNotIn("account_removal_observations", acceptance_module.app_recovery_diagnostics(contaminated))
+        self.assertNotIn("PRIVATE", json.dumps(acceptance_module.app_recovery_diagnostics(contaminated)))
+
     def test_account_removal_observations_reject_partial_bad_oversized_and_excess_lines(self):
         stage = "MORPHEUS_APP_RECOVERY_STAGE observer_revocation\n"
         marker = "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage="

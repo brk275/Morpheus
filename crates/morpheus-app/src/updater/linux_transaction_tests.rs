@@ -135,8 +135,22 @@ fn committed_pre_store_acknowledgement_never_allows_later_binary_rollback() {
     session.apply(&mut journal).unwrap();
     session.trial = Some(journal.id.clone());
     session.acknowledge(&fixture.next_metadata).unwrap();
+    // Model the exact open-file-description alias inherited by an unrelated
+    // concurrent fork, without scheduling a process or weakening zero-wait
+    // acquisition. Closing only the original descriptor cannot release it.
+    let inherited_lock = session._lock.try_clone().unwrap();
+    assert!(matches!(
+        AppImageSession::lock(&fixture.installed, Duration::ZERO),
+        Err(UpdateError::UpdateActive)
+    ));
     drop(session);
     let recovered = AppImageSession::lock(&fixture.installed, Duration::ZERO).unwrap();
+    // Retiring the old alias must not release the new owner's independent lock.
+    drop(inherited_lock);
+    assert!(matches!(
+        AppImageSession::lock(&fixture.installed, Duration::ZERO),
+        Err(UpdateError::UpdateActive)
+    ));
     let mut journal = recovered.journal().unwrap().unwrap();
     assert_eq!(journal.phase, Phase::Committed);
     assert_eq!(

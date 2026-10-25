@@ -98,6 +98,30 @@ impl Drop for RemovalOwner {
     }
 }
 
+// Synthetic hosted fixtures retain only fixed receipt flags. In particular,
+// logout can report Pending after an already-completed partial deletion; a
+// later completion-only observer then has no owner from which to recover it.
+// This does not retry removal or change any success/authorization decision.
+#[cfg(debug_assertions)]
+pub(super) fn fixture_removal_observation(stage: &'static str, flags: Option<(bool, bool, bool)>) {
+    if std::env::var_os("MORPHEUS_MATRIX_TEST_ACCOUNTS").is_none() {
+        return;
+    }
+    use std::io::Write as _;
+    let mut output = std::io::stderr().lock();
+    if let Some((complete, credentials, store)) = flags {
+        let _ = writeln!(
+            output,
+            "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage={stage} complete={} credentials={} store={}",
+            u8::from(complete),
+            u8::from(credentials),
+            u8::from(store)
+        );
+    } else {
+        let _ = writeln!(output, "MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION stage={stage}");
+    }
+}
+
 fn incomplete_removal(id: &str) -> RemovalResult {
     RemovalResult {
         account_id: id.into(),
@@ -717,8 +741,29 @@ impl AccountManager {
             // presented as successful erasure.
             let store_removed = match fs::remove_dir_all(&account_dir) {
                 Ok(()) => true,
-                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_error) => {
+                    #[cfg(debug_assertions)]
+                    fixture_removal_observation(
+                        match _error.kind() {
+                            std::io::ErrorKind::DirectoryNotEmpty => "owned_store_not_empty",
+                            std::io::ErrorKind::PermissionDenied => "owned_store_denied",
+                            _ => "owned_store_error",
+                        },
+                        None,
+                    );
+                    false
+                }
             };
+            #[cfg(debug_assertions)]
+            fixture_removal_observation(
+                "owned_delete_finished",
+                Some((
+                    credentials_removed && store_removed,
+                    credentials_removed,
+                    store_removed,
+                )),
+            );
             (credentials_removed, store_removed)
         });
         // No await between native task creation and publishing its sole owner.

@@ -359,6 +359,18 @@ pub struct AppImageSession {
     shutdown_authority: Option<ShutdownAuthority>,
 }
 
+impl Drop for AppImageSession {
+    fn drop(&mut self) {
+        // CLOEXEC acts at exec, so an unrelated concurrent spawn can still
+        // inherit this locked open-file description between fork and exec.
+        // Retire the original session's lock at its existing Drop boundary,
+        // rather than waiting for every such descriptor alias to close.
+        // Failure leaves File's ordinary close as the fail-closed fallback;
+        // releasing a lock is never a shutdown or update-success receipt.
+        let _ = self._lock.unlock();
+    }
+}
+
 fn private_directory(path: &Path) -> Result<(), UpdateError> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => sync_directory(path.parent().ok_or(UpdateError::RecoveryRequired)?)?,

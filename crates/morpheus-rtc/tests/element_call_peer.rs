@@ -410,6 +410,7 @@ async fn group_and_screen(
     room: &str,
     original_microphone: &NativeTone,
 ) {
+    eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE microphone_cryptor");
     let (microphone_sid, _) =
         native_sender(rtc, room, livekit::track::TrackSource::Microphone, None)
             .expect("Actual original microphone sender cryptor missing");
@@ -430,10 +431,12 @@ async fn group_and_screen(
             .expect("Cannot protect late-peer profile");
     }
     let manager = AccountManager::open(profile.join("carol")).expect("Cannot open late-peer store");
+    eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE late_login");
     let account = manager
         .add_password_account(&carol.homeserver_url, &carol.username, &carol.password)
         .await
         .expect("Late-peer login failed");
+    eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE late_sync");
     timeout(Duration::from_secs(90), async {
         let status = manager.subscribe_sync_status();
         loop {
@@ -462,11 +465,14 @@ async fn group_and_screen(
         .active_client()
         .await
         .expect("Late-peer client missing");
+    eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE late_bootstrap");
     bootstrap_identity(&client, carol).await;
     let mut late = RtcService::new(client);
+    eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE late_join");
     late.join(room, CallOptions::element_call_matrix_2_0())
         .await
         .expect("Late-peer join failed");
+    eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE group_roster");
     timeout(Duration::from_secs(90), async {
         while !exact_roster(rtc, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
             || !exact_roster(&late, room, &[&alice.user_id, &bob.user_id, &carol.user_id])

@@ -443,7 +443,7 @@ impl ActorAcceptance {
             .fresh_offer(case, caller, alice, rtc, info, bob_room)
             .await?;
         let key = row.token.ui_key();
-        let slot = server_slot(rtc.client(), &case.room_id).await?;
+        let slot = server_slot(rtc.client(), &case.room_id, case.mode).await?;
         let mut quiet = QuietEvidence::new(rtc.client().get_room(&case.room_id).ok_or(())?)?;
         self.phase(ActorStage::AnswerReservation);
         let accepted = self
@@ -516,7 +516,7 @@ impl ActorAcceptance {
             matches!(self.calls.status(), CallStatus::Joined { account_id, call } if account_id == self.account.id && call == joined),
         )?;
         actor_fact("accepted_join_identity");
-        check(server_slot(rtc.client(), &case.room_id).await? == slot)?;
+        check(server_slot(rtc.client(), &case.room_id, case.mode).await? == slot)?;
         actor_fact("slot_unchanged");
         self.phase(ActorStage::ReceiveOnlyState);
         let mut audio = self.calls.subscribe_audio();
@@ -798,33 +798,67 @@ async fn wait_absent(handle: &IncomingHandle, key: &str, deadline: Instant) -> R
     })
     .await
 }
-async fn server_slot(client: &Client, room: &OwnedRoomId) -> Result<Value, ()> {
+async fn server_slot(client: &Client, room: &OwnedRoomId, mode: InteropMode) -> Result<Value, ()> {
+    let original_key = match mode {
+        InteropMode::Current => "m.call#room",
+        InteropMode::Sticky2025 => "m.call#ROOM",
+        InteropMode::RoomState => return Err(error("room_state")),
+    };
     let result = client
         .send(get_state_events::v3::Request::new(room.clone()))
         .with_request_config(
             RequestConfig::new()
                 .retry_limit(0)
-                .timeout(Duration::from_secs(5)),
+                .timeout(Duration::from_secs(5))
+                .max_response_bytes(8 * 1024 * 1024),
         )
         .await
         .map_err(|_| error("room_state"))?;
     check(result.room_state.len() <= 512)?;
-    let mut found = None;
+    let mut slots = std::collections::BTreeMap::new();
     for event in result.room_state {
         check(event.json().get().len() <= MAX_MEMBERSHIP_BYTES)?;
         let value: Value =
             serde_json::from_str(event.json().get()).map_err(|_| error("room_state"))?;
-        if value.get("type").and_then(Value::as_str) == Some("m.rtc.slot")
-            && value.get("state_key").and_then(Value::as_str) == Some("m.call#room")
-        {
-            check(found.is_none() && value.get("event_id").and_then(Value::as_str).is_some())?;
-            // Unsigned server metadata can vary. Identity and content may not.
-            found = Some(
-                serde_json::json!({"event_id": value.get("event_id"), "content":value.get("content")}),
-            );
+        let kind = value.get("type").and_then(Value::as_str).ok_or(())?;
+        if !matches!(kind, "m.rtc.slot" | "org.matrix.msc4143.rtc.slot") {
+            continue;
         }
+        let key = value.get("state_key").and_then(Value::as_str).ok_or(())?;
+        check(value.get("event_id").and_then(Value::as_str).is_some())?;
+        // Unsigned metadata may change. Preserve actual type/key/event ID and
+        // content of every slot, including all non-target slots, across Answer.
+        check(slots.insert((kind.to_owned(), key.to_owned()),
+            serde_json::json!({"event_id":value.get("event_id"), "content":value.get("content")}))
+            .is_none())?;
     }
-    found.ok_or_else(|| error("room_state"))
+    // This fixture creates only room encryption, with no slot preseed. Require
+    // the actual canonical write at its original selected wire key, not either
+    // spelling or another format's room-wide slot. Existing stable authority is
+    // tested separately by local_rtc's real close/empty/reopen cycle.
+    check(!slots.contains_key(&("m.rtc.slot".to_owned(), original_key.to_owned())))?;
+    let canonical = slots
+        .get(&(
+            "org.matrix.msc4143.rtc.slot".to_owned(),
+            original_key.to_owned(),
+        ))
+        .ok_or_else(|| error("room_state"))?;
+    check(canonical.pointer("/content/status").and_then(Value::as_str) == Some("open"))?;
+    check(
+        canonical
+            .pointer("/content/application/type")
+            .and_then(Value::as_str)
+            == Some("m.call"),
+    )?;
+    check(matches!(
+        canonical
+            .pointer("/content/encryption/type")
+            .and_then(Value::as_str),
+        Some("m.per_member" | "org.matrix.msc4143.per_member")
+    ))?;
+    Ok(Value::Array(slots.into_iter().map(|((kind, key), event)| {
+        serde_json::json!({"type":kind,"state_key":key,"event":event})
+    }).collect()))
 }
 async fn wait_joined(
     observer: &mut PassiveCallObserver,

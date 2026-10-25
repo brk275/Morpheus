@@ -1,5 +1,6 @@
 import contextlib
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -64,6 +65,189 @@ class EvidenceTests(unittest.TestCase):
             "MORPHEUS_ELEMENT_FAILURE browser_acceptance", "MORPHEUS_ELEMENT_FAILURE private_password",
         )))
         self.assertEqual(result, {"stage": "browser_roster", "failure": "browser_acceptance"})
+
+    def test_native_group_stages_are_closed_ordered_and_bounded(self):
+        lines = [target.NATIVE_STAGE_PREFIX + value for value in target.NATIVE_STAGES]
+        for count in range(1, len(lines) + 1):
+            output = "\n".join(lines[:count])
+            self.assertEqual(target.native_stages(output), target.NATIVE_STAGES[:count])
+            self.assertEqual(target.diagnostics(output), {"native_stage": target.NATIVE_STAGES[count - 1]})
+        self.assertEqual(target.native_stages("ordinary private log"), ())
+        for output in (lines[1], lines[0] + "\n" + lines[0], "\n".join(lines + [lines[-1]]),
+                       lines[0] + " private", target.NATIVE_STAGE_PREFIX + "opaque_secret",
+                       target.NATIVE_STAGE_PREFIX + "x" * 97):
+            with self.subTest(output=output):
+                self.assertEqual(target.native_stages(output), ("invalid",))
+                self.assertEqual(target.diagnostics(output), {"native_stage": "invalid"})
+
+    def test_native_failure_facts_follow_owned_cleanup_and_successful_scan(self):
+        for scanner_status, join_failure, service_failure in ((0, False, False), (1, False, False),
+                                                            (0, True, False), (0, False, True)):
+            with self.subTest(scanner_status=scanner_status, join_failure=join_failure, service_failure=service_failure), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                fixture = root / "fixture.json"
+                fixture.write_text("{}")
+                fixture.chmod(0o600)
+                (root / "browser-ready").touch()
+                runner = target.Runner(root, "scanner")
+                native = self.anchored_log(runner, "native.log", (
+                    "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
+                    + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
+                    + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
+                browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
+                native.joined = browser.joined = False
+                native.status = mock.Mock(return_value=1)
+                browser.status = mock.Mock(return_value=None)
+                events = []
+                def native_join():
+                    events.append("native_join")
+                    if join_failure:
+                        raise RuntimeError("fixture_operation")
+                    native.joined = True
+                def browser_join():
+                    events.append("browser_join")
+                    browser.joined = True
+                native.close = native_join
+                browser.close = browser_join
+                runner.children = [browser, native]
+                def scanned(*args, **kwargs):
+                    events.append("scan")
+                    return subprocess.CompletedProcess([], scanner_status)
+                original_snapshots = runner.log_snapshots
+                def snapshot():
+                    events.append("read")
+                    return original_snapshots()
+                visible = io.StringIO()
+                with mock.patch.object(target.sys, "platform", "linux"), mock.patch.dict(os.environ, {
+                    "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux",
+                }, clear=True), mock.patch.object(target, "assert_contained"), \
+                        mock.patch.object(target, "Runner", return_value=runner), \
+                        mock.patch.object(runner, "command", return_value=""), \
+                        mock.patch.object(runner, "service", side_effect=[{"official_image_identity_verified": True},
+                                                                      RuntimeError("fixture_operation") if service_failure else None]), \
+                        mock.patch.object(runner, "start", side_effect=[browser, native]), \
+                        mock.patch.object(target, "native_executable", return_value=Path("native")), \
+                        mock.patch.object(target, "media_fixtures"), \
+                        mock.patch.object(target.subprocess, "run", side_effect=scanned), \
+                        mock.patch.object(runner, "log_snapshots", side_effect=snapshot), \
+                        contextlib.redirect_stdout(visible), self.assertRaisesRegex(
+                            RuntimeError, "fixture_operation" if join_failure or service_failure else (
+                                "native_acceptance" if scanner_status == 0 else "log_scan")):
+                    target.execute(root, fixture, "scanner")
+                self.assertEqual(events, ["native_join", "browser_join"] + ([] if join_failure or service_failure else ["read", "scan"]))
+                self.assertIsNone(native.log_anchor)
+                self.assertIsNone(browser.log_anchor)
+                output = visible.getvalue()
+                self.assertNotIn("opaque", output)
+                self.assertEqual(target.evidence(output),
+                                 {"native_audio": True} if scanner_status == 0 and not join_failure and not service_failure else {})
+                self.assertEqual(target.diagnostics(output).get("native_stage"),
+                                 "late_login" if scanner_status == 0 and not join_failure and not service_failure else None)
+
+    @staticmethod
+    def anchored_log(runner, name, data):
+        child = target.Child.__new__(target.Child)
+        child.log = runner.logs / name
+        child.log_anchor = os.open(child.log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        child.log_identity = child.file_identity(os.fstat(child.log_anchor))
+        os.write(child.log_anchor, data)
+        child.joined = True
+        runner.children.append(child)
+        return child
+
+    def test_log_scan_uses_exact_original_binary_snapshot_before_decode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = target.Runner(Path(directory), "scanner")
+            raw = b"\xffopaque-fixture-log\nMORPHEUS_ELEMENT_NATIVE_STAGE microphone_cryptor\n"
+            child = self.anchored_log(runner, "native.log", raw)
+            try:
+                def scanned(*args, **kwargs):
+                    os.ftruncate(child.log_anchor, 0)
+                    os.lseek(child.log_anchor, 0, os.SEEK_SET)
+                    os.write(child.log_anchor, b"changed after snapshot")
+                    return subprocess.CompletedProcess([], 0)
+                with mock.patch.object(target.subprocess, "run", side_effect=scanned) as scan:
+                    combined, native = runner.scan(child)
+                supplied = scan.call_args.kwargs["input"]
+                self.assertIsInstance(supplied, bytes)
+                self.assertEqual(hashlib.sha256(supplied).digest(), hashlib.sha256(raw).digest())
+                self.assertEqual(combined, raw.decode(errors="replace"))
+                self.assertEqual(native, combined)
+            finally:
+                runner.release_log_anchors()
+
+    def test_log_snapshot_refuses_symlink_replacement_and_oversize_before_scan(self):
+        for change in ("symlink", "replacement", "missing", "fifo", "alias", "oversize", "metadata"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                runner = target.Runner(Path(directory), "scanner")
+                child = self.anchored_log(runner, "native.log", b"private")
+                try:
+                    if change == "symlink":
+                        child.log.unlink()
+                        other = Path(directory) / "other"
+                        other.write_bytes(b"other")
+                        child.log.symlink_to(other)
+                    elif change == "replacement":
+                        child.log.unlink()
+                        child.log.write_bytes(b"replacement")
+                    elif change == "missing":
+                        child.log.unlink()
+                    elif change == "fifo":
+                        child.log.unlink()
+                        os.mkfifo(child.log, 0o600)
+                    elif change == "alias":
+                        os.link(child.log, Path(directory) / "alias")
+                    elif change == "oversize":
+                        os.ftruncate(child.log_anchor, target.MAX_LOG_BYTES + 1)
+                    else:
+                        child.log.chmod(0o644)
+                    with mock.patch.object(target.subprocess, "run") as scan, \
+                            mock.patch.object(target.os, "read") as read, self.assertRaisesRegex(RuntimeError, "log_scan"):
+                        runner.scan(child)
+                    scan.assert_not_called()
+                    read.assert_not_called()
+                finally:
+                    runner.release_log_anchors()
+
+    def test_log_snapshot_refuses_change_during_read_and_bounded_tree_overflow(self):
+        for change in ("during_read", "entries", "files", "depth"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                runner = target.Runner(Path(directory), "scanner")
+                child = self.anchored_log(runner, "native.log", b"private")
+                original_read = os.read
+                def changed_read(fd, count):
+                    data = original_read(fd, count)
+                    if data:
+                        os.ftruncate(child.log_anchor, 0)
+                    return data
+                try:
+                    with contextlib.ExitStack() as stack:
+                        if change == "during_read":
+                            stack.enter_context(mock.patch.object(target.os, "read", side_effect=changed_read))
+                        else:
+                            stack.enter_context(mock.patch.object(target, {
+                                "entries": "MAX_LOG_ENTRIES", "files": "MAX_LOG_FILES", "depth": "MAX_LOG_DEPTH",
+                            }[change], 0))
+                        scan = stack.enter_context(mock.patch.object(target.subprocess, "run"))
+                        with self.assertRaisesRegex(RuntimeError, "log_scan"):
+                            runner.scan(child)
+                        scan.assert_not_called()
+                finally:
+                    runner.release_log_anchors()
+
+    def test_combined_binary_log_limit_includes_record_separators(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = target.Runner(Path(directory), "scanner")
+            first = self.anchored_log(runner, "first.log", b"aaaa")
+            self.anchored_log(runner, "second.log", b"bbbb")
+            try:
+                with mock.patch.object(target, "MAX_LOG_BYTES", 8), \
+                        mock.patch.object(target.subprocess, "run") as scan, self.assertRaisesRegex(RuntimeError, "log_scan"):
+                    runner.scan(first)
+                scan.assert_not_called()
+            finally:
+                runner.release_log_anchors()
 
     def test_native_artifact_must_be_one_named_test_inside_target(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -204,6 +388,7 @@ class OwnedProcessTests(unittest.TestCase):
                 self.assertEqual(child.process.returncode, 7)
             finally:
                 child.close()
+                child.release_log_anchor()
                 if descendant is not None:
                     with contextlib.suppress(ProcessLookupError, FileNotFoundError):
                         current = Path(f"/proc/{descendant}/stat").read_text().rsplit(")", 1)[1].split()[19]

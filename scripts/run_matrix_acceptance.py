@@ -180,6 +180,8 @@ ACCOUNT_REMOVAL_STAGES = frozenset((
     "logout_pending", "existing_observation_timeout", "existing_observation_error",
     "existing_finished", "wrong_account", "registry_remaining",
     "logout_error", "store_remaining", "store_observation_error",
+    "owned_delete_finished", "logout_result", "owned_store_not_empty",
+    "owned_store_denied", "owned_store_error",
 ))
 ACCOUNT_REMOVAL_LINE = re.compile(r"^MORPHEUS_ACCOUNT_REMOVAL_OBSERVATION[^\n]*$", re.MULTILINE)
 ACCOUNT_REMOVAL_OBSERVATION = re.compile(

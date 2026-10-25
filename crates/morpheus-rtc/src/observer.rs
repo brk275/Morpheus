@@ -197,7 +197,7 @@ impl PassiveCallObserver {
         require_joined(&self.room)?;
         require_encrypted(&self.room).await?;
         let client = self.room.client();
-        validate_current_slot(&self.room_id, |request| {
+        validate_current_slot(&self.room_id, self.mode, |request| {
             let client = client.clone();
             async move {
                 client
@@ -335,21 +335,27 @@ fn wire_slot(mode: InteropMode) -> Result<&'static str, ObserverError> {
     }
 }
 
-// Match pinned core::feeder::SlotEvents::current: a stable state event is
-// authoritative, even when it is closed or malformed. The pinned SDK slot
-// writer sends SLOT_EVENT_TYPE directly; Ruma 0.35 has no slot alias mapping.
-// Only an exact missing-state response permits the unstable spelling. Both
-// requests stay inside snapshot's existing overall ten-second deadline.
-async fn validate_current_slot<F, Fut>(room_id: &RoomId, mut fetch: F) -> Result<(), ObserverError>
+// Match core::feeder::SlotEvents::current at the selected original wire key:
+// a stable state event is authoritative, even when closed or malformed. Only
+// exact missing state permits the unstable type at that same key, never another
+// format's slot. Both reads stay inside snapshot's existing ten-second deadline.
+async fn validate_current_slot<F, Fut>(
+    room_id: &RoomId,
+    mode: InteropMode,
+    mut fetch: F,
+) -> Result<(), ObserverError>
 where
     F: FnMut(get_state_event_for_key::v3::Request) -> Fut,
     Fut: Future<Output = Result<get_state_event_for_key::v3::Response, HttpError>>,
 {
+    // Read only the selected original wire key. The lower core key is a
+    // normalized roster identity, not an alias for Sticky2025's upper ROOM.
+    let original_slot = wire_slot(mode)?;
     let request = |event_type| {
         get_state_event_for_key::v3::Request::new(
             room_id.to_owned(),
             StateEventType::from(event_type),
-            SLOT.to_owned(),
+            original_slot.to_owned(),
         )
     };
     let response = match fetch(request(SLOT_EVENT_TYPE)).await {
@@ -361,7 +367,11 @@ where
         }
         Err(_) => return Err(ObserverError::SlotUnavailable),
     };
-    validate_slot(room_id.as_str(), response.event_or_content.get())
+    validate_slot(
+        room_id.as_str(),
+        original_slot,
+        response.event_or_content.get(),
+    )
 }
 
 fn missing_slot_state(error: &HttpError) -> bool {
@@ -370,7 +380,7 @@ fn missing_slot_state(error: &HttpError) -> bool {
     })
 }
 
-fn validate_slot(room_id: &str, raw: &str) -> Result<(), ObserverError> {
+fn validate_slot(room_id: &str, original_slot: &str, raw: &str) -> Result<(), ObserverError> {
     if raw.len() > MAX_EVENT_BYTES {
         return Err(ObserverError::SlotUnavailable);
     }
@@ -378,7 +388,7 @@ fn validate_slot(room_id: &str, raw: &str) -> Result<(), ObserverError> {
         serde_json::from_str(raw).map_err(|_| ObserverError::SlotUnavailable)?;
     let slot = RawSlotEvent {
         room_id: room_id.to_owned(),
-        slot_id: SLOT.to_owned(),
+        slot_id: original_slot.to_owned(),
         content,
     };
     match slot.resolve(RoomEncryption::Encrypted) {
@@ -527,7 +537,7 @@ mod tests {
         let room_id = RoomId::parse("!room:example.org").unwrap();
         let mut seen = Vec::new();
         assert_eq!(
-            validate_current_slot(&room_id, |request| {
+            validate_current_slot(&room_id, InteropMode::Current, |request| {
                 record_request(&mut seen, request);
                 std::future::ready(Ok(open_slot_response()))
             })
@@ -540,6 +550,68 @@ mod tests {
             "m.rtc.slot"
         );
         assert_ne!(SLOT_EVENT_TYPE, wire_event_type(SLOT_EVENT_TYPE));
+    }
+
+    #[tokio::test]
+    async fn selected_mode_keeps_both_authority_reads_in_the_original_wire_namespace() {
+        let room_id = RoomId::parse("!room:example.org").unwrap();
+        for (mode, expected_key) in [
+            (InteropMode::Current, "m.call#room"),
+            (InteropMode::Sticky2025, "m.call#ROOM"),
+        ] {
+            for present in [true, false] {
+                let mut seen = Vec::new();
+                assert_eq!(
+                    validate_current_slot(&room_id, mode, |request| {
+                        assert_eq!(request.room_id, room_id);
+                        assert_eq!(request.state_key, expected_key);
+                        seen.push(request.event_type.to_string());
+                        std::future::ready(if present || seen.len() == 2 {
+                            Ok(open_slot_response())
+                        } else {
+                            Err(api_error(404, ErrorKind::NotFound))
+                        })
+                    })
+                    .await,
+                    Ok(())
+                );
+                assert_eq!(
+                    seen,
+                    if present {
+                        vec![SLOT_EVENT_TYPE]
+                    } else {
+                        vec![SLOT_EVENT_TYPE, wire_event_type(SLOT_EVENT_TYPE)]
+                    }
+                );
+            }
+            // A closed authoritative slot must not be rescued by either an
+            // unstable slot or the other format's open room-wide slot.
+            let mut reads = 0;
+            assert_eq!(
+                validate_current_slot(&room_id, mode, |request| {
+                    assert_eq!(request.state_key, expected_key);
+                    reads += 1;
+                    std::future::ready(Ok(if reads == 1 {
+                        slot_response(json!({"status":"closed"}))
+                    } else {
+                        open_slot_response()
+                    }))
+                })
+                .await,
+                Err(ObserverError::SlotUnavailable)
+            );
+            assert_eq!(reads, 1);
+        }
+        let mut reads = 0;
+        assert_eq!(
+            validate_current_slot(&room_id, InteropMode::RoomState, |_| {
+                reads += 1;
+                std::future::ready(Ok(open_slot_response()))
+            })
+            .await,
+            Err(ObserverError::UnsupportedDialect)
+        );
+        assert_eq!(reads, 0);
     }
 
     #[tokio::test]
@@ -556,7 +628,7 @@ mod tests {
         ] {
             let mut seen = Vec::new();
             assert_eq!(
-                validate_current_slot(&room_id, |request| {
+                validate_current_slot(&room_id, InteropMode::Current, |request| {
                     record_request(&mut seen, request);
                     std::future::ready(Ok(if seen.len() == 1 {
                         slot_response(value.clone())
@@ -576,7 +648,7 @@ mod tests {
         let room_id = RoomId::parse("!room:example.org").unwrap();
         let mut seen = Vec::new();
         assert_eq!(
-            validate_current_slot(&room_id, |request| {
+            validate_current_slot(&room_id, InteropMode::Current, |request| {
                 record_request(&mut seen, request);
                 std::future::ready(if seen.len() == 1 {
                     Err(api_error(404, ErrorKind::NotFound))
@@ -605,7 +677,7 @@ mod tests {
             let mut error = Some(error);
             let mut seen = Vec::new();
             assert_eq!(
-                validate_current_slot(&room_id, |request| {
+                validate_current_slot(&room_id, InteropMode::Current, |request| {
                     record_request(&mut seen, request);
                     std::future::ready(match error.take() {
                         Some(error) => Err(error),
@@ -631,7 +703,7 @@ mod tests {
             let mut fallback = Some(fallback);
             let mut seen = Vec::new();
             assert_eq!(
-                validate_current_slot(&room_id, |request| {
+                validate_current_slot(&room_id, InteropMode::Current, |request| {
                     record_request(&mut seen, request);
                     std::future::ready(if seen.len() == 1 {
                         Err(api_error(404, ErrorKind::NotFound))
@@ -652,7 +724,7 @@ mod tests {
             let slot = json!({"status":"open", "application":{"type":"m.call"},
                 "encryption":{"type":encryption}});
             assert_eq!(
-                validate_slot("!room:example.org", &slot.to_string()),
+                validate_slot("!room:example.org", SLOT, &slot.to_string()),
                 Ok(())
             );
         }
@@ -664,7 +736,7 @@ mod tests {
             json!({"status":"open", "application":{"type":"m.call"}, "encryption":{"type":"other"}}),
         ] {
             assert_eq!(
-                validate_slot("!room:example.org", &slot.to_string()),
+                validate_slot("!room:example.org", SLOT, &slot.to_string()),
                 Err(ObserverError::SlotUnavailable)
             );
         }
@@ -831,6 +903,8 @@ mod tests {
         assert!(!opaque("line\nnext"));
         assert!(!opaque(&"a".repeat(256)));
         assert!(opaque("logical"));
-        assert!(validate_slot("!room:example.org", &" ".repeat(MAX_EVENT_BYTES + 1)).is_err());
+        assert!(
+            validate_slot("!room:example.org", SLOT, &" ".repeat(MAX_EVENT_BYTES + 1)).is_err()
+        );
     }
 }
