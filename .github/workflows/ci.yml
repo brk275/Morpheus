@@ -522,6 +522,20 @@ jobs:
             test "$(grep -Fxc -- "test $webrtc_native_test ... ok" "$RUNNER_TEMP/morpheus-webrtc-native-result.txt")" = 1
             test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-webrtc-native-result.txt")" = 1
           done
+          # Select synthetic native-source ownership cases only. Preserved
+          # upstream peer/audio-device tests are not selected by these literals.
+          libwebrtc_source_tests=(
+            native::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner
+            native::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner
+            native::video_source::tests::first_real_capture_stops_warmup_without_releasing_live_source
+          )
+          cargo test --locked -p libwebrtc --lib -- --list > "$RUNNER_TEMP/morpheus-libwebrtc-source-tests.txt"
+          for libwebrtc_source_test in "${libwebrtc_source_tests[@]}"; do
+            test "$(grep -Fxc -- "$libwebrtc_source_test: test" "$RUNNER_TEMP/morpheus-libwebrtc-source-tests.txt")" = 1
+            cargo test --locked -p libwebrtc --lib "$libwebrtc_source_test" -- --exact --test-threads=1 | tee "$RUNNER_TEMP/morpheus-libwebrtc-source-result.txt"
+            test "$(grep -Fxc -- "test $libwebrtc_source_test ... ok" "$RUNNER_TEMP/morpheus-libwebrtc-source-result.txt")" = 1
+            test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-libwebrtc-source-result.txt")" = 1
+          done
           # These exact library cases use synthetic buffers/owners or unnamed
           # kernel events/pipes. Never run CPAL's preserved device hardware tests.
           case "$RUNNER_OS" in

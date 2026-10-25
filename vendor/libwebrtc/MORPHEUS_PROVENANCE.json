@@ -1,0 +1,31 @@
+{
+  "upstream_crate": "libwebrtc",
+  "version": "0.3.38",
+  "archive_sha256": "fc0088d99d0757751962e6d60e8fcd42b1bfb5affd2b25da45e0735443330905",
+  "archive_bytes": 75077,
+  "upstream_repository": "https://github.com/livekit/rust-sdks",
+  "recorded_vcs_commit": "af369aae0fe074762ef0a2051529e7ec63045042",
+  "recorded_vcs_path": "libwebrtc",
+  "official_commit_tree": "a1c62e8b049abc4001a97ee97bfc27aee9b772e9",
+  "modified_upstream_files": [
+    "Cargo.toml",
+    "src/native/video_source.rs",
+    "src/native/peer_connection_factory.rs",
+    "src/peer_connection.rs"
+  ],
+  "additional_files": [
+    "Cargo.toml.upstream",
+    "LICENSE",
+    "MORPHEUS_PATCH.md",
+    "MORPHEUS_PROVENANCE.json",
+    "NOTICE",
+    "SDK_WORKSPACE_Cargo.toml.upstream",
+    "UPSTREAM_FILES.sha256",
+    "src/native/peer_connection_factory.rs.upstream",
+    "src/native/video_source.rs.upstream",
+    "src/peer_connection.rs.upstream"
+  ],
+  "native_prebuilt_source_attributed": false,
+  "license_compliance_verified": false,
+  "distribution_ready": false
+}

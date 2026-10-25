@@ -5117,8 +5117,6 @@ dependencies = [
 [[package]]
 name = "libwebrtc"
 version = "0.3.38"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0088d99d0757751962e6d60e8fcd42b1bfb5affd2b25da45e0735443330905"
 dependencies = [
  "cxx",
  "jni 0.21.1",
