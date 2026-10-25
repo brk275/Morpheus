@@ -6,6 +6,7 @@
 
 use std::{
     any::Any,
+    borrow::Cow,
     cell::RefCell,
     collections::VecDeque,
     rc::{Rc, Weak},
@@ -46,12 +47,12 @@ impl TimelineModel {
             self.notify.row_changed(row);
         }
     }
-    fn replace(&self, next: Vec<Arc<MessageInfo>>) {
+    fn replace(&self, next: Cow<'_, [Arc<MessageInfo>]>) {
         let (prefix, removed, added) = {
             let old = self.rows.borrow();
             let prefix = old
                 .iter()
-                .zip(&next)
+                .zip(next.iter())
                 .take_while(|(a, b)| same_row(a, b))
                 .count();
             if prefix == old.len() && prefix == next.len() {
@@ -87,7 +88,7 @@ impl TimelineModel {
                     .collect()
             };
             if changed.len() > MAX_ROW_NOTIFICATIONS {
-                *self.rows.borrow_mut() = next;
+                *self.rows.borrow_mut() = next.into_owned();
                 self.notify.reset();
                 return;
             }
@@ -108,11 +109,18 @@ impl TimelineModel {
                 self.notify.row_removed(prefix, removed);
             }
             if added != 0 {
-                drop(
-                    self.rows
-                        .borrow_mut()
-                        .splice(prefix..prefix, next.into_iter().skip(prefix).take(added)),
-                );
+                match next {
+                    Cow::Borrowed(next) => drop(
+                        self.rows
+                            .borrow_mut()
+                            .splice(prefix..prefix, next[prefix..prefix + added].iter().cloned()),
+                    ),
+                    Cow::Owned(next) => drop(
+                        self.rows
+                            .borrow_mut()
+                            .splice(prefix..prefix, next.into_iter().skip(prefix).take(added)),
+                    ),
+                }
                 self.notify.row_added(prefix, added);
             }
         }
@@ -182,6 +190,25 @@ pub(crate) fn update_scoped(
     rows: Vec<Arc<MessageInfo>>,
     scope: Option<Rc<crate::message_copy::CopyScope>>,
 ) -> ModelRc<MessageItem> {
+    update_rows_scoped(current, Cow::Owned(rows), scope)
+}
+
+/// Borrow the coalesced feed's immutable snapshot on the UI thread. Unchanged
+/// rows already belong to the model; only inserted or edited rows need new
+/// handles, unless a new model or a bulk reset replaces the whole history.
+pub(crate) fn update_snapshot_scoped(
+    current: ModelRc<MessageItem>,
+    rows: &[Arc<MessageInfo>],
+    scope: Option<Rc<crate::message_copy::CopyScope>>,
+) -> ModelRc<MessageItem> {
+    update_rows_scoped(current, Cow::Borrowed(rows), scope)
+}
+
+fn update_rows_scoped(
+    current: ModelRc<MessageItem>,
+    rows: Cow<'_, [Arc<MessageInfo>]>,
+    scope: Option<Rc<crate::message_copy::CopyScope>>,
+) -> ModelRc<MessageItem> {
     if let Some(model) = current.as_any().downcast_ref::<TimelineModel>() {
         // Source replacement precedes a reset that can synchronously project.
         model.replace(rows);
@@ -208,7 +235,7 @@ pub(crate) fn update_scoped(
             weak: weak.clone(),
             copy_scope: RefCell::new(scope),
             copy_projected: RefCell::new(VecDeque::new()),
-            rows: RefCell::new(rows),
+            rows: RefCell::new(rows.into_owned()),
             notify: ModelNotify::default(),
             #[cfg(test)]
             projected: std::cell::Cell::new(0),
@@ -644,6 +671,115 @@ pub(crate) mod tests {
             3,
             "only two reentrant observer reads and one explicit read project text"
         );
+    }
+
+    #[test]
+    fn borrowed_feed_snapshots_keep_notifications_and_do_not_clone_unchanged_handles() {
+        struct HandleObserver {
+            row: Arc<MessageInfo>,
+            counts: RefCell<Vec<usize>>,
+        }
+        impl ModelChangeListener for HandleObserver {
+            fn row_changed(self: Pin<&Self>, _row: usize) {
+                self.counts.borrow_mut().push(Arc::strong_count(&self.row));
+            }
+            fn row_added(self: Pin<&Self>, _index: usize, _count: usize) {
+                self.counts.borrow_mut().push(Arc::strong_count(&self.row));
+            }
+            fn row_removed(self: Pin<&Self>, _index: usize, _count: usize) {
+                self.counts.borrow_mut().push(Arc::strong_count(&self.row));
+            }
+            fn reset(self: Pin<&Self>) {
+                self.counts.borrow_mut().push(Arc::strong_count(&self.row));
+            }
+        }
+
+        let original: Arc<Vec<_>> = Arc::new((0..10_000).map(|i| Arc::new(fixture(i))).collect());
+        let model = update_snapshot_scoped(ModelRc::default(), original.as_slice(), None);
+        let observer = Box::pin(ModelChangeListenerContainer::new(Observer {
+            model: model.clone(),
+            changes: RefCell::new(Vec::new()),
+        }));
+        model
+            .model_tracker()
+            .attach_peer(observer.as_ref().model_peer());
+        let handles = Box::pin(ModelChangeListenerContainer::new(HandleObserver {
+            row: original[5_000].clone(),
+            counts: RefCell::new(Vec::new()),
+        }));
+        model
+            .model_tracker()
+            .attach_peer(handles.as_ref().model_peer());
+
+        // The retained feed snapshot is borrowed, including during reentrant
+        // notifications. No temporary full Vec may retain every old handle.
+        assert_eq!(
+            update_snapshot_scoped(model.clone(), original.as_slice(), None),
+            model
+        );
+        assert!(observer.as_ref().get().changes.borrow().is_empty());
+        let mut appended = original.as_ref().clone();
+        appended.push(Arc::new(fixture(10_000)));
+        let appended = Arc::new(appended);
+        let append_count = Arc::strong_count(&original[5_000]);
+        assert_eq!(
+            update_snapshot_scoped(model.clone(), appended.as_slice(), None),
+            model
+        );
+
+        let mut edited = appended.as_ref().clone();
+        Arc::make_mut(&mut edited[0]).body = "Edited borrowed row".into();
+        let edited = Arc::new(edited);
+        let edit_count = Arc::strong_count(&original[5_000]);
+        assert_eq!(
+            update_snapshot_scoped(model.clone(), edited.as_slice(), None),
+            model
+        );
+        assert_eq!(
+            model.row_data(0).unwrap().body.as_str(),
+            "Edited borrowed row"
+        );
+        assert_ne!(original[0].body, "Edited borrowed row");
+
+        let mut reset = edited.as_ref().clone();
+        for row in &mut reset[..MAX_ROW_NOTIFICATIONS + 1] {
+            Arc::make_mut(row).body = "Bulk borrowed replacement".into();
+        }
+        let reset = Arc::new(reset);
+        let reset_count = Arc::strong_count(&original[5_000]);
+        assert_eq!(
+            update_snapshot_scoped(model.clone(), reset.as_slice(), None),
+            model
+        );
+        assert_eq!(
+            update_snapshot_scoped(model.clone(), reset.as_slice(), None),
+            model
+        );
+        assert_eq!(
+            *observer.as_ref().get().changes.borrow(),
+            [
+                Change::Added(10_000, 1, 10_001),
+                Change::Changed(0, 10_001),
+                Change::Reset(10_001),
+            ]
+        );
+        assert_eq!(
+            *handles.as_ref().get().counts.borrow(),
+            [append_count, edit_count, reset_count],
+            "notifications must not retain an eager clone of the whole feed"
+        );
+        assert_eq!(model.row_count(), reset.len());
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        assert!(
+            stored
+                .rows
+                .borrow()
+                .iter()
+                .zip(reset.iter())
+                .all(|(shown, source)| shown.as_ref() == source.as_ref())
+        );
+        assert!(has_exact_row(&model, 0, &reset[0]));
+        assert!(has_exact_row(&model, 5_000, &original[5_000]));
     }
 
     #[test]

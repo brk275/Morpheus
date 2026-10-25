@@ -4717,11 +4717,7 @@ impl LiveUi {
                                     &room_id,
                                 )
                             {
-                                publish_live_messages_scoped(
-                                    &ui,
-                                    messages.as_ref().clone(),
-                                    copy_scope,
-                                );
+                                publish_live_messages_scoped(&ui, messages.as_slice(), copy_scope);
                                 recovery.publish(
                                     &ui,
                                     crate::timeline_recovery::Pane::Room,
@@ -4940,9 +4936,9 @@ impl LiveUi {
                             )
                         {
                             unshown.store(false, Ordering::Release);
-                            ui.set_messages(crate::timeline_model::update_scoped(
+                            ui.set_messages(crate::timeline_model::update_snapshot_scoped(
                                 ui.get_messages(),
-                                messages.as_ref().clone(),
+                                messages.as_slice(),
                                 copy_scope,
                             ));
                             ui.set_conversation_focused(true);
@@ -6287,15 +6283,15 @@ fn visible_feed_target(
 /// do not call it.
 #[cfg(test)]
 pub(crate) fn publish_live_messages(ui: &AppWindow, messages: Vec<Arc<MessageInfo>>) {
-    publish_live_messages_scoped(ui, messages, None);
+    publish_live_messages_scoped(ui, &messages, None);
 }
 
 fn publish_live_messages_scoped(
     ui: &AppWindow,
-    messages: Vec<Arc<MessageInfo>>,
+    messages: &[Arc<MessageInfo>],
     scope: Option<std::rc::Rc<crate::message_copy::CopyScope>>,
 ) {
-    ui.set_messages(crate::timeline_model::update_scoped(
+    ui.set_messages(crate::timeline_model::update_snapshot_scoped(
         ui.get_messages(),
         messages,
         scope,
