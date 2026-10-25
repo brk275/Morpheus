@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
+// Modified by Morpheus (2026-10-26): bounded media failure observations.
+// See MORPHEUS_PATCH.md in the crate root.
+
 //! High-level "join a call" facade over the whole stack.
 //!
 //! [`LiveKitCall::join`] wires together everything a MatrixRTC participant needs —
@@ -63,6 +66,33 @@ use matrix_rtc_livekit::{LiveKitSession, LiveKitTransportConnection, MediaKeyBri
 use super::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 
 mod held_events;
+
+/// Failure-only observations from the retained call's real media sources and SDK report.
+///
+/// Counters are positive per-entry high-water lower bounds, not totals or deltas.
+/// Typed SDK defaults conflate an absent field with zero, so neither can establish
+/// zero traffic. This deliberately exposes no identifiers, raw stats or handles.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MediaFailureSnapshot {
+    /// An actual SDK stats report completed, not necessarily with video entries.
+    pub sampled: bool,
+    pub tx_video_encoded: Option<u64>,
+    pub tx_video_packets: Option<u64>,
+    pub rx_video_packets: Option<u64>,
+    pub rx_video_decoded: Option<u64>,
+    /// Source-lifetime submission/admission flags from one unique local camera.
+    /// Admission proves native source acceptance only, not encoding or delivery.
+    pub capture_submitted: Option<bool>,
+    pub capture_admitted: Option<bool>,
+}
+
+fn positive_media_counter(current: Option<u64>, sample: u64) -> Option<u64> {
+    if sample == 0 {
+        current
+    } else {
+        Some(current.map_or(sample, |previous| previous.max(sample)))
+    }
+}
 
 /// Errors produced when joining, operating, or leaving a [`LiveKitCall`].
 #[derive(Debug, thiserror::Error)]
@@ -486,6 +516,84 @@ impl LiveKitCall {
         kind: MediaStreamKind,
     ) -> Option<ReceiveStats> {
         self.engine.receive_stats(member_id, kind).await
+    }
+
+    /// Read bounded failure-localizing facts without changing constraints or keys.
+    ///
+    /// Source flags and the report are independent observations of this retained
+    /// call, not an atomic cross-reconnect snapshot. The SDK captures its session
+    /// when querying stats. Callers must bound this read and validate their call
+    /// generation again afterward. No error payload or raw SDK object escapes.
+    pub async fn media_failure_snapshot(&self) -> MediaFailureSnapshot {
+        use livekit::webrtc::stats::RtcStats;
+
+        let room = self.connection.session().room();
+        let mut snapshot = MediaFailureSnapshot::default();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use livekit::{
+                prelude::{LocalTrack, TrackSource},
+                webrtc::video_source::RtcVideoSource,
+            };
+            // Ambiguous or absent camera sources stay unknown. Retain only the
+            // first two candidates needed to prove uniqueness, never media data.
+            let cameras: Vec<_> = room
+                .local_participant()
+                .track_publications()
+                .into_values()
+                .filter(|publication| publication.source() == TrackSource::Camera)
+                .filter_map(|publication| match publication.track() {
+                    Some(LocalTrack::Video(track)) => Some(track),
+                    _ => None,
+                })
+                .take(2)
+                .collect();
+            if let [camera] = cameras.as_slice() {
+                if let RtcVideoSource::Native(source) = camera.rtc_source() {
+                    let status = source.capture_status();
+                    snapshot.capture_submitted = Some(status.submitted);
+                    snapshot.capture_admitted = Some(status.admitted);
+                }
+            }
+        }
+        let Ok(stats) = room.get_stats().await else {
+            return snapshot;
+        };
+        snapshot.sampled = true;
+        // The native API owns collection. Bound our reduction and withhold all
+        // counters if its report is unexpectedly large or its count overflows.
+        if stats
+            .publisher_stats
+            .len()
+            .checked_add(stats.subscriber_stats.len())
+            .is_none_or(|length| length > 4_096)
+        {
+            return snapshot;
+        }
+        for entry in stats.publisher_stats.iter().chain(&stats.subscriber_stats) {
+            match entry {
+                RtcStats::OutboundRtp(value) if value.stream.kind == "video" => {
+                    snapshot.tx_video_encoded = positive_media_counter(
+                        snapshot.tx_video_encoded,
+                        u64::from(value.outbound.frames_encoded),
+                    );
+                    snapshot.tx_video_packets =
+                        positive_media_counter(snapshot.tx_video_packets, value.sent.packets_sent);
+                }
+                RtcStats::InboundRtp(value) if value.stream.kind == "video" => {
+                    snapshot.rx_video_packets = positive_media_counter(
+                        snapshot.rx_video_packets,
+                        value.received.packets_received,
+                    );
+                    snapshot.rx_video_decoded = positive_media_counter(
+                        snapshot.rx_video_decoded,
+                        u64::from(value.inbound.frames_decoded),
+                    );
+                }
+                _ => {}
+            }
+        }
+        snapshot
     }
 
     /// Publish a local track (microphone, camera, screenshare) on our focus;

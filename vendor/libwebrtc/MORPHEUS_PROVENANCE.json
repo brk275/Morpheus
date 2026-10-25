@@ -11,7 +11,12 @@
     "Cargo.toml",
     "src/native/video_source.rs",
     "src/native/peer_connection_factory.rs",
-    "src/peer_connection.rs"
+    "src/peer_connection.rs",
+    "src/video_source.rs",
+    "src/native/peer_connection.rs",
+    "src/native/rtp_receiver.rs",
+    "src/native/rtp_sender.rs",
+    "src/native/mod.rs"
   ],
   "additional_files": [
     "Cargo.toml.upstream",
@@ -23,7 +28,12 @@
     "UPSTREAM_FILES.sha256",
     "src/native/peer_connection_factory.rs.upstream",
     "src/native/video_source.rs.upstream",
-    "src/peer_connection.rs.upstream"
+    "src/peer_connection.rs.upstream",
+    "src/video_source.rs.upstream",
+    "src/native/rtp_receiver.rs.upstream",
+    "src/native/rtp_sender.rs.upstream",
+    "src/native/mod.rs.upstream",
+    "src/native/peer_connection.rs.upstream"
   ],
   "native_prebuilt_source_attributed": false,
   "license_compliance_verified": false,

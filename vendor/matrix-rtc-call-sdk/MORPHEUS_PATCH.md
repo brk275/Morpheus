@@ -59,3 +59,34 @@ remain available. The same-revision adapter's
 precedence, fixed read failures, request limits, single-write behavior and the
 remaining stable-only stock-close/distributed-race limitations. No default,
 membership/key/transport policy or original held-event ownership is changed.
+
+Additional accepted-key sender adoption correction:
+
+- Let MediaKeyHandler register and adopt the last successfully applied own index
+  atomically. Remove the separate recorded-key snapshot/setter: a ring-refused
+  key remains in that snapshot, and an independently read snapshot could also
+  overwrite a newly activated rotation.
+- Preserve key replay, identity mapping, original event receiver, connection
+  ownership, delayed activation and all incoming/history/trust policy. Focused
+  transport-module regressions exercise this same production handler registration
+  with refused and held imports. Original SDK attachment tests remain byte-exact;
+  no fixture/scanner policy changes or local test execution.
+
+This source-proven rejected-index bug is not established as the cause of any
+captured RTC first-frame failure. No native crypto readiness or success is claimed.
+
+## Bounded media failure observations
+
+Morpheus adds a read-only snapshot through the retained call and service. It
+exposes only positive per-entry video counter lower bounds and explicit native
+capture flags from a unique local camera. Missing or typed-zero counters remain
+unknown. Source admission, encoded frames and sent packets are separate facts;
+none establishes successful remote decryption or decoded media. No identifiers,
+raw reports, keys or native handles leave this interface.
+
+The existing synthetic outage fixture reads this snapshot only after its original
+45-second media deadline failed, within one three-second observation window. Its
+original failure, acceptance predicates, call authority and cleanup remain intact.
+The app observer is Linux-test-only and fenced to the retained call generation.
+Native report parsing is bounded separately in libwebrtc; source flags and stats
+are independent readings, not an atomic snapshot across an internal reconnect.

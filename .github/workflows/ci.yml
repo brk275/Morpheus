@@ -500,6 +500,8 @@ jobs:
             pool::tests::dropping_pool_settles_entered_apply_without_running_queued_successor
             pool::tests::constraint_first_poll_uses_current_writer_admission_before_removal
             pool::tests::first_poll_panic_remains_failed_but_later_real_intent_can_settle
+            keys::tests::sender_registration_adopts_only_an_accepted_own_index
+            keys::tests::registration_and_in_flight_acceptance_share_one_sender_order
           )
           cargo test --locked -p matrix-rtc-transport --lib -- --list > "$RUNNER_TEMP/morpheus-rtc-constraint-tests.txt"
           for rtc_constraint_test in "${rtc_constraint_tests[@]}"; do
@@ -648,12 +650,15 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          # Select synthetic native-source ownership cases only. Preserved
-          # upstream peer/audio-device tests are not selected by these literals.
+          # Select synthetic source ownership and bounded stats parsing only.
+          # Preserved upstream peer/audio-device tests are not selected here.
           libwebrtc_source_tests=(
             imp::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner
             imp::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner
             imp::video_source::tests::first_real_capture_stops_warmup_without_releasing_live_source
+            imp::stats_tests::native_stats_parser_preserves_empty_and_typed_reports
+            imp::stats_tests::native_stats_parser_rejects_malformed_and_unknown_reports
+            imp::stats_tests::native_stats_parser_enforces_byte_and_record_limits
           )
           cargo test --locked -p libwebrtc --lib -- --list > "$RUNNER_TEMP/morpheus-libwebrtc-source-tests.txt"
           for libwebrtc_source_test in "${libwebrtc_source_tests[@]}"; do

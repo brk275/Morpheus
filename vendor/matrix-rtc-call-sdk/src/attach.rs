@@ -13,6 +13,8 @@
 //! [`attach_media`] rather than repeating it. Transport-specific setup (the key
 //! ring, the token endpoint) stays with the caller.
 
+// Modified by Morpheus: accepted-key sender adoption; see MORPHEUS_PATCH.md.
+
 use std::sync::Arc;
 
 use matrix_rtc_call::RtcCall;
@@ -205,18 +207,14 @@ where
             // advertise a rotation to peers and keep encrypting with the
             // previous key, so anyone joining after it decrypts nothing — and
             // the forward secrecy the rotation exists for is not delivered.
-            // After the connect and the replay, so the first key is already in
-            // the ring; the hook only ever *moves* the index.
+            // Registration atomically adopts only the last index actually
+            // accepted by the key handler's ring, then follows later activations.
+            // Recorded-but-rejected keys must never select our sender's index.
             let for_keys = connection.clone();
             key_handler.set_local_sender(
                 own_identity.clone(),
                 Box::new(move |key_index| for_keys.set_local_key_index(key_index)),
             );
-            // Adopt the index we are already on rather than assuming 0: a
-            // rotation between the join and here would otherwise be missed.
-            if let Some(own) = key_handler.key_for(&own_identity) {
-                connection.set_local_key_index(own.key_index);
-            }
             Some(connection)
         }
         None => None,

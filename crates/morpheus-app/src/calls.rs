@@ -640,6 +640,31 @@ pub(crate) struct RecoveryKeyObservation {
     pub key_index: u8,
 }
 
+/// A bounded, synthetic-fixture observer. No native handles leave the active
+/// worker, and an observation never starts or prolongs a call.
+#[cfg(all(test, target_os = "linux"))]
+struct MediaFailureRequest {
+    token: u64,
+    reply: oneshot::Sender<Option<morpheus_rtc::MediaFailureSnapshot>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct MediaFailureRequests {
+    sender: mpsc::Sender<MediaFailureRequest>,
+    receiver: Mutex<mpsc::Receiver<MediaFailureRequest>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl MediaFailureRequests {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(1);
+        Self {
+            sender,
+            receiver: Mutex::new(receiver),
+        }
+    }
+}
+
 struct Shared {
     ring_request: Arc<RingRequestGate>,
     slot: Mutex<CallSlot>,
@@ -673,6 +698,8 @@ struct Shared {
     next_token: AtomicU64,
     #[cfg(all(test, target_os = "linux"))]
     recovery_keys: broadcast::Sender<RecoveryKeyObservation>,
+    #[cfg(all(test, target_os = "linux"))]
+    media_failure: MediaFailureRequests,
 }
 
 impl Shared {
@@ -951,6 +978,8 @@ impl CallController {
                 next_token: AtomicU64::new(1),
                 #[cfg(all(test, target_os = "linux"))]
                 recovery_keys: broadcast::channel(64).0,
+                #[cfg(all(test, target_os = "linux"))]
+                media_failure: MediaFailureRequests::new(),
             }),
         }
     }
@@ -958,6 +987,38 @@ impl CallController {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn subscribe_recovery_keys(&self) -> broadcast::Receiver<RecoveryKeyObservation> {
         self.shared.recovery_keys.subscribe()
+    }
+
+    /// Called only after the live fixture's original media deadline failed.
+    /// Admission, sampling and reply share one bound; a changed join returns
+    /// unknown. This cannot satisfy or extend any acceptance deadline.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn observe_current_media_failure(
+        &self,
+        token: u64,
+    ) -> Option<morpheus_rtc::MediaFailureSnapshot> {
+        if token == 0 || self.video_token() != token {
+            return None;
+        }
+        let observation = async {
+            let (reply, response) = oneshot::channel();
+            self.shared
+                .media_failure
+                .sender
+                .send(MediaFailureRequest { token, reply })
+                .await
+                .ok()?;
+            response.await.ok().flatten()
+        };
+        let result = timeout(Duration::from_secs(2), observation)
+            .await
+            .ok()
+            .flatten();
+        if self.video_token() == token {
+            result
+        } else {
+            None
+        }
     }
 
     pub fn subscribe_status(&self) -> watch::Receiver<CallStatus> {
@@ -2059,6 +2120,49 @@ struct RecoveryInputs<'a> {
     sync: &'a mut watch::Receiver<SyncStatus>,
 }
 
+/// Always pending in production. In a Linux test this owns only closed
+/// numeric/boolean observations; the surrounding call select retains priority
+/// for cancellation, account revocation and all regular media work.
+async fn observe_media_failures(
+    shared: &Shared,
+    rtc: &RtcService,
+    room_id: &str,
+    presentation: u64,
+    selection: &AccountSelection,
+) {
+    #[cfg(all(test, target_os = "linux"))]
+    loop {
+        let request = { shared.media_failure.receiver.lock().await.recv().await };
+        let Some(request) = request else {
+            return pending::<()>().await;
+        };
+        if request.reply.is_closed() {
+            continue;
+        }
+        let current = || {
+            request.token != 0
+                && request.token == presentation
+                && shared.active_video_token.load(Ordering::SeqCst) == presentation
+                && selection.is_current()
+        };
+        let result = if current() {
+            timeout(Duration::from_secs(2), rtc.media_failure_snapshot(room_id))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let result = if current() { result } else { None };
+        let _ = request.reply.send(result);
+    }
+    #[cfg(not(all(test, target_os = "linux")))]
+    {
+        let _ = (shared, rtc, room_id, presentation, selection);
+        pending::<()>().await;
+    }
+}
+
 /// How a finished call is reported to the UI.
 enum CallOutcome {
     Idle,
@@ -2396,6 +2500,17 @@ impl CallWorker {
                     &self.shared.active_video_token,
                 );
                 tokio::pin!(video);
+                // Test-only requests use this exact retained service and join.
+                // Keep the observer pinned while the regular select runs so a
+                // roster/audio tick cannot cancel a sample halfway through.
+                let media_failure = observe_media_failures(
+                    &self.shared,
+                    &rtc,
+                    &self.room_id,
+                    self.presentation,
+                    &self.selection,
+                );
+                tokio::pin!(media_failure);
                 let mut audio_running = true;
                 let mut video_running = true;
                 let mut media_degraded = false;
@@ -2418,6 +2533,7 @@ impl CallWorker {
                         _ = &mut self.cancel => break SessionEnd::Finish(Ok(())),
                         _ = established_cancelled(incoming_guard.as_ref()) => break SessionEnd::Finish(Err(CallControllerError::IncomingOfferUnavailable)),
                         _ = self.selection.revoked() => break SessionEnd::Finish(Err(CallControllerError::AccountChanged)),
+                        () = &mut media_failure => {},
                         changed = active.changed() => {
                             if changed.is_err() || !self.selection.is_current()
                                 || active.borrow().as_ref().map(|account| account.id.as_str()) != Some(self.account_id.as_str()) {
@@ -4265,6 +4381,8 @@ mod tests {
             next_token: AtomicU64::new(6),
             #[cfg(all(test, target_os = "linux"))]
             recovery_keys: broadcast::channel(64).0,
+            #[cfg(all(test, target_os = "linux"))]
+            media_failure: MediaFailureRequests::new(),
         };
         shared.invitation.send_replace(InvitationUpdate {
             token: 5,
@@ -4371,6 +4489,8 @@ mod tests {
             next_token: AtomicU64::new(6),
             #[cfg(all(test, target_os = "linux"))]
             recovery_keys: broadcast::channel(64).0,
+            #[cfg(all(test, target_os = "linux"))]
+            media_failure: MediaFailureRequests::new(),
         };
         let state = AudioState {
             microphone_muted: true,

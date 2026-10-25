@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by Morpheus: reject invalid native stats reports without panicking.
+// See MORPHEUS_PATCH.md in the crate root.
+
 use std::sync::Arc;
 
 use cxx::SharedPtr;
@@ -414,14 +417,7 @@ impl PeerConnection {
         self.sys_handle.get_stats(ctx, |ctx, stats| {
             let tx = ctx.0.downcast::<oneshot::Sender<Result<Vec<RtcStats>, RtcError>>>().unwrap();
 
-            if stats.is_empty() {
-                let _ = tx.send(Ok(vec![]));
-                return;
-            }
-
-            // Unwrap because it should not happens
-            let vec = serde_json::from_str(&stats).unwrap();
-            let _ = tx.send(Ok(vec));
+            let _ = tx.send(super::parse_stats_report(&stats));
         });
 
         rx.await.map_err(|_| RtcError {

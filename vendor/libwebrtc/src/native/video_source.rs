@@ -16,7 +16,10 @@
 // See MORPHEUS_PATCH.md in the crate root.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -56,9 +59,13 @@ pub struct NativeVideoSource {
     inner: Arc<VideoSourceInner>,
 }
 
+const CAPTURE_SUBMITTED: u8 = 1;
+const CAPTURE_ADMITTED: u8 = 2;
+
 struct VideoSourceInner {
     sys_handle: SharedPtr<vt_sys::ffi::VideoTrackSource>,
     captured_frames: Mutex<usize>,
+    capture_status: AtomicU8,
 }
 
 impl NativeVideoSource {
@@ -79,6 +86,7 @@ impl NativeVideoSource {
                     is_screencast,
                 ),
                 captured_frames: Mutex::new(0),
+                capture_status: AtomicU8::new(0),
             }),
         };
         let weak_source = Arc::downgrade(&source.inner);
@@ -128,6 +136,14 @@ impl NativeVideoSource {
         self.inner.sys_handle.clone()
     }
 
+    pub fn capture_status(&self) -> (bool, bool) {
+        let status = self.inner.capture_status.load(Ordering::Acquire);
+        (
+            status & CAPTURE_SUBMITTED != 0,
+            status & CAPTURE_ADMITTED != 0,
+        )
+    }
+
     pub fn capture_frame<T: AsRef<dyn VideoBuffer>>(&self, frame: &VideoFrame<T>) {
         let mut builder = vf_sys::ffi::new_video_frame_builder();
         builder.pin_mut().set_rotation(frame.rotation.into());
@@ -154,7 +170,10 @@ impl NativeVideoSource {
 
         *self.inner.captured_frames.lock() += 1;
 
-        self.inner.sys_handle.on_captured_frame(
+        self.inner
+            .capture_status
+            .fetch_or(CAPTURE_SUBMITTED, Ordering::Release);
+        let admitted = self.inner.sys_handle.on_captured_frame(
             &builder.pin_mut().build(),
             &vt_sys::ffi::FrameMetadata {
                 has_packet_trailer: has_trailer,
@@ -162,6 +181,11 @@ impl NativeVideoSource {
                 frame_id: fid,
             },
         );
+        if admitted {
+            self.inner
+                .capture_status
+                .fetch_or(CAPTURE_ADMITTED, Ordering::Release);
+        }
     }
 
     /// Captures a Jetson DMA-buffer backed video frame.
@@ -209,7 +233,10 @@ impl NativeVideoSource {
         };
 
         *self.inner.captured_frames.lock() += 1;
-        self.inner.sys_handle.capture_dmabuf_frame(
+        self.inner
+            .capture_status
+            .fetch_or(CAPTURE_SUBMITTED, Ordering::Release);
+        let admitted = self.inner.sys_handle.capture_dmabuf_frame(
             dmabuf_fd,
             width as i32,
             height as i32,
@@ -220,7 +247,13 @@ impl NativeVideoSource {
                 user_timestamp: user_ts,
                 frame_id: fid,
             },
-        )
+        );
+        if admitted {
+            self.inner
+                .capture_status
+                .fetch_or(CAPTURE_ADMITTED, Ordering::Release);
+        }
+        admitted
     }
 
     /// Set the packet trailer handler used by this source.

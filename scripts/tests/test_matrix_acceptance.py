@@ -2558,6 +2558,39 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
         self.assertEqual(acceptance_module.outage_diagnostics("MORPHEUS_RTC_OUTAGE_STAGE cleanup\n"),
                          {"cleanup_started": True})
 
+    def test_outage_transport_is_positive_lower_bounds_or_unknown_and_never_success_evidence(self):
+        receiver = ("MORPHEUS_RTC_OUTAGE_TRANSPORT role=receiver peer=0 sampled=true "
+                    "tx_video_encoded=unknown tx_video_packets=unknown rx_video_packets=9 "
+                    "rx_video_decoded=unknown capture_submitted=unknown capture_admitted=unknown\n")
+        sender = ("MORPHEUS_RTC_OUTAGE_TRANSPORT role=sender peer=1 sampled=true "
+                  "tx_video_encoded=18446744073709551615 tx_video_packets=4 rx_video_packets=unknown "
+                  "rx_video_decoded=unknown capture_submitted=true capture_admitted=true\n")
+        rows = acceptance_module.outage_diagnostics(receiver + sender)["transport"]
+        self.assertEqual(rows[0], {"role": "receiver", "peer": 0, "sampled": True,
+                         "tx_video_encoded": None, "tx_video_packets": None, "rx_video_packets": 9,
+                         "rx_video_decoded": None, "capture_submitted": None, "capture_admitted": None})
+        self.assertEqual(rows[1]["tx_video_encoded"], (1 << 64) - 1)
+        unknown = receiver.replace("sampled=true", "sampled=unknown").replace("rx_video_packets=9", "rx_video_packets=unknown")
+        self.assertIsNone(acceptance_module.outage_diagnostics(unknown)["transport"][0]["sampled"])
+        for target in ("dm", "room"):
+            with self.assertRaises(RuntimeError):
+                acceptance_module.outage_evidence(self.output(target) + receiver + sender, target)
+
+    def test_outage_transport_rejects_duplicates_overflow_zero_extra_data_and_untrusted_fields(self):
+        receiver = ("MORPHEUS_RTC_OUTAGE_TRANSPORT role=receiver peer=0 sampled=true "
+                    "tx_video_encoded=unknown tx_video_packets=unknown rx_video_packets=9 "
+                    "rx_video_decoded=unknown capture_submitted=unknown capture_admitted=unknown\n")
+        for raw in (receiver + receiver, receiver.replace("role=receiver", "role=sender"),
+                    receiver.replace("peer=0", "peer=3"), receiver.replace("rx_video_packets=9", "rx_video_packets=0"),
+                    receiver.replace("rx_video_packets=9", "rx_video_packets=18446744073709551616"),
+                    receiver.replace("rx_video_packets=9", "rx_video_packets=09"),
+                    receiver.replace("sampled=true", "sampled=unknown"),
+                    receiver.replace("capture_admitted=unknown", "capture_admitted=true"),
+                    receiver.rstrip() + " private_payload\n", receiver.replace("rx_video_packets=9", "private_payload=9"),
+                    "MORPHEUS_RTC_OUTAGE_TRANSPORT " + "x" * 513 + "\n"):
+            self.assertEqual(acceptance_module.outage_diagnostics(raw), {"transport": "invalid"})
+        self.assertEqual(acceptance_module.outage_diagnostics("private server text\n"), {})
+
     def test_only_explicit_suite_mints_capability_and_preserves_default_plan(self):
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
                 "GITHUB_REPOSITORY": "brk275/Morpheus", "MORPHEUS_MATRIX_SFU_RUN_ID": "ambient"}):

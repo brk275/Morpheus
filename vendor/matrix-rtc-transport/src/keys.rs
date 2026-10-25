@@ -25,6 +25,8 @@
 //! drive it from a plain thread. Enforcing it is therefore a transport-layer
 //! obligation, and this is the one implementation of it.
 
+// Modified by Morpheus: accepted-key sender adoption; see MORPHEUS_PATCH.md.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -136,6 +138,15 @@ pub type LocalKeyIndexHook = Box<dyn Fn(u8) + Send + Sync>;
 #[cfg(target_arch = "wasm32")]
 pub type LocalKeyIndexHook = Box<dyn Fn(u8)>;
 
+/// Serializes sender registration with accepted-key activation. Retains only
+/// indices, never another copy of the key material. A rejected import must not
+/// displace the last index the configured ring accepted.
+#[derive(Default)]
+struct LocalSenderState {
+    applied_indices: HashMap<String, u8>,
+    sender: Option<(String, LocalKeyIndexHook)>,
+}
+
 /// Records media keys signalled by `matrix-rtc-core` and, when built with
 /// [`MediaKeyHandler::with_ring`], imports them into the transport's
 /// [`FrameKeyRing`].
@@ -155,7 +166,7 @@ pub struct MediaKeyHandler {
     switch_listener: Arc<Mutex<Option<SwitchCompleteListener>>>,
     /// Our own transport identity and how to re-index our sender; `None` until
     /// the room is connected. See [`LocalKeyIndexHook`].
-    local_sender: Arc<Mutex<Option<(String, LocalKeyIndexHook)>>>,
+    local_sender: Arc<Mutex<LocalSenderState>>,
 }
 
 impl MediaKeyHandler {
@@ -209,11 +220,25 @@ impl MediaKeyHandler {
     /// new key index, so an activated rotation actually changes what we encrypt
     /// with. Without it the handler records and imports keys as before, and our
     /// own rotations never take effect.
+    ///
+    /// Registration also adopts the most recent index successfully applied for
+    /// this identity. With no ring, record-only application remains sufficient.
+    /// Rejected keys remain recorded but cannot select our sender's index. The
+    /// same lock orders this adoption with later activations, so a replay
+    /// snapshot cannot overwrite a rotation that completed during attachment.
     pub fn set_local_sender(&self, own_identity: impl Into<String>, hook: LocalKeyIndexHook) {
-        *self
+        let own_identity = own_identity.into();
+        let mut state = self
             .local_sender
             .lock()
-            .expect("key handler local sender mutex poisoned") = Some((own_identity.into(), hook));
+            .expect("key handler local sender mutex poisoned");
+        let applied_index = state.applied_indices.get(&own_identity).copied();
+        state.sender = Some((own_identity, hook));
+        if let Some(index) = applied_index
+            && let Some((_, hook)) = state.sender.as_ref()
+        {
+            hook(index);
+        }
     }
 
     /// The latest recorded key for a participant identity, if any.
@@ -245,7 +270,7 @@ impl MediaKeyHandler {
         ring: Option<&Arc<dyn FrameKeyRing>>,
         keys: &Mutex<HashMap<String, ParticipantKey>>,
         listener: &Mutex<Option<KeyImportListener>>,
-        local_sender: &Mutex<Option<(String, LocalKeyIndexHook)>>,
+        local_sender: &Mutex<LocalSenderState>,
         key: ParticipantKey,
     ) {
         // Whether the key ring refused this index. Our sender must not be moved
@@ -288,14 +313,18 @@ impl MediaKeyHandler {
         // Our own key: also move the sender onto the new index. `set_key` alone
         // only fills the ring, so without this we would advertise the rotation
         // and keep stamping the previous index.
-        if !rejected
-            && let Some((own_identity, hook)) = local_sender
+        if !rejected {
+            let mut state = local_sender
                 .lock()
-                .expect("key handler local sender mutex poisoned")
-                .as_ref()
-            && own_identity == &key.rtc_backend_identity
-        {
-            hook(key.key_index);
+                .expect("key handler local sender mutex poisoned");
+            state
+                .applied_indices
+                .insert(key.rtc_backend_identity.clone(), key.key_index);
+            if let Some((own_identity, hook)) = state.sender.as_ref()
+                && own_identity == &key.rtc_backend_identity
+            {
+                hook(key.key_index);
+            }
         }
 
         keys.lock()
@@ -764,5 +793,150 @@ mod tests {
 
         assert!(switched.lock().unwrap().is_empty());
         assert!(handler.key_for("me").is_some());
+    }
+
+    /// A recorded refusal must not become the sender's initial index merely
+    /// because the sender is attached after key replay.
+    #[tokio::test]
+    async fn sender_registration_adopts_only_an_accepted_own_index() {
+        struct SelectiveRing(Mutex<Vec<u8>>);
+
+        #[async_trait]
+        impl FrameKeyRing for SelectiveRing {
+            fn ring_size(&self) -> u16 {
+                4
+            }
+
+            async fn set_key(&self, _identity: &str, index: u8, _key: Vec<u8>) -> bool {
+                self.0.lock().unwrap().push(index);
+                index != 2
+            }
+        }
+
+        let ring = Arc::new(SelectiveRing(Mutex::new(Vec::new())));
+        let handler = MediaKeyHandler::with_ring(ring.clone());
+        for (identity, key_index) in [("me", 2), ("me", 4), ("peer", 1)] {
+            handler
+                .on_new_key_material(KeyMaterialSignal {
+                    key: vec![1; 4],
+                    key_index,
+                    rtc_backend_identity: identity.to_owned(),
+                    use_after_ms: 0,
+                })
+                .await;
+        }
+        let switched = Arc::new(Mutex::new(Vec::new()));
+        let observed = switched.clone();
+        handler.set_local_sender(
+            "me",
+            Box::new(move |index| {
+                observed.lock().unwrap().push(index);
+            }),
+        );
+        assert!(switched.lock().unwrap().is_empty());
+        assert_eq!(handler.key_for("me").unwrap().key_index, 4);
+
+        for (identity, key_index) in [("me", 1), ("me", 2), ("me", 4), ("peer", 3)] {
+            handler
+                .on_new_key_material(KeyMaterialSignal {
+                    key: vec![1; 4],
+                    key_index,
+                    rtc_backend_identity: identity.to_owned(),
+                    use_after_ms: 0,
+                })
+                .await;
+        }
+        assert_eq!(*switched.lock().unwrap(), [1]);
+        let replacement = Arc::new(Mutex::new(Vec::new()));
+        let observed = replacement.clone();
+        handler.set_local_sender(
+            "me",
+            Box::new(move |index| {
+                observed.lock().unwrap().push(index);
+            }),
+        );
+        assert_eq!(*replacement.lock().unwrap(), [1]);
+        assert_eq!(handler.key_for("me").unwrap().key_index, 4);
+        assert!(!ring.0.lock().unwrap().contains(&4));
+
+        handler
+            .on_new_key_material(KeyMaterialSignal {
+                key: vec![1; 4],
+                key_index: 3,
+                rtc_backend_identity: "me".to_owned(),
+                use_after_ms: 0,
+            })
+            .await;
+        assert_eq!(*replacement.lock().unwrap(), [1, 3]);
+        assert_eq!(*switched.lock().unwrap(), [1]);
+    }
+
+    /// The real import future is held inside the ring while registration adopts
+    /// the previous accepted index. Its completion must then move that same
+    /// sender forward, with no independent attachment snapshot left to rewind it.
+    #[tokio::test]
+    async fn registration_and_in_flight_acceptance_share_one_sender_order() {
+        struct HeldRing {
+            entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<()>>,
+        }
+
+        #[async_trait]
+        impl FrameKeyRing for HeldRing {
+            fn ring_size(&self) -> u16 {
+                16
+            }
+
+            async fn set_key(&self, _identity: &str, index: u8, _key: Vec<u8>) -> bool {
+                if index == 2 {
+                    if let Some(entered) = self.entered.lock().unwrap().take() {
+                        let _ = entered.send(());
+                    }
+                    let mut release = self.release.lock().await;
+                    (&mut *release).await.is_ok()
+                } else {
+                    true
+                }
+            }
+        }
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let handler = MediaKeyHandler::with_ring(Arc::new(HeldRing {
+            entered: Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Mutex::new(release_rx),
+        }));
+        handler
+            .on_new_key_material(KeyMaterialSignal {
+                key: vec![1; 4],
+                key_index: 1,
+                rtc_backend_identity: "me".to_owned(),
+                use_after_ms: 0,
+            })
+            .await;
+
+        let switched = Arc::new(Mutex::new(Vec::new()));
+        let apply = handler.on_new_key_material(KeyMaterialSignal {
+            key: vec![2; 4],
+            key_index: 2,
+            rtc_backend_identity: "me".to_owned(),
+            use_after_ms: 0,
+        });
+        let register = async {
+            let entered = entered_rx.await.is_ok();
+            let observed = switched.clone();
+            handler.set_local_sender(
+                "me",
+                Box::new(move |index| {
+                    observed.lock().unwrap().push(index);
+                }),
+            );
+            let adopted_previous = *switched.lock().unwrap() == [1];
+            let released = release_tx.send(()).is_ok();
+            (entered, adopted_previous, released)
+        };
+        let ((), observations) = tokio::join!(apply, register);
+        assert_eq!(observations, (true, true, true));
+        assert_eq!(*switched.lock().unwrap(), [1, 2]);
     }
 }

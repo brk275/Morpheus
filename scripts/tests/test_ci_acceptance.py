@@ -362,6 +362,9 @@ class NativeRouteWorkflowTests(unittest.TestCase):
             "imp::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner",
             "imp::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner",
             "imp::video_source::tests::first_real_capture_stops_warmup_without_releasing_live_source",
+            "imp::stats_tests::native_stats_parser_preserves_empty_and_typed_reports",
+            "imp::stats_tests::native_stats_parser_rejects_malformed_and_unknown_reports",
+            "imp::stats_tests::native_stats_parser_enforces_byte_and_record_limits",
         )
         for case in cases:
             self.assertEqual(source.count(case), 1)
@@ -370,6 +373,24 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertIn('grep -Fxc -- "test $libwebrtc_source_test ... ok"', step)
         self.assertIn("VIDEO_SOURCE_OUTCOME: ${{ steps.video-source-tests.outcome }}", source)
         self.assertIn('("video-source-tests", "VIDEO_SOURCE_OUTCOME")', source)
+
+    def test_transport_key_acceptance_regressions_are_explicit_in_vendor_gate(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        start = "          rtc_constraint_tests=(\n"
+        self.assertEqual(source.count(start), 1)
+        selected = source.split(start, 1)[1].split("          )\n", 1)[0]
+        for case in (
+            "keys::tests::sender_registration_adopts_only_an_accepted_own_index",
+            "keys::tests::registration_and_in_flight_acceptance_share_one_sender_order",
+        ):
+            self.assertEqual(source.count(case), 1)
+            self.assertIn(case, selected)
+        self.assertIn('cargo test --locked -p matrix-rtc-transport --lib -- --list', source)
+        self.assertIn('grep -Fxc -- "$rtc_constraint_test: test"', source)
+        self.assertIn('cargo test --locked -p matrix-rtc-transport --lib "$rtc_constraint_test" -- --exact', source)
+        self.assertIn('grep -Fxc -- "test $rtc_constraint_test ... ok"', source)
+        self.assertIn("VENDOR_OUTCOME: ${{ steps.vendor-tests.outcome }}", source)
+        self.assertIn('("vendor-tests", "VENDOR_OUTCOME")', source)
 
     def test_manual_inputs_and_fixed_routes_keep_existing_security_and_commands(self):
         source=WORKFLOW.read_text(encoding="utf-8")

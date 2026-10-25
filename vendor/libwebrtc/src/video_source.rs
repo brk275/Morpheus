@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by Morpheus: expose explicit capture-status observations.
+// See MORPHEUS_PATCH.md in the crate root.
+
 use crate::{enum_dispatch, imp::video_source as vs_imp};
 
 #[derive(Debug, Clone)]
@@ -53,6 +56,18 @@ pub mod native {
     use crate::video_frame::FrameMetadata;
     use crate::video_frame::{VideoBuffer, VideoFrame};
 
+    /// Positive high-water observations for explicit frames submitted to one source.
+    ///
+    /// Warm-up frames are excluded. Native admission is not encoding, encryption,
+    /// RTP transmission, remote reception, or successful decryption.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct VideoCaptureStatus {
+        /// An explicit capture reached the native submission boundary.
+        pub submitted: bool,
+        /// The native source returned true after adaptation and its OnFrame call.
+        pub admitted: bool,
+    }
+
     #[derive(Clone)]
     pub struct NativeVideoSource {
         pub(crate) handle: vs_imp::NativeVideoSource,
@@ -77,6 +92,14 @@ pub mod native {
 
         pub fn capture_frame<T: AsRef<dyn VideoBuffer>>(&self, frame: &VideoFrame<T>) {
             self.handle.capture_frame(frame)
+        }
+
+        /// Observe explicit capture progress on this same source without taking a
+        /// native lock. False is not a diagnosis: a concurrent call can still be
+        /// entering or executing. These sticky flags reset only with a new source.
+        pub fn capture_status(&self) -> VideoCaptureStatus {
+            let (submitted, admitted) = self.handle.capture_status();
+            VideoCaptureStatus { submitted, admitted }
         }
 
         /// Captures a Jetson DMA-buffer backed video frame.

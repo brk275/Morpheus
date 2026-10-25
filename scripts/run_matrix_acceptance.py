@@ -317,6 +317,55 @@ OUTAGE_DELIVERY = re.compile(r"^MORPHEUS_RTC_OUTAGE_DELIVERY " + " ".join(
     name + r"=(true|false)" for name in OUTAGE_DELIVERY_FIELDS) + r"$", re.MULTILINE)
 
 
+# Failure-only observations of real SDK/native state. Typed RTC stats default
+# missing counters to zero, so only positive lower bounds may leave the process.
+# None means unknown, including a missing/zero counter, never proof of no traffic.
+OUTAGE_TRANSPORT_COUNTERS = (
+    "tx_video_encoded", "tx_video_packets", "rx_video_packets", "rx_video_decoded",
+)
+OUTAGE_TRANSPORT_CAPTURE = ("capture_submitted", "capture_admitted")
+OUTAGE_TRANSPORT = re.compile(
+    r"^MORPHEUS_RTC_OUTAGE_TRANSPORT role=(receiver|sender) peer=([0-2]) "
+    r"sampled=(true|false|unknown) " + " ".join(
+        name + r"=(unknown|[1-9][0-9]{0,19})" for name in OUTAGE_TRANSPORT_COUNTERS
+    ) + " " + " ".join(
+        name + r"=(true|false|unknown)" for name in OUTAGE_TRANSPORT_CAPTURE
+    ) + r"$"
+)
+
+
+def outage_transport_diagnostics(output: str):
+    lines = [line for line in output.splitlines()
+             if line.startswith("MORPHEUS_RTC_OUTAGE_TRANSPORT")]
+    if not lines:
+        return None
+    if len(lines) > 3:
+        return "invalid"
+    observations = []
+    peers = set()
+    for index, line in enumerate(lines):
+        match = OUTAGE_TRANSPORT.fullmatch(line) if len(line) <= 512 else None
+        if match is None:
+            return "invalid"
+        role, peer, sampled, *values = match.groups()
+        if peer in peers or role != ("receiver" if index == 0 else "sender"):
+            return "invalid"
+        peers.add(peer)
+        counters = {name: (None if value == "unknown" else int(value)) for name, value in
+                    zip(OUTAGE_TRANSPORT_COUNTERS, values[:4], strict=True)}
+        if any(value is not None and (value > (1 << 64) - 1 or sampled != "true")
+               for value in counters.values()):
+            return "invalid"
+        capture = {name: (None if value == "unknown" else value == "true") for name, value in
+                   zip(OUTAGE_TRANSPORT_CAPTURE, values[4:], strict=True)}
+        if capture["capture_admitted"] is True and capture["capture_submitted"] is not True:
+            return "invalid"
+        observations.append({"role": role, "peer": int(peer),
+                             "sampled": None if sampled == "unknown" else sampled == "true",
+                             **counters, **capture})
+    return observations
+
+
 def outage_evidence(output: str, target: str) -> dict[str, bool]:
     if target not in OUTAGE_TARGET:
         raise RuntimeError("Invalid owned SFU outage target")
@@ -377,6 +426,9 @@ def outage_diagnostics(output: str) -> dict:
         result["delivery"] = ({name: value == "true" for name, value in
                                zip(OUTAGE_DELIVERY_FIELDS, match.groups(), strict=True)}
                               if len(delivery_lines) == 1 and match is not None else "invalid")
+    transport = outage_transport_diagnostics(output)
+    if transport is not None:
+        result["transport"] = transport
     checks = {name: value == "true" for name, value in OUTAGE_CHECK.findall(output)
               if name in OUTAGE_CHECKS or name in OUTAGE_TARGET.values()}
     if checks:

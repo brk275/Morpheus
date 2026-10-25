@@ -19,7 +19,8 @@ use matrix_sdk::{
     ruma::events::room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
 };
 use morpheus_rtc::{
-    AudioDeviceSelection, I420Buffer, MediaError, Publication, VideoFrame, VideoRotation,
+    AudioDeviceSelection, I420Buffer, MediaError, MediaFailureSnapshot, Publication, VideoFrame,
+    VideoRotation,
 };
 use tokio::sync::broadcast;
 
@@ -103,6 +104,32 @@ impl DeliveryProgress {
             self.sequence,
         );
     }
+}
+
+// Fixed synthetic roles/indexes only. A positive counter is a lower bound from
+// a real video stats entry; unknown never means zero. These lines are failure
+// diagnostics and cannot satisfy any outage acceptance predicate.
+fn report_transport_failure(role: &'static str, peer: usize, value: Option<MediaFailureSnapshot>) {
+    let flag = |value: Option<bool>| match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    };
+    let counter = |value: Option<u64>| {
+        value
+            .filter(|value| *value > 0)
+            .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+    };
+    eprintln!(
+        "\nMORPHEUS_RTC_OUTAGE_TRANSPORT role={role} peer={peer} sampled={} tx_video_encoded={} tx_video_packets={} rx_video_packets={} rx_video_decoded={} capture_submitted={} capture_admitted={}",
+        flag(value.map(|value| value.sampled)),
+        counter(value.and_then(|value| value.tx_video_encoded)),
+        counter(value.and_then(|value| value.tx_video_packets)),
+        counter(value.and_then(|value| value.rx_video_packets)),
+        counter(value.and_then(|value| value.rx_video_decoded)),
+        flag(value.and_then(|value| value.capture_submitted)),
+        flag(value.and_then(|value| value.capture_admitted)),
+    );
 }
 
 fn video_push_failure(error: MediaError) {
@@ -805,6 +832,37 @@ impl OutageSession {
         )
     }
 
+    async fn failed_media_transport(&self, case: &OutageCase, owner: usize, generation: u64) {
+        // Only the existing two/three-person synthetic fixture is observable.
+        // Keep one receiver then at most two senders, even if a query times out.
+        if !(2..=3).contains(&self.peers.len()) || owner >= self.peers.len() {
+            return;
+        }
+        let mut observations = vec![None; self.peers.len()];
+        let _ = time::timeout(Duration::from_secs(3), async {
+            observations[owner] = self.calls.observe_current_media_failure(generation).await;
+            for (index, peer) in self.peers.iter().enumerate() {
+                if index != owner {
+                    if let Some(rtc) = &peer.rtc {
+                        observations[index] = rtc.media_failure_snapshot(case.room.as_str()).await;
+                    }
+                }
+            }
+        })
+        .await;
+        // A generation change invalidates every result in this observation
+        // window. No retained old-call counters are presented as current facts.
+        if self.calls.video_token() != generation {
+            observations.fill(None);
+        }
+        report_transport_failure("receiver", owner, observations[owner]);
+        for (index, value) in observations.into_iter().enumerate() {
+            if index != owner {
+                report_transport_failure("sender", index, value);
+            }
+        }
+    }
+
     async fn media(
         &self,
         case: &OutageCase,
@@ -824,7 +882,7 @@ impl OutageSession {
         let mut sequence = 0u32;
         let mut progress = MediaProgress::default();
         let mut delivery = DeliveryProgress::default();
-        time::timeout(Duration::from_secs(45), async {
+        let result = time::timeout(Duration::from_secs(45), async {
             loop {
                 // Only these retained, current fixture publications receive
                 // frames. No capture devices, files or owner media are opened.
@@ -985,12 +1043,17 @@ impl OutageSession {
                 time::sleep(Duration::from_millis(67)).await;
             }
         })
-        .await
-        .map_err(|_| {
-            progress.report();
-            delivery.report();
-            media_failure("deadline");
-        })?
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                progress.report();
+                delivery.report();
+                media_failure("deadline");
+                self.failed_media_transport(case, owner, generation).await;
+                Err(())
+            }
+        }
     }
 
     async fn key_receipts(

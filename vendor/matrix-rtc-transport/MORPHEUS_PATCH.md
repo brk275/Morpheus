@@ -39,3 +39,21 @@ backend hangs or panics.
 Morpheus applies its default Rust formatting to the copied Rust sources using
 the pinned formatter. The original preimage inventory remains unchanged; these
 formatting changes do not change the upstream license or dependency versions.
+
+Additional accepted-key sender adoption correction:
+
+- Keep the latest successfully applied key index per identity, separately from
+  the existing recorded-key API. A native ring refusal or out-of-range index
+  remains recorded and reported, but cannot replace an accepted sender index.
+- Register the local sender and adopt its accepted index under the same existing
+  sender mutex used by later activations. No key material is copied into this
+  metadata and no new task, timer, wire format, trust decision or dependency is
+  introduced. A record-only handler preserves its existing successful-apply
+  behavior. Existing hooks still run synchronously under that mutex.
+- Focused existing-module regressions exercise pre-registration refusal and
+  bounds, accepted-index retention, peer isolation and an actual held ring
+  operation completing across sender registration. No test has been run locally.
+
+This corrects an attachment path that could select a recorded-but-rejected key;
+there is no evidence that such rejection caused the captured first-frame outage.
+The existing recorded-key listener is not a native acceptance/decryption receipt.

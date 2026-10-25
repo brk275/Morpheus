@@ -74,3 +74,47 @@ No source-only review or synthetic lifetime assertion authorizes distribution.
 The modified Rust source copies are formatted with the project's authenticated
 Rustfmt using stdin only, edition 2021 and disabled child traversal. Exact
 original preimages and the original package inventory remain unchanged.
+
+## Explicit native capture observations
+
+The public native video source now exposes a read-only `capture_status()`
+snapshot for the same retained source. An atomic two-bit record distinguishes
+an explicit Rust frame reaching the existing native submission boundary from
+that native call returning true. The I420 and Linux DMA-buffer paths both
+record the actual existing native result; warm-up frames do not set either
+flag. The getter does not acquire a native/source mutex, spawn work, retain
+another source, or change capture return signatures.
+
+The native true result follows adaptation and `OnFrame`, not encoding or
+network transmission. These are sticky positive observations only; false can
+also mean that a call is still entering or executing. They cannot establish
+encoder/RTP activity, successful encryption/decryption or recovery. The existing
+local camera track's actual sender stats are a separate source of positive
+encoded/sent observations. No frame bytes, timestamps, dimensions, codec/layer
+selection, native ABI, warm-up policy, encryption policy or acceptance criteria
+are changed. `src/video_source.rs.upstream` preserves the unmodified public
+source; the original package inventory remains unchanged. No code, tests,
+formatter or native tools were executed when preparing this addition.
+
+## Native stats report failure boundary
+
+The three existing native peer-connection/sender/receiver stats callbacks now
+send the result of one shared parser through their original Result oneshot.
+Malformed, unknown-type or oversized reports return Internal with the fixed
+message `invalid native stats report`; neither raw JSON nor serde's error text
+is copied into that error. Empty strings retain their original empty result.
+The parser admits at most 8 MiB of UTF-8 input and 4096 typed records, ignores
+untrusted size hints, and rejects trailing data. It does not change the native
+stats ABI, callback context, cancellation ownership, report fields or numeric
+default semantics. A zero typed field still does not prove field presence.
+
+The byte cap is checked after CXX already produced the original String; it is
+not a bound on native stats collection or serialization. The record cap bounds
+Vec growth; one additional record may be parsed before excess is detected.
+Existing serde recursion limits remain in effect. The internal context downcast
+still relies on the exact Rust-owned sender installed by the same call.
+
+Three source-only proposed regressions cover typed/empty reports, malformed and
+unknown data/fixed-error privacy, and exact byte/record boundaries. No native
+stats, tests or tools were run locally. Existing source/native/provenance and
+actual encrypted media/recovery acceptance requirements remain open.

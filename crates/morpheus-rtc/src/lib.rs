@@ -65,8 +65,8 @@ pub use matrix_rtc_transport::{Dimensions, MediaConstraints, RemoteTrackHandle, 
 pub use media::{MediaError, Publication};
 #[cfg(feature = "native-rtc")]
 pub use native::{
-    CallInfo, CallOptions, InteropMode, ParticipantInfo, ParticipantStreamInfo, RtcService,
-    RtcStreamKind, install_crypto_provider,
+    CallInfo, CallOptions, InteropMode, MediaFailureSnapshot, ParticipantInfo,
+    ParticipantStreamInfo, RtcService, RtcStreamKind, install_crypto_provider,
 };
 #[cfg(feature = "native-rtc")]
 pub use observer::{ObservedCall, ObservedParticipant, ObserverError, PassiveCallObserver};

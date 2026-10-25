@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+pub use matrix_rtc_call_sdk::livekit::MediaFailureSnapshot;
 use matrix_rtc_call_sdk::{
     LiveKitCall, LiveKitCallOptions, Participant, close_slot, open_slot, open_slot_with_admission,
 };
@@ -488,6 +489,12 @@ impl RtcService {
 
     pub fn call(&self, room_id: &str) -> Option<&LiveKitCall> {
         self.calls.get(room_id).map(|active| &active.call)
+    }
+
+    /// Failure-localizing positive media observations, never call acceptance.
+    /// The caller owns the deadline and must revalidate its generation afterward.
+    pub async fn media_failure_snapshot(&self, room_id: &str) -> Option<MediaFailureSnapshot> {
+        Some(self.call(room_id)?.media_failure_snapshot().await)
     }
 
     pub fn call_mut(&mut self, room_id: &str) -> Option<&mut LiveKitCall> {
