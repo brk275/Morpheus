@@ -5684,7 +5684,6 @@ dependencies = [
 [[package]]
 name = "matrix-rtc-transport"
 version = "0.5.0-rc.2"
-source = "git+https://github.com/element-hq/matrix-rust-rtc?tag=v0.5.0-rc.2#53880ef1ef66b62df555ce71ccd1d6c85b813596"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

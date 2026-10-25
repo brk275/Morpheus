@@ -11,6 +11,7 @@ members = [
     "vendor/lru",
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
+    "vendor/matrix-rtc-transport",
     "vendor/matrix-rtc-core",
     "vendor/cargo-packager-updater",
     "vendor/matrix-sdk",
@@ -70,6 +71,7 @@ matrix-rtc-matrix-sdk = { path = "vendor/matrix-rtc-matrix-sdk" }
 matrix-rtc-call-sdk = { path = "vendor/matrix-rtc-call-sdk" }
 # Validate every local/remote focus before exchanging Matrix OpenID credentials.
 matrix-rtc-livekit = { path = "vendor/matrix-rtc-livekit" }
+matrix-rtc-transport = { path = "vendor/matrix-rtc-transport" }
 # Renew encrypted call membership for a newly observed peer using normal room sends.
 matrix-rtc-core = { path = "vendor/matrix-rtc-core" }
 

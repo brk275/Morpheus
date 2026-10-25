@@ -15,6 +15,7 @@ provenance and regression tests when updating a dependency.
 | lru 0.16.4 | Backport panic-safe cache removal | [Patch notes](lru/MORPHEUS_PATCH.md) |
 | image-webp 0.2.4 | Bound lossless entropy-tree complexity before group allocation | [Patch notes](image-webp/MORPHEUS_PATCH.md) |
 | matrix-rtc-livekit | Secure authorization and media endpoints | [Patch notes](matrix-rtc-livekit/README.md) |
+| matrix-rtc-transport 0.5.0-rc.2 | Serialize latest remote subscription constraints through actual async completion | [Patch notes](matrix-rtc-transport/MORPHEUS_PATCH.md) |
 | matrix-rtc-core 0.5.0-rc.2 | Bounded encrypted membership renewal; original Sticky2025 room-slot authority | [Patch notes](matrix-rtc-core/MORPHEUS_PATCH.md) |
 | matrix-rtc-call-sdk 0.5.0-rc.2 | Preserve bounded pre-return events and the original slot-write admission | [Patch notes](matrix-rtc-call-sdk/MORPHEUS_PATCH.md) |
 | matrix-rtc-matrix-sdk 0.5.0-rc.2 | Preserve original stable slot authority before one admitted state write | [Patch notes](matrix-rtc-matrix-sdk/MORPHEUS_PATCH.md) |

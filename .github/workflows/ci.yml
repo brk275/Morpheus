@@ -492,6 +492,22 @@ jobs:
           cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
           cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
           cargo test --locked -p matrix-rtc-livekit --lib
+          rtc_constraint_tests=(
+            pool::tests::constraint_writer_settles_older_apply_then_coalesces_newest_intent
+            pool::tests::removed_constraint_writer_cannot_finish_after_new_same_key_intent
+            pool::tests::replacement_connection_receives_latest_intent_without_old_target_retention
+            pool::tests::dropping_pool_retires_queued_constraint_before_connection_lock_release
+            pool::tests::dropping_pool_settles_entered_apply_without_running_queued_successor
+            pool::tests::constraint_first_poll_uses_current_writer_admission_before_removal
+            pool::tests::first_poll_panic_remains_failed_but_later_real_intent_can_settle
+          )
+          cargo test --locked -p matrix-rtc-transport --lib -- --list > "$RUNNER_TEMP/morpheus-rtc-constraint-tests.txt"
+          for rtc_constraint_test in "${rtc_constraint_tests[@]}"; do
+            test "$(grep -Fxc -- "$rtc_constraint_test: test" "$RUNNER_TEMP/morpheus-rtc-constraint-tests.txt")" = 1
+            cargo test --locked -p matrix-rtc-transport --lib "$rtc_constraint_test" -- --exact | tee "$RUNNER_TEMP/morpheus-rtc-constraint-result.txt"
+            test "$(grep -Fxc -- "test $rtc_constraint_test ... ok" "$RUNNER_TEMP/morpheus-rtc-constraint-result.txt")" = 1
+            test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-rtc-constraint-result.txt")" = 1
+          done
           cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
           cargo test --locked -p cargo-packager-updater --lib
           cargo test --locked -p webrtc-sys-build --lib
