@@ -8,7 +8,7 @@ use std::{
     any::Any,
     borrow::Cow,
     cell::RefCell,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     rc::{Rc, Weak},
     sync::Arc,
 };
@@ -27,12 +27,41 @@ struct TimelineModel {
     copy_scope: RefCell<Option<Rc<crate::message_copy::CopyScope>>>,
     copy_projected: RefCell<VecDeque<usize>>,
     rows: RefCell<Vec<Arc<MessageInfo>>>,
+    // Built only by event lookup, owned by this exact model, and never larger
+    // than the loaded row set. Duplicate event IDs keep their first position.
+    event_index: RefCell<Option<HashMap<String, usize>>>,
     notify: ModelNotify,
+    #[cfg(test)]
+    indexed_rows: std::cell::Cell<usize>,
     #[cfg(test)]
     projected: std::cell::Cell<usize>,
 }
 
 impl TimelineModel {
+    fn event_position(&self, event_id: &str) -> Option<usize> {
+        let missing = self.event_index.borrow().is_none();
+        if missing {
+            let rows = self.rows.borrow();
+            let mut index = HashMap::new();
+            for (position, row) in rows.iter().enumerate() {
+                #[cfg(test)]
+                self.indexed_rows.set(self.indexed_rows.get() + 1);
+                if let Some(event) = row.event_id.as_ref() {
+                    index.entry(event.clone()).or_insert(position);
+                }
+            }
+            *self.event_index.borrow_mut() = Some(index);
+        }
+        self.event_index
+            .borrow()
+            .as_ref()
+            .and_then(|index| index.get(event_id).copied())
+    }
+
+    fn invalidate_event_index(&self) {
+        self.event_index.borrow_mut().take();
+    }
+
     // Re-arm only the bounded recent projections. This never resets history
     // geometry, scroll or drafts just to refresh opaque Copy metadata.
     fn notify_copy_rows(&self) {
@@ -88,9 +117,19 @@ impl TimelineModel {
                     .collect()
             };
             if changed.len() > MAX_ROW_NOTIFICATIONS {
+                self.invalidate_event_index();
                 *self.rows.borrow_mut() = next.into_owned();
                 self.notify.reset();
                 return;
+            }
+            let identifiers_changed = {
+                let rows = self.rows.borrow();
+                changed
+                    .iter()
+                    .any(|&row| rows[row].event_id != next[row].event_id)
+            };
+            if identifiers_changed {
+                self.invalidate_event_index();
             }
             {
                 let mut rows = self.rows.borrow_mut();
@@ -105,10 +144,18 @@ impl TimelineModel {
             // Release each borrow before notifying. A listener may immediately
             // read row_count/data and must see a valid intermediate model.
             if removed != 0 {
+                self.invalidate_event_index();
                 drop(self.rows.borrow_mut().drain(prefix..prefix + removed));
                 self.notify.row_removed(prefix, removed);
             }
             if added != 0 {
+                // Take before changing rows: a panic must leave no stale cache.
+                // A pure append preserves every old position; any other insert
+                // invalidates it. Do not build an index nobody has requested.
+                let mut index = self.event_index.borrow_mut().take();
+                if prefix != self.rows.borrow().len() {
+                    index = None;
+                }
                 match next {
                     Cow::Borrowed(next) => drop(
                         self.rows
@@ -121,6 +168,18 @@ impl TimelineModel {
                             .splice(prefix..prefix, next.into_iter().skip(prefix).take(added)),
                     ),
                 }
+                if let Some(index) = index.as_mut() {
+                    let rows = self.rows.borrow();
+                    for (offset, row) in rows[prefix..prefix + added].iter().enumerate() {
+                        let position = prefix + offset;
+                        #[cfg(test)]
+                        self.indexed_rows.set(self.indexed_rows.get() + 1);
+                        if let Some(event) = row.event_id.as_ref() {
+                            index.entry(event.clone()).or_insert(position);
+                        }
+                    }
+                }
+                *self.event_index.borrow_mut() = index;
                 self.notify.row_added(prefix, added);
             }
         }
@@ -236,7 +295,10 @@ fn update_rows_scoped(
             copy_scope: RefCell::new(scope),
             copy_projected: RefCell::new(VecDeque::new()),
             rows: RefCell::new(rows.into_owned()),
+            event_index: RefCell::new(None),
             notify: ModelNotify::default(),
+            #[cfg(test)]
+            indexed_rows: std::cell::Cell::new(0),
             #[cfg(test)]
             projected: std::cell::Cell::new(0),
         });
@@ -266,11 +328,7 @@ pub(crate) fn refresh_copy_context(current: &ModelRc<MessageItem>) {
 /// stored rows without projecting any row.
 pub(crate) fn index_of_event(model: &ModelRc<MessageItem>, event_id: &str) -> Option<usize> {
     if let Some(model) = model.as_any().downcast_ref::<TimelineModel>() {
-        return model
-            .rows
-            .borrow()
-            .iter()
-            .position(|row| row.event_id.as_deref() == Some(event_id));
+        return model.event_position(event_id);
     }
     model
         .iter()
@@ -323,12 +381,8 @@ pub(crate) fn info_of_event(
     event_id: &str,
 ) -> Option<Arc<MessageInfo>> {
     let model = model.as_any().downcast_ref::<TimelineModel>()?;
-    model
-        .rows
-        .borrow()
-        .iter()
-        .find(|row| row.event_id.as_deref() == Some(event_id))
-        .cloned()
+    let position = model.event_position(event_id)?;
+    model.rows.borrow().get(position).cloned()
 }
 
 /// Re-project the rows whose source matches, for presentation state kept
@@ -979,5 +1033,225 @@ pub(crate) mod tests {
         assert_ne!(returned, room);
         assert_rows(&returned, &[fixture(3)]);
         assert_rows(&room, &[fixture(2)]);
+    }
+
+    #[test]
+    fn ten_thousand_event_lookups_reuse_index_for_noops_edits_and_appends() {
+        let original: Vec<_> = (0..10_000).map(|i| Arc::new(fixture(i))).collect();
+        let model = update_snapshot_scoped(ModelRc::default(), &original, None);
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        assert!(stored.event_index.borrow().is_none());
+        assert_eq!(stored.indexed_rows.get(), 0, "unused index stays lazy");
+        for _ in 0..3 {
+            assert_eq!(
+                index_of_event(&model, "$fixture-9999:example.org"),
+                Some(9_999)
+            );
+            assert!(info_of_event(&model, "$fixture-5000:example.org").is_some());
+            assert_eq!(index_of_event(&model, "$missing:example.org"), None);
+        }
+        assert_eq!(stored.indexed_rows.get(), 10_000, "one initial build");
+        assert_eq!(
+            update_snapshot_scoped(model.clone(), &original, None),
+            model
+        );
+        let mut next = original.clone();
+        let mut edited = next[5_000].as_ref().clone();
+        edited.body = "Edited and redacted presentation".into();
+        edited.rich_markdown = None;
+        edited.rich_accessible = None;
+        edited.reaction_summary = "Check 2".into();
+        next[5_000] = Arc::new(edited);
+        assert_eq!(update_snapshot_scoped(model.clone(), &next, None), model);
+        let shown = info_of_event(&model, "$fixture-5000:example.org").unwrap();
+        assert!(
+            Arc::ptr_eq(&shown, &next[5_000]),
+            "lookup reads the new row, not a cached payload"
+        );
+        assert_eq!(stored.indexed_rows.get(), 10_000);
+        next.push(Arc::new(fixture(10_000)));
+        next.push(Arc::new(fixture(42)));
+        assert_eq!(update_snapshot_scoped(model.clone(), &next, None), model);
+        assert_eq!(
+            index_of_event(&model, "$fixture-10000:example.org"),
+            Some(10_000)
+        );
+        assert_eq!(index_of_event(&model, "$fixture-42:example.org"), Some(42));
+        assert_eq!(
+            stored.indexed_rows.get(),
+            10_002,
+            "append indexes only its new rows"
+        );
+        assert_eq!(stored.event_index.borrow().as_ref().unwrap().len(), 10_001);
+        assert_eq!(
+            projection_count(&model),
+            0,
+            "event lookup never projects rich text"
+        );
+
+        let lazy = update_snapshot_scoped(ModelRc::default(), &original, None);
+        update_snapshot_scoped(lazy.clone(), &next, None);
+        let lazy = lazy.as_any().downcast_ref::<TimelineModel>().unwrap();
+        assert!(lazy.event_index.borrow().is_none());
+        assert_eq!(
+            lazy.indexed_rows.get(),
+            0,
+            "edits/appends do not build an unused cache"
+        );
+    }
+
+    struct IndexObserver {
+        model: ModelRc<MessageItem>,
+        queries: Vec<String>,
+        notifications: std::cell::Cell<usize>,
+    }
+
+    impl IndexObserver {
+        fn check(&self) {
+            let stored = self.model.as_any().downcast_ref::<TimelineModel>().unwrap();
+            for event in &self.queries {
+                let expected = stored
+                    .rows
+                    .borrow()
+                    .iter()
+                    .position(|row| row.event_id.as_deref() == Some(event.as_str()));
+                assert_eq!(index_of_event(&self.model, event), expected);
+                let found = info_of_event(&self.model, event);
+                match expected {
+                    Some(position) => assert!(Arc::ptr_eq(
+                        &found.unwrap(),
+                        &stored.rows.borrow()[position]
+                    )),
+                    None => assert!(found.is_none()),
+                }
+            }
+            assert!(stored.event_index.borrow().as_ref().unwrap().len() <= self.model.row_count());
+            self.notifications.set(self.notifications.get() + 1);
+        }
+    }
+
+    impl ModelChangeListener for IndexObserver {
+        fn row_changed(self: Pin<&Self>, _: usize) {
+            self.check();
+        }
+        fn row_added(self: Pin<&Self>, _: usize, _: usize) {
+            self.check();
+        }
+        fn row_removed(self: Pin<&Self>, _: usize, _: usize) {
+            self.check();
+        }
+        fn reset(self: Pin<&Self>) {
+            self.check();
+        }
+    }
+
+    #[test]
+    fn event_index_matches_current_rows_during_edits_paging_moves_removal_and_reset() {
+        let mut rows: Vec<_> = [0, 1, 1, 2]
+            .into_iter()
+            .map(|i| Arc::new(fixture(i)))
+            .collect();
+        Arc::make_mut(&mut rows[3]).event_id = None;
+        let model = update_shared(ModelRc::default(), rows.clone());
+        assert_eq!(index_of_event(&model, "$fixture-1:example.org"), Some(1));
+        let observer = Box::pin(ModelChangeListenerContainer::new(IndexObserver {
+            model: model.clone(),
+            queries: (0..MAX_ROW_NOTIFICATIONS + 5)
+                .map(|i| format!("$fixture-{i}:example.org"))
+                .chain([
+                    String::new(),
+                    "$sent:example.org".into(),
+                    "$missing:example.org".into(),
+                ])
+                .collect(),
+            notifications: std::cell::Cell::new(0),
+        }));
+        model
+            .model_tracker()
+            .attach_peer(observer.as_ref().model_peer());
+        // Same event ID, new value: the cached position must return the current Arc.
+        Arc::make_mut(&mut rows[0]).reaction_summary = "Updated 2".into();
+        update_shared(model.clone(), rows.clone());
+        // Local echo acknowledgement and changing the first duplicate's ID.
+        Arc::make_mut(&mut rows[3]).event_id = Some("$sent:example.org".into());
+        Arc::make_mut(&mut rows[1]).event_id = Some(String::new());
+        update_shared(model.clone(), rows.clone());
+        assert_eq!(index_of_event(&model, "$fixture-1:example.org"), Some(2));
+        assert_eq!(index_of_event(&model, ""), Some(1));
+        // Pagination, reordering and removals invalidate shifted positions.
+        rows.insert(0, Arc::new(fixture(4)));
+        update_shared(model.clone(), rows.clone());
+        rows.rotate_left(2);
+        update_shared(model.clone(), rows.clone());
+        rows.remove(1);
+        update_shared(model.clone(), rows.clone());
+        rows = (0..MAX_ROW_NOTIFICATIONS + 5)
+            .map(|i| Arc::new(fixture(i)))
+            .collect();
+        update_shared(model.clone(), rows.clone());
+        for row in &mut rows {
+            Arc::make_mut(row).body.push_str(" changed");
+        }
+        update_shared(model.clone(), rows);
+        update_shared(model.clone(), Vec::new());
+        assert!(observer.as_ref().get().notifications.get() >= 8);
+        assert_eq!(model.row_count(), 0);
+        assert!(
+            model
+                .as_any()
+                .downcast_ref::<TimelineModel>()
+                .unwrap()
+                .event_index
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn event_index_is_model_local_and_never_retains_old_row_payloads() {
+        let first = Arc::new(fixture(7));
+        let old_row = Arc::downgrade(&first);
+        let model = update_shared(ModelRc::default(), vec![first]);
+        assert_eq!(index_of_event(&model, "$fixture-7:example.org"), Some(0));
+        let mut replacement = fixture(7);
+        replacement.body = "Current account's edited row".into();
+        update_shared(model.clone(), vec![Arc::new(replacement)]);
+        assert!(
+            old_row.upgrade().is_none(),
+            "index keeps IDs/positions, never an old row Arc"
+        );
+        let mut other = fixture(7);
+        other.body = "Other room/thread's own row".into();
+        let other = update_shared(ModelRc::default(), vec![Arc::new(other)]);
+        assert_ne!(model, other);
+        assert_eq!(
+            info_of_event(&model, "$fixture-7:example.org")
+                .unwrap()
+                .body,
+            "Current account's edited row"
+        );
+        assert_eq!(
+            info_of_event(&other, "$fixture-7:example.org")
+                .unwrap()
+                .body,
+            "Other room/thread's own row"
+        );
+        let old_model = model
+            .as_any()
+            .downcast_ref::<TimelineModel>()
+            .unwrap()
+            .weak
+            .clone();
+        drop(model);
+        assert!(
+            old_model.upgrade().is_none(),
+            "detaching releases the entire indexed model"
+        );
+        let returned = update_shared(ModelRc::default(), vec![Arc::new(fixture(9))]);
+        assert_eq!(index_of_event(&returned, "$fixture-7:example.org"), None);
+        assert_eq!(index_of_event(&returned, "$fixture-9:example.org"), Some(0));
+        assert_eq!(index_of_event(&other, "$fixture-7:example.org"), Some(0));
     }
 }
