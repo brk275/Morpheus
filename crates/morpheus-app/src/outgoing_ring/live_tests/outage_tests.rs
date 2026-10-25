@@ -29,7 +29,7 @@ use crate::{
         RecoveryKeyObservation,
     },
     updater::UpdateActivity,
-    video_render::{TileMedium, TileState, VideoUpdate},
+    video_render::{StageProgress, StageSnapshot, TileMedium, TileState, VideoUpdate},
 };
 
 use super::{
@@ -65,6 +65,43 @@ impl MediaProgress {
 
     fn report(&self) {
         eprintln!("\nMORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS mask={:04x}", self.0);
+    }
+}
+
+// Scope these failure-only observations to the latest actual presentation seen
+// in this call generation. Stage progress is aggregate, not per-peer evidence.
+#[derive(Default)]
+struct DeliveryProgress {
+    presentation: Option<u64>,
+    stage: StageProgress,
+    epoch: bool,
+    sequence: bool,
+}
+
+impl DeliveryProgress {
+    fn observe(&mut self, snapshot: &StageSnapshot) {
+        if self.presentation != Some(snapshot.presentation) {
+            *self = Self {
+                presentation: Some(snapshot.presentation),
+                ..Self::default()
+            };
+        }
+        self.stage = snapshot.progress;
+    }
+
+    fn report(&self) {
+        eprintln!(
+            "\nMORPHEUS_RTC_OUTAGE_DELIVERY polled={} scheduled={} invalid_dimensions={} invalid_plane={} stale_epoch={} accepted={} worker_join_failure={} epoch={} sequence={}",
+            self.stage.contains(StageProgress::FRAME_POLLED),
+            self.stage.contains(StageProgress::CONVERSION_SCHEDULED),
+            self.stage.contains(StageProgress::INVALID_DIMENSIONS),
+            self.stage.contains(StageProgress::INVALID_PLANE),
+            self.stage.contains(StageProgress::STALE_EPOCH),
+            self.stage.contains(StageProgress::ACCEPTED),
+            self.stage.contains(StageProgress::WORKER_JOIN_FAILURE),
+            self.epoch,
+            self.sequence,
+        );
     }
 }
 
@@ -786,6 +823,7 @@ impl OutageSession {
         let roster = self.calls.subscribe_roster();
         let mut sequence = 0u32;
         let mut progress = MediaProgress::default();
+        let mut delivery = DeliveryProgress::default();
         time::timeout(Duration::from_secs(45), async {
             loop {
                 // Only these retained, current fixture publications receive
@@ -813,6 +851,7 @@ impl OutageSession {
                 if let VideoUpdate::Stage { token, stage } = snapshot {
                     if token == generation && old_presentation != Some(stage.presentation) {
                         progress.seen(0);
+                        delivery.observe(&stage);
                         let mut matched = HashSet::new();
                         for tile in stage
                             .layout
@@ -864,6 +903,8 @@ impl OutageSession {
                                         .get(frame_slot)
                                         .ok_or_else(|| media_failure("frame_slot_invalid"))?;
                                     progress.seen(7);
+                                    delivery.epoch |= slot.epoch != 0;
+                                    delivery.sequence |= slot.sequence != 0;
                                     if slot.epoch == 0 || slot.sequence == 0 {
                                         continue;
                                     }
@@ -947,6 +988,7 @@ impl OutageSession {
         .await
         .map_err(|_| {
             progress.report();
+            delivery.report();
             media_failure("deadline");
         })?
     }

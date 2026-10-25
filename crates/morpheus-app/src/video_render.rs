@@ -156,6 +156,33 @@ pub struct FrameSlot {
     pub pixels: Option<SharedPixelBuffer<Rgb8Pixel>>,
 }
 
+/// Test-only high-water observations from one actual video task/presentation.
+/// These describe the whole stage, not a particular participant or frame slot.
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, Copy, Default)]
+pub struct StageProgress(u8);
+
+#[cfg(all(test, target_os = "linux"))]
+impl StageProgress {
+    pub const FRAME_POLLED: Self = Self(1 << 0);
+    pub const CONVERSION_SCHEDULED: Self = Self(1 << 1);
+    pub const INVALID_DIMENSIONS: Self = Self(1 << 2);
+    pub const INVALID_PLANE: Self = Self(1 << 3);
+    pub const STALE_EPOCH: Self = Self(1 << 4);
+    pub const ACCEPTED: Self = Self(1 << 5);
+    pub const WORKER_JOIN_FAILURE: Self = Self(1 << 6);
+
+    pub fn contains(self, observation: Self) -> bool {
+        self.0 & observation.0 != 0
+    }
+
+    fn observe(&mut self, observation: Self) -> bool {
+        let changed = !self.contains(observation);
+        self.0 |= observation.0;
+        changed
+    }
+}
+
 #[derive(Clone)]
 pub struct StageSnapshot {
     /// Unique to one video task. A rejoin keeps the call token but starts a
@@ -165,6 +192,8 @@ pub struct StageSnapshot {
     pub revision: u64,
     pub layout: Arc<StageLayout>,
     pub frames: [FrameSlot; FRAME_SLOTS],
+    #[cfg(all(test, target_os = "linux"))]
+    pub progress: StageProgress,
 }
 
 #[derive(Clone)]
@@ -291,6 +320,10 @@ pub async fn run_remote_video(
             }
             converted = async { conversion.as_mut().expect("guarded conversion").await }, if conversion.is_some() => {
                 conversion = None;
+                #[cfg(all(test, target_os = "linux"))]
+                if converted.is_err() {
+                    stage.presenter.dirty |= stage.presenter.progress.observe(StageProgress::WORKER_JOIN_FAILURE);
+                }
                 if let Ok(converted) = converted {
                     stage.presenter.accept(converted);
                 }
@@ -305,6 +338,10 @@ pub async fn run_remote_video(
                     // released slot changes its epoch, so a late result for
                     // it is discarded even within the same call token.
                     conversion = Some(tokio::task::spawn_blocking(move || convert_batch(batch)));
+                    #[cfg(all(test, target_os = "linux"))]
+                    {
+                        stage.presenter.dirty |= stage.presenter.progress.observe(StageProgress::CONVERSION_SCHEDULED);
+                    }
                 }
             }
             () = poll_fn(|cx| stage.presenter.poll_frames(cx)), if stage.presenter.decoding() => {
@@ -672,6 +709,8 @@ impl<M: StageMedia> Stage<M> {
                 revision: self.revision,
                 layout: Arc::clone(&self.layout),
                 frames: self.presenter.frames.clone(),
+                #[cfg(all(test, target_os = "linux"))]
+                progress: self.presenter.progress,
             }),
         });
     }
@@ -967,6 +1006,8 @@ struct Presenter {
     dirty: bool,
     /// A frame stream ended since the last plan.
     ended: bool,
+    #[cfg(all(test, target_os = "linux"))]
+    progress: StageProgress,
 }
 
 impl Presenter {
@@ -1058,6 +1099,10 @@ impl Presenter {
             for _ in 0..MAX_DRAIN {
                 match decoder.frames.poll_next_unpin(cx) {
                     Poll::Ready(Some(frame)) => {
+                        #[cfg(all(test, target_os = "linux"))]
+                        {
+                            self.dirty |= self.progress.observe(StageProgress::FRAME_POLLED);
+                        }
                         decoder.newest = Some(frame);
                         progressed = true;
                     }
@@ -1109,15 +1154,35 @@ impl Presenter {
 
     fn accept(&mut self, converted: Vec<Converted>) {
         for result in converted {
+            #[cfg(all(test, target_os = "linux"))]
+            match &result.pixels {
+                Err(FrameError::InvalidDimensions) => {
+                    self.dirty |= self.progress.observe(StageProgress::INVALID_DIMENSIONS);
+                }
+                Err(FrameError::InvalidPlane) => {
+                    self.dirty |= self.progress.observe(StageProgress::INVALID_PLANE);
+                }
+                Ok(_) => {}
+            }
             let Ok(pixels) = result.pixels else {
                 continue;
             };
             // A released or reassigned slot has a new epoch; drop late pictures.
+            #[cfg(all(test, target_os = "linux"))]
+            if self.decoders[result.slot].is_none()
+                || self.frames[result.slot].epoch != result.epoch
+            {
+                self.dirty |= self.progress.observe(StageProgress::STALE_EPOCH);
+            }
             let frame = &mut self.frames[result.slot];
             if self.decoders[result.slot].is_some() && frame.epoch == result.epoch {
                 frame.sequence += 1;
                 frame.pixels = Some(pixels);
                 self.dirty = true;
+                #[cfg(all(test, target_os = "linux"))]
+                {
+                    self.progress.observe(StageProgress::ACCEPTED);
+                }
             }
         }
     }
@@ -1804,6 +1869,20 @@ mod tests {
         );
         assert_eq!(unchanged_constraints, replacement_constraints);
         assert!(new_stream_retained && new_closed && new_stream_retired);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(initial.progress.contains(StageProgress::FRAME_POLLED));
+            assert!(initial.progress.contains(StageProgress::ACCEPTED));
+            // This test converts synchronously; it must not claim a blocking job.
+            assert!(
+                !initial
+                    .progress
+                    .contains(StageProgress::CONVERSION_SCHEDULED)
+            );
+            assert!(!initial.progress.contains(StageProgress::STALE_EPOCH));
+            assert!(replaced.progress.contains(StageProgress::STALE_EPOCH));
+            assert!(delivered.progress.contains(StageProgress::ACCEPTED));
+        }
     }
 
     #[test]

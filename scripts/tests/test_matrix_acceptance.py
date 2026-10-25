@@ -2498,6 +2498,7 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                        output + "MORPHEUS_RTC_OUTAGE_FAILURE outcome=error call=joined\n",
                        output + "MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE push_transport\n",
                        output + "MORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS mask=ffff\n",
+                       output + "MORPHEUS_RTC_OUTAGE_DELIVERY polled=false scheduled=false invalid_dimensions=false invalid_plane=false stale_epoch=false accepted=false worker_join_failure=false epoch=false sequence=false\n",
                        "Skipped live fixture\n" + output, self.output("room" if target == "dm" else "dm")]
             for name in expected:
                 marker = f"MORPHEUS_RTC_OUTAGE_CHECK {name}=true"
@@ -2541,6 +2542,18 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                     marker.replace("0001", "10000"), marker.replace("0001", "FFFF"),
                     marker.replace("0001", "private_payload"), "MORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS\n"):
             self.assertEqual(acceptance_module.outage_diagnostics(raw), {"media_progress": "invalid"})
+        for bits in (0, 1, 0x100, 0x1ff):
+            expected = {name: bool(bits & (1 << bit))
+                        for bit, name in enumerate(acceptance_module.OUTAGE_DELIVERY_FIELDS)}
+            marker = "MORPHEUS_RTC_OUTAGE_DELIVERY " + " ".join(
+                name + "=" + str(value).lower() for name, value in expected.items()) + "\n"
+            self.assertEqual(acceptance_module.outage_diagnostics(marker), {"delivery": expected})
+        for raw in (marker + marker, marker.rstrip() + " private_payload\n",
+                    marker.replace("polled=true", "polled=1"), marker.replace("sequence=true", "sequence=TRUE"),
+                    marker.replace(" epoch=true", ""), marker.replace("polled=true", "other=true"),
+                    "MORPHEUS_RTC_OUTAGE_DELIVERY " + "x" * 385 + "\n",
+                    "MORPHEUS_RTC_OUTAGE_DELIVERY\n"):
+            self.assertEqual(acceptance_module.outage_diagnostics(raw), {"delivery": "invalid"})
         self.assertEqual(acceptance_module.outage_diagnostics("private server text\n"), {})
         self.assertEqual(acceptance_module.outage_diagnostics("MORPHEUS_RTC_OUTAGE_STAGE cleanup\n"),
                          {"cleanup_started": True})

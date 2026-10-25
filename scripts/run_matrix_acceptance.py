@@ -309,6 +309,14 @@ OUTAGE_MEDIA_PROGRESS_FIELDS = (
 OUTAGE_MEDIA_PROGRESS = re.compile(r"^MORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS mask=([0-9a-f]{4})$", re.MULTILINE)
 
 
+OUTAGE_DELIVERY_FIELDS = (
+    "polled", "scheduled", "invalid_dimensions", "invalid_plane", "stale_epoch",
+    "accepted", "worker_join_failure", "epoch", "sequence",
+)
+OUTAGE_DELIVERY = re.compile(r"^MORPHEUS_RTC_OUTAGE_DELIVERY " + " ".join(
+    name + r"=(true|false)" for name in OUTAGE_DELIVERY_FIELDS) + r"$", re.MULTILINE)
+
+
 def outage_evidence(output: str, target: str) -> dict[str, bool]:
     if target not in OUTAGE_TARGET:
         raise RuntimeError("Invalid owned SFU outage target")
@@ -362,6 +370,13 @@ def outage_diagnostics(output: str) -> dict:
                                         for bit, name in enumerate(OUTAGE_MEDIA_PROGRESS_FIELDS)}
         else:
             result["media_progress"] = "invalid"
+    delivery_lines = [line for line in output.splitlines()
+                      if line.startswith("MORPHEUS_RTC_OUTAGE_DELIVERY")]
+    if delivery_lines:
+        match = OUTAGE_DELIVERY.fullmatch(delivery_lines[0]) if len(delivery_lines[0]) <= 384 else None
+        result["delivery"] = ({name: value == "true" for name, value in
+                               zip(OUTAGE_DELIVERY_FIELDS, match.groups(), strict=True)}
+                              if len(delivery_lines) == 1 and match is not None else "invalid")
     checks = {name: value == "true" for name, value in OUTAGE_CHECK.findall(output)
               if name in OUTAGE_CHECKS or name in OUTAGE_TARGET.values()}
     if checks:
