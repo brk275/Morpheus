@@ -98,18 +98,18 @@ belong in the private reporting channel described in [SECURITY.md](SECURITY.md).
 - Use real native screenshots with fictional accounts and retain their capture
   provenance. Do not generate or retouch application screenshots.
 
-## Cursor Cloud specific instructions
+## Cursor Cloud development notes
 
-Cloud Agent VMs for this repository have a memory cgroup near 15 GiB. `cargo build` and `cargo run` of `morpheus-app` compile that crate as one LLVM module and are killed before the binary is linked. Compile the desktop app with one Cargo job and sixteen codegen units:
+For a memory-constrained Linux Cloud VM, after the source and dependency review above and only when a build is authorized, this development command limits Cargo to one job and sets sixteen codegen units for the app crate:
 
 ```sh
-cargo rustc --locked -p morpheus-app -- -C codegen-units=16
+cargo rustc --locked -j 1 -p morpheus-app -- -C codegen-units=16
 ```
 
-The binary is `target/debug/morpheus-app`. Rust 1.99.0 comes from `rust-toolchain.toml`.
+Memory limits and build failures depend on the VM and build inputs; this command is not evidence that a build succeeds. With the default target directory and host target, the binary is `target/debug/morpheus-app`. Rust 1.99.0 comes from `rust-toolchain.toml`.
 
-A debug build reads `MORPHEUS_QA_PROFILE_DIR` when it is an absolute path and keeps that run's configuration and account store there. The desktop session is already available. From the sign-in window, **Explore the interactive preview** opens the in-memory offline preview with fictional conversations.
+For disposable preview QA on a fresh VM, set `MORPHEUS_QA_PROFILE_DIR` to a new absolute directory before launch. Debug builds use its `config.toml` and `data` subdirectory; relative paths are rejected and release builds ignore this override. It retains the ordinary OS credential provider, so use only fictional preview data, no personal accounts or existing credential vault. When a VM desktop session is available, **Explore the interactive preview** on the sign-in window opens the in-memory fictional conversations.
 
-Native calls stay outside this environment. They need the owned PipeWire client from `scripts/build_linux_native.py` and `--features native-calls`, described in [Linux native source builds](docs/LINUX_NATIVE_BUILD.md).
+This command omits native calls. Linux native calls require `--features native-calls` and the owned PipeWire client prepared through `scripts/build_linux_native.py`, as described in [Linux native source builds](docs/LINUX_NATIVE_BUILD.md).
 
-Hosted package and native workflows stay gated by the spending policy above. This environment does not dispatch them.
+Hosted package and native workflows remain gated by the spending policy above. Do not dispatch them from this preview route.
