@@ -550,4 +550,130 @@ mod redaction_tests {
         assert!(!logs.contains(MARKER), "credential was logged");
         assert!(!logs.contains(&proxy), "proxy URL was logged");
     }
+
+    // The production send/oneshot path is retained; only the WebSocket writer's
+    // response is controlled. No socket, credentials or real transport is used.
+    fn controlled_signal_stream() -> (SignalStream, mpsc::Receiver<InternalMessage>) {
+        let (internal_tx, internal_rx) = mpsc::channel(8);
+        let stream = SignalStream {
+            internal_tx,
+            read_handle: livekit_runtime::spawn(async {}),
+            write_handle: livekit_runtime::spawn(async {}),
+        };
+        (stream, internal_rx)
+    }
+
+    async fn poll_signal_once<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    fn acknowledge_mute(receiver: &mut mpsc::Receiver<InternalMessage>, sid: &str) -> bool {
+        let InternalMessage::Signal { signal, response_chn } = receiver.try_recv().unwrap() else {
+            panic!("expected a signal request");
+        };
+        let matched =
+            matches!(signal, proto::signal_request::Message::Mute(value) if value.sid == sid);
+        response_chn.send(Ok(())).unwrap();
+        matched
+    }
+
+    #[tokio::test]
+    async fn failed_send_releases_stream_before_queue_so_close_writer_and_fifo_flush_finish() {
+        use super::super::{SignalInner, SignalOptions};
+        use std::{
+            sync::atomic::{AtomicBool, AtomicU32},
+            task::Poll,
+        };
+        use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+
+        let (stream, mut original_requests) = controlled_signal_stream();
+        let inner = SignalInner {
+            stream: AsyncRwLock::new(Some(stream)),
+            token: parking_lot::Mutex::new(String::new()),
+            reconnecting: AtomicBool::new(false),
+            queue: AsyncMutex::new(Vec::new()),
+            url: "wss://localhost:7880".into(),
+            options: SignalOptions::default(),
+            join_response: proto::JoinResponse::default(),
+            request_id: AtomicU32::new(1),
+            single_pc_mode_active: false,
+        };
+        let mute = |sid: &str| {
+            proto::signal_request::Message::Mute(proto::MuteTrackRequest {
+                sid: sid.to_owned(),
+                muted: true,
+            })
+        };
+        let mut send = Box::pin(inner.send(mute("failed")));
+        assert!(poll_signal_once(send.as_mut()).await.is_pending());
+        let InternalMessage::Signal { signal, response_chn } =
+            original_requests.try_recv().unwrap()
+        else {
+            panic!("expected the original send");
+        };
+        let original_matched =
+            matches!(signal, proto::signal_request::Message::Mute(value) if value.sid == "failed");
+        {
+            let mut queue = inner.queue.lock().await;
+            queue.push(mute("first"));
+            queue.push(mute("second"));
+        }
+
+        // Fair writer admission reproduces the actual restart/close boundary:
+        // this writer waits for the original send, and a later flush's reader
+        // waits behind the writer while holding the queue.
+        let mut writer = Box::pin(inner.stream.write());
+        assert!(poll_signal_once(writer.as_mut()).await.is_pending());
+        let mut flush = Box::pin(inner.flush_queue());
+        assert!(poll_signal_once(flush.as_mut()).await.is_pending());
+        let flush_owns_queue = inner.queue.try_lock().is_err();
+        response_chn.send(Err(SignalError::SendError)).unwrap();
+        let failed_send_waits_for_queue = poll_signal_once(send.as_mut()).await.is_pending();
+        let Poll::Ready(mut stream_guard) = poll_signal_once(writer.as_mut()).await else {
+            // Retire the exact controlled futures/streams before reporting the
+            // old read -> queue -> writer -> read cycle as a test failure.
+            drop(send);
+            drop(flush);
+            drop(writer);
+            inner.close(false).await;
+            panic!("failed send retained the stream while waiting for the queue");
+        };
+        let original = stream_guard.take().unwrap();
+        let (replacement, mut replacement_requests) = controlled_signal_stream();
+        *stream_guard = Some(replacement);
+        drop(stream_guard);
+        drop(writer);
+        original.close(false).await;
+
+        // Both older queued messages use the replacement, in their original
+        // order; the failed direct send is still queued, never silently retried.
+        assert!(poll_signal_once(flush.as_mut()).await.is_pending());
+        let first_matched = acknowledge_mute(&mut replacement_requests, "first");
+        assert!(poll_signal_once(flush.as_mut()).await.is_pending());
+        let second_matched = acknowledge_mute(&mut replacement_requests, "second");
+        let flush_completed = poll_signal_once(flush.as_mut()).await.is_ready();
+        drop(flush);
+        let send_completed = poll_signal_once(send.as_mut()).await.is_ready();
+        drop(send);
+        let failure_retained = matches!(
+            inner.queue.lock().await.as_slice(),
+            [proto::signal_request::Message::Mute(value)] if value.sid == "failed"
+        );
+        let mut flush = Box::pin(inner.flush_queue());
+        assert!(poll_signal_once(flush.as_mut()).await.is_pending());
+        let retry_matched = acknowledge_mute(&mut replacement_requests, "failed");
+        let retry_completed = poll_signal_once(flush.as_mut()).await.is_ready();
+        drop(flush);
+        let queue_empty = inner.queue.lock().await.is_empty();
+        let no_stale_or_extra =
+            original_requests.try_recv().is_err() && replacement_requests.try_recv().is_err();
+        inner.close(false).await;
+
+        assert!(original_matched && flush_owns_queue && failed_send_waits_for_queue);
+        assert!(first_matched && second_matched && failure_retained && retry_matched);
+        assert!(flush_completed && send_completed && retry_completed);
+        assert!(queue_empty && no_stale_or_extra);
+    }
 }

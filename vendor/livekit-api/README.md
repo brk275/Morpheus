@@ -38,3 +38,11 @@ unused async-std backend is not approved for Morpheus distribution.
   path can print peer-controlled close reasons. Runtime trace settings cannot
   re-enable these compiled-out messages. A captured-log websocket test includes
   the transitive logger and checks dummy bearer/proxy credentials remain absent.
+
+- A failed direct signal send releases its selected stream read guard before
+  waiting for the queue. This breaks the queue/stream/reconnect-writer lock
+  inversion while keeping the original stream protected through that send.
+  Queue FIFO, pass-through drops, and the existing failed-flush message policy
+  are unchanged. The focused Tokio test drives the real send/flush/read/write
+  locks and internal oneshots with a controlled writer; it does not establish
+  WebSocket or RTC recovery.

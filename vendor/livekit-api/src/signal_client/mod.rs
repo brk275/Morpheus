@@ -565,19 +565,28 @@ impl SignalInner {
         // until the new stream is installed, so this awaits and then writes via
         // the new stream. Same code path for the steady-state send — the lock is
         // free and we send immediately.
-        if let Some(stream) = self.stream.read().await.as_ref() {
-            if let Err(SignalError::SendError) = stream.send(signal.clone()).await {
+        let stream_guard = self.stream.read().await;
+        if let Some(stream) = stream_guard.as_ref() {
+            let result = stream.send(signal.clone()).await;
+            // Keep the selected stream protected through the original send,
+            // then release it before waiting for the queue. A concurrent flush
+            // can hold that queue while waiting behind a restart/close writer.
+            drop(stream_guard);
+            if let Err(SignalError::SendError) = result {
                 if !pass_through {
                     self.queue.lock().await.push(signal);
                 } else {
                     log::warn!("dropping pass-through signal — send failed");
                 }
             }
-        } else if !pass_through {
-            // Stream not in place AND signal is queueable — hold it.
-            self.queue.lock().await.push(signal);
         } else {
-            log::warn!("dropping pass-through signal — no stream available");
+            drop(stream_guard);
+            if !pass_through {
+                // Stream not in place AND signal is queueable — hold it.
+                self.queue.lock().await.push(signal);
+            } else {
+                log::warn!("dropping pass-through signal — no stream available");
+            }
         }
     }
 

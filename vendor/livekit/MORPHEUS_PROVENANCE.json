@@ -1,0 +1,26 @@
+{
+  "upstream_crate": "livekit",
+  "version": "0.7.48",
+  "archive_sha256": "3db88772d10f8ef1ab43a0aa0634a1d4807d0567b65665274af3e084589dbec6",
+  "archive_bytes": 204301,
+  "upstream_repository": "https://github.com/livekit/rust-sdks",
+  "recorded_vcs_commit": "af369aae0fe074762ef0a2051529e7ec63045042",
+  "recorded_vcs_path": "livekit",
+  "official_commit_tree": "a1c62e8b049abc4001a97ee97bfc27aee9b772e9",
+  "modified_upstream_files": [
+    "src/room/participant/remote_participant.rs"
+  ],
+  "additional_files": [
+    "Cargo.toml.upstream",
+    "LICENSE",
+    "MORPHEUS_PATCH.md",
+    "MORPHEUS_PROVENANCE.json",
+    "NOTICE",
+    "SDK_WORKSPACE_Cargo.toml.upstream",
+    "UPSTREAM_FILES.sha256",
+    "src/room/participant/remote_participant.rs.upstream"
+  ],
+  "native_prebuilt_source_attributed": false,
+  "license_compliance_verified": false,
+  "distribution_ready": false
+}

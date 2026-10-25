@@ -651,9 +651,9 @@ jobs:
           # Select synthetic native-source ownership cases only. Preserved
           # upstream peer/audio-device tests are not selected by these literals.
           libwebrtc_source_tests=(
-            native::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner
-            native::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner
-            native::video_source::tests::first_real_capture_stops_warmup_without_releasing_live_source
+            imp::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner
+            imp::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner
+            imp::video_source::tests::first_real_capture_stops_warmup_without_releasing_live_source
           )
           cargo test --locked -p libwebrtc --lib -- --list > "$RUNNER_TEMP/morpheus-libwebrtc-source-tests.txt"
           for libwebrtc_source_test in "${libwebrtc_source_tests[@]}"; do

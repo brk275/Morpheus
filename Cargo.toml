@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 # Keep vendored library development feature sets outside the application workspace.
-exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto", "vendor/winit", "vendor/notify-rust", "vendor/mac-notification-sys", "vendor/tauri-winrt-notification", "vendor/i-slint-backend-winit", "vendor/matrix-rtc-call-sdk", "vendor/matrix-rtc-matrix-sdk", "vendor/libwebrtc"]
+exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto", "vendor/winit", "vendor/notify-rust", "vendor/mac-notification-sys", "vendor/tauri-winrt-notification", "vendor/i-slint-backend-winit", "vendor/matrix-rtc-call-sdk", "vendor/matrix-rtc-matrix-sdk", "vendor/libwebrtc", "vendor/livekit"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
@@ -33,6 +33,8 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/brk275/Morpheus"
 
 [patch.crates-io]
+# Same-version awaited remote settings send/queue admission.
+livekit = { path = "vendor/livekit" }
 # Same-version video warm-up retains only weak source ownership while waiting.
 libwebrtc = { path = "vendor/libwebrtc" }
 # Same-version OpenGL config preference; complete upstream source retained.

@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use livekit::id::ParticipantIdentity;
 use livekit::options::TrackPublishOptions;
+use livekit::participant::RemoteVideoDetail;
 use livekit::prelude::{
     LocalAudioTrack, LocalTrack, LocalVideoTrack, Participant, RemoteTrack, RoomEvent,
     RtcAudioSource, TrackDimension, TrackKind, TrackPublication, TrackSource,
@@ -458,40 +459,31 @@ impl TransportConnection for LiveKitTransportConnection {
         // bandwidth (dynacast even stops the publisher's encoder), only an
         // idle decoder object is retained.
         //
-        // `Paused`/`Off` keep the subscription: `set_enabled(false)` sets
-        // the `disabled` flag server-side — no data, instant resume.
-        publication.set_enabled(matches!(resolved.demand, StreamDemand::Active));
-
-        // CAUTION: every SDK setter sends a full-replacement
-        // `UpdateTrackSettings`. `set_video_quality` in particular sends
-        // *only* the (protocol-deprecated) quality field — zeroed dimensions
-        // and `disabled: false` — so it must never follow a pause or carry a
-        // size hint alongside. `VideoDetail` being an exclusive enum plus the
-        // pause guard below keeps every combination consistent.
-        if matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare) {
+        // Keep the subscription while paused. Await the SDK's one complete settings
+        // update instead of its synchronous setters, whose independent spawned sends
+        // could let an older pause overtake a newer active/dimension request.
+        let detail = if matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare) {
             match resolved.detail {
-                VideoDetail::Auto => {}
-                VideoDetail::Dimensions(dimensions) => {
-                    // Sends {disabled, width, height}: consistent with the
-                    // pause state set above.
-                    publication.update_video_dimensions(TrackDimension(
-                        dimensions.width,
-                        dimensions.height,
-                    ));
-                }
-                VideoDetail::Quality(limit) => {
-                    if matches!(resolved.demand, StreamDemand::Active) {
-                        // No-op (with a livekit warning) on non-simulcast
-                        // tracks.
-                        publication.set_video_quality(match limit {
-                            QualityLimit::Low => LkVideoQuality::Low,
-                            QualityLimit::Medium => LkVideoQuality::Medium,
-                            QualityLimit::High => LkVideoQuality::High,
-                        });
-                    }
-                }
+                VideoDetail::Auto => RemoteVideoDetail::Auto,
+                VideoDetail::Dimensions(dimensions) => RemoteVideoDetail::Dimensions(
+                    TrackDimension(dimensions.width, dimensions.height),
+                ),
+                VideoDetail::Quality(limit) => RemoteVideoDetail::Quality(match limit {
+                    QualityLimit::Low => LkVideoQuality::Low,
+                    QualityLimit::Medium => LkVideoQuality::Medium,
+                    QualityLimit::High => LkVideoQuality::High,
+                }),
             }
-        }
+        } else {
+            RemoteVideoDetail::Auto
+        };
+        participant
+            .update_track_settings(
+                &publication.sid(),
+                matches!(resolved.demand, StreamDemand::Active),
+                detail,
+            )
+            .await;
         Ok(())
     }
 

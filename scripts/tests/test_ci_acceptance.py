@@ -359,9 +359,9 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertIn("        id: video-source-tests\n", step)
         self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')", step)
         cases = (
-            "native::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner",
-            "native::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner",
-            "native::video_source::tests::first_real_capture_stops_warmup_without_releasing_live_source",
+            "imp::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner",
+            "imp::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner",
+            "imp::video_source::tests::first_real_capture_stops_warmup_without_releasing_live_source",
         )
         for case in cases:
             self.assertEqual(source.count(case), 1)
