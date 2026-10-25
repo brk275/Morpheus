@@ -572,10 +572,23 @@ impl<M: StageMedia> Stage<M> {
     /// Keep exactly the planned streams open, each in a stable slot.
     fn open_planned(&mut self, decode: &[DecodeRequest]) {
         for slot in 0..FRAME_SLOTS {
-            if !self.presenter.decoders[slot]
-                .as_ref()
-                .is_some_and(|decoder| decode.iter().any(|request| request.key == decoder.key))
-            {
+            let keep = match self.presenter.decoders[slot].as_ref() {
+                Some(decoder) if decode.iter().any(|request| request.key == decoder.key) => {
+                    // The SDK can refresh a same-key track handle without a
+                    // StreamStarted event. Never retain its old frame stream
+                    // or picture just because the membership and kind match.
+                    let current = self.media.track(&decoder.key);
+                    let same = self.presenter.is_track(slot, current.as_ref());
+                    if !same {
+                        // A replacement starts with its own subscription state.
+                        // Reapply the current demand even if the size is unchanged.
+                        self.constraints.remove(&decoder.key);
+                    }
+                    same
+                }
+                _ => false,
+            };
+            if !keep {
                 self.presenter.release(slot);
             }
         }
@@ -1643,6 +1656,154 @@ mod tests {
             member_id: "bob".into(),
         });
         assert!(!stage.presenter.decoding());
+    }
+
+    #[test]
+    fn refreshed_same_key_track_replaces_its_stream_without_a_start_event() {
+        struct Retirement(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Retirement {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct QueuedTrack(Mutex<Option<BoxStream<'static, VideoFrame>>>);
+        impl RemoteTrackHandle for QueuedTrack {
+            fn kind(&self) -> MediaStreamKind {
+                MediaStreamKind::Camera
+            }
+            fn video_frames(&self) -> Option<BoxStream<'static, VideoFrame>> {
+                self.0.lock().unwrap().take()
+            }
+        }
+        fn queued_track(
+            retired: Arc<std::sync::atomic::AtomicBool>,
+        ) -> (
+            Arc<dyn RemoteTrackHandle>,
+            tokio::sync::mpsc::Sender<VideoFrame>,
+        ) {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let retirement = Retirement(retired);
+            let frames = futures_util::stream::poll_fn(move |cx| {
+                let _ = &retirement;
+                receiver.poll_recv(cx)
+            })
+            .boxed();
+            (Arc::new(QueuedTrack(Mutex::new(Some(frames)))), sender)
+        }
+        fn snapshot(updates: &watch::Receiver<VideoUpdate>) -> Arc<StageSnapshot> {
+            match updates.borrow().clone() {
+                VideoUpdate::Stage { stage, .. } => stage,
+                VideoUpdate::Clear { .. } => panic!("expected a stage snapshot"),
+            }
+        }
+
+        let old_retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let new_retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (old_track, old_sender) = queued_track(Arc::clone(&old_retired));
+        let (new_track, new_sender) = queued_track(Arc::clone(&new_retired));
+        let media = FakeMedia {
+            participants: vec![participant("bob", &[(RtcStreamKind::Camera, false)])],
+            ..FakeMedia::default()
+        };
+        media
+            .tracks
+            .lock()
+            .unwrap()
+            .insert(camera("bob"), old_track);
+        let mut stage = Stage::new(media, 21);
+        stage.participants = stage.media.participants();
+        stage.request(&StageRequest {
+            token: 21,
+            presented: true,
+            ..StageRequest::default()
+        });
+        let active = AtomicU64::new(21);
+        let (published, updates) = watch::channel(VideoUpdate::Clear { token: 21 });
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        stage.replan();
+        let slot = stage.presenter.slot_of(&camera("bob")).unwrap();
+        old_sender
+            .try_send(padded_frame(VideoRotation::Deg0))
+            .unwrap();
+        let first_polled = stage.presenter.poll_frames(&mut context).is_ready();
+        let first = convert_batch(stage.presenter.take_due_frames(Instant::now()));
+        stage.presenter.accept(first);
+        stage.publish(&published, &active);
+        let initial = snapshot(&updates);
+        let original_constraints = stage.media.constraints.lock().unwrap().len();
+
+        // Retain a real conversion result from the old epoch across a same-key
+        // replacement, just as a blocking conversion can finish after refresh.
+        old_sender
+            .try_send(padded_frame(VideoRotation::Deg0))
+            .unwrap();
+        let old_polled = stage.presenter.poll_frames(&mut context).is_ready();
+        let stale = convert_batch(
+            stage
+                .presenter
+                .take_due_frames(Instant::now() + Duration::from_secs(1)),
+        );
+        stage
+            .media
+            .tracks
+            .lock()
+            .unwrap()
+            .insert(camera("bob"), new_track);
+        // No StreamStarted event: exercise the same production replan used by
+        // periodic refresh and roster changes after the SDK refreshes its Arc.
+        stage.replan();
+        stage.presenter.accept(stale);
+        stage.publish(&published, &active);
+        let replaced = snapshot(&updates);
+        let replacement_constraints = stage.media.constraints.lock().unwrap().len();
+        let old_closed = old_sender.is_closed();
+        let old_stream_retired = old_retired.load(Ordering::SeqCst);
+
+        new_sender
+            .try_send(padded_frame(VideoRotation::Deg180))
+            .unwrap();
+        let new_polled = stage.presenter.poll_frames(&mut context).is_ready();
+        let fresh = convert_batch(stage.presenter.take_due_frames(Instant::now()));
+        stage.presenter.accept(fresh);
+        stage.publish(&published, &active);
+        let delivered = snapshot(&updates);
+        stage.replan();
+        stage.publish(&published, &active);
+        let unchanged = snapshot(&updates);
+        let unchanged_constraints = stage.media.constraints.lock().unwrap().len();
+        let new_stream_retained = !new_retired.load(Ordering::SeqCst);
+
+        // The ordinary hidden-stage path closes the actual new receiver too.
+        stage.request(&StageRequest::default());
+        stage.replan();
+        let new_closed = new_sender.is_closed();
+        let new_stream_retired = new_retired.load(Ordering::SeqCst);
+        assert!(first_polled && old_polled && new_polled);
+        assert_ne!(initial.frames[slot].epoch, 0);
+        assert_eq!(initial.frames[slot].sequence, 1);
+        assert!(initial.frames[slot].pixels.is_some());
+        assert!(old_closed && old_stream_retired);
+        assert_eq!(replaced.layout, initial.layout);
+        assert_ne!(replaced.frames[slot].epoch, initial.frames[slot].epoch);
+        assert_eq!(replaced.frames[slot].sequence, 0);
+        assert!(replaced.frames[slot].pixels.is_none());
+        assert_eq!(replacement_constraints, original_constraints + 1);
+        assert_eq!(delivered.frames[slot].epoch, replaced.frames[slot].epoch);
+        assert_eq!(delivered.frames[slot].sequence, 1);
+        assert_eq!(
+            delivered.frames[slot].pixels.as_ref().unwrap().as_slice(),
+            rgb_buffer(&padded_frame(VideoRotation::Deg180), (1280, 720))
+                .unwrap()
+                .as_slice()
+        );
+        assert_eq!(unchanged.frames[slot].epoch, delivered.frames[slot].epoch);
+        assert_eq!(
+            unchanged.frames[slot].sequence,
+            delivered.frames[slot].sequence
+        );
+        assert_eq!(unchanged_constraints, replacement_constraints);
+        assert!(new_stream_retained && new_closed && new_stream_retired);
     }
 
     #[test]
