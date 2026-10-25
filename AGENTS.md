@@ -97,3 +97,19 @@ belong in the private reporting channel described in [SECURITY.md](SECURITY.md).
   behavior from verified release readiness.
 - Use real native screenshots with fictional accounts and retain their capture
   provenance. Do not generate or retouch application screenshots.
+
+## Cursor Cloud specific instructions
+
+Cloud Agent VMs for this repository have a memory cgroup near 15 GiB. `cargo build` and `cargo run` of `morpheus-app` compile that crate as one LLVM module and are killed before the binary is linked. Compile the desktop app with one Cargo job and sixteen codegen units:
+
+```sh
+cargo rustc --locked -p morpheus-app -- -C codegen-units=16
+```
+
+The binary is `target/debug/morpheus-app`. Rust 1.99.0 comes from `rust-toolchain.toml`.
+
+A debug build reads `MORPHEUS_QA_PROFILE_DIR` when it is an absolute path and keeps that run's configuration and account store there. The desktop session is already available. From the sign-in window, **Explore the interactive preview** opens the in-memory offline preview with fictional conversations.
+
+Native calls stay outside this environment. They need the owned PipeWire client from `scripts/build_linux_native.py` and `--features native-calls`, described in [Linux native source builds](docs/LINUX_NATIVE_BUILD.md).
+
+Hosted package and native workflows stay gated by the spending policy above. This environment does not dispatch them.
