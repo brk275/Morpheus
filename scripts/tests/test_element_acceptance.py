@@ -112,6 +112,36 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.diagnostics(stages + malformed)["native_group_roster"], "invalid")
         self.assertEqual(target.native_group_rosters(pair), ("invalid",))
 
+    def test_bob_sticky_decrypt_diagnostics_are_closed_and_not_acceptance(self):
+        stages = "\n".join(target.NATIVE_STAGE_PREFIX + value for value in target.NATIVE_STAGES) + "\n"
+        rosters = "\n".join(target.GROUP_ROSTER_PREFIX + f"side={side} total=three "
+                            "alice=one bob=one carol=one other=zero local_owner=one"
+                            for side in target.GROUP_ROSTER_SIDES) + "\n"
+        context = stages + rosters
+        original = target.BOB_STICKY_PREFIX + "side=original keyed=one same_event=true decrypt=decrypted"
+        late = target.BOB_STICKY_PREFIX + "side=late keyed=zero same_event=true decrypt=missing_key"
+        pair = original + "\n" + late
+        self.assertEqual(target.native_bob_sticky(context + pair), (original, late))
+        self.assertEqual(target.diagnostics(context + pair)["native_bob_sticky"],
+                         "; ".join(line.removeprefix(target.BOB_STICKY_PREFIX) for line in (original, late)))
+        self.assertNotIn("native_bob_sticky", target.diagnostics(context + pair, include_native=False))
+        self.assertEqual(target.evidence(context + pair), {})
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(context + pair, complete=True)
+        unavailable = target.BOB_STICKY_PREFIX + "side=late keyed=unavailable same_event=false decrypt=source_unavailable"
+        self.assertEqual(target.native_bob_sticky(context + original + "\n" + unavailable), (original, unavailable))
+        self.assertEqual(target.native_bob_sticky("ordinary private log"), ())
+        for malformed in (original, late, late + "\n" + original, pair + "\n" + late,
+                          pair + " trailing", pair + "x" * 161,
+                          pair.replace("decrypted", "invalid"),
+                          pair.replace("same_event=true decrypt=missing_key", "same_event=false decrypt=missing_key"),
+                          original + "\n" + unavailable.replace("same_event=false", "same_event=true")):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(target.native_bob_sticky(context + malformed), ("invalid",))
+                self.assertEqual(target.diagnostics(context + malformed)["native_bob_sticky"], "invalid")
+        self.assertEqual(target.native_bob_sticky(pair), ("invalid",))
+        self.assertEqual(target.native_bob_sticky(stages + pair), ("invalid",))
+
     def test_native_failure_facts_follow_owned_cleanup_and_successful_scan(self):
         for scanner_status, join_failure, service_failure in ((0, False, False), (1, False, False),
                                                             (0, True, False), (0, False, True)):
@@ -127,7 +157,9 @@ class EvidenceTests(unittest.TestCase):
                     "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
                     + "".join(target.NATIVE_STAGE_PREFIX + value + "\n" for value in target.NATIVE_STAGES)
                     + target.GROUP_ROSTER_PREFIX + "side=original total=three alice=one bob=one carol=one other=zero local_owner=one\n"
-                    + target.GROUP_ROSTER_PREFIX + "side=late total=two alice=one bob=zero carol=one other=zero local_owner=one\n").encode())
+                    + target.GROUP_ROSTER_PREFIX + "side=late total=two alice=one bob=zero carol=one other=zero local_owner=one\n"
+                    + target.BOB_STICKY_PREFIX + "side=original keyed=one same_event=true decrypt=decrypted\n"
+                    + target.BOB_STICKY_PREFIX + "side=late keyed=zero same_event=true decrypt=missing_key\n").encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
                 native.joined = browser.joined = False
                 native.status = mock.Mock(return_value=1)
@@ -178,6 +210,8 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.diagnostics(output).get("native_stage"),
                                  "group_roster" if scanner_status == 0 and not join_failure and not service_failure else None)
                 self.assertEqual("native_group_roster" in target.diagnostics(output),
+                                 scanner_status == 0 and not join_failure and not service_failure)
+                self.assertEqual("native_bob_sticky" in target.diagnostics(output),
                                  scanner_status == 0 and not join_failure and not service_failure)
 
     @staticmethod

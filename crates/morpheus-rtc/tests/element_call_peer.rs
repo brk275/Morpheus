@@ -458,8 +458,246 @@ fn report_group_roster(
     );
 }
 
+// Timeout-only diagnostics. These ordinary public decrypt calls can queue the
+// SDK's existing same-user key requests / backup downloads; they do not change
+// key-sharing policy. The same bounded homeserver event is used for both rooms.
+// Keyed-cache counts exclude the separate keyless encrypted-sticky buffer.
+#[derive(Clone, Copy)]
+struct BobStickyDiagnostic {
+    keyed: &'static str,
+    same_event: bool,
+    decrypt: &'static str,
+}
+
+async fn report_bob_sticky_recovery(
+    original_manager: &AccountManager,
+    late_manager: &AccountManager,
+    room: &str,
+    alice: &str,
+    bob: &str,
+    carol: &str,
+) {
+    use matrix_sdk::{
+        config::RequestConfig,
+        deserialized_responses::{TimelineEventKind, UnableToDecryptReason},
+        ruma::{
+            RoomId, api::client::room::get_room_event,
+            events::room::encrypted::OriginalSyncRoomEncryptedEvent,
+        },
+    };
+
+    let unavailable = BobStickyDiagnostic {
+        keyed: "unavailable",
+        same_event: false,
+        decrypt: "source_unavailable",
+    };
+    let reports = async {
+        let clients = tokio::join!(
+            timeout(Duration::from_secs(3), original_manager.active_client()),
+            timeout(Duration::from_secs(3), late_manager.active_client()),
+        );
+        let (Ok(Ok(original_client)), Ok(Ok(late_client))) = clients else {
+            return [unavailable; 2];
+        };
+        if original_client.user_id().map(|user| user.as_str()) != Some(alice)
+            || late_client.user_id().map(|user| user.as_str()) != Some(carol)
+        {
+            return [unavailable; 2];
+        }
+        let Ok(room_id) = RoomId::parse(room) else {
+            return [unavailable; 2];
+        };
+        let (Some(original), Some(late)) = (
+            original_client.get_room(&room_id),
+            late_client.get_room(&room_id),
+        ) else {
+            return [unavailable; 2];
+        };
+        if original.state() != matrix_sdk::RoomState::Joined
+            || late.state() != matrix_sdk::RoomState::Joined
+        {
+            return [unavailable; 2];
+        }
+        let original_live = original.sticky_events().live();
+        let late_live = late.sticky_events().live();
+        if original_live.len() > 64 || late_live.len() > 64 {
+            return [unavailable; 2];
+        }
+        let sources = original_live
+            .iter()
+            .filter(|event| {
+                event.key.sender.as_str() == bob
+                    && matches!(
+                        event.key.event_type.as_str(),
+                        "m.rtc.member" | "org.matrix.msc4143.rtc.member"
+                    )
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        let late_count = late_live
+            .iter()
+            .filter(|event| {
+                event.key.sender.as_str() == bob
+                    && matches!(
+                        event.key.event_type.as_str(),
+                        "m.rtc.member" | "org.matrix.msc4143.rtc.member"
+                    )
+            })
+            .take(2)
+            .count();
+        let bucket = |count| match count {
+            0 => "zero",
+            1 => "one",
+            _ => "many",
+        };
+        let mut reports = [
+            BobStickyDiagnostic {
+                keyed: bucket(sources.len()),
+                ..unavailable
+            },
+            BobStickyDiagnostic {
+                keyed: bucket(late_count),
+                ..unavailable
+            },
+        ];
+        let [source] = sources.as_slice() else {
+            if sources.len() > 1 {
+                for report in &mut reports {
+                    report.decrypt = "source_ambiguous";
+                }
+            }
+            return reports;
+        };
+        if source.raw().json().get().len() > 64 * 1024
+            || source
+                .raw()
+                .get_field::<String>("sender")
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(bob)
+            || !source
+                .encryption_info()
+                .is_some_and(|info| info.sender.as_str() == bob)
+        {
+            for report in &mut reports {
+                report.decrypt = "source_invalid";
+            }
+            return reports;
+        }
+        // StickyEvent retains decrypted content, not the original ciphertext.
+        // Fetch exactly its SDK-held event ID once through Carol's own client.
+        let request = get_room_event::v3::Request::new(room_id, source.event_id.clone());
+        let response = timeout(
+            Duration::from_secs(3),
+            late_client.send(request).with_request_config(
+                RequestConfig::new()
+                    .retry_limit(0)
+                    .timeout(Duration::from_secs(3))
+                    .max_response_bytes(64 * 1024),
+            ),
+        )
+        .await;
+        let fetched = match response {
+            Ok(Ok(response)) => response.event,
+            failed => {
+                for report in &mut reports {
+                    report.decrypt = if failed.is_err() {
+                        "fetch_timeout"
+                    } else {
+                        "fetch_error"
+                    };
+                }
+                return reports;
+            }
+        };
+        if fetched.json().get().len() > 64 * 1024
+            || fetched
+                .get_field::<String>("type")
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some("m.room.encrypted")
+            || fetched
+                .get_field::<String>("sender")
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(bob)
+            || fetched
+                .get_field::<String>("room_id")
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(room)
+            || fetched
+                .get_field::<String>("event_id")
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(source.event_id.as_str())
+            || fetched
+                .get_field::<serde_json::Value>("state_key")
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            for report in &mut reports {
+                report.decrypt = "event_invalid";
+            }
+            return reports;
+        }
+        let encrypted = matrix_sdk::ruma::serde::Raw::<OriginalSyncRoomEncryptedEvent>::from_json(
+            fetched.into_json(),
+        );
+        if encrypted.deserialize().is_err() {
+            for report in &mut reports {
+                report.decrypt = "event_invalid";
+            }
+            return reports;
+        }
+        // No spawn: each original future is directly held under its own bound.
+        for (target, report) in [&original, &late].into_iter().zip(&mut reports) {
+            report.same_event = true;
+            report.decrypt = match timeout(
+                Duration::from_secs(3),
+                target.decrypt_event(&encrypted, None),
+            )
+            .await
+            {
+                Err(_) => "decrypt_timeout",
+                Ok(Err(_)) => "decrypt_error",
+                Ok(Ok(event)) => match event.kind {
+                    TimelineEventKind::Decrypted(_) => "decrypted",
+                    TimelineEventKind::PlainText { .. } => "not_encrypted",
+                    TimelineEventKind::UnableToDecrypt { utd_info, .. } => match utd_info.reason {
+                        UnableToDecryptReason::MissingMegolmSession {
+                            withheld_code: None,
+                        } => "missing_key",
+                        UnableToDecryptReason::MissingMegolmSession {
+                            withheld_code: Some(_),
+                        } => "withheld",
+                        UnableToDecryptReason::UnknownMegolmMessageIndex => "unknown_index",
+                        UnableToDecryptReason::SenderIdentityNotTrusted(_) => "trust",
+                        _ => "other_utd",
+                    },
+                },
+            };
+        }
+        reports
+    }
+    .await;
+    for (side, report) in ["original", "late"].into_iter().zip(reports) {
+        eprintln!(
+            "MORPHEUS_ELEMENT_BOB_STICKY side={side} keyed={} same_event={} decrypt={}",
+            report.keyed, report.same_event, report.decrypt,
+        );
+    }
+}
+
 async fn group_and_screen(
     rtc: &mut RtcService,
+    original_manager: &AccountManager,
     root: &std::path::Path,
     alice: &TestAccount,
     bob: &TestAccount,
@@ -557,6 +795,17 @@ async fn group_and_screen(
             &carol.user_id,
             &carol.user_id,
         );
+    }
+    if group_roster.is_err() {
+        report_bob_sticky_recovery(
+            original_manager,
+            &manager,
+            room,
+            &alice.user_id,
+            &bob.user_id,
+            &carol.user_id,
+        )
+        .await;
     }
     group_roster.expect("Three-member native rosters did not converge");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_group_roster=true");
@@ -1108,6 +1357,7 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
             .expect("Late group peer fixture missing");
         group_and_screen(
             &mut rtc,
+            &manager,
             root,
             alice,
             bob,

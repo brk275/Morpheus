@@ -56,6 +56,17 @@ GROUP_ROSTER_PATTERN = re.compile(
     r"alice=(zero|one|many) bob=(zero|one|many) carol=(zero|one|many) "
     r"other=(zero|one|many) local_owner=(zero|one|many)"
 )
+BOB_STICKY_PREFIX = "MORPHEUS_ELEMENT_BOB_STICKY "
+BOB_STICKY_ATTEMPTS = frozenset((
+    "decrypt_timeout", "decrypt_error", "decrypted", "not_encrypted", "missing_key",
+    "withheld", "unknown_index", "trust", "other_utd",
+))
+BOB_STICKY_PATTERN = re.compile(
+    r"side=(original|late) keyed=(unavailable|zero|one|many) same_event=(true|false) "
+    r"decrypt=(source_unavailable|source_ambiguous|source_invalid|fetch_timeout|fetch_error|"
+    r"event_invalid|decrypt_timeout|decrypt_error|decrypted|not_encrypted|missing_key|"
+    r"withheld|unknown_index|trust|other_utd)"
+)
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128
 MAX_LOG_ENTRIES = 65_536
@@ -117,6 +128,31 @@ def native_group_rosters(output: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def native_bob_sticky(output: str) -> tuple[str, ...]:
+    """Closed observations from the same ciphertext; never recovery acceptance."""
+    result = []
+    cursor = 0
+    while (start := output.find("MORPHEUS_ELEMENT_BOB_STICKY", cursor)) >= 0:
+        cursor = start + len("MORPHEUS_ELEMENT_BOB_STICKY")
+        if start and output[start - 1] != "\n":
+            continue
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if len(result) >= 2 or end - start > 160:
+            return ("invalid",)
+        line = output[start:end]
+        match = BOB_STICKY_PATTERN.fullmatch(line.removeprefix(BOB_STICKY_PREFIX))
+        if (not line.startswith(BOB_STICKY_PREFIX) or match is None
+                or match[1] != GROUP_ROSTER_SIDES[len(result)]
+                or (match[3] == "true") != (match[4] in BOB_STICKY_ATTEMPTS)):
+            return ("invalid",)
+        result.append(line)
+    if result and (len(result) != 2 or native_stages(output) != NATIVE_STAGES
+                   or native_group_rosters(output) in ((), ("invalid",))):
+        return ("invalid",)
+    return tuple(result)
+
+
 def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
@@ -131,6 +167,10 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         if rosters := native_group_rosters(output):
             result["native_group_roster"] = "; ".join(
                 line.removeprefix(GROUP_ROSTER_PREFIX) for line in rosters
+            )
+        if sticky := native_bob_sticky(output):
+            result["native_bob_sticky"] = "; ".join(
+                line.removeprefix(BOB_STICKY_PREFIX) for line in sticky
             )
     return result
 
@@ -509,6 +549,8 @@ def execute(root: Path, fixture: Path, gitleaks: str):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
         for line in native_group_rosters(native_output):
             print(line if line != "invalid" else GROUP_ROSTER_PREFIX + "invalid", flush=True)
+        for line in native_bob_sticky(native_output):
+            print(line if line != "invalid" else BOB_STICKY_PREFIX + "invalid", flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):
