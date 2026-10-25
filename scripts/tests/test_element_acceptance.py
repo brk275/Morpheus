@@ -142,6 +142,91 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(target.native_bob_sticky(pair), ("invalid",))
         self.assertEqual(target.native_bob_sticky(stages + pair), ("invalid",))
 
+    def test_build_summary_is_bounded_closed_and_not_acceptance(self):
+        def diagnostic(**changes):
+            span = {"is_primary": True, "file_name": "crates/morpheus-rtc/tests/element_call_peer.rs",
+                    "line_start": 664}
+            span.update(changes)
+            return {"reason": "compiler-message", "target": {"name": "element_call_peer"},
+                    "message": {"level": "error", "message": "private compiler payload",
+                                "code": {"code": "E0308"}, "spans": [span]}}
+        raw = json.dumps(diagnostic())
+        summary = "category=rust peer=E0308@664"
+        self.assertEqual(target.compiler_failure_summary("private prefix" * 200_000 + "\n" + raw), summary)
+        record = target.BUILD_PREFIX + summary + "\n"
+        self.assertEqual(target.diagnostics(record, include_native=False), {"build": summary})
+        self.assertEqual(target.evidence(record), {})
+        for changes in ({"line_start": True}, {"line_start": 0}, {"line_start": 1_000_000},
+                        {"file_name": "/private/compiler.rs"}, {"is_primary": False}):
+            self.assertEqual(target.compiler_failure_summary(json.dumps(diagnostic(**changes))),
+                             "category=rust peer=none")
+        for raw, expected in (("error: linking with private compiler payload", "link"),
+                              ("failed to run custom build command private", "build_script"),
+                              ("failed to download private", "download"), ("private", "other")):
+            self.assertEqual(target.compiler_failure_summary(raw), f"category={expected} peer=none")
+        malformed = [[], {"reason": "compiler-message", "message": []},
+                     {"reason": "compiler-message", "message": {"level": "error", "code": [], "spans": []}}]
+        for item in malformed:
+            self.assertNotIn("private", target.compiler_failure_summary(json.dumps(item)))
+        self.assertEqual(target.compiler_failure_summary('{"nested":' + "[" * 1024 + "]" * 1024 + "}"),
+                         "category=other peer=none")
+        many = [json.dumps(diagnostic(line_start=index)) for index in range(1, 21)]
+        self.assertEqual(target.compiler_failure_summary("\n".join(many)),
+                         "category=rust peer=" + ",".join(f"E0308@{index}" for index in range(1, 9)))
+        for invalid in (record * 2, record.rstrip() + " private\n",
+                        target.BUILD_PREFIX + "category=unknown peer=none\n",
+                        target.BUILD_PREFIX + "category=rust peer=E0308@0\n"):
+            self.assertEqual(target.build_diagnostic(invalid), "invalid")
+            self.assertEqual(target.evidence(invalid), {})
+
+    def test_build_diagnostic_requires_original_cleanup_and_log_scan(self):
+        for scan_code, join_failure, service_failure, anchor_failure in (
+                (0, False, False, False), (1, False, False, False), (0, True, False, False),
+                (0, False, True, False), (0, False, False, True)):
+            with self.subTest(scan=scan_code, join=join_failure, service=service_failure,
+                              anchor=anchor_failure), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                fixture = root / "fixture.json"
+                fixture.write_text("{}")
+                fixture.chmod(0o600)
+                runner = target.Runner(root, "scanner")
+                child = self.anchored_log(runner, "compiler.log", b"private compiler payload\n")
+                child.joined = False
+                def joined():
+                    if join_failure:
+                        raise RuntimeError("fixture_operation")
+                    child.joined = True
+                child.close = joined
+                runner.children = [child]
+                original_release = runner.release_log_anchors
+                def release_anchors():
+                    original_release()
+                    if anchor_failure:
+                        raise RuntimeError("fixture_operation")
+                def command(args, **kwargs):
+                    if args[0] == "cargo":
+                        raise RuntimeError("fixture_operation")
+                    return ""
+                visible = io.StringIO()
+                with mock.patch.object(target.sys, "platform", "linux"), mock.patch.dict(os.environ, {
+                    "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux",
+                }, clear=True), mock.patch.object(target, "assert_contained"), \
+                        mock.patch.object(target, "Runner", return_value=runner), \
+                        mock.patch.object(runner, "command", side_effect=command), \
+                        mock.patch.object(runner, "release_log_anchors", side_effect=release_anchors), \
+                        mock.patch.object(runner, "service", side_effect=(
+                            RuntimeError("fixture_operation") if service_failure else lambda action: None)), \
+                        mock.patch.object(target.subprocess, "run", return_value=subprocess.CompletedProcess([], scan_code)), \
+                        contextlib.redirect_stdout(visible), self.assertRaises(RuntimeError):
+                    target.execute(root, fixture, "scanner")
+                output = visible.getvalue()
+                self.assertNotIn("private", output)
+                self.assertEqual(target.evidence(output), {})
+                self.assertEqual(target.diagnostics(output).get("build"),
+                                 "category=other peer=none" if scan_code == 0 and not join_failure and not service_failure and not anchor_failure else None)
+                self.assertIsNone(child.log_anchor)
+
     def test_native_failure_facts_follow_owned_cleanup_and_successful_scan(self):
         for scanner_status, join_failure, service_failure in ((0, False, False), (1, False, False),
                                                             (0, True, False), (0, False, True)):

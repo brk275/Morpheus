@@ -3518,6 +3518,7 @@ class ScopedContinuationTests(unittest.TestCase):
                         output = (private * 512 + "\n" + f"MORPHEUS_ELEMENT_STAGE {phase}\n"
                                   f"MORPHEUS_ELEMENT_FAILURE {failure}\n"
                                   "MORPHEUS_ELEMENT_NATIVE_STAGE group_roster\n"
+                                  "MORPHEUS_ELEMENT_BUILD category=rust peer=E0308@664\n"
                                   "MORPHEUS_ELEMENT_CHECK browser_identity=true\n" + private + "\n")
                         with self.contained_child(runner, output, scanner_code=scanner_code,
                                                   cleanup_error=cleanup_error) as (visible, _, _, _, _, scan):
@@ -3537,6 +3538,7 @@ class ScopedContinuationTests(unittest.TestCase):
                             detail = {"failure": failure}
                             if phase != "unrecognized_phase":
                                 detail["stage"] = phase
+                            detail["build"] = "category=rust peer=E0308@664"
                             self.assertEqual(records, [{"check": acceptance_module.ELEMENT_LABEL,
                                                         "element_infrastructure": detail}])
                         if cleanup_error:

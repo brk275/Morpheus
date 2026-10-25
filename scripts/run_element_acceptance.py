@@ -67,6 +67,11 @@ BOB_STICKY_PATTERN = re.compile(
     r"event_invalid|decrypt_timeout|decrypt_error|decrypted|not_encrypted|missing_key|"
     r"withheld|unknown_index|trust|other_utd)"
 )
+BUILD_PREFIX = "MORPHEUS_ELEMENT_BUILD "
+BUILD_PATTERN = re.compile(
+    r"category=(rust|link|build_script|download|other) "
+    r"peer=(none|E[0-9]{4}@[1-9][0-9]{0,5}(?:,E[0-9]{4}@[1-9][0-9]{0,5}){0,7})"
+)
 MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LOG_FILES = 128
 MAX_LOG_ENTRIES = 65_536
@@ -153,6 +158,71 @@ def native_bob_sticky(output: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def compiler_failure_summary(output: str) -> str:
+    """Only fixed categories and peer-source error codes/lines; no compiler text."""
+    tail = output[-2_097_152:]
+    category = "other"
+    for phrases, value in (
+        (("error: linking with",), "link"),
+        (("failed to run custom build command",), "build_script"),
+        (("failed to download", "failed to get"), "download"),
+    ):
+        if any(phrase in tail for phrase in phrases):
+            category = value
+            break
+    locations = set()
+    rust_error = False
+    for line in tail.split("\n"):
+        if len(line) > 262_144 or not line.startswith("{"):
+            continue
+        try:
+            item = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(item, dict) or item.get("reason") != "compiler-message":
+            continue
+        message = item.get("message")
+        if not isinstance(message, dict) or message.get("level") != "error":
+            continue
+        rust_error = True
+        target = item.get("target")
+        code = message.get("code")
+        spans = message.get("spans")
+        if (not isinstance(target, dict) or target.get("name") != "element_call_peer"
+                or not isinstance(code, dict) or not isinstance(code.get("code"), str)
+                or re.fullmatch(r"E[0-9]{4}", code["code"]) is None
+                or not isinstance(spans, list) or len(spans) > 64):
+            continue
+        for span in spans:
+            if (not isinstance(span, dict) or span.get("is_primary") is not True
+                    or span.get("file_name") not in (
+                        "crates/morpheus-rtc/tests/element_call_peer.rs", "tests/element_call_peer.rs")
+                    or type(span.get("line_start")) is not int
+                    or not 1 <= span["line_start"] <= 999_999):
+                continue
+            locations.add((code["code"], span["line_start"]))
+            if len(locations) >= 8:
+                break
+        if len(locations) >= 8:
+            break
+    if category == "other" and rust_error:
+        category = "rust"
+    peer = ",".join(f"{code}@{line}" for code, line in sorted(locations)) or "none"
+    return f"category={category} peer={peer}"
+
+
+def build_diagnostic(output: str) -> str | None:
+    result = None
+    for line in output[-4096:].split("\n"):
+        if not line.startswith("MORPHEUS_ELEMENT_BUILD"):
+            continue
+        if (result is not None or len(line) > 180 or not line.startswith(BUILD_PREFIX)
+                or BUILD_PATTERN.fullmatch(line.removeprefix(BUILD_PREFIX)) is None):
+            return "invalid"
+        result = line.removeprefix(BUILD_PREFIX)
+    return result
+
+
 def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
     result = {}
     stages = [value for value in STAGE_PATTERN.findall(output) if value in STAGES]
@@ -161,6 +231,8 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         result["stage"] = stages[-1]
     if failures:
         result["failure"] = failures[-1]
+    if build := build_diagnostic(output):
+        result["build"] = build
     if include_native:
         if native := native_stages(output):
             result["native_stage"] = native[-1]
@@ -545,6 +617,10 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     for key, value in sorted(facts.items()):
         print(f"MORPHEUS_ELEMENT_CHECK {key}={str(value).lower()}", flush=True)
     if children_joined and cleanup_failure is None:
+        # output exists only after the exact log snapshot passed scanning and
+        # all original log anchors were released. Build failure stays fatal.
+        if failed_stage == "native_test_build" and output:
+            print(BUILD_PREFIX + compiler_failure_summary(output), flush=True)
         for value in native_stages(native_output):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
         for line in native_group_rosters(native_output):

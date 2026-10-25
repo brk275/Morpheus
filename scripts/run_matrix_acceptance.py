@@ -1307,8 +1307,10 @@ class Acceptance:
             # and failure category may escape, after this outer group's actual
             # teardown and independent scan; native facts/logs stay withheld.
             detail = {"failure": element_failure[1]}
-            if stage := element_diagnostics(output[-4096:], include_native=False).get("stage"):
-                detail["stage"] = stage
+            found = element_diagnostics(output[-4096:], include_native=False)
+            for key in ("stage", "build"):
+                if key in found:
+                    detail[key] = found[key]
             print(json.dumps({"check": label, "element_infrastructure": detail}), flush=True)
             raise RuntimeError("Element acceptance infrastructure or cleanup failed")
         if ring_case is not None and (ring_evidence(output).get("cleanup") is False
