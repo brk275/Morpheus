@@ -301,22 +301,17 @@ int32_t AdmProxy::RegisterAudioCallback(webrtc::AudioTransport* transport) {
 }
 
 int32_t AdmProxy::Init() {
-  // Init is a no-op - Platform ADM is created lazily via AcquirePlatformAdm()
+  // Sub-ADMs are initialized for the lifetime of this factory-owned proxy.
+  // Android initializes its platform ADM on the first acquisition.
   return 0;
 }
 
 int32_t AdmProxy::Terminate() {
-  webrtc::MutexLock lock(&mutex_);
-
-  int32_t result = 0;
-  if (synthetic_adm_) {
-    result = synthetic_adm_->Terminate();
-  }
-  if (platform_adm_) {
-    int32_t platform_result = platform_adm_->Terminate();
-    if (result == 0) result = platform_result;
-  }
-  return result;
+  // The voice engine borrows this proxy. When its last peer connection closes,
+  // it stops playout and recording and detaches its callback before Terminate.
+  // Destroying the sub-ADMs here would leave the next Init with no platform
+  // devices or synthetic audio pump. Their final teardown belongs to ~AdmProxy.
+  return 0;
 }
 
 bool AdmProxy::Initialized() const {
@@ -325,6 +320,11 @@ bool AdmProxy::Initialized() const {
   bool synthetic_init = synthetic_adm_ && synthetic_adm_->Initialized();
   bool platform_init = platform_adm_ && platform_adm_->Initialized();
   return synthetic_init || platform_init;
+}
+
+bool AdmProxy::synthetic_initialized() const {
+  webrtc::MutexLock lock(&mutex_);
+  return synthetic_adm_ && synthetic_adm_->Initialized();
 }
 
 int16_t AdmProxy::PlayoutDevices() {

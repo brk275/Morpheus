@@ -27,6 +27,9 @@ pub mod ffi {
 
         fn audio_device(self: &PeerConnectionFactory) -> SharedPtr<AudioDeviceController>;
 
+        fn initialized(self: &AudioDeviceController) -> bool;
+        fn synthetic_initialized(self: &AudioDeviceController) -> bool;
+
         fn playout_devices(self: &AudioDeviceController) -> i16;
         fn recording_devices(self: &AudioDeviceController) -> i16;
         fn playout_device_name(self: &AudioDeviceController, index: u16) -> String;
@@ -73,16 +76,115 @@ impl_thread_safety!(ffi::AudioDeviceController, Send + Sync);
 
 #[cfg(test)]
 mod tests {
-    use crate::peer_connection_factory::ffi::create_peer_connection_factory;
-    use std::sync::Mutex;
+    use super::SharedPtr;
+    use crate::{
+        candidate::ffi::Candidate,
+        data_channel::ffi::DataChannel,
+        jsep::ffi::IceCandidate,
+        media_stream::ffi::MediaStream,
+        peer_connection::ffi::{
+            ContinualGatheringPolicy, IceConnectionState, IceGatheringState, IceTransportsType,
+            PeerConnectionState, RtcConfiguration, SignalingState,
+        },
+        peer_connection_factory::{
+            ffi::{create_peer_connection_factory, CandidatePairChangeEvent},
+            PeerConnectionObserver, PeerConnectionObserverWrapper,
+        },
+        rtp_receiver::ffi::RtpReceiver,
+        rtp_transceiver::ffi::RtpTransceiver,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct BarePeerObserver {
+        released: Arc<AtomicUsize>,
+    }
+
+    impl Drop for BarePeerObserver {
+        fn drop(&mut self) {
+            self.released.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl PeerConnectionObserver for BarePeerObserver {
+        fn on_signaling_change(&self, _state: SignalingState) {}
+        fn on_add_stream(&self, _stream: SharedPtr<MediaStream>) {}
+        fn on_remove_stream(&self, _stream: SharedPtr<MediaStream>) {}
+        fn on_data_channel(&self, _channel: SharedPtr<DataChannel>) {}
+        fn on_renegotiation_needed(&self) {}
+        fn on_negotiation_needed_event(&self, _event: u32) {}
+        fn on_ice_connection_change(&self, _state: IceConnectionState) {}
+        fn on_standardized_ice_connection_change(&self, _state: IceConnectionState) {}
+        fn on_connection_change(&self, _state: PeerConnectionState) {}
+        fn on_ice_gathering_change(&self, _state: IceGatheringState) {}
+        fn on_ice_candidate(&self, _candidate: SharedPtr<IceCandidate>) {}
+        fn on_ice_candidate_error(
+            &self,
+            _address: String,
+            _port: i32,
+            _url: String,
+            _error_code: i32,
+            _error_text: String,
+        ) {
+        }
+        fn on_ice_candidates_removed(&self, _removed: Vec<SharedPtr<Candidate>>) {}
+        fn on_ice_connection_receiving_change(&self, _receiving: bool) {}
+        fn on_ice_selected_candidate_pair_changed(&self, _event: CandidatePairChangeEvent) {}
+        fn on_add_track(
+            &self,
+            _receiver: SharedPtr<RtpReceiver>,
+            _streams: Vec<SharedPtr<MediaStream>>,
+        ) {
+        }
+        fn on_track(&self, _transceiver: SharedPtr<RtpTransceiver>) {}
+        fn on_remove_track(&self, _receiver: SharedPtr<RtpReceiver>) {}
+        fn on_interesting_usage(&self, _pattern: i32) {}
+    }
 
     #[test]
     fn test_audio_device_controller_bridge() {
         let _guard = TEST_MUTEX.lock().expect("test mutex poisoned");
         let factory = create_peer_connection_factory();
         let audio = factory.audio_device();
+
+        // Synthetic initialization needs no physical device. Do not start audio.
+        assert!(audio.initialized());
+        assert!(audio.synthetic_initialized());
+        let released = Arc::new(AtomicUsize::new(0));
+        for expected_releases in 1..=2 {
+            // Each cycle has exactly one bare PC, no SDP, tracks or ICE servers.
+            // Keep this same factory across both last-PC releases.
+            let peer = factory
+                .create_peer_connection(
+                    RtcConfiguration {
+                        ice_servers: Vec::new(),
+                        continual_gathering_policy: ContinualGatheringPolicy::GatherOnce,
+                        ice_transport_type: IceTransportsType::None,
+                    },
+                    Box::new(PeerConnectionObserverWrapper::new(Arc::new(
+                        BarePeerObserver {
+                            released: Arc::clone(&released),
+                        },
+                    ))),
+                )
+                .expect("bare peer connection creation failed");
+            assert!(!peer.is_null());
+            assert!(audio.initialized());
+            assert!(audio.synthetic_initialized());
+            peer.close();
+            drop(peer);
+            // The C++ PC releases its native PC member before this observer.
+            assert_eq!(released.load(Ordering::Relaxed), expected_releases);
+            assert!(audio.initialized(), "last peer release terminated the ADM");
+            assert!(
+                audio.synthetic_initialized(),
+                "last peer release terminated the synthetic ADM"
+            );
+        }
 
         let recording_count = audio.recording_devices();
         let playout_count = audio.playout_devices();

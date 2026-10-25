@@ -10,8 +10,12 @@ and the nested generated lockfile are omitted. Upstream crate SHA-256:
 ```
 
 Morpheus changes `build.rs`, adds the `sha2` build dependency, and adds
-`pipewire_isolation.rs` plus `pipewire-symbols.txt`. The Rust/C++ transport,
-cryptography, audio, video and capture source remain upstream code.
+`pipewire_isolation.rs` plus `pipewire-symbols.txt`. The wrapper also changes
+native logging in `src/webrtc.cpp`, `include/livekit/webrtc.h`, `src/webrtc.rs`
+and the start of the `KeyProvider` constructor in `src/frame_cryptor.cpp`.
+Audio lifetime and enumeration changes are in `src/adm_proxy.cpp`,
+`include/livekit/adm_proxy.h` and the controller header, C++ and Rust bridge.
+The sections below describe these changes and their verification limits.
 
 ## Prebuilt cache admission
 
@@ -132,3 +136,65 @@ capture run was performed. Hosted build/link/origin/capture evidence remains
 required, as do the separate physical-device and compositor release gates.
 Re-review the archive and remove or adapt this patch when upstream eliminates
 the public stub collision; never broaden the digest check as a fallback.
+
+## Factory audio lifetime across calls
+
+`src/adm_proxy.cpp` keeps its platform and synthetic audio devices initialized
+for the lifetime of the factory-owned proxy. A WebRTC voice engine borrows that
+proxy: it stops recording and playout and detaches its callback before invoking
+`Terminate()`. The proxy's matching `Init()` leaves the already initialized
+devices in place. Final sub-device termination remains in `~AdmProxy()`.
+
+Previously the engine's `Terminate()` destroyed the synthetic audio pump and
+terminated the platform device while `Init()` remained a no-op. Releasing the
+last peer connection could consequently leave the next call silent or return
+negative device counts. The fix preserves audio device selection and mode state
+across calls; it does not retain an idle peer connection or keep capture running.
+See the [upstream lifecycle report](https://github.com/livekit/rust-sdks/issues/1468).
+
+Verification must exercise repeated last-peer destruction with the same factory,
+then actual call recovery and native playback. A successful first call is not
+sufficient evidence for this patch. Physical device and package release checks
+remain separate prerequisites.
+
+The existing controller bridge test checks synthetic initialization directly
+before and after two last-peer releases; the general initialized query retains
+its original synthetic-or-platform meaning. These flags do not prove decoded
+audio or native-thread quiescence. Device enumeration clamps negative native
+errors to zero before higher Rust layers convert counts to unsigned values.
+
+The normalized Cargo manifest omits the unused `env_logger` dev dependency so
+this existing bridge test uses the already locked dependency graph. No source
+references it; the original `Cargo.toml.orig` is preserved for provenance.
+
+## Native log severity boundary
+
+The pinned native archive retains key-derivation log strings, and the observed
+upstream implementation emits such records at INFO. Full source-to-binary
+attribution remains open. The wrapper disables its independent debugger/stderr
+logging route once, before
+any wrapper KeyProvider, runtime or log sink is constructed. Every wrapper log
+sink registers at WARNING and also forwards only WARNING/ERROR records. No
+message-content filter is used, and the existing Rust callback mapping is
+unchanged. This does not remove the underlying native logging instructions or
+prove that a debug-enabled application previously disclosed key material.
+
+The fixed synthetic regression in `src/webrtc.rs` constructs a KeyProvider
+and derives a disposable key before its sink, checks the actual debug setting
+and stream threshold, and exercises both RTC_LOG and the forwarding guard.
+CXX 1.0.203 cannot condition its bridge on cfg(test), so the fixed-message C++
+test shims and private Rust bridge are compiled in ordinary builds; only the
+Rust cfg(test) case calls them. They accept no message/key input, expose no
+external Rust API, and have no production callers. The test does not reset
+global logger state; source ordering covers provider-first construction, while
+a fresh exact test process can additionally observe that order.
+
+Upstream libwebrtc 0.3.38 maps every forwarded native severity to Rust DEBUG;
+this patch preserves that mapping rather than promoting warnings to WARN.
+Other external C++ users could still reset global logger settings or install
+independent sinks; no current Morpheus wrapper/caller exposes such a reset.
+A no-logging native build is not validated by this regression, which requires
+actual WARNING/ERROR callbacks. Existing key algorithms, encryption, TLS trust
+and SIF payload handling are unchanged. Their separate native-source and
+release acceptance requirements remain open. No native code was executed
+during preparation of this source proposal.

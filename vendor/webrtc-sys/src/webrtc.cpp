@@ -20,6 +20,7 @@
 #include <atomic>
 #include <iostream>
 #include <memory>
+#include <mutex>
 
 #include "livekit/audio_track.h"
 #include "livekit/media_stream_track.h"
@@ -41,7 +42,18 @@ static webrtc::Mutex g_mutex{};
 // execution of the first init
 static uint32_t g_release_counter(0);
 
+void ensure_native_log_safety() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    // Some native key derivation sites log key bytes at INFO. Disable the
+    // independent debugger/stderr route before a runtime or provider exists.
+    webrtc::LogMessage::LogToDebug(webrtc::LS_NONE);
+    webrtc::LogMessage::SetLogToStderr(false);
+  });
+}
+
 RtcRuntime::RtcRuntime() {
+  ensure_native_log_safety();
   RTC_LOG(LS_VERBOSE) << "RtcRuntime()";
 
   {
@@ -152,7 +164,8 @@ std::shared_ptr<VideoTrack> RtcRuntime::get_or_create_video_track(
 LogSink::LogSink(
     rust::Fn<void(rust::String message, LoggingSeverity severity)> fnc)
     : fnc_(fnc) {
-  webrtc::LogMessage::AddLogToStream(this, webrtc::LoggingSeverity::LS_VERBOSE);
+  ensure_native_log_safety();
+  webrtc::LogMessage::AddLogToStream(this, webrtc::LS_WARNING);
 }
 
 LogSink::~LogSink() {
@@ -161,12 +174,38 @@ LogSink::~LogSink() {
 
 void LogSink::OnLogMessage(const std::string& message,
                            webrtc::LoggingSeverity severity) {
+  if (severity != webrtc::LS_WARNING && severity != webrtc::LS_ERROR) {
+    return;
+  }
   fnc_(rust::String::lossy(message), static_cast<LoggingSeverity>(severity));
 }
 
 std::unique_ptr<LogSink> new_log_sink(
     rust::Fn<void(rust::String, LoggingSeverity)> fnc) {
   return std::make_unique<LogSink>(fnc);
+}
+
+// Fixed, private Rust-test support. These functions never accept message text
+// or key material and have no application callers.
+bool native_log_policy_for_test_debug_disabled() {
+  return webrtc::LogMessage::GetLogToDebug() == webrtc::LS_NONE;
+}
+
+bool native_log_policy_for_test_sink_is_warning(LogSink& sink) {
+  return webrtc::LogMessage::GetLogToStream(&sink) == webrtc::LS_WARNING;
+}
+
+void native_log_policy_for_test_emit(LogSink& sink) {
+  RTC_LOG(LS_VERBOSE) << "MORPHEUS_NATIVE_LOG_POLICY_native_verbose";
+  RTC_LOG(LS_INFO) << "MORPHEUS_NATIVE_LOG_POLICY_native_info";
+  RTC_LOG(LS_WARNING) << "MORPHEUS_NATIVE_LOG_POLICY_native_warning";
+  RTC_LOG(LS_ERROR) << "MORPHEUS_NATIVE_LOG_POLICY_native_error";
+  // Exercise the forwarding guard independently of stream registration.
+  sink.OnLogMessage("MORPHEUS_NATIVE_LOG_POLICY_direct_verbose", webrtc::LS_VERBOSE);
+  sink.OnLogMessage("MORPHEUS_NATIVE_LOG_POLICY_direct_info", webrtc::LS_INFO);
+  sink.OnLogMessage("MORPHEUS_NATIVE_LOG_POLICY_direct_none", webrtc::LS_NONE);
+  sink.OnLogMessage("MORPHEUS_NATIVE_LOG_POLICY_direct_warning", webrtc::LS_WARNING);
+  sink.OnLogMessage("MORPHEUS_NATIVE_LOG_POLICY_direct_error", webrtc::LS_ERROR);
 }
 
 rust::String create_random_uuid() {

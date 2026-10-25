@@ -495,6 +495,17 @@ jobs:
           cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
           cargo test --locked -p cargo-packager-updater --lib
           cargo test --locked -p webrtc-sys-build --lib
+          webrtc_native_tests=(
+            audio_device_controller::tests::test_audio_device_controller_bridge
+            webrtc::tests::native_log_policy_keeps_warnings_and_errors_without_info_or_debug_fallback
+          )
+          for webrtc_native_test in "${webrtc_native_tests[@]}"; do
+            cargo test --locked -p webrtc-sys --lib "$webrtc_native_test" -- --list --exact > "$RUNNER_TEMP/morpheus-webrtc-native-tests.txt"
+            test "$(grep -Fxc -- "$webrtc_native_test: test" "$RUNNER_TEMP/morpheus-webrtc-native-tests.txt")" = 1
+            cargo test --locked -p webrtc-sys --lib "$webrtc_native_test" -- --exact --test-threads=1 | tee "$RUNNER_TEMP/morpheus-webrtc-native-result.txt"
+            test "$(grep -Fxc -- "test $webrtc_native_test ... ok" "$RUNNER_TEMP/morpheus-webrtc-native-result.txt")" = 1
+            test "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$' "$RUNNER_TEMP/morpheus-webrtc-native-result.txt")" = 1
+          done
           # These exact library cases use synthetic buffers/owners or unnamed
           # kernel events/pipes. Never run CPAL's preserved device hardware tests.
           case "$RUNNER_OS" in

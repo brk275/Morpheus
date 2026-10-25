@@ -25,12 +25,22 @@ AudioDeviceController::AudioDeviceController(
     webrtc::scoped_refptr<AdmProxy> adm_proxy)
     : adm_proxy_(std::move(adm_proxy)) {}
 
+bool AudioDeviceController::initialized() const {
+  return adm_proxy_->Initialized();
+}
+
+bool AudioDeviceController::synthetic_initialized() const {
+  return adm_proxy_->synthetic_initialized();
+}
+
 int16_t AudioDeviceController::playout_devices() const {
-  return adm_proxy_->PlayoutDevices();
+  const int16_t count = adm_proxy_->PlayoutDevices();
+  return count < 0 ? 0 : count;
 }
 
 int16_t AudioDeviceController::recording_devices() const {
-  return adm_proxy_->RecordingDevices();
+  const int16_t count = adm_proxy_->RecordingDevices();
+  return count < 0 ? 0 : count;
 }
 
 rust::String AudioDeviceController::playout_device_name(uint16_t index) const {

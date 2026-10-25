@@ -127,6 +127,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   int32_t Init() override;
   int32_t Terminate() override;
   bool Initialized() const override;
+  // Query the synthetic sub-ADM directly; platform state cannot mask its loss.
+  bool synthetic_initialized() const;
 
   int16_t PlayoutDevices() override;
   int16_t RecordingDevices() override;

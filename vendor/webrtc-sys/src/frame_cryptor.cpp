@@ -103,6 +103,7 @@ KeyDerivationAlgorithmToFrameCryptorKeyDerivationAlgorithm(
 }
 
 KeyProvider::KeyProvider(KeyProviderOptions options) {
+  ensure_native_log_safety();
   webrtc::KeyProviderOptions rtc_options;
   rtc_options.shared_key = options.shared_key;
 

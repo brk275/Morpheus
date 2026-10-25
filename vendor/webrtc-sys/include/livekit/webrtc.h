@@ -40,6 +40,10 @@ class LogSink;
 
 namespace livekit_ffi {
 
+// Shared by every key provider, runtime and log sink, including provider-first
+// construction before a PeerConnectionFactory installs the Rust log sink.
+void ensure_native_log_safety();
+
 class MediaStreamTrack;
 class RtpReceiver;
 class RtpSender;
@@ -112,6 +116,11 @@ class LogSink : public webrtc::LogSink {
 
 std::unique_ptr<LogSink> new_log_sink(
     rust::Fn<void(rust::String, LoggingSeverity)> fnc);
+
+// Private bridge test support: fixed synthetic records and actual logger state.
+bool native_log_policy_for_test_debug_disabled();
+bool native_log_policy_for_test_sink_is_warning(LogSink& sink);
+void native_log_policy_for_test_emit(LogSink& sink);
 
 rust::String create_random_uuid();
 

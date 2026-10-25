@@ -28,7 +28,11 @@ class AudioDeviceController {
  public:
   explicit AudioDeviceController(webrtc::scoped_refptr<AdmProxy> adm_proxy);
 
-  // Device enumeration
+  // Reports ADM lifetime without starting recording or playout.
+  bool initialized() const;
+  bool synthetic_initialized() const;
+
+  // Device enumeration. Negative native errors are exposed as zero devices.
   int16_t playout_devices() const;
   int16_t recording_devices() const;
   rust::String playout_device_name(uint16_t index) const;
