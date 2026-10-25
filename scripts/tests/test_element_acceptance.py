@@ -141,7 +141,7 @@ class EvidenceTests(unittest.TestCase):
                 output = visible.getvalue()
                 self.assertNotIn("opaque", output)
                 self.assertEqual(target.evidence(output),
-                                 {"native_audio": True} if scanner_status == 0 and not join_failure and not service_failure else {})
+                                 {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure else {})
                 self.assertEqual(target.diagnostics(output).get("native_stage"),
                                  "late_login" if scanner_status == 0 and not join_failure and not service_failure else None)
 
