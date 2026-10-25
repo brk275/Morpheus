@@ -297,7 +297,7 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual((result["check_route"], result["matrix_suite"]), ("all", "full"))
 
     def test_manual_routes_are_exact_existing_checks_and_matrix_suites(self):
-        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "devices", "vendor", "sdk",
+        self.assertEqual(MANUAL_CHECKS, {"all", "models", "desktop", "desktop-video", "devices", "vendor", "sdk",
                                         "matrix", "wayland", "config", "helpers"})
         self.assertEqual(MATRIX_SUITES, {"full", "draft-recovery", "drafts-only", "timeline-reads",
                                          "timeline-failures", "media-only", "app-timeline",
@@ -320,6 +320,21 @@ class ScopeTests(unittest.TestCase):
             self.assertEqual(selected["matrix_suite"], suite)
             self.assertEqual(selected["native_matrix"], {"os": ["ubuntu-24.04"]})
             self.assertFalse(selected["wayland"])
+
+    def test_desktop_video_batches_only_affected_checks_on_fixed_native_platforms(self):
+        for platform, platforms in MANUAL_PLATFORMS.items():
+            with self.subTest(platform=platform):
+                selected = event_selection({"inputs": {"platform": platform, "checks": "desktop-video"}},
+                                           "workflow_dispatch")
+                self.assertEqual(selected, {
+                    "native": True, "native_matrix": {"os": list(platforms)}, "config": False,
+                    "wayland": False, "manual": True, "manual_platform": platform,
+                    "check_route": "desktop-video", "matrix_suite": "full",
+                })
+                for suite in MATRIX_SUITES - {"full"}:
+                    with self.subTest(suite=suite), self.assertRaises(ValueError):
+                        event_selection({"inputs": {"platform": platform, "checks": "desktop-video",
+                                                    "matrix_suite": suite}}, "workflow_dispatch")
 
     def test_element_interop_requires_explicit_linux_matrix_selection(self):
         inputs = {"platform": "linux", "checks": "matrix", "matrix_suite": "element-interop"}

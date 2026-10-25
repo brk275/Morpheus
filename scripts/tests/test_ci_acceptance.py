@@ -123,7 +123,10 @@ class AcceptanceTests(unittest.TestCase):
             self.assertIsNotNone(acceptance_error(value,"pull_request"))
             self.assertIsNotNone(acceptance_error(value,"push"))
         for platform, route in (("all","helpers"), ("linux","config"), ("linux","matrix"), ("linux","wayland"),
-                                ("windows","devices"), ("macos-arm","vendor"), ("macos-intel","sdk")):
+                                ("windows","devices"), ("macos-arm","vendor"), ("macos-intel","sdk"),
+                                ("all","desktop-video"), ("linux","desktop-video"),
+                                ("windows","desktop-video"), ("macos-arm","desktop-video"),
+                                ("macos-intel","desktop-video")):
             native = [] if route in {"helpers","config"} else platforms[platform]
             value = snapshot(bool(native),config=route=="config",platforms=native,wayland=route=="wayland")
             value["scope"]["outputs"].update(manual="true",manual_platform=platform,check_route=route)
@@ -280,12 +283,13 @@ class NativeRouteWorkflowTests(unittest.TestCase):
     def test_selected_steps_must_pass_and_unselected_steps_must_be_skipped(self):
         validate = load_native_validator()
         for runner in ("Linux","Windows","macOS"):
-            for route in ("all","models","desktop","devices","vendor","sdk","matrix","wayland"):
+            for route in ("all","models","desktop","desktop-video","devices","vendor","sdk","matrix","wayland"):
                 if route in ("matrix","wayland") and runner!="Linux":
                     continue
                 wayland = "true" if runner=="Linux" and route in ("all","wayland") else "false"
-                selected = {"model-tests":route in ("all","models"), "desktop-tests":route in ("all","desktop"),
+                selected = {"model-tests":route in ("all","models"), "desktop-tests":route in ("all","desktop","desktop-video"),
                             "device-tests":route in ("all","devices"), "vendor-tests":route in ("all","vendor"),
+                            "video-source-tests":route in ("all","vendor","desktop-video"),
                             "sdk-receipt-tests":route in ("all","sdk"),
                             "windows-capture-tests":runner=="Windows" and route in ("all","devices"),
                             "wayland-tests":wayland=="true", "matrix-tests":runner=="Linux" and route in ("all","matrix")}
@@ -318,13 +322,13 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         # the same matrix-wide scope with its Windows-only capture also skipped.
         for runner in ("Windows", "macOS"):
             outcomes = {name: {"outcome": "success"} for name in (
-                "model-tests", "desktop-tests", "device-tests", "vendor-tests", "sdk-receipt-tests")}
+                "model-tests", "desktop-tests", "device-tests", "vendor-tests", "video-source-tests", "sdk-receipt-tests")}
             outcomes.update({name: {"outcome": "skipped"} for name in (
                 "wayland-tests", "matrix-tests", "preview-capture", "preview-upload")})
             outcomes["windows-capture-tests"] = {"outcome": "success" if runner == "Windows" else "skipped"}
             self.assertIsNone(validate("all", runner, project("all", runner, "true"), outcomes))
             self.assertIsNotNone(validate("all", runner, "true", outcomes))
-            for route in ("models", "desktop", "devices", "vendor", "sdk", "matrix", "wayland", "foreign"):
+            for route in ("models", "desktop", "desktop-video", "devices", "vendor", "sdk", "matrix", "wayland", "foreign"):
                 # Only the legitimate whole-matrix route may project true.
                 # Invalid route/global-Wayland pairs must stay fail-closed.
                 self.assertEqual(project(route, runner, "true"), "true")
@@ -345,6 +349,27 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertEqual(ast.dump(projection.args[0]), ast.dump(calls[0].args[0]))
         self.assertEqual(ast.dump(projection.args[1]), ast.dump(calls[0].args[1]))
         self.assertEqual(ast.unparse(projection.args[2]), "os.environ.get('WAYLAND_SELECTED')")
+
+    def test_native_video_step_selects_exact_synthetic_cases_and_is_required(self):
+        source = WORKFLOW.read_text(encoding="utf-8")
+        start = "      - name: Test synthetic native video source ownership\n"
+        end = "      - name: Test pinned SDK sticky receipt and redaction regressions\n"
+        self.assertEqual(source.count(start), 1)
+        step = source.split(start, 1)[1].split(end, 1)[0]
+        self.assertIn("        id: video-source-tests\n", step)
+        self.assertIn("if: (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'vendor' || needs.scope.outputs.check_route == 'desktop-video')", step)
+        cases = (
+            "native::video_source::tests::unused_source_drop_before_first_poll_releases_native_owner",
+            "native::video_source::tests::last_source_clone_drop_while_warmup_pending_releases_native_owner",
+            "native::video_source::tests::first_real_capture_stops_warmup_without_releasing_live_source",
+        )
+        for case in cases:
+            self.assertEqual(source.count(case), 1)
+            self.assertIn(case, step)
+        self.assertIn('cargo test --locked -p libwebrtc --lib "$libwebrtc_source_test" -- --exact --test-threads=1', step)
+        self.assertIn('grep -Fxc -- "test $libwebrtc_source_test ... ok"', step)
+        self.assertIn("VIDEO_SOURCE_OUTCOME: ${{ steps.video-source-tests.outcome }}", source)
+        self.assertIn('("video-source-tests", "VIDEO_SOURCE_OUTCOME")', source)
 
     def test_manual_inputs_and_fixed_routes_keep_existing_security_and_commands(self):
         source=WORKFLOW.read_text(encoding="utf-8")
