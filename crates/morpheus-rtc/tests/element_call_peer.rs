@@ -481,8 +481,9 @@ async fn report_bob_sticky_recovery(
         config::RequestConfig,
         deserialized_responses::{TimelineEventKind, UnableToDecryptReason},
         ruma::{
-            RoomId, api::client::room::get_room_event,
-            events::room::encrypted::OriginalSyncRoomEncryptedEvent,
+            RoomId,
+            api::client::room::get_room_event,
+            events::{TimelineEventType, room::encrypted::OriginalSyncRoomEncryptedEvent},
         },
     };
 
@@ -523,25 +524,21 @@ async fn report_bob_sticky_recovery(
         if original_live.len() > 64 || late_live.len() > 64 {
             return [unavailable; 2];
         }
+        let member_types = [
+            TimelineEventType::from("m.rtc.member"),
+            TimelineEventType::from("org.matrix.msc4143.rtc.member"),
+        ];
         let sources = original_live
             .iter()
             .filter(|event| {
-                event.key.sender.as_str() == bob
-                    && matches!(
-                        event.key.event_type.as_str(),
-                        "m.rtc.member" | "org.matrix.msc4143.rtc.member"
-                    )
+                event.key.sender.as_str() == bob && member_types.contains(&event.key.event_type)
             })
             .take(2)
             .collect::<Vec<_>>();
         let late_count = late_live
             .iter()
             .filter(|event| {
-                event.key.sender.as_str() == bob
-                    && matches!(
-                        event.key.event_type.as_str(),
-                        "m.rtc.member" | "org.matrix.msc4143.rtc.member"
-                    )
+                event.key.sender.as_str() == bob && member_types.contains(&event.key.event_type)
             })
             .take(2)
             .count();
