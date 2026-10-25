@@ -124,7 +124,7 @@ class EvidenceTests(unittest.TestCase):
                 }, clear=True), mock.patch.object(target, "assert_contained"), \
                         mock.patch.object(target, "Runner", return_value=runner), \
                         mock.patch.object(runner, "command", return_value=""), \
-                        mock.patch.object(runner, "service", side_effect=[{"official_image_identity_verified": True},
+                        mock.patch.object(runner, "service", side_effect=[{"official_image_identity_verified": True, "base_url": "http://127.0.0.1:18080"},
                                                                       RuntimeError("fixture_operation") if service_failure else None]), \
                         mock.patch.object(runner, "start", side_effect=[browser, native]), \
                         mock.patch.object(target, "native_executable", return_value=Path("native")), \
