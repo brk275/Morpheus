@@ -53,6 +53,21 @@ fn media_failure(site: &'static str) {
     eprintln!("\nMORPHEUS_RTC_OUTAGE_MEDIA_FAILURE {site}");
 }
 
+// Independent high-water observations, used only to localize a failed deadline.
+// They are never acceptance evidence and contain no identifiers or media values.
+#[derive(Default)]
+struct MediaProgress(u16);
+
+impl MediaProgress {
+    fn seen(&mut self, bit: u32) {
+        self.0 |= 1 << bit;
+    }
+
+    fn report(&self) {
+        eprintln!("\nMORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS mask={:04x}", self.0);
+    }
+}
+
 fn video_push_failure(error: MediaError) {
     let site = match error {
         MediaError::NotJoined => "push_not_joined",
@@ -770,6 +785,7 @@ impl OutageSession {
         self.calls.set_stage_presented(true);
         let roster = self.calls.subscribe_roster();
         let mut sequence = 0u32;
+        let mut progress = MediaProgress::default();
         time::timeout(Duration::from_secs(45), async {
             loop {
                 // Only these retained, current fixture publications receive
@@ -787,9 +803,16 @@ impl OutageSession {
                 sequence = sequence
                     .checked_add(1)
                     .ok_or_else(|| media_failure("sequence_overflow"))?;
+                {
+                    let current = roster.borrow();
+                    if current.token == generation && current.members.len() == self.peers.len() {
+                        progress.seen(12);
+                    }
+                }
                 let snapshot = video.borrow_and_update().clone();
                 if let VideoUpdate::Stage { token, stage } = snapshot {
                     if token == generation && old_presentation != Some(stage.presentation) {
+                        progress.seen(0);
                         let mut matched = HashSet::new();
                         for tile in stage
                             .layout
@@ -797,6 +820,17 @@ impl OutageSession {
                             .iter()
                             .chain(stage.layout.tiles.iter())
                         {
+                            if !tile.is_local && tile.key.medium == TileMedium::Camera {
+                                progress.seen(1);
+                                match tile.state {
+                                    TileState::Connecting => progress.seen(2),
+                                    TileState::Undecryptable => progress.seen(3),
+                                    TileState::Unavailable => progress.seen(4),
+                                    TileState::Live => progress.seen(5),
+                                    TileState::Muted | TileState::Off => progress.seen(13),
+                                    _ => {}
+                                }
+                            }
                             if tile.is_local
                                 || tile.key.medium != TileMedium::Camera
                                 || tile.state != TileState::Live
@@ -818,6 +852,7 @@ impl OutageSession {
                                 if tile.user_id == account.user_id
                                     && tile.key.member_id == info.membership_id
                                 {
+                                    progress.seen(6);
                                     // Visibility is applied asynchronously. The retained
                                     // hidden-stage snapshot can have a subscribed live
                                     // track before its decoder has a frame slot.
@@ -828,10 +863,13 @@ impl OutageSession {
                                         .frames
                                         .get(frame_slot)
                                         .ok_or_else(|| media_failure("frame_slot_invalid"))?;
+                                    progress.seen(7);
                                     if slot.epoch == 0 || slot.sequence == 0 {
                                         continue;
                                     }
+                                    progress.seen(8);
                                     if let Some(pixels) = &slot.pixels {
+                                        progress.seen(9);
                                         let width = pixels.width();
                                         let height = pixels.height();
                                         if !(160..=320).contains(&width)
@@ -840,6 +878,7 @@ impl OutageSession {
                                         {
                                             continue;
                                         }
+                                        progress.seen(10);
                                         let pixel = &pixels.as_slice()
                                             [(height / 2 * width + width / 2) as usize];
                                         // Widely separated epochs survive VP8 conversion/scaling.
@@ -857,6 +896,7 @@ impl OutageSession {
                             }
                         }
                         if matched.len() == self.peers.len() - 1 {
+                            progress.seen(11);
                             let update = roster.borrow().clone();
                             let own = match self.calls.subscribe_status().borrow().clone() {
                                 CallStatus::Joined { call, .. } => Some(call),
@@ -887,6 +927,10 @@ impl OutageSession {
                                         )
                                     })
                             });
+                            progress.seen(14);
+                            if !complete {
+                                progress.seen(15);
+                            }
                             if complete {
                                 require(case.dm == (matched.len() == 1))
                                     .map_err(|()| media_failure("participant_count"))?;
@@ -901,7 +945,10 @@ impl OutageSession {
             }
         })
         .await
-        .map_err(|_| media_failure("deadline"))?
+        .map_err(|_| {
+            progress.report();
+            media_failure("deadline");
+        })?
     }
 
     async fn key_receipts(

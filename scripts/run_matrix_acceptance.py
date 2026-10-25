@@ -300,6 +300,15 @@ OUTAGE_MEDIA_FAILURE_SITES = frozenset((
 OUTAGE_MEDIA_FAILURE = re.compile(r"^MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE ([a-z_]+)$", re.MULTILINE)
 
 
+OUTAGE_MEDIA_PROGRESS_FIELDS = (
+    "stage_seen", "remote_camera_seen", "connecting_seen", "undecryptable_seen",
+    "unavailable_seen", "live_seen", "identity_match_seen", "frame_slot_seen",
+    "decoded_frame_seen", "pixel_buffer_seen", "dimensions_match_seen", "all_colors_match_seen",
+    "roster_shape_match_seen", "muted_or_off_seen", "roster_identity_checked", "roster_identity_incomplete",
+)
+OUTAGE_MEDIA_PROGRESS = re.compile(r"^MORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS mask=([0-9a-f]{4})$", re.MULTILINE)
+
+
 def outage_evidence(output: str, target: str) -> dict[str, bool]:
     if target not in OUTAGE_TARGET:
         raise RuntimeError("Invalid owned SFU outage target")
@@ -343,6 +352,16 @@ def outage_diagnostics(output: str) -> dict:
         match = OUTAGE_MEDIA_FAILURE.fullmatch(media_lines[0])
         result["media_failure"] = (match[1] if len(media_lines) == 1 and match is not None
                                    and match[1] in OUTAGE_MEDIA_FAILURE_SITES else "invalid")
+    progress_lines = [line for line in output.splitlines()
+                      if line.startswith("MORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS")]
+    if progress_lines:
+        match = OUTAGE_MEDIA_PROGRESS.fullmatch(progress_lines[0])
+        if len(progress_lines) == 1 and match is not None:
+            mask = int(match[1], 16)
+            result["media_progress"] = {name: bool(mask & (1 << bit))
+                                        for bit, name in enumerate(OUTAGE_MEDIA_PROGRESS_FIELDS)}
+        else:
+            result["media_progress"] = "invalid"
     checks = {name: value == "true" for name, value in OUTAGE_CHECK.findall(output)
               if name in OUTAGE_CHECKS or name in OUTAGE_TARGET.values()}
     if checks:

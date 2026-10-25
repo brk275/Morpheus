@@ -2497,6 +2497,7 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                        output + "MORPHEUS_RTC_OUTAGE_STAGE private_payload\n",
                        output + "MORPHEUS_RTC_OUTAGE_FAILURE outcome=error call=joined\n",
                        output + "MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE push_transport\n",
+                       output + "MORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS mask=ffff\n",
                        "Skipped live fixture\n" + output, self.output("room" if target == "dm" else "dm")]
             for name in expected:
                 marker = f"MORPHEUS_RTC_OUTAGE_CHECK {name}=true"
@@ -2530,6 +2531,16 @@ class OwnedSfuRecoveryTests(unittest.TestCase):
                     marker.replace("push_transport", "private_payload"), marker.rstrip() + " private_payload\n",
                     "MORPHEUS_RTC_OUTAGE_MEDIA_FAILURE\n"):
             self.assertEqual(acceptance_module.outage_diagnostics(raw), {"media_failure": "invalid"})
+        for mask in (0, 1, 0x1000, 0xffff):
+            marker = f"MORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS mask={mask:04x}\n"
+            expected = {name: bool(mask & (1 << bit))
+                        for bit, name in enumerate(acceptance_module.OUTAGE_MEDIA_PROGRESS_FIELDS)}
+            self.assertEqual(acceptance_module.outage_diagnostics(marker), {"media_progress": expected})
+        marker = "MORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS mask=0001\n"
+        for raw in (marker + marker, marker.rstrip() + " private_payload\n",
+                    marker.replace("0001", "10000"), marker.replace("0001", "FFFF"),
+                    marker.replace("0001", "private_payload"), "MORPHEUS_RTC_OUTAGE_MEDIA_PROGRESS\n"):
+            self.assertEqual(acceptance_module.outage_diagnostics(raw), {"media_progress": "invalid"})
         self.assertEqual(acceptance_module.outage_diagnostics("private server text\n"), {})
         self.assertEqual(acceptance_module.outage_diagnostics("MORPHEUS_RTC_OUTAGE_STAGE cleanup\n"),
                          {"cleanup_started": True})
