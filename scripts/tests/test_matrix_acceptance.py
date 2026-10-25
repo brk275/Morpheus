@@ -3507,6 +3507,41 @@ class ScopedContinuationTests(unittest.TestCase):
                     runner.run(label, ["test"], pid_namespace=True, **extra)
                 self.assertNotIsInstance(caught.exception, acceptance_module.CheckFailure)
 
+    def test_element_infrastructure_phase_is_closed_and_outer_scan_gated(self):
+        private = "private child payload"
+        for failure in ("fixture_operation", "log_scan"):
+            for phase in ("native_test_build", "native_test", "unrecognized_phase"):
+                for scanner_code, cleanup_error in ((0, None), (1, None), (0, RuntimeError(private))):
+                    with self.subTest(failure=failure, phase=phase, scanner=scanner_code,
+                                      cleanup=cleanup_error is not None), tempfile.TemporaryDirectory() as folder:
+                        runner = Acceptance(Path(folder), "scanner")
+                        output = (private * 512 + "\n" + f"MORPHEUS_ELEMENT_STAGE {phase}\n"
+                                  f"MORPHEUS_ELEMENT_FAILURE {failure}\n"
+                                  "MORPHEUS_ELEMENT_NATIVE_STAGE group_roster\n"
+                                  "MORPHEUS_ELEMENT_CHECK browser_identity=true\n" + private + "\n")
+                        with self.contained_child(runner, output, scanner_code=scanner_code,
+                                                  cleanup_error=cleanup_error) as (visible, _, _, _, _, scan):
+                            with self.assertRaises(RuntimeError) as caught:
+                                runner.run(acceptance_module.ELEMENT_LABEL, ["test"],
+                                           element_checks=True, pid_namespace=True)
+                        self.assertNotIsInstance(caught.exception, acceptance_module.CheckFailure)
+                        rendered = visible.getvalue()
+                        self.assertNotIn(private, rendered + str(caught.exception))
+                        self.assertNotIn("native_stage", rendered)
+                        self.assertNotIn("browser_identity", rendered)
+                        records = [json.loads(line) for line in rendered.splitlines()
+                                   if line.startswith("{")]
+                        if scanner_code or cleanup_error:
+                            self.assertEqual(records, [])
+                        else:
+                            detail = {"failure": failure}
+                            if phase != "unrecognized_phase":
+                                detail["stage"] = phase
+                            self.assertEqual(records, [{"check": acceptance_module.ELEMENT_LABEL,
+                                                        "element_infrastructure": detail}])
+                        if cleanup_error:
+                            scan.assert_not_called()
+
     def test_element_setup_deadline_is_fatal_and_only_actual_peer_stages_are_collectible(self):
         from run_element_acceptance import STAGES
         self.assertIn("browser_receive_audio", acceptance_module.ELEMENT_TEST_STAGES)

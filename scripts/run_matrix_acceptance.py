@@ -1301,7 +1301,15 @@ class Acceptance:
         # cleanup ownership. Namespace errors are always infrastructure faults.
         if pid_namespace and "Element process containment failed; raw diagnostics withheld" in output:
             raise RuntimeError("Acceptance process containment failed")
-        if element_checks and re.search(r"^MORPHEUS_ELEMENT_FAILURE (?:log_scan|fixture_operation)$", output, re.MULTILINE):
+        if element_checks and (element_failure := re.search(
+                r"^MORPHEUS_ELEMENT_FAILURE (log_scan|fixture_operation)$", output, re.MULTILINE)):
+            # Inner scan/ownership failures remain fatal. Only the fixed phase
+            # and failure category may escape, after this outer group's actual
+            # teardown and independent scan; native facts/logs stay withheld.
+            detail = {"failure": element_failure[1]}
+            if stage := element_diagnostics(output[-4096:], include_native=False).get("stage"):
+                detail["stage"] = stage
+            print(json.dumps({"check": label, "element_infrastructure": detail}), flush=True)
             raise RuntimeError("Element acceptance infrastructure or cleanup failed")
         if ring_case is not None and (ring_evidence(output).get("cleanup") is False
                                      or ring_diagnostics(output).get("failure") == "cleanup"
