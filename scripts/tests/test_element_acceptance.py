@@ -80,6 +80,38 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.native_stages(output), ("invalid",))
                 self.assertEqual(target.diagnostics(output), {"native_stage": "invalid"})
 
+    def test_native_group_roster_diagnostics_are_two_ordered_fixed_records(self):
+        stages = "\n".join(target.NATIVE_STAGE_PREFIX + value for value in target.NATIVE_STAGES) + "\n"
+        original = target.GROUP_ROSTER_PREFIX + (
+            "side=original total=three alice=one bob=one carol=one other=zero local_owner=one"
+        )
+        late = target.GROUP_ROSTER_PREFIX + (
+            "side=late total=two alice=one bob=zero carol=one other=zero local_owner=one"
+        )
+        pair = original + "\n" + late
+        self.assertEqual(target.native_group_rosters(stages + pair), (original, late))
+        self.assertEqual(target.diagnostics(stages + pair)["native_group_roster"],
+                         "; ".join(line.removeprefix(target.GROUP_ROSTER_PREFIX) for line in (original, late)))
+        self.assertNotIn("native_group_roster", target.diagnostics(stages + pair, include_native=False))
+        self.assertEqual(target.evidence(stages + pair), {})
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(stages + pair, complete=True)
+        unavailable = target.GROUP_ROSTER_PREFIX + (
+            "side=late total=unavailable alice=zero bob=zero carol=zero other=zero local_owner=zero"
+        )
+        duplicate = late.replace("total=two", "total=more").replace("bob=zero", "bob=many")
+        for record in (unavailable, duplicate):
+            self.assertEqual(target.native_group_rosters(stages + original + "\n" + record), (original, record))
+        self.assertEqual(target.native_group_rosters("ordinary private text"), ())
+        for malformed in (original, late, late + "\n" + original, pair + "\n" + late,
+                          original + "\n" + late.replace("bob=zero", "bob=opaque_secret"),
+                          original + "\n" + late + " trailing", original + "\n" + late + "x" * 161,
+                          original + "\n" + unavailable.replace("bob=zero", "bob=one")):
+            with self.subTest(malformed=malformed):
+                self.assertEqual(target.native_group_rosters(stages + malformed), ("invalid",))
+                self.assertEqual(target.diagnostics(stages + malformed)["native_group_roster"], "invalid")
+        self.assertEqual(target.native_group_rosters(pair), ("invalid",))
+
     def test_native_failure_facts_follow_owned_cleanup_and_successful_scan(self):
         for scanner_status, join_failure, service_failure in ((0, False, False), (1, False, False),
                                                             (0, True, False), (0, False, True)):
@@ -93,8 +125,9 @@ class EvidenceTests(unittest.TestCase):
                 runner = target.Runner(root, "scanner")
                 native = self.anchored_log(runner, "native.log", (
                     "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
-                    + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
-                    + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
+                    + "".join(target.NATIVE_STAGE_PREFIX + value + "\n" for value in target.NATIVE_STAGES)
+                    + target.GROUP_ROSTER_PREFIX + "side=original total=three alice=one bob=one carol=one other=zero local_owner=one\n"
+                    + target.GROUP_ROSTER_PREFIX + "side=late total=two alice=one bob=zero carol=one other=zero local_owner=one\n").encode())
                 browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
                 native.joined = browser.joined = False
                 native.status = mock.Mock(return_value=1)
@@ -143,7 +176,9 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.evidence(output),
                                  {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure else {})
                 self.assertEqual(target.diagnostics(output).get("native_stage"),
-                                 "late_login" if scanner_status == 0 and not join_failure and not service_failure else None)
+                                 "group_roster" if scanner_status == 0 and not join_failure and not service_failure else None)
+                self.assertEqual("native_group_roster" in target.diagnostics(output),
+                                 scanner_status == 0 and not join_failure and not service_failure)
 
     @staticmethod
     def anchored_log(runner, name, data):

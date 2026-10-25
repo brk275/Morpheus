@@ -401,6 +401,63 @@ fn exact_roster(rtc: &RtcService, room: &str, users: &[&str]) -> bool {
     actual == expected
 }
 
+// Failure diagnostics only: fixed role multiplicities never replace the
+// original exact-three-user roster assertion or establish a cause.
+fn report_group_roster(
+    side: &'static str,
+    rtc: &RtcService,
+    room: &str,
+    alice: &str,
+    bob: &str,
+    carol: &str,
+    local_user: &str,
+) {
+    let Ok(members) = rtc.participants(room) else {
+        eprintln!(
+            "MORPHEUS_ELEMENT_GROUP_ROSTER side={side} total=unavailable alice=zero bob=zero carol=zero other=zero local_owner=zero"
+        );
+        return;
+    };
+    let bucket = |count| match count {
+        0 => "zero",
+        1 => "one",
+        _ => "many",
+    };
+    let role = |user: &str| {
+        bucket(
+            members
+                .iter()
+                .filter(|member| member.user_id == user)
+                .count(),
+        )
+    };
+    let total = match members.len() {
+        0 => "zero",
+        1 => "one",
+        2 => "two",
+        3 => "three",
+        _ => "more",
+    };
+    let other = bucket(
+        members
+            .iter()
+            .filter(|member| ![alice, bob, carol].contains(&member.user_id.as_str()))
+            .count(),
+    );
+    let local_owner = bucket(
+        members
+            .iter()
+            .filter(|member| member.is_local && member.user_id == local_user)
+            .count(),
+    );
+    eprintln!(
+        "MORPHEUS_ELEMENT_GROUP_ROSTER side={side} total={total} alice={} bob={} carol={} other={other} local_owner={local_owner}",
+        role(alice),
+        role(bob),
+        role(carol),
+    );
+}
+
 async fn group_and_screen(
     rtc: &mut RtcService,
     root: &std::path::Path,
@@ -473,15 +530,35 @@ async fn group_and_screen(
         .await
         .expect("Late-peer join failed");
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE group_roster");
-    timeout(Duration::from_secs(90), async {
+    let group_roster = timeout(Duration::from_secs(90), async {
         while !exact_roster(rtc, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
             || !exact_roster(&late, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
         {
             sleep(Duration::from_millis(200)).await;
         }
     })
-    .await
-    .expect("Three-member native rosters did not converge");
+    .await;
+    if group_roster.is_err() {
+        report_group_roster(
+            "original",
+            rtc,
+            room,
+            &alice.user_id,
+            &bob.user_id,
+            &carol.user_id,
+            &alice.user_id,
+        );
+        report_group_roster(
+            "late",
+            &late,
+            room,
+            &alice.user_id,
+            &bob.user_id,
+            &carol.user_id,
+            &carol.user_id,
+        );
+    }
+    group_roster.expect("Three-member native rosters did not converge");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_group_roster=true");
 
     // A newly created device must actually decrypt the already-running sender,
