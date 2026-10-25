@@ -267,6 +267,7 @@ OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
 OUTAGE_TEST = "outgoing_ring::live_tests::outage_tests::current_call_recovers_from_owned_sfu_restart"
 OUTAGE_LABELS = ("rtc-recovery-current-dm", "rtc-recovery-current-room")
 OUTAGE_HELPER_TESTS = (
+    ("rtc-recovery-stage-readiness", "video_render::tests::hidden_stage_pauses_every_remote_stream_and_drops_pictures"),
     ("rtc-recovery-audio-spectrum", "outgoing_ring::live_tests::alsa_playback::tests::group_oracle_requires_both_distinct_new_tones_and_refuses_old_or_silent_audio"),
     ("rtc-recovery-audio-checkpoint", "outgoing_ring::live_tests::alsa_playback::tests::checkpoint_retires_old_windows_and_reassembles_partial_stereo_frames"),
     ("rtc-recovery-audio-library-path", "outgoing_ring::live_tests::alsa_playback::loaded::tests::malformed_ambiguous_and_foreign_loaded_objects_are_refused"),

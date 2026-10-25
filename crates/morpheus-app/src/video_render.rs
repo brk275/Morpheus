@@ -1556,6 +1556,16 @@ mod tests {
 
         stage.request(&StageRequest::default());
         stage.replan();
+        // A hidden subscribed track remains live without a decoder slot. A
+        // receiver may still hold this snapshot when visibility is requested.
+        let hidden_camera = stage
+            .layout
+            .tiles
+            .iter()
+            .find(|tile| tile.key == camera("bob"))
+            .unwrap();
+        assert_eq!(hidden_camera.state, TileState::Live);
+        assert_eq!(hidden_camera.frame_slot, None);
         assert!(!stage.presenter.decoding());
         assert!(
             stage
@@ -1569,6 +1579,27 @@ mod tests {
             Some(paused())
         );
         assert_eq!(stage.media.last_constraint(&camera("bob")), Some(paused()));
+
+        stage.request(&StageRequest {
+            presented: true,
+            ..StageRequest::default()
+        });
+        stage.replan();
+        let visible_camera = stage
+            .layout
+            .tiles
+            .iter()
+            .find(|tile| tile.key == camera("bob"))
+            .unwrap();
+        assert_eq!(visible_camera.state, TileState::Live);
+        let visible_slot = visible_camera.frame_slot.unwrap();
+        assert_ne!(stage.presenter.frames[visible_slot].epoch, 0);
+        assert_eq!(stage.presenter.frames[visible_slot].sequence, 0);
+        assert!(stage.presenter.frames[visible_slot].pixels.is_none());
+        assert_eq!(
+            stage.media.last_constraint(&camera("bob")),
+            Some(sized(FILMSTRIP_SIZE))
+        );
     }
 
     #[test]

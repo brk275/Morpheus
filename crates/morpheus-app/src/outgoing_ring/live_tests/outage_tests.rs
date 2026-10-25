@@ -783,8 +783,13 @@ impl OutageSession {
                                 if tile.user_id == account.user_id
                                     && tile.key.member_id == info.membership_id
                                 {
-                                    let slot =
-                                        stage.frames.get(tile.frame_slot.ok_or(())?).ok_or(())?;
+                                    // Visibility is applied asynchronously. The retained
+                                    // hidden-stage snapshot can have a subscribed live
+                                    // track before its decoder has a frame slot.
+                                    let Some(frame_slot) = tile.frame_slot else {
+                                        continue;
+                                    };
+                                    let slot = stage.frames.get(frame_slot).ok_or(())?;
                                     if slot.epoch == 0 || slot.sequence == 0 {
                                         continue;
                                     }
