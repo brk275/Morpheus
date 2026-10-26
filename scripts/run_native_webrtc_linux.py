@@ -134,12 +134,64 @@ def module(name, expected=None):
     return value
 
 
+# These are code-owned phases from the exact pinned helpers, never manifest or argv values.
+_TOOL_PHASES = frozenset({"admission", "receipt"} | {
+    prefix + name for prefix in ("download_", "stage_")
+    for name in ("gn", "ninja", "clang", "rust", "sysroot-amd64", "sysroot-i386", "llvmobjdump")
+})
+_HELPER_PHASES = {
+    "linux_stager.py": _TOOL_PHASES,
+    "python_stager.py": _TOOL_PHASES | {"stage_python_data"},
+    "instrumented_stager.py": _TOOL_PHASES | {
+        prefix + name for prefix in ("download_", "stage_")
+        for name in ("msan-chained-origins-noble-lib", "msan-no-origins-noble-lib")
+    },
+}
+
+
+def helper_failure_context(value, error):
+    helper, phase, lines = "unknown", "unknown", []
+    if type(value) is types.ModuleType:
+        namespace = value.__dict__
+        for name in HELPERS:
+            module_name = "morpheus_recipe_" + name.replace(".", "_")
+            path = str(Path(__file__).resolve().parent / "native_webrtc" / name)
+            if (namespace.get("__name__") == module_name and sys.modules.get(module_name) is value
+                    and namespace.get("__file__") == path):
+                helper = name
+                selected = namespace.get("PHASE")
+                if type(selected) is str and selected in _HELPER_PHASES.get(name, ()):
+                    phase = selected
+                frame = error.__traceback__
+                # Only fixed helper frames: no traceback formatting, filenames, function names or locals.
+                for _ in range(64):
+                    if frame is None:
+                        break
+                    if (frame.tb_frame.f_globals is namespace and frame.tb_frame.f_code.co_filename == path
+                            and type(frame.tb_lineno) is int and 0 < frame.tb_lineno <= 99999):
+                        lines = (lines + [frame.tb_lineno])[-3:]
+                    frame = frame.tb_next
+                if frame is not None:
+                    lines = []
+                break
+    return {"helper": helper, "phase": phase, "lines": lines}
+
+
 def cli(value, argv):
     original = sys.argv
     sys.argv = [value.__file__, *argv]
     try:
         result = value.main()
         need(result in (None, 0))
+    except BaseException as error:
+        # Imported main() bypasses the helper's __main__ closed error handler.
+        # Emit bounded code context only, then preserve the original failure and traceback.
+        try:
+            print("MORPHEUS_NATIVE_HELPER_FAILED " + json.dumps(
+                helper_failure_context(value, error), sort_keys=True, separators=(",", ":")), file=sys.stderr)
+        except BaseException:
+            pass  # Diagnostic output must never replace the original helper failure.
+        raise
     finally:
         sys.argv = original
 

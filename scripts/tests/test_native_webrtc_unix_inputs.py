@@ -1,6 +1,8 @@
 """Input traversal regressions for the native Unix builder; synthetic files only."""
 from pathlib import Path
 import hashlib
+import io
+import json
 import importlib.util
 import os
 import sys
@@ -157,6 +159,50 @@ _PIPELINE_SPEC = importlib.util.spec_from_file_location("morpheus_native_cache_t
 assert _PIPELINE_SPEC is not None and _PIPELINE_SPEC.loader is not None
 _PIPELINE = importlib.util.module_from_spec(_PIPELINE_SPEC)
 _PIPELINE_SPEC.loader.exec_module(_PIPELINE)
+
+
+class NativeLinuxStageConsumerTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA profiles")
+    def test_actual_selected_linux_profile_passes_the_actual_stager_consumer(self):
+        # Read the actual checked-in cohort and invoke only its DATA validator.
+        # No archives, network, subprocess, staged executable, admission or build is involved.
+        profile = _SCRIPT.parents[1] / "native/webrtc/linux/selected-linux-build-inputs.json"
+        helper = _PIPELINE.module("linux_stager.py")
+        manifest = helper.decode(profile.read_bytes())
+        materials = helper.linux_inputs_validate(manifest, "Linuxx64")
+        self.assertEqual([row["name"] for row in materials],
+                         ["rust", "sysroot-amd64", "sysroot-i386", "llvmobjdump"])
+        self.assertIs(materials, manifest["materials"])
+
+    def test_imported_helper_failure_exposes_only_closed_context_and_reraises(self):
+        helper = _PIPELINE.module("linux_stager.py")
+        original = sys.argv
+        error = ValueError("PRIVATE token=https://private.invalid/?credential=SECRET /private/owner")
+        helper.__dict__["synthetic_error"] = error
+        # A reviewed synthetic function whose filename/globals match the actual fixed helper.
+        exec(compile("def main():\n    raise synthetic_error\n", helper.__file__, "exec"), helper.__dict__)
+        for phase, expected in (("admission", "admission"),
+                                ("download_rust", "download_rust"),
+                                ("PRIVATE/SECRET", "unknown")):
+            with self.subTest(phase=expected):
+                helper.PHASE = phase
+                output = io.StringIO()
+                with mock.patch.object(_PIPELINE.sys, "stderr", output):
+                    with self.assertRaises(ValueError) as caught:
+                        _PIPELINE.cli(helper, ["PRIVATE_ARG=SECRET"])
+                self.assertIs(caught.exception, error)
+                self.assertIs(sys.argv, original)
+                raw = output.getvalue()
+                self.assertLess(len(raw), 256)
+                self.assertEqual(raw.split(" ", 1)[0], "MORPHEUS_NATIVE_HELPER_FAILED")
+                context = json.loads(raw.split(" ", 1)[1])
+                self.assertEqual(context, {"helper": "linux_stager.py", "phase": expected, "lines": [2]})
+                for private in ("PRIVATE", "SECRET", "private.invalid", "/private/owner", "ValueError"):
+                    self.assertNotIn(private, raw)
+                # The same failure cannot attribute its lines to an unregistered/renamed module.
+                with mock.patch.dict(helper.__dict__, {"__name__": "unreviewed_module"}):
+                    self.assertEqual(_PIPELINE.helper_failure_context(helper, error),
+                                     {"helper": "unknown", "phase": "unknown", "lines": []})
 
 
 class NativeCacheDataBoundaryTests(unittest.TestCase):
