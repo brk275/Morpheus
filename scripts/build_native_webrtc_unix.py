@@ -18,9 +18,7 @@ import os
 from pathlib import Path, PurePosixPath
 import platform
 import re
-import signal
 import stat
-import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -125,6 +123,8 @@ GATES = {"source", "deps-hooks", "toolchain-rust", "patches", "native-test-sourc
          "license-material", "license-gn-resolution", "wrapper-abi", "symbol-prefix",
          "generated-metadata"}
 HEX = re.compile(r"[0-9a-f]{64}\Z")
+MAC_MATERIAL_HELPER_SHA = "8a2f35fbf33b0d0121a496acb620db9a61cf47b953ea01fcf6ce3f7944e32f3c"
+COMMAND_PROCESS_HELPER_SHA = "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b"
 MAX_LOG = 256 * 1024 * 1024
 MAX_INVENTORY = 128 * 1024 * 1024
 MAX_FILES = 1_000_000
@@ -369,17 +369,19 @@ class Build:
         require(self.work.is_absolute() and not self.work.exists()
                 and self.work.parent.resolve(strict=True).is_relative_to(temp))
         self.m = bound_json(Path(args.admission), args.admission_sha256)
-        require(self.m["schema"] == (5 if host == "Linux" else 2)
+        require(self.m["schema"] == (5 if host == "Linux" else 6)
                 and self.m["target"] == args.target)
         require(("python_runtime" in self.m) is (host == "Linux")
                 and ("instrumented_data" in self.m) is (host == "Linux")
-                and ("linux_materials" in self.m) is (host == "Linux"))
+                and ("linux_materials" in self.m) is (host == "Linux")
+                and ("mac_materials" in self.m) is (host == "Darwin")
+                and ("mac_host" in self.m) is (host == "Darwin"))
         require(self.m["recipe_sha256"] == digest(Path(__file__).resolve()))
         require(self.m["source_revision"] == SOURCE_REV and self.m["source_tree"] == SOURCE_TREE
                 and self.m["sdk_revision"] == SDK_REV
                 and self.m["depot_revision"] == DEPOT_REV and self.m["depot_tree"] == DEPOT_TREE)
         require(set(self.m["gates"]) == GATES | (
-            {"python-runtime", "instrumented-data"} if host == "Linux" else set()))
+            {"python-runtime", "instrumented-data"} if host == "Linux" else {"mac-python-runtime", "mac-host-sdk"}))
         for gate_name, gate in self.m["gates"].items():
             receipt = bound_json(Path(gate["path"]), gate["sha256"])
             require(receipt["status"] == "approved-for-isolated-native-build"
@@ -409,6 +411,10 @@ class Build:
                         and receipt["linux_materials_sha256"] == self.m["linux_materials"]["linux_materials"]["sha256"]
                         and receipt["core_materials_sha256"] == self.m["linux_materials"]["core_materials"]["sha256"]
                         and receipt["source_overlay_sha256"] == self.m["source_provision"]["source_overlay"]["sha256"])
+            if gate_name in {"mac-python-runtime", "mac-host-sdk"}:
+                require(receipt["mac_material_plan_sha256"] == self.m["mac_materials"]["plan"]["sha256"]
+                        and receipt["mac_host_binding_sha256"] == self.m["mac_host"]["sha256"]
+                        and receipt["mac_material_helper_sha256"] == MAC_MATERIAL_HELPER_SHA)
             if gate_name in {"patches", "native-test-source"}:
                 require(receipt["native_security_binding_sha256"]
                         == self.m["native_security"]["sha256"])
@@ -420,14 +426,19 @@ class Build:
             self.roots[name] = root
         require({"source", "depot", "tools", "sdk", "reference", "provenance"} <= set(self.roots))
         require(("python-data" in self.roots) is (host == "Linux")
-                and ("instrumented-data" in self.roots) is (host == "Linux"))
+                and ("instrumented-data" in self.roots) is (host == "Linux")
+                and ("mac-data" in self.roots) is (host == "Darwin"))
         require(all(not self.work.is_relative_to(root) for root in self.roots.values()))
+        self.target = args.target
+        self.host_tools = {}
+        if host == "Darwin":
+            self.validate_mac_host()
         self.src = self.roots["source"]
         self.tools = self.m["tools"]
         roles = {"git", "python", "vpython3", "gn", "ninja", "llvm-ar",
                  "llvm-objcopy", "clang++", "rustc", "cargo", "license-gn"}
-        require(set(self.tools) == roles | ({"cipd"} if host == "Linux" else set()))
-        for role in roles:
+        require(set(self.tools) == roles | {"cipd"})
+        for role in roles | {"cipd"}:
             t = self.tools[role]
             path = self.item(t)
             require(os.access(path, os.X_OK) and digest(path) == t["sha256"])
@@ -438,8 +449,7 @@ class Build:
         launchers = {"python3": "python", "vpython3": "vpython3", "gn": "gn",
                      "ninja": "ninja", "git": "git", "rustc": "rustc",
                      "cargo": "cargo", "clang++": "clang++"}
-        if host == "Linux":
-            launchers["cipd"] = "cipd"
+        launchers["cipd"] = "cipd"
         for name, role in launchers.items():
             (self.work / "bin" / name).symlink_to(self.item(self.tools[role]))
         self.env = {
@@ -468,10 +478,16 @@ class Build:
             self.validate_python_materials()
             self.validate_instrumented_materials()
             self.validate_linux_materials()
+        else:
+            self.validate_mac_materials()
         self.validate_source_export()
         self.validate_patches()
 
     def item(self, row):
+        if set(row) == {"host", "sha256"}:
+            require(self.target in ("mac-arm64", "mac-x64") and row["host"] == "git"
+                    and row["sha256"] == self.host_tools["git"]["sha256"])
+            return Path(self.host_tools["git"]["path"])
         root = self.roots[row["root"]]
         path = root / str(rel(row["path"]))
         resolved = path.resolve(strict=True)
@@ -483,31 +499,205 @@ class Build:
 
     def command(self, label, argv, timeout, cwd=None):
         require(re.fullmatch(r"[a-z0-9-]{1,64}", label) is not None)
+        if self.target in ("mac-arm64", "mac-x64"):
+            self.verify_mac_host()
+        # Keep one process owner for the complete build. An unproved cleanup
+        # leaves its retained authority fatal for every later command.
+        runner = getattr(self, "_native_command_runner", None)
+        if runner is None:
+            runner = self.native_module("git_source_stager.py", COMMAND_PROCESS_HELPER_SHA)
+            self._native_command_runner = runner
+        require(os.name == "posix" and runner.MAX_METADATA == MAX_LOG)
         log = self.work / "logs" / (label + ".log")
+        stdout = self.work / "logs" / (label + ".capture.stdout")
+        stderr = self.work / "logs" / (label + ".capture.stderr")
+        # Refuse a repeated label before executing anything. All three files
+        # are private, exclusive outputs; only the owned pipe readers write
+        # capture files, within one shared pre-write MAX_LOG budget.
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        proc = None
-        try:
-            proc = subprocess.Popen(argv, cwd=cwd or self.src, env=self.env,
-                                    stdin=subprocess.DEVNULL, stdout=fd,
-                                    stderr=subprocess.STDOUT, start_new_session=True)
-            deadline = time.monotonic() + timeout
-            while proc.poll() is None:
-                require(os.fstat(fd).st_size <= MAX_LOG and time.monotonic() < deadline)
-                time.sleep(0.2)
-            require(proc.wait() == 0 and os.fstat(fd).st_size <= MAX_LOG)
-        finally:
-            try:
-                if proc is not None and proc.poll() is None:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    proc.wait(timeout=30)
-            finally:
-                os.close(fd)
+        with os.fdopen(fd, "wb") as output:
+            capture = runner.run_git_owned(argv, cwd or self.src, self.env, timeout,
+                                           stdout, stderr, MAX_LOG, None)
+            require(capture["original_joined"] is True
+                    and capture["process_contract"] == "trusted_git_fresh_process_group"
+                    and capture["combined_limit_bytes"] == MAX_LOG)
+            # Preserve the existing complete log consumed by Git/GTest/archive
+            # parsers. Both captured streams are retained privately; the log
+            # concatenates stdout then stderr after the original group is killed,
+            # its leader joined and both readers finished. It is not a hostile
+            # setsid-escape sandbox and grants no tool execution admission.
+            total = 0
+            for path, expected in ((stdout, capture["stdout_bytes"]),
+                                   (stderr, capture["stderr_bytes"])):
+                initial = path.lstat()
+                require(stat.S_ISREG(initial.st_mode) and initial.st_nlink == 1
+                        and initial.st_uid == os.geteuid()
+                        and stat.S_IMODE(initial.st_mode) == 0o600
+                        and initial.st_size == expected <= MAX_LOG)
+                incoming = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                with os.fdopen(incoming, "rb") as source:
+                    identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                    require(identity(initial) == identity(os.fstat(source.fileno())))
+                    count = 0
+                    while block := source.read(64 * 1024):
+                        count += len(block)
+                        total += len(block)
+                        require(count <= expected and total <= MAX_LOG)
+                        output.write(block)
+                    require(count == expected and identity(initial)
+                            == identity(os.fstat(source.fileno())) == identity(path.lstat()))
+            output.flush()
+            os.fsync(output.fileno())
+        if self.target in ("mac-arm64", "mac-x64"):
+            self.verify_mac_host()
         self.commands.append({"label": label, "argv": argv, "exit": 0,
-                              "log_sha256": digest(log)})
+                              "log_sha256": digest(log), "process_capture": capture})
         return log
+
+    def native_module(self, name, expected):
+        path = Path(__file__).resolve().parent / "native_webrtc" / name
+        raw = read(path, 256 * 1024)
+        require(hashlib.sha256(raw).hexdigest() == expected)
+        module = types.ModuleType("morpheus_mac_" + name.replace(".", "_"))
+        module.__file__ = str(path)
+        exec(compile(raw, str(path), "exec"), module.__dict__)
+        return module
+
+    def validate_mac_host(self):
+        binding = bound_json(Path(self.m["mac_host"]["path"]), self.m["mac_host"]["sha256"], 1024 * 1024)
+        require(binding["schema"] == "morpheus-native-macos-host-v1"
+                and binding["target"] == self.target and binding["sdk_redistribution"] is False)
+        sdk = self.roots["sdk"]
+        require(sdk == sdk.resolve(strict=True) and sdk.parent == Path("/Applications")
+                and re.fullmatch(r"Xcode(?:_[A-Za-z0-9_.-]+)?\.app", sdk.name))
+        require(binding["sdk_inventory_sha256"] == self.m["roots"]["sdk"]["inventory_sha256"]
+                and binding["developer_dir"] == self.m["toolchain"]["developer_dir"]
+                and binding["sdk_path"] == self.m["toolchain"]["sysroot_or_sdk"]
+                and binding["developer_dir"]["root"] == "sdk" and binding["sdk_path"]["root"] == "sdk")
+        require(set(binding["tools"]) == {"git", "xcodebuild", "xcrun", "xcode-select", "sw_vers"})
+        require(binding["mac_sdk_min"] == "15"
+                and binding["mac_sdk_gni_sha256"] == "b3962e7ad03db5784e84dbce294b2f1d5f27528f360ab35c24aa1c9c272dceda"
+                and binding["find_sdk_sha256"] == "fcfdded28669fa5d964df92f5874f100e271f0a1f966151d8a084f71c3bf866a")
+        require(digest(self.roots["source"] / "build/config/mac/mac_sdk.gni") == binding["mac_sdk_gni_sha256"]
+                and digest(self.roots["source"] / "build/mac/find_sdk.py") == binding["find_sdk_sha256"])
+        # The original native override runs this selector: absent the force
+        # environment and corporate-host directory, the genuine path is system
+        # Xcode. The clean command environment never inherits a force flag.
+        require(not os.path.lexists("/Library/GoogleCorpSupport")
+                and digest(self.roots["source"] / "build/mac/should_use_hermetic_xcode.py") == "9f71d27d1af372205d07318c240622c156ee18f67e7499a6356a697c238f7691"
+                and digest(self.roots["source"] / "build_overrides/build.gni") == "5e2c94a0428fc6ff417a7fd71843c040d31c2b16e38a5d3a09b2bb4488a3a183")
+        developer = self.item(binding["developer_dir"])
+        sdk_dir = developer / "Platforms/MacOSX.platform/Developer/SDKs"
+        candidates = []
+        for child in sdk_dir.iterdir():
+            match = re.fullmatch(r"MacOSX([0-9]+)\.([0-9]+)\.sdk", child.name)
+            if match and child.is_dir():
+                version = tuple(int(part) for part in match.groups())
+                if version >= (15, 0): candidates.append((version, child.resolve(strict=True)))
+        require(0 < len(candidates) <= 32
+                and self.item(binding["sdk_path"]) == sorted(candidates)[0][1])
+        helper = self.native_module("macos_materials.py", MAC_MATERIAL_HELPER_SHA)
+        _, directories = helper.sdk_inventory(sdk)
+        require(hashlib.sha256(helper.canonical(directories)).hexdigest() == binding["directory_topology_sha256"])
+        self.host_tools = binding["tools"]
+        self.verify_mac_host()
+
+    def verify_mac_host(self):
+        for role, row in self.host_tools.items():
+            path = Path("/usr/bin") / role
+            require(set(row) == {"path", "bytes", "sha256"} and Path(row["path"]) == path)
+            actual = path.resolve(strict=True)
+            require(actual.is_relative_to(Path("/usr")) and actual.is_file())
+            info = actual.stat()
+            require(info.st_uid == 0 and info.st_mode & 0o022 == 0
+                    and info.st_size == row["bytes"] and digest(actual) == row["sha256"])
+
+    def validate_mac_materials(self):
+        data = self.m["mac_materials"]
+        require(set(data) == {"schema", "plan", "materials", "overlay"}
+                and data["schema"] == "morpheus-macos-material-consumer-v1"
+                and all(data[key]["root"] == "mac-data" for key in ("plan", "materials"))
+                and data["plan"]["path"] == "material-plan.json"
+                and data["materials"]["path"] == "tool-materials.json")
+        self.mac_helper = self.native_module("macos_materials.py", MAC_MATERIAL_HELPER_SHA)
+        self.mac_material = self.native_module("linux_materials.py", LINUX_MATERIAL_HELPER_SHA)
+        python = self.native_module("python_stager.py", PYTHON_STAGER_SHA)
+        transport = self.native_module("linux_stager.py", "f3a908bc20170ee01f2643169ce60397627981d86de11ffaedf03dd8ea9e1c8c")
+        core_rows, _ = self.mac_helper.core_profile(self.roots["tools"], self.target, self.mac_material, transport)
+        self.mac_plan, expected, _ = self.mac_helper.profile(self.roots["mac-data"],
+            data["plan"]["sha256"], self.target, self.mac_material, python)
+        require(set(self.files["mac-data"]) == set(expected))
+        for role, ref in self.mac_plan["roles"].items():
+            require(self.tools[role] == {"root": "mac-data", **ref})
+        for spec in self.mac_plan["specs"]:
+            path = self.src / (".vpython3" if spec["name"] == "native" else "third_party/depot_tools/.vpython3")
+            require(read(path, 65536) == spec["source"].encode())
+        require(digest(self.item(data["materials"])) == data["materials"]["sha256"])
+        self.mac_overlay = bound_json(self.item(data["overlay"]), data["overlay"]["sha256"])
+        require(data["overlay"]["sha256"] == self.m["source_provision"]["source_overlay"]["sha256"])
+        projected = []
+        for rows, prefix, mount in ((core_rows, "tools/gn/", "buildtools/mac/"),
+                (core_rows, "tools/ninja/", "third_party/ninja/"),
+                (core_rows, "tools/clang/", "third_party/llvm-build/Release+Asserts/"),
+                (expected, "runtime/rust/", "third_party/rust-toolchain/")):
+            for name, row in rows.items():
+                if name.startswith(prefix):
+                    projected.append({"path": mount + name[len(prefix):], "type": "file",
+                        "mode": "100755" if row["mode"] & 0o111 else "100644",
+                        "bytes": row["bytes"], "sha256": row["sha256"]})
+        require(self.mac_overlay == sorted(projected, key=lambda row: row["path"]))
+
+    def prepare_mac_runtime(self):
+        self.verify_gitlinks()
+        for name in ("python-cache", "python-cache/cipd", "python-cache/cipd/instances",
+                     "python-cache/vpython", "python-results"):
+            (self.work / name).mkdir(mode=0o700)
+        self.env.update({"CIPD_CACHE_DIR": str(self.work / "python-cache/cipd"),
+                         "VPYTHON_VIRTUALENV_ROOT": str(self.work / "python-cache/vpython"),
+                         "CIPD_SERVICE_URL": "https://chrome-infra-packages.appspot.com",
+                         "CIPD_MAX_THREADS": "2", "CIPD_PARALLEL_DOWNLOADS": "2"})
+        pins = []
+        for row in self.mac_plan["materials"]:
+            if not row["seed_cache"]: continue
+            original = self.roots["mac-data"] / "cipd-cache/instances" / row["instance_id"]
+            raw = read(original, row["bytes"])
+            require(len(raw) == row["bytes"] and hashlib.sha256(raw).hexdigest() == row["sha256"])
+            write_new(self.work / "python-cache/cipd/instances" / row["instance_id"], raw)
+            output = self.work / "python-results" / (str(len(pins)).zfill(3) + ".json")
+            old_umask = os.umask(0o077)
+            try:
+                self.command("mac-python-resolve-" + str(len(pins)), [self.tool("cipd"), "resolve",
+                    "-cache-dir=" + self.env["CIPD_CACHE_DIR"], "-service-url=" + self.env["CIPD_SERVICE_URL"],
+                    "-version=" + row["version"], "-json-output=" + str(output), row["package"]], 60)
+            finally: os.umask(old_umask)
+            require(json.loads(read(output, 65536)) == {"result": {"": [{"package": row["package"],
+                "pin": {"package": row["package"], "instance_id": row["instance_id"]}}]}})
+            pins.append({"package": row["package"], "version": row["version"], "instance_id": row["instance_id"],
+                         "archive_sha256": row["sha256"], "result_sha256": digest(output)})
+        for spec in self.mac_plan["specs"]:
+            path = self.src / (".vpython3" if spec["name"] == "native" else "third_party/depot_tools/.vpython3")
+            old_umask = os.umask(0o077)
+            try:
+                self.command("mac-python-install-" + spec["name"], [self.tool("vpython3"), "-vpython-root",
+                    self.env["VPYTHON_VIRTUALENV_ROOT"], "-vpython-spec", str(path), "-vpython-tool", "install"], 900)
+            finally: os.umask(old_umask)
+        self.verify_mac_instances()
+        self.verify_gitlinks()
+        self.python_runtime_proof = {"schema": "morpheus-genuine-macos-vpython-setup-v1",
+            "material_plan_sha256": self.m["mac_materials"]["plan"]["sha256"], "resolved_original_pins": pins,
+            "genuine_install_specs": [{"name": s["name"], "sha256": s["sha256"]} for s in self.mac_plan["specs"]],
+            "cache_scope": "same-owned-work-root-through-GN-Ninja", "standalone_pip": False,
+            "native_source_readiness_inferred": False}
+        json_new(self.work / "python-realization-receipt.json", self.python_runtime_proof)
+
+    def verify_mac_instances(self):
+        for row in self.mac_plan["materials"]:
+            if not row["seed_cache"]: continue
+            path = self.work / "python-cache/cipd/instances" / row["instance_id"]
+            info = path.lstat()
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+                    and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size == row["bytes"]
+                    and digest(path) == row["sha256"])
 
     def validate_python_materials(self):
         runtime = self.m["python_runtime"]
@@ -1138,6 +1328,8 @@ class Build:
     def build(self):
         if self.target_os == "linux":
             self.prepare_python_runtime()
+        else:
+            self.prepare_mac_runtime()
         prod, tests = self.work / "prod", self.work / "tests"
         for name, directory, testing in (("production", prod, False), ("tests", tests, True)):
             self.command("gn-" + name, [self.tool("gn"), "gen", str(directory),
@@ -1179,6 +1371,8 @@ class Build:
         self.package_output(prod, targets)
 
     def copy(self, src, dst):
+        if self.target_os == "mac":
+            require(not src.resolve(strict=True).is_relative_to(self.roots["sdk"]))
         require(src.is_file() and not src.is_symlink() and not dst.exists())
         dst.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
@@ -1286,6 +1480,11 @@ class Build:
         if self.target_os == "linux":
             self.verify_python_instances()
             self.verify_instrumented_materials()
+        if self.target_os == "mac":
+            self.verify_mac_instances()
+            self.mac_helper.profile(self.roots["mac-data"], self.m["mac_materials"]["plan"]["sha256"],
+                                    self.target, self.mac_material, self.native_module("python_stager.py", PYTHON_STAGER_SHA))
+            self.verify_mac_host()
         json_new(package / "PROVENANCE.json", {
             "target": self.target, "source_revision": SOURCE_REV, "source_tree": SOURCE_TREE,
             "sdk_reference_revision": SDK_REV, "outer_depot_revision": DEPOT_REV,
@@ -1302,6 +1501,10 @@ class Build:
             **({"python_runtime_setup": self.python_runtime_proof,
                 "instrumented_source_material": self.instrumented_proof,
                 "linux_projected_materials": self.linux_materials_proof} if self.target_os == "linux" else {}),
+            **({"python_runtime_setup": self.python_runtime_proof,
+                "mac_material_plan_sha256": self.m["mac_materials"]["plan"]["sha256"],
+                "host_sdk_binding_sha256": self.m["mac_host"]["sha256"], "apple_sdk_redistributed": False}
+               if self.target_os == "mac" else {}),
             "admission_sha256": self.admission_sha, "recipe_sha256": digest(Path(__file__).resolve()),
             "production_gn_args": self.args(False), "test_gn_args": self.args(True),
             "production_targets": targets, "license_targets": license_targets,

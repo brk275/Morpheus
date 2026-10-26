@@ -1,0 +1,168 @@
+{
+  "assets": [
+    {
+      "bytes": 473118,
+      "path": "native/webrtc/linux/selected-tool-manifest.json",
+      "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+    },
+    {
+      "bytes": 6427,
+      "path": "native/webrtc/linux/inputs/root-security-source-plan.json",
+      "sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
+    },
+    {
+      "bytes": 22976,
+      "path": "native/webrtc/linux/patches/01-sif-validation.patch",
+      "sha256": "4f5ba9a827220170080ae4d1183e01b437eb7014c391bda46cd258ae0c5f5169"
+    },
+    {
+      "bytes": 5382,
+      "path": "native/webrtc/linux/patches/02-key-log-removal.patch",
+      "sha256": "793e25908a56d8993cb082e40728ad1bd39919a0abf988b1921384d15dd601fd"
+    },
+    {
+      "bytes": 160798,
+      "path": "native/webrtc/linux/patches/03-root-refresh.patch",
+      "sha256": "6f10c7bf1f0396e5a6e287343a93049d3b7e9387f1cffc9fe7f70a580d0bf508"
+    },
+    {
+      "bytes": 1705,
+      "path": "native/webrtc/linux/patches/04-copy-discard-option.patch",
+      "sha256": "ad5f64e55a6c4187b242535f84149c46590565d0e1017f1340856a8fcbd06835"
+    },
+    {
+      "bytes": 9441,
+      "path": "native/webrtc/linux/patches/05-frame-bounds.patch",
+      "sha256": "3e9934378b8c164314907ba7161f9b223554201fda47dad50744a1ae15c61b1d"
+    },
+    {
+      "bytes": 4058,
+      "path": "native/webrtc/linux/patches/06-sif-trailer-snapshot.patch",
+      "sha256": "df26ab1d8a31ca5cab1f39fda912e0c3e73a726c59cfcde4457e79415094edfd"
+    },
+    {
+      "bytes": 3958,
+      "path": "native/webrtc/linux/patches/07-h264-prefix-validation.patch",
+      "sha256": "1de7bf5402089c13f93f108f3008aaa8c025e2bdbd7b2375694417c186c86a17"
+    },
+    {
+      "bytes": 5457,
+      "path": "native/webrtc/linux/patches/08-rbsp-decoded-iv.patch",
+      "sha256": "dbefa1b81cd8b24eb0bcd41ec996e6b14265d66ffdad38cf1112e646821d4e09"
+    },
+    {
+      "bytes": 785,
+      "path": "native/webrtc/linux/patches/add_licenses.patch",
+      "sha256": "3744d07bce56a3cc281f70196ad52513b6395d353a73d2de97f2de616bc27625"
+    },
+    {
+      "bytes": 764,
+      "path": "native/webrtc/linux/patches/fix_license_json_parsing.patch",
+      "sha256": "602275f0ebe9b5122496eaf3ecf624068316c87fdbcfee9d8fa5495463ca471b"
+    },
+    {
+      "bytes": 2523,
+      "path": "native/webrtc/linux/patches/ssl_verify_callback_with_native_handle.patch",
+      "sha256": "55042fe99107439e88e56cddec4f5caf8c8a92e72f2e035ac8e37d52aaecb20c"
+    },
+    {
+      "bytes": 940,
+      "path": "native/webrtc/linux/patches/add_deps.patch",
+      "sha256": "da222e44f306137ed96b626879948325dc21857dcf054482b1e3df83e59fe5f4"
+    },
+    {
+      "bytes": 5947,
+      "path": "native/webrtc/linux/patches/external_audio_source.patch",
+      "sha256": "83bfe8101270cc60be25991ec07bbabf51c071f6529b50895e4b1ef07314b81f"
+    },
+    {
+      "bytes": 19791,
+      "path": "native/webrtc/macos/mac-arm64/source-plan.json",
+      "sha256": "f30716078734d51770a9afd411a9fbe80a0d1cc676a8ccf46ec44d180bc091b1"
+    },
+    {
+      "bytes": 14522,
+      "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+      "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+    },
+    {
+      "bytes": 5111,
+      "path": "native/webrtc/macos/mac-arm64/dependency-decisions.json",
+      "sha256": "eda6ac628a6d2b022942b59bad9ea069d0a921bd7da36db0c9a61a3b7337ef23"
+    },
+    {
+      "bytes": 17692,
+      "path": "native/webrtc/macos/patch-manifest.json",
+      "sha256": "b2ca5cb477a68c18f273b66ea310b387976a85305f667bc531ccb35a0950ed79"
+    },
+    {
+      "bytes": 3066288,
+      "path": "native/webrtc/macos/mac-arm64/selected-mac-materials.json",
+      "sha256": "8755401b35207e5b815bfdc2ad13e623c8c320b4ee3a2d86102294dfb498af3f"
+    }
+  ],
+  "cache_handoff_authorized": false,
+  "core_plan": {
+    "path": "native/webrtc/linux/selected-tool-manifest.json",
+    "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+  },
+  "declaration_ledger": {
+    "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+    "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+  },
+  "dependency_decisions": {
+    "path": "native/webrtc/macos/mac-arm64/dependency-decisions.json",
+    "sha256": "eda6ac628a6d2b022942b59bad9ea069d0a921bd7da36db0c9a61a3b7337ef23"
+  },
+  "host_git": {
+    "bytes": null,
+    "path": "HOST_MAC_GIT_PATH_UNBOUND",
+    "sha256": "HOST_MAC_GIT_SHA256_UNBOUND",
+    "version": "HOST_MAC_GIT_VERSION_UNBOUND"
+  },
+  "host_python": {
+    "bytes": null,
+    "path": "HOST_PYTHON_3_13_PATH_UNBOUND",
+    "sha256": "HOST_PYTHON_3_13_SHA256_UNBOUND"
+  },
+  "host_zstd": {
+    "bytes": null,
+    "path": "HOST_MAC_ZSTD_PATH_UNBOUND",
+    "sha256": "HOST_MAC_ZSTD_SHA256_UNBOUND"
+  },
+  "mac_material_plan": {
+    "path": "native/webrtc/macos/mac-arm64/selected-mac-materials.json",
+    "sha256": "8755401b35207e5b815bfdc2ad13e623c8c320b4ee3a2d86102294dfb498af3f"
+  },
+  "minimum_free_bytes": 12884901888,
+  "native_test_count": 12,
+  "patch_manifest": {
+    "path": "native/webrtc/macos/patch-manifest.json",
+    "sha256": "b2ca5cb477a68c18f273b66ea310b387976a85305f667bc531ccb35a0950ed79"
+  },
+  "pipeline_sha256": "f782ba32996f6c78b074deb6a57bd22a53f3f863c5ae2559f672f17be7974906",
+  "production_targets": [
+    ":default",
+    "api/audio_codecs:builtin_audio_decoder_factory",
+    "api/task_queue:default_task_queue_factory",
+    "sdk:native_api",
+    "sdk:default_codec_factory_objc",
+    "pc:peer_connection",
+    "sdk:videocapture_objc",
+    "sdk:mac_framework_objc",
+    "desktop_capture_objc",
+    "modules/audio_device:audio_device"
+  ],
+  "recipe_sha256": "42afc017bd5b27df8b9b2cd47be762c3af9a6e5784e1184516c9429d0a5dc2e6",
+  "schema": "morpheus-native-macos-pipeline-v1",
+  "security_patch_count": 8,
+  "security_plan": {
+    "path": "native/webrtc/linux/inputs/root-security-source-plan.json",
+    "sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
+  },
+  "source_plan": {
+    "path": "native/webrtc/macos/mac-arm64/source-plan.json",
+    "sha256": "f30716078734d51770a9afd411a9fbe80a0d1cc676a8ccf46ec44d180bc091b1"
+  },
+  "target": "mac-arm64"
+}

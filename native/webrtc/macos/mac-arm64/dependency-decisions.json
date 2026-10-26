@@ -1,0 +1,143 @@
+{
+  "build_ready": false,
+  "declarations": [
+    {
+      "decision": "real-material",
+      "declaration_sha256": "512f124bae00996fb0574ad8ba7835530424734678e5092eeea2eba4b0f50481",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        },
+        {
+          "path": "native/webrtc/linux/selected-tool-manifest.json",
+          "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+        }
+      ],
+      "path": "src/buildtools/mac"
+    },
+    {
+      "decision": "unresolved",
+      "declaration_sha256": "76b0593fbaeb5b9f05af05e8483189dcf8305f62575a069c4b75a07fd1741eec",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        }
+      ],
+      "path": "src/buildtools/mac_arm64-format"
+    },
+    {
+      "decision": "unresolved",
+      "declaration_sha256": "2c49d85553fc73d22c06dac2f5a3bc4905dfaf51b15b7811573b67fc004df093",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        }
+      ],
+      "path": "src/buildtools/reclient"
+    },
+    {
+      "decision": "unresolved",
+      "declaration_sha256": "630afb11f8eb0e3d31c592710ecc627cc30aaeccdc75fedfc573403e66150ad9",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        }
+      ],
+      "path": "src/third_party/llvm-build/Release+Asserts"
+    },
+    {
+      "decision": "real-material",
+      "declaration_sha256": "4f8a1b18a05043b3d79815827b825ce12b51981e3152c05650e7e321a2728cfe",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        },
+        {
+          "path": "native/webrtc/linux/selected-tool-manifest.json",
+          "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+        }
+      ],
+      "path": "src/third_party/ninja"
+    },
+    {
+      "decision": "real-material",
+      "declaration_sha256": "913740a413b1477e404665bb9d55cbca3fa8aba19dce824e0b0f0afd05a1166c",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        },
+        {
+          "path": "native/webrtc/macos/mac-arm64/selected-mac-materials.json",
+          "sha256": "8755401b35207e5b815bfdc2ad13e623c8c320b4ee3a2d86102294dfb498af3f"
+        }
+      ],
+      "path": "src/third_party/rust-toolchain"
+    },
+    {
+      "decision": "unresolved",
+      "declaration_sha256": "9231bc0a00e91cd836362ce8afbf7bb4b97824d1d786dad03400f55fca48253b",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        }
+      ],
+      "path": "src/third_party/siso/cipd"
+    },
+    {
+      "decision": "unresolved",
+      "declaration_sha256": "3e154637b3b53dba38291534a34c82122c0a9b2e1d5f09e12cf0b22f24738207",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        }
+      ],
+      "path": "src/third_party/test_fonts/test_fonts"
+    },
+    {
+      "decision": "unresolved",
+      "declaration_sha256": "11a8c5b21479f8313e27189db28532aed3ee4c3f0291390c25a78f6a8fef0e3e",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        }
+      ],
+      "path": "src/tools/luci-go"
+    },
+    {
+      "decision": "unresolved",
+      "declaration_sha256": "62b7186108c104253eeca040ea1d6a8e27d885bf9f266790dcf928d834e8928b",
+      "evidence": [
+        {
+          "path": "native/webrtc/macos/mac-arm64/declaration-ledger.json",
+          "sha256": "b6bc46419f730216748bda8a8a3a17d0731d0042a48b725269c250b12f1b54a5"
+        }
+      ],
+      "path": "src/tools/resultdb"
+    }
+  ],
+  "native_test_target": "//:rtc_unittests",
+  "production_targets": [
+    ":default",
+    "api/audio_codecs:builtin_audio_decoder_factory",
+    "api/task_queue:default_task_queue_factory",
+    "sdk:native_api",
+    "sdk:default_codec_factory_objc",
+    "pc:peer_connection",
+    "sdk:videocapture_objc",
+    "sdk:mac_framework_objc",
+    "desktop_capture_objc",
+    "modules/audio_device:audio_device"
+  ],
+  "schema": "morpheus-native-macos-dependency-decisions-v1",
+  "source_revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+  "target": "mac-arm64"
+}

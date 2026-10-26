@@ -1,12 +1,14 @@
 """Input traversal regressions for the native Unix builder; synthetic files only."""
 from pathlib import Path
 import hashlib
+import tarfile
 import io
 import json
 import importlib.util
 import os
 import stat
 import sys
+import time
 from tempfile import TemporaryDirectory
 import unittest
 import zipfile
@@ -412,6 +414,213 @@ class NativeCacheDataBoundaryTests(unittest.TestCase):
                 with self.assertRaises(_PIPELINE.Refused):
                     archive.fileobj.read(65536)
 
+
+_MAC_PATH = _SCRIPT.parent / "native_webrtc/macos_materials.py"
+_MAC_SPEC = importlib.util.spec_from_file_location("morpheus_mac_material_tests", _MAC_PATH)
+assert _MAC_SPEC is not None and _MAC_SPEC.loader is not None
+_MAC = importlib.util.module_from_spec(_MAC_SPEC)
+_MAC_SPEC.loader.exec_module(_MAC)
+
+
+class NativeMacMaterialBoundaryTests(unittest.TestCase):
+    def profile(self):
+        return {"format": "tar.xz", "members": [
+            {"path": "bin", "kind": "directory", "mode": 0o755, "bytes": 0},
+            {"path": "bin/tool", "kind": "regular", "mode": 0o755, "bytes": 4,
+             "sha256": "a" * 64, "output_mode": 0o700},
+            {"path": "bin/alias", "kind": "symlink", "mode": 0o777, "bytes": 0, "linkname": "tool"}],
+            "alias_copies": [{"path": "bin/alias", "kind": "symlink", "linkname": "tool", "source": "bin/tool",
+                              "bytes": 4, "sha256": "a" * 64, "output_mode": 0o700}]}
+
+    def test_declared_regular_alias_is_a_copy_and_escape_is_refused(self):
+        row = self.profile()
+        self.assertEqual(set(_MAC.paths(row, _MATERIAL)), {"bin", "bin/tool", "bin/alias"})
+        row["members"][-1]["linkname"] = "../../outside"
+        row["alias_copies"][0]["linkname"] = "../../outside"
+        with self.assertRaises(_MAC.Refused):
+            _MAC.paths(row, _MATERIAL)
+
+    def test_unknown_alias_changed_bytes_and_case_collision_are_refused(self):
+        for change in ("unknown", "bytes", "case"):
+            with self.subTest(change=change):
+                row = self.profile()
+                if change == "unknown": row["alias_copies"] = []
+                elif change == "bytes": row["alias_copies"][0]["sha256"] = "b" * 64
+                else: row["members"].append({"path": "BIN", "kind": "directory", "mode": 0o755, "bytes": 0})
+                with self.assertRaises(_MAC.Refused):
+                    _MAC.paths(row, _MATERIAL)
+
+    def test_real_mac_profiles_validate_original_runtime_archives_and_app_roles(self):
+        python = _PIPELINE.module("python_stager.py")
+        for target in ("mac-arm64", "mac-x64"):
+            with self.subTest(target=target):
+                path = _SCRIPT.parents[1] / "native/webrtc/macos" / target / "selected-mac-materials.json"
+                plan = json.loads(path.read_bytes())
+                self.assertIs(_MAC.validate(plan, target, _MATERIAL, python), plan)
+                self.assertEqual(len(plan["materials"]), 34)
+                self.assertEqual(sum(row["seed_cache"] for row in plan["materials"]), 30)
+                self.assertEqual(plan["roles"]["vpython3"]["path"],
+                    "runtime/vpython/vpython3.app/Contents/MacOS/vpython3")
+                plan["roles"]["vpython3"]["path"] = "runtime/vpython/vpython3"
+                with self.assertRaises(_MAC.Refused):
+                    _MAC.validate(plan, target, _MATERIAL, python)
+
+    def test_zip_implicit_parents_are_derived_without_accepting_aliases_or_file_parents(self):
+        member = {"path": "app/Contents/bin/tool", "kind": "regular", "mode": 0o100755,
+                  "bytes": 4, "sha256": "a" * 64, "output_mode": 0o700}
+        row = {"format": "zip", "members": [member], "alias_copies": []}
+        self.assertEqual(_MAC.paths(row, _MATERIAL), {member["path"]: member})
+        for extra in ({**member, "path": "app"}, {**member, "path": "APP/other"},
+                      {**member, "path": "app/../escape"}):
+            with self.subTest(path=extra["path"]), self.assertRaises(_MAC.Refused):
+                _MAC.paths({**row, "members": [member, extra]}, _MATERIAL)
+        # The same omission is not silently generalized to tar inventories.
+        with self.assertRaises(_MAC.Refused):
+            _MAC.paths({**row, "format": "tar.xz"}, _MATERIAL)
+
+    def test_tar_exact_pax_data_is_checked_before_writing_its_payload(self):
+        payload = b"synthetic bounded archive body"
+        path = "bin/" + "x" * 110
+        parent = {"path": "bin", "kind": "directory", "mode": 0o755, "bytes": 0}
+        member = {"path": path, "kind": "regular", "mode": 0o644, "bytes": len(payload),
+                  "sha256": hashlib.sha256(payload).hexdigest(), "output_mode": 0o600,
+                  "pax_headers": {"path": path, "mtime": "1762913607.25"}}
+        row = {"format": "tar.xz", "members": [parent, member], "alias_copies": []}
+        transport = _PIPELINE.module("linux_stager.py")
+        class Stage:
+            def __init__(self): self.files = []
+            def create(self, path):
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                self.files.append(path)
+                return path.open("xb")
+            def parents(self, path): path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            def bytes(self, path, raw):
+                with self.create(path) as stream: stream.write(raw)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            archive = root / "synthetic.tar.xz"
+            with tarfile.open(archive, "w:xz", format=tarfile.PAX_FORMAT) as output:
+                info = tarfile.TarInfo("bin"); info.type = tarfile.DIRTYPE; info.mode = 0o755
+                output.addfile(info)
+                info = tarfile.TarInfo(path); info.mode = 0o644; info.size = len(payload)
+                info.pax_headers = dict(member["pax_headers"])
+                output.addfile(info, io.BytesIO(payload))
+            destination = root / "good"
+            _MAC.extract(Stage(), row, archive, destination, _MATERIAL, transport)
+            self.assertEqual((destination / path).read_bytes(), payload)
+            wrong = json.loads(json.dumps(row)); wrong["members"][1]["pax_headers"]["mtime"] = "1762913608.25"
+            with self.assertRaises(_MAC.Refused):
+                _MAC.extract(Stage(), wrong, archive, root / "bad", _MATERIAL, transport)
+            self.assertFalse((root / "bad" / path).exists())
+        for fields in ({"path": "../escape"}, {"path": "bin/other"}, {"linkpath": "bin/tool"},
+                       {"size": "1"}, {"GNU.sparse.name": path}, {"mtime": 5}, {"mtime": "NaN"}):
+            with self.subTest(keys=tuple(fields)), self.assertRaises(_MAC.Refused):
+                _MAC.paths({**row, "members": [parent, {**member, "pax_headers": fields}]}, _MATERIAL)
+
+    def test_projection_refuses_original_gitlink_scope_before_copy(self):
+        with TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            files = {"tools/gn/gn": {"path": "tools/gn/gn", "bytes": 4,
+                                    "sha256": "a" * 64, "mode": 0o700}}
+            for marker in ("src/buildtools/mac", "src/buildtools/mac/gn", "src/buildtools/mac/gn/child"):
+                with self.subTest(marker=marker):
+                    with mock.patch.object(_MATERIAL, "file_fact", side_effect=AssertionError("copy before marker check")):
+                        with self.assertRaises(_MAC.Refused):
+                            _MAC.project(base, {}, {"."}, [marker], (base, files), (base, {}), "mac-arm64", _MATERIAL)
+
+    def test_mac_args_retain_both_real_declared_deployment_settings_and_native_targets(self):
+        build = object.__new__(_BUILDER.Build)
+        build.target_os, build.cpu = "mac", "arm64"
+        args = build.args(False)
+        self.assertIn('mac_deployment_target="10.15"', args)
+        self.assertIn('mac_min_system_version="10.15"', args)
+        self.assertIn('rtc_include_tests=false', args)
+        self.assertIn('rtc_include_tests=true', build.args(True))
+        self.assertEqual(build.production_targets(), [":default"] + list(_BUILDER.MAC_TARGETS))
+        self.assertEqual(len(_BUILDER.TESTS), 12)
+
+    def test_apple_sdk_material_cannot_be_copied_into_package(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            sdk = root / "sdk"; sdk.mkdir(); (sdk / "header.h").write_bytes(b"synthetic SDK")
+            build = object.__new__(_BUILDER.Build)
+            build.target_os, build.roots = "mac", {"sdk": sdk}
+            with self.assertRaises(_BUILDER.Refused):
+                build.copy(sdk / "header.h", root / "redistributed.h")
+            self.assertFalse((root / "redistributed.h").exists())
+
+
+
+
+@unittest.skipUnless(os.name == "posix" and hasattr(os, "waitid"), "Owned Unix process contract")
+class NativeUnixOwnedCommandTests(unittest.TestCase):
+    def fixture(self, root):
+        root.chmod(0o700)
+        (root / "logs").mkdir(mode=0o700)
+        build = object.__new__(_BUILDER.Build)
+        build.work, build.src, build.target, build.commands = root, root, "linux-x64", []
+        build.env = {"PATH": str(Path(sys.executable).parent), "HOME": str(root),
+                     "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+        return build
+
+    def test_success_retains_both_streams_and_proves_owned_group_join(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            build = self.fixture(root)
+            log = build.command("ordinary", [sys.executable, "-I", "-B", "-c",
+                                "import os; os.write(1,b'output'); os.write(2,b'error')"], 5)
+            self.assertEqual(log.read_bytes(), b"outputerror")
+            self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+            capture = build.commands[0]["process_capture"]
+            self.assertIs(capture["original_joined"], True)
+            self.assertEqual(capture["process_contract"], "trusted_git_fresh_process_group")
+            self.assertEqual(capture["stdout_bytes"] + capture["stderr_bytes"], log.stat().st_size)
+            self.assertIsNone(build._native_command_runner.UNRETIRED_COMMAND)
+
+    def test_successful_leader_cannot_leave_its_inherited_group_running(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            build = self.fixture(root)
+            child = ("import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_bytes(b'ready'); "
+                     "time.sleep(0.4); pathlib.Path(sys.argv[2]).write_bytes(b'unretired')")
+            leader = ("import pathlib,subprocess,sys,time; "
+                      "subprocess.Popen([sys.executable,'-I','-B','-c',sys.argv[1],sys.argv[2],sys.argv[3]]); "
+                      "deadline=time.monotonic()+3; "
+                      "\nwhile not pathlib.Path(sys.argv[2]).exists():\n"
+                      " if time.monotonic()>=deadline: raise SystemExit(2)\n time.sleep(0.01)\n")
+            ready, late = root / "ready", root / "unretired"
+            build.command("leader", [sys.executable, "-I", "-B", "-c", leader, child,
+                                     str(ready), str(late)], 5)
+            self.assertTrue(ready.is_file())
+            time.sleep(0.6)
+            self.assertFalse(late.exists(), "successful leader left its compiler child running")
+            self.assertIsNone(build._native_command_runner.UNRETIRED_COMMAND)
+
+    def test_output_limits_apply_before_writes_and_timeout_retires_the_group(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            build = self.fixture(root)
+            runner = build.native_module("git_source_stager.py", _BUILDER.COMMAND_PROCESS_HELPER_SHA)
+            build._native_command_runner = runner
+            # Exercise the real readers and owner at a small synthetic budget;
+            # production keeps the independently fixed256MiB combined limit.
+            with mock.patch.object(_BUILDER, "MAX_LOG", 1024), \
+                    mock.patch.object(runner, "MAX_METADATA", 1024):
+                for fd in (1, 2):
+                    label = "overflow-" + str(fd)
+                    with self.subTest(fd=fd), self.assertRaises(runner.Refusal) as caught:
+                        build.command(label, [sys.executable, "-I", "-B", "-c",
+                            "import os; os.write(" + str(fd) + ",b'x'*4096)"], 5)
+                    self.assertEqual(caught.exception.category, "command_output")
+                    self.assertLessEqual(sum(path.stat().st_size for path in
+                        (root / "logs").glob(label + ".capture.*")), 1024)
+                    self.assertIsNone(runner.UNRETIRED_COMMAND)
+                with self.assertRaises(runner.Refusal) as caught:
+                    build.command("timeout", [sys.executable, "-I", "-B", "-c",
+                                               "import time; time.sleep(30)"], 0.05)
+                self.assertEqual(caught.exception.category, "command_timeout")
+                self.assertIsNone(runner.UNRETIRED_COMMAND)
+            self.assertEqual(build.commands, [])
 
 if __name__ == "__main__":
     unittest.main()

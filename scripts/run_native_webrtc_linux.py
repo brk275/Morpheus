@@ -42,13 +42,13 @@ PYTHON_PLAN = "b3cd3a5066338da7fa450fe48580d987dbb88f90d9497dc2106802ab989c0aea"
 INSTRUMENTED_PLAN = "927a95029b9ddc8f4b4cce20f07975505b343260d913b9c3488bc6f6182ad0f9"
 HELPERS = {
     "git_source_stager.py": "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b",
-    "source_importer.py": "6e70b070d63860a32dc32830272c287cfbd87a003dfdc4e88c67a245c5cf292d",
+    "source_importer.py": "0181f9be9bff3100fea67c3692e1dfc44ea244a434cbf598f88e6691968bf7ee",
     "linux_stager.py": "f3a908bc20170ee01f2643169ce60397627981d86de11ffaedf03dd8ea9e1c8c",
     "python_stager.py": "4de9a016a988535b7576f2e0d7561afa290529dae7b1eb267bb8382956d49d02",
     "instrumented_stager.py": "8903aef2de2ea5a7778ad4ba21047909ad7595d3e1359f151829e489910fc84f",
     "linux_materials.py": "acca8d027e3e2f1ce3a38181345b522a2906e5eeb1a1fc39cd3c1d2ff3bf0b51",
 }
-BUILD_RECIPE = "f37dc881c21df52712e69476af14886bde8c2b96b659baf0aea72dabd6ce2126"
+BUILD_RECIPE = "42afc017bd5b27df8b9b2cd47be762c3af9a6e5784e1184516c9429d0a5dc2e6"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -284,7 +284,7 @@ def signed_blob_url(value):
     return signed
 
 
-def cache_download(args, temp, material, plan):
+def cache_download(args, temp, material, plan, *, mac_target=None):
     """Exact cache lookup; never invoke the action's prefix restore or tar."""
     record = cache_identity(args, material)
     origin = urllib.parse.urlsplit(os.environ["ACTIONS_RESULTS_URL"])
@@ -343,8 +343,15 @@ def cache_download(args, temp, material, plan):
         tool = plan["host_zstd"]
         need(set(tool) == {"path", "bytes", "sha256"})
         executable = Path(tool["path"])
-        need(executable == Path("/usr/bin/zstd").resolve(strict=True)
-             and host_fact(executable) == {key: tool[key] for key in ("bytes", "sha256")})
+        if mac_target is None:
+            need(executable == Path("/usr/bin/zstd").resolve(strict=True))
+        else:
+            need(mac_target in ("mac-arm64", "mac-x64") and os.uname().sysname == "Darwin"
+                 and os.uname().machine == ("arm64" if mac_target == "mac-arm64" else "x86_64")
+                 and (executable.is_relative_to(Path("/usr/local"))
+                      or executable.is_relative_to(Path("/opt/homebrew"))))
+            need(executable == executable.resolve(strict=True))
+        need(host_fact(executable) == {key: tool[key] for key in ("bytes", "sha256")})
         home = directory / "home"; home.mkdir(mode=0o700)
         # Reuse the existing original owned-process/pipe/session implementation.
         # This is an independently bound hosted DATA decompressor, not a native
@@ -896,7 +903,8 @@ def cache_identity(args, material, after_save=False):
     return {key: value[key] for key in ("id", "key", "ref", "version", "size_in_bytes")}
 
 
-def restore(args, temp, material):
+def restore(args, temp, material, *, mac_target=None):
+    need(mac_target is None or mac_target in ("mac-arm64", "mac-x64"))
     cache = cache_identity(args, material)
     archive = temp / "native-webrtc-handoff/handoff.tar.gz"
     fact = material.file_fact(archive)
@@ -917,13 +925,18 @@ def restore(args, temp, material):
                     raw.extend(block)
                 need(stream.read(1) == b"" and len(raw) == member.size)
                 header = json.loads(raw)
-                need(header["schema"] == "morpheus-native-linux-handoff-v1"
+                need(header["schema"] == ("morpheus-native-linux-handoff-v1" if mac_target is None else "morpheus-native-macos-handoff-v1")
                      and header["pipeline_plan_sha256"] == args.plan_sha256
                      and header["build_admission_granted"] is False
                      and header["native_sources_complete"] is False
                      and header["build_ready"] is False and header["distribution_ready"] is False)
-                need(len(header["roots"]) == 6 and set(spec["role"] for spec in header["roots"].values()) ==
-                     {"assembled", "core", "linux", "python", "instrumented", "control"})
+                if mac_target is None:
+                    need(len(header["roots"]) == 6 and set(spec["role"] for spec in header["roots"].values()) ==
+                         {"assembled", "core", "linux", "python", "instrumented", "control"})
+                else:
+                    need(header["target"] == mac_target and header["apple_sdk_redistributed"] is False
+                         and len(header["roots"]) == 4 and set(spec["role"] for spec in header["roots"].values()) ==
+                         {"source", "core", "mac", "control"})
                 for name, spec in header["roots"].items():
                     need(re.fullmatch(r"morpheus-webrtc-(?:tools|assembled|control)-[0-9a-f]{16}", name)
                          and not os.path.lexists(temp / name))

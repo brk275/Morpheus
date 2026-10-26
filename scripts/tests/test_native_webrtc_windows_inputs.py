@@ -6,9 +6,11 @@ import importlib.util
 import io
 import json
 import os
+import stat
 from pathlib import Path
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 PATH = Path(__file__).resolve().parents[1] / "run_native_webrtc_windows.py"
@@ -18,6 +20,188 @@ SPEC.loader.exec_module(TARGET)
 
 
 class WindowsNativeInputsTests(unittest.TestCase):
+    def test_windows_original_cipd_instance_path_and_both_hashes_are_required(self):
+        helper_path = PATH.parent / "native_webrtc/python_stager.py"
+        self.assertEqual(hashlib.sha256(helper_path.read_bytes()).hexdigest(), TARGET.HELPERS["python_stager.py"])
+        spec = importlib.util.spec_from_file_location("windows_cipd_actual_transport", helper_path)
+        stager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stager)
+        profile = json.loads((PATH.parents[1] / "native/webrtc/windows/runtime-data.json").read_bytes())
+        actual = [item["tool"] for item in profile["materials"] if item["tool"]["name"] in TARGET.WINDOWS_CIPD_SHA1]
+        self.assertEqual(len(actual), 3)
+        for tool in actual:
+            self.assertEqual(TARGET.windows_cipd_instance(tool)["hashAlgo"], "SHA1")
+            for changed in (dict(tool, sha256="0" * 64), dict(tool, bytes=tool["bytes"] + 1),
+                            dict(tool, source=dict(tool["source"], package="foreign/wheel"))):
+                with self.assertRaises(TARGET.Refused):
+                    TARGET.windows_cipd_instance(changed)
+        payload = b"opaque synthetic archive DATA"
+        sha1 = hashlib.sha1(payload).hexdigest()
+        tool = dict(actual[0], bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+        # A controlled fixture pin exercises the actual request and hashing
+        # functions. Production pin identities are checked against real profile
+        # rows above; no network/archive/tool execution or fake hash is used.
+        pin = {key: tool[key] for key in ("name", "format", "bytes", "sha256", "source")}
+        pin["instance_sha1"] = sha1
+        signed = "https://storage.googleapis.com/chrome-infra-packages/store/SHA1/" + sha1 + "?fixture=1"
+        for variant in ("valid", "corrupt", "surplus", "wrong_algorithm", "foreign_host", "duplicate", "length"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                lookup_connection, archive_connection = mock.Mock(), mock.Mock()
+                lookup, response = mock.Mock(), mock.Mock()
+                url = signed.replace("/SHA1/", "/SHA256/") if variant == "wrong_algorithm" else signed
+                if variant == "foreign_host":
+                    url = url.replace("storage.googleapis.com", "foreign.invalid")
+                metadata = b")]}'\n" + json.dumps({"signedUrl": url}).encode()
+                if variant == "duplicate":
+                    metadata = b")]}'\n{\"signedUrl\":\"" + signed.encode() + b"\",\"signedUrl\":\"" + signed.encode() + b"\"}"
+                lookup.read.return_value = metadata
+                content = b"x" * len(payload) if variant == "corrupt" else payload + (b"x" if variant == "surplus" else b"")
+                response.read.side_effect = io.BytesIO(content).read
+                response.getheader.side_effect = lambda name: (str(len(payload) + (1 if variant == "length" else 0))
+                                                               if name == "Content-Length" else None)
+                owner = mock.Mock()
+                owner.create.side_effect = lambda destination: destination.open("xb")
+                destination = Path(temporary) / "original.zip"
+                with mock.patch.dict(TARGET.WINDOWS_CIPD_SHA1, {tool["name"]: pin}), \
+                        mock.patch.object(stager, "https", side_effect=[(lookup_connection, lookup),
+                                                                     (archive_connection, response)]) as transport:
+                    if variant == "valid":
+                        TARGET.windows_cipd_download(stager, owner, tool, destination)
+                        self.assertEqual(destination.read_bytes(), payload)
+                    else:
+                        with self.assertRaises((TARGET.Refused, stager.Refusal)):
+                            TARGET.windows_cipd_download(stager, owner, tool, destination)
+                first = transport.call_args_list[0]
+                self.assertEqual(first.args[0], "https://chrome-infra-packages.appspot.com/prpc/cipd.Repository/GetInstanceURL")
+                self.assertEqual(json.loads(first.kwargs["body"]), {"package": tool["source"]["package"],
+                    "instance": {"hashAlgo": "SHA1", "hexDigest": sha1}})
+                lookup_connection.close.assert_called_once_with()
+                if variant in ("wrong_algorithm", "foreign_host", "duplicate"):
+                    self.assertEqual(transport.call_count, 1)
+                    self.assertFalse(destination.exists())
+                else:
+                    self.assertEqual(transport.call_count, 2)
+                    self.assertEqual(transport.call_args_list[1].args[0], signed)
+                    archive_connection.close.assert_called_once_with()
+
+    def test_complete_bound_windows_runtime_profile_reaches_actual_35_material_consumer(self):
+        plan_path = PATH.parents[1] / "native/webrtc/windows/pipeline-plan.json"
+        plan = json.loads(plan_path.read_bytes())
+        record = plan["runtime_profile"]
+        raw = (PATH.parents[1] / record["path"]).read_bytes()
+        self.assertEqual({"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()},
+                         {key: record[key] for key in ("bytes", "sha256")})
+        profile = json.loads(raw)
+        self.assertEqual(len(profile["materials"]), 35)
+        self.assertIsNone(plan["source_profile"])
+        self.assertIsNone(plan["build_inputs"])
+        self.assertIs(plan["cache_handoff_authorized"], False)
+        helper_path = PATH.parent / "native_webrtc/python_stager.py"
+        self.assertEqual(hashlib.sha256(helper_path.read_bytes()).hexdigest(), TARGET.HELPERS["python_stager.py"])
+        spec = importlib.util.spec_from_file_location("windows_35_actual_stager", helper_path)
+        stager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stager)
+        control = mock.Mock(root=Path("synthetic-windows-runtime"))
+        # Run original admission, table and source checks; no network, archive
+        # extraction, CIPD/vpython environment, executable tool or build runs.
+        with mock.patch.object(TARGET, "bound_asset", return_value=(None, profile)), \
+                mock.patch.object(stager, "download") as downloads, \
+                mock.patch.object(TARGET, "windows_cipd_download") as original_instances, \
+                mock.patch.object(stager, "extract") as ordinary, \
+                mock.patch.object(TARGET, "windows_python_zip_extract") as python_zip, \
+                mock.patch.object(TARGET, "windows_rust_extract") as rust, \
+                mock.patch.object(TARGET, "write_json") as receipt:
+            TARGET.runtime_stage(stager, Path("synthetic-workspace"), plan, control)
+        self.assertEqual(downloads.call_count, 32)
+        self.assertEqual(original_instances.call_count, 3)
+        paths = {call.args[2] for call in downloads.call_args_list}
+        paths.update(call.args[3] for call in original_instances.call_args_list)
+        self.assertEqual(len(paths), 35)
+        for call in original_instances.call_args_list:
+            instance = TARGET.windows_cipd_instance(call.args[2])
+            self.assertEqual(instance["hashAlgo"], "SHA1")
+            self.assertRegex(instance["hexDigest"], r"^[0-9a-f]{40}$")
+        self.assertEqual(ordinary.call_count, 32)
+        self.assertEqual(python_zip.call_count, 2)
+        self.assertEqual(rust.call_count, 1)
+        self.assertEqual({call.args[2]["name"] for call in python_zip.call_args_list}, {"cpython", "vpython"})
+        self.assertIs(receipt.call_args.args[2]["build_ready"], False)
+        self.assertIs(receipt.call_args.args[2]["genuine_vpython_realized"], False)
+        self.assertEqual(receipt.call_args.args[2]["tools_executed"], [])
+        for item in profile["materials"]:
+            if item["role"] not in TARGET.WINDOWS_PYTHON_ZIPS:
+                continue
+            tool = item["tool"]
+            table = TARGET.windows_python_zip_members(stager, tool)
+            self.assertEqual(len(table), len(tool["members"]))
+            with self.assertRaises(stager.Refusal):
+                stager.check_members(tool)
+            for changed in (dict(tool, sha256="0" * 64),
+                            dict(tool, source=dict(tool["source"], package="foreign/python"))):
+                with self.assertRaises(TARGET.Refused):
+                    TARGET.windows_python_zip_members(stager, changed)
+            for name in ("CON .txt", "../escape name", " parent/file", "parent/file ", "bad\tname"):
+                changed = copy.deepcopy(tool)
+                changed["members"][0]["path"] = name
+                with self.subTest(name=name), self.assertRaises((TARGET.Refused, stager.Refusal)):
+                    TARGET.windows_python_zip_members(stager, changed)
+            changed = copy.deepcopy(tool)
+            changed["members"][0]["sha256"] = "0" * 64
+            with self.assertRaises(TARGET.Refused):
+                TARGET.windows_python_zip_members(stager, changed)
+
+    def test_windows_python_zip_preserves_all_seven_original_spaced_spellings(self):
+        plan = json.loads((PATH.parents[1] / "native/webrtc/windows/pipeline-plan.json").read_bytes())
+        profile = json.loads((PATH.parents[1] / plan["runtime_profile"]["path"]).read_bytes())
+        names = [row["path"] for item in profile["materials"]
+                 if item["role"] in TARGET.WINDOWS_PYTHON_ZIPS
+                 for row in item["tool"]["members"] if " " in row["path"]]
+        self.assertEqual(len(names), 7)
+        helper_path = PATH.parent / "native_webrtc/python_stager.py"
+        self.assertEqual(hashlib.sha256(helper_path.read_bytes()).hexdigest(), TARGET.HELPERS["python_stager.py"])
+        spec = importlib.util.spec_from_file_location("windows_python_zip_actual_stager", helper_path)
+        stager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stager)
+        for bad_mode in (False, True):
+            with self.subTest(bad_mode=bad_mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                root.chmod(0o700)
+                archive, output = root / "synthetic.zip", root / "output"
+                table, payloads = {}, {}
+                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as target:
+                    for index, name in enumerate(names):
+                        data = ("synthetic original path DATA " + str(index)).encode("ascii")
+                        entry = zipfile.ZipInfo(name)
+                        entry.create_system = 3
+                        entry.external_attr = (stat.S_IFREG | (0o600 if bad_mode else 0o400)) << 16
+                        target.writestr(entry, data)
+                        payloads[name] = data
+                        table[name] = {"path": name, "kind": "regular", "bytes": len(data), "mode": 0o400,
+                                       "output_mode": 0o600, "sha256": hashlib.sha256(data).hexdigest()}
+                stage = object.__new__(stager.Stage)
+                stage.root, stage.files, stage.dirs = output, [], []
+                stage.windows = stager.WindowsDirectories() if os.name == "nt" else None
+                stage.held, stage.identities = [], {}
+                stage.mkdir(output)
+                try:
+                    # Full immutable archive/table admission is exercised above.
+                    # This synthetic ZIP isolates the real header/write/parent
+                    # boundary with original spellings and synthetic payloads.
+                    with mock.patch.object(TARGET, "windows_python_zip_members", return_value=table):
+                        if bad_mode:
+                            with self.assertRaises(TARGET.Refused):
+                                TARGET.windows_python_zip_extract(stager, stage,
+                                    {"bytes": archive.stat().st_size}, archive, output)
+                        else:
+                            TARGET.windows_python_zip_extract(stager, stage,
+                                {"bytes": archive.stat().st_size}, archive, output)
+                            self.assertEqual({p.relative_to(output).as_posix() for p in output.rglob("*") if p.is_file()},
+                                             set(names))
+                            for name, data in payloads.items():
+                                self.assertEqual(stager.snapshot(output / name, stager.MAX_FILE), data)
+                finally:
+                    stage.finish(False)
+
     def test_windows_rust_oversize_exception_is_exact_and_download_bucket_is_fixed(self):
         helper_path = PATH.parent / "native_webrtc/python_stager.py"
         self.assertEqual(hashlib.sha256(helper_path.read_bytes()).hexdigest(),

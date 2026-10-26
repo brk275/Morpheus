@@ -1,0 +1,35 @@
+name: Morpheus Mac native source producer entry
+description: Read-only host discovery or explicitly admitted Mac DATA/native producer
+inputs:
+  target:
+    required: true
+  xcode_app:
+    default: ''
+  phase:
+    required: true
+  plan_sha256:
+    default: ''
+  publish_handoff:
+    default: 'false'
+  cache_key:
+    default: ''
+  cache_id:
+    default: ''
+  handoff_sha256:
+    default: ''
+  handoff_bytes:
+    default: ''
+  admission_sha256:
+    default: ''
+outputs:
+  cache_key:
+    description: Exact new source DATA cache key
+  handoff_sha256:
+    description: Actual SDK-free DATA bundle SHA256
+  handoff_bytes:
+    description: Actual SDK-free DATA bundle bytes
+  cache_save:
+    description: Explicit save decision after exact inputs and free capacity
+runs:
+  using: node24
+  main: entry.cjs

@@ -50,6 +50,23 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(classify(paths + ["scripts/run_windows_capture_acceptance.py"])
                          ["native_matrix"]["os"], ["windows-2025"])
 
+    def test_manual_mac_native_source_producer_keeps_affected_scope(self):
+        paths = [".github/workflows/native-webrtc-macos-source.yml",
+                 "native/webrtc/macos/mac-arm64/pipeline-plan.json",
+                 "native/webrtc/macos/mac-x64/source-plan.json",
+                 "scripts/run_native_webrtc_macos.py",
+                 "scripts/native_webrtc/macos_materials.py",
+                 "scripts/build_native_webrtc_unix.py",
+                 ".github/workflows/native-webrtc-windows-source.yml",
+                 "native/webrtc/windows/pipeline-plan.json"]
+        self.assertFalse(classify(paths)["native"])
+        self.assertEqual(classify(paths, force_all=True)["native_matrix"]["os"], list(PLATFORMS))
+        for shared in ("Cargo.lock", "vendor/libwebrtc/src/lib.rs", ".github/workflows/unknown-mac-producer.yml",
+                       "native/webrtc/unknown-platform/input.json", "crates/morpheus-rtc/src/media.rs"):
+            with self.subTest(shared=shared):
+                self.assertEqual(classify(paths + [shared])["native_matrix"]["os"], list(PLATFORMS))
+
+
     def test_matrix_diagnostics_preserve_native_scope_without_unrelated_portal(self):
         reviewed = {"crates/morpheus-matrix/tests/drafts_local.rs",
                     "scripts/run_matrix_acceptance.py", "scripts/tests/test_matrix_acceptance.py"}

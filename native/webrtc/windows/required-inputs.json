@@ -3,6 +3,13 @@
     "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
     "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
   },
+  "bound_runtime_archive_data": {
+    "archive_presence_proves_environment": false,
+    "bytes": 3612901,
+    "material_count": 35,
+    "path": "native/webrtc/windows/runtime-data.json",
+    "sha256": "761d5d56e3568d53d08afdd3a67ba61043e14b5bcf9b195251eea56891c56494"
+  },
   "build_ready": false,
   "cache_restore_enabled": false,
   "compiler_cipd_runtime_closure": false,
@@ -19,8 +26,8 @@
     "Fresh Windows2025 Python and Git actual file SHA/bytes/version plus tool/image admission",
     "Windows-selected complete DEPS literal/Var/condition context, repositories/trees and gitlinks source plan",
     "Exact Windows SDK/platform5 plus root8 ordered patch manifest with complete pre/postimages",
-    "Windows CPython3.11, vpython, CIPD executable/runtime/wheels archive bytes/instances/member licenses",
-    "Windows Rust toolchain exact revision/archive/member/source/license and source projection",
+    "Complete toolchain trust, source/preferred-form and license closure for the35 bound Windows runtime archives; DATA staging grants no tool execution",
+    "Windows Rust actual source projection and compiler usability; exact revision/archive/member DATA are bound in runtime-data.json",
     "Genuine Windows CIPD cache/tag resolution and vpython environment realization proof (DATA archive presence is insufficient)",
     "Host Microsoft VisualStudio/MSVC and WindowsSDK versions/roots/complete inventories/ABI; host-only no redistribution",
     "Pinned GN generated metadata/Clang revision and license tool resolution proof",

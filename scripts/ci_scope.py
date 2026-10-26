@@ -125,8 +125,9 @@ def classify(paths, force_all=False):
             native.update(PLATFORMS)
         elif (path in MANUAL_LINUX_PACKAGE_INPUTS or path in MANUAL_NATIVE_VAULT_INPUTS
               or path in {"scripts/ci_scope.py", ".github/workflows/native-webrtc-source.yml",
+                          ".github/workflows/native-webrtc-macos-source.yml",
                           ".github/workflows/native-webrtc-windows-source.yml"}
-              or path.startswith("native/webrtc/linux/") or path.startswith("native/webrtc/windows/")):
+              or path.startswith("native/webrtc/linux/") or path.startswith("native/webrtc/macos/") or path.startswith("native/webrtc/windows/")):
             # The classifier itself is exercised by the always-on helper
             # tests. Mixed changes still select their affected native inputs;
             # manual full verification remains an unconditional full matrix.

@@ -19,8 +19,12 @@ import shutil
 import ssl
 import stat
 import sys
+import struct
 import tarfile
+import time
+import urllib.parse
 import types
+import zipfile
 
 REPOSITORY = "brk275/Morpheus"
 NATIVE = "aaeeee8077eb0a4cad1c9494e9c6433c751ef663"
@@ -38,6 +42,78 @@ MAX_FILE = 64 * 1024 ** 3
 MAX_FILES = 1_000_000
 MAX_TOTAL = 256 * 1024 ** 3
 
+
+# Original Windows Python ZIPs contain7literal internal-space paths. Only
+# these full immutable archive/source/member identities use the ZIP path mode.
+# Three original universal CIPD instances use SHA1 identity. Their full
+# independent archive SHA256 remains mandatory; no equivalent lookup is guessed.
+WINDOWS_CIPD_SHA1 = {
+    "wheels-a93ae92281633f3c": {
+        "name": "wheels-a93ae92281633f3c",
+        "format": "zip",
+        "bytes": 18131,
+        "sha256": "cb6fb4cb7adcefe636c6568059d428cd5c5c23181060594313e1085b35173ba8",
+        "source": {
+            "kind": "cipd",
+            "package": "infra/python/wheels/funcsigs-py2_py3",
+            "version": "version:1.0.2"
+        },
+        "instance_sha1": "647d7235398bf27d91f882879db00e029aee9a08"
+    },
+    "wheels-5b08a8c609e85acc": {
+        "name": "wheels-5b08a8c609e85acc",
+        "format": "zip",
+        "bytes": 23504,
+        "sha256": "77027fb33b5933b7801613c8ea6999552969fe1882de702d434927c59fee550e",
+        "source": {
+            "kind": "cipd",
+            "package": "infra/python/wheels/packaging-py2_py3",
+            "version": "version:16.8"
+        },
+        "instance_sha1": "fe6a85cf07fb8b9fdfd97ed5ec171983dc4ada97"
+    },
+    "wheels-321750c49ce19b7c": {
+        "name": "wheels-321750c49ce19b7c",
+        "format": "zip",
+        "bytes": 10762,
+        "sha256": "4a23290e689d8df1695cc54758e9c3c7e969a820c25396043ce6b893816ebb33",
+        "source": {
+            "kind": "cipd",
+            "package": "infra/python/wheels/six-py2_py3",
+            "version": "version:1.10.0"
+        },
+        "instance_sha1": "e00dc04ad5029579cffc146324c365377f8bcd1d"
+    }
+}
+
+WINDOWS_PYTHON_ZIPS = {
+    "vpython": {
+        "name": "vpython",
+        "format": "zip",
+        "bytes": 49390243,
+        "sha256": "4de8953e0721bd13e614f1f6ee576ef3e0f019170b01b2f6bb680af906c6cefe",
+        "source": {
+            "kind": "cipd",
+            "package": "infra/tools/luci/vpython3/windows-amd64",
+            "version": "git_revision:ad0c4b622c7d4cee870f57eed8170c059ca42ed3"
+        },
+        "member_count": 3772,
+        "members_sha256": "37b9118afea858976fb67a5a6116ddd61d69d2f900fcb8e63ad51a225e402712"
+    },
+    "cpython": {
+        "name": "cpython",
+        "format": "zip",
+        "bytes": 19711639,
+        "sha256": "11fc068d726c84eae9bf43ec1bb56a435febdadbac24e6a80a0d8b8daac19d50",
+        "source": {
+            "kind": "cipd",
+            "package": "infra/3pp/tools/cpython3/windows-amd64",
+            "version": "version:2@3.11.8.chromium.35"
+        },
+        "member_count": 1907,
+        "members_sha256": "d088daa8c3dc94d5605ac32e0b3d832e7fc69d0c6107081759a845a7e130258d"
+    }
+}
 
 # Exact Windows Rust DATA from the pinned tools/rust/update_rust.py caller.
 # This is not the Linux rust material, a version resolver or execution authority.
@@ -508,6 +584,124 @@ def windows_rust_extract(stager, stage, tool, archive, output):
     stage.files.remove(tar_path)
 
 
+def windows_python_zip_members(stager, tool):
+    pin = WINDOWS_PYTHON_ZIPS.get(tool.get("name"))
+    need(pin is not None and all(tool.get(key) == pin[key]
+         for key in ("name", "format", "bytes", "sha256", "source"))
+         and tool["alias_copies"] == [] and tool["omitted_aliases"] == []
+         and tool["omission_evidence"] is None)
+    members = tool["members"]
+    need(type(members) is list and len(members) == pin["member_count"] <= stager.MAX_MEMBERS)
+    table, ordinary, prefixes = {}, [], {}
+    folded, expanded = set(), 0
+    for row in members:
+        need(type(row) is dict and set(row) == {"path", "kind", "bytes", "mode", "sha256", "output_mode"}
+             and row["kind"] == "regular")
+        name = stager.rel(row["path"], internal_spaces=True)
+        need(name not in table and name.casefold() not in folded)
+        folded.add(name.casefold())
+        stager.bounded_int(row["bytes"], 0, stager.MAX_FILE)
+        need(type(row["mode"]) is int and row["mode"] & ~0o777 == 0
+             and type(row["sha256"]) is str and HEX.fullmatch(row["sha256"])
+             and row["output_mode"] == (0o700 if row["mode"] & 0o111 else 0o600))
+        table[name] = row
+        expanded += row["bytes"]
+        if " " not in name:
+            ordinary.append(row)
+        parts = name.split("/")
+        for count in range(1, len(parts)):
+            parent = "/".join(parts[:count])
+            need(prefixes.setdefault(parent.casefold(), parent) == parent)
+    need(expanded <= stager.MAX_EXPANDED and not folded.intersection(prefixes))
+    # The unchanged checker still covers every ordinary spelling. The full
+    # pinned inventory and the same explicit path/type/mode/hash checks above
+    # cover the7original spaced files; no generic parser policy is loosened.
+    stager.check_members(dict(tool, members=ordinary))
+    raw = (json.dumps(members, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    need(hashlib.sha256(raw).hexdigest() == pin["members_sha256"])
+    return table
+
+
+def windows_python_zip_extract(stager, stage, tool, archive, output):
+    table = windows_python_zip_members(stager, tool)
+    # Retain the original generic ZIP central-directory and entry limits.
+    with archive.open("rb") as source:
+        source.seek(max(0, tool["bytes"] - 65557))
+        tail = source.read(65557)
+    position = tail.rfind(b"PK\x05\x06")
+    need(position >= 0 and len(tail) - position >= 22)
+    header = struct.unpack("<4s4H2LH", tail[position:position + 22])
+    need(header[1] == header[2] == 0 and header[3] == header[4] <= stager.MAX_MEMBERS
+         and header[5] <= 4 * 1024 * 1024 and header[6] + header[5] <= tool["bytes"]
+         and header[7] == len(tail) - position - 22)
+    seen = set()
+    with zipfile.ZipFile(archive, "r", allowZip64=False) as source:
+        for member in source.infolist():
+            need(not member.flag_bits & 1 and not member.is_dir()
+                 and member.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED))
+            name = stager.rel(member.filename, internal_spaces=True)
+            need(name in table and name not in seen)
+            seen.add(name)
+            row = table[name]
+            mode = (member.external_attr >> 16) & 0o177777
+            need(stat.S_IFMT(mode) in (0, stat.S_IFREG)
+                 and (member.file_size, mode & 0o777) == (row["bytes"], row["mode"]))
+            with source.open(member) as stream:
+                stager.write_member(stage, output / name, stream, row)
+    need(seen == set(table))
+
+
+def windows_cipd_instance(tool):
+    pin = WINDOWS_CIPD_SHA1.get(tool.get("name"))
+    need(pin is not None and all(tool.get(key) == pin[key]
+         for key in ("name", "format", "bytes", "sha256", "source")))
+    return {"hashAlgo": "SHA1", "hexDigest": pin["instance_sha1"]}
+
+
+def windows_cipd_download(stager, stage, tool, archive):
+    instance = windows_cipd_instance(tool)
+    payload = json.dumps({"package": tool["source"]["package"], "instance": instance},
+                         separators=(",", ":")).encode()
+    connection, response = stager.https(
+        "https://chrome-infra-packages.appspot.com/prpc/cipd.Repository/GetInstanceURL",
+        method="POST", body=payload, json_response=True)
+    try:
+        raw = response.read(65537)
+        need(len(raw) <= 65536 and raw.startswith(b")]}'"))
+        record = stager.decode(raw[4:])
+        need(type(record) is dict and set(record) == {"signedUrl"})
+        signed = urllib.parse.urlsplit(record["signedUrl"])
+        need(signed.hostname == "storage.googleapis.com"
+             and signed.path == "/chrome-infra-packages/store/SHA1/" + instance["hexDigest"]
+             and bool(signed.query))
+    finally:
+        connection.close()
+    # The original reviewed transport independently enforces HTTPS/host/port,
+    # no redirects/credentials/ambient auth/encoding before this bounded read.
+    connection, response = stager.https(record["signedUrl"])
+    try:
+        need(response.getheader("Content-Length") == str(tool["bytes"])
+             and response.getheader("Transfer-Encoding") is None)
+        actual, original, count = hashlib.sha256(), hashlib.sha1(), 0
+        deadline = time.monotonic() + 300
+        with stage.create(archive) as output:
+            while count < tool["bytes"]:
+                need(time.monotonic() < deadline)
+                block = response.read(min(1024 * 1024, tool["bytes"] - count))
+                need(bool(block))
+                count += len(block)
+                need(count <= tool["bytes"])
+                output.write(block)
+                actual.update(block)
+                original.update(block)
+            need(response.read(1) == b"" and actual.hexdigest() == tool["sha256"]
+                 and original.hexdigest() == instance["hexDigest"])
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        connection.close()
+
+
 def runtime_stage(stager, workspace, plan, control):
     _, profile = bound_asset(workspace, plan["runtime_profile"])
     need(type(profile) is dict and set(profile) == {"schema", "target", "materials"}
@@ -553,6 +747,8 @@ def runtime_stage(stager, workspace, plan, control):
         origins.add(identity)
         if key == "rust":
             windows_rust_members(stager, tool)
+        elif key in WINDOWS_PYTHON_ZIPS:
+            windows_python_zip_members(stager, tool)
         else:
             stager.check_members(tool)
         need(all(row["kind"] in ("regular", "directory") for row in tool["members"]))
@@ -561,8 +757,14 @@ def runtime_stage(stager, workspace, plan, control):
             windows_rust_download(stager, control, tool, archive)
             windows_rust_extract(stager, control, tool, archive, control.root / "runtime" / key)
         else:
-            stager.download(control, tool, archive)
-            stager.extract(control, tool, archive, control.root / "runtime" / key)
+            if key in WINDOWS_CIPD_SHA1:
+                windows_cipd_download(stager, control, tool, archive)
+            else:
+                stager.download(control, tool, archive)
+            if key in WINDOWS_PYTHON_ZIPS:
+                windows_python_zip_extract(stager, control, tool, archive, control.root / "runtime" / key)
+            else:
+                stager.extract(control, tool, archive, control.root / "runtime" / key)
     # These are genuine archive bytes, not a fabricated CIPD cache/tag lookup,
     # vpython environment realization, Python/Rust execution or SDK substitute.
     write_json(control, control.root / "runtime-data-receipt.json", {"schema": 1,
