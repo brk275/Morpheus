@@ -33,9 +33,9 @@ SECURITY = "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
 CORE = "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
 HELPERS = {
     "python_stager.py": "4de9a016a988535b7576f2e0d7561afa290529dae7b1eb267bb8382956d49d02",
-    "git_source_stager.py": "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b",
+    "git_source_stager.py": "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211",
 }
-RECIPE = "08830749810e79b9977ac4bdb39b48059e0b837305873e486747812240a54c8b"
+RECIPE = "27097b3f4fa2be835c3b5cd984622be4c3fc551571104879077ebeb97a1c1bff"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 MAX_JSON = 128 * 1024 * 1024
 MAX_FILE = 64 * 1024 ** 3
@@ -349,7 +349,7 @@ def source_stage(stager, temp, workspace, plan, control):
     _, patch = bound_asset(workspace, profile["patch_manifest"])
     security, security_value = bound_asset(workspace, profile["security_plan"])
     need(profile["security_plan"]["sha256"] == SECURITY
-         and original["schema"] == "morpheus-native-webrtc-sources-v2" and original["target"] == "win-x64"
+         and original["schema"] == "morpheus-native-webrtc-sources-v3" and original["target"] == "win-x64"
          and security_value["baseline_commit"] == NATIVE and security_value["baseline_tree"] == TREE)
     need(type(profile["patch_files"]) is list and 13 <= len(profile["patch_files"]) <= 32)
     # Keep the original protected-temp input boundary of the pinned exporter.
@@ -426,9 +426,14 @@ def project(owner, source, core, core_manifest, runtime, runtime_profile):
     # other tool material can be silently overwritten or coalesced.
     src = source / "checkout/src"
     original = {row["path"].casefold() for row in tree_files(src)}
+    normalizer = fixed_module("git_source_stager.py", HELPERS["git_source_stager.py"])
+    aliases = normalizer.verify_source_aliases(source)
     markers = load_unbound(source / "materials/gitlinks.json")
     roots = {row["exported_path"].removeprefix("src/").casefold() for row in markers
              if row["exported_path"].startswith("src/")}
+    roots.update((row["mount"] + "/" + value).removeprefix("src/").casefold()
+                 for row in aliases for value in (row["path"], row["target_path"])
+                 if row["mount"] == "src" or row["mount"].startswith("src/"))
     out = []
     def add(origin, name, value, output_mode):
         name = relative(name)
@@ -467,6 +472,7 @@ def project(owner, source, core, core_manifest, runtime, runtime_profile):
     overlay = source / "materials/windows-source-overlay.json"
     register_parent(owner, overlay.parent)
     write_json(owner, overlay, sorted(out, key=lambda row: row["path"]))
+    normalizer.verify_source_aliases(source)
     return overlay
 
 

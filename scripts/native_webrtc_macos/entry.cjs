@@ -4,6 +4,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+// Only source-fixed categories may cross the failed-entry boundary.
+const ENTRY_FAILURES = Object.freeze(["entry", "host_guard", "workspace", "plan_read", "plan_parse", "plan_identity", "preflight_input", "preflight_tools", "preflight_xcode_listing", "preflight_xcode_root", "preflight_xcode_version", "preflight_sdk_listing", "preflight_sdk_metadata", "preflight_sdk_inventory", "preflight_python_listing", "preflight_zstd_candidates", "preflight_emit", "producer_input", "python_admission", "producer_source", "exec_support", "producer_args", "exec_handover"]);
+let entryFailure = 'entry';
 function need(ok) { if (!ok) throw new Error(); }
 function fact(name, cap = 128 * 1024 * 1024) {
   const actual = fs.realpathSync(name);
@@ -69,32 +72,44 @@ function sdkInventory(root) {
 try {
   const input = name => process.env[`INPUT_${name.toUpperCase()}`] || '';
   const target = input('target'), phase = input('phase');
+  entryFailure = 'host_guard';
   need(process.platform === 'darwin' && ['mac-arm64', 'mac-x64'].includes(target));
   need(process.arch === (target === 'mac-arm64' ? 'arm64' : 'x64'));
   need(process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_ENVIRONMENT === 'github-hosted'
     && process.env.GITHUB_REPOSITORY === 'brk275/Morpheus' && process.env.GITHUB_REF === 'refs/heads/main'
     && process.env.GITHUB_ACTOR === 'brk275' && process.env.GITHUB_TRIGGERING_ACTOR === 'brk275'
     && process.env.GITHUB_EVENT_NAME === 'workflow_dispatch');
+  entryFailure = 'workspace';
   const workspace = fs.realpathSync(process.env.GITHUB_WORKSPACE);
   const planPath = path.join(workspace, 'native/webrtc/macos', target, 'pipeline-plan.json');
+  entryFailure = 'plan_read';
   const raw = read(planPath, 1024 * 1024), planSha = crypto.createHash('sha256').update(raw).digest('hex');
+  entryFailure = 'plan_parse';
   const plan = JSON.parse(raw.toString('utf8'));
+  entryFailure = 'plan_identity';
   need(plan.schema === 'morpheus-native-macos-pipeline-v1' && plan.target === target);
   if (phase === 'preflight') {
+    entryFailure = 'preflight_input';
     need(input('publish_handoff') === 'false');
+    entryFailure = 'preflight_tools';
     const tools = {};
     for (const role of ['git', 'xcodebuild', 'xcrun', 'xcode-select', 'sw_vers']) tools[role] = fact('/usr/bin/' + role);
+    entryFailure = 'preflight_xcode_listing';
     const xcodes = fs.readdirSync('/Applications').filter(x => /^Xcode(?:_[A-Za-z0-9_.-]+)?\.app$/.test(x));
     need(xcodes.length <= 32);
     const sdk = [];
     for (const app of xcodes) {
+      entryFailure = 'preflight_xcode_root';
       const root = path.join('/Applications', app), canonical = fs.realpathSync(root);
       need(path.dirname(canonical) === '/Applications');
+      entryFailure = 'preflight_xcode_version';
       const version = fact(path.join(canonical, 'Contents/version.plist'), 1024 * 1024);
       const sdkDir = path.join(canonical, 'Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs');
+      entryFailure = 'preflight_sdk_listing';
       const names = fs.readdirSync(sdkDir).filter(n => /^MacOSX\d+\.\d+\.sdk$/.test(n)); need(names.length <= 32);
       for (const name of names) {
         const file = path.join(sdkDir, name, 'System/Library/CoreServices/SystemVersion.plist');
+        entryFailure = 'preflight_sdk_metadata';
         const metadata = fact(file, 1024 * 1024); delete metadata.path;
         const appVersion = { ...version }; delete appVersion.path;
         need(sdk.length < 32);
@@ -103,9 +118,11 @@ try {
     }
     let fullSdk = 'UNBOUND';
     if (input('xcode_app')) {
+      entryFailure = 'preflight_sdk_inventory';
       need(/^Xcode(?:_[A-Za-z0-9_.-]+)?\.app$/.test(input('xcode_app')) && xcodes.includes(input('xcode_app')));
       fullSdk = sdkInventory(path.join('/Applications', input('xcode_app')));
     }
+    entryFailure = 'preflight_python_listing';
     const pythonCandidates = [];
     const prefixes = ['/Library/Frameworks/Python.framework/Versions', '/opt/hostedtoolcache/Python'];
     for (const prefix of prefixes) {
@@ -121,6 +138,7 @@ try {
         }
       }
     }
+    entryFailure = 'preflight_zstd_candidates';
     const zstdCandidates = [];
     for (const candidate of ['/usr/local/bin/zstd', '/opt/homebrew/bin/zstd']) {
       if (!fs.existsSync(candidate)) continue;
@@ -128,6 +146,7 @@ try {
       catch (_) { zstdCandidates.push({candidate_path: candidate, admissible_root_owned_identity: false}); }
     }
     // No version commands, Xcode selection, license acceptance, installs or SDK copies.
+    entryFailure = 'preflight_emit';
     console.log('MORPHEUS_NATIVE_MAC_HOST_INPUTS ' + JSON.stringify({ schema: 1, target,
       source_commit: process.env.GITHUB_SHA, run_id: process.env.GITHUB_RUN_ID, run_attempt: process.env.GITHUB_RUN_ATTEMPT,
       image_os: process.env.ImageOS || null, image_version: process.env.ImageVersion || null,
@@ -136,14 +155,19 @@ try {
       sdk_redistributed: false, cache_write: false, staged: false, build_admission_granted: false,
       native_sources_complete: false, build_ready: false, distribution_ready: false }));
   } else {
+    entryFailure = 'producer_input';
     need(input('xcode_app') === '');
     need(['stage', 'build', 'cache-receipt'].includes(phase) && /^[0-9a-f]{64}$/.test(input('plan_sha256')) && planSha === input('plan_sha256'));
+    entryFailure = 'python_admission';
     const python = plan.host_python;
     need(python && typeof python.path === 'string' && (python.path.startsWith('/Library/Frameworks/Python.framework/') || python.path.startsWith('/opt/hostedtoolcache/Python/')));
     const actual = fact(python.path); need(actual.path === python.path && actual.sha256 === python.sha256 && actual.bytes === python.bytes);
+    entryFailure = 'producer_source';
     const script = path.resolve(__dirname, '..', 'run_native_webrtc_macos.py');
     const scriptRaw = read(script, 256 * 1024); need(crypto.createHash('sha256').update(scriptRaw).digest('hex') === plan.pipeline_sha256);
+    entryFailure = 'exec_support';
     need(typeof process.execve === 'function');
+    entryFailure = 'producer_args';
     const args = [python.path, '-I', '-B', script, '--target', target, '--phase', phase, '--plan', planPath, '--plan-sha256', planSha];
     if (phase === 'stage') {
       need(['cache_key','cache_id','handoff_sha256','handoff_bytes','admission_sha256'].every(name => input(name) === ''));
@@ -155,6 +179,11 @@ try {
     }
     const env = { ...process.env, PYTHONNOUSERSITE: '1', PYTHONDONTWRITEBYTECODE: '1' };
     for (const name of ['NODE_OPTIONS','PYTHONPATH','PYTHONHOME','VPYTHON_BYPASS','VPYTHON_VIRTUALENV_ROOT','CIPD_CACHE_DIR']) delete env[name];
+    entryFailure = 'exec_handover';
     process.execve(python.path, args, env); throw new Error();
   }
-} catch (_) { process.stderr.write('MORPHEUS_NATIVE_MAC_PRODUCER_ENTRY failed\n'); process.exitCode = 1; }
+} catch (_) {
+  const category = ENTRY_FAILURES.includes(entryFailure) ? entryFailure : 'entry';
+  process.stderr.write('MORPHEUS_NATIVE_MAC_PRODUCER_ENTRY failed category=' + category + '\n');
+  process.exitCode = 1;
+}

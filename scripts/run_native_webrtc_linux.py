@@ -35,20 +35,20 @@ CACHE_RESERVE = 1_000_000_000
 MAX_EXPANDED = 32 * 1024 * 1024 * 1024
 MAX_MEMBERS = 1_000_000
 MAX_JSON = 128 * 1024 * 1024
-INPUT_PLAN = "2489cdd737218109dd56378f9b7049aeda68df3798dc670c1899cb1e90a9d32c"
+INPUT_PLAN = "656733d46a801782283d8b8e573f65dff01cc83934da545c66c81b635656b454"
 PATCH_MANIFEST = "e97be792680220ec3d21f39a0a950599a3266fd3041e2a8d5027df36d946b714"
 SECURITY_PLAN = "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
 PYTHON_PLAN = "b3cd3a5066338da7fa450fe48580d987dbb88f90d9497dc2106802ab989c0aea"
 INSTRUMENTED_PLAN = "927a95029b9ddc8f4b4cce20f07975505b343260d913b9c3488bc6f6182ad0f9"
 HELPERS = {
-    "git_source_stager.py": "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b",
-    "source_importer.py": "20d92bfd183f60be2011da16cc7a6916158dfbc7e76fcedc126cfe53210cc5e5",
+    "git_source_stager.py": "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211",
+    "source_importer.py": "c74bdee7672625427f584769d2401fd9e8cbe1d59187d42086c07b48372c5833",
     "linux_stager.py": "f3a908bc20170ee01f2643169ce60397627981d86de11ffaedf03dd8ea9e1c8c",
     "python_stager.py": "4de9a016a988535b7576f2e0d7561afa290529dae7b1eb267bb8382956d49d02",
     "instrumented_stager.py": "8903aef2de2ea5a7778ad4ba21047909ad7595d3e1359f151829e489910fc84f",
     "linux_materials.py": "acca8d027e3e2f1ce3a38181345b522a2906e5eeb1a1fc39cd3c1d2ff3bf0b51",
 }
-BUILD_RECIPE = "934991862c91f25a50a161c22e54858d23dc9d02daf75be88ddd7d32763908e1"
+BUILD_RECIPE = "e845aeaa16dd270d1c9e319feeecbe18be1d77677646e83d460bc1605f267bb7"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -740,6 +740,7 @@ def stage(args, plan, temp, material):
         row["file"] = str(p)
     relocated_patches = control / "patch-manifest.json"
     patch_fact = material.write_json(relocated_patches, patches)
+    need(source_plan["schema"] == "morpheus-native-webrtc-sources-v3")
     original_git = source_plan["git"]
     need(all("UNBOUND" in str(v) for v in original_git.values() if v is not None))
     need(Path(plan["host_git"]["path"]) == Path("/usr/bin/git").resolve(strict=True)
@@ -768,7 +769,7 @@ def stage(args, plan, temp, material):
         "job": os.environ["GITHUB_JOB"], "source": {"root": str(original),
           "inventory": {"path": str(original_inventory), "sha256": original_fact["sha256"]},
           "producer_source_sha256": HELPERS["git_source_stager.py"],
-          "producer_binding_sha256": "33d7a49ef10d0c3f6acc2a8466c762e8fbabf6212c1ae0038b81839ded4fcb1b"},
+          "producer_binding_sha256": "a10f3368c06f2f7c31642e952e606dd09c006a81d8d4ded554cf8ab609db6585"},
         "instrumented": {"root": str(roots["instrumented"]),
           "plan": {"path": "selected-instrumented-inputs.json", "sha256": INSTRUMENTED_PLAN},
           "materials": {"path": "tool-materials.json", "sha256": instrumented_materials["sha256"]},
@@ -780,9 +781,15 @@ def stage(args, plan, temp, material):
     base = assembled / "provision"
     files, directories = scan_tree(material, base)
     marker_rows = load(base / "materials/gitlinks.json", material.file_fact(base / "materials/gitlinks.json")["sha256"])
+    normalizer = module("git_source_stager.py")
+    aliases = normalizer.verify_source_aliases(base)
+    protected = [row["exported_path"] for row in marker_rows]
+    protected += [row["mount"] + "/" + value for row in aliases
+                  for value in (row["path"], row["target_path"])]
     overlay, files, directories = material.project(base, files, directories,
-        [row["exported_path"] for row in marker_rows], [(kind, roots[kind],
+        protected, [(kind, roots[kind],
          material.file_fact(roots[kind] / "tool-materials.json")["sha256"]) for kind in ("core", "linux")])
+    normalizer.verify_source_aliases(base)
     old_overlay = load(base / "materials/instrumented-source-overlay.json",
         material.file_fact(base / "materials/instrumented-source-overlay.json")["sha256"])
     projection = sorted(old_overlay + overlay, key=lambda row: row["path"])

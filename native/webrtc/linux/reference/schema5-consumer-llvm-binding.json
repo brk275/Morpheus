@@ -1,6 +1,6 @@
 {
   "build_ready": false,
-  "change_kind": "validator_logic_extended_with_exact_shared_llvm_material_identity",
+  "change_kind": "exact_source_alias_normalization_validation_at_existing_marker_checkpoints",
   "compiler_cipd_runtime_closure": false,
   "distribution_ready": false,
   "execution_admitted": false,
@@ -20,15 +20,23 @@
   "native_sources_complete": false,
   "parent_consumer_binding_path": "reference/schema5-consumer-privacy-binding.json",
   "parent_consumer_binding_sha256": "088e25fef10412a68d8cc97cbeb6d815d34985d3a61cca1a82a0509b4f8d3fb2",
-  "producer_interface_sha256": "bc3d31fd5a9ea468c603847f6b699d24b8f958e5734d75da52913dd3b90ac898",
+  "producer_interface_sha256": "ebfdd22dd8eaa6ee893adbdc9fe904f5e859d33b7353b067a66c32df526508bf",
   "receipt_semantics": "New consumer declaration for a genuine validator extension; not an equivalence-only rebind or execution approval.",
   "recipe": {
     "path": "scripts/build_native_webrtc_unix.py",
-    "sha256": "934991862c91f25a50a161c22e54858d23dc9d02daf75be88ddd7d32763908e1"
+    "sha256": "e845aeaa16dd270d1c9e319feeecbe18be1d77677646e83d460bc1605f267bb7"
   },
   "same_twelve_external_gates_and_twelve_native_cases": true,
   "schema": "morpheus-native-schema5-consumer-llvm-extension-v1",
   "security_plan_sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080",
+  "source_normalization": {
+    "aliases_material": "materials/source-aliases.json",
+    "cross_scope_overlays_refused": true,
+    "filesystem_symlinks_created": false,
+    "originals_and_copy_outputs_checked": true,
+    "source_normalizer_sha256": "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211",
+    "source_plan_schema": "morpheus-native-webrtc-sources-v3"
+  },
   "validator_extension": {
     "other_collision_refusals_preserved": true,
     "overlap": "Only exact path/type/bytes/SHA256/mode for third_party/llvm-build/Release+Asserts/bin/llvm-nm may coalesce. Both original profiles are verified and retained; no overwrite or omitted input inventory.",

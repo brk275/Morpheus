@@ -76,9 +76,9 @@
       "sha256": "83bfe8101270cc60be25991ec07bbabf51c071f6529b50895e4b1ef07314b81f"
     },
     {
-      "bytes": 19789,
+      "bytes": 61650,
       "path": "native/webrtc/macos/mac-x64/source-plan.json",
-      "sha256": "c58ddfb3f0639ecd1911baa0764050732317c87c39c6a9f1c604e6cef569a172"
+      "sha256": "6d45ee75d71dffaa30a376f17463188c47fbc6b0b347078a61a1cd76085f9ca0"
     },
     {
       "bytes": 14512,
@@ -99,6 +99,11 @@
       "bytes": 3066223,
       "path": "native/webrtc/macos/mac-x64/selected-mac-materials.json",
       "sha256": "64f88aeb7dde4306ff37ee723bf979dcc12c4d08362a1195a73210a974be76c9"
+    },
+    {
+      "bytes": 2428,
+      "path": "native/webrtc/linux/reference/producer-interface.json",
+      "sha256": "ebfdd22dd8eaa6ee893adbdc9fe904f5e859d33b7353b067a66c32df526508bf"
     }
   ],
   "cache_handoff_authorized": false,
@@ -140,7 +145,7 @@
     "path": "native/webrtc/macos/patch-manifest.json",
     "sha256": "b2ca5cb477a68c18f273b66ea310b387976a85305f667bc531ccb35a0950ed79"
   },
-  "pipeline_sha256": "06751b9e852123b54db025ef05f459c3f4b6995f63ba7a33b5ee1867630c3b64",
+  "pipeline_sha256": "90d94cec8709db1457830c6ace1346eb4f37974c2d761285d703b0596d11acd2",
   "production_targets": [
     ":default",
     "api/audio_codecs:builtin_audio_decoder_factory",
@@ -153,7 +158,7 @@
     "desktop_capture_objc",
     "modules/audio_device:audio_device"
   ],
-  "recipe_sha256": "934991862c91f25a50a161c22e54858d23dc9d02daf75be88ddd7d32763908e1",
+  "recipe_sha256": "e845aeaa16dd270d1c9e319feeecbe18be1d77677646e83d460bc1605f267bb7",
   "schema": "morpheus-native-macos-pipeline-v1",
   "security_patch_count": 8,
   "security_plan": {
@@ -162,7 +167,7 @@
   },
   "source_plan": {
     "path": "native/webrtc/macos/mac-x64/source-plan.json",
-    "sha256": "c58ddfb3f0639ecd1911baa0764050732317c87c39c6a9f1c604e6cef569a172"
+    "sha256": "6d45ee75d71dffaa30a376f17463188c47fbc6b0b347078a61a1cd76085f9ca0"
   },
   "target": "mac-x64"
 }

@@ -7,6 +7,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -534,7 +535,7 @@ class WindowsNativeInputsTests(unittest.TestCase):
             manifest = asset("patch-manifest.json", {"schema": "morpheus-native-source-patches-v1",
                 "patches": [{"file": row["path"], "bytes": row["bytes"], "sha256": row["sha256"]}
                             for row in patches]})
-            source_plan = asset("source-plan.json", {"schema": "morpheus-native-webrtc-sources-v2",
+            source_plan = asset("source-plan.json", {"schema": "morpheus-native-webrtc-sources-v3",
                 "target": "win-x64", "git": {"path": "GIT_UNBOUND"}})
             git = workspace / "git.exe"
             git.write_bytes(b"synthetic tool DATA only")
@@ -599,6 +600,61 @@ class WindowsNativeInputsTests(unittest.TestCase):
             TARGET.runner()
         api.assert_not_called()
         module.assert_not_called()
+
+    if os.name == "nt":
+        def test_actual_entry_wrapped_file_and_raw_directory_ancestry(self):
+            # This regression requires the fresh affected Windows host. It
+            # invokes only reviewed entry ancestry on generated temporary data.
+            self.assertEqual(os.environ.get("GITHUB_ACTIONS"), "true")
+            self.assertEqual(os.environ.get("RUNNER_ENVIRONMENT"), "github-hosted")
+            workflow = (PATH.parents[1] / ".github/workflows/native-webrtc-windows-source.yml").read_text()
+            start = workflow.index("            while ($null -ne $parent) {")
+            end = workflow.index("            $entryFailure = 'python_identity'", start)
+            walk = workflow[start:end]
+            self.assertEqual(walk.count("while ($null -ne $parent) {"), 1)
+            walk = walk.replace("while ($null -ne $parent) {",
+                                "while ($null -ne $parent) {\n              $visited.Add($parent.FullName)", 1)
+            script = r"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+try {
+    $root = $env:MORPHEUS_ANCESTRY_ROOT
+    $directory = Join-Path $root 'actual\nested'
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
+    $file = Join-Path $directory 'synthetic.bin'
+    [IO.File]::WriteAllBytes($file, [byte[]]@(1,2,3,4))
+    $item = Get-Item -LiteralPath $file -Force
+    if ($item -isnot [IO.FileInfo] -or $item.PSIsContainer) { throw 'wrapped' }
+    $raw = $item.Directory
+    if ($raw -isnot [IO.DirectoryInfo] -or $null -ne $raw.PSObject.Properties['PSIsContainer']) { throw 'raw' }
+    $visited = [Collections.Generic.List[string]]::new()
+    $parent = $item
+    $walk = [ScriptBlock]::Create($env:MORPHEUS_ENTRY_WALK)
+    . $walk
+    if ($null -ne $parent -or $visited.Count -lt 3 -or $visited[0] -cne $item.FullName -or
+        $visited[1] -cne $raw.FullName -or $visited[$visited.Count - 1] -cne $raw.Root.FullName) { throw 'ancestry' }
+    # A genuine temporary junction must still trigger the unchanged explicit
+    # reparse refusal, rather than an absent-property/other incidental error.
+    $alias = Join-Path $root 'alias'
+    New-Item -ItemType Junction -Path $alias -Target $directory | Out-Null
+    $item = Get-Item -LiteralPath (Join-Path $alias 'synthetic.bin') -Force
+    $parent = $item
+    $visited.Clear()
+    $refused = $false
+    try { . $walk } catch { if ($_.Exception.Message -ceq 'python') { $refused = $true } else { throw 'unexpected' } }
+    if (-not $refused) { throw 'reparse' }
+    Write-Output 'MORPHEUS_WINDOWS_ANCESTRY_OK'
+} catch { Write-Output 'MORPHEUS_WINDOWS_ANCESTRY_FAILED'; exit 1 }
+"""
+            pwsh = Path(os.environ["ProgramFiles"]) / "PowerShell/7/pwsh.exe"
+            with tempfile.TemporaryDirectory() as temporary:
+                env = os.environ.copy()
+                env["MORPHEUS_ANCESTRY_ROOT"] = temporary
+                env["MORPHEUS_ENTRY_WALK"] = walk
+                result = subprocess.run([str(pwsh), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                    text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
+            self.assertEqual(result.returncode, 0, "fixed entry ancestry regression failed")
+            self.assertEqual(result.stdout.strip(), "MORPHEUS_WINDOWS_ANCESTRY_OK")
 
 
 if __name__ == "__main__":

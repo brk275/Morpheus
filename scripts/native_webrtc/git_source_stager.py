@@ -811,6 +811,277 @@ def verify_gitlinks(checkout: Path, entries: dict) -> None:
             need(next(listing, None) is None, "gitlink_not_empty", name)
 
 
+def alias_tree(rows: list) -> str:
+    tree = {}
+    for row in rows:
+        path = rel(row["path"])
+        node = tree
+        parts = path.split("/")
+        for part in parts[:-1]:
+            need(part not in node or type(node[part]) is dict, "alias_parent", path)
+            node = node.setdefault(part, {})
+        need(parts[-1] not in node, "alias_collision", path)
+        node[parts[-1]] = (row["mode"], row["oid"])
+    def encode(node):
+        entries = []
+        for name, value in node.items():
+            mode, oid = ("40000", encode(value)) if type(value) is dict else value
+            key = name.encode("utf-8") + (b"/" if mode == "40000" else b"")
+            entries.append((key, mode.encode("ascii") + b" " + name.encode("utf-8")
+                            + b"\0" + bytes.fromhex(oid)))
+        data = b"".join(value for _, value in sorted(entries))
+        return hashlib.sha1(b"tree " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+    return encode(tree)
+
+
+def alias_policy(rows: list, specs: dict, markers: dict) -> dict:
+    need(type(rows) is list and len(rows) <= 4096, "alias_plan")
+    entries = {}
+    keys = {"mount", "path", "mode", "type", "oid", "target", "target_bytes",
+            "target_sha256", "target_path", "target_type", "target_mode", "target_oid", "action"}
+    for row in rows:
+        need(type(row) is dict and set(row) == keys, "alias_plan")
+        mount, path = rel(row["mount"]), rel(row["path"])
+        name = rel(mount + "/" + path)
+        need(mount in specs and row["mode"] == "120000" and row["type"] == "blob"
+             and type(row["oid"]) is str and OID.fullmatch(row["oid"]), "alias_plan", name)
+        raw = row["target"]
+        need(type(raw) is str and 0 < len(raw.encode("utf-8")) <= 4096
+             and not raw.startswith("/") and "\\" not in raw and ":" not in raw
+             and all(ord(c) >= 32 and ord(c) != 127 for c in raw), "alias_target", name)
+        data = raw.encode("utf-8")
+        need(type(row["target_bytes"]) is int and row["target_bytes"] == len(data)
+             and row["target_sha256"] == sha(data)
+             and row["oid"] == hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest(),
+             "alias_target", name)
+        parts = path.split("/")[:-1]
+        for part in raw.split("/"):
+            if part in ("", "."):
+                continue
+            if part == "..":
+                need(bool(parts), "alias_escape", name)
+                parts.pop()
+            else:
+                parts.append(part)
+        target = rel("/".join(parts))
+        need(target == row["target_path"] and target != path, "alias_target", name)
+        kind = row["target_type"]
+        need((kind, row["action"]) in (("file", "copy-file"), ("tree", "copy-tree"),
+                                      ("missing", "retain-dangling")), "alias_plan", name)
+        if kind == "missing":
+            need(row["target_oid"] is None and row["target_mode"] is None, "alias_plan", name)
+        else:
+            need(type(row["target_oid"]) is str and OID.fullmatch(row["target_oid"])
+                 and row["target_mode"] in (("100644", "100755") if kind == "file" else ("040000",)),
+                 "alias_plan", name)
+        outside_gitlinks(name, markers)
+        outside_gitlinks(mount + "/" + target, markers)
+        need(name.casefold() not in {key.casefold() for key in entries}, "alias_collision", name)
+        for other in entries:
+            need(not (name.casefold().startswith(other.casefold() + "/")
+                      or other.casefold().startswith(name.casefold() + "/")), "alias_collision", name)
+        # Neither a destination nor its original target may be supplied by a
+        # different selected repository graft. Original ancestor mounts remain.
+        for selected in specs:
+            if selected == mount or mount.startswith(selected + "/"):
+                continue
+            for scope in (name, mount + "/" + target):
+                left, right = scope.casefold(), selected.casefold()
+                need(not (left == right or left.startswith(right + "/")
+                          or right.startswith(left + "/")), "alias_graft", name)
+        entries[name] = dict(row)
+    # Alias chains and targets below another alias are not admitted. Every
+    # COPY source is an original regular leaf or a closed all-regular subtree.
+    for name, row in entries.items():
+        target = (row["mount"] + "/" + row["target_path"]).casefold()
+        for other in entries:
+            scope = other.casefold()
+            need(not (target == scope or target.startswith(scope + "/")
+                      or (row["target_type"] == "tree" and scope.startswith(target + "/"))),
+                 "alias_chain", name)
+    return entries
+
+
+def alias_sources(row: dict, originals: dict) -> list:
+    target = row["target_path"]
+    if row["target_type"] == "file":
+        value = originals.get(target)
+        need(value is not None and value["mode"] == row["target_mode"]
+             and value["oid"] == row["target_oid"] and value["mode"] in ("100644", "100755"),
+             "alias_source", row["path"])
+        return [target]
+    descendants = [(path, value) for path, value in originals.items() if path.startswith(target + "/")]
+    if row["target_type"] == "missing":
+        need(target not in originals and not descendants, "alias_dangling", row["path"])
+        return []
+    need(target not in originals and bool(descendants)
+         and all(value["mode"] in ("100644", "100755") for _, value in descendants),
+         "alias_nested_type", row["path"])
+    relative = [{"path": path[len(target) + 1:], "mode": value["mode"], "oid": value["oid"]}
+                for path, value in descendants]
+    need(alias_tree(relative) == row["target_oid"], "alias_source", row["path"])
+    return sorted(path for path, _ in descendants)
+
+
+def alias_outputs(row: dict, sources: list, originals: dict) -> list:
+    result = []
+    for source in sources:
+        fact = originals[source]
+        suffix = source[len(row["target_path"]):] if row["target_type"] == "tree" else ""
+        result.append({"path": rel(row["mount"] + "/" + row["path"] + suffix),
+                       "source_path": rel(row["mount"] + "/" + source), "mode": fact["mode"],
+                       "blob": fact["blob"], "bytes": fact["bytes"], "sha256": fact["sha256"]})
+    return sorted(result, key=lambda item: item["path"])
+
+
+def outside_aliases(name: str, rows: dict) -> None:
+    folded = rel(name).casefold()
+    for row in rows.values():
+        for path in (row["path"], row["target_path"]):
+            scope = (row["mount"] + "/" + path).casefold()
+            need(not (folded == scope or folded.startswith(scope + "/")
+                      or scope.startswith(folded + "/")), "alias_change", name)
+
+
+def verify_aliases(checkout: Path, rows: list, provenance: Path) -> None:
+    for row in rows:
+        original_blob = provenance / row["original_blob_path"]
+        original_info = no_link(original_blob)
+        need(stat.S_ISREG(original_info.st_mode) and original_info.st_nlink == 1, "alias_original_blob")
+        if os.name != "nt":
+            need(stat.S_IMODE(original_info.st_mode) == 0o600, "alias_original_blob")
+        raw = read(original_blob, 4096)
+        need(raw == row["target"].encode("utf-8") and sha(raw) == row["target_sha256"],
+             "alias_original_blob", row["exported_path"])
+        destination = checkout / row["exported_path"]
+        if row["action"] == "retain-dangling":
+            absolute(str(destination.parent))
+            need(not os.path.lexists(destination)
+                 and not os.path.lexists(checkout / row["mount"] / row["target_path"]),
+                 "alias_dangling", row["exported_path"])
+            continue
+        expected = {value["path"]: value for value in row["outputs"]}
+        for value in row["outputs"]:
+            for name in (value["path"], value["source_path"]):
+                path = checkout / name
+                info = no_link(path)
+                need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "alias_materialization", name)
+                if os.name != "nt":
+                    need(stat.S_IMODE(info.st_mode) == (int(value["mode"], 8) & 0o777), "alias_materialization", name)
+                data = read(path, MAX_BLOB)
+                need(len(data) == value["bytes"] and sha(data) == value["sha256"]
+                     and hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+                     == value["blob"], "alias_materialization", name)
+        if row["action"] == "copy-tree":
+            seen, directories = set(), {row["exported_path"]}
+            for name in expected:
+                parent = PurePosixPath(name).parent
+                while str(parent).startswith(row["exported_path"] + "/"):
+                    directories.add(str(parent))
+                    parent = parent.parent
+            actual_dirs = set()
+            def failed(_):
+                need(False, "alias_materialization", row["exported_path"])
+            for directory, children, names in os.walk(destination, followlinks=False, onerror=failed):
+                here = Path(directory)
+                info = no_link(here)
+                need(stat.S_ISDIR(info.st_mode), "alias_materialization", row["exported_path"])
+                if os.name != "nt":
+                    need(stat.S_IMODE(info.st_mode) == 0o700, "private_mode")
+                relative = here.relative_to(checkout).as_posix()
+                need(relative in directories, "alias_materialization", relative)
+                actual_dirs.add(relative)
+                for child in children:
+                    path = here / child
+                    need(path.relative_to(checkout).as_posix() in directories
+                         and stat.S_ISDIR(no_link(path).st_mode), "alias_materialization")
+                for child in names:
+                    name = (here / child).relative_to(checkout).as_posix()
+                    need(name in expected, "alias_materialization", name)
+                    seen.add(name)
+            need(seen == set(expected) and actual_dirs == directories, "alias_materialization", row["exported_path"])
+
+
+def alias_materials(plan: dict, rows: list, repositories: list, materials: dict,
+                    receipt: dict, checkout: Path, inventories: dict, provenance: Path) -> list:
+    specs = {row["mount"]: {key: row[key] for key in ("mount", "url", "revision", "tree")}
+             for row in repositories}
+    markers = gitlink_policy(plan["gitlinks"], specs)
+    declarations = alias_policy(plan["aliases"], specs, markers)
+    need(type(rows) is list and len(rows) == len(declarations), "alias_materials")
+    actual = []
+    for repo in repositories:
+        originals = {row["path"]: row for row in repo["files"]}
+        need(len(originals) == len(repo["files"]), "alias_materials")
+        nodes = {path: {"mode": value["mode"], "oid": value["blob"]} for path, value in originals.items()}
+        need(type(repo.get("aliases")) is list, "alias_materials")
+        for value in [*repo["gitlinks"], *repo["aliases"]]:
+            need(value["path"] not in nodes, "alias_materials")
+            nodes[value["path"]] = {"mode": value["mode"], "oid": value["oid"]}
+        need(alias_tree([{"path": path, **value} for path, value in nodes.items()]) == repo["tree"], "alias_original_tree")
+        for value in repo["aliases"]:
+            declaration = declarations.get(value["exported_path"])
+            need(declaration is not None and declaration["mount"] == repo["mount"], "alias_materials")
+            sources = alias_sources(declaration, nodes)
+            outputs = alias_outputs(declaration, sources, originals)
+            expected = {**declaration, "repository_revision": repo["revision"],
+                        "repository_tree": repo["tree"], "exported_path": declaration["mount"] + "/" + declaration["path"],
+                        "original_blob_path": "materials/original-alias-blobs/" + declaration["oid"] + ".link",
+                        "outputs": outputs}
+            need(value == expected, "alias_materials", value["exported_path"])
+            raw = read(provenance / value["original_blob_path"], 4096)
+            need(raw == declaration["target"].encode("utf-8"), "alias_original_blob")
+            for output in outputs:
+                need(inventories.get(output["path"]) == {"path": output["path"], "type": "file",
+                     "mode": output["mode"], "bytes": output["bytes"], "sha256": output["sha256"]}, "alias_materials")
+            actual.append(value)
+    need(sorted(actual, key=lambda row: row["exported_path"]) == rows
+         and len({row["exported_path"] for row in actual}) == len(declarations), "alias_materials")
+    for value in (materials, receipt):
+        need(value["alias_normalizations"] == len(rows)
+             and value["non_materialized_aliases"] == sum(row["action"] == "retain-dangling" for row in rows)
+             and value["filesystem_symlinks_created"] is False, "alias_materials")
+    verify_aliases(checkout, rows, provenance)
+    return rows
+
+
+
+def verify_source_aliases(provenance: Path) -> list:
+    def checked(name, expected=None):
+        data = read(provenance / name, MAX_PLAN)
+        if expected is not None:
+            need(sha(data) == expected, "alias_materials")
+        return json.loads(data, object_pairs_hook=pairs)
+    receipt = checked("source-provision-receipt.json")
+    materials = checked("materials/source-materials.json", receipt["materials_sha256"])
+    plan = checked("materials/plan.json", materials["plan_sha256"])
+    need(receipt["schema"] == "morpheus-native-webrtc-source-provision-v1"
+         and materials["schema"] == "morpheus-native-webrtc-git-materials-v1"
+         and plan["schema"] == "morpheus-native-webrtc-sources-v3"
+         and receipt["plan_sha256"] == materials["plan_sha256"], "alias_materials")
+    names = {"repositories": "materials/repositories.json", "aliases": "materials/source-aliases.json",
+             "typed_source_files": "materials/post-patch-source-inventory.json",
+             "typed_outer_files": "materials/outer-depot-inventory.json"}
+    values = {}
+    for key, name in names.items():
+        fact = materials["manifests"][key]
+        data = read(provenance / name, MAX_PLAN)
+        need(fact == {"bytes": len(data), "sha256": sha(data)}, "alias_materials")
+        values[key] = json.loads(data, object_pairs_hook=pairs)
+    inventory = {}
+    for key, prefix in (("typed_source_files", "src/"), ("typed_outer_files", "outer-depot/")):
+        for row in values[key]:
+            name = prefix + rel(row["path"])
+            need(set(row) == {"path", "type", "mode", "bytes", "sha256"}
+                 and row["type"] == "file" and name not in inventory, "alias_materials")
+            inventory[name] = {**row, "path": name}
+    rows = alias_materials(plan, values["aliases"], values["repositories"], materials,
+                           receipt, provenance / "checkout", inventory, provenance)
+    need(all(value[key] is False for value in (receipt, materials)
+             for key in ("native_sources_complete", "build_ready", "distribution_ready")), "alias_materials")
+    return rows
+
+
 class Git:
     def __init__(self, executable: Path, root: Path, environment: dict, timeout: int):
         self.executable, self.root, self.environment, self.timeout = executable, root, environment, timeout
@@ -854,6 +1125,58 @@ class Git:
     def command(self, args: list[str], cap: int = MAX_METADATA, cwd: Path | None = None) -> bytes:
         return read(self.command_file(args, cap, cwd), cap)
 
+
+    def aliases(self, spec: dict, prefix: list, checkout: Path, declarations: list,
+                nodes: dict, originals: dict, file_budget: int = MAX_FILES,
+                byte_budget: int = MAX_BYTES) -> tuple[list, dict]:
+        # Preflight the whole original+COPY projection before writing the first
+        # alias blob or output. A closed tree may expand to many regular files.
+        count, total = len(originals), sum(row["bytes"] for row in originals.values())
+        need(count <= file_budget <= MAX_FILES and total <= byte_budget <= MAX_BYTES, "resource")
+        pending = []
+        for row in declarations:
+            outputs = alias_outputs(row, alias_sources(row, nodes), originals)
+            count += len(outputs)
+            total += sum(output["bytes"] for output in outputs)
+            need(count <= file_budget and total <= byte_budget, "resource")
+            pending.append((row, outputs))
+        receipts, files = [], {}
+        for row, outputs in pending:
+            blob_path = "materials/original-alias-blobs/" + row["oid"] + ".link"
+            raw = self.command([*prefix, "cat-file", "blob", row["oid"]], 4096)
+            need(raw == row["target"].encode("utf-8"), "alias_original_blob")
+            destination = self.root / blob_path
+            if os.path.lexists(destination):
+                need(read(destination, 4096) == raw, "alias_original_blob")
+            else:
+                with private_file(destination) as target:
+                    target.write(raw)
+            receipt = {**row, "repository_revision": spec["revision"],
+                       "repository_tree": spec["tree"],
+                       "exported_path": row["mount"] + "/" + row["path"],
+                       "original_blob_path": blob_path, "outputs": outputs}
+            if row["action"] == "copy-tree":
+                path = checkout / receipt["exported_path"]
+                private_parents(path.parent, checkout)
+                need(not os.path.lexists(path), "alias_collision")
+                private_directory(path)
+            for output in outputs:
+                path = checkout / output["path"]
+                private_parents(path.parent, checkout)
+                absolute(str(path.parent))
+                need(not os.path.lexists(path), "alias_collision", output["path"])
+                data = read(checkout / output["source_path"], MAX_BLOB)
+                need(len(data) == output["bytes"] and sha(data) == output["sha256"], "alias_source")
+                with private_file(path) as target:
+                    target.write(data)
+                os.chmod(path, int(output["mode"], 8) & 0o777)
+                files[output["path"]] = {"path": output["path"].removeprefix(spec["mount"] + "/"),
+                    "mode": output["mode"], "blob": output["blob"],
+                    "bytes": output["bytes"], "sha256": output["sha256"]}
+            receipts.append(receipt)
+        verify_aliases(checkout, receipts, self.root)
+        return receipts, files
+
     def repository(self, spec: dict, number: int, checkout: Path, policy: dict) -> tuple[dict, dict, list]:
         store = self.root / "objects" / f"{number:03d}.git"
         self.command(["init", "--bare", "--template=" + str(self.root / "empty-template"), str(store)])
@@ -866,7 +1189,7 @@ class Git:
         need(tree == spec["tree"], "git_identity", spec["mount"])
         self.command([*prefix, "fsck", "--full", "--strict", "--no-reflogs"])
         listing = self.command([*prefix, "ls-tree", "-rz", "--full-tree", revision])
-        rows, links = [], []
+        rows, links, aliases, nodes = [], [], [], {}
         for line in listing.split(b"\0"):
             if not line:
                 continue
@@ -875,6 +1198,15 @@ class Git:
             path = rel(name.decode("utf-8"))
             full_path = rel(spec["mount"] + "/" + path)
             need(OID.fullmatch(oid), "git_identity")
+            need(path not in nodes, "path_collision")
+            nodes[path] = {"mode": mode, "oid": oid}
+            if mode == "120000" and kind == "blob":
+                declaration = policy["aliases"].get(full_path)
+                need(declaration is not None and declaration["oid"] == oid
+                     and declaration["mount"] == spec["mount"] and declaration["path"] == path,
+                     "undeclared_alias", full_path)
+                aliases.append(declaration)
+                continue
             if mode == "160000" and kind == "commit":
                 declaration = {"mount": spec["mount"], "path": path, "mode": mode,
                                "type": kind, "oid": oid, "action": "uninitialized-directory"}
@@ -887,12 +1219,29 @@ class Git:
             need(kind == "blob" and mode in ("100644", "100755"), "unsupported_tree_mode", full_path)
             outside_gitlinks(full_path, policy)
             rows.append({"path": path, "mode": mode, "blob": oid})
-        need(0 < len(rows) and len(rows) + len(links) <= MAX_FILES, "resource")
-        names = [row["path"].casefold() for row in [*rows, *links]]
+        need(0 < len(rows) and len(rows) + len(links) + len(aliases) <= MAX_FILES, "resource")
+        names = [row["path"].casefold() for row in [*rows, *links, *aliases]]
         need(len(set(names)) == len(names), "path_collision", spec["mount"])
         need({row["exported_path"] for row in links}
              == {name for name, row in policy["entries"].items() if row["mount"] == spec["mount"]},
              "unmatched_gitlink_plan", spec["mount"])
+        canonical = {}
+        for value in [*rows, *links, *aliases]:
+            name = value["path"]
+            for component in [name, *[str(parent) for parent in PurePosixPath(name).parents if str(parent) != "."]]:
+                need(canonical.setdefault(component.casefold(), component) == component,
+                     "path_collision", spec["mount"])
+        leaves = set(names)
+        for name in names:
+            need(not any(str(parent) in leaves for parent in PurePosixPath(name).parents),
+                 "path_collision", spec["mount"])
+        need({spec["mount"] + "/" + row["path"] for row in aliases}
+             == {name for name, row in policy["aliases"].items() if row["mount"] == spec["mount"]},
+             "unmatched_alias_plan", spec["mount"])
+        # Bind the complete original tree including links, before normalization.
+        need(alias_tree([{"path": path, **value} for path, value in nodes.items()]) == tree,
+             "git_identity", spec["mount"])
+        need(len(rows) <= policy["remaining_files"], "resource")
         files = {}
         # One original bounded command completes before any batch decoding. No
         # pipe read can wait indefinitely before the command's timeout applies.
@@ -907,7 +1256,7 @@ class Git:
                 need(len(parts) == 3 and parts[:2] == [row["blob"], "blob"], "git_blob")
                 size = int(parts[2])
                 total += size
-                need(0 <= size <= MAX_BLOB and total <= MAX_BYTES, "resource")
+                need(0 <= size <= MAX_BLOB and total <= policy["remaining_bytes"], "resource")
                 name = spec["mount"] + "/" + row["path"]
                 destination = checkout / name
                 private_parents(destination.parent, checkout)
@@ -939,15 +1288,24 @@ class Git:
             private_directory(destination)
             own_entries[name] = policy["entries"][name]
         verify_gitlinks(checkout, own_entries)
+        original_files = list(files.values())
+        original_map = {row["path"]: row for row in original_files}
+        aliases, copied = self.aliases(spec, prefix, checkout, aliases, nodes, original_map,
+                                       policy["remaining_files"], policy["remaining_bytes"])
+        need(not (set(copied) & set(files)), "alias_collision")
+        files.update(copied)
+        need(len(files) <= MAX_FILES and sum(row["bytes"] for row in files.values()) <= MAX_BYTES,
+             "resource")
         return {**spec, "object_store": store.relative_to(self.root).as_posix(),
-                "files": list(files.values()), "gitlinks": links}, files, links
+                "files": original_files, "gitlinks": links, "aliases": aliases}, files, links
 
 
 def snapshot(root: Path, expected: dict, policy: dict) -> dict:
     verify_gitlinks(root, policy["entries"])
+    verify_aliases(root, policy["alias_receipts"], policy["provenance"])
     actual = {}
     entries = 0
-    for directory, subdirs, names in os.walk(root, followlinks=False):
+    for directory, subdirs, names in os.walk(root, followlinks=False, onerror=lambda _: need(False, "snapshot_io")):
         for name in [*subdirs, *names]:
             entries += 1
             need(entries <= MAX_FILES, "resource")
@@ -966,6 +1324,7 @@ def snapshot(root: Path, expected: dict, policy: dict) -> dict:
             actual[relative] = {**fact, "bytes": len(data), "sha256": sha(data)}
     need(actual == expected, "unbound_change")
     verify_gitlinks(root, policy["entries"])
+    verify_aliases(root, policy["alias_receipts"], policy["provenance"])
     return actual
 
 
@@ -1070,6 +1429,7 @@ def apply_patches(git: Git, checkout: Path, manifest: dict, expected: dict,
             need(set(change) == {"path", "before", "after"}, "patch_format")
             name = scope + "/" + rel(change["path"])
             outside_gitlinks(name, policy)
+            outside_aliases(name, policy["aliases"])
             before, after = change["before"], change["after"]
             need(after is not None and set(after) == {"sha256", "bytes", "mode"}, "patch_format")
             need(SHA.fullmatch(after["sha256"]) and type(after["bytes"]) is int
@@ -1117,8 +1477,8 @@ def provision(args: argparse.Namespace) -> None:
     need(plan_path.is_relative_to(runner), "runner")
     plan, plan_bytes = bound_json(plan_path, args.plan_sha256)
     need(set(plan) == {"schema", "target", "git", "repositories", "deps_files",
-                       "condition_values", "patch_manifest", "security_plan", "command_timeout_seconds", "gitlinks"})
-    need(plan["schema"] == "morpheus-native-webrtc-sources-v2" and plan["target"] in TARGETS)
+                       "condition_values", "patch_manifest", "security_plan", "command_timeout_seconds", "gitlinks", "aliases"})
+    need(plan["schema"] == "morpheus-native-webrtc-sources-v3" and plan["target"] in TARGETS)
     os_name, arch, host_os, host_cpu = TARGETS[plan["target"]]
     need(os.environ.get("RUNNER_OS") == os_name and os.environ.get("RUNNER_ARCH") == arch, "runner")
     need(type(plan["command_timeout_seconds"]) is int
@@ -1150,6 +1510,8 @@ def provision(args: argparse.Namespace) -> None:
                                       "revision": OUTER_REV, "tree": OUTER_TREE}, "depot_identity")
     need(specs.get("src/third_party/depot_tools", {}).get("revision") == NESTED_REV, "depot_identity")
     policy = gitlink_policy(plan["gitlinks"], specs)
+    policy["aliases"] = alias_policy(plan["aliases"], specs, policy)
+    policy["alias_receipts"] = []
     deps_rows = {}
     need(type(plan["deps_files"]) is list and 0 < len(plan["deps_files"]) <= 64)
     for row in plan["deps_files"]:
@@ -1185,7 +1547,7 @@ def provision(args: argparse.Namespace) -> None:
          "security_plan")
     validate_patch_set(patch_manifest, runner, root, host_os)
     private_directory(root)
-    for directory in ("objects", "checkout", "private-logs", "materials", "empty-hooks", "empty-template", "empty-home"):
+    for directory in ("objects", "checkout", "private-logs", "materials", "materials/original-alias-blobs", "empty-hooks", "empty-template", "empty-home"):
         private_directory(root / directory)
     with private_file(root / "empty"):
         pass
@@ -1204,6 +1566,7 @@ def provision(args: argparse.Namespace) -> None:
     git = Git(executable, root, environment, plan["command_timeout_seconds"])
     need(git.command(["--version"], 1024).decode().strip() == tool["version"], "git_tool")
     checkout = root / "checkout"
+    policy["provenance"] = root
     fetched, files, source_receipts, gitlink_receipts = set(), {}, [], []
 
     def fetch(mount: str) -> None:
@@ -1211,6 +1574,8 @@ def provision(args: argparse.Namespace) -> None:
         if mount in fetched:
             return
         need(mount in specs, "missing_dependency", mount)
+        policy["remaining_files"] = MAX_FILES - len(files)
+        policy["remaining_bytes"] = MAX_BYTES - sum(row["bytes"] for row in files.values())
         receipt, exported, links = git.repository(specs[mount], len(fetched), checkout, policy)
         need(not (set(exported) & set(files)), "overlapping_repository_file", mount)
         files.update(exported)
@@ -1218,6 +1583,7 @@ def provision(args: argparse.Namespace) -> None:
         need(len(files) <= MAX_FILES and sum(row["bytes"] for row in files.values()) <= MAX_BYTES, "resource")
         fetched.add(mount)
         source_receipts.append(receipt)
+        policy["alias_receipts"].extend(receipt["aliases"])
         gitlink_receipts.extend(links)
 
     fetch("src")
@@ -1271,6 +1637,8 @@ def provision(args: argparse.Namespace) -> None:
         stream.write(patch_bytes)
     manifests = {"security": security_receipt}
     manifests["repositories"] = save(root / "materials/repositories.json", source_receipts)
+    manifests["aliases"] = save(root / "materials/source-aliases.json",
+                                 sorted(policy["alias_receipts"], key=lambda row: row["exported_path"]))
     manifests["gitlinks"] = save(root / "materials/gitlinks.json", sorted(gitlink_receipts, key=lambda row: row["exported_path"]))
     manifests["commands"] = save(root / "materials/commands.json", git.commands)
     manifests["deps"] = save(root / "materials/deps-selection.json", selections)
@@ -1299,13 +1667,20 @@ def provision(args: argparse.Namespace) -> None:
         "manifests": manifests, "selected_git_source_set_verified": True,
         "native_sources_complete": False, "compiler_cipd_runtime_closure": False,
         "hooks_executed": False, "build_ready": False, "distribution_ready": False,
-        "uninitialized_gitlinks": len(gitlink_receipts), "submodule_sources_materialized": False})
+        "uninitialized_gitlinks": len(gitlink_receipts), "submodule_sources_materialized": False,
+        "alias_normalizations": len(policy["alias_receipts"]),
+        "non_materialized_aliases": sum(row["action"] == "retain-dangling" for row in policy["alias_receipts"]),
+        "filesystem_symlinks_created": False})
     verify_gitlinks(checkout, policy["entries"])
+    verify_aliases(checkout, policy["alias_receipts"], root)
     save(root / "source-provision-receipt.json", {
         "schema": "morpheus-native-webrtc-source-provision-v1", "plan_sha256": args.plan_sha256,
         "materials_sha256": sha(read(root / "materials/source-materials.json", MAX_METADATA)),
         "native_sources_complete": False, "build_ready": False, "distribution_ready": False,
-        "uninitialized_gitlinks": len(gitlink_receipts), "submodule_sources_materialized": False})
+        "uninitialized_gitlinks": len(gitlink_receipts), "submodule_sources_materialized": False,
+        "alias_normalizations": len(policy["alias_receipts"]),
+        "non_materialized_aliases": sum(row["action"] == "retain-dangling" for row in policy["alias_receipts"]),
+        "filesystem_symlinks_created": False})
     print('{"native_source_provision":"git_source_set_complete"}', flush=True)
 
 

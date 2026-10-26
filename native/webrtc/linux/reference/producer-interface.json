@@ -1,4 +1,10 @@
 {
+  "aliases": {
+    "file": "materials/source-aliases.json",
+    "filesystem_symlinks_created": false,
+    "original_blobs": "materials/original-alias-blobs/<GitOID>.link",
+    "shape": "array<exact plan declaration + repository_revision/tree + exported_path + original_blob_path + outputs[{path,source_path,mode,blob,bytes,sha256}]>"
+  },
   "build_ready": false,
   "distribution_ready": false,
   "execution_admitted": false,
@@ -10,7 +16,7 @@
     "file": "materials/repositories.json",
     "patched": false,
     "path_base": "path within original repository; object_store relative to provision root",
-    "shape": "array<{mount,url,revision,tree,object_store,files:[{path,mode,blob,bytes,sha256}]}>"
+    "shape": "array<{mount,url,revision,tree,object_store,files:[{path,mode,blob,bytes,sha256}],gitlinks:[original declarations plus empty marker receipts],aliases:[original120000 declarations plus exact normalization receipts]}>"
   },
   "outer_depot": {
     "file": "materials/outer-depot-files.json",
@@ -35,8 +41,9 @@
   },
   "receipt": "source-provision-receipt.json",
   "required_security_plan_sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080",
-  "schema": "morpheus-native-source-producer-interface-v1",
+  "schema": "morpheus-native-source-producer-interface-v2",
   "source_directory": "checkout/src",
   "source_git_administrative_metadata": false,
-  "symlinks": "unsupported mode causes refusal, not omitted inventory"
+  "source_plan_schema": "morpheus-native-webrtc-sources-v3",
+  "symlinks": "No filesystem links. Every original120000 entry requires exact plan declaration, original blob retention, and closed regular COPY projection or explicit original dangling record."
 }

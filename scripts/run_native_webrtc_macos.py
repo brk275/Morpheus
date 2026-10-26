@@ -21,8 +21,8 @@ import types
 
 REPOSITORY = "brk275/Morpheus"
 BASELINE = "aaeeee8077eb0a4cad1c9494e9c6433c751ef663"
-COMMON_SHA = "33fe07ea752de11f06597540359d13f1401a04f383e4e34bdd036d73b0c09907"
-BUILDER_SHA = "934991862c91f25a50a161c22e54858d23dc9d02daf75be88ddd7d32763908e1"
+COMMON_SHA = "d4910573393abdf904c750da7be9ef3457169f99d92d216742c81119c79834e5"
+BUILDER_SHA = "e845aeaa16dd270d1c9e319feeecbe18be1d77677646e83d460bc1605f267bb7"
 MAC_HELPER_SHA = "87e087e6f47f10134f04f119e8523d03d4ad67ed0f3971546d9c0edd7a713334"
 TARGETS = {"mac-arm64": ("ARM64", "arm64", "MacARM", "macos-15"),
            "mac-x64": ("X64", "x86_64", "MacIntel", "macos-15-intel")}
@@ -141,7 +141,7 @@ def stage(args, plan, temp, common, material, mac):
     source_path, source = common.asset(assets, plan["source_plan"])
     _, patches = common.asset(assets, plan["patch_manifest"])
     security_path, _ = common.asset(assets, plan["security_plan"], common.SECURITY_PLAN)
-    common.need(source["schema"] == "morpheus-native-webrtc-sources-v2" and source["target"] == args.target)
+    common.need(source["schema"] == "morpheus-native-webrtc-sources-v3" and source["target"] == args.target)
     decisions = dependency_decisions(assets, plan, common)
     common.need(shutil.disk_usage(temp).free >= plan["minimum_free_bytes"])
     host_git = plan["host_git"]
@@ -186,8 +186,14 @@ def stage(args, plan, temp, common, material, mac):
     core_rows, _ = mac.core_profile(roots["core"], args.target, material, common.module("linux_stager.py"))
     _, runtime_rows, _ = mac.profile(roots["mac"], plan["mac_material_plan"]["sha256"], args.target, material, common.module("python_stager.py"))
     marker_rows = material.read_json(assembled / "materials/gitlinks.json", material.file_fact(assembled / "materials/gitlinks.json")["sha256"])
-    overlay = mac.project(assembled, files, directories, [row["exported_path"] for row in marker_rows],
+    normalizer = common.module("git_source_stager.py")
+    aliases = normalizer.verify_source_aliases(assembled)
+    protected = [row["exported_path"] for row in marker_rows]
+    protected += [row["mount"] + "/" + value for row in aliases
+                  for value in (row["path"], row["target_path"])]
+    overlay = mac.project(assembled, files, directories, protected,
                           (roots["core"], core_rows), (roots["mac"], runtime_rows), args.target, material)
+    normalizer.verify_source_aliases(assembled)
     overlay_fact = material.write_json(assembled / "materials/macos-source-overlay.json", overlay)
     full_files, _ = common.scan_tree(material, assembled)
     material.write_json(control / "source-inventory.json", [{"path": name.removeprefix("checkout/src/"), "type": "file",

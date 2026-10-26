@@ -54,31 +54,38 @@ jobs:
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
+          $entryFailure = 'input'
           try {
             if ($env:NATIVE_WINDOWS_PHASE -notin @('stage', 'build') -or
                 $env:NATIVE_WINDOWS_PLAN_SHA256 -cnotmatch '^[0-9a-f]{64}$' -or
                 $env:NATIVE_WINDOWS_BOOTSTRAP_SHA256 -cnotmatch '^[0-9a-f]{64}$') { throw 'input' }
+            $entryFailure = 'python_discovery'
             $commands = @(Get-Command python.exe -CommandType Application -All)
             if ($commands.Count -lt 1) { throw 'python' }
             $python = [IO.Path]::GetFullPath($commands[0].Source)
+            $entryFailure = 'python_path'
             if ($python -notmatch '^[A-Za-z]:\\' -or $python.StartsWith('\\')) { throw 'python' }
             $item = Get-Item -LiteralPath $python -Force
             $parent = $item
             while ($null -ne $parent) {
               if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'python' }
-              $parent = if ($parent.PSIsContainer) { $parent.Parent } else { $parent.Directory }
+              $parent = if ($parent -is [IO.DirectoryInfo]) { $parent.Parent } else { $parent.Directory }
             }
+            $entryFailure = 'python_identity'
             if ($item.PSIsContainer -or $item.Length -le 0 -or $item.Length -gt 268435456 -or
                 (Get-FileHash -LiteralPath $python -Algorithm SHA256).Hash.ToLowerInvariant() -cne
                   $env:NATIVE_WINDOWS_BOOTSTRAP_SHA256) { throw 'python' }
             # Fixed script/path/argv. No source hook, cmd /C, interpolated shell
             # command, dependency installation or host tool version probe.
+            $entryFailure = 'python_invoke'
             $plan = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath 'native/webrtc/windows/pipeline-plan.json'
             & $python -I -B scripts/run_native_webrtc_windows.py --phase $env:NATIVE_WINDOWS_PHASE `
               --plan $plan --plan-sha256 $env:NATIVE_WINDOWS_PLAN_SHA256
+            $entryFailure = 'python_exit'
             if ($LASTEXITCODE -ne 0) { throw 'phase' }
           } catch {
-            Write-Output 'MORPHEUS_NATIVE_WINDOWS_ENTRY failed'
+            $category = if ($entryFailure -cin @('input', 'python_discovery', 'python_path', 'python_identity', 'python_invoke', 'python_exit')) { $entryFailure } else { 'entry' }
+            Write-Output ('MORPHEUS_NATIVE_WINDOWS_ENTRY failed category=' + $category)
             exit 1
           }
       # No artifact/install/upload/sign/release step or cache restore. Existing

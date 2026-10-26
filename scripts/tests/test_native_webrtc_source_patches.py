@@ -232,5 +232,163 @@ class InstrumentedAssemblyTests(unittest.TestCase):
                     _SOURCE.assembly_layout(files, directories)
 
 
+
+class SourceAliasInputTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        script = Path(__file__).resolve().parents[1] / "native_webrtc/git_source_stager.py"
+        spec = importlib.util.spec_from_file_location("morpheus_actual_source_alias_tests", script)
+        assert spec is not None and spec.loader is not None
+        cls.source = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.source)
+
+    def fixture(self, root, tree=False, missing=False):
+        source = self.source
+        for name in ("checkout", "checkout/src", "materials", "materials/original-alias-blobs"):
+            source.private_directory(root / name)
+        payload = b"synthetic original source fixture\n"
+        blob = hashlib.sha1(b"blob " + str(len(payload)).encode() + b"\0" + payload).hexdigest()
+        target = "original/one.h" if tree else "original.h"
+        mode = "100644"
+        if not missing:
+            source.private_parents((root / "checkout/src" / target).parent, root / "checkout")
+            (root / "checkout/src" / target).write_bytes(payload)
+            os.chmod(root / "checkout/src" / target, 0o644)
+        raw = b"absent.h" if missing else b"original" if tree else b"original.h"
+        row = {"mount": "src", "path": "alias", "mode": "120000", "type": "blob",
+            "oid": hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest(),
+            "target": raw.decode(), "target_bytes": len(raw), "target_sha256": hashlib.sha256(raw).hexdigest(),
+            "target_path": raw.decode(), "target_type": "missing" if missing else "tree" if tree else "file",
+            "target_mode": None if missing else "040000" if tree else mode,
+            "target_oid": None if missing else source.alias_tree([{"path": "one.h", "mode": mode, "oid": blob}]) if tree else blob,
+            "action": "retain-dangling" if missing else "copy-tree" if tree else "copy-file"}
+        original = {} if missing else {target: {"path": target, "mode": mode, "blob": blob,
+            "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}}
+        nodes = {name: {"mode": fact["mode"], "oid": fact["blob"]} for name, fact in original.items()}
+        nodes["alias"] = {"mode": "120000", "oid": row["oid"]}
+        spec = {"mount": "src", "revision": "a" * 40, "tree": source.alias_tree([
+            {"path": name, **value} for name, value in nodes.items()])}
+        owner = object.__new__(source.Git)
+        owner.root = root
+        owner.command = lambda argv, cap: raw
+        receipts, files = owner.aliases(spec, [], root / "checkout", [row], nodes, original)
+        return row, receipts, files, nodes
+
+    def test_selected_original_profile_declares_all_aliases_and_markers(self):
+        import json
+        plan = json.loads((Path(__file__).resolve().parents[2] / "native/webrtc/linux/source-plan.json").read_bytes())
+        self.assertEqual(plan["schema"], "morpheus-native-webrtc-sources-v3")
+        specs = {row["mount"]: row for row in plan["repositories"]}
+        markers = self.source.gitlink_policy(plan["gitlinks"], specs)
+        aliases = self.source.alias_policy(plan["aliases"], specs, markers)
+        self.assertEqual(len(markers["entries"]), 22)
+        self.assertEqual(len(aliases), 69)
+        self.assertEqual(sum(row["action"] == "copy-tree" for row in aliases.values()), 8)
+        self.assertEqual(sum(row["action"] == "retain-dangling" for row in aliases.values()), 1)
+        self.assertEqual(aliases["outer-depot/cros_sdk"]["target"], "cros")
+        self.assertEqual(aliases["outer-depot/cros_sdk"]["oid"], "a876afe9bd699fefe0c719400b4b744582432854")
+
+    def test_actual_copy_retains_original_blob_and_private_closed_projection(self):
+        for tree in (False, True):
+            with self.subTest(tree=tree), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                row, receipts, files, _ = self.fixture(root, tree=tree)
+                self.source.verify_aliases(root / "checkout", receipts, root)
+                self.assertEqual(len(files), 1)
+                output = receipts[0]["outputs"][0]
+                self.assertEqual((root / "checkout" / output["path"]).read_bytes(),
+                                 (root / "checkout" / output["source_path"]).read_bytes())
+                self.assertFalse((root / "checkout" / output["path"]).is_symlink())
+                self.assertEqual((root / receipts[0]["original_blob_path"]).read_bytes(), row["target"].encode())
+                (root / "checkout" / output["path"]).write_bytes(b"changed")
+                with self.assertRaises(self.source.Refusal):
+                    self.source.verify_aliases(root / "checkout", receipts, root)
+
+    def test_copy_budget_refusal_precedes_every_alias_write_and_blob_command(self):
+        for kind in ("files", "bytes"):
+            with self.subTest(kind=kind), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                row, receipts, _, nodes = self.fixture(root)
+                receipt, output = receipts[0], receipts[0]["outputs"][0]
+                (root / "checkout" / output["path"]).unlink()
+                (root / receipt["original_blob_path"]).unlink()
+                source_path = output["source_path"].removeprefix("src/")
+                originals = {source_path: {"path": source_path,
+                    **{key: output[key] for key in ("mode", "blob", "bytes", "sha256")}}}
+                owner = object.__new__(self.source.Git)
+                owner.root = root
+                calls = []
+                owner.command = lambda argv, cap: calls.append(argv) or row["target"].encode()
+                limits = {"file_budget": 1} if kind == "files" else {"byte_budget": output["bytes"]}
+                with self.assertRaises(self.source.Refusal) as caught:
+                    owner.aliases({"mount": "src", "revision": "a" * 40,
+                        "tree": receipt["repository_tree"]}, [], root / "checkout", [row], nodes, originals, **limits)
+                self.assertEqual(caught.exception.category, "resource")
+                self.assertEqual(calls, [])
+                self.assertFalse((root / "checkout" / output["path"]).exists())
+                self.assertFalse((root / receipt["original_blob_path"]).exists())
+
+    def test_copy_tree_refuses_extra_link_and_nested_original_modes(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            row, receipts, _, nodes = self.fixture(root, tree=True)
+            extra = root / "checkout/src/alias/extra"
+            extra.write_bytes(b"undeclared")
+            with self.assertRaises(self.source.Refusal):
+                self.source.verify_aliases(root / "checkout", receipts, root)
+            extra.unlink()
+            extra.symlink_to("one.h")
+            with self.assertRaises(self.source.Refusal):
+                self.source.verify_aliases(root / "checkout", receipts, root)
+            extra.unlink()
+            os.link(root / "checkout/src/alias/one.h", extra)
+            with self.assertRaises(self.source.Refusal):
+                self.source.verify_aliases(root / "checkout", receipts, root)
+            extra.unlink()
+            for mode in ("120000", "160000"):
+                with self.subTest(mode=mode), self.assertRaises(self.source.Refusal):
+                    self.source.alias_sources(row, {**nodes, "original/nested": {"mode": mode, "oid": "a" * 40}})
+
+    def test_dangling_alias_remains_absent_and_original_target_is_retained(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            row, receipts, files, _ = self.fixture(root, missing=True)
+            self.assertEqual(files, {})
+            self.assertFalse((root / "checkout/src/alias").exists())
+            self.source.verify_aliases(root / "checkout", receipts, root)
+            (root / "checkout/src/absent.h").write_bytes(b"fabricated target")
+            with self.assertRaises(self.source.Refusal):
+                self.source.verify_aliases(root / "checkout", receipts, root)
+
+    def test_alias_plan_refuses_escape_chain_graft_marker_and_changed_scope(self):
+        with TemporaryDirectory() as temporary:
+            row, _, _, _ = self.fixture(Path(temporary))
+        source = self.source
+        specs = {"src": {}}
+        markers = source.gitlink_policy([], specs)
+        aliases = source.alias_policy([row], specs, markers)
+        for name in ("src/alias", "src/alias/child", "src/original.h", "src"):
+            with self.subTest(name=name), self.assertRaises(source.Refusal):
+                source.outside_aliases(name, aliases)
+        raw = b"../outside"
+        escape = {**row, "target": raw.decode(), "target_bytes": len(raw),
+                  "target_sha256": hashlib.sha256(raw).hexdigest(),
+                  "oid": hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest(),
+                  "target_path": "outside"}
+        with self.assertRaises(source.Refusal) as caught:
+            source.alias_policy([escape], specs, markers)
+        self.assertEqual(caught.exception.category, "alias_escape")
+        with self.assertRaises(source.Refusal):
+            source.alias_policy([row, {**row, "path": "ALIAS"}], specs, markers)
+        for changed in ({"target_sha256": "0" * 64}, {"extra": True}):
+            with self.subTest(changed=changed), self.assertRaises(source.Refusal):
+                source.alias_policy([{**row, **changed}], specs, markers)
+        with self.assertRaises(source.Refusal):
+            source.alias_policy([row], {**specs, "src/alias/child": {}}, markers)
+        marker = {"mount": "src", "path": "original.h", "mode": "160000", "type": "commit",
+                  "oid": "b" * 40, "action": "uninitialized-directory"}
+        with self.assertRaises(source.Refusal):
+            source.alias_policy([row], specs, source.gitlink_policy([marker], specs))
+
 if __name__ == "__main__":
     unittest.main()

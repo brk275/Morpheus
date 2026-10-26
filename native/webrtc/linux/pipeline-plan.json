@@ -261,9 +261,9 @@
       "sha256": "55042fe99107439e88e56cddec4f5caf8c8a92e72f2e035ac8e37d52aaecb20c"
     },
     {
-      "bytes": 1108,
+      "bytes": 1613,
       "path": "reference/git-source-privacy-binding.json",
-      "sha256": "33d7a49ef10d0c3f6acc2a8466c762e8fbabf6212c1ae0038b81839ded4fcb1b"
+      "sha256": "a10f3368c06f2f7c31642e952e606dd09c006a81d8d4ded554cf8ab609db6585"
     },
     {
       "bytes": 857,
@@ -271,14 +271,14 @@
       "sha256": "343c10863e454774b759b078b4e56be87774578eba68e05831560844b5e6b913"
     },
     {
-      "bytes": 1772,
+      "bytes": 2428,
       "path": "reference/producer-interface.json",
-      "sha256": "bc3d31fd5a9ea468c603847f6b699d24b8f958e5734d75da52913dd3b90ac898"
+      "sha256": "ebfdd22dd8eaa6ee893adbdc9fe904f5e859d33b7353b067a66c32df526508bf"
     },
     {
-      "bytes": 2295,
+      "bytes": 2688,
       "path": "reference/schema5-consumer-llvm-binding.json",
-      "sha256": "07b8edfa78d38854b9468965e3ead9a95fb19ba404415f357268058339657775"
+      "sha256": "da892a568e43b7adb94bc1da31b5794cf16f8fe91f99c0fdf2e4d83a8c999d84"
     },
     {
       "bytes": 858,
@@ -391,9 +391,9 @@
       "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
     },
     {
-      "bytes": 20771,
+      "bytes": 62632,
       "path": "source-plan.json",
-      "sha256": "2489cdd737218109dd56378f9b7049aeda68df3798dc670c1899cb1e90a9d32c"
+      "sha256": "656733d46a801782283d8b8e573f65dff01cc83934da545c66c81b635656b454"
     }
   ],
   "cache_handoff_authorized": true,
@@ -434,7 +434,7 @@
     "path": "patch-manifest.json",
     "sha256": "e97be792680220ec3d21f39a0a950599a3266fd3041e2a8d5027df36d946b714"
   },
-  "pipeline_sha256": "33fe07ea752de11f06597540359d13f1401a04f383e4e34bdd036d73b0c09907",
+  "pipeline_sha256": "d4910573393abdf904c750da7be9ef3457169f99d92d216742c81119c79834e5",
   "python_plan": {
     "path": "selected-python-inputs.json",
     "sha256": "b3cd3a5066338da7fa450fe48580d987dbb88f90d9497dc2106802ab989c0aea"
@@ -448,7 +448,7 @@
   "security_plan_sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080",
   "source_plan": {
     "path": "source-plan.json",
-    "sha256": "2489cdd737218109dd56378f9b7049aeda68df3798dc670c1899cb1e90a9d32c"
+    "sha256": "656733d46a801782283d8b8e573f65dff01cc83934da545c66c81b635656b454"
   },
   "target": "linux-x64"
 }

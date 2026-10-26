@@ -36,7 +36,8 @@ TARGETS = {
     "mac-x64": ("Darwin", "x86_64", "mac", "x64", "mac-x64-release"),
 }
 SECURITY_PLAN_SHA = "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
-PRODUCER_INTERFACE_SHA = "bc3d31fd5a9ea468c603847f6b699d24b8f958e5734d75da52913dd3b90ac898"
+PRODUCER_INTERFACE_SHA = "ebfdd22dd8eaa6ee893adbdc9fe904f5e859d33b7353b067a66c32df526508bf"
+SOURCE_NORMALIZER_SHA = "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211"
 FINDER_SHA = "f42b1d5f2c8e2f26d50a679a5e5dc7595dd4c1b64af23f6684c22207f5c98b73"
 LASTCHANGE_GNI_SHA = "63cb16e1cdd6632bab19f820e485dc88686d1fc31637d8539e0f40a1abe7117f"
 TESTS = (
@@ -124,7 +125,7 @@ GATES = {"source", "deps-hooks", "toolchain-rust", "patches", "native-test-sourc
          "generated-metadata"}
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 MAC_MATERIAL_HELPER_SHA = "87e087e6f47f10134f04f119e8523d03d4ad67ed0f3971546d9c0edd7a713334"
-COMMAND_PROCESS_HELPER_SHA = "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b"
+COMMAND_PROCESS_HELPER_SHA = "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211"
 MAX_LOG = 256 * 1024 * 1024
 MAX_INVENTORY = 128 * 1024 * 1024
 MAX_FILES = 1_000_000
@@ -272,7 +273,7 @@ def gitlink_name(value):
 
 
 def gitlink_material(plan, rows, repositories, materials, receipt):
-    require(plan["schema"] == "morpheus-native-webrtc-sources-v2")
+    require(plan["schema"] == "morpheus-native-webrtc-sources-v3")
     require(type(plan["gitlinks"]) is list and len(plan["gitlinks"]) <= 1024)
     require(type(rows) is list and len(rows) <= 1024)
     original = {row["mount"]: row for row in repositories}
@@ -1100,13 +1101,13 @@ class Build:
     def validate_source_export(self):
         provision = self.roots["provenance"]
         require(set(self.m["source_provision"]) == {"producer_interface", "receipt", "materials", "repositories",
-                "source_inventory", "depot_inventory", "security_receipt", "source_overlay", "source_plan", "gitlinks"})
+                "source_inventory", "depot_inventory", "security_receipt", "source_overlay", "source_plan", "gitlinks", "aliases"})
         require(self.src == provision / "checkout/src"
                 and self.roots["depot"] == provision / "checkout/outer-depot")
         contract = self.m["source_provision"]["producer_interface"]
         require(contract["sha256"] == PRODUCER_INTERFACE_SHA)
         interface = bound_json(self.item(contract), PRODUCER_INTERFACE_SHA)
-        require(interface["schema"] == "morpheus-native-source-producer-interface-v1"
+        require(interface["schema"] == "morpheus-native-source-producer-interface-v2"
                 and interface["source_git_administrative_metadata"] is False
                 and interface["required_security_plan_sha256"] == SECURITY_PLAN_SHA)
         receipt = self.provision_json("receipt")
@@ -1131,7 +1132,8 @@ class Build:
                        "source_inventory": "materials/post-patch-source-inventory.json",
                        "depot_inventory": "materials/outer-depot-inventory.json",
                        "security_receipt": "materials/security-source-receipt.json",
-                       "source_plan": "materials/plan.json", "gitlinks": "materials/gitlinks.json"}
+                       "source_plan": "materials/plan.json", "gitlinks": "materials/gitlinks.json",
+                       "aliases": "materials/source-aliases.json"}
         for name, path in fixed_paths.items():
             require(self.m["source_provision"][name]["path"] == path)
         native = self.provision_json("source_inventory", manifests["typed_source_files"])
@@ -1183,6 +1185,16 @@ class Build:
         require(source_plan["target"] == self.target)
         marker_rows = self.provision_json("gitlinks", manifests["gitlinks"])
         self.gitlinks = gitlink_material(source_plan, marker_rows, repositories, materials, receipt)
+        self.alias_helper = self.native_module("git_source_stager.py", SOURCE_NORMALIZER_SHA)
+        alias_rows = self.provision_json("aliases", manifests["aliases"])
+        original_inventory = {prefix + row["path"]: {**row, "path": prefix + row["path"]}
+            for prefix, rows in (("src/", native), ("outer-depot/", depot)) for row in rows}
+        self.aliases = self.alias_helper.alias_materials(source_plan, alias_rows, repositories,
+            materials, receipt, provision / "checkout", original_inventory, provision)
+        alias_policy = self.alias_helper.alias_policy(source_plan["aliases"], selected,
+            self.alias_helper.gitlink_policy(source_plan["gitlinks"], selected))
+        for row in overlay:
+            self.alias_helper.outside_aliases("src/" + row["path"], alias_policy)
         for name in self.files["source"]:
             outside_gitlinks("src/" + name, self.gitlinks)
         for name in self.files["depot"]:
@@ -1196,6 +1208,8 @@ class Build:
         self.validate_gn_metadata(selected)
 
     def verify_gitlinks(self):
+        self.alias_helper.verify_aliases(self.roots["provenance"] / "checkout", self.aliases,
+                                         self.roots["provenance"])
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         root = self.roots["provenance"] / "checkout"
         root_fd = os.open(root, flags)
@@ -1467,6 +1481,8 @@ class Build:
                             self.copy(path, dest)
         self.copy(self.item(self.m["source_provision"]["gitlinks"]), package / "SOURCE_GITLINKS.json")
         require(digest(package / "SOURCE_GITLINKS.json") == self.m["source_provision"]["gitlinks"]["sha256"])
+        self.copy(self.item(self.m["source_provision"]["aliases"]), package / "SOURCE_ALIASES.json")
+        require(digest(package / "SOURCE_ALIASES.json") == self.m["source_provision"]["aliases"]["sha256"])
         self.verify_gitlinks()
         # Provisioned inputs must not have been rewritten by build hooks.
         for name, root in self.roots.items():
@@ -1492,11 +1508,13 @@ class Build:
             "original_repositories": self.original_repositories,
             "source_provision_materials_sha256": self.m["source_provision"]["materials"]["sha256"],
             "source_export_has_git_metadata": False,
-            "source_plan_schema": "morpheus-native-webrtc-sources-v2",
+            "source_plan_schema": "morpheus-native-webrtc-sources-v3",
             "source_plan_sha256": self.m["source_provision"]["source_plan"]["sha256"],
             "gitlinks_material_sha256": self.m["source_provision"]["gitlinks"]["sha256"],
             "uninitialized_gitlinks": len(self.gitlinks["rows"]),
             "submodule_sources_materialized": False, "gitlinks": self.gitlinks["rows"],
+            "source_aliases_sha256": self.m["source_provision"]["aliases"]["sha256"],
+            "source_alias_normalizations": self.aliases, "source_filesystem_symlinks_created": False,
             "gn_metadata_policy": self.gn_metadata,
             **({"python_runtime_setup": self.python_runtime_proof,
                 "instrumented_source_material": self.instrumented_proof,
