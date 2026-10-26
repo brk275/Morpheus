@@ -43,7 +43,7 @@ INSTRUMENTED_PLAN = "927a95029b9ddc8f4b4cce20f07975505b343260d913b9c3488bc6f6182
 HELPERS = {
     "git_source_stager.py": "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b",
     "source_importer.py": "6bd8d4885f3914c3288d568c573f42fd42665c90cc13b7cb2992a884e7c680c9",
-    "linux_stager.py": "e808367d1ffe7db888bb34419638c7d3a7ec906e326c1b195a5ca4832a3d1b69",
+    "linux_stager.py": "f3a908bc20170ee01f2643169ce60397627981d86de11ffaedf03dd8ea9e1c8c",
     "python_stager.py": "2be14639b7dc92df4ec467104f9c1fa666e9ad2aad7b5da7102283c7df105d33",
     "instrumented_stager.py": "8903aef2de2ea5a7778ad4ba21047909ad7595d3e1359f151829e489910fc84f",
     "linux_materials.py": "acca8d027e3e2f1ce3a38181345b522a2906e5eeb1a1fc39cd3c1d2ff3bf0b51",

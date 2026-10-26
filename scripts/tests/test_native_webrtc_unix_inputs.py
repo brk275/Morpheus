@@ -174,6 +174,26 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                          ["rust", "sysroot-amd64", "sysroot-i386", "llvmobjdump"])
         self.assertIs(materials, manifest["materials"])
 
+    @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA profiles")
+    def test_linux_xz_decoder_allows_overhead_only_for_exact_pinned_sysroots(self):
+        helper = _PIPELINE.module("linux_stager.py")
+        profile = _SCRIPT.parents[1] / "native/webrtc/linux/selected-linux-build-inputs.json"
+        materials = helper.linux_inputs_validate(helper.decode(profile.read_bytes()), "Linuxx64")
+        tools = {row["name"]: row for row in materials}
+        # Valid synthetic one-byte XZ DATA with the original sysroot dictionary
+        # size. No archive/network/tool/source execution is involved.
+        raw = bytes.fromhex("fd377a585a0000016922de3602002101200000000988a57601000078000000008316dc8c00011501a96334609042990d010000000001595a")
+        for name in ("sysroot-amd64", "sysroot-i386"):
+            with self.subTest(name=name):
+                self.assertEqual(helper.linux_xz_decoder(tools[name]).decompress(raw), b"x")
+        # Every other pinned input retains the smaller original total limit.
+        with self.assertRaises(helper.lzma.LZMAError):
+            helper.linux_xz_decoder(tools["rust"]).decompress(raw)
+        for change in ({"sha256": "0" * 64}, {"bytes": 1}, {"format": "tar.gz"}, {"name": "other"}):
+            with self.subTest(change=next(iter(change))):
+                with self.assertRaises(helper.Refusal):
+                    helper.linux_xz_decoder(tools["sysroot-amd64"] | change)
+
     def test_imported_helper_failure_exposes_only_closed_context_and_reraises(self):
         helper = _PIPELINE.module("linux_stager.py")
         original = sys.argv

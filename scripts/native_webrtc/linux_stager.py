@@ -690,12 +690,25 @@ def linux_inputs_validate(manifest, target):
     return materials
 
 
+def linux_xz_decoder(tool):
+    # The two original pinned sysroots use a 256 MiB XZ dictionary. That is
+    # smaller than liblzma's total decoder memory: allow fixed overhead only
+    # for these exact archive identities, keeping all other tools at 256 MiB.
+    name = tool["name"]
+    require(name in LINUX_MATERIAL_PINS)
+    pin = LINUX_MATERIAL_PINS[name]
+    require(tool["format"] == "tar.xz" and tool["sha256"] == pin["sha256"]
+            and tool["bytes"] == pin["bytes"])
+    limit = (320 if name in ("sysroot-amd64", "sysroot-i386") else 256) * 1024 * 1024
+    return lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=limit)
+
+
 def extract_linux(stage, tool, archive, output):
     table = check_linux_members(tool)
     # Same bounded decompression policy as core Clang, larger member bound only
     # for these exact code-pinned Linux inventories. Nothing is extractall'd.
     tar_path = archive.with_suffix(".tar")
-    decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=256 * 1024 * 1024)
+    decompressor = linux_xz_decoder(tool)
     total = 0
     with archive.open("rb") as src, stage.create(tar_path) as out:
         while not decompressor.eof:
