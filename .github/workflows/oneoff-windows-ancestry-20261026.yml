@@ -24,6 +24,13 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        # Preserve the exact authenticated Git blob bytes on Windows.
+        env:
+          GIT_CONFIG_COUNT: '2'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -41,9 +48,9 @@ jobs:
           $python = 'C:\hostedtoolcache\windows\Python\3.12.10\x64\python.exe'
           $checks = @(
             @($python, '4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a', 104952),
-            @('.github/workflows/native-webrtc-windows-source.yml', '816a1af1bf7d1de64837cc148a6ec31d3ccf75c66037882319ff93f7bbee54cb', 4368),
+            @('.github/workflows/native-webrtc-windows-source.yml', '7b2d96ba36375604953e8f3c4c0cb05ee3f592d1b5cb714c3904018976927df7', 4642),
             @('scripts/native_webrtc_macos/entry.cjs', '8b6005d0df82bcc69a0218101b68c3e05422f62e1ea80e91a7389393a365ea41', 12865),
-            @('scripts/tests/test_native_webrtc_windows_inputs.py', '85a747ee659b86d7494df41296fb39a8687aa818dd6ecf3fbc5dfd32865379e4', 42264),
+            @('scripts/tests/test_native_webrtc_windows_inputs.py', '4ab35a3333f8c23d66c0637d16ab598d0ba2019e9f6d9ddd7b53066f443efa4d', 42669),
             @('scripts/run_native_webrtc_windows.py', '4468ba03a0c9bbf29465f3a13073d34aec497271f42c0498df639e6b5c5fac42', 43699)
           )
           foreach ($check in $checks) {
