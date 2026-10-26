@@ -176,9 +176,35 @@ jobs:
         timeout-minutes: 20
         shell: bash
         run: |
-          # Fresh hosted runners must never wait for a package prompt, an
-          # unbounded mirror connection or an unattended dpkg lock.
-          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+          # Use only the official Ubuntu archive for this step; the hosted
+          # image's Azure mirror can stall otherwise bounded provisioning.
+          [[ "${ImageOS:-}" == ubuntu24 ]]
+          [[ "$(dpkg --print-architecture)" == amd64 ]]
+          [[ "${RUNNER_TEMP:-}" == /* && -d "$RUNNER_TEMP" ]]
+          test -r /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          # APT resolves the disabled sourceparts value below to /etc/apt/-.
+          test ! -d /etc/apt/-
+          apt_sources="$(mktemp --tmpdir="$RUNNER_TEMP" --suffix=.sources morpheus-apt-XXXXXXXXXX)"
+          trap 'rm -f -- "$apt_sources"' EXIT
+          cat > "$apt_sources" <<'MORPHEUS_UBUNTU_SOURCES'
+          Types: deb
+          URIs: https://archive.ubuntu.com/ubuntu
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: https://security.ubuntu.com/ubuntu
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          MORPHEUS_UBUNTU_SOURCES
+          chmod 0644 "$apt_sources"
+          # Keep all three invocations noninteractive and bounded; no global
+          # source files or package verification settings are changed.
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o "Dir::Etc::sourcelist=$apt_sources" -o Dir::Etc::sourceparts=-)
           sudo -n env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get "${apt_options[@]}" update < /dev/null
           sudo -n env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none apt-get "${apt_options[@]}" install -y \
             libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
