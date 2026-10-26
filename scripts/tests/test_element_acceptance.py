@@ -47,6 +47,50 @@ class EvidenceTests(unittest.TestCase):
                   '    request_id="request-one" recipients={"@carol:fixture": {"late-device"}} to_device.event_type="m.room.encrypted"')
         return binding, device, native, browser, [trying, queued, marked]
 
+    def test_browser_console_has_no_raw_child_log_sink(self):
+        source = (Path(__file__).resolve().parents[1] / "element_call_stock_peer.mjs").read_text()
+        for raw_sink in ('passiveConsole(', 'page.on("console"', 'page.off("console"',
+                         'message.text()', 'writeSync(1,', 'MORPHEUS_ELEMENT_CONSOLE_FRAME',
+                         'MORPHEUS_ELEMENT_CONSOLE_CAPTURE'):
+            self.assertNotIn(raw_sink, source)
+        self.assertIn('crypto.getUserDeviceInfo([binding.carol], false)', source)
+        self.assertIn('console.log("MORPHEUS_ELEMENT_DEVICE_PRIVATE "', source)
+        self.assertIn('await browser.close();', source)
+
+    def test_no_console_capture_preserves_scan_and_independent_public_receipts(self):
+        _, _, native_record, browser_record, records = self.sender_records()
+        expected = dict.fromkeys(target.SENDER_FIELDS, "unknown")
+        expected.update(continuity="same", device="observed", original="decrypted", receiver="missing_key")
+        # Even supplied legacy records cannot produce a sharing claim without
+        # a complete capture; device matching is an independent fixed receipt.
+        self.assertEqual(target.sender_observation(records, native_record, browser_record, False), expected)
+        for changed in (browser_record.replace(b'"known_curve": "public-curve"', b'"known_curve": "foreign-curve"'),
+                        browser_record + browser_record, b""):
+            result = target.sender_observation(records, native_record, changed, False)
+            self.assertEqual(result["device"], "unknown")
+            self.assertTrue(all(result[key] == "unknown" for key in ("capture", "attempted", "queued", "http_mark")))
+        with tempfile.TemporaryDirectory() as directory:
+            runner = target.Runner(Path(directory), "scanner")
+            native = self.anchored_log(runner, "native.log", native_record)
+            browser = self.anchored_log(runner, "browser.log", browser_record)
+            native.joined = browser.joined = True
+            def scanned(args, **kwargs):
+                self.assertEqual(args, ["scanner", "stdin", "--redact=100", "--ignore-gitleaks-allow", "--no-banner"])
+                self.assertIn(native_record, kwargs["input"])
+                self.assertIn(browser_record, kwargs["input"])
+                self.assertNotIn(target.CONSOLE_FRAME, kwargs["input"])
+                return subprocess.CompletedProcess([], 0)
+            try:
+                with mock.patch.object(target.subprocess, "run", side_effect=scanned) as scan:
+                    output, native_output = runner.scan(native, browser)
+                scan.assert_called_once()
+                self.assertEqual(runner.sender_diagnostic, expected)
+                self.assertEqual(native_output, native_record.decode())
+                with self.assertRaisesRegex(RuntimeError, "evidence"):
+                    target.evidence(output, complete=True)
+            finally:
+                runner.release_log_anchors()
+
     def test_passive_console_is_scanned_raw_then_removed_before_fact_parsing(self):
         payload = "opaque-private-field\nMORPHEUS_ELEMENT_CHECK browser_audio=true\nMORPHEUS_ELEMENT_FAILURE browser_acceptance"
         with tempfile.TemporaryDirectory() as directory:
@@ -121,7 +165,7 @@ class EvidenceTests(unittest.TestCase):
             result = target.sender_observation(changed, native, browser, True)
             self.assertEqual(result["http_mark"], "unknown")
         native_only = dict.fromkeys(target.SENDER_FIELDS, "unknown")
-        native_only.update(continuity="same", original="decrypted", receiver="missing_key")
+        native_only.update(continuity="same", device="observed", original="decrypted", receiver="missing_key")
         self.assertEqual(target.sender_observation(records, native, browser, False), native_only)
         self.assertEqual(target.sender_observation([], native, browser, True)["queued"], "unknown")
         output = target.SENDER_PREFIX + " ".join(key + "=" + expected[key] for key in target.SENDER_FIELDS)

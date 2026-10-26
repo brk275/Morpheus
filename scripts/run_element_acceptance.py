@@ -273,9 +273,7 @@ def sender_observation(records, native: bytes, browser: bytes, window: bool):
     if binding["receiver"] in SENDER_VALUES["receiver"]:
         result["receiver"] = binding["receiver"]
     # The native same-cipher/receiver receipt is independent of stock logging.
-    # Missing/capped stock capture withholds sender claims, not this receipt.
-    if not window:
-        return result
+    # The bounded cached-device receipt is independent of console capture too.
     samples = [device["sample"] for device in devices]
     if (not devices or len(samples) != len(set(samples)) or any(sample not in tuple(str(index) for index in range(1, 9)) for sample in samples)
             or binding["continuity"] != "same" or binding["original"] != "decrypted"
@@ -284,6 +282,9 @@ def sender_observation(records, native: bytes, browser: bytes, window: bool):
                        (binding["carol"], binding["carol_device"], binding["carol_curve"]) for device in devices)):
         return result
     result["device"] = "observed"
+    # No console capture means no attempted/queued/HTTP-marked sharing claim.
+    if not window:
+        return result
     expected = (binding["carol"], binding["carol_device"])
     queued = {}
     seen_queued = set()

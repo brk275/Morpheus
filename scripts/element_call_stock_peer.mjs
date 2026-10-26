@@ -2,7 +2,7 @@
 // Observe the stock official Element Call image. No RTC refresh, membership
 // injection, SDK patch, or getUserMedia replacement belongs in this harness.
 // Cross-signing bootstraps only the disposable account's real SDK identity.
-import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -24,50 +24,8 @@ async function poll(callback, message, milliseconds = 90_000) {
   throw new Error(message);
 }
 
-// Raw console text is private DATA, not acceptance output. Keep it unescaped for
-// the independent scanner, but frame by byte length so embedded markers cannot
-// become facts. Synchronous writes cannot leave an unbounded Node output queue.
-function passiveConsole(page) {
-  const limit = 2 * 1024 * 1024;
-  let total = 0;
-  let count = 0;
-  let capped = false;
-  const write = (bytes) => {
-    let offset = 0;
-    while (offset < bytes.length) {
-      const written = writeSync(1, bytes, offset, bytes.length - offset);
-      if (written <= 0) throw new Error("Private console write failed");
-      offset += written;
-    }
-  };
-  write(Buffer.from("MORPHEUS_ELEMENT_CONSOLE_CAPTURE started\n"));
-  const listener = (message) => {
-    if (capped) return;
-    try {
-      const text = message.text();
-      const length = Buffer.byteLength(text, "utf8");
-      if (length > 65_536 || count >= 4_096 || total + length > limit) {
-        capped = true;
-        write(Buffer.from("MORPHEUS_ELEMENT_CONSOLE_CAPTURE capped\n"));
-        return;
-      }
-      const body = Buffer.from(text, "utf8");
-      const header = Buffer.from(`MORPHEUS_ELEMENT_CONSOLE_FRAME ${body.length}\n`);
-      write(header);
-      write(body);
-      write(Buffer.from("\nMORPHEUS_ELEMENT_CONSOLE_END\n"));
-      total += body.length;
-      count++;
-    } catch {
-      capped = true;
-      // A failed/partial write will also make post-scan framing invalid.
-      try { write(Buffer.from("MORPHEUS_ELEMENT_CONSOLE_CAPTURE capped\n")); } catch {}
-    }
-  };
-  page.on("console", listener);
-  return () => page.off("console", listener);
-}
-
+// Child logs receive fixture-owned fixed markers and bounded public-identity
+// receipts. The stock browser/SDK console stays outside this optional observer.
 async function main() {
   // Even an inherited diagnostic flag invalidates stock-client evidence.
   if (process.env.MORPHEUS_ELEMENT_DIAG_REFRESH !== undefined)
@@ -101,11 +59,9 @@ async function main() {
     ],
   });
   let page;
-  let stopConsole;
   try {
     const context = await browser.newContext({ permissions: ["camera", "microphone"], viewport: { width: 1280, height: 850 } });
     page = await context.newPage();
-    stopConsole = passiveConsole(page); // Before any login/navigation or stock SDK work.
     page.setDefaultTimeout(45_000);
     mark("browser_login");
     await page.goto(new URL("login", base).href);
@@ -648,7 +604,7 @@ async function main() {
         }
       });
     } finally {
-      try { await browser.close(); } finally { stopConsole?.(); }
+      await browser.close();
     }
   }
 }
