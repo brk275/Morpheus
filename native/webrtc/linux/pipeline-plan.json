@@ -396,7 +396,7 @@
       "sha256": "2489cdd737218109dd56378f9b7049aeda68df3798dc670c1899cb1e90a9d32c"
     }
   ],
-  "cache_handoff_authorized": false,
+  "cache_handoff_authorized": true,
   "core_plan": {
     "path": "selected-tool-manifest.json",
     "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
@@ -410,15 +410,15 @@
     "sha256": "57bd48e1dfc09a469333371a975ef5f12e33bc948dc3dd7042edc3e02c4d196a"
   },
   "host_git": {
-    "bytes": null,
-    "path": null,
-    "sha256": null,
-    "version": null
+    "bytes": 4576040,
+    "path": "/usr/bin/git",
+    "sha256": "d4d2ba562243015206d4248edfec871a74786499292d00ed072dbca2f5ae8073",
+    "version": "git version 2.55.0"
   },
   "host_zstd": {
-    "bytes": null,
-    "path": null,
-    "sha256": null
+    "bytes": 1022760,
+    "path": "/usr/bin/zstd",
+    "sha256": "7c5468b370f7c47eda07281e3437fafc568f95d10420051e3aa522709f9342c5"
   },
   "instrumented_plan": {
     "path": "selected-instrumented-inputs.json",
