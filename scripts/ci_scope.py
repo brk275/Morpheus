@@ -123,7 +123,9 @@ def classify(paths, force_all=False):
             wayland_affected = True
         if path == "Cargo.lock" or path.endswith("Cargo.toml"):
             native.update(PLATFORMS)
-        elif path in MANUAL_LINUX_PACKAGE_INPUTS or path in MANUAL_NATIVE_VAULT_INPUTS or path == "scripts/ci_scope.py":
+        elif (path in MANUAL_LINUX_PACKAGE_INPUTS or path in MANUAL_NATIVE_VAULT_INPUTS
+              or path in {"scripts/ci_scope.py", ".github/workflows/native-webrtc-source.yml"}
+              or path.startswith("native/webrtc/linux/")):
             # The classifier itself is exercised by the always-on helper
             # tests. Mixed changes still select their affected native inputs;
             # manual full verification remains an unconditional full matrix.

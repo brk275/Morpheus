@@ -1,0 +1,19 @@
+{
+  "build_ready": false,
+  "change_kind": "security_plan_metadata_digest_only_and_dependent_constant",
+  "distribution_ready": false,
+  "execution_admitted": false,
+  "native_sources_complete": false,
+  "parent_source_binding_sha256": "24a20a3f959238df7dd45c03690c21f0b0f5c7fd867b6a8b742b6b1c901364f3",
+  "plan": {
+    "path": "native/webrtc/linux/selected-instrumented-inputs.json",
+    "sha256": "927a95029b9ddc8f4b4cce20f07975505b343260d913b9c3488bc6f6182ad0f9"
+  },
+  "recipe": {
+    "path": "scripts/native_webrtc/instrumented_stager.py",
+    "sha256": "8903aef2de2ea5a7778ad4ba21047909ad7595d3e1359f151829e489910fc84f"
+  },
+  "same_archive_members_aliases_mounts_and_source_identities": true,
+  "schema": "morpheus-native-instrumented-privacy-rebind-v1",
+  "security_plan_sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
+}

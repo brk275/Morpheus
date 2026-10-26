@@ -1,0 +1,68 @@
+{
+  "GN_graph_or_native_execution_observed": false,
+  "active_production_headers": "genuine staged Debian Bullseye amd64 sysroot libpipewire-0.3 0.3.65 plus libspa-0.2; pkg_config rewrites sysroot includes and ignores PipeWire link flags under default rtc_link_pipewire=false",
+  "active_production_pipewire": true,
+  "build_ready": false,
+  "build_revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+  "cipd_packages_scope": "external PipeWire1.4.8/WirePlumber0.5.11 test servers only, per both original README.chromium. Standalone shared_screencast_stream_test has the CIPD data directory; only its isolate-map use_pipewire flag causes MB to launch configure_pipewire. Production default excludes tests; selected rtc_unittests binary does not depend on that standalone target or invoke MB. GN may describe unrelated standalone targets during generation; this does not execute the wrapper or consume its server files.",
+  "consumer_scope_functions": {
+    "args": {
+      "end_line": 1130,
+      "line": 1109,
+      "sha256": "0870b586516678e2f76be820133546ff2fd33767d2f438999bbed27c3e1ad12a",
+      "source": "def args(self, tests):\n        common = [\"is_debug=false\", \"is_official_build=false\", \"build_with_chromium=false\", \"use_siso=false\",\n                  \"enable_rust=true\", \"enable_rust_cxx=true\", \"enable_chromium_prelude=true\",\n                  'target_os=\"' + self.target_os + '\"', 'target_cpu=\"' + self.cpu + '\"',\n                  \"rtc_enable_protobuf=false\", \"treat_warnings_as_errors=false\",\n                  \"use_custom_libcxx=false\", \"use_clang_modules=false\",\n                  \"rtc_include_tests=\" + str(tests).lower(), \"rtc_build_tools=false\",\n                  \"rtc_build_examples=false\", \"rtc_libvpx_build_vp9=true\", \"enable_libaom=true\",\n                  \"is_component_build=false\", \"enable_stripping=true\",\n                  \"rtc_use_h264=true\", \"rtc_use_h265=true\", \"use_rtti=true\"]\n        if self.target_os == \"linux\":\n            common += [\"use_llvm_libatomic=false\", \"use_custom_libcxx_for_host=false\",\n                       \"rtc_use_pipewire=true\", \"symbol_level=0\", \"enable_iterator_debugging=false\",\n                       \"rtc_use_x11=true\", 'ffmpeg_branding=\"Chrome\"']\n        else:\n            common += [\"enable_dsyms=false\", 'mac_deployment_target=\"10.15\"',\n                       'mac_min_system_version=\"10.15\"', \"rtc_enable_symbol_export=true\",\n                       \"rtc_enable_objc_symbol_export=false\",\n                       \"rtc_include_dav1d_in_internal_decoder_factory=true\",\n                       \"clang_use_chrome_plugins=false\", \"use_lld=false\",\n                       \"rtc_include_internal_audio_device=true\"]\n        return \" \".join(common)"
+    },
+    "build": {
+      "end_line": 1173,
+      "line": 1132,
+      "sha256": "01ac0b8ef1659a05b9749cf8c399c5524450510133757f70f82d9477c92e6c61",
+      "source": "def build(self):\n        if self.target_os == \"linux\":\n            self.prepare_python_runtime()\n        prod, tests = self.work / \"prod\", self.work / \"tests\"\n        for name, directory, testing in ((\"production\", prod, False), (\"tests\", tests, True)):\n            self.command(\"gn-\" + name, [self.tool(\"gn\"), \"gen\", str(directory),\n                         \"--root=\" + str(self.src), \"--fail-on-unused-args\",\n                         \"--args=\" + self.args(testing)], 900)\n        targets = self.production_targets()\n        self.command(\"ninja-production\", [self.tool(\"ninja\"), \"-C\", str(prod),\n                     \"-j\", str(self.jobs), \"-l\", str(self.jobs)] + targets, 10800)\n        self.command(\"ninja-tests\", [self.tool(\"ninja\"), \"-C\", str(tests),\n                     \"-j\", str(self.jobs), \"-l\", str(self.jobs), \"rtc_unittests\"], 10800)\n        binary = tests / \"rtc_unittests\"\n        require(binary.is_file() and not binary.is_symlink())\n        list_log = self.command(\"native-test-list\", [str(binary), \"--gtest_list_tests\",\n                                  \"--gtest_filter=\" + \":\".join(self.tests)], 60)\n        listed, suite = [], \"\"\n        for line in read(list_log, 8 * 1024 * 1024).decode(\"utf-8\").splitlines():\n            if re.fullmatch(r\"[A-Za-z0-9_]+\\.\", line):\n                suite = line[:-1]\n            elif re.fullmatch(r\"  [A-Za-z0-9_]+\", line) and suite:\n                listed.append(suite + \".\" + line.strip())\n        require(Counter(listed) == Counter(self.tests))\n        xml = self.work / \"native-tests.xml\"\n        self.command(\"native-test-run\", [str(binary), \"--gtest_filter=\" + \":\".join(self.tests),\n                     \"--gtest_output=xml:\" + str(xml)], 600)\n        data = read(xml, 4 * 1024 * 1024)\n        require(b\"<!DOCTYPE\" not in data and b\"<!ENTITY\" not in data)\n        result = ET.fromstring(data)\n        cases = list(result.iter(\"testcase\"))\n        require(Counter(c.get(\"classname\", \"\") + \".\" + c.get(\"name\", \"\") for c in cases)\n                == Counter(self.tests))\n        require(all(c.get(\"status\") == \"run\" and c.get(\"result\") == \"completed\"\n                    and not list(c) for c in cases))\n        require(all(int(result.get(k, \"-1\")) == 0 for k in (\"failures\", \"disabled\", \"errors\")))\n        require(int(result.get(\"tests\", \"-1\")) == len(self.tests))\n        self.verify_gitlinks()\n        if self.target_os == \"linux\":\n            self.verify_python_instances()\n            self.verify_instrumented_materials()\n        self.package_output(prod, targets)"
+    },
+    "production_targets": {
+      "end_line": 1057,
+      "line": 1056,
+      "sha256": "de1a0fec1bc84c9aa8379a240b711d679efa60a179261b77c290effbb904b787",
+      "source": "def production_targets(self):\n        return [\":default\"] + (list(MAC_TARGETS) if self.target_os == \"mac\" else [])"
+    }
+  },
+  "consumer_source_sha256": "52c68acf11f6d72ce7ae4d6cb93185072820c5b16d0e47c851ed23aa578d6f99",
+  "distribution_ready": false,
+  "effective_native_source": {
+    "condition_change": "No change to default test guard or shared_screencast dependency; patch adds libaom import/define and webrtc deps.",
+    "patch_manifest_path": "patch-manifest.json",
+    "patch_manifest_sha256": "e97be792680220ec3d21f39a0a950599a3266fd3041e2a8d5027df36d946b714",
+    "root_BUILD_gn_baseline_sha256": "28de900976df3f8d54285575a29fe5e0ca53632a464a6cdebd051d1ef1e26ec9",
+    "root_BUILD_gn_effective_sha256": "4c53c151d8502f9f78be131c75b798e622159fd94ec0dba6cd96ab6a14308e74",
+    "root_BUILD_gn_patch": "add_deps.patch"
+  },
+  "host_prerequisite_not_satisfied_by_source_proof": "Real admitted host pkg-config/runtime and generated GN graph/build remain required; no server/runtime capture acceptance.",
+  "native_archive_sha256": "bfcfd0a02d6d31aeeeddcba69782e2b8f07131ee32357eec94b51debc45d81a3",
+  "native_revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+  "native_sources_complete": false,
+  "native_tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5",
+  "production_rtc_include_tests": false,
+  "production_target": ":default",
+  "rtc_link_pipewire_default": false,
+  "runtime_capture_or_PipeWire_acceptance_claimed": false,
+  "schema": "morpheus-native-linux-pipewire-selected-scope-v1",
+  "scope_changes_require_new_review": [
+    "building or running shared_screencast_stream_test",
+    "running MB use_pipewire wrapper",
+    "copying these server binaries into distribution",
+    "changing production/test target or fixed GN arguments"
+  ],
+  "selected_material_source_proof": {
+    "pc_files": [
+      "evidence/pipewire/libpipewire-0.3.pc",
+      "evidence/pipewire/libspa-0.2.pc"
+    ],
+    "sysroot_archive_sha256": "36a164623d03f525e3dfb783a5e9b8a00e98e1ddd2b5cff4e449bd016dd27e50",
+    "sysroot_overlay_sha256": "1f2d9903b33034987e18edaab4e1f261238c65d5d504603f087d6fbda8445bc9",
+    "toolchain_default": "Linux x64 use_sysroot=true; default target_sysroot_dir selects existing genuine Bullseye amd64 projection; no fixed builder override.",
+    "version": "0.3.65"
+  },
+  "source_only": true,
+  "test_invocation": "direct binary with exact existing twelve security GTest selectors; no MB wrapper",
+  "test_target": "//:rtc_unittests",
+  "third_party_revision": "a3b630c291f1cf3b711687b1c4be322d3015512e"
+}

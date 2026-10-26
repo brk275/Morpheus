@@ -16,6 +16,19 @@ from scripts.ci_scope import (MACOS, PLATFORMS, WAYLAND_UNRELATED_NATIVE_INPUTS,
 
 
 class ScopeTests(unittest.TestCase):
+    def test_manual_native_source_producer_does_not_trigger_app_native_jobs(self):
+        paths = [".github/workflows/native-webrtc-source.yml",
+                 "native/webrtc/linux/pipeline-plan.json",
+                 "native/webrtc/linux/patches/01-sif-validation.patch",
+                 "scripts/run_native_webrtc_linux.py",
+                 "scripts/native_webrtc/linux_materials.py"]
+        self.assertEqual(classify(paths)["native_matrix"]["os"], [])
+        self.assertEqual(classify(paths, force_all=True)["native_matrix"]["os"], list(PLATFORMS))
+        for shared in ("Cargo.lock", "vendor/libwebrtc/src/lib.rs",
+                       ".github/workflows/ci.yml", "native/webrtc/unknown-platform/input.json"):
+            with self.subTest(shared=shared):
+                self.assertEqual(classify(paths + [shared])["native_matrix"]["os"], list(PLATFORMS))
+
     def test_matrix_diagnostics_preserve_native_scope_without_unrelated_portal(self):
         reviewed = {"crates/morpheus-matrix/tests/drafts_local.rs",
                     "scripts/run_matrix_acceptance.py", "scripts/tests/test_matrix_acceptance.py"}

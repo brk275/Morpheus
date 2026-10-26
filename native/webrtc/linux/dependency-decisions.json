@@ -1,0 +1,263 @@
+{
+  "GN_graph_executed": false,
+  "declarations": [
+    {
+      "decision": "real-material",
+      "declaration_sha256": "d508d24cf264eabecc3f937da9abeabedd84afe94e33b3173eab9b3deadd069e",
+      "evidence": [
+        {
+          "path": "selected-tool-manifest.json",
+          "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+        }
+      ],
+      "path": "src/buildtools/linux64",
+      "rationale": "Exact original code-pinned staged profile and actual source projection are required."
+    },
+    {
+      "decision": "proven-inactive",
+      "declaration_sha256": "21b9149b971e3f54df5eec466f6e2be4c652536d9e4e2591ae4529d38f2ed21c",
+      "evidence": [
+        {
+          "path": "evidence/build-rbe.gni",
+          "sha256": "8cec2ca088ce1ffe46a19baedc091a1e13a4021fe04769ec3fbd44b68957dc1e"
+        }
+      ],
+      "path": "src/buildtools/reclient",
+      "rationale": "Pinned rbe.gni defaults use_remoteexec=false and use_reclient=use_remoteexec&&!use_siso; unchanged fixed recipe uses direct Ninja and does not enable remote execution."
+    },
+    {
+      "decision": "real-material",
+      "declaration_sha256": "ac0b5d58d200959294564e489e222be0a944978e672c77cbc8b798e1b7a57092",
+      "evidence": [
+        {
+          "path": "selected-tool-manifest.json",
+          "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+        },
+        {
+          "path": "evidence/condition-evaluation.json",
+          "sha256": "c11650880a085c883012af1fa7586ac117a925b21e8f16a9522001dd457abf92"
+        },
+        {
+          "path": "selected-linux-build-inputs.json",
+          "sha256": "f75cf14baaec10fdc9203626737808d3987cc734923b0bb55eae6218234489a5"
+        },
+        {
+          "path": "evidence/llvm-material-closure.json",
+          "sha256": "c3851c8b7b07862cd00b5933891b9c181425c4fa9dd15a18ce936cc54f8ed5dd"
+        }
+      ],
+      "path": "src/third_party/llvm-build/Release+Asserts",
+      "rationale": "Complete selected Clang and llvmobjdump immutable archives are staged and projected into the original Release+Asserts mount. The sole identical llvm-nm overlap is verified against both complete input profiles and coalesced without overwrite; every other overlap refuses."
+    },
+    {
+      "decision": "real-material",
+      "declaration_sha256": "14e9b41168f6e2fabd2f24042c754ca7289ad21a3735d3688f60c00b6622f44f",
+      "evidence": [
+        {
+          "path": "selected-linux-build-inputs.json",
+          "sha256": "f75cf14baaec10fdc9203626737808d3987cc734923b0bb55eae6218234489a5"
+        }
+      ],
+      "path": "src/third_party/rust-toolchain",
+      "rationale": "Exact original code-pinned staged profile and actual source projection are required."
+    },
+    {
+      "decision": "proven-inactive",
+      "declaration_sha256": "1627092d0df55c329b519c566c0c4630e986d6f0bc0d1660c7b4a8a0f1d80e51",
+      "evidence": [
+        {
+          "path": "evidence/four-declarations-caller-proof.json",
+          "sha256": "1335f859dbe20a05325c71c75bf5e250b7142fac588dbef224a668e21ce33319"
+        }
+      ],
+      "path": "src/third_party/test_fonts/test_fonts",
+      "rationale": "DEPS non_git_source condition is selected, not excluded. Complete native source has no test_fonts caller beyond DEPS and no Skia or test-font GN/C++ target. Complete pinned build/testing source finds only the Fuchsia component test_fonts shard and its README; testing/test.gni enters its non-Fuchsia Linux branch. Neither Linux :default nor Linux rtc_unittests declares a font data path. No generic sync/hooks is invoked by the fixed builder."
+    },
+    {
+      "decision": "real-material",
+      "declaration_sha256": "bb007721a1aec43bae8e6461ad5fbc82dbad9dc36b5f8fddd1a4cadbae45f8b4",
+      "evidence": [
+        {
+          "path": "selected-tool-manifest.json",
+          "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+        }
+      ],
+      "path": "src/third_party/ninja",
+      "rationale": "Exact original code-pinned staged profile and actual source projection are required."
+    },
+    {
+      "decision": "proven-inactive",
+      "declaration_sha256": "ca7810374a008ba4d6ca91c224a69cda959ab1264375b5e8b6ae025819b84932",
+      "evidence": [
+        {
+          "path": "evidence/build-rbe.gni",
+          "sha256": "8cec2ca088ce1ffe46a19baedc091a1e13a4021fe04769ec3fbd44b68957dc1e"
+        }
+      ],
+      "path": "src/third_party/siso/cipd",
+      "rationale": "The fixed original GN args explicitly set use_siso=false; direct GN and Ninja commands never invoke autoninja/siso."
+    },
+    {
+      "decision": "proven-inactive",
+      "declaration_sha256": "97399b5d2f9747e7ee24972e9a505ce118aa7797ffaa8fa0dd578ead3a19265b",
+      "evidence": [
+        {
+          "path": "evidence/four-declarations-caller-proof.json",
+          "sha256": "1335f859dbe20a05325c71c75bf5e250b7142fac588dbef224a668e21ce33319"
+        }
+      ],
+      "path": "src/tools/resultdb",
+      "rationale": "DEPS installs infra/tools/result_adapter; no native GN/C++ caller or build/testing target invokes that binary. Linux rtc_test generates a wrapper and includes testing:test_scripts_shared, whose build/util:proto and :test_results only provide checked-in Python DATA. Wrapper generation only writes wrapper text; the fixed builder directly invokes rtc_unittests with gtest list/filter/XML, never a ResultDB adapter or bot/recipe runner. Android/ChromeOS runner mentions and infra ResultDB configuration are excluded from this Linux direct command route."
+    },
+    {
+      "decision": "proven-inactive",
+      "declaration_sha256": "b4b48e50175bfe518cf98e64320eeb4aafa09ba92f862ab8eede62b680bebd30",
+      "evidence": [
+        {
+          "path": "declaration-ledger.json",
+          "sha256": "2ea59842c90033f32529753950bff4172ef1322107784b7aea3cc00fa2478d58"
+        },
+        {
+          "path": "evidence/native-root-BUILD.gn",
+          "sha256": "28de900976df3f8d54285575a29fe5e0ca53632a464a6cdebd051d1ef1e26ec9"
+        },
+        {
+          "path": "evidence/native-test-BUILD.gn",
+          "sha256": "34d066661818cfb90f9d4c9840e5c542b29de6ec9ab8bbf513ae5fbd869ece13"
+        }
+      ],
+      "path": "src/third_party/jdk/current",
+      "rationale": "Original DEPS explicitly identifies Linux JDK as chromium_presubmit checkstyle input. Fixed native targets are Linux C++ production and rtc_unittests, not Android or presubmit."
+    },
+    {
+      "decision": "proven-inactive",
+      "declaration_sha256": "70dd5984176df7cb26ae463ef5dc33da5be97c0134e7700353386f8848485b35",
+      "evidence": [
+        {
+          "path": "evidence/four-declarations-caller-proof.json",
+          "sha256": "1335f859dbe20a05325c71c75bf5e250b7142fac588dbef224a668e21ce33319"
+        }
+      ],
+      "path": "src/tools/luci-go",
+      "rationale": "Selected package contains cas/isolate/swarming. Complete native and pinned build/testing GN source contains no action consuming this path. Concrete caller testing/trigger_scripts/base_test_triggerer.py constructs tools/luci-go/swarming, but is an infra trigger entry, absent from the Linux rtc_test generation/data groups and fixed GN/Ninja/direct test/license command route. No trigger/Swarming/isolate/CAS invocation is made."
+    },
+    {
+      "decision": "proven-inactive",
+      "declaration_sha256": "326218495573ad8a8af20ae0b7dfa6c8f2fae648c671b117bb8da44376d02333",
+      "evidence": [
+        {
+          "path": "evidence/pipewire/configure_pipewire.py",
+          "sha256": "b5ebfa8e100852ef1a6a343410af1130db1b2d95229933bbbc13cc84c2eb14b7"
+        },
+        {
+          "path": "evidence/pipewire/desktop-capture-BUILD.gn",
+          "sha256": "a573469fab364960bbd8a751975d31fb109409e746c92a7c65bfb106259b6625"
+        },
+        {
+          "path": "evidence/pipewire/gn_isolate_map.pyl",
+          "sha256": "7e74685145c89eb9a57e21a80f751d0ebcdb7d142983ef69a7f0003638a73b3a"
+        },
+        {
+          "path": "evidence/pipewire/libpipewire-0.3.pc",
+          "sha256": "675165687990579fb1385796bec5ebea2eaab8a01ae354ac7cd2c5a39d07e683"
+        },
+        {
+          "path": "evidence/pipewire/libspa-0.2.pc",
+          "sha256": "9827f502882ddd205e4c46a05f38b45c2ff5b52e1330ae57c04fceaa0caf7d68"
+        },
+        {
+          "path": "evidence/pipewire/mb.py",
+          "sha256": "5b14f792a7ec622e323fb68dbc017c42c5680acb7aea0a9bcfb785c97d9e1e84"
+        },
+        {
+          "path": "evidence/pipewire/native-root-BUILD.gn",
+          "sha256": "4c53c151d8502f9f78be131c75b798e622159fd94ec0dba6cd96ab6a14308e74"
+        },
+        {
+          "path": "evidence/pipewire/native-webrtc.gni",
+          "sha256": "df86c65b417b7185c21d49144bd02845d47f768493763a1b4791c5c12f1d4b73"
+        },
+        {
+          "path": "evidence/pipewire/pipewire-LICENSE",
+          "sha256": "8909c319a7e27dbb33a15b9035f89ab3b7b2f6a12f8bcddc755206a8db1ada44"
+        },
+        {
+          "path": "evidence/pipewire/pipewire-README.chromium",
+          "sha256": "bc8e24682e921934a4d0c9ddca5551ec961c194b8a4d0a2bd76594660a4e454f"
+        },
+        {
+          "path": "evidence/pipewire/pkg-config.py",
+          "sha256": "f5ca11a6009ec259055d21ab31592e75a654965d0815cf630d104ffb63e5a0e2"
+        },
+        {
+          "path": "evidence/pipewire/pkg_config.gni",
+          "sha256": "1ec4968b6c18e006b311f4b97d36dfd573bf9ec9195faa0f0536735d79cee0de"
+        },
+        {
+          "path": "evidence/pipewire/portal-BUILD.gn",
+          "sha256": "12892153ea24383cb1d223ef8c4ebfac564a43732ef2f0593d88133a68ef43aa"
+        },
+        {
+          "path": "evidence/pipewire/primary-sources.json",
+          "sha256": "11bf48613d4f3f6510764bb3c069240b0f2025a841bd7f8d3a852fbed875fac0"
+        },
+        {
+          "path": "evidence/pipewire/selected-scope.json",
+          "sha256": "25a39d7e16210b1c302192556afa6999d9b904325c69e1e9887442c1422b8fa0"
+        },
+        {
+          "path": "evidence/pipewire/sysroot.gni",
+          "sha256": "321f44b7a38a780fda2796c6fef5b80e04fbffbc551d9bea35b57fb14c3c7a0a"
+        },
+        {
+          "path": "evidence/pipewire/toolchain-sysroot.gni",
+          "sha256": "5071cbe46d130d5838ecdb68c22ecacc0140e857769a7146d3a6917a03901449"
+        },
+        {
+          "path": "evidence/pipewire/wireplumber-LICENSE",
+          "sha256": "c4457360115a1af78d662aa357c710104dbd47c5cb52d4ab0342871931ae2d43"
+        },
+        {
+          "path": "evidence/pipewire/wireplumber-README.chromium",
+          "sha256": "acebab2038f3cd68593a824c5024cd95b2fb734f34f9a74013a249a255e084fd"
+        }
+      ],
+      "path": "src/third_party/pipewire/linux-amd64",
+      "rationale": "Only the original CIPD PipeWire/WirePlumber test-server declaration is inactive for the fixed producer scope. PipeWire capture remains enabled: native portal uses genuine staged sysroot pkg-config headers (0.3.65/SPA). Production :default excludes tests; selected rtc_unittests/native12 runs directly, not standalone shared_screencast_stream_test or the MB use_pipewire wrapper. Both pinned package READMEs explicitly identify test-only use and Shipped:no. No claim about other tests, runtime capture or whole upstream checkout closure."
+    },
+    {
+      "decision": "proven-inactive",
+      "declaration_sha256": "2795c0903debd1017ac822629077bcfe8a4cc0dc6ddb980e2e4b65b996fc7dea",
+      "evidence": [
+        {
+          "path": "evidence/four-declarations-caller-proof.json",
+          "sha256": "1335f859dbe20a05325c71c75bf5e250b7142fac588dbef224a668e21ce33319"
+        }
+      ],
+      "path": "src/buildtools/linux64-format",
+      "rationale": "Pinned buildtools DEPS declares Linux clang-format as a standalone formatting binary; the complete 78-leaf buildtools tree has no execution caller. Complete native and pinned build/testing GN/actions have no linux64-format or clang-format invocation; incidental clang-format comments are not commands. Fixed builder invokes GN/Ninja/native tests/archive/objcopy/license generation, with no presubmit, format or generic hooks command."
+    },
+    {
+      "decision": "real-material",
+      "declaration_sha256": "257a4d9e28415349abb01467c53394fc1d8a477373562658c2be02c771c552ed",
+      "evidence": [
+        {
+          "path": "selected-instrumented-inputs.json",
+          "sha256": "927a95029b9ddc8f4b4cce20f07975505b343260d913b9c3488bc6f6182ad0f9"
+        }
+      ],
+      "path": "src/third_party/instrumented_libs/binaries",
+      "rationale": "Exact original code-pinned staged profile and actual source projection are required."
+    }
+  ],
+  "execution_admission": false,
+  "gn_target_cpu": "x64",
+  "gn_target_os": "linux",
+  "gn_use_siso": false,
+  "native_test_target": "//:rtc_unittests",
+  "production_targets": [
+    ":default"
+  ],
+  "schema": "morpheus-native-linux-dependency-decisions-v1",
+  "source_revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663"
+}

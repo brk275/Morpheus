@@ -1,0 +1,89 @@
+{
+  "all_other_llvm_object_conditions": false,
+  "baseline": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+  "build_ready": false,
+  "compiler_source_correspondence_proven": false,
+  "decision": "real-material",
+  "declaration": "src/third_party/llvm-build/Release+Asserts",
+  "distribution_ready": false,
+  "new_output_rows": [
+    {
+      "bytes": 458512,
+      "mode": "100755",
+      "path": "third_party/llvm-build/Release+Asserts/bin/llvm-bcanalyzer",
+      "sha256": "99b22c80374e174a3cba127915c570566483212f02f02eca86fea65bdf3e3d62",
+      "type": "file"
+    },
+    {
+      "bytes": 824992,
+      "mode": "100755",
+      "path": "third_party/llvm-build/Release+Asserts/bin/llvm-cxxfilt",
+      "sha256": "340cad70d8439b0ab64058f997411b9b9681431118deea302d2d4c9d73c15af3",
+      "type": "file"
+    },
+    {
+      "bytes": 17376208,
+      "mode": "100755",
+      "path": "third_party/llvm-build/Release+Asserts/bin/llvm-dwarfdump",
+      "sha256": "428d214fba0cb90b4c4d4e6a840987eb6992ac3145fe689194a4a06c33cf0e51",
+      "type": "file"
+    },
+    {
+      "bytes": 21311248,
+      "mode": "100755",
+      "path": "third_party/llvm-build/Release+Asserts/bin/llvm-nm",
+      "sha256": "d58075cc6c8e423ae5f07a6dc464563a45c3738db8d272e9a869898f9c28572f",
+      "type": "file"
+    },
+    {
+      "bytes": 22829920,
+      "mode": "100755",
+      "path": "third_party/llvm-build/Release+Asserts/bin/llvm-objdump",
+      "sha256": "26e2338d1f4a4819915403e7c76907de78724a50ad9eb991cc6837d9c03b1356",
+      "type": "file"
+    },
+    {
+      "bytes": 34,
+      "mode": "100644",
+      "path": "third_party/llvm-build/Release+Asserts/llvmobjdump_build_revision",
+      "sha256": "bc083637b187e75d27477b130c1f9187f109783809789addcd39b56aee5783e5",
+      "type": "file"
+    },
+    {
+      "bytes": 22829920,
+      "mode": "100755",
+      "path": "third_party/llvm-build/Release+Asserts/bin/llvm-otool",
+      "sha256": "26e2338d1f4a4819915403e7c76907de78724a50ad9eb991cc6837d9c03b1356",
+      "type": "file"
+    }
+  ],
+  "original_update_script": {
+    "git_blob": "ffc91eafaccf0427bb72bc1f651e1acadd4b7808",
+    "path": "src/tools/clang/scripts/update.py",
+    "semantics": "objdump maps to llvmobjdump package in the same LLVM_BUILD_DIR; clang must be assembled first. No hook/update script is executed or its generated stamp invented.",
+    "sha256": "42fb6f075c6017c9ed83bc3a1846ddb70350108f47171ac2132028d9578c43cc"
+  },
+  "projection": "Complete main Clang profile plus complete llvmobjdump profile. Exact shared llvm-nm is verified from both inputs and copied once; llvm-otool is a regular copy of actual llvm-objdump. No arbitrary overwrite/omission/links.",
+  "schema": "morpheus-native-linux-llvm-material-closure-v1",
+  "selected_conditions": {
+    "((checkout_linux or checkout_mac or checkout_android) and host_os == \"linux\") and non_git_source": true,
+    "(host_os == \"linux\" or checkout_android) and non_git_source": true,
+    "not llvm_force_head_revision": true
+  },
+  "selected_objects": [
+    {
+      "archive": "clang",
+      "bytes": 56526480,
+      "sha256": "0e18eb7f358240275c4ef5f92072c9acec37a168287ae69942f6a86462792b89"
+    },
+    {
+      "archive": "llvmobjdump",
+      "bytes": 5727588,
+      "generation": 1763731830357400,
+      "member_inventory_sha256": "20ab4b9ee1e93d93ad94d20208db5abdb29334d7dd200098f012328aca52a7e3",
+      "sha256": "fc5e696e4aa5b36103089fbe4113f53d19a8f9880bb906c4554d075fc6632b5a"
+    }
+  ],
+  "tools_executed": [],
+  "tools_revision": "8993ecb8d92d9571c0f78e22a90b71783fe696d8"
+}

@@ -1,0 +1,42 @@
+{
+  "build_ready": false,
+  "distribution_ready": false,
+  "execution_admitted": false,
+  "generated_lastchange": "deferred, never run here; default dummy vs official actual consumer requires builder review",
+  "git_head_fallback": false,
+  "material_manifest": "materials/source-materials.json",
+  "native_sources_complete": false,
+  "original_repositories": {
+    "file": "materials/repositories.json",
+    "patched": false,
+    "path_base": "path within original repository; object_store relative to provision root",
+    "shape": "array<{mount,url,revision,tree,object_store,files:[{path,mode,blob,bytes,sha256}]}>"
+  },
+  "outer_depot": {
+    "file": "materials/outer-depot-files.json",
+    "path_base": "checkout/outer-depot",
+    "shape": "array<{path,bytes,sha256}>"
+  },
+  "outer_depot_directory": "checkout/outer-depot",
+  "outer_depot_typed": {
+    "file": "materials/outer-depot-inventory.json",
+    "path_base": "checkout/outer-depot",
+    "shape": "array<{path,type:\"file\",mode:\"100644\"|\"100755\",bytes,sha256}>"
+  },
+  "post_patch_source": {
+    "file": "materials/post-patch-source-files.json",
+    "path_base": "checkout/src",
+    "shape": "array<{path,bytes,sha256}>"
+  },
+  "post_patch_source_typed": {
+    "file": "materials/post-patch-source-inventory.json",
+    "path_base": "checkout/src",
+    "shape": "array<{path,type:\"file\",mode:\"100644\"|\"100755\",bytes,sha256}>"
+  },
+  "receipt": "source-provision-receipt.json",
+  "required_security_plan_sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080",
+  "schema": "morpheus-native-source-producer-interface-v1",
+  "source_directory": "checkout/src",
+  "source_git_administrative_metadata": false,
+  "symlinks": "unsupported mode causes refusal, not omitted inventory"
+}

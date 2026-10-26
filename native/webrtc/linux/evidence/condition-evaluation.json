@@ -1,0 +1,680 @@
+[
+  {
+    "at": "/deps/src/examples/androidtests/third_party/gradle",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/ios",
+    "deps": "src/DEPS",
+    "expression": "checkout_ios",
+    "value": false
+  },
+  {
+    "at": "/deps/src/buildtools/linux64",
+    "deps": "src/DEPS",
+    "expression": "checkout_linux",
+    "value": true
+  },
+  {
+    "at": "/deps/src/buildtools/mac",
+    "deps": "src/DEPS",
+    "expression": "checkout_mac",
+    "value": false
+  },
+  {
+    "at": "/deps/src/buildtools/win",
+    "deps": "src/DEPS",
+    "expression": "checkout_win",
+    "value": false
+  },
+  {
+    "at": "/deps/src/buildtools/reclient",
+    "deps": "src/DEPS",
+    "expression": "not (host_os == \"linux\" and host_cpu == \"arm64\")",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts",
+    "deps": "src/DEPS",
+    "expression": "not llvm_force_head_revision",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/0",
+    "deps": "src/DEPS",
+    "expression": "(host_os == \"linux\" or checkout_android) and non_git_source",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/1",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"linux\" and checkout_clang_tidy and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/2",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"linux\" and checkout_clangd and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/3",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"linux\" and checkout_clang_coverage_tools and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/4",
+    "deps": "src/DEPS",
+    "expression": "((checkout_linux or checkout_mac or checkout_android) and host_os == \"linux\") and non_git_source",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/5",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"x64\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/6",
+    "deps": "src/DEPS",
+    "expression": "checkout_mac and not host_os == \"mac\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/7",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"x64\" and checkout_clang_tidy",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/8",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"x64\" and checkout_clangd",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/9",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"x64\" and checkout_clang_coverage_tools",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/10",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"x64\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/11",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"arm64\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/12",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"arm64\" and checkout_clang_tidy",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/13",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"arm64\" and checkout_clangd",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/14",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"arm64\" and checkout_clang_coverage_tools",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/15",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"arm64\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/16",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"win\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/17",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"win\" and checkout_clang_tidy",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/18",
+    "deps": "src/DEPS",
+    "expression": "checkout_win and not host_os == \"win\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/19",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"win\" and checkout_clangd",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/20",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"win\" and checkout_clang_coverage_tools",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/llvm-build/Release+Asserts/objects/21",
+    "deps": "src/DEPS",
+    "expression": "(checkout_linux or checkout_mac or checkout_android) and host_os == \"win\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/rust-toolchain/objects/0",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"linux\" and non_git_source",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/rust-toolchain/objects/1",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"x64\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/rust-toolchain/objects/2",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"arm64\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/rust-toolchain/objects/3",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"win\"",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/test_fonts/test_fonts",
+    "deps": "src/DEPS",
+    "expression": "non_git_source",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/ninja",
+    "deps": "src/DEPS",
+    "expression": "non_git_source",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/siso/cipd",
+    "deps": "src/DEPS",
+    "expression": "non_git_source",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/android_system_sdk/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_build_tools/aapt2/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_build_tools/bundletool/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_build_tools/dagger_compiler/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_build_tools/error_prone/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_build_tools/error_prone_javac/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_build_tools/lint/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_build_tools/nullaway/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/aosp_dalvik/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/cpu_features/src",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/fontconfig/src",
+    "deps": "src/DEPS",
+    "expression": "checkout_linux",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/google-truth/src",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/jdk/current",
+    "deps": "src/DEPS",
+    "expression": "(checkout_android or checkout_linux) and non_git_source",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/jdk11",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/junit/src",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/kotlin_stdlib/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/kotlinc/current",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/libunwindstack",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/lss",
+    "deps": "src/DEPS",
+    "expression": "checkout_android or checkout_linux",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/mockito/src",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/instrumented_libs",
+    "deps": "src/DEPS",
+    "expression": "checkout_instrumented_libraries",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/r8/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/r8/d8/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/requests/src",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/espresso",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/hamcrest/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_toolchain/ndk",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/androidx/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_build_tools/manifest_merger/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_sdk/public",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/icu4j/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/robolectric/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/sqlite4java/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/turbine/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/zstd/src",
+    "deps": "src/DEPS",
+    "expression": "checkout_android",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/pipewire/linux-amd64",
+    "deps": "src/DEPS",
+    "expression": "checkout_linux",
+    "value": true
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/autorolled/cipd",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/com_android_tools_common",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/com_android_tools_layoutlib_layoutlib_api",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/com_android_tools_sdk_common",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/com_google_android_apps_common_testing_accessibility_framework_accessibility_test_framework",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/com_googlecode_java_diff_utils_diffutils",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/com_squareup_javapoet",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/net_bytebuddy_byte_buddy",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/net_bytebuddy_byte_buddy_agent",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_ccil_cowan_tagsoup_tagsoup",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_checkerframework_checker_compat_qual",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_jetbrains_kotlin_kotlin_android_extensions_runtime",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_jetbrains_kotlin_kotlin_parcelize_runtime",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_jetbrains_kotlinx_atomicfu_jvm",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_jetbrains_kotlinx_kotlinx_coroutines_guava",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_jsoup_jsoup",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_mockito_mockito_android",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_mockito_mockito_core",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_mockito_mockito_subclass",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/deps/src/third_party/android_deps/cipd/libs/org_objenesis_objenesis",
+    "deps": "src/DEPS",
+    "expression": "checkout_android and non_git_source",
+    "value": false
+  },
+  {
+    "at": "/hooks/2",
+    "deps": "src/DEPS",
+    "expression": "checkout_linux and checkout_arm",
+    "value": false
+  },
+  {
+    "at": "/hooks/3",
+    "deps": "src/DEPS",
+    "expression": "checkout_linux and checkout_arm64",
+    "value": false
+  },
+  {
+    "at": "/hooks/4",
+    "deps": "src/DEPS",
+    "expression": "checkout_linux and (checkout_x86 or checkout_x64)",
+    "value": true
+  },
+  {
+    "at": "/hooks/5",
+    "deps": "src/DEPS",
+    "expression": "checkout_linux and checkout_mips",
+    "value": false
+  },
+  {
+    "at": "/hooks/6",
+    "deps": "src/DEPS",
+    "expression": "checkout_linux and checkout_x64",
+    "value": true
+  },
+  {
+    "at": "/hooks/7",
+    "deps": "src/DEPS",
+    "expression": "checkout_win and host_os == \"linux\"",
+    "value": false
+  },
+  {
+    "at": "/hooks/8",
+    "deps": "src/DEPS",
+    "expression": "checkout_win",
+    "value": false
+  },
+  {
+    "at": "/hooks/9",
+    "deps": "src/DEPS",
+    "expression": "checkout_mac",
+    "value": false
+  },
+  {
+    "at": "/hooks/10",
+    "deps": "src/DEPS",
+    "expression": "checkout_fuchsia",
+    "value": false
+  },
+  {
+    "at": "/hooks/11",
+    "deps": "src/DEPS",
+    "expression": "checkout_fuchsia and checkout_fuchsia_product_bundles",
+    "value": false
+  },
+  {
+    "at": "/hooks/13",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"arm64\"",
+    "value": false
+  },
+  {
+    "at": "/hooks/14",
+    "deps": "src/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"x64\"",
+    "value": false
+  },
+  {
+    "at": "/hooks/15",
+    "deps": "src/DEPS",
+    "expression": "checkout_win and host_os == \"win\"",
+    "value": false
+  },
+  {
+    "at": "/hooks/16",
+    "deps": "src/DEPS",
+    "expression": "checkout_win and host_os == \"mac\"",
+    "value": false
+  },
+  {
+    "at": "/hooks/17",
+    "deps": "src/DEPS",
+    "expression": "checkout_win and host_os == \"linux\"",
+    "value": false
+  },
+  {
+    "at": "/hooks/21",
+    "deps": "src/DEPS",
+    "expression": "download_remoteexec_cfg",
+    "value": false
+  },
+  {
+    "at": "/deps/win-format",
+    "deps": "src/buildtools/DEPS",
+    "expression": "host_os == \"win\"",
+    "value": false
+  },
+  {
+    "at": "/deps/mac-format",
+    "deps": "src/buildtools/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"x64\"",
+    "value": false
+  },
+  {
+    "at": "/deps/mac_arm64-format",
+    "deps": "src/buildtools/DEPS",
+    "expression": "host_os == \"mac\" and host_cpu == \"arm64\"",
+    "value": false
+  },
+  {
+    "at": "/deps/linux64-format",
+    "deps": "src/buildtools/DEPS",
+    "expression": "host_os == \"linux\"",
+    "value": true
+  },
+  {
+    "at": "/deps/binaries",
+    "deps": "src/third_party/instrumented_libs/DEPS",
+    "expression": "checkout_instrumented_libraries and non_git_source",
+    "value": true
+  }
+]

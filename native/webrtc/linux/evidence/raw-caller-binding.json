@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "bytes": 13664,
+      "path": "scripts/ci_scope.py",
+      "sha256": "6720cee41849cc1b14c0b2d5c34cbd135dad2271d1b9a6f7ace5d4bb2e1ea998"
+    },
+    {
+      "bytes": 26731,
+      "path": "scripts/tests/test_ci_scope.py",
+      "sha256": "37b81de5130cb59ce2b4d2e44946e4eb6491d0585f03948a5ff1eadb7231851e"
+    }
+  ],
+  "raw": "SOURCE_REPOSITORY_ROOT_UNBOUND",
+  "revision": "15c1a319847b9bd567b05ebe82c08e726ebd70b5"
+}

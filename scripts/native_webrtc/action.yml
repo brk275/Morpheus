@@ -1,0 +1,31 @@
+name: Morpheus native Linux producer entry
+description: Deliver genuine job-scoped cache credentials to the reviewed Python DATA consumer
+inputs:
+  phase:
+    required: true
+  plan_sha256:
+    required: true
+  publish_handoff:
+    default: 'false'
+  cache_key:
+    default: ''
+  cache_id:
+    default: ''
+  handoff_sha256:
+    default: ''
+  handoff_bytes:
+    default: ''
+  admission_sha256:
+    default: ''
+outputs:
+  cache_key:
+    description: Exact new source DATA cache key
+  handoff_sha256:
+    description: Actual inner DATA bundle SHA256
+  handoff_bytes:
+    description: Actual inner DATA bundle bytes
+  cache_save:
+    description: Explicit save decision after free-capacity and input checks
+runs:
+  using: node24
+  main: entry.cjs

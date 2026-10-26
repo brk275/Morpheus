@@ -1,0 +1,17 @@
+{
+  "build_ready": false,
+  "change_kind": "dependent_fixed_digest_constants_only",
+  "distribution_ready": false,
+  "execution_admitted": false,
+  "instrumented_binding_sha256": "343c10863e454774b759b078b4e56be87774578eba68e05831560844b5e6b913",
+  "native_sources_complete": false,
+  "parent_source_binding_sha256": "465cd816879e3671f5b86e4b99b857f30d2aaa04dce47b4ed441e990c0fa0ae1",
+  "producer_interface_sha256": "bc3d31fd5a9ea468c603847f6b699d24b8f958e5734d75da52913dd3b90ac898",
+  "recipe": {
+    "path": "scripts/build_native_webrtc_unix.py",
+    "sha256": "52c68acf11f6d72ce7ae4d6cb93185072820c5b16d0e47c851ed23aa578d6f99"
+  },
+  "same_twelve_external_gates_and_twelve_native_cases": true,
+  "schema": "morpheus-native-schema5-consumer-privacy-rebind-v1",
+  "security_plan_sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
+}

@@ -1,0 +1,51 @@
+[
+  {
+    "blob": "6696d458e9dfe68967b7064a77a50b460291df47",
+    "bytes": 776,
+    "path": "cache-save-action.yml",
+    "sha256": "9f3f665720a6cfc4d47b7994e316ab5b12b39a5b0a2dea5d179baa012e50f46a",
+    "url": "https://raw.githubusercontent.com/actions/cache/5a3ec84eff668545956fd18022155c47e93e2684/save/action.yml"
+  },
+  {
+    "blob": "3c5e5aeae0bba2d2e1b58b05768cf7e023dc835f",
+    "bytes": 1589,
+    "path": "cache-restore-action.yml",
+    "sha256": "61905d8302128bb10c34397b7147058ade82ce2b85816b1531f31d65f3918c56",
+    "url": "https://raw.githubusercontent.com/actions/cache/5a3ec84eff668545956fd18022155c47e93e2684/restore/action.yml"
+  },
+  {
+    "blob": "78cd9d5c3f5205ebedb6adff6903218e70f6b30c",
+    "bytes": 5479,
+    "path": "build-rbe.gni",
+    "sha256": "8cec2ca088ce1ffe46a19baedc091a1e13a4021fe04769ec3fbd44b68957dc1e",
+    "url": "https://raw.githubusercontent.com/webrtc-sdk/build/be1a8f6dcd7df7e46320192c5e2f364e50d79bbf/toolchain/rbe.gni"
+  },
+  {
+    "blob": "cb658276290ffa26e2651ac7dc7ac8a2ebd91761",
+    "bytes": 6044,
+    "path": "build-nocompile.gni",
+    "sha256": "0c88ff01503486c13b0bbe157606b0311bfcd31656b9ddc363c28e92ff408e8f",
+    "url": "https://raw.githubusercontent.com/webrtc-sdk/build/be1a8f6dcd7df7e46320192c5e2f364e50d79bbf/nocompile.gni"
+  },
+  {
+    "blob": "4f54d90b1b03135d017ba815166f803e8d71876f",
+    "bytes": 24959,
+    "path": "native-root-BUILD.gn",
+    "sha256": "28de900976df3f8d54285575a29fe5e0ca53632a464a6cdebd051d1ef1e26ec9",
+    "url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/BUILD.gn"
+  },
+  {
+    "blob": "82c10e4c5f516110fd5b681fbdfd957b4e794dc1",
+    "bytes": 20167,
+    "path": "modules-desktop-capture-BUILD.gn",
+    "sha256": "a573469fab364960bbd8a751975d31fb109409e746c92a7c65bfb106259b6625",
+    "url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/modules/desktop_capture/BUILD.gn"
+  },
+  {
+    "blob": "46a410ba6d1845360638b8b168091c3b130517a7",
+    "bytes": 42071,
+    "path": "native-test-BUILD.gn",
+    "sha256": "34d066661818cfb90f9d4c9840e5c542b29de6ec9ab8bbf513ae5fbd869ece13",
+    "url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/test/BUILD.gn"
+  }
+]

@@ -1,0 +1,146 @@
+{
+  "baseline_commit": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+  "baseline_repository": "https://github.com/webrtc-sdk/webrtc",
+  "baseline_tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5",
+  "execution_admitted": false,
+  "final_security_paths": [
+    {
+      "baseline_blob": "536c9343569509b1dfb7d82f05471cf4a62a1438",
+      "bytes": 2606,
+      "git_blob": "70cef3951fb14b98f2455ee81d8877d278457370",
+      "material": "POSTPATCH_SOURCE_ROOT_UNBOUND/api/crypto/BUILD.gn",
+      "mode": "100644",
+      "path": "api/crypto/BUILD.gn",
+      "sha256": "3b5b3fc8b9522423078f7b3ec803b0f154c376ae51dc1db9ca9d335f279a017b"
+    },
+    {
+      "baseline_blob": "dcbe7603890038a051141ce0ce49b95e51aa6a29",
+      "bytes": 41027,
+      "git_blob": "8db04160636b0a1ff7b1016e5f010fc2ac25d879",
+      "material": "POSTPATCH_SOURCE_ROOT_UNBOUND/api/crypto/frame_crypto_transformer.cc",
+      "mode": "100644",
+      "path": "api/crypto/frame_crypto_transformer.cc",
+      "sha256": "81b1bc99719a7f67fa5d7fae7504f4db7c4245d4d97318df3bebf417b98af0c7"
+    },
+    {
+      "baseline_blob": "246add1e3c7250124431806e2b850a8ddb9eaa16",
+      "bytes": 17418,
+      "git_blob": "59407f274fd43561dbda561acabf56154a192bd8",
+      "material": "POSTPATCH_SOURCE_ROOT_UNBOUND/api/crypto/frame_crypto_transformer.h",
+      "mode": "100644",
+      "path": "api/crypto/frame_crypto_transformer.h",
+      "sha256": "b3b050ed5553f0a132cbc20300366668b155dd4248dfb0c1dee71080e3bc2587"
+    },
+    {
+      "baseline_blob": "c1000a03c6c0f909cfcac012dcae824f5f4fcb05",
+      "bytes": 14644,
+      "git_blob": "36c48df61daebb50fc94dafb0a14eec10450c76c",
+      "material": "POSTPATCH_SOURCE_ROOT_UNBOUND/api/crypto/frame_crypto_transformer_unittest.cc",
+      "mode": "100644",
+      "path": "api/crypto/frame_crypto_transformer_unittest.cc",
+      "sha256": "2b1356142ecc88758b03e89ee615694edb03db4bc15b610bbdfe89d551860e56"
+    },
+    {
+      "baseline_blob": null,
+      "bytes": 19990,
+      "git_blob": "f07128ab20f819a60adcd40e97f8e85f24f30e6f",
+      "material": "POSTPATCH_SOURCE_ROOT_UNBOUND/api/crypto/sif_payload_unittest.cc",
+      "mode": "100644",
+      "path": "api/crypto/sif_payload_unittest.cc",
+      "sha256": "f79355710f7350a9de13ae07d6e13144bb913a02c989c01772c28738422cac7c"
+    },
+    {
+      "baseline_blob": "c3f2701b042afaea7242e3a836e3febcb583618b",
+      "bytes": 114008,
+      "git_blob": "f6a9caaebcf294c53b76dc102e6b77b67496a9cc",
+      "material": "POSTPATCH_SOURCE_ROOT_UNBOUND/rtc_base/ssl_roots.h",
+      "mode": "100644",
+      "path": "rtc_base/ssl_roots.h",
+      "sha256": "f54188260ea8fd409ecd789a463931e9b1bde5a37a0c699a2535044c4ba9b7f3"
+    }
+  ],
+  "gtest_filters": [
+    "SifPayload.MatchesJsSdkHashes",
+    "SifPayload.AcceptsServerBlankFrames",
+    "SifPayload.RejectsAnythingElse",
+    "SifTransform.ForwardsKnownAudioAndVideoWithoutKeyAndStripsTrailer",
+    "SifTransform.RejectsForeignTrailerPayloadWithAndWithoutKeyOnBothMediaPaths",
+    "SifTransform.KeepsDisabledAndEmptyBehaviorForBothDiscardPolicies",
+    "SifTransform.OrdinaryAuthenticatedMediaStillRoundTripsOnBothMediaPaths",
+    "KeyProvider.DerivationLogsOnlySizesForBothAlgorithms",
+    "KeyProvider.CopiesPreserveDiscardFrameWhenCryptorNotReady",
+    "SifTransform.RejectsShortEncryptedHeadersIvAndTags",
+    "SifTransform.RejectsRbspWhichShrinksBelowTheAuthenticatedRecord",
+    "KeyProvider.SifTrailerSnapshotsStayCoherentDuringUpdates"
+  ],
+  "merge_admitted": false,
+  "patches": [
+    {
+      "bytes": 22976,
+      "name": "01-sif-validation.patch",
+      "order": 1,
+      "path": "native/webrtc/linux/patches/01-sif-validation.patch",
+      "sha256": "4f5ba9a827220170080ae4d1183e01b437eb7014c391bda46cd258ae0c5f5169"
+    },
+    {
+      "bytes": 5382,
+      "name": "02-key-log-removal.patch",
+      "order": 2,
+      "path": "native/webrtc/linux/patches/02-key-log-removal.patch",
+      "sha256": "793e25908a56d8993cb082e40728ad1bd39919a0abf988b1921384d15dd601fd"
+    },
+    {
+      "bytes": 160798,
+      "name": "03-root-refresh.patch",
+      "order": 3,
+      "path": "native/webrtc/linux/patches/03-root-refresh.patch",
+      "sha256": "6f10c7bf1f0396e5a6e287343a93049d3b7e9387f1cffc9fe7f70a580d0bf508"
+    },
+    {
+      "bytes": 1705,
+      "name": "04-copy-discard-option.patch",
+      "order": 4,
+      "path": "native/webrtc/linux/patches/04-copy-discard-option.patch",
+      "sha256": "ad5f64e55a6c4187b242535f84149c46590565d0e1017f1340856a8fcbd06835"
+    },
+    {
+      "bytes": 9441,
+      "name": "05-frame-bounds.patch",
+      "order": 5,
+      "path": "native/webrtc/linux/patches/05-frame-bounds.patch",
+      "sha256": "3e9934378b8c164314907ba7161f9b223554201fda47dad50744a1ae15c61b1d"
+    },
+    {
+      "bytes": 4058,
+      "name": "06-sif-trailer-snapshot.patch",
+      "order": 6,
+      "path": "native/webrtc/linux/patches/06-sif-trailer-snapshot.patch",
+      "sha256": "df26ab1d8a31ca5cab1f39fda912e0c3e73a726c59cfcde4457e79415094edfd"
+    },
+    {
+      "bytes": 3958,
+      "name": "07-h264-prefix-validation.patch",
+      "order": 7,
+      "path": "native/webrtc/linux/patches/07-h264-prefix-validation.patch",
+      "sha256": "1de7bf5402089c13f93f108f3008aaa8c025e2bdbd7b2375694417c186c86a17"
+    },
+    {
+      "bytes": 5457,
+      "name": "08-rbsp-decoded-iv.patch",
+      "order": 8,
+      "path": "native/webrtc/linux/patches/08-rbsp-decoded-iv.patch",
+      "sha256": "dbefa1b81cd8b24eb0bcd41ec996e6b14265d66ffdad38cf1112e646821d4e09"
+    }
+  ],
+  "provenance": "Prospective new immutable source baseline; no attribution to existing51ef native assets.",
+  "schema": "morpheus-native-security-source-plan-v1",
+  "scope": "Root source-reviewed eight native security/correctness patches only. This tree excludes separate platform SDK patches, generated configuration, DEPS/tools. No source-build, execution, distribution or merge admission. Matching rebuilt native library+headers and exact12 real GTest checks mandatory.",
+  "security_only_tree": "3befdfd0c1c0eb0d1c57d47c3b08a7a00762ff23",
+  "source_review_inputs": {
+    "h264_default_source_scan_findings": 0,
+    "h264_independent_review_sha256": "8b45ce64232aebdeda9ae6e46e2e23ce75bbdbef482694ca3cc9b1a23ccea997",
+    "root_h264_successor_sha256": "d2935b12e7378c3aeeabc93a55d3eb165a123f7fd9544659c7d3cfa1fdba3181",
+    "six_artifacts_root_rehashed": 136,
+    "six_binding_sha256": "ae61ccded5d838afac4f52b99969ca510c7a1e00013001bc5c3b6e3de722baac"
+  }
+}

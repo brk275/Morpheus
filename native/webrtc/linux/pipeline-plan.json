@@ -1,0 +1,454 @@
+{
+  "assets": [
+    {
+      "bytes": 17481,
+      "path": "declaration-ledger.json",
+      "sha256": "2ea59842c90033f32529753950bff4172ef1322107784b7aea3cc00fa2478d58"
+    },
+    {
+      "bytes": 12881,
+      "path": "dependency-decisions.json",
+      "sha256": "57bd48e1dfc09a469333371a975ef5f12e33bc948dc3dd7042edc3e02c4d196a"
+    },
+    {
+      "bytes": 6044,
+      "path": "evidence/build-nocompile.gni",
+      "sha256": "0c88ff01503486c13b0bbe157606b0311bfcd31656b9ddc363c28e92ff408e8f"
+    },
+    {
+      "bytes": 5479,
+      "path": "evidence/build-rbe.gni",
+      "sha256": "8cec2ca088ce1ffe46a19baedc091a1e13a4021fe04769ec3fbd44b68957dc1e"
+    },
+    {
+      "bytes": 335,
+      "path": "evidence/cache-v4.2.3-tag.json",
+      "sha256": "6628b930182ca4d20bc7c0a8d95767ee07f0ee8bd28ee3b6f01d4b7543fe4e3d"
+    },
+    {
+      "bytes": 18763,
+      "path": "evidence/condition-evaluation.json",
+      "sha256": "c11650880a085c883012af1fa7586ac117a925b21e8f16a9522001dd457abf92"
+    },
+    {
+      "bytes": 7493,
+      "path": "evidence/four-declarations-caller-proof.json",
+      "sha256": "1335f859dbe20a05325c71c75bf5e250b7142fac588dbef224a668e21ce33319"
+    },
+    {
+      "bytes": 3534,
+      "path": "evidence/llvm-material-closure.json",
+      "sha256": "c3851c8b7b07862cd00b5933891b9c181425c4fa9dd15a18ce936cc54f8ed5dd"
+    },
+    {
+      "bytes": 20167,
+      "path": "evidence/modules-desktop-capture-BUILD.gn",
+      "sha256": "a573469fab364960bbd8a751975d31fb109409e746c92a7c65bfb106259b6625"
+    },
+    {
+      "bytes": 24959,
+      "path": "evidence/native-root-BUILD.gn",
+      "sha256": "28de900976df3f8d54285575a29fe5e0ca53632a464a6cdebd051d1ef1e26ec9"
+    },
+    {
+      "bytes": 42071,
+      "path": "evidence/native-test-BUILD.gn",
+      "sha256": "34d066661818cfb90f9d4c9840e5c542b29de6ec9ab8bbf513ae5fbd869ece13"
+    },
+    {
+      "bytes": 2283,
+      "path": "evidence/new-primary-records.json",
+      "sha256": "898e70927fe5d904ec94a6bc2f783d9e84158e3f26a7dfa0baf120ba124e27e5"
+    },
+    {
+      "bytes": 2457,
+      "path": "evidence/pipewire/configure_pipewire.py",
+      "sha256": "b5ebfa8e100852ef1a6a343410af1130db1b2d95229933bbbc13cc84c2eb14b7"
+    },
+    {
+      "bytes": 20167,
+      "path": "evidence/pipewire/desktop-capture-BUILD.gn",
+      "sha256": "a573469fab364960bbd8a751975d31fb109409e746c92a7c65bfb106259b6625"
+    },
+    {
+      "bytes": 4777,
+      "path": "evidence/pipewire/gn_isolate_map.pyl",
+      "sha256": "7e74685145c89eb9a57e21a80f751d0ebcdb7d142983ef69a7f0003638a73b3a"
+    },
+    {
+      "bytes": 284,
+      "path": "evidence/pipewire/libpipewire-0.3.pc",
+      "sha256": "675165687990579fb1385796bec5ebea2eaab8a01ae354ac7cd2c5a39d07e683"
+    },
+    {
+      "bytes": 211,
+      "path": "evidence/pipewire/libspa-0.2.pc",
+      "sha256": "9827f502882ddd205e4c46a05f38b45c2ff5b52e1330ae57c04fceaa0caf7d68"
+    },
+    {
+      "bytes": 5643,
+      "path": "evidence/pipewire/mb.py",
+      "sha256": "5b14f792a7ec622e323fb68dbc017c42c5680acb7aea0a9bcfb785c97d9e1e84"
+    },
+    {
+      "bytes": 25226,
+      "path": "evidence/pipewire/native-root-BUILD.gn",
+      "sha256": "4c53c151d8502f9f78be131c75b798e622159fd94ec0dba6cd96ab6a14308e74"
+    },
+    {
+      "bytes": 44070,
+      "path": "evidence/pipewire/native-webrtc.gni",
+      "sha256": "df86c65b417b7185c21d49144bd02845d47f768493763a1b4791c5c12f1d4b73"
+    },
+    {
+      "bytes": 1218,
+      "path": "evidence/pipewire/pipewire-LICENSE",
+      "sha256": "8909c319a7e27dbb33a15b9035f89ab3b7b2f6a12f8bcddc755206a8db1ada44"
+    },
+    {
+      "bytes": 656,
+      "path": "evidence/pipewire/pipewire-README.chromium",
+      "sha256": "bc8e24682e921934a4d0c9ddca5551ec961c194b8a4d0a2bd76594660a4e454f"
+    },
+    {
+      "bytes": 8754,
+      "path": "evidence/pipewire/pkg-config.py",
+      "sha256": "f5ca11a6009ec259055d21ab31592e75a654965d0815cf630d104ffb63e5a0e2"
+    },
+    {
+      "bytes": 6868,
+      "path": "evidence/pipewire/pkg_config.gni",
+      "sha256": "1ec4968b6c18e006b311f4b97d36dfd573bf9ec9195faa0f0536735d79cee0de"
+    },
+    {
+      "bytes": 3076,
+      "path": "evidence/pipewire/portal-BUILD.gn",
+      "sha256": "12892153ea24383cb1d223ef8c4ebfac564a43732ef2f0593d88133a68ef43aa"
+    },
+    {
+      "bytes": 8226,
+      "path": "evidence/pipewire/primary-sources.json",
+      "sha256": "11bf48613d4f3f6510764bb3c069240b0f2025a841bd7f8d3a852fbed875fac0"
+    },
+    {
+      "bytes": 8374,
+      "path": "evidence/pipewire/selected-scope.json",
+      "sha256": "25a39d7e16210b1c302192556afa6999d9b904325c69e1e9887442c1422b8fa0"
+    },
+    {
+      "bytes": 2725,
+      "path": "evidence/pipewire/sysroot.gni",
+      "sha256": "321f44b7a38a780fda2796c6fef5b80e04fbffbc551d9bea35b57fb14c3c7a0a"
+    },
+    {
+      "bytes": 635,
+      "path": "evidence/pipewire/toolchain-sysroot.gni",
+      "sha256": "5071cbe46d130d5838ecdb68c22ecacc0140e857769a7146d3a6917a03901449"
+    },
+    {
+      "bytes": 1095,
+      "path": "evidence/pipewire/wireplumber-LICENSE",
+      "sha256": "c4457360115a1af78d662aa357c710104dbd47c5cb52d4ab0342871931ae2d43"
+    },
+    {
+      "bytes": 1029,
+      "path": "evidence/pipewire/wireplumber-README.chromium",
+      "sha256": "acebab2038f3cd68593a824c5024cd95b2fb734f34f9a74013a249a255e084fd"
+    },
+    {
+      "bytes": 442,
+      "path": "evidence/raw-caller-binding.json",
+      "sha256": "27c6dd69be038846a04b51acd8d6d3de5fd28f7b8f30a4e2995fda482cfcd1ac"
+    },
+    {
+      "bytes": 10353166,
+      "path": "expected-linux-overlay.json",
+      "sha256": "ce7ab3da14ce9dc1338edcac3080093798bc00f2354294f36d7b3a50eee53a7a"
+    },
+    {
+      "bytes": 6427,
+      "path": "inputs/root-security-source-plan.json",
+      "sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
+    },
+    {
+      "bytes": 20786,
+      "path": "patch-manifest.json",
+      "sha256": "e97be792680220ec3d21f39a0a950599a3266fd3041e2a8d5027df36d946b714"
+    },
+    {
+      "bytes": 22976,
+      "path": "patches/01-sif-validation.patch",
+      "sha256": "4f5ba9a827220170080ae4d1183e01b437eb7014c391bda46cd258ae0c5f5169"
+    },
+    {
+      "bytes": 5382,
+      "path": "patches/02-key-log-removal.patch",
+      "sha256": "793e25908a56d8993cb082e40728ad1bd39919a0abf988b1921384d15dd601fd"
+    },
+    {
+      "bytes": 160798,
+      "path": "patches/03-root-refresh.patch",
+      "sha256": "6f10c7bf1f0396e5a6e287343a93049d3b7e9387f1cffc9fe7f70a580d0bf508"
+    },
+    {
+      "bytes": 1705,
+      "path": "patches/04-copy-discard-option.patch",
+      "sha256": "ad5f64e55a6c4187b242535f84149c46590565d0e1017f1340856a8fcbd06835"
+    },
+    {
+      "bytes": 9441,
+      "path": "patches/05-frame-bounds.patch",
+      "sha256": "3e9934378b8c164314907ba7161f9b223554201fda47dad50744a1ae15c61b1d"
+    },
+    {
+      "bytes": 4058,
+      "path": "patches/06-sif-trailer-snapshot.patch",
+      "sha256": "df26ab1d8a31ca5cab1f39fda912e0c3e73a726c59cfcde4457e79415094edfd"
+    },
+    {
+      "bytes": 3958,
+      "path": "patches/07-h264-prefix-validation.patch",
+      "sha256": "1de7bf5402089c13f93f108f3008aaa8c025e2bdbd7b2375694417c186c86a17"
+    },
+    {
+      "bytes": 5457,
+      "path": "patches/08-rbsp-decoded-iv.patch",
+      "sha256": "dbefa1b81cd8b24eb0bcd41ec996e6b14265d66ffdad38cf1112e646821d4e09"
+    },
+    {
+      "bytes": 940,
+      "path": "patches/add_deps.patch",
+      "sha256": "da222e44f306137ed96b626879948325dc21857dcf054482b1e3df83e59fe5f4"
+    },
+    {
+      "bytes": 785,
+      "path": "patches/add_licenses.patch",
+      "sha256": "3744d07bce56a3cc281f70196ad52513b6395d353a73d2de97f2de616bc27625"
+    },
+    {
+      "bytes": 426,
+      "path": "patches/david_disable_gun_source_macro.patch",
+      "sha256": "a4789ab8a70cd1d17f15a486caf02736c5ea350facdd4718b7504aa3bf8f66f1"
+    },
+    {
+      "bytes": 722,
+      "path": "patches/disable_crel.patch",
+      "sha256": "9c1c89c4f488209bf3397900754a5980b23e30702df579cca02ba96c164e8d2c"
+    },
+    {
+      "bytes": 525,
+      "path": "patches/disable_sme_for_libyuv.patch",
+      "sha256": "e19d3de930350f9257e8ebbd50b7a94677152f999ef94df70434258fcec37a2d"
+    },
+    {
+      "bytes": 5947,
+      "path": "patches/external_audio_source.patch",
+      "sha256": "83bfe8101270cc60be25991ec07bbabf51c071f6529b50895e4b1ef07314b81f"
+    },
+    {
+      "bytes": 987,
+      "path": "patches/fix_desktop_capture_compile.patch",
+      "sha256": "e768451621cffb76232bac65b926e197dc49947fd8cb31e5f976bd480a659c85"
+    },
+    {
+      "bytes": 764,
+      "path": "patches/fix_license_json_parsing.patch",
+      "sha256": "602275f0ebe9b5122496eaf3ecf624068316c87fdbcfee9d8fa5495463ca471b"
+    },
+    {
+      "bytes": 2523,
+      "path": "patches/ssl_verify_callback_with_native_handle.patch",
+      "sha256": "55042fe99107439e88e56cddec4f5caf8c8a92e72f2e035ac8e37d52aaecb20c"
+    },
+    {
+      "bytes": 1108,
+      "path": "reference/git-source-privacy-binding.json",
+      "sha256": "33d7a49ef10d0c3f6acc2a8466c762e8fbabf6212c1ae0038b81839ded4fcb1b"
+    },
+    {
+      "bytes": 857,
+      "path": "reference/instrumented-privacy-binding.json",
+      "sha256": "343c10863e454774b759b078b4e56be87774578eba68e05831560844b5e6b913"
+    },
+    {
+      "bytes": 1772,
+      "path": "reference/producer-interface.json",
+      "sha256": "bc3d31fd5a9ea468c603847f6b699d24b8f958e5734d75da52913dd3b90ac898"
+    },
+    {
+      "bytes": 2295,
+      "path": "reference/schema5-consumer-llvm-binding.json",
+      "sha256": "bef8a8323c88d68d3d30c8f7c1795e6251016602e60f8c73b7590903f7ab30d6"
+    },
+    {
+      "bytes": 858,
+      "path": "reference/schema5-consumer-privacy-binding.json",
+      "sha256": "088e25fef10412a68d8cc97cbeb6d815d34985d3a61cca1a82a0509b4f8d3fb2"
+    },
+    {
+      "bytes": 182,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/.gclient",
+      "sha256": "3650bb3230db48db33e10efbef81c280bae35a5ed7babe354745f25fab053689"
+    },
+    {
+      "bytes": 119205,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/boringssl_prefix_symbols.txt",
+      "sha256": "740c1e02bbfcce3b053c43442a2f66341424b78cbe861deb0aa1ba4198d10b6d"
+    },
+    {
+      "bytes": 5482,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/build_linux.sh",
+      "sha256": "db16d2f4f6ed60db3d49f37597dda6952509aaccf2568a661534095bf695a2de"
+    },
+    {
+      "bytes": 5027,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/build_macos.sh",
+      "sha256": "df80789d334708af4e028fe9f06201dcb6f8606de9f2ad2f1253a1696fe0824a"
+    },
+    {
+      "bytes": 3087,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/build_windows.cmd",
+      "sha256": "c33aac0d2ce32766784208ea60c2bc3fc1c83902169011e02ebacd9973ad7301"
+    },
+    {
+      "bytes": 940,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/add_deps.patch",
+      "sha256": "da222e44f306137ed96b626879948325dc21857dcf054482b1e3df83e59fe5f4"
+    },
+    {
+      "bytes": 785,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/add_licenses.patch",
+      "sha256": "3744d07bce56a3cc281f70196ad52513b6395d353a73d2de97f2de616bc27625"
+    },
+    {
+      "bytes": 895,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/android_use_libunwind.patch",
+      "sha256": "36c17bb8c7b219a6e2e714a477869af756a51331ba25264e8f65060562ab72fc"
+    },
+    {
+      "bytes": 426,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/david_disable_gun_source_macro.patch",
+      "sha256": "a4789ab8a70cd1d17f15a486caf02736c5ea350facdd4718b7504aa3bf8f66f1"
+    },
+    {
+      "bytes": 722,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/disable_crel.patch",
+      "sha256": "9c1c89c4f488209bf3397900754a5980b23e30702df579cca02ba96c164e8d2c"
+    },
+    {
+      "bytes": 525,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/disable_sme_for_libyuv.patch",
+      "sha256": "e19d3de930350f9257e8ebbd50b7a94677152f999ef94df70434258fcec37a2d"
+    },
+    {
+      "bytes": 5947,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/external_audio_source.patch",
+      "sha256": "83bfe8101270cc60be25991ec07bbabf51c071f6529b50895e4b1ef07314b81f"
+    },
+    {
+      "bytes": 987,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/fix_desktop_capture_compile.patch",
+      "sha256": "e768451621cffb76232bac65b926e197dc49947fd8cb31e5f976bd480a659c85"
+    },
+    {
+      "bytes": 764,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/fix_license_json_parsing.patch",
+      "sha256": "602275f0ebe9b5122496eaf3ecf624068316c87fdbcfee9d8fa5495463ca471b"
+    },
+    {
+      "bytes": 12628,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/jni_prefix.patch",
+      "sha256": "c5d00ee7243c8f7d55f90b3b7c6dd494dca85e0ed429b66885a278992aaa68ac"
+    },
+    {
+      "bytes": 2523,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/ssl_verify_callback_with_native_handle.patch",
+      "sha256": "55042fe99107439e88e56cddec4f5caf8c8a92e72f2e035ac8e37d52aaecb20c"
+    },
+    {
+      "bytes": 568,
+      "path": "reference/sdk/webrtc-sys/libwebrtc/patches/windows_silence_warnings.patch",
+      "sha256": "50dc2fa0db35abe9a4dd2d6849f70d12aa45c82af3371fcf8d6771fed9046887"
+    },
+    {
+      "bytes": 728933,
+      "path": "selected-instrumented-inputs.json",
+      "sha256": "927a95029b9ddc8f4b4cce20f07975505b343260d913b9c3488bc6f6182ad0f9"
+    },
+    {
+      "bytes": 16775086,
+      "path": "selected-linux-build-inputs.json",
+      "sha256": "f75cf14baaec10fdc9203626737808d3987cc734923b0bb55eae6218234489a5"
+    },
+    {
+      "bytes": 1217165,
+      "path": "selected-python-inputs.json",
+      "sha256": "b3cd3a5066338da7fa450fe48580d987dbb88f90d9497dc2106802ab989c0aea"
+    },
+    {
+      "bytes": 473118,
+      "path": "selected-tool-manifest.json",
+      "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+    },
+    {
+      "bytes": 20771,
+      "path": "source-plan.json",
+      "sha256": "2489cdd737218109dd56378f9b7049aeda68df3798dc670c1899cb1e90a9d32c"
+    }
+  ],
+  "cache_handoff_authorized": false,
+  "core_plan": {
+    "path": "selected-tool-manifest.json",
+    "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+  },
+  "declaration_ledger": {
+    "path": "declaration-ledger.json",
+    "sha256": "2ea59842c90033f32529753950bff4172ef1322107784b7aea3cc00fa2478d58"
+  },
+  "dependency_decisions": {
+    "path": "dependency-decisions.json",
+    "sha256": "57bd48e1dfc09a469333371a975ef5f12e33bc948dc3dd7042edc3e02c4d196a"
+  },
+  "host_git": {
+    "bytes": null,
+    "path": null,
+    "sha256": null,
+    "version": null
+  },
+  "host_zstd": {
+    "bytes": null,
+    "path": null,
+    "sha256": null
+  },
+  "instrumented_plan": {
+    "path": "selected-instrumented-inputs.json",
+    "sha256": "927a95029b9ddc8f4b4cce20f07975505b343260d913b9c3488bc6f6182ad0f9"
+  },
+  "linux_plan": {
+    "path": "selected-linux-build-inputs.json",
+    "sha256": "f75cf14baaec10fdc9203626737808d3987cc734923b0bb55eae6218234489a5"
+  },
+  "minimum_free_bytes": 25769803776,
+  "native_test_count": 12,
+  "patch_manifest": {
+    "path": "patch-manifest.json",
+    "sha256": "e97be792680220ec3d21f39a0a950599a3266fd3041e2a8d5027df36d946b714"
+  },
+  "pipeline_sha256": "2d4feea982c1fb4acc2dff4f39f1501af5f25d48b557e4a1a03f8b3a3c80383e",
+  "python_plan": {
+    "path": "selected-python-inputs.json",
+    "sha256": "b3cd3a5066338da7fa450fe48580d987dbb88f90d9497dc2106802ab989c0aea"
+  },
+  "schema": "morpheus-native-linux-pipeline-v1",
+  "security_patch_count": 8,
+  "security_plan": {
+    "path": "inputs/root-security-source-plan.json",
+    "sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
+  },
+  "security_plan_sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080",
+  "source_plan": {
+    "path": "source-plan.json",
+    "sha256": "2489cdd737218109dd56378f9b7049aeda68df3798dc670c1899cb1e90a9d32c"
+  },
+  "target": "linux-x64"
+}

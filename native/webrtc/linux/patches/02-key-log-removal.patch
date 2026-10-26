@@ -1,0 +1,156 @@
+diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
+index 696303119d4ea21798510da9fbce483e219dee87..1d403f1f9c866015f66cbeed5b407624cfc3e35e 100644
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -27,9 +27,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <iterator>
+-#include <iomanip>
+ #include <iostream>
+-#include <sstream>
+ #include <string>
+ 
+ #include "absl/container/inlined_vector.h"
+@@ -148,25 +146,6 @@
+       return true;
+   }
+   return false;
+-}
+-
+-std::string to_uint8_list(const uint8_t* data, int len) {
+-  std::stringstream ss;
+-  ss << "[";
+-  for (int i = 0; i < len; i++) {
+-    ss << static_cast<unsigned>(data[i]) << ",";
+-  }
+-  ss << "]";
+-  return ss.str();
+-}
+-
+-std::string to_hex(const uint8_t* data, int len) {
+-  std::stringstream ss;
+-  ss << std::uppercase << std::hex << std::setfill('0');
+-  for (int i = 0; i < len; i++) {
+-    ss << std::setw(2) << static_cast<unsigned>(data[i]);
+-  }
+-  return ss.str();
+ }
+ 
+ uint8_t get_unencrypted_bytes(webrtc::TransformableFrameInterface* frame,
+@@ -260,12 +239,10 @@
+     return ErrorUnexpected;
+   }
+ 
+-  RTC_LOG(LS_INFO) << "secret " << to_uint8_list(secret.data(), secret.size())
+-                   << " len " << secret.size() << " slat << "
+-                   << to_uint8_list(salt.data(), salt.size()) << " len "
+-                   << salt.size() << "\n derived_key "
+-                   << to_uint8_list(derived_key.data(), derived_key.size())
+-                   << " len " << derived_key.size();
++  // Never log key material: only sizes.
++  RTC_LOG(LS_VERBOSE) << "Derived HKDF-SHA256 key, secret len "
++                      << secret.size() << ", salt len " << salt.size()
++                      << ", derived key len " << derived_key.size();
+ 
+   return Success;
+ }
+@@ -284,13 +261,10 @@
+     return ErrorUnexpected;
+   }
+ 
+-  RTC_LOG(LS_INFO) << "raw_key "
+-                   << to_uint8_list(raw_key.data(), raw_key.size()) << " len "
+-                   << raw_key.size() << " slat << "
+-                   << to_uint8_list(salt.data(), salt.size()) << " len "
+-                   << salt.size() << "\n derived_key "
+-                   << to_uint8_list(derived_key.data(), derived_key.size())
+-                   << " len " << derived_key.size();
++  // Never log key material: only sizes.
++  RTC_LOG(LS_VERBOSE) << "Derived PBKDF2 key, raw key len " << raw_key.size()
++                      << ", salt len " << salt.size()
++                      << ", derived key len " << derived_key.size();
+ 
+   return Success;
+ }
+diff --git a/api/crypto/frame_crypto_transformer_unittest.cc b/api/crypto/frame_crypto_transformer_unittest.cc
+index c1000a03c6c0f909cfcac012dcae824f5f4fcb05..f74389a5acf8a2507f70cdca297dd82c4162ddf5 100644
+--- a/api/crypto/frame_crypto_transformer_unittest.cc
++++ b/api/crypto/frame_crypto_transformer_unittest.cc
+@@ -1,6 +1,7 @@
+ #include "api/crypto/frame_crypto_transformer.h"
+ 
+ #include <memory>
++#include <mutex>
+ #include <string>
+ 
+ #include "rtc_base/logging.h"
+@@ -241,4 +242,68 @@
+   EXPECT_NE(encrypted_data.value()->iv, encrypted_data2.value()->iv);
+ }
+ 
++namespace {
++
++struct KeyLogObservation {
++  bool rendered_material = false;
++  int hkdf_size_records = 0;
++  int pbkdf2_size_records = 0;
++};
++
++class KeyDerivationTestLogSink : public LogSink {
++ public:
++  KeyDerivationTestLogSink() { LogMessage::AddLogToStream(this, LS_VERBOSE); }
++  ~KeyDerivationTestLogSink() override { Close(); }
++  void Close() {
++    if (!closed_) {
++      LogMessage::RemoveLogToStream(this);
++      closed_ = true;
++    }
++  }
++  void OnLogMessage(const std::string& message, LoggingSeverity severity) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    observed_.rendered_material |=
++        message.find("secret [") != std::string::npos ||
++        message.find("raw_key [") != std::string::npos ||
++        message.find("derived_key [") != std::string::npos;
++    if (severity == LS_VERBOSE) {
++      observed_.hkdf_size_records +=
++          message.find("Derived HKDF-SHA256 key, secret len ") != std::string::npos;
++      observed_.pbkdf2_size_records +=
++          message.find("Derived PBKDF2 key, raw key len ") != std::string::npos;
++    }
++  }
++  void OnLogMessage(const std::string& message) override {}
++  KeyLogObservation observed() const {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return observed_;
++  }
++
++ private:
++  mutable std::mutex mutex_;
++  bool closed_ = false;
++  KeyLogObservation observed_;
++};
++
++}  // namespace
++
++TEST(KeyProvider, DerivationLogsOnlySizesForBothAlgorithms) {
++  KeyDerivationTestLogSink sink;
++  bool imported = true;
++  for (auto algorithm : {kHKDF, kPBKDF2}) {
++    KeyProviderOptions options;
++    options.key_derivation_algorithm = algorithm;
++    auto provider = make_ref_counted<DefaultKeyProviderImpl>(options);
++    imported &= provider->SetKey("synthetic", 0, std::vector<uint8_t>(32, 0x42));
++  }
++  // RemoveLogToStream guarantees callbacks have ceased. No log message text
++  // or synthetic key bytes are stored or printed by this test sink.
++  sink.Close();
++  const auto observed = sink.observed();
++  EXPECT_TRUE(imported);
++  EXPECT_FALSE(observed.rendered_material);
++  EXPECT_EQ(observed.hkdf_size_records, 1);
++  EXPECT_EQ(observed.pbkdf2_size_records, 1);
++}
++
+ }  // namespace webrtc

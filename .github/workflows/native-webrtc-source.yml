@@ -1,0 +1,97 @@
+name: Native WebRTC Linux source producer
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Stage DATA, or build a separately reviewed exact cached handoff
+        type: choice
+        required: true
+        options: [preflight, stage, build]
+      plan_sha256:
+        description: SHA256 of native/webrtc/linux/pipeline-plan.json
+        type: string
+        required: true
+      publish_handoff:
+        description: Save the bounded DATA handoff only after source/storage admission
+        type: boolean
+        default: false
+      cache_key:
+        description: Exact immutable handoff cache key (build only)
+        type: string
+        default: ''
+      cache_id:
+        description: Independently recorded numeric cache ID (build only)
+        type: string
+        default: ''
+      handoff_sha256:
+        description: Independently admitted inner DATA bundle digest (build only)
+        type: string
+        default: ''
+      handoff_bytes:
+        description: Independently recorded exact inner bundle size (build only)
+        type: string
+        default: ''
+      admission_sha256:
+        description: SHA256 of native/webrtc/linux/build-admission.json (build only)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: native-webrtc-source-linux
+  cancel-in-progress: false
+
+jobs:
+  producer:
+    if: >-
+      github.repository == 'brk275/Morpheus' &&
+      github.ref == 'refs/heads/main' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.phase == 'preflight' && 5 || 360 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Run the exact reviewed producer phase
+        id: producer
+        uses: ./scripts/native_webrtc
+        env:
+          NATIVE_READ_TOKEN: ${{ github.token }}
+        with:
+          phase: ${{ inputs.phase }}
+          plan_sha256: ${{ inputs.plan_sha256 }}
+          publish_handoff: ${{ inputs.publish_handoff }}
+          cache_key: ${{ inputs.cache_key }}
+          cache_id: ${{ inputs.cache_id }}
+          handoff_sha256: ${{ inputs.handoff_sha256 }}
+          handoff_bytes: ${{ inputs.handoff_bytes }}
+          admission_sha256: ${{ inputs.admission_sha256 }}
+      # SAVE ONLY. The action's restore implementation performs prefix lookup
+      # and extraction before reporting cache-hit; it is deliberately unused.
+      - name: Save one admitted DATA bundle within the existing free cache cap
+        if: steps.producer.outputs.cache_save == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/native-webrtc-handoff/handoff.tar.gz
+          key: ${{ steps.producer.outputs.cache_key }}
+          enableCrossOsArchive: false
+      - name: Bind the actual stored cache identity
+        if: steps.producer.outputs.cache_save == 'true'
+        uses: ./scripts/native_webrtc
+        env:
+          NATIVE_READ_TOKEN: ${{ github.token }}
+        with:
+          phase: cache-receipt
+          plan_sha256: ${{ inputs.plan_sha256 }}
+          cache_key: ${{ steps.producer.outputs.cache_key }}
+          handoff_sha256: ${{ steps.producer.outputs.handoff_sha256 }}
+          handoff_bytes: ${{ steps.producer.outputs.handoff_bytes }}
+      # No artifacts, installer uploads, cache fallbacks, quota changes, release
+      # credentials, publication or unrelated app/platform builds are added.

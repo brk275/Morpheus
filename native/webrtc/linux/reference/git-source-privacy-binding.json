@@ -1,0 +1,26 @@
+{
+  "build_ready": false,
+  "change_kind": "metadata_paths_and_dependent_hash_constants_only",
+  "distribution_ready": false,
+  "execution_admitted": false,
+  "native_sources_complete": false,
+  "parent_source_binding_sha256": "2cc264be43fc31a0a41727b51021fd4516a5032775bc03fcdb93183959caa1af",
+  "producer_interface": {
+    "path": "native/webrtc/linux/reference/producer-interface.json",
+    "sha256": "bc3d31fd5a9ea468c603847f6b699d24b8f958e5734d75da52913dd3b90ac898"
+  },
+  "recipe": {
+    "path": "scripts/native_webrtc/git_source_stager.py",
+    "sha256": "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b"
+  },
+  "same_eight_patch_bytes_and_six_postimage_identities_and_twelve_cases": true,
+  "schema": "morpheus-native-source-privacy-rebind-v1",
+  "security_plan": {
+    "path": "native/webrtc/linux/inputs/root-security-source-plan.json",
+    "sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
+  },
+  "source_plan": {
+    "path": "native/webrtc/linux/source-plan.json",
+    "sha256": "2489cdd737218109dd56378f9b7049aeda68df3798dc670c1899cb1e90a9d32c"
+  }
+}

@@ -1,0 +1,143 @@
+{
+  "GN_graph_executed": false,
+  "authenticated_source": [
+    {
+      "archive_sha256": "bfcfd0a02d6d31aeeeddcba69782e2b8f07131ee32357eec94b51debc45d81a3",
+      "bytes": 102856028,
+      "complete_text_search_sha256": "b90f4161e5d036cdf0762f840dde896b6870b4664f336561ca9956120f402cf9",
+      "mount": "src",
+      "regular_files": 7499,
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
+    },
+    {
+      "archive_sha256": "93a285ce9e98124a7cb181f0dfbeb93c514011c683bdf9e6c591bd040e0f9691",
+      "complete_blob_tree_proof_sha256": "de8ba2fa22e3a0b22e2ecf34b6406d5a0cfa98042c5d7d2cfd544692a1b4d27e",
+      "mount": "src/build",
+      "regular_or_symlink_leaves": 1436,
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2"
+    },
+    {
+      "archive_sha256": "fbc4d232f97479b3d103ec62a477b9c83adbf0f4503e66fc8fb531fcd2f57899",
+      "complete_blob_tree_proof_sha256": "adf0d83836cfa150dedf5f05f3171d760b2505dcff5999d9b2713ca2c3fdcf62",
+      "mount": "src/buildtools",
+      "regular_or_symlink_leaves": 78,
+      "tree": "a3e6af02b8c81472c67d47bce22caa1f87a83889"
+    },
+    {
+      "archive_sha256": "e3c6b7b357953d86d15d15c5a0e4f54431bd5146416ac0a26ea0ccb79d2e7587",
+      "complete_blob_tree_proof_sha256": "35c71eb9984d66103da4ca9f94c570fe23e9cfd1e8131239b4aeac723c68fa5b",
+      "mount": "src/testing",
+      "regular_or_symlink_leaves": 789,
+      "tree": "84ac15456637eecdd3dd5f3ea559a9a7ab760c42"
+    }
+  ],
+  "direct_callers": [
+    {
+      "path": "callers/build_native_webrtc_unix.py",
+      "sha256": "fb11a2b1a9c67332968ceb38a1e46e5d723e16780212c2a19b59fa66c00bf180"
+    },
+    {
+      "path": "native/BUILD.gn",
+      "sha256": "28de900976df3f8d54285575a29fe5e0ca53632a464a6cdebd051d1ef1e26ec9"
+    },
+    {
+      "path": "native/webrtc.gni",
+      "sha256": "df86c65b417b7185c21d49144bd02845d47f768493763a1b4791c5c12f1d4b73"
+    },
+    {
+      "path": "native/test/BUILD.gn",
+      "sha256": "34d066661818cfb90f9d4c9840e5c542b29de6ec9ab8bbf513ae5fbd869ece13"
+    },
+    {
+      "path": "native/test/test_main.cc",
+      "sha256": "d30705b761031f9ca9175fc5f19e01cb2ea92f94a0869f873cebf0d8e8bc8e7f"
+    },
+    {
+      "path": "native/test/test_main_lib.cc",
+      "sha256": "f32ebe98ea6b63c2174b6f9aa32a706178c50e4b1ffb8b6d3f24c9a932cb59dc"
+    },
+    {
+      "path": "native/tools_webrtc/libs/generate_licenses.py",
+      "sha256": "e6b5c94a8138e62c9d16beec64741d3e081ccc1ced59e983b818cef6a96a916e"
+    },
+    {
+      "path": "testing/test.gni",
+      "sha256": "913394c2eb534b34a068819f6a3e494b85a9cd70604cd1ffd5bf7a90cdde5f47"
+    },
+    {
+      "path": "testing/BUILD.gn",
+      "sha256": "807686b3ae7ce79af0f501b1c5ec0a3b9b7b86a8a900c67ea80d49fbe6581ac4"
+    },
+    {
+      "path": "testing/trigger_scripts/base_test_triggerer.py",
+      "sha256": "2946d953828e514442e42729f079f87ae076389eb5bcd30c4279cabf4c066511"
+    },
+    {
+      "path": "build/util/BUILD.gn",
+      "sha256": "65cce5c8a3a138da9b7f2883b1988b60fb59ae1ad438de1c5ece0d21cdd15cd7"
+    },
+    {
+      "path": "build/util/generate_wrapper.gni",
+      "sha256": "108f64b85cb63bb9a0c27607ea6b31db6452c0a0f93a765110e30ac410925248"
+    },
+    {
+      "path": "build/util/generate_wrapper.py",
+      "sha256": "3c0c06c039874c8b99af3d85b5e20d41cf12ce84f09b32d19e0af79260e60973"
+    },
+    {
+      "path": "buildtools/DEPS",
+      "sha256": "72317f8d247e4a40a8629efaf0d267302258715ddc38b4d28448f1fecb4bb9b4"
+    }
+  ],
+  "limits": [
+    "This is pinned static source review; no GN graph or candidate code was executed.",
+    "Only four declaration decisions change. Other prerequisites, unresolved material, all 12 security gates and readiness flags remain untouched.",
+    "Archive sources are inert private review evidence, not authority to execute downloaded code."
+  ],
+  "proof": [
+    {
+      "decision": "proven-inactive",
+      "invalidation": "Any change to target/platform, test data path, imported target closure, generated actions or source recipe requires fresh review; not a blanket unused-font assertion.",
+      "path": "src/third_party/test_fonts/test_fonts",
+      "reason": "DEPS non_git_source condition is selected, not excluded. Complete native source has no test_fonts caller beyond DEPS and no Skia or test-font GN/C++ target. Complete pinned build/testing source finds only the Fuchsia component test_fonts shard and its README; testing/test.gni enters its non-Fuchsia Linux branch. Neither Linux :default nor Linux rtc_unittests declares a font data path. No generic sync/hooks is invoked by the fixed builder.",
+      "selected_declaration_retained": true
+    },
+    {
+      "decision": "proven-inactive",
+      "invalidation": "Adopting result_adapter, infra runners or altered test command requires genuine original material or a new proof.",
+      "path": "src/tools/resultdb",
+      "reason": "DEPS installs infra/tools/result_adapter; no native GN/C++ caller or build/testing target invokes that binary. Linux rtc_test generates a wrapper and includes testing:test_scripts_shared, whose build/util:proto and :test_results only provide checked-in Python DATA. Wrapper generation only writes wrapper text; the fixed builder directly invokes rtc_unittests with gtest list/filter/XML, never a ResultDB adapter or bot/recipe runner. Android/ChromeOS runner mentions and infra ResultDB configuration are excluded from this Linux direct command route.",
+      "selected_declaration_retained": true
+    },
+    {
+      "decision": "proven-inactive",
+      "invalidation": "Any future trigger/upload/remote execution workflow requires genuine packages and review.",
+      "path": "src/tools/luci-go",
+      "reason": "Selected package contains cas/isolate/swarming. Complete native and pinned build/testing GN source contains no action consuming this path. Concrete caller testing/trigger_scripts/base_test_triggerer.py constructs tools/luci-go/swarming, but is an infra trigger entry, absent from the Linux rtc_test generation/data groups and fixed GN/Ninja/direct test/license command route. No trigger/Swarming/isolate/CAS invocation is made.",
+      "selected_declaration_retained": true
+    },
+    {
+      "decision": "proven-inactive",
+      "invalidation": "Formatting, presubmit or sync/hooks route changes invalidate this exclusion.",
+      "path": "src/buildtools/linux64-format",
+      "reason": "Pinned buildtools DEPS declares Linux clang-format as a standalone formatting binary; the complete 78-leaf buildtools tree has no execution caller. Complete native and pinned build/testing GN/actions have no linux64-format or clang-format invocation; incidental clang-format comments are not commands. Fixed builder invokes GN/Ninja/native tests/archive/objcopy/license generation, with no presubmit, format or generic hooks command.",
+      "selected_declaration_retained": true
+    }
+  ],
+  "schema": "morpheus-linux-four-declaration-caller-proof-v1",
+  "scope": {
+    "build_with_chromium": false,
+    "native_runtime": "direct rtc_unittests with existing 12 crypto filters; generated wrapper is not invoked",
+    "native_test_target": "//:rtc_unittests",
+    "production_targets": [
+      ":default"
+    ],
+    "recipe_sha256": "fb11a2b1a9c67332968ceb38a1e46e5d723e16780212c2a19b59fa66c00bf180",
+    "source_revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+    "source_tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5",
+    "target_cpu": "x64",
+    "target_os": "linux"
+  },
+  "source_only": true
+}

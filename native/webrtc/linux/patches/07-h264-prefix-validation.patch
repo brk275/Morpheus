@@ -1,0 +1,87 @@
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -429,7 +429,13 @@
+   }
+   // H264 arrives as Annex B; every NALU has to be one of the blank key frame's.
+   auto nalus = webrtc::H264::FindNaluIndices(payload);
+-  return !nalus.empty() &&
++  if (nalus.empty()) return false;
++  // Annex B permits zero padding before the first start code. The parser
++  // ignores that prefix, so reject any nonzero bytes rather than forwarding
++  // unvalidated media alongside the known blank NALUs.
++  auto leading = payload.subview(0, nalus.front().start_offset);
++  return std::all_of(leading.begin(), leading.end(),
++                     [](uint8_t byte) { return byte == 0; }) &&
+          std::all_of(nalus.begin(), nalus.end(),
+                      [&](const webrtc::H264::NaluIndex& n) {
+                        return IsSifH264Nalu(payload.subview(
+--- a/api/crypto/sif_payload_unittest.cc
++++ b/api/crypto/sif_payload_unittest.cc
+@@ -96,6 +96,9 @@
+   EXPECT_TRUE(IsKnownSifPayload(Concat({kStartCode4, kH264Sps, kStartCode4,
+                                         kH264Pps, kStartCode4, kH264Idr})));
+   EXPECT_TRUE(IsKnownSifPayload(Concat({kStartCode4, kH264Idr})));
++  EXPECT_TRUE(IsKnownSifPayload(Concat({{0x00, 0x00, 0x01}, kH264Idr})));
++  EXPECT_TRUE(IsKnownSifPayload(
++      Concat({{0x00, 0x00}, kStartCode4, kH264Idr})));
+ }
+ 
+ TEST(SifPayload, RejectsAnythingElse) {
+@@ -115,6 +118,9 @@
+   EXPECT_FALSE(IsKnownSifPayload(
+       Concat({kStartCode4, kH264Sps, kStartCode4, kH264Pps, kStartCode4,
+               {0x65, 0xde, 0xad, 0xbe, 0xef}})));
++  // The NALU parser ignores prefix bytes; those bytes are not blank media.
++  EXPECT_FALSE(IsKnownSifPayload(
++      Concat({{0xde, 0xad, 0xbe, 0xef}, kStartCode4, kH264Idr})));
+   // Bare NALUs without start codes are not the Annex B frame we forward.
+   EXPECT_FALSE(IsKnownSifPayload(kH264Idr));
+ }
+@@ -298,6 +304,8 @@
+       {MediaType::kVideoFrame,
+        Concat({kStartCode4, kH264Sps, kStartCode4, kH264Pps, kStartCode4, kH264Idr})},
+       {MediaType::kVideoFrame, Concat({kStartCode4, kH264Idr})},
++      {MediaType::kVideoFrame,
++       Concat({{0x00, 0x00}, kStartCode4, kH264Idr})},
+       {MediaType::kAudioFrame, OpusSilence()},
+       {MediaType::kAudioFrame, Concat({{0x6f}, OpusSilence()})},
+       {MediaType::kAudioFrame, std::vector<uint8_t>(160, 0xff)},
+@@ -319,20 +327,26 @@
+ }
+ 
+ TEST(SifTransform, RejectsForeignTrailerPayloadWithAndWithoutKeyOnBothMediaPaths) {
++  const std::vector<std::vector<uint8_t>> inputs = {
++      std::vector<uint8_t>(500, 0x7a),
++      Concat({{0xde, 0xad, 0xbe, 0xef}, kStartCode4, kH264Idr}),
++  };
+   for (auto media : {MediaType::kAudioFrame, MediaType::kVideoFrame}) {
+     for (bool key : {false, true}) {
+-      NativeTransform transform(media, key);
+-      const bool submitted = transform.Submit(std::vector<uint8_t>(500, 0x7a));
+-      const bool failed = transform.WaitForState();
+-      const bool retired = transform.WaitForRetirement();
+-      const auto observed = transform.Finish();
+-      EXPECT_TRUE(observed.started);
+-      EXPECT_TRUE(submitted);
+-      EXPECT_TRUE(retired);
+-      EXPECT_TRUE(failed);
+-      EXPECT_TRUE(observed.frames.empty());
+-      EXPECT_EQ(observed.states,
+-                std::vector<FrameCryptionState>{kDecryptionFailed});
++      for (const auto& input : inputs) {
++        NativeTransform transform(media, key);
++        const bool submitted = transform.Submit(input);
++        const bool failed = transform.WaitForState();
++        const bool retired = transform.WaitForRetirement();
++        const auto observed = transform.Finish();
++        EXPECT_TRUE(observed.started);
++        EXPECT_TRUE(submitted);
++        EXPECT_TRUE(retired);
++        EXPECT_TRUE(failed);
++        EXPECT_TRUE(observed.frames.empty());
++        EXPECT_EQ(observed.states,
++                  std::vector<FrameCryptionState>{kDecryptionFailed});
++      }
+     }
+   }
+ }

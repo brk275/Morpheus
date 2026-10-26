@@ -1,0 +1,161 @@
+{
+  "all_data_only": true,
+  "native_archive_sha256": "bfcfd0a02d6d31aeeeddcba69782e2b8f07131ee32357eec94b51debc45d81a3",
+  "no_tool_or_source_execution": true,
+  "schema": "morpheus-native-pipewire-primary-source-records-v1",
+  "source_records": [
+    {
+      "baseline_blob": "4f54d90b1b03135d017ba815166f803e8d71876f",
+      "baseline_sha256": "28de900976df3f8d54285575a29fe5e0ca53632a464a6cdebd051d1ef1e26ec9",
+      "effective_sha256": "4c53c151d8502f9f78be131c75b798e622159fd94ec0dba6cd96ab6a14308e74",
+      "patch_names": [
+        "add_deps.patch"
+      ],
+      "path": "evidence/pipewire/native-root-BUILD.gn",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "source_path": "BUILD.gn",
+      "source_url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/BUILD.gn"
+    },
+    {
+      "baseline_blob": "5272873b959f34d506f28ebab21243bd67dbe0a7",
+      "baseline_sha256": "df86c65b417b7185c21d49144bd02845d47f768493763a1b4791c5c12f1d4b73",
+      "effective_sha256": "df86c65b417b7185c21d49144bd02845d47f768493763a1b4791c5c12f1d4b73",
+      "patch_names": [],
+      "path": "evidence/pipewire/native-webrtc.gni",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "source_path": "webrtc.gni",
+      "source_url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/webrtc.gni"
+    },
+    {
+      "baseline_blob": "82c10e4c5f516110fd5b681fbdfd957b4e794dc1",
+      "baseline_sha256": "a573469fab364960bbd8a751975d31fb109409e746c92a7c65bfb106259b6625",
+      "effective_sha256": "a573469fab364960bbd8a751975d31fb109409e746c92a7c65bfb106259b6625",
+      "patch_names": [],
+      "path": "evidence/pipewire/desktop-capture-BUILD.gn",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "source_path": "modules/desktop_capture/BUILD.gn",
+      "source_url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/modules/desktop_capture/BUILD.gn"
+    },
+    {
+      "baseline_blob": "de8a81be5554abd0a0bd1c1460372487b056c977",
+      "baseline_sha256": "12892153ea24383cb1d223ef8c4ebfac564a43732ef2f0593d88133a68ef43aa",
+      "effective_sha256": "12892153ea24383cb1d223ef8c4ebfac564a43732ef2f0593d88133a68ef43aa",
+      "patch_names": [],
+      "path": "evidence/pipewire/portal-BUILD.gn",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "source_path": "modules/portal/BUILD.gn",
+      "source_url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/modules/portal/BUILD.gn"
+    },
+    {
+      "baseline_blob": "6c77b9a7d406417cac06978aadda0c595f603408",
+      "baseline_sha256": "5b14f792a7ec622e323fb68dbc017c42c5680acb7aea0a9bcfb785c97d9e1e84",
+      "effective_sha256": "5b14f792a7ec622e323fb68dbc017c42c5680acb7aea0a9bcfb785c97d9e1e84",
+      "patch_names": [],
+      "path": "evidence/pipewire/mb.py",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "source_path": "tools_webrtc/mb/mb.py",
+      "source_url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/tools_webrtc/mb/mb.py"
+    },
+    {
+      "baseline_blob": "7e751ba049e57fbba70d5aad56f9cfdc0ca3383a",
+      "baseline_sha256": "7e74685145c89eb9a57e21a80f751d0ebcdb7d142983ef69a7f0003638a73b3a",
+      "effective_sha256": "7e74685145c89eb9a57e21a80f751d0ebcdb7d142983ef69a7f0003638a73b3a",
+      "patch_names": [],
+      "path": "evidence/pipewire/gn_isolate_map.pyl",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "source_path": "infra/specs/gn_isolate_map.pyl",
+      "source_url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/infra/specs/gn_isolate_map.pyl"
+    },
+    {
+      "baseline_blob": "37b41214c7091f535550a30c2bd66ca49888cdc4",
+      "baseline_sha256": "b5ebfa8e100852ef1a6a343410af1130db1b2d95229933bbbc13cc84c2eb14b7",
+      "effective_sha256": "b5ebfa8e100852ef1a6a343410af1130db1b2d95229933bbbc13cc84c2eb14b7",
+      "patch_names": [],
+      "path": "evidence/pipewire/configure_pipewire.py",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "source_path": "tools_webrtc/configure_pipewire.py",
+      "source_url": "https://raw.githubusercontent.com/webrtc-sdk/webrtc/aaeeee8077eb0a4cad1c9494e9c6433c751ef663/tools_webrtc/configure_pipewire.py"
+    },
+    {
+      "bytes": 626,
+      "name": "pipewire-directory.json",
+      "sha256": "eb6042566a58583d279c7a43270d3a41397524bde58c43643c298dae8f484c7a",
+      "status": 200,
+      "url": "https://chromium.googlesource.com/chromium/src/third_party/+/a3b630c291f1cf3b711687b1c4be322d3015512e/pipewire/?format=JSON"
+    },
+    {
+      "bytes": 6868,
+      "name": "pkg_config.gni",
+      "sha256": "1ec4968b6c18e006b311f4b97d36dfd573bf9ec9195faa0f0536735d79cee0de",
+      "status": 200,
+      "url": "https://raw.githubusercontent.com/webrtc-sdk/build/be1a8f6dcd7df7e46320192c5e2f364e50d79bbf/config/linux/pkg_config.gni"
+    },
+    {
+      "bytes": 8754,
+      "name": "pkg-config.py",
+      "sha256": "f5ca11a6009ec259055d21ab31592e75a654965d0815cf630d104ffb63e5a0e2",
+      "status": 200,
+      "url": "https://raw.githubusercontent.com/webrtc-sdk/build/be1a8f6dcd7df7e46320192c5e2f364e50d79bbf/config/linux/pkg-config.py"
+    },
+    {
+      "bytes": 656,
+      "git_blob": "ca91def07825bb80a3788403460b0f4a81ba9ccb",
+      "path": "pipewire/README.chromium",
+      "sha256": "bc8e24682e921934a4d0c9ddca5551ec961c194b8a4d0a2bd76594660a4e454f",
+      "status": 200,
+      "url": "https://chromium.googlesource.com/chromium/src/third_party/+/a3b630c291f1cf3b711687b1c4be322d3015512e/pipewire/README.chromium?format=TEXT"
+    },
+    {
+      "bytes": 1218,
+      "git_blob": "aa100ce9c02238111b56e394ad5a13311e23a521",
+      "path": "pipewire/LICENSE",
+      "sha256": "8909c319a7e27dbb33a15b9035f89ab3b7b2f6a12f8bcddc755206a8db1ada44",
+      "status": 200,
+      "url": "https://chromium.googlesource.com/chromium/src/third_party/+/a3b630c291f1cf3b711687b1c4be322d3015512e/pipewire/LICENSE?format=TEXT"
+    },
+    {
+      "bytes": 489,
+      "git_blob": null,
+      "path": "pipewire/3pp/",
+      "sha256": "61fb8d93cdc3791eed608eadced28df4810ad04a3dd955ac1805d90e5adfac08",
+      "status": 200,
+      "url": "https://chromium.googlesource.com/chromium/src/third_party/+/a3b630c291f1cf3b711687b1c4be322d3015512e/pipewire/3pp/?format=JSON"
+    },
+    {
+      "bytes": 1029,
+      "git_blob": "24aae9d1c560a9ddadd1482c39b317723dfe74f5",
+      "path": "wireplumber/README.chromium",
+      "sha256": "acebab2038f3cd68593a824c5024cd95b2fb734f34f9a74013a249a255e084fd",
+      "status": 200,
+      "url": "https://chromium.googlesource.com/chromium/src/third_party/+/a3b630c291f1cf3b711687b1c4be322d3015512e/wireplumber/README.chromium?format=TEXT"
+    },
+    {
+      "bytes": 1095,
+      "git_blob": "1cbe1a82f247d18976b28e0e0cddb009f4b2cd4a",
+      "path": "wireplumber/LICENSE",
+      "sha256": "c4457360115a1af78d662aa357c710104dbd47c5cb52d4ab0342871931ae2d43",
+      "status": 200,
+      "url": "https://chromium.googlesource.com/chromium/src/third_party/+/a3b630c291f1cf3b711687b1c4be322d3015512e/wireplumber/LICENSE?format=TEXT"
+    },
+    {
+      "bytes": 489,
+      "git_blob": null,
+      "path": "wireplumber/3pp/",
+      "sha256": "3b8fd787680bc312cb2ebe0cde59ef9a8793aa242fd313bcf6ed1d4958380435",
+      "status": 200,
+      "url": "https://chromium.googlesource.com/chromium/src/third_party/+/a3b630c291f1cf3b711687b1c4be322d3015512e/wireplumber/3pp/?format=JSON"
+    },
+    {
+      "bytes": 2725,
+      "git_blob": "e7aaa18479d47958d6407f4d22bbe7ea939e1f92",
+      "sha256": "321f44b7a38a780fda2796c6fef5b80e04fbffbc551d9bea35b57fb14c3c7a0a",
+      "url": "https://raw.githubusercontent.com/webrtc-sdk/build/be1a8f6dcd7df7e46320192c5e2f364e50d79bbf/config/sysroot.gni"
+    },
+    {
+      "bytes": 635,
+      "git_blob": "3063d241006749d984cc5cbca154d31093cd97ba",
+      "sha256": "5071cbe46d130d5838ecdb68c22ecacc0140e857769a7146d3a6917a03901449",
+      "url": "https://raw.githubusercontent.com/webrtc-sdk/build/be1a8f6dcd7df7e46320192c5e2f364e50d79bbf/toolchain/sysroot.gni"
+    }
+  ]
+}
