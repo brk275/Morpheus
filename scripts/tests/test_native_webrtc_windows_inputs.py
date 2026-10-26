@@ -379,13 +379,20 @@ class WindowsNativeInputsTests(unittest.TestCase):
         def consume(selected):
             with mock.patch.object(TARGET, "bound_asset", return_value=(None, selected)), \
                     mock.patch.object(stager, "download") as download, \
+                    mock.patch.object(TARGET, "windows_cipd_download") as original_instances, \
                     mock.patch.object(stager, "extract") as extract, \
                     mock.patch.object(TARGET, "write_json"):
                 TARGET.runtime_stage(stager, Path("synthetic-workspace"), plan, control)
-                return download.call_args_list, extract.call_args_list
-        downloads, extractions = consume(profile)
-        self.assertEqual(len(downloads), 3)
-        self.assertEqual(len({call.args[2] for call in downloads}), 3)
+                return download.call_args_list, original_instances.call_args_list, extract.call_args_list
+        downloads, original_instances, extractions = consume(profile)
+        self.assertEqual(len(downloads), 2)
+        self.assertEqual(len(original_instances), 1)
+        paths = {call.args[2] for call in downloads}
+        paths.update(call.args[3] for call in original_instances)
+        self.assertEqual(len(paths), 3)
+        self.assertEqual(original_instances[0].args[2], materials[0]["tool"])
+        self.assertEqual(TARGET.windows_cipd_instance(original_instances[0].args[2]),
+                         {"hashAlgo": "SHA1", "hexDigest": "e00dc04ad5029579cffc146324c365377f8bcd1d"})
         self.assertEqual({call.args[3].name for call in extractions},
                          {item["tool"]["name"] for item in materials})
         for item, call in zip(materials, extractions):

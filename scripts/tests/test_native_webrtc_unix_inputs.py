@@ -472,7 +472,7 @@ class NativeMacMaterialBoundaryTests(unittest.TestCase):
         self.assertEqual(_MAC.paths(row, _MATERIAL), {member["path"]: member})
         for extra in ({**member, "path": "app"}, {**member, "path": "APP/other"},
                       {**member, "path": "app/../escape"}):
-            with self.subTest(path=extra["path"]), self.assertRaises(_MAC.Refused):
+            with self.subTest(path=extra["path"]), self.assertRaises((_MAC.Refused, _MATERIAL.Refused)):
                 _MAC.paths({**row, "members": [member, extra]}, _MATERIAL)
         # The same omission is not silently generalized to tar inventories.
         with self.assertRaises(_MAC.Refused):
@@ -481,7 +481,8 @@ class NativeMacMaterialBoundaryTests(unittest.TestCase):
     def test_tar_exact_pax_data_is_checked_before_writing_its_payload(self):
         payload = b"synthetic bounded archive body"
         path = "bin/" + "x" * 110
-        parent = {"path": "bin", "kind": "directory", "mode": 0o755, "bytes": 0}
+        parent = {"path": "bin", "kind": "directory", "mode": 0o755, "bytes": 0,
+                  "pax_headers": {"path": "bin/"}}
         member = {"path": path, "kind": "regular", "mode": 0o644, "bytes": len(payload),
                   "sha256": hashlib.sha256(payload).hexdigest(), "output_mode": 0o600,
                   "pax_headers": {"path": path, "mtime": "1762913607.25"}}
@@ -501,6 +502,7 @@ class NativeMacMaterialBoundaryTests(unittest.TestCase):
             archive = root / "synthetic.tar.xz"
             with tarfile.open(archive, "w:xz", format=tarfile.PAX_FORMAT) as output:
                 info = tarfile.TarInfo("bin"); info.type = tarfile.DIRTYPE; info.mode = 0o755
+                info.pax_headers = dict(parent["pax_headers"])
                 output.addfile(info)
                 info = tarfile.TarInfo(path); info.mode = 0o644; info.size = len(payload)
                 info.pax_headers = dict(member["pax_headers"])
@@ -512,10 +514,14 @@ class NativeMacMaterialBoundaryTests(unittest.TestCase):
             with self.assertRaises(_MAC.Refused):
                 _MAC.extract(Stage(), wrong, archive, root / "bad", _MATERIAL, transport)
             self.assertFalse((root / "bad" / path).exists())
-        for fields in ({"path": "../escape"}, {"path": "bin/other"}, {"linkpath": "bin/tool"},
+        for fields in ({"path": "../escape"}, {"path": "bin/other"}, {"path": path + "/"},
+                       {"linkpath": "bin/tool"},
                        {"size": "1"}, {"GNU.sparse.name": path}, {"mtime": 5}, {"mtime": "NaN"}):
             with self.subTest(keys=tuple(fields)), self.assertRaises(_MAC.Refused):
                 _MAC.paths({**row, "members": [parent, {**member, "pax_headers": fields}]}, _MATERIAL)
+        for value in ("bin//", "../bin/", "/bin/", "bin/../elsewhere/", "other/"):
+            with self.subTest(directory_pax=value), self.assertRaises(_MAC.Refused):
+                _MAC.paths({**row, "members": [{**parent, "pax_headers": {"path": value}}, member]}, _MATERIAL)
 
     def test_projection_refuses_original_gitlink_scope_before_copy(self):
         with TemporaryDirectory() as temporary:

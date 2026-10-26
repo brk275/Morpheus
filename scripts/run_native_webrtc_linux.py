@@ -42,13 +42,13 @@ PYTHON_PLAN = "b3cd3a5066338da7fa450fe48580d987dbb88f90d9497dc2106802ab989c0aea"
 INSTRUMENTED_PLAN = "927a95029b9ddc8f4b4cce20f07975505b343260d913b9c3488bc6f6182ad0f9"
 HELPERS = {
     "git_source_stager.py": "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b",
-    "source_importer.py": "0181f9be9bff3100fea67c3692e1dfc44ea244a434cbf598f88e6691968bf7ee",
+    "source_importer.py": "2803d989cb879f5fd60fad3934f69da5437e02a5b15ae9cdf2dea5e5efb359aa",
     "linux_stager.py": "f3a908bc20170ee01f2643169ce60397627981d86de11ffaedf03dd8ea9e1c8c",
     "python_stager.py": "4de9a016a988535b7576f2e0d7561afa290529dae7b1eb267bb8382956d49d02",
     "instrumented_stager.py": "8903aef2de2ea5a7778ad4ba21047909ad7595d3e1359f151829e489910fc84f",
     "linux_materials.py": "acca8d027e3e2f1ce3a38181345b522a2906e5eeb1a1fc39cd3c1d2ff3bf0b51",
 }
-BUILD_RECIPE = "42afc017bd5b27df8b9b2cd47be762c3af9a6e5784e1184516c9429d0a5dc2e6"
+BUILD_RECIPE = "ceb017dac1c2f55972ff9fb8f6c123cec24e46c421d3270409710498532e1411"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 

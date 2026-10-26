@@ -123,7 +123,7 @@ GATES = {"source", "deps-hooks", "toolchain-rust", "patches", "native-test-sourc
          "license-material", "license-gn-resolution", "wrapper-abi", "symbol-prefix",
          "generated-metadata"}
 HEX = re.compile(r"[0-9a-f]{64}\Z")
-MAC_MATERIAL_HELPER_SHA = "8a2f35fbf33b0d0121a496acb620db9a61cf47b953ea01fcf6ce3f7944e32f3c"
+MAC_MATERIAL_HELPER_SHA = "9a1173f18e0e21d30030ed6c16b105bddb4e7bded26da4af1eec7bbce2cb1e5e"
 COMMAND_PROCESS_HELPER_SHA = "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b"
 MAX_LOG = 256 * 1024 * 1024
 MAX_INVENTORY = 128 * 1024 * 1024

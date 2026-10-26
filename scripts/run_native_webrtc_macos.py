@@ -21,9 +21,9 @@ import types
 
 REPOSITORY = "brk275/Morpheus"
 BASELINE = "aaeeee8077eb0a4cad1c9494e9c6433c751ef663"
-COMMON_SHA = "7ee735ae5a2aad7eee28f13c3cd860d758bffec47174c32a349ec01af28f513f"
-BUILDER_SHA = "42afc017bd5b27df8b9b2cd47be762c3af9a6e5784e1184516c9429d0a5dc2e6"
-MAC_HELPER_SHA = "8a2f35fbf33b0d0121a496acb620db9a61cf47b953ea01fcf6ce3f7944e32f3c"
+COMMON_SHA = "b42d5da0e5689f9bf8448187129d26bbd560ebe07eb97ab45dfb3ac877b9d34a"
+BUILDER_SHA = "ceb017dac1c2f55972ff9fb8f6c123cec24e46c421d3270409710498532e1411"
+MAC_HELPER_SHA = "9a1173f18e0e21d30030ed6c16b105bddb4e7bded26da4af1eec7bbce2cb1e5e"
 TARGETS = {"mac-arm64": ("ARM64", "arm64", "MacARM", "macos-15"),
            "mac-x64": ("X64", "x86_64", "MacIntel", "macos-15-intel")}
 

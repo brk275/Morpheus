@@ -42,14 +42,16 @@ def need(ok):
         raise Refused()
 
 def pax_metadata(member):
-    # Only authenticated Rust archive metadata. path repeats the already
-    # canonical inventory name; it never redirects a file or changes its type.
+    # Only authenticated Rust archive metadata. A directory's original PAX
+    # path may retain one terminal slash; the canonical inventory does not.
+    # Preserve the exact metadata bytes without redirecting a path or type.
     fields = member.get("pax_headers", {})
     need(type(fields) is dict and set(fields) <= {"path", "mtime"})
     for key, value in fields.items():
         need(type(value) is str and 0 < len(value.encode("utf-8")) <= 2048)
         if key == "path":
-            need(value == member["path"])
+            need(value == member["path"] or (member["kind"] == "directory"
+                 and value == member["path"] + "/"))
         else:
             need(re.fullmatch(r"[0-9]{1,12}(?:\.[0-9]{1,9})?", value) is not None)
     return fields
