@@ -79,14 +79,21 @@ def bounded_int(v, low, high):
     return v
 
 
-def rel(name):
+def rel(name, *, internal_spaces=False):
     require(isinstance(name, str) and 0 < len(name) <= 512)
     require(not name.startswith("/") and "\\" not in name and ":" not in name)
+    # Only the independently bound Python ZIP member table opts into ordinary
+    # internal ASCII spaces. Preserve the literal spelling; do not strip,
+    # normalize, or broaden core-tool/archive-input paths.
+    allowed = r"[A-Za-z0-9_+.,=@() \-]+" if internal_spaces else r"[A-Za-z0-9_+.,=@()\-]+"
     parts = name.split("/")
     for part in parts:
-        require(re.fullmatch(r"[A-Za-z0-9_+.,=@()\-]+", part) is not None)
-        require(part not in (".", "..") and not part.endswith((".", " ")))
-        stem = part.split(".")[0].upper()
+        require(re.fullmatch(allowed, part) is not None)
+        require(part not in (".", "..") and not part.startswith(" ")
+                and not part.endswith((".", " ")))
+        # Win32 device aliases remain reserved before an extension even when
+        # ASCII spaces occur immediately before that extension (CON .txt).
+        stem = part.split(".")[0].rstrip(" ").upper()
         require(stem not in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"})
         require(re.fullmatch(r"(?:COM|LPT)[1-9]", stem) is None)
     return name
@@ -789,12 +796,12 @@ def python_data_validate(raw, target):
     return plan
 
 
-def python_zip_extract(stage, material, archive, output):
+def python_zip_members(material):
     members = material["members"]
     require(type(members) is list and 0 < len(members) <= MAX_MEMBERS)
     table, folded = {}, set()
     for row in members:
-        name = rel(row["path"])
+        name = rel(row["path"], internal_spaces=True)
         require(name not in table and name.casefold() not in folded
                 and row["kind"] in ("regular", "directory", "symlink"))
         table[name] = row
@@ -812,7 +819,7 @@ def python_zip_extract(stage, material, archive, output):
         # Exactly ten original vpython bundle aliases, all sibling regular files.
         # This is not a generic ZIP symlink policy. No on-disk link is created.
         require(material["name"] == "vpython")
-        link = rel(row["linkname"])
+        link = rel(row["linkname"], internal_spaces=True)
         require("/" not in link)
         source = str(PurePosixPath(name).parent / link)
         require(source in table and table[source]["kind"] == "regular")
@@ -822,6 +829,11 @@ def python_zip_extract(stage, material, archive, output):
     require(copies == material["alias_copies"]
             and len(copies) == (10 if material["name"] == "vpython" else 0))
     require(sum(row["bytes"] for row in members) + sum(row["bytes"] for row in copies) <= MAX_EXPANDED)
+    return table, copies
+
+
+def python_zip_extract(stage, material, archive, output):
+    table, copies = python_zip_members(material)
     # Bound the central directory before ZipFile allocates its entry list.
     with archive.open("rb") as source:
         source.seek(max(0, material["bytes"] - 65557))
@@ -837,7 +849,8 @@ def python_zip_extract(stage, material, archive, output):
         for entry in source.infolist():
             require(not entry.flag_bits & 1
                     and entry.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED))
-            name = rel(entry.filename.rstrip("/") if entry.is_dir() else entry.filename)
+            name = rel(entry.filename.rstrip("/") if entry.is_dir() else entry.filename,
+                       internal_spaces=True)
             require(name in table and name not in seen)
             seen.add(name)
             row = table[name]

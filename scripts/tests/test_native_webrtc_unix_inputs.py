@@ -5,9 +5,11 @@ import io
 import json
 import importlib.util
 import os
+import stat
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+import zipfile
 from unittest import mock
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "build_native_webrtc_unix.py"
@@ -173,6 +175,93 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
         self.assertEqual([row["name"] for row in materials],
                          ["rust", "sysroot-amd64", "sysroot-i386", "llvmobjdump"])
         self.assertIs(materials, manifest["materials"])
+
+    @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA profiles")
+    def test_actual_python_profile_admits_all_original_zip_member_spellings(self):
+        helper = _PIPELINE.module("python_stager.py")
+        raw = (_SCRIPT.parents[1] / "native/webrtc/linux/selected-python-inputs.json").read_bytes()
+        plan = helper.python_data_validate(raw, "Linuxx64")
+        original = next(row for row in plan["materials"] if row["name"] == "vpython")
+        table, copies = helper.python_zip_members(original)
+        self.assertEqual(len(table), len(original["members"]))
+        self.assertEqual(copies, original["alias_copies"])
+        self.assertEqual({name for name in table if " " in name}, {
+            "3.11/lib/python3.11/site-packages/setuptools/_vendor/jaraco/text/Lorem ipsum.txt",
+            "3.11/lib/python3.11/site-packages/setuptools/command/launcher manifest.xml",
+            "3.11/lib/python3.11/site-packages/setuptools/script (dev).tmpl",
+            "3.8/lib/python3.8/site-packages/setuptools/command/launcher manifest.xml",
+            "3.8/lib/python3.8/site-packages/setuptools/script (dev).tmpl",
+        })
+        # The unchanged generic/core-tool path policy still refuses spaces.
+        for name in table:
+            if " " in name:
+                with self.assertRaises(helper.Refusal):
+                    helper.rel(name)
+
+    @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA profiles")
+    def test_original_space_names_survive_zip_stage_snapshot_and_full_inventory(self):
+        helper = _PIPELINE.module("python_stager.py")
+        raw = (_SCRIPT.parents[1] / "native/webrtc/linux/selected-python-inputs.json").read_bytes()
+        plan = helper.python_data_validate(raw, "Linuxx64")
+        original = next(row for row in plan["materials"] if row["name"] == "vpython")
+        names = [row["path"] for row in original["members"] if " " in row["path"]]
+        self.assertEqual(len(names), 5)
+        with TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            parent.chmod(0o700)
+            archive, output = parent / "synthetic.zip", parent / "output"
+            rows, payloads = [], {}
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as target:
+                for index, name in enumerate(names):
+                    data = ("synthetic ordinary DATA " + str(index)).encode("ascii")
+                    entry = zipfile.ZipInfo(name)
+                    entry.create_system = 3
+                    entry.external_attr = (stat.S_IFREG | 0o600) << 16
+                    target.writestr(entry, data)
+                    payloads[name] = data
+                    rows.append({"path": name, "kind": "regular", "mode": stat.S_IFREG | 0o600,
+                                 "output_mode": 0o600, "bytes": len(data),
+                                 "sha256": hashlib.sha256(data).hexdigest()})
+            material = {"name": "synthetic", "members": rows, "alias_copies": [],
+                        "bytes": archive.stat().st_size}
+            # Exercise the real Stage file/parent/identity methods inside an
+            # already private synthetic root, not production runner admission.
+            stage = object.__new__(helper.Stage)
+            stage.root, stage.files, stage.dirs = output, [], []
+            stage.windows, stage.held, stage.identities = None, [], {}
+            stage.mkdir(output)
+            try:
+                helper.python_zip_extract(stage, material, archive, output)
+                files, _ = _PIPELINE.scan_tree(_MATERIAL, output)
+                self.assertEqual(set(files), set(names))
+                inventory = [{"path": row["path"], "type": "file", "bytes": row["bytes"],
+                              "sha256": row["sha256"]} for row in rows]
+                self.assertEqual(set(_BUILDER.inventory(output, inventory)), set(names))
+                for name, data in payloads.items():
+                    self.assertEqual(helper.snapshot(output / name, helper.MAX_FILE), data)
+                    self.assertEqual(files[name]["sha256"], hashlib.sha256(data).hexdigest())
+            finally:
+                stage.finish(False)
+
+    def test_python_zip_space_policy_refuses_traversal_devices_and_name_aliases(self):
+        helper = _PIPELINE.module("python_stager.py")
+        row = {"path": "ordinary name.txt", "kind": "regular", "mode": stat.S_IFREG | 0o600,
+               "output_mode": 0o600, "bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}
+        for name in ("/absolute name", "C:/drive name", "name:stream", "a\\b name", "a/../b name",
+                     "a/./b name", "a//b name", " name", "name ", "parent /name", "parent/ name",
+                     "name.", "name\tvalue", "name\nvalue", "name\x00value", "name\x7fvalue",
+                     "name\u00a0value", "name\u00e9value", "CON .txt", "aux .dat", "COM1 .bin",
+                     "parent/LPT9 .log", "CON", "NUL.txt", "a" * 513):
+            with self.subTest(name=name):
+                with self.assertRaises(helper.Refusal):
+                    helper.python_zip_members({"name": "synthetic", "members": [row | {"path": name}],
+                                               "alias_copies": []})
+        with self.assertRaises(helper.Refusal):
+            helper.python_zip_members({"name": "synthetic", "members": [row, row | {"path": "ORDINARY NAME.TXT"}],
+                                       "alias_copies": []})
+        with self.assertRaises(helper.Refusal):
+            helper.python_zip_members({"name": "synthetic", "members": [row, row | {"path": "ordinary name.txt/child"}],
+                                       "alias_copies": []})
 
     @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA profiles")
     def test_linux_xz_decoder_allows_overhead_only_for_exact_pinned_sysroots(self):

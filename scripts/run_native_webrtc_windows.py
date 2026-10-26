@@ -11,6 +11,7 @@ import copy
 import hashlib
 import http.client
 import json
+import lzma
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -18,6 +19,7 @@ import shutil
 import ssl
 import stat
 import sys
+import tarfile
 import types
 
 REPOSITORY = "brk275/Morpheus"
@@ -26,7 +28,7 @@ TREE = "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
 SECURITY = "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
 CORE = "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
 HELPERS = {
-    "python_stager.py": "2be14639b7dc92df4ec467104f9c1fa666e9ad2aad7b5da7102283c7df105d33",
+    "python_stager.py": "4de9a016a988535b7576f2e0d7561afa290529dae7b1eb267bb8382956d49d02",
     "git_source_stager.py": "5debe4d363c339de898b965dee15660867b9a0bc4a96380f434bf19deab20c7b",
 }
 RECIPE = "08830749810e79b9977ac4bdb39b48059e0b837305873e486747812240a54c8b"
@@ -36,6 +38,23 @@ MAX_FILE = 64 * 1024 ** 3
 MAX_FILES = 1_000_000
 MAX_TOTAL = 256 * 1024 ** 3
 
+
+# Exact Windows Rust DATA from the pinned tools/rust/update_rust.py caller.
+# This is not the Linux rust material, a version resolver or execution authority.
+WINDOWS_RUST = {
+    "name": "rust", "format": "tar.xz", "bytes": 197809928,
+    "sha256": "8cd2f0c4d312c0a7c127a8e6adf0a73ceecad316997e925fbebc1d855e95f6ba",
+    "source": {"kind": "gcs",
+        "object": "Win/rust-toolchain-11339a0ef5ed586bb7ea4f85a9b7287880caac3a-1-llvmorg-22-init-14273-gea10026b.tar.xz",
+        "generation": 1762971372158285},
+}
+WINDOWS_RUST_INVENTORY = "6a3d37c5ac6be6a5492ee4a3869039e0c51d4c8527559a22ef747de77e39bdbd"
+WINDOWS_RUST_PDB = {
+    "path": "bin/rustc_driver-3a0942c7db1abfe9.pdb",
+    "raw_path": "bin/rustc_driver-3a0942c7db1abfe9.pdb", "kind": "regular",
+    "bytes": 556744704, "mode": 0o666, "output_mode": 0o600,
+    "sha256": "e46612a1d55a7f1b36a74a33ff338a578d7ebc1fa921c24d8a149ec39a1d4a10",
+}
 
 class Refused(Exception):
     pass
@@ -381,6 +400,114 @@ def load_unbound(p):
     return json.loads(read(p), object_pairs_hook=unique)
 
 
+def windows_rust_identity(tool):
+    need(all(tool.get(key) == value for key, value in WINDOWS_RUST.items())
+         and tool.get("alias_copies") == [] and tool.get("omitted_aliases") == []
+         and tool.get("omission_evidence") is None)
+
+
+def windows_rust_member_limit(stager, tool, row):
+    windows_rust_identity(tool)
+    if type(row.get("bytes")) is int and row["bytes"] > stager.MAX_FILE:
+        # No manifest-selected cap: precisely this original PDB in this archive.
+        need(row == WINDOWS_RUST_PDB)
+        return WINDOWS_RUST_PDB["bytes"]
+    return stager.MAX_FILE
+
+
+def windows_rust_members(stager, tool):
+    windows_rust_identity(tool)
+    members = tool["members"]
+    need(type(members) is list and len(members) == 4866)
+    ordinary, table, expanded = [], {}, 0
+    for row in members:
+        need(type(row) is dict and row.get("kind") in ("regular", "directory"))
+        keys = {"path", "raw_path", "kind", "bytes", "mode"}
+        if row["kind"] == "regular":
+            keys |= {"sha256", "output_mode"}
+        need(set(row) == keys)
+        name = stager.rel(row["path"])
+        need(name not in table and row["raw_path"] == name
+             and row["kind"] in ("regular", "directory"))
+        stager.bounded_int(row["bytes"], 0, windows_rust_member_limit(stager, tool, row))
+        table[name] = row
+        expanded += row["bytes"]
+        if row != WINDOWS_RUST_PDB:
+            ordinary.append(row)
+    # Preserve the generic spelling/case/parent/mode/hash/alias checks and its
+    # default 512MiB limit for every other original archive member.
+    stager.check_members(dict(tool, members=ordinary))
+    # Serialize only this bounded, typed inventory, not arbitrary profile data.
+    raw = (json.dumps(members, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    need(hashlib.sha256(raw).hexdigest() == WINDOWS_RUST_INVENTORY)
+    need(table.get(WINDOWS_RUST_PDB["path"]) == WINDOWS_RUST_PDB
+         and expanded <= stager.MAX_EXPANDED)
+    return table
+
+
+def windows_rust_download(stager, stage, tool, archive):
+    windows_rust_identity(tool)
+    # Generic download selects bucket for name=rust; bind the actual original
+    # fixed bucket without rewriting the profile or borrowing Linux's pin.
+    request = dict(tool, source=dict(tool["source"], bucket="chromium-browser-clang"))
+    stager.download(stage, request, archive)
+
+
+def windows_rust_write_member(stager, stage, destination, stream, tool, row):
+    stager.bounded_int(row["bytes"], 0, windows_rust_member_limit(stager, tool, row))
+    total, digest = 0, hashlib.sha256()
+    with stage.create(destination) as out:
+        while total < row["bytes"]:
+            block = stream.read(min(1024 * 1024, row["bytes"] - total))
+            need(bool(block))
+            total += len(block)
+            need(total <= row["bytes"])
+            digest.update(block)
+            out.write(block)
+        need(stream.read(1) == b"" and digest.hexdigest() == row["sha256"])
+        out.flush()
+        os.fsync(out.fileno())
+    os.chmod(destination, row["output_mode"])
+    # fact streams a stable non-reparse, single-link original file. Unlike the
+    # generic snapshot this never allocates the entire large PDB in memory.
+    need(fact(destination, row["bytes"]) == {key: row[key] for key in ("bytes", "sha256")})
+
+
+def windows_rust_extract(stager, stage, tool, archive, output):
+    table = windows_rust_members(stager, tool)
+    tar_path = archive.with_suffix(".tar")
+    decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=256 * 1024 * 1024)
+    total = 0
+    with archive.open("rb") as source, stage.create(tar_path) as out:
+        while not decoder.eof:
+            block = source.read(1024 * 1024) if decoder.needs_input else b""
+            need(bool(block) or not decoder.needs_input)
+            data = decoder.decompress(block, max_length=1024 * 1024)
+            total += len(data)
+            need(total <= stager.MAX_EXPANDED + 32 * 1024 * 1024)
+            out.write(data)
+        need(decoder.unused_data == b"" and source.read(1) == b"")
+    seen = set()
+    with tarfile.open(tar_path, "r:") as source:
+        for member in source:
+            need(len(seen) < stager.MAX_MEMBERS and (member.isfile() or member.isdir()))
+            name = stager.rel(member.name.rstrip("/") if member.isdir() else member.name)
+            need(name not in seen and name in table)
+            seen.add(name)
+            row = table[name]
+            kind = "regular" if member.isfile() else "directory"
+            need((member.name, kind, member.size, member.mode) ==
+                 (row["raw_path"], row["kind"], row["bytes"], row["mode"]))
+            if kind == "directory":
+                stage.parents(output / name / "_directory_only")
+            else:
+                with source.extractfile(member) as stream:
+                    windows_rust_write_member(stager, stage, output / name, stream, tool, row)
+    need(seen == set(table))
+    tar_path.unlink()
+    stage.files.remove(tar_path)
+
+
 def runtime_stage(stager, workspace, plan, control):
     _, profile = bound_asset(workspace, plan["runtime_profile"])
     need(type(profile) is dict and set(profile) == {"schema", "target", "materials"}
@@ -413,10 +540,8 @@ def runtime_stage(stager, workspace, plan, control):
                  and type(origin["version"]) is str and 0 < len(origin["version"]) <= 256
                  and "latest" not in origin["version"].lower())
         else:
-            need(set(origin) == {"kind", "object", "generation"} and origin["kind"] == "gcs"
-                 and type(origin["object"]) is str and item["role"] == "rust" and origin["object"].startswith("Win/")
-                 and relative(origin["object"]) == origin["object"]
-                 and type(origin["generation"]) is int and origin["generation"] > 0)
+            need(item["role"] == "rust")
+            windows_rust_identity(tool)
         # Multiple genuine wheels/versions keep their original package archives and resource layouts.
         # A fixed package+version-derived key prevents shared wheel output/entrypoint collisions.
         key = item["role"]
@@ -426,11 +551,18 @@ def runtime_stage(stager, workspace, plan, control):
         need(tool["name"] == key and key not in material_keys and identity not in origins)
         material_keys.add(key)
         origins.add(identity)
-        stager.check_members(tool)
+        if key == "rust":
+            windows_rust_members(stager, tool)
+        else:
+            stager.check_members(tool)
         need(all(row["kind"] in ("regular", "directory") for row in tool["members"]))
         archive = control.root / "runtime-archives" / (key + (".zip" if tool["format"] == "zip" else ".tar.xz"))
-        stager.download(control, tool, archive)
-        stager.extract(control, tool, archive, control.root / "runtime" / key)
+        if key == "rust":
+            windows_rust_download(stager, control, tool, archive)
+            windows_rust_extract(stager, control, tool, archive, control.root / "runtime" / key)
+        else:
+            stager.download(control, tool, archive)
+            stager.extract(control, tool, archive, control.root / "runtime" / key)
     # These are genuine archive bytes, not a fabricated CIPD cache/tag lookup,
     # vpython environment realization, Python/Rust execution or SDK substitute.
     write_json(control, control.root / "runtime-data-receipt.json", {"schema": 1,

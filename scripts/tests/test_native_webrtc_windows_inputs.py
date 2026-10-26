@@ -3,6 +3,7 @@
 import hashlib
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,96 @@ SPEC.loader.exec_module(TARGET)
 
 
 class WindowsNativeInputsTests(unittest.TestCase):
+    def test_windows_rust_oversize_exception_is_exact_and_download_bucket_is_fixed(self):
+        helper_path = PATH.parent / "native_webrtc/python_stager.py"
+        self.assertEqual(hashlib.sha256(helper_path.read_bytes()).hexdigest(),
+                         TARGET.HELPERS["python_stager.py"])
+        spec = importlib.util.spec_from_file_location("windows_rust_actual_stager", helper_path)
+        stager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stager)
+        tool = copy.deepcopy(TARGET.WINDOWS_RUST) | {
+            "alias_copies": [], "omitted_aliases": [], "omission_evidence": None,
+            "members": [copy.deepcopy(TARGET.WINDOWS_RUST_PDB)]}
+        pdb = copy.deepcopy(TARGET.WINDOWS_RUST_PDB)
+        self.assertEqual(TARGET.windows_rust_member_limit(stager, tool, pdb), 556744704)
+        ordinary = dict(pdb, path="bin/ordinary.pdb", raw_path="bin/ordinary.pdb", bytes=512 * 1024 ** 2)
+        self.assertEqual(TARGET.windows_rust_member_limit(stager, tool, ordinary), stager.MAX_FILE)
+        for field, value in (("path", "bin/other.pdb"), ("raw_path", "./" + pdb["path"]),
+                             ("bytes", pdb["bytes"] + 1), ("mode", 0o777),
+                             ("output_mode", 0o700), ("sha256", "0" * 64), ("kind", "symlink")):
+            with self.subTest(member_field=field), self.assertRaises(TARGET.Refused):
+                TARGET.windows_rust_member_limit(stager, tool, dict(pdb, **{field: value}))
+        for field, value in (("name", "clang"), ("format", "zip"), ("bytes", tool["bytes"] - 1),
+                             ("sha256", "0" * 64), ("source", dict(tool["source"], generation=1)),
+                             ("source", dict(tool["source"], object="Linux_x64/other.tar.xz")),
+                             ("source", dict(tool["source"], bucket="foreign"))):
+            with self.subTest(archive_field=field), self.assertRaises(TARGET.Refused):
+                TARGET.windows_rust_member_limit(stager, dict(tool, **{field: value}), pdb)
+        # The ordinary stager remains capped and a partial/altered inventory
+        # cannot gain the special extraction path even with the original PDB.
+        with self.assertRaises(stager.Refusal):
+            stager.check_members(tool)
+        with self.assertRaises(TARGET.Refused):
+            TARGET.windows_rust_members(stager, tool)
+        original_source = dict(tool["source"])
+        with mock.patch.object(stager, "download") as download:
+            TARGET.windows_rust_download(stager, "owner", tool, Path("owned-rust.tar.xz"))
+        submitted = download.call_args.args[1]
+        self.assertEqual(submitted["source"], original_source | {"bucket": "chromium-browser-clang"})
+        self.assertEqual(tool["source"], original_source)
+        self.assertEqual({key: value for key, value in submitted.items() if key != "source"},
+                         {key: value for key, value in tool.items() if key != "source"})
+
+    def test_windows_rust_member_uses_bounded_chunks_and_streamed_stable_rehash(self):
+        helper_path = PATH.parent / "native_webrtc/python_stager.py"
+        self.assertEqual(hashlib.sha256(helper_path.read_bytes()).hexdigest(),
+                         TARGET.HELPERS["python_stager.py"])
+        spec = importlib.util.spec_from_file_location("windows_rust_stream_actual_stager", helper_path)
+        stager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stager)
+        tool = copy.deepcopy(TARGET.WINDOWS_RUST) | {
+            "alias_copies": [], "omitted_aliases": [], "omission_evidence": None}
+        payload = b"synthetic Rust DATA\0" * 65537
+        row = {"path": "bin/synthetic.pdb", "raw_path": "bin/synthetic.pdb", "kind": "regular",
+               "bytes": len(payload), "mode": 0o666, "output_mode": 0o600,
+               "sha256": hashlib.sha256(payload).hexdigest()}
+        class Fragmented(io.BytesIO):
+            def __init__(self, data):
+                super().__init__(data)
+                self.requests = []
+            def read(self, size=-1):
+                self.requests.append(size)
+                self.assert_bounded(size)
+                return super().read(min(size, 65536))
+            @staticmethod
+            def assert_bounded(size):
+                if not 0 < size <= 1024 * 1024:
+                    raise AssertionError("unbounded member read")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            owner = mock.Mock()
+            owner.create.side_effect = lambda destination: destination.open("xb")
+            # Test the real stable streaming fact() on POSIX too. Only its
+            # independent Windows drive-path gate is replaced for this fixture.
+            with mock.patch.object(TARGET, "path", side_effect=lambda value: Path(value)), \
+                    mock.patch.object(stager, "snapshot", side_effect=AssertionError("full-member allocation")):
+                stream = Fragmented(payload)
+                destination = root / "original.pdb"
+                TARGET.windows_rust_write_member(stager, owner, destination, stream, tool, row)
+                self.assertEqual(TARGET.fact(destination), {key: row[key] for key in ("bytes", "sha256")})
+                self.assertGreater(len(stream.requests), 2)
+                for label, data, selected in (("truncated", payload[:-1], row),
+                                               ("surplus", payload + b"x", row),
+                                               ("hash", payload, dict(row, sha256="0" * 64))):
+                    with self.subTest(label=label), self.assertRaises(TARGET.Refused):
+                        TARGET.windows_rust_write_member(stager, owner, root / (label + ".pdb"),
+                                                         Fragmented(data), tool, selected)
+                oversized = dict(row, bytes=stager.MAX_FILE + 1)
+                with self.assertRaises(TARGET.Refused):
+                    TARGET.windows_rust_write_member(stager, owner, root / "foreign.pdb",
+                                                     Fragmented(b""), tool, oversized)
+                self.assertFalse((root / "foreign.pdb").exists())
+
     def test_actual_two_version_wheels_and_virtualenv_keep_distinct_runtime_consumer_roots(self):
         # Exact original universal six versions and required virtualenv CIPD ZIP inventories.
         # Only the production DATA consumer/check_members run; no download, extraction or tool execution.
