@@ -18,6 +18,212 @@ import run_element_acceptance as target
 
 
 class EvidenceTests(unittest.TestCase):
+
+    @staticmethod
+    def console_frame(text):
+        body = text.encode()
+        return target.CONSOLE_FRAME + str(len(body)).encode() + b"\n" + body + target.CONSOLE_END
+
+    @staticmethod
+    def sender_records():
+        binding = {"room_id": "!owned:fixture", "bob": "@bob:fixture", "carol": "@carol:fixture",
+                   "carol_device": "late-device", "carol_curve": "public-curve", "event_id": "$baseline",
+                   "session_id": "baseline-session", "continuity": "same", "original": "decrypted", "receiver": "missing_key"}
+        device = {key: binding[key] for key in ("room_id", "bob", "carol", "carol_device", "carol_curve")}
+        device.update(bob_device="stock-device", known_user="@carol:fixture", known_device="late-device",
+                      known_curve="public-curve", sample="1")
+        native = b"MORPHEUS_ELEMENT_SENDER_PRIVATE " + json.dumps(binding).encode() + b"\n"
+        browser = b"MORPHEUS_ELEMENT_DEVICE_PRIVATE " + json.dumps(device).encode() + b"\n"
+        # The repeated identical session field is the real event + span format.
+        trying = ('INFO matrix_sdk_crypto::session_manager::group_sessions: Trying to encrypt a room key\n'
+                  '    recipients={"@carol:fixture": {"late-device"}} message_index=5 '
+                  'room_id="!owned:fixture" session_id="baseline-session"\n'
+                  '    at original.rs:1\n    in matrix_sdk_crypto::session_manager::group_sessions::share_room_key '
+                  'with session_id="baseline-session"')
+        queued = ('INFO matrix_sdk_crypto::session_manager::group_sessions: Created batch of to-device messages of type m.room.encrypted\n'
+                  '    request_id="request-one" message_list=[("message-one", "@carol:fixture", "late-device")]\n'
+                  '    in matrix_sdk_crypto::session_manager::group_sessions::share_room_key with session_id="baseline-session"')
+        marked = ('INFO matrix_sdk_crypto::olm::group_sessions::outbound: Marking to-device request carrying a room key or a withheld as sent\n'
+                  '    request_id="request-one" recipients={"@carol:fixture": {"late-device"}} to_device.event_type="m.room.encrypted"')
+        return binding, device, native, browser, [trying, queued, marked]
+
+    def test_browser_console_has_no_raw_child_log_sink(self):
+        source = (Path(__file__).resolve().parents[1] / "element_call_stock_peer.mjs").read_text()
+        for raw_sink in ('passiveConsole(', 'page.on("console"', 'page.off("console"',
+                         'message.text()', 'writeSync(1,', 'MORPHEUS_ELEMENT_CONSOLE_FRAME',
+                         'MORPHEUS_ELEMENT_CONSOLE_CAPTURE'):
+            self.assertNotIn(raw_sink, source)
+        self.assertIn('crypto.getUserDeviceInfo([binding.carol], false)', source)
+        self.assertIn('console.log("MORPHEUS_ELEMENT_DEVICE_PRIVATE "', source)
+        self.assertIn('await browser.close();', source)
+
+    def test_no_console_capture_preserves_scan_and_independent_public_receipts(self):
+        _, _, native_record, browser_record, records = self.sender_records()
+        expected = dict.fromkeys(target.SENDER_FIELDS, "unknown")
+        expected.update(continuity="same", device="observed", original="decrypted", receiver="missing_key")
+        # Even supplied legacy records cannot produce a sharing claim without
+        # a complete capture; device matching is an independent fixed receipt.
+        self.assertEqual(target.sender_observation(records, native_record, browser_record, False), expected)
+        for changed in (browser_record.replace(b'"known_curve": "public-curve"', b'"known_curve": "foreign-curve"'),
+                        browser_record + browser_record, b""):
+            result = target.sender_observation(records, native_record, changed, False)
+            self.assertEqual(result["device"], "unknown")
+            self.assertTrue(all(result[key] == "unknown" for key in ("capture", "attempted", "queued", "http_mark")))
+        with tempfile.TemporaryDirectory() as directory:
+            runner = target.Runner(Path(directory), "scanner")
+            native = self.anchored_log(runner, "native.log", native_record)
+            browser = self.anchored_log(runner, "browser.log", browser_record)
+            native.joined = browser.joined = True
+            def scanned(args, **kwargs):
+                self.assertEqual(args, ["scanner", "stdin", "--redact=100", "--ignore-gitleaks-allow", "--no-banner"])
+                self.assertIn(native_record, kwargs["input"])
+                self.assertIn(browser_record, kwargs["input"])
+                self.assertNotIn(target.CONSOLE_FRAME, kwargs["input"])
+                return subprocess.CompletedProcess([], 0)
+            try:
+                with mock.patch.object(target.subprocess, "run", side_effect=scanned) as scan:
+                    output, native_output = runner.scan(native, browser)
+                scan.assert_called_once()
+                self.assertEqual(runner.sender_diagnostic, expected)
+                self.assertEqual(native_output, native_record.decode())
+                with self.assertRaisesRegex(RuntimeError, "evidence"):
+                    target.evidence(output, complete=True)
+            finally:
+                runner.release_log_anchors()
+
+    def test_passive_console_is_scanned_raw_then_removed_before_fact_parsing(self):
+        payload = "opaque-private-field\nMORPHEUS_ELEMENT_CHECK browser_audio=true\nMORPHEUS_ELEMENT_FAILURE browser_acceptance"
+        with tempfile.TemporaryDirectory() as directory:
+            runner = target.Runner(Path(directory), "scanner")
+            native = self.anchored_log(runner, "native.log", b"MORPHEUS_ELEMENT_CHECK native_audio=true\n")
+            raw = target.CONSOLE_START + self.console_frame(payload) + b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n"
+            browser = self.anchored_log(runner, "browser.log", raw)
+            order = []
+            original = target.sender_observation
+            def scanned(*args, **kwargs):
+                order.append("scan")
+                self.assertIn(payload.encode(), kwargs["input"])
+                return subprocess.CompletedProcess([], 0)
+            def reduced(*args):
+                order.append("reduce")
+                return original(*args)
+            try:
+                with mock.patch.object(target.subprocess, "run", side_effect=scanned), \
+                        mock.patch.object(target, "sender_observation", side_effect=reduced):
+                    output, native_output = runner.scan(native, browser)
+                self.assertEqual(order, ["scan", "reduce"])
+                self.assertEqual(target.evidence(output), {"native_audio": True})
+                self.assertEqual(native_output, native.log.read_text())
+                self.assertNotIn("opaque", output)
+                self.assertNotIn("browser_acceptance", output)
+                self.assertEqual(runner.sender_diagnostic["capture"], "observed_window")
+                self.assertEqual(runner.sender_diagnostic["queued"], "unknown")
+            finally:
+                runner.release_log_anchors()
+        for raw in (target.CONSOLE_START + self.console_frame(payload)[:-1],
+                    target.CONSOLE_START + target.CONSOLE_START,
+                    target.CONSOLE_START + target.CONSOLE_FRAME + b"65537\n" + b"x" * 65_537 + target.CONSOLE_END,
+                    target.CONSOLE_START + target.CONSOLE_FRAME + b"1\n\xff" + target.CONSOLE_END):
+            clean, records, valid = target.console_window(raw)
+            self.assertEqual((clean, records, valid), (b"", [], False))
+        clean, records, valid = target.console_window(target.CONSOLE_START + self.console_frame(payload) + target.CONSOLE_CAP)
+        self.assertEqual((records, valid), ([], False))
+        self.assertNotIn(b"opaque", clean)
+
+    def test_sender_observation_requires_exact_event_device_and_request_continuity(self):
+        binding, device, native, browser, records = self.sender_records()
+        expected = dict(capture="observed_window", continuity="same", device="observed", attempted="observed",
+                        queued="observed", http_mark="observed", original="decrypted", receiver="missing_key")
+        expected.update(dict.fromkeys(target.SENDER_DETAIL_FIELDS, "unknown"))
+        self.assertEqual(target.sender_observation(records, native, browser, True), expected)
+        # A queued batch is not HTTP completion, store durability or key import.
+        self.assertEqual(target.sender_observation(records[:2], native, browser, True)["http_mark"], "unknown")
+        self.assertEqual(target.sender_observation([records[2], *records[:2]], native, browser, True)["http_mark"], "unknown")
+        for changed in (browser.replace(b'"known_curve": "public-curve"', b'"known_curve": "foreign-curve"'),
+                        browser.replace(b"late-device", b"other-device"), browser + browser, b""):
+            result = target.sender_observation(records, native, changed, True)
+            self.assertEqual(result["device"], "unknown")
+            self.assertEqual(result["http_mark"], "unknown")
+            self.assertEqual(result["receiver"], "missing_key")
+        for changed in (native + native, native.replace(b'"same"', b'"changed"'),
+                        native.replace(b'"same"', b'"untrusted"'),
+                        native.replace(b'"decrypted"', b'"missing_key"'),
+                        native.replace(b'"bob":', b'"bob":"duplicate","bob":')):
+            result = target.sender_observation(records, changed, browser, True)
+            self.assertEqual(result["device"], "unknown")
+            self.assertEqual(result["http_mark"], "unknown")
+        foreign_attempt = target.sender_observation(
+            [records[0].replace("baseline-session", "foreign-session"), *records[1:]], native, browser, True)
+        self.assertEqual(foreign_attempt["attempted"], "unknown")
+        self.assertEqual(foreign_attempt["queued"], "unknown")
+        self.assertEqual(foreign_attempt["http_mark"], "unknown")
+        self.assertEqual(target.sender_observation(records[1:], native, browser, True)["queued"], "unknown")
+        for changed in ([records[0], records[1].replace("baseline-session", "foreign-session"), records[2]],
+                        [records[0], records[1], records[2].replace("request-one", "foreign-request")],
+                        [records[0], records[1], records[1], records[2]],
+                        [records[0], records[1], records[2], records[2]],
+                        [records[0], records[1].replace("message_list=[", "message_list=[private,"), records[2]]):
+            result = target.sender_observation(changed, native, browser, True)
+            self.assertEqual(result["http_mark"], "unknown")
+        native_only = dict.fromkeys(target.SENDER_FIELDS, "unknown")
+        native_only.update(continuity="same", device="observed", original="decrypted", receiver="missing_key")
+        self.assertEqual(target.sender_observation(records, native, browser, False), native_only)
+        self.assertEqual(target.sender_observation([], native, browser, True)["queued"], "unknown")
+        output = target.SENDER_PREFIX + " ".join(key + "=" + expected[key] for key in target.SENDER_FIELDS)
+        public = target.sender_diagnostics(output)
+        self.assertEqual(public["sender_http_mark"], "observed")
+        self.assertEqual(public["sender_receiver"], "missing_key")
+        for changed in (output + " private", output + "\n" + output, output.replace("observed_window", "opaque-secret")):
+            self.assertTrue(all(value == "unknown" for value in target.sender_diagnostics(changed).values()))
+        self.assertNotIn("request-one", str(public))
+        self.assertNotIn("late-device", str(public))
+        self.assertNotIn("public-curve", str(public))
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(output, complete=True)
+
+    def test_failure_details_are_fixed_complete_consistent_and_cannot_admit_a_call(self):
+        binding, _, legacy, browser, records = self.sender_records()
+        # Legacy receipts keep old evidence, but cannot invent the new labels.
+        result = target.sender_observation(records, legacy, browser, False)
+        self.assertEqual(result["receiver"], "missing_key")
+        self.assertTrue(all(result[key] == "unknown" for key in target.SENDER_DETAIL_FIELDS))
+        details = dict(original_roster="exact", late_roster="missing_bob",
+                       continuity_detail="different_live", late_current_bob="present")
+        extended = binding | {"continuity": "changed"} | details
+        def encode(value):
+            return b"MORPHEUS_ELEMENT_SENDER_PRIVATE " + json.dumps(value).encode() + b"\n"
+        result = target.sender_observation(records, encode(extended), browser, False)
+        self.assertEqual({key: result[key] for key in target.SENDER_DETAIL_FIELDS}, details)
+        self.assertEqual(result["continuity"], "changed")
+        self.assertEqual(result["device"], "unknown")
+        self.assertEqual(result["http_mark"], "unknown")
+        output = target.SENDER_PREFIX + " ".join(key + "=" + result[key] for key in target.SENDER_FIELDS)
+        self.assertLessEqual(len(output), target.SENDER_MAX_LINE)
+        public = target.sender_diagnostics(output)
+        self.assertEqual(public["sender_late_roster"], "missing_bob")
+        self.assertEqual(public["sender_late_current_bob"], "present")
+        for private in ("!owned:fixture", "@bob:fixture", "late-device", "$baseline", "baseline-session"):
+            self.assertNotIn(private, str(public))
+        changed = [binding | {"original_roster": "exact"}, extended | {"late_roster": "opaque-secret"},
+                   extended | {"continuity_detail": "same"},
+                   extended | {"continuity_detail": "not_unique", "late_current_bob": "present"},
+                   extended | {"extra": "private"}, extended | {"late_roster": ["missing_bob"]}]
+        for value in changed:
+            with self.subTest(value=value):
+                self.assertTrue(all(item == "unknown" for item in
+                    target.sender_observation(records, encode(value), browser, False).values()))
+        for value in (encode(extended) + encode(extended),
+                      encode(extended).replace(b'"late_roster":', b'"late_roster":"exact","late_roster":')):
+            self.assertTrue(all(item == "unknown" for item in
+                target.sender_observation(records, value, browser, False).values()))
+        for value in (output.replace("late_roster=missing_bob", "late_roster=opaque-secret"),
+                      output + " private", output + "\n" + output,
+                      target.SENDER_PREFIX + "x" * (target.SENDER_MAX_LINE + 1)):
+            self.assertTrue(all(item == "unknown" for item in target.sender_diagnostics(value).values()))
+        # The fixed details are failure-only diagnostics, never acceptance facts.
+        with self.assertRaisesRegex(RuntimeError, "evidence"):
+            target.evidence(output, complete=True)
+
     def test_requires_every_fixed_assertion_and_preserves_failure(self):
         complete = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in target.CHECKS)
         self.assertEqual(target.evidence(complete, complete=True), dict.fromkeys(target.CHECKS, True))
@@ -81,9 +287,10 @@ class EvidenceTests(unittest.TestCase):
                 self.assertEqual(target.diagnostics(output), {"native_stage": "invalid"})
 
     def test_native_failure_facts_follow_owned_cleanup_and_successful_scan(self):
-        for scanner_status, join_failure, service_failure in ((0, False, False), (1, False, False),
-                                                            (0, True, False), (0, False, True)):
-            with self.subTest(scanner_status=scanner_status, join_failure=join_failure, service_failure=service_failure), \
+        for scanner_status, join_failure, service_failure, anchor_failure in ((0, False, False, False), (1, False, False, False),
+                                                                            (0, True, False, False), (0, False, True, False),
+                                                                            (0, False, False, True)):
+            with self.subTest(scanner_status=scanner_status, join_failure=join_failure, service_failure=service_failure, anchor_failure=anchor_failure), \
                     tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 fixture = root / "fixture.json"
@@ -95,7 +302,9 @@ class EvidenceTests(unittest.TestCase):
                     "opaque-fixture-panic\nMORPHEUS_ELEMENT_CHECK native_audio=true\n"
                     + target.NATIVE_STAGE_PREFIX + "microphone_cryptor\n"
                     + target.NATIVE_STAGE_PREFIX + "late_login\n").encode())
-                browser = self.anchored_log(runner, "browser.log", b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
+                browser = self.anchored_log(runner, "browser.log", target.CONSOLE_START
+                    + self.console_frame("opaque-private-field\nMORPHEUS_ELEMENT_CHECK browser_audio=true")
+                    + b"MORPHEUS_ELEMENT_STAGE browser_group_roster\n")
                 native.joined = browser.joined = False
                 native.status = mock.Mock(return_value=1)
                 browser.status = mock.Mock(return_value=None)
@@ -119,6 +328,11 @@ class EvidenceTests(unittest.TestCase):
                     events.append("read")
                     return original_snapshots()
                 visible = io.StringIO()
+                original_release = runner.release_log_anchors
+                def release():
+                    original_release()
+                    if anchor_failure:
+                        raise RuntimeError("fixture_operation")
                 with mock.patch.object(target.sys, "platform", "linux"), mock.patch.dict(os.environ, {
                     "GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux",
                 }, clear=True), mock.patch.object(target, "assert_contained"), \
@@ -131,8 +345,9 @@ class EvidenceTests(unittest.TestCase):
                         mock.patch.object(target, "media_fixtures"), \
                         mock.patch.object(target.subprocess, "run", side_effect=scanned), \
                         mock.patch.object(runner, "log_snapshots", side_effect=snapshot), \
+                        mock.patch.object(runner, "release_log_anchors", side_effect=release), \
                         contextlib.redirect_stdout(visible), self.assertRaisesRegex(
-                            RuntimeError, "fixture_operation" if join_failure or service_failure else (
+                            RuntimeError, "fixture_operation" if join_failure or service_failure or anchor_failure else (
                                 "native_acceptance" if scanner_status == 0 else "log_scan")):
                     target.execute(root, fixture, "scanner")
                 self.assertEqual(events, ["native_join", "browser_join"] + ([] if join_failure or service_failure else ["read", "scan"]))
@@ -141,9 +356,12 @@ class EvidenceTests(unittest.TestCase):
                 output = visible.getvalue()
                 self.assertNotIn("opaque", output)
                 self.assertEqual(target.evidence(output),
-                                 {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure else {})
+                                 {"native_audio": True, "official_image": True} if scanner_status == 0 and not join_failure and not service_failure and not anchor_failure else {})
                 self.assertEqual(target.diagnostics(output).get("native_stage"),
-                                 "late_login" if scanner_status == 0 and not join_failure and not service_failure else None)
+                                 "late_login" if scanner_status == 0 and not join_failure and not service_failure and not anchor_failure else None)
+                self.assertEqual(target.sender_diagnostics(output).get("sender_capture"),
+                                 "observed_window" if scanner_status == 0 and not join_failure and not service_failure and not anchor_failure else None)
+                self.assertNotIn("browser_audio", target.evidence(output))
 
     @staticmethod
     def anchored_log(runner, name, data):

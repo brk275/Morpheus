@@ -401,6 +401,325 @@ fn exact_roster(rtc: &RtcService, room: &str, users: &[&str]) -> bool {
     actual == expected
 }
 
+// A fixed-label view of the same in-memory roster used by exact_roster.
+// This runs only after the unchanged group deadline has already failed.
+fn roster_discriminator(rtc: &RtcService, room: &str, users: [&str; 3]) -> &'static str {
+    let Ok(members) = rtc.participants(room) else {
+        return "unavailable";
+    };
+    if members.len() > 64 {
+        return "unavailable";
+    }
+    let mut counts = [0_usize; 3];
+    for member in members {
+        let Some(index) = users.iter().position(|user| member.user_id.as_str() == *user) else {
+            return "unexpected_or_duplicate";
+        };
+        counts[index] += 1;
+        if counts[index] > 1 {
+            return "unexpected_or_duplicate";
+        }
+    }
+    let missing = counts.iter().filter(|count| **count == 0).count();
+    if missing == 0 {
+        "exact"
+    } else if missing > 1 {
+        "missing_multiple"
+    } else if counts[0] == 0 {
+        "missing_alice"
+    } else if counts[1] == 0 {
+        "missing_bob"
+    } else {
+        "missing_carol"
+    }
+}
+
+// A private, bounded observation of Bob's original already-decrypted sticky
+// membership. No ciphertext/key bytes are printed. This never admits a call.
+struct SenderBaseline {
+    event_id: matrix_sdk::ruma::OwnedEventId,
+    session_id: String,
+    wire: serde_json::Value,
+    encrypted: matrix_sdk::ruma::serde::Raw<
+        matrix_sdk::ruma::events::room::encrypted::OriginalSyncRoomEncryptedEvent,
+    >,
+}
+
+fn bob_memberships(room: &matrix_sdk::Room, bob: &str) -> Vec<matrix_sdk::ruma::OwnedEventId> {
+    use matrix_sdk::ruma::events::TimelineEventType;
+    let live = room.sticky_events().live();
+    if live.len() > 64 {
+        return Vec::new();
+    }
+    let types = [
+        TimelineEventType::from("m.rtc.member"),
+        TimelineEventType::from("org.matrix.msc4143.rtc.member"),
+    ];
+    live.iter()
+        .filter(|event| {
+            event.key.sender.as_str() == bob
+                && types.contains(&event.key.event_type)
+                && event
+                    .encryption_info()
+                    .is_some_and(|info| info.sender.as_str() == bob)
+        })
+        .take(2)
+        .map(|event| event.event_id.clone())
+        .collect()
+}
+
+async fn fetch_bob_event(
+    client: &Client,
+    room: &str,
+    bob: &str,
+    event_id: &matrix_sdk::ruma::EventId,
+) -> Option<SenderBaseline> {
+    use matrix_sdk::{
+        config::RequestConfig,
+        ruma::{
+            api::client::room::get_room_event,
+            events::room::encrypted::OriginalSyncRoomEncryptedEvent,
+        },
+    };
+    let room_id = matrix_sdk::ruma::RoomId::parse(room).ok()?;
+    let joined = client.get_room(&room_id)?;
+    if joined.state() != matrix_sdk::RoomState::Joined {
+        return None;
+    }
+    let fetched = timeout(
+        Duration::from_secs(3),
+        client
+            .send(get_room_event::v3::Request::new(
+                room_id,
+                event_id.to_owned(),
+            ))
+            .with_request_config(
+                RequestConfig::new()
+                    .retry_limit(0)
+                    .timeout(Duration::from_secs(3))
+                    .max_response_bytes(64 * 1024),
+            ),
+    )
+    .await
+    .ok()?
+    .ok()?
+    .event;
+    if joined.state() != matrix_sdk::RoomState::Joined || fetched.json().get().len() > 64 * 1024 {
+        return None;
+    }
+    let mut wire: serde_json::Value = serde_json::from_str(fetched.json().get()).ok()?;
+    if wire.get("sender")?.as_str()? != bob
+        || wire.get("room_id")?.as_str()? != room
+        || wire.get("event_id")?.as_str()? != event_id.as_str()
+        || wire.get("type")?.as_str()? != "m.room.encrypted"
+        || wire.get("state_key").is_some()
+        || wire.pointer("/content/algorithm")?.as_str()? != "m.megolm.v1.aes-sha2"
+    {
+        return None;
+    }
+    let session_id = wire.pointer("/content/session_id")?.as_str()?.to_owned();
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte))
+    {
+        return None;
+    }
+    let encrypted = matrix_sdk::ruma::serde::Raw::<OriginalSyncRoomEncryptedEvent>::from_json(
+        fetched.into_json(),
+    );
+    encrypted.deserialize().ok()?;
+    // Only the server's changing age annotation is excluded. Every other
+    // field, including redaction annotations and full ciphertext, must match.
+    if let Some(unsigned) = wire
+        .get_mut("unsigned")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        unsigned.remove("age");
+    }
+    Some(SenderBaseline {
+        event_id: event_id.to_owned(),
+        session_id,
+        wire,
+        encrypted,
+    })
+}
+
+async fn sender_baseline(client: &Client, room: &str, bob: &str) -> Option<SenderBaseline> {
+    let room_id = matrix_sdk::ruma::RoomId::parse(room).ok()?;
+    let joined = client.get_room(&room_id)?;
+    let events = bob_memberships(&joined, bob);
+    let [event_id] = events.as_slice() else {
+        return None;
+    };
+    fetch_bob_event(client, room, bob, event_id).await
+}
+
+async fn sender_device(root: &std::path::Path, client: &Client, room: &str, carol: &str) {
+    if client.user_id().map(|value| value.as_str()) != Some(carol) {
+        return;
+    }
+    let Some(device) = client.device_id() else {
+        return;
+    };
+    let Ok(Some(curve)) =
+        timeout(Duration::from_secs(3), client.encryption().curve25519_key()).await
+    else {
+        return;
+    };
+    let binding = serde_json::json!({
+        "room_id": room, "carol": carol, "carol_device": device.as_str(),
+        "carol_curve": curve.to_base64(),
+    });
+    let Ok(bytes) = serde_json::to_vec(&binding) else {
+        return;
+    };
+    if bytes.len() > 8_192 {
+        return;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // An unavailable diagnostic never replaces an existing acceptance predicate.
+    // Readiness is published only after the JSON owner has left scope; the
+    // browser separately proves exact no-follow FD/identity/size on its bytes.
+    {
+        let Ok(mut file) = options.open(root.join("sender-device.json")) else {
+            return;
+        };
+        if file.write_all(&bytes).is_err() {
+            return;
+        }
+    }
+    if let Ok(mut ready) = options.open(root.join("sender-device-ready")) {
+        let _ = ready.write_all(b"ready\n");
+    }
+}
+
+async fn sender_decrypt(room: &matrix_sdk::Room, baseline: &SenderBaseline) -> &'static str {
+    use matrix_sdk::deserialized_responses::{TimelineEventKind, UnableToDecryptReason};
+    match timeout(
+        Duration::from_secs(3),
+        room.decrypt_event(&baseline.encrypted, None),
+    )
+    .await
+    {
+        Err(_) => "timeout",
+        Ok(Err(_)) => "error",
+        Ok(Ok(event)) => match event.kind {
+            TimelineEventKind::Decrypted(_) => "decrypted",
+            TimelineEventKind::PlainText { .. } => "not_encrypted",
+            TimelineEventKind::UnableToDecrypt { utd_info, .. } => match utd_info.reason {
+                UnableToDecryptReason::MissingMegolmSession {
+                    withheld_code: None,
+                } => "missing_key",
+                UnableToDecryptReason::MissingMegolmSession {
+                    withheld_code: Some(_),
+                } => "withheld",
+                UnableToDecryptReason::UnknownMegolmMessageIndex => "unknown_index",
+                UnableToDecryptReason::SenderIdentityNotTrusted(_) => "trust",
+                _ => "other_utd",
+            },
+        },
+    }
+}
+
+async fn sender_receiver(
+    original: &Client,
+    late: &Client,
+    baseline: Option<&SenderBaseline>,
+    room: &str,
+    bob: &str,
+    carol: &str,
+    original_roster: &'static str,
+    late_roster: &'static str,
+) {
+    let observe = async {
+        let baseline = baseline?;
+        let room_id = matrix_sdk::ruma::RoomId::parse(room).ok()?;
+        let joined = original.get_room(&room_id)?;
+        let late_room = late.get_room(&room_id)?;
+        if joined.state() != matrix_sdk::RoomState::Joined
+            || late_room.state() != matrix_sdk::RoomState::Joined
+            || late.user_id().map(|value| value.as_str()) != Some(carol)
+        {
+            return None;
+        }
+        let before = bob_memberships(&joined, bob);
+        let current = fetch_bob_event(late, room, bob, &baseline.event_id).await?;
+        // Failure-only ordinary public decrypt. This can queue the SDK's existing
+        // same-user requests, never foreign historical key permission. It runs
+        // after the unchanged roster deadline has already failed, not as repair.
+        let original_decrypt = sender_decrypt(&joined, baseline).await;
+        let receiver = sender_decrypt(&late_room, baseline).await;
+        let after = bob_memberships(&joined, bob);
+        // Decompose the original continuity conjunction without fetching a
+        // different event or claiming that the cached baseline is still current.
+        let continuity_detail = if before.len() != 1 {
+            "not_unique"
+        } else if before[0] != baseline.event_id {
+            "different_live"
+        } else if after != before {
+            "live_changed"
+        } else if current.wire != baseline.wire {
+            "wire_changed"
+        } else {
+            "same"
+        };
+        let continuity = if continuity_detail == "same" {
+            "same"
+        } else {
+            "changed"
+        };
+        // A stable current Bob event in the original client's already-decrypted
+        // map can be compared with the late client's map. No key/event fetch is
+        // added, and no event identifier is exposed by this fixed label.
+        let late_current_bob = if before.len() != 1
+            || after != before
+            || late_room.sticky_events().live().len() > 64
+        {
+            "unknown"
+        } else {
+            let late_events = bob_memberships(&late_room, bob);
+            if late_events.len() > 1 {
+                "ambiguous"
+            } else if late_events.first() == before.first() {
+                "present"
+            } else {
+                "missing"
+            }
+        };
+        if joined.state() != matrix_sdk::RoomState::Joined
+            || late_room.state() != matrix_sdk::RoomState::Joined
+        {
+            return None;
+        }
+        let device = late.device_id()?;
+        let curve = timeout(Duration::from_secs(3), late.encryption().curve25519_key())
+            .await
+            .ok()??;
+        Some(serde_json::json!({
+            "room_id": room, "bob": bob, "carol": carol,
+            "carol_device": device.as_str(), "carol_curve": curve.to_base64(),
+            "event_id": baseline.event_id.as_str(), "session_id": baseline.session_id,
+            "continuity": continuity, "original": original_decrypt, "receiver": receiver,
+            "original_roster": original_roster, "late_roster": late_roster,
+            "continuity_detail": continuity_detail, "late_current_bob": late_current_bob,
+        }))
+    }
+    .await;
+    if let Some(binding) = observe {
+        // Only the independently scanned native log is parsed. This private
+        // binding is never copied to public output; the reducer emits fixed enums.
+        eprintln!("MORPHEUS_ELEMENT_SENDER_PRIVATE {}", binding);
+    }
+}
+
 async fn group_and_screen(
     rtc: &mut RtcService,
     root: &std::path::Path,
@@ -418,6 +737,7 @@ async fn group_and_screen(
         root.join("native-microphone-sid"),
         microphone_sid.as_bytes(),
     );
+    let baseline = sender_baseline(rtc.client(), room, &bob.user_id).await;
     // The unmodified pinned core keeps keys fresh for ten seconds. Make the
     // late arrival occur outside that window rather than asking a test-only
     // API to rotate keys or assuming a fast bulk join has to rotate them.
@@ -467,21 +787,42 @@ async fn group_and_screen(
         .expect("Late-peer client missing");
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE late_bootstrap");
     bootstrap_identity(&client, carol).await;
+    sender_device(root, &client, room, &carol.user_id).await;
     let mut late = RtcService::new(client);
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE late_join");
     late.join(room, CallOptions::element_call_matrix_2_0())
         .await
         .expect("Late-peer join failed");
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE group_roster");
-    timeout(Duration::from_secs(90), async {
+    let roster = timeout(Duration::from_secs(90), async {
         while !exact_roster(rtc, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
             || !exact_roster(&late, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
         {
             sleep(Duration::from_millis(200)).await;
         }
     })
-    .await
-    .expect("Three-member native rosters did not converge");
+    .await;
+    if roster.is_err() {
+        let users = [
+            alice.user_id.as_str(),
+            bob.user_id.as_str(),
+            carol.user_id.as_str(),
+        ];
+        let original_roster = roster_discriminator(rtc, room, users);
+        let late_roster = roster_discriminator(&late, room, users);
+        sender_receiver(
+            rtc.client(),
+            late.client(),
+            baseline.as_ref(),
+            room,
+            &bob.user_id,
+            &carol.user_id,
+            original_roster,
+            late_roster,
+        )
+        .await;
+    }
+    roster.expect("Three-member native rosters did not converge");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_group_roster=true");
 
     // A newly created device must actually decrypt the already-running sender,

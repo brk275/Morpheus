@@ -58,6 +58,326 @@ STAGE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_STAGE ([a-z_]+)$", re.MULTILINE)
 FAILURE_PATTERN = re.compile(r"^MORPHEUS_ELEMENT_FAILURE ([a-z_]+)$", re.MULTILINE)
 
 
+CONSOLE_START = b"MORPHEUS_ELEMENT_CONSOLE_CAPTURE started\n"
+CONSOLE_CAP = b"MORPHEUS_ELEMENT_CONSOLE_CAPTURE capped\n"
+CONSOLE_FRAME = b"MORPHEUS_ELEMENT_CONSOLE_FRAME "
+CONSOLE_END = b"\nMORPHEUS_ELEMENT_CONSOLE_END\n"
+SENDER_DETAIL_FIELDS = ("original_roster", "late_roster", "continuity_detail", "late_current_bob")
+SENDER_FIELDS = ("capture", "continuity", "device", "attempted", "queued", "http_mark", "original", "receiver") + SENDER_DETAIL_FIELDS
+SENDER_VALUES = {
+    "capture": frozenset(("observed_window", "unknown")),
+    "continuity": frozenset(("same", "changed", "unknown")),
+    "device": frozenset(("observed", "unknown")),
+    "attempted": frozenset(("observed", "unknown")),
+    "queued": frozenset(("observed", "unknown")),
+    "http_mark": frozenset(("observed", "unknown")),
+    "original": frozenset(("decrypted", "missing_key", "withheld", "unknown_index", "trust",
+                            "other_utd", "not_encrypted", "timeout", "error", "unknown")),
+    "receiver": frozenset(("decrypted", "missing_key", "withheld", "unknown_index", "trust",
+                            "other_utd", "not_encrypted", "timeout", "error", "unknown")),
+    "original_roster": frozenset(("exact", "missing_alice", "missing_bob", "missing_carol", "missing_multiple",
+                                  "unexpected_or_duplicate", "unavailable", "unknown")),
+    "late_roster": frozenset(("exact", "missing_alice", "missing_bob", "missing_carol", "missing_multiple",
+                              "unexpected_or_duplicate", "unavailable", "unknown")),
+    "continuity_detail": frozenset(("same", "not_unique", "different_live", "live_changed", "wire_changed", "unknown")),
+    "late_current_bob": frozenset(("present", "missing", "ambiguous", "unknown")),
+}
+SENDER_PREFIX = "MORPHEUS_ELEMENT_SENDER "
+# Exact finite output budget from closed literal names/categories; never raw IDs.
+SENDER_MAX_LINE = len(SENDER_PREFIX) + len(SENDER_FIELDS) - 1 + sum(
+    len(key) + 1 + max(map(len, SENDER_VALUES[key])) for key in SENDER_FIELDS)
+
+
+def console_window(data: bytes):
+    """After scanning raw bytes, remove length-framed console DATA from facts.
+
+    Actual owned child termination closes the observed window. It does not prove
+    all SDK logging was available/delivered, so absent records remain UNKNOWN.
+    Partial framing, duplicate starts, caps or invalid UTF-8 cannot yield evidence.
+    """
+    clean, records = [], []
+    cursor = total = 0
+    started = capped = False
+    try:
+        while cursor < len(data):
+            end = data.find(b"\n", cursor)
+            end = len(data) if end < 0 else end + 1
+            line = data[cursor:end]
+            cursor = end
+            if line == CONSOLE_START:
+                if started:
+                    raise ValueError
+                started = True
+            elif line == CONSOLE_CAP:
+                if not started or capped:
+                    raise ValueError
+                capped = True
+            elif line.startswith(CONSOLE_FRAME):
+                if not started or capped or len(line) > 64 or len(records) >= 4_096:
+                    raise ValueError
+                value = line[len(CONSOLE_FRAME):-1]
+                if not re.fullmatch(rb"0|[1-9][0-9]{0,4}", value):
+                    raise ValueError
+                length = int(value)
+                if length > 65_536 or total + length > 2 * 1024 * 1024:
+                    raise ValueError
+                stop = cursor + length
+                if data[stop:stop + len(CONSOLE_END)] != CONSOLE_END:
+                    raise ValueError
+                records.append(data[cursor:stop].decode("utf8", errors="strict"))
+                total += length
+                cursor = stop + len(CONSOLE_END)
+            elif line.startswith(b"MORPHEUS_ELEMENT_CONSOLE_"):
+                raise ValueError
+            else:
+                clean.append(line)
+        return b"".join(clean), records if started and not capped else [], started and not capped
+    except (ValueError, UnicodeError):
+        # No raw fallback: malformed framing could contain forged fact lines.
+        return b"", [], False
+
+
+def private_sender_records(data: bytes, prefix: bytes, keys, limit=1, optional_keys=()):
+    """One bounded flat private record, never a public ID/path/error payload."""
+    found = []
+    cursor = 0
+    while (start := data.find(prefix, cursor)) >= 0:
+        cursor = start + len(prefix)
+        if start and data[start - 1:start] != b"\n":
+            continue
+        end = data.find(b"\n", cursor)
+        end = len(data) if end < 0 else end
+        if end - cursor > 8_192 or len(found) >= limit:
+            return []
+        try:
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError
+                    result[key] = value
+                return result
+            value = json.loads(data[cursor:end], object_pairs_hook=unique)
+            if (not isinstance(value, dict) or set(value) not in (set(keys), set(keys) | set(optional_keys))
+                    or any(not isinstance(item, str) or not 0 < len(item) <= 1_024
+                           or not item.isascii() or any(ord(char) < 32 for char in item)
+                           for item in value.values())):
+                return []
+        except (ValueError, RecursionError):
+            return []
+        found.append(value)
+    return found
+
+
+def debug_string(text, name):
+    values = re.findall(r"(?:^|\s)" + re.escape(name) + r'=("(?:[^"\\]|\\.)*")(?=\s|$)', text)
+    if not values:
+        raise ValueError
+    parsed = [json.loads(value) for value in values]
+    if any(not isinstance(value, str) or not 0 < len(value) <= 1_024 for value in parsed) or len(set(parsed)) != 1:
+        raise ValueError
+    return parsed[0]
+
+
+def recipients_field(text, name, tuples=False):
+    """Only the pinned Debug map-of-sets / list-of-triples grammar, no eval."""
+    lines = [line.strip() for line in text.splitlines() if line.startswith("    ") and name + "=" in line]
+    if len(lines) != 1 or lines[0].count(name + "=") != 1:
+        raise ValueError
+    value = lines[0].split(name + "=", 1)[1]
+    pos = 0
+    decoder = json.JSONDecoder()
+    def token(char):
+        nonlocal pos
+        while pos < len(value) and value[pos].isspace():
+            pos += 1
+        if not value.startswith(char, pos):
+            raise ValueError
+        pos += len(char)
+    def string():
+        nonlocal pos
+        while pos < len(value) and value[pos].isspace():
+            pos += 1
+        item, end = decoder.raw_decode(value, pos)
+        if not isinstance(item, str) or not 0 < len(item) <= 1_024:
+            raise ValueError
+        pos = end
+        return item
+    result = set()
+    if tuples:
+        token("[")
+        for count in range(129):
+            if value[pos:].lstrip().startswith("]"):
+                token("]")
+                break
+            if count == 128:
+                raise ValueError
+            if count:
+                token(",")
+            token("(")
+            string()  # message ID is private; only exact user/device are selected.
+            token(",")
+            user = string()
+            token(",")
+            device = string()
+            token(")")
+            if (user, device) in result:
+                raise ValueError
+            result.add((user, device))
+        else:
+            raise ValueError
+    else:
+        token("{")
+        users = set()
+        for count in range(65):
+            if value[pos:].lstrip().startswith("}"):
+                token("}")
+                break
+            if count == 64:
+                raise ValueError
+            if count:
+                token(",")
+            user = string()
+            if user in users:
+                raise ValueError
+            users.add(user)
+            token(":")
+            token("{")
+            for index in range(129):
+                if value[pos:].lstrip().startswith("}"):
+                    token("}")
+                    break
+                if index == 128 or len(result) >= 128:
+                    raise ValueError
+                if index:
+                    token(",")
+                device = string()
+                if (user, device) in result:
+                    raise ValueError
+                result.add((user, device))
+            else:
+                raise ValueError
+        else:
+            raise ValueError
+    # Remaining fields are parsed independently; delimiters cannot be smuggled.
+    if pos < len(value) and not value[pos].isspace():
+        raise ValueError
+    return result
+
+
+def sender_detail_values_valid(value):
+    if any(value.get(key) not in SENDER_VALUES[key] for key in SENDER_DETAIL_FIELDS):
+        return False
+    detail = value["continuity_detail"]
+    if detail == "unknown":
+        return all(value[key] == "unknown" for key in SENDER_DETAIL_FIELDS)
+    if value.get("continuity") != ("same" if detail == "same" else "changed"):
+        return False
+    return (detail not in ("not_unique", "live_changed")
+            or value["late_current_bob"] == "unknown")
+
+
+def sender_observation(records, native: bytes, browser: bytes, window: bool):
+    result = dict.fromkeys(SENDER_FIELDS, "unknown")
+    if window:
+        result["capture"] = "observed_window"
+    bindings = private_sender_records(native, b"MORPHEUS_ELEMENT_SENDER_PRIVATE ", (
+        "room_id", "bob", "carol", "carol_device", "carol_curve", "event_id", "session_id", "continuity", "original", "receiver"),
+        optional_keys=SENDER_DETAIL_FIELDS)
+    devices = private_sender_records(browser, b"MORPHEUS_ELEMENT_DEVICE_PRIVATE ", (
+        "room_id", "bob", "bob_device", "carol", "carol_device", "carol_curve", "known_user", "known_device", "known_curve", "sample"), 8)
+    if len(bindings) != 1:
+        return result
+    binding = bindings[0]
+    # A legacy private binding can establish only its old fields. An extended
+    # binding must contain the complete closed group and consistent continuity.
+    if any(key in binding for key in SENDER_DETAIL_FIELDS):
+        if not sender_detail_values_valid(binding):
+            return result
+        for key in SENDER_DETAIL_FIELDS:
+            result[key] = binding[key]
+    if binding["continuity"] in SENDER_VALUES["continuity"]:
+        result["continuity"] = binding["continuity"]
+    if binding["original"] in SENDER_VALUES["original"]:
+        result["original"] = binding["original"]
+    if binding["receiver"] in SENDER_VALUES["receiver"]:
+        result["receiver"] = binding["receiver"]
+    # The native same-cipher/receiver receipt is independent of stock logging.
+    # The bounded cached-device receipt is independent of console capture too.
+    samples = [device["sample"] for device in devices]
+    if (not devices or len(samples) != len(set(samples)) or any(sample not in tuple(str(index) for index in range(1, 9)) for sample in samples)
+            or binding["continuity"] != "same" or binding["original"] != "decrypted"
+            or any(binding[key] != device[key] for device in devices for key in ("room_id", "bob", "carol", "carol_device", "carol_curve"))
+            or not any((device["known_user"], device["known_device"], device["known_curve"]) ==
+                       (binding["carol"], binding["carol_device"], binding["carol_curve"]) for device in devices)):
+        return result
+    result["device"] = "observed"
+    # No console capture means no attempted/queued/HTTP-marked sharing claim.
+    if not window:
+        return result
+    expected = (binding["carol"], binding["carol_device"])
+    queued = {}
+    seen_queued = set()
+    marked = set()
+    pending_recipients = set()
+    try:
+        for text in records:
+            if "INFO matrix_sdk_crypto::session_manager::group_sessions: Trying to encrypt a room key\n" in text:
+                pending_recipients = set()
+                if (debug_string(text, "session_id") == binding["session_id"]
+                        and debug_string(text, "room_id") == binding["room_id"]):
+                    pending_recipients = recipients_field(text, "recipients")
+                    if expected in pending_recipients:
+                        result["attempted"] = "observed"
+            elif "INFO matrix_sdk_crypto::session_manager::group_sessions: Created batch of to-device messages of type m.room.encrypted\n" in text:
+                if debug_string(text, "session_id") != binding["session_id"]:
+                    continue
+                request = debug_string(text, "request_id")
+                if request in seen_queued:
+                    raise ValueError
+                seen_queued.add(request)
+                recipients = recipients_field(text, "message_list", tuples=True)
+                # Require the actual-session attempt, not just a span label:
+                # the pinned SDK records its span before possible key rotation.
+                if expected in recipients and recipients <= pending_recipients:
+                    queued[request] = recipients
+                    result["queued"] = "observed"
+            elif "INFO matrix_sdk_crypto::olm::group_sessions::outbound: Marking to-device request carrying a room key or a withheld as sent\n" in text:
+                request = debug_string(text, "request_id")
+                if request in marked:
+                    raise ValueError
+                marked.add(request)
+                recipients = recipients_field(text, "recipients")
+                if request in queued and expected in queued[request] and recipients == queued[request]:
+                    result["http_mark"] = "observed"
+    except (ValueError, RecursionError):
+        # Unsupported/malformed/ambiguous formats yield no sender claims.
+        for key in ("attempted", "queued", "http_mark"):
+            result[key] = "unknown"
+    return result
+
+
+def sender_diagnostics(output: str):
+    values = []
+    for line in output.splitlines():
+        if line.startswith(SENDER_PREFIX):
+            if len(line) > SENDER_MAX_LINE or values:
+                return dict.fromkeys(("sender_" + key for key in SENDER_FIELDS), "unknown")
+            fields = line[len(SENDER_PREFIX):].split(" ")
+            if len(fields) != len(SENDER_FIELDS):
+                return dict.fromkeys(("sender_" + key for key in SENDER_FIELDS), "unknown")
+            result = {}
+            for field, key in zip(fields, SENDER_FIELDS):
+                head, sep, value = field.partition("=")
+                if not sep or head != key or value not in SENDER_VALUES[key]:
+                    return dict.fromkeys(("sender_" + name for name in SENDER_FIELDS), "unknown")
+                result["sender_" + key] = value
+            if not sender_detail_values_valid({key: result["sender_" + key] for key in SENDER_FIELDS}):
+                return dict.fromkeys(("sender_" + key for key in SENDER_FIELDS), "unknown")
+            values.append(result)
+    return values[0] if values else {}
+
+
 def evidence(output: str, *, complete=False) -> dict[str, bool]:
     result = {}
     for key, value in CHECK_PATTERN.findall(output):
@@ -96,6 +416,7 @@ def diagnostics(output: str, *, include_native=True) -> dict[str, str]:
         result["failure"] = failures[-1]
     if include_native and (native := native_stages(output)):
         result["native_stage"] = native[-1]
+    result.update(sender_diagnostics(output))
     return result
 
 
@@ -232,6 +553,7 @@ class Runner:
         self.stage = "configuration"
         self.sequence = 0
         self.children = []
+        self.sender_diagnostic = {}
         self.root_identity = Child.file_identity(self.root.stat())[:-1]
 
     def mark(self, value):
@@ -358,10 +680,11 @@ class Runner:
             os.close(fd)
         return sorted(snapshots)
 
-    def scan(self, native=None):
+    def scan(self, native=None, browser=None):
         if any(child.joined is not True for child in self.children):
             raise RuntimeError("fixture_operation")
-        if native is not None and not any(child is native for child in self.children):
+        if (native is not None and native is browser
+                or any(child is not None and not any(owner is child for owner in self.children) for child in (native, browser))):
             raise RuntimeError("log_scan")
         try:
             snapshots = self.log_snapshots()
@@ -377,6 +700,16 @@ class Runner:
             raise RuntimeError("log_scan") from None
         if result.returncode:
             raise RuntimeError("log_scan")
+        if browser is not None:
+            browser_name = browser.log.relative_to(self.root).as_posix()
+            browser_output = next((data for name, data in snapshots if name == browser_name), b"")
+            clean, records, window = console_window(browser_output)
+            self.sender_diagnostic = sender_observation(records, native_output, clean, window)
+            # Console text is never fed to acceptance/stage parsers, even if it
+            # contains an exact forged success marker. Scan used the RAW bytes.
+            combined = b"\n".join(clean if name == browser_name else data for name, data in snapshots)
+        elif CONSOLE_FRAME in combined or CONSOLE_START in combined:
+            raise RuntimeError("evidence")
         return (combined.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n"),
                 native_output.decode(errors="replace").replace("\r\n", "\n").replace("\r", "\n"))
 
@@ -394,7 +727,8 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     runner = Runner(root, gitleaks)
     failure = None
     failed_stage = "configuration"
-    native = None
+    native = browser = None
+    sender = {}
     peers_complete = False
     children_joined = False
     cleanup_failure = None
@@ -450,7 +784,8 @@ def execute(root: Path, fixture: Path, gitleaks: str):
     try:
         if not children_joined or cleanup_failure is not None:
             raise RuntimeError("fixture_operation")
-        output, native_output = runner.scan(native)
+        output, native_output = runner.scan(native, browser)
+        sender = runner.sender_diagnostic
         # This is the exact native log snapshot included in the successful
         # scan, inspected only after owned group teardown and actual waits.
         if peers_complete and children_joined and not exact_native_pass(native_output):
@@ -459,18 +794,20 @@ def execute(root: Path, fixture: Path, gitleaks: str):
         facts = evidence(output, complete=not failure)
     except RuntimeError as error:
         failure = str(error)
-        output, native_output, facts = "", "", {}
+        output, native_output, facts, sender = "", "", {}, {}
     finally:
         try:
             runner.release_log_anchors()
         except BaseException:
             failure = "fixture_operation"
-            output, native_output, facts = "", "", {}
+            output, native_output, facts, sender = "", "", {}, {}
     for key, value in sorted(facts.items()):
         print(f"MORPHEUS_ELEMENT_CHECK {key}={str(value).lower()}", flush=True)
     if children_joined and cleanup_failure is None:
         for value in native_stages(native_output):
             print(NATIVE_STAGE_PREFIX + value, flush=True)
+    if failure and sender:
+        print(SENDER_PREFIX + " ".join(key + "=" + sender[key] for key in SENDER_FIELDS), flush=True)
     # Cleanup is required but must not erase the last useful failure stage.
     diagnostic_output = output.replace("MORPHEUS_ELEMENT_STAGE element_cleanup\n", "")
     if found := diagnostics(diagnostic_output, include_native=False):

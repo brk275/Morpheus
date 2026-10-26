@@ -2,7 +2,7 @@
 // Observe the stock official Element Call image. No RTC refresh, membership
 // injection, SDK patch, or getUserMedia replacement belongs in this harness.
 // Cross-signing bootstraps only the disposable account's real SDK identity.
-import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -24,6 +24,8 @@ async function poll(callback, message, milliseconds = 90_000) {
   throw new Error(message);
 }
 
+// Child logs receive fixture-owned fixed markers and bounded public-identity
+// receipts. The stock browser/SDK console stays outside this optional observer.
 async function main() {
   // Even an inherited diagnostic flag invalidates stock-client evidence.
   if (process.env.MORPHEUS_ELEMENT_DIAG_REFRESH !== undefined)
@@ -391,7 +393,75 @@ async function main() {
     }), "Initial exact-sender media key not observed");
     writeFileSync(join(root, "browser-observed"), "observed\n", { mode: 0o600, flag: "wx" });
     mark("browser_group_roster");
-    await poll(() => existsSync(join(root, "group-ready")), "Late peer did not become ready", 150_000);
+    let deviceSamples = 0;
+    let lastDeviceSample = 0;
+    const observeDevice = async () => {
+      if (deviceSamples >= 8 || Date.now() - lastDeviceSample < 5_000 ||
+          !existsSync(join(root, "sender-device-ready"))) return;
+      deviceSamples++;
+      lastDeviceSample = Date.now();
+      let binding;
+      let descriptor;
+      try {
+        const parent = lstatSync(root, { bigint: true });
+        if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== BigInt(process.getuid()) ||
+            (parent.mode & 0o077n) !== 0n) return;
+        descriptor = openSync(join(root, "sender-device.json"),
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        const before = fstatSync(descriptor, { bigint: true });
+        if (!before.isFile() || before.uid !== parent.uid || before.nlink !== 1n ||
+            (before.mode & 0o777n) !== 0o600n || before.size <= 0n || before.size > 8_192n) return;
+        const bytes = Buffer.alloc(Number(before.size) + 1);
+        let size = 0;
+        while (size < bytes.length) {
+          const read = readSync(descriptor, bytes, size, bytes.length - size, null);
+          if (!read) break;
+          size += read;
+        }
+        const after = fstatSync(descriptor, { bigint: true });
+        const named = lstatSync(join(root, "sender-device.json"), { bigint: true });
+        const currentParent = lstatSync(root, { bigint: true });
+        const keys = ["dev", "ino", "uid", "gid", "mode", "nlink", "size", "mtimeNs", "ctimeNs"];
+        if (size !== Number(before.size) || keys.some((key) => before[key] !== after[key] || before[key] !== named[key]) ||
+            ["dev", "ino", "uid", "gid", "mode"].some((key) => parent[key] !== currentParent[key])) return;
+        binding = JSON.parse(bytes.subarray(0, size).toString("utf8"));
+        if (Object.keys(binding).sort().join(",") !== "carol,carol_curve,carol_device,room_id" ||
+            binding.room_id !== roomId || binding.carol !== late.user_id ||
+            ![binding.carol_device, binding.carol_curve].every((value) =>
+              typeof value === "string" && value.length > 0 && value.length <= 128)) return;
+      } catch { return; }
+      finally { if (descriptor !== undefined) closeSync(descriptor); }
+      // This API reads tracked device data; false forbids its HTTP-download
+      // branch. It does not prepare encryption, refresh, share, or export keys.
+      // A timed-out read remains owned by the original browser until teardown.
+      let timer;
+      try {
+        const result = await Promise.race([
+          page.evaluate(async (binding) => {
+            const client = window.matrixclient;
+            const crypto = client?.getCrypto();
+            const user = client?.getUserId();
+            const device = client?.getDeviceId();
+            if (!crypto || !user || !device) return null;
+            const devices = await crypto.getUserDeviceInfo([binding.carol], false);
+            const known = devices.get(binding.carol)?.get(binding.carol_device);
+            if (window.matrixclient !== client || client.getUserId() !== user || client.getDeviceId() !== device) return null;
+            return { bob: user, bob_device: device, known_user: known?.userId ?? "unknown",
+              known_device: known?.deviceId ?? "unknown", known_curve: known?.getIdentityKey() ?? "unknown" };
+          }, binding),
+          new Promise((resolve) => { timer = setTimeout(() => resolve(null), 3_000); }),
+        ]);
+        if (result?.bob === account.user_id &&
+            [result.bob_device, result.known_user, result.known_device, result.known_curve].every((value) =>
+              typeof value === "string" && value.length > 0 && value.length <= 1_024))
+          console.log("MORPHEUS_ELEMENT_DEVICE_PRIVATE " + JSON.stringify({ ...binding, ...result, sample: String(deviceSamples) }));
+      } catch { /* A missing observation is UNKNOWN, never a negative device verdict. */ }
+      finally { clearTimeout(timer); }
+    };
+    await poll(async () => {
+      await observeDevice();
+      return existsSync(join(root, "group-ready"));
+    }, "Late peer did not become ready", 150_000);
     const groupOwner = readOwner("group-audio-owner.json", late.user_id);
     const screenOwner = readOwner("screen-owner.json", native.user_id, true);
     const microphoneSid = readFileSync(join(root, "native-microphone-sid"));
@@ -533,7 +603,9 @@ async function main() {
           delete window.__morpheusInteropKeys;
         }
       });
-    } finally { await browser.close(); }
+    } finally {
+      await browser.close();
+    }
   }
 }
 
