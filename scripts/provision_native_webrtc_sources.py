@@ -1309,6 +1309,401 @@ def provision(args: argparse.Namespace) -> None:
     print('{"native_source_provision":"git_source_set_complete"}', flush=True)
 
 
+ASSEMBLY_SOURCE_SHA = "015b2a29e115a67e476f12d811ce7820272e375501aac68c8358d03084031eec"
+ASSEMBLY_SOURCE_BINDING_SHA = "2cc264be43fc31a0a41727b51021fd4516a5032775bc03fcdb93183959caa1af"
+ASSEMBLY_INSTRUMENTED_SHA = "58c780cbfb2390e2707719b0b4cf7f2d6c43093e7f6616ea816b154c40bd111b"
+ASSEMBLY_INSTRUMENTED_BINDING_SHA = "24a20a3f959238df7dd45c03690c21f0b0f5c7fd867b6a8b742b6b1c901364f3"
+ASSEMBLY_INSTRUMENTED_STAGER_SHA = "2cad3ea4fe91dd1f067829b8450da61945b18c3540979b4184c4b3afb36a2d54"
+ASSEMBLY_CONSUMER_BINDING_SHA = "b81677e4e5a148d54e9eded6d05b7d47094d7feabb0f4e9392d44fc9fcd0bd34"
+ASSEMBLY_PREFIX = "third_party/instrumented_libs/binaries"
+
+
+def assembly_layout(files: dict, directories: set) -> None:
+    need(type(files) is dict and type(directories) is set and "." in directories,
+         "assembly_inventory")
+    need(0 < len(files) and len(files) + len(directories) <= MAX_FILES, "resource")
+    need(sum(row["bytes"] for row in files.values()) <= MAX_BYTES, "resource")
+    names = {}
+    for name in [*files, *sorted(directories - {"."})]:
+        rel(name)
+        need(name.casefold() not in names, "assembly_collision")
+        names[name.casefold()] = name
+    for name, row in files.items():
+        need(set(row) == {"path", "bytes", "sha256", "mode"} and row["path"] == name
+             and type(row["bytes"]) is int and 0 <= row["bytes"] <= MAX_BYTES
+             and type(row["sha256"]) is str and SHA.fullmatch(row["sha256"])
+             and type(row["mode"]) is int
+             and row["mode"] in (0o400, 0o444, 0o500, 0o555, 0o600, 0o644, 0o700, 0o755),
+             "assembly_inventory")
+    for name in names.values():
+        need(all(str(parent) in directories for parent in PurePosixPath(name).parents),
+             "assembly_inventory")
+
+
+def assembly_tree(root: Path, files: dict, directories: set, destination: Path | None = None) -> None:
+    # Only original regular files and exact private empty directories are copied.
+    # Never follow links, infer a checkout, or execute any source/tool.
+    assembly_layout(files, directories)
+    seen_files, seen_dirs = set(), set()
+    def walk_error(_error: OSError) -> None:
+        # Missing topology cannot be treated as a successfully verified tree.
+        raise Refusal("assembly_walk") from None
+    for directory, children, names in os.walk(root, followlinks=False, onerror=walk_error):
+        current = Path(directory)
+        info = no_link(current)
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+             and stat.S_IMODE(info.st_mode) == 0o700, "assembly_private")
+        relative = current.relative_to(root).as_posix()
+        need(relative in directories, "assembly_unbound")
+        seen_dirs.add(relative)
+        for child in children:
+            child_path = current / child
+            child_info = no_link(child_path)
+            need(child_path.relative_to(root).as_posix() in directories, "assembly_unbound")
+            need(stat.S_ISDIR(child_info.st_mode) and child_info.st_uid == os.geteuid()
+                 and stat.S_IMODE(child_info.st_mode) == 0o700, "assembly_private")
+        for name in names:
+            relative = (current / name).relative_to(root).as_posix()
+            need(relative in files, "assembly_unbound")
+            seen_files.add(relative)
+    need(seen_files == set(files) and seen_dirs == directories, "assembly_unbound")
+    if destination is not None:
+        for name in sorted(directories - {"."}, key=lambda name: (name.count("/"), name)):
+            private_directory(destination / name)
+    identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mode, st.st_uid,
+                           st.st_nlink, st.st_mtime_ns, st.st_ctime_ns)
+    for name, row in sorted(files.items()):
+        path = root / name
+        before = no_link(path)
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+             and before.st_uid == os.geteuid() and before.st_size == row["bytes"]
+             and stat.S_IMODE(before.st_mode) == row["mode"], "assembly_identity")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        output = None
+        try:
+            need(identity(os.fstat(fd)) == identity(before), "assembly_identity")
+            if destination is not None:
+                output = private_file(destination / name)
+            value, count = hashlib.sha256(), 0
+            while True:
+                block = os.read(fd, IO_CHUNK)
+                if not block:
+                    break
+                count += len(block)
+                need(count <= row["bytes"], "assembly_identity")
+                value.update(block)
+                if output is not None:
+                    output.write(block)
+            need(count == row["bytes"] and value.hexdigest() == row["sha256"]
+                 and identity(before) == identity(os.fstat(fd)) == identity(no_link(path)),
+                 "assembly_identity")
+            if output is not None:
+                output.flush()
+                os.fchmod(output.fileno(), row["mode"])
+                os.fsync(output.fileno())
+        finally:
+            if output is not None:
+                output.close()
+            os.close(fd)
+
+
+def assembly_instrumented(spec: dict, runner: Path) -> tuple[Path, dict, set, list, dict]:
+    need(set(spec) == {"root", "plan", "materials", "core_manifest"}, "assembly_profile")
+    root = absolute(spec["root"])
+    need(root.parent == runner and re.fullmatch(r"morpheus-webrtc-tools-[0-9a-f]{16}", root.name),
+         "assembly_profile")
+    fixed = {"plan": "selected-instrumented-inputs.json", "materials": "tool-materials.json",
+             "core_manifest": "selected-tool-manifest.json"}
+    for key, name in fixed.items():
+        need(set(spec[key]) == {"path", "sha256"} and spec[key]["path"] == name,
+             "assembly_profile")
+    need(spec["plan"]["sha256"] == ASSEMBLY_INSTRUMENTED_SHA, "assembly_profile")
+    plan, _ = bound_json(root / fixed["plan"], ASSEMBLY_INSTRUMENTED_SHA)
+    material, _ = bound_json(root / fixed["materials"], spec["materials"]["sha256"])
+    core = read(root / fixed["core_manifest"], MAX_PLAN)
+    need(sha(core) == spec["core_manifest"]["sha256"] == material["manifest_sha256"],
+         "assembly_profile")
+    need(plan["schema"] == "morpheus-native-linux-instrumented-inputs-v1"
+         and plan["baseline"] == NATIVE_REV and plan["tree"] == NATIVE_TREE
+         and plan["target"] == "Linuxx64"
+         and plan["root_eight_security_plan_sha256"] == SECURITY_PLAN_SHA,
+         "assembly_profile")
+    tools = plan["materials"]
+    need([tool["name"] for tool in tools] == ["msan-chained-origins-noble-lib",
+                                            "msan-no-origins-noble-lib"], "assembly_profile")
+    need(material["schema"] == 4 and material["status"] == "instrumented_library_data_staged"
+         and material["instrumented_inputs_sha256"] == ASSEMBLY_INSTRUMENTED_SHA
+         and material["target"] == "Linuxx64" and material["baseline"] == NATIVE_REV
+         and material["materials"] == tools and material["executed_tools"] == []
+         and material["normalization"] == "exact_gzip_library_alias_regular_copies_no_filesystem_links"
+         and material["permission_model"] == "unix_private_directories_0700_files_0600_or_0700"
+         and "python_inputs_sha256" not in material and "linux_inputs_sha256" not in material,
+         "assembly_profile")
+    need(all(material[key] is False for key in ("environment_complete", "native_sources_complete",
+         "compiler_cipd_runtime_closure", "build_ready", "distribution_ready", "hooks_executed")),
+         "assembly_profile")
+    files, directories, overlay, archives = {}, {"."}, [], []
+    def entry(name: str, size: int, digest: str, mode: int) -> None:
+        rel(name)
+        need(name not in files, "assembly_collision")
+        files[name] = {"path": name, "bytes": size, "sha256": digest, "mode": mode}
+        directories.update(str(parent) for parent in PurePosixPath(name).parents)
+    for tool in tools:
+        entry("archives/" + tool["name"] + ".tar.gz", tool["bytes"], tool["sha256"], 0o600)
+        for name in tool["implicit_directories"]:
+            directories.add("instrumented-inputs/" + rel(name))
+        for member in tool["members"]:
+            name = "instrumented-inputs/" + rel(member["raw_path"])
+            if member["kind"] == "directory":
+                directories.add(name)
+                directories.update(str(parent) for parent in PurePosixPath(name).parents)
+            elif member["kind"] == "regular":
+                mode = 0o700 if member["mode"] & 0o111 else 0o600
+                entry(name, member["bytes"], member["sha256"], mode)
+                overlay.append({"path": ASSEMBLY_PREFIX + "/" + member["raw_path"], "type": "file",
+                                "mode": "100755" if mode == 0o700 else "100644",
+                                "bytes": member["bytes"], "sha256": member["sha256"]})
+            else:
+                need(member["kind"] == "symlink", "assembly_profile")
+        for alias in tool["alias_copies"]:
+            entry("instrumented-inputs/" + alias["destination"], alias["bytes"], alias["sha256"], alias["output_mode"])
+            overlay.append({"path": ASSEMBLY_PREFIX + "/" + alias["destination"], "type": "file",
+                            "mode": "100755" if alias["output_mode"] == 0o700 else "100644",
+                            "bytes": alias["bytes"], "sha256": alias["sha256"]})
+        archives.append({key: tool[key] for key in ("name", "sha256", "bytes", "members",
+                         "alias_copies", "omitted_aliases", "omission_evidence")})
+    need(material["archives"] == archives and len(overlay) == 2584, "assembly_profile")
+    for name in fixed.values():
+        data = read(root / name, MAX_PLAN)
+        entry(name, len(data), sha(data), 0o600)
+    assembly_tree(root, files, directories)
+    return root, files, directories, sorted(overlay, key=lambda row: row["path"]), {
+        "producer_binding_sha256": ASSEMBLY_INSTRUMENTED_BINDING_SHA,
+        "producer_source_sha256": ASSEMBLY_INSTRUMENTED_STAGER_SHA,
+        "plan_sha256": ASSEMBLY_INSTRUMENTED_SHA,
+        "materials_sha256": spec["materials"]["sha256"],
+        "core_manifest_sha256": spec["core_manifest"]["sha256"]}
+
+
+def assemble_instrumented(args: argparse.Namespace) -> None:
+    need(os.name == "posix" and sys.platform == "linux" and os.uname().machine == "x86_64"
+         and os.environ.get("GITHUB_ACTIONS") == "true"
+         and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+         and os.environ.get("RUNNER_OS") == "Linux" and os.environ.get("RUNNER_ARCH") == "X64",
+         "runner")
+    runner = absolute(os.environ["RUNNER_TEMP"])
+    path = absolute(args.plan)
+    need(path.is_relative_to(runner), "runner")
+    plan, _ = bound_json(path, args.plan_sha256)
+    need(set(plan) == {"schema", "purpose", "target", "recipe_sha256", "public_repository",
+         "standard_hosted_runner", "repository", "run_id", "run_attempt", "job", "source", "instrumented"}
+         and plan["schema"] == "morpheus-native-instrumented-assembly-plan-v1"
+         and plan["purpose"] == "assemble_verified_native_instrumented_source_only"
+         and plan["target"] == "linux-x64" and plan["public_repository"] is True
+         and plan["standard_hosted_runner"] is True
+         and plan["repository"] == os.environ.get("GITHUB_REPOSITORY") == "brk275/Morpheus",
+         "assembly_plan")
+    for key, env in (("run_id", "GITHUB_RUN_ID"), ("run_attempt", "GITHUB_RUN_ATTEMPT"), ("job", "GITHUB_JOB")):
+        need(type(plan[key]) is str and bool(plan[key]) and plan[key] == os.environ.get(env), "runner")
+    need(sha(read(absolute(__file__), MAX_BLOB)) == plan["recipe_sha256"], "assembly_plan")
+    source = plan["source"]
+    need(set(source) == {"root", "inventory", "producer_source_sha256", "producer_binding_sha256"}
+         and source["producer_source_sha256"] == ASSEMBLY_SOURCE_SHA
+         and source["producer_binding_sha256"] == ASSEMBLY_SOURCE_BINDING_SHA, "assembly_plan")
+    original = absolute(source["root"])
+    inventory_ref = source["inventory"]
+    need(set(inventory_ref) == {"path", "sha256"}, "assembly_plan")
+    original_inventory = absolute(inventory_ref["path"])
+    need(original.is_relative_to(runner) and original != runner
+         and original_inventory.is_relative_to(runner) and not original_inventory.is_relative_to(original),
+         "assembly_plan")
+    inputs, _ = bound_json(original_inventory, inventory_ref["sha256"])
+    need(set(inputs) == {"schema", "files", "directories"}
+         and inputs["schema"] == "morpheus-native-provision-tree-inventory-v1"
+         and type(inputs["files"]) is list and type(inputs["directories"]) is list,
+         "assembly_inventory")
+    files = {row["path"]: row for row in inputs["files"]}
+    directories = set(inputs["directories"])
+    need(len(files) == len(inputs["files"]) and len(directories) == len(inputs["directories"]),
+         "assembly_inventory")
+    assembly_layout(files, directories)
+    data_root, data_files, data_dirs, overlay, material = assembly_instrumented(plan["instrumented"], runner)
+    root = Path(args.output_root)
+    need(root.is_absolute() and absolute(str(root.parent)) == runner
+         and re.fullmatch(r"morpheus-webrtc-assembled-[0-9a-f]{16}", root.name)
+         and not os.path.lexists(root), "runner")
+    for left, right in ((original, data_root), (original, root), (data_root, root)):
+        need(not left.is_relative_to(right) and not right.is_relative_to(left), "assembly_roots")
+    assembly_tree(original, files, directories)
+    def original_json(name: str) -> object:
+        need(name in files, "assembly_original")
+        data = read(original / name, MAX_PLAN)
+        need(sha(data) == files[name]["sha256"], "assembly_original")
+        return json.loads(data, object_pairs_hook=pairs)
+    receipt = original_json("source-provision-receipt.json")
+    materials = original_json("materials/source-materials.json")
+    source_plan = original_json("materials/plan.json")
+    need(receipt["schema"] == "morpheus-native-webrtc-source-provision-v1"
+         and materials["schema"] == "morpheus-native-webrtc-git-materials-v1"
+         and materials["target"] == source_plan["target"] == "linux-x64"
+         and source_plan["schema"] == "morpheus-native-webrtc-sources-v2"
+         and receipt["materials_sha256"] == files["materials/source-materials.json"]["sha256"]
+         and receipt["plan_sha256"] == materials["plan_sha256"] == files["materials/plan.json"]["sha256"]
+         and materials["security_plan_sha256"] == SECURITY_PLAN_SHA
+         and materials["native_revision"] == NATIVE_REV and materials["native_tree"] == NATIVE_TREE
+         and materials["outer_depot_revision"] == OUTER_REV and materials["nested_depot_revision"] == NESTED_REV
+         and materials["selected_git_source_set_verified"] is True, "assembly_original")
+    need(all(receipt[key] is False and materials[key] is False for key in
+             ("native_sources_complete", "build_ready", "distribution_ready"))
+         and materials["compiler_cipd_runtime_closure"] is False and materials["hooks_executed"] is False,
+         "assembly_original")
+    names = {"typed_source_files": "materials/post-patch-source-inventory.json",
+             "typed_outer_files": "materials/outer-depot-inventory.json",
+             "repositories": "materials/repositories.json", "gitlinks": "materials/gitlinks.json"}
+    values = {}
+    for key, name in names.items():
+        fact = materials["manifests"][key]
+        need(fact == {"bytes": files[name]["bytes"], "sha256": files[name]["sha256"]}, "assembly_original")
+        values[key] = original_json(name)
+    specs = {row["mount"]: row for row in source_plan["repositories"]}
+    need(len(specs) == len(source_plan["repositories"])
+         and {row["mount"] for row in values["repositories"]} == set(specs), "assembly_original")
+    need(specs.get("src") == {"mount": "src", "url": NATIVE_URL, "revision": NATIVE_REV, "tree": NATIVE_TREE}
+         and specs.get("outer-depot") == {"mount": "outer-depot", "url": DEPOT_URL,
+                                         "revision": OUTER_REV, "tree": OUTER_TREE}
+         and specs.get("src/third_party/depot_tools", {}).get("revision") == NESTED_REV,
+         "assembly_original")
+    policy = gitlink_policy(source_plan["gitlinks"], specs)
+    links, link_paths = [], set()
+    for repo in values["repositories"]:
+        need(all(repo[key] == specs[repo["mount"]][key] for key in ("mount", "url", "revision", "tree")),
+             "assembly_original")
+        for link in repo["gitlinks"]:
+            declaration = policy["entries"].get(link["exported_path"])
+            need(declaration is not None and declaration["mount"] == repo["mount"]
+                 and link["exported_path"] not in link_paths and link == {**declaration,
+                 "repository_revision": repo["revision"], "repository_tree": repo["tree"],
+                 "exported_path": declaration["mount"] + "/" + declaration["path"],
+                 "materialized_type": "directory", "materialized_empty": True,
+                 "source_present": False, "submodule_initialized": False}, "assembly_original")
+            links.append(link)
+            link_paths.add(link["exported_path"])
+    need(link_paths == set(policy["entries"])
+         and sorted(links, key=lambda row: row["exported_path"]) == values["gitlinks"]
+         and len(links) == len(policy["entries"]) == materials["uninitialized_gitlinks"]
+         == receipt["uninitialized_gitlinks"]
+         and materials["submodule_sources_materialized"] is False
+         and receipt["submodule_sources_materialized"] is False, "assembly_original")
+    verify_gitlinks(original / "checkout", policy["entries"])
+    checkout_files = {}
+    for key, prefix in (("typed_source_files", "checkout/src/"), ("typed_outer_files", "checkout/outer-depot/")):
+        for row in values[key]:
+            name = prefix + rel(row["path"])
+            need(set(row) == {"path", "type", "mode", "bytes", "sha256"} and row["type"] == "file"
+                 and row["mode"] in ("100644", "100755") and name not in checkout_files
+                 and files[name] == {"path": name, "bytes": row["bytes"], "sha256": row["sha256"],
+                                      "mode": int(row["mode"], 8) & 0o777}, "assembly_original")
+            outside_gitlinks(name.removeprefix("checkout/"), policy)
+            checkout_files[name] = files[name]
+    need(set(checkout_files) == {name for name in files if name.startswith("checkout/")}, "assembly_original")
+    combined, combined_dirs = dict(files), set(directories)
+    for row in overlay:
+        name = "checkout/src/" + rel(row["path"])
+        outside_gitlinks("src/" + row["path"], policy)
+        need(name not in combined, "assembly_overwrite")
+        combined[name] = {"path": name, "bytes": row["bytes"], "sha256": row["sha256"],
+                          "mode": int(row["mode"], 8) & 0o777}
+        combined_dirs.update(str(parent) for parent in PurePosixPath(name).parents)
+    assembly_layout(combined, combined_dirs)
+    for name in ("materials/instrumented-source-overlay.json", "materials/instrumented-assembly-receipt.json"):
+        need(name not in combined and name not in combined_dirs, "assembly_overwrite")
+    private_directory(root)
+    private_directory(root / "provision")
+    private_directory(root / "handoff")
+    output = root / "provision"
+    assembly_tree(original, files, directories, output)
+    for name in sorted(combined_dirs - directories, key=lambda name: (name.count("/"), name)):
+        private_directory(output / name)
+    for row in overlay:
+        raw = row["path"].removeprefix(ASSEMBLY_PREFIX + "/")
+        origin = "instrumented-inputs/" + raw
+        target = "checkout/src/" + row["path"]
+        need(data_files[origin]["bytes"] == row["bytes"] and data_files[origin]["sha256"] == row["sha256"],
+             "assembly_profile")
+        # Reuse the same bounded verified regular-file copying path for one
+        # approved material. Its final source mode differs only by read bits.
+        stage = output / target
+        fd = os.open(data_root / origin, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            before = os.fstat(fd)
+            need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_uid == os.geteuid()
+                 and before.st_size == row["bytes"]
+                 and stat.S_IMODE(before.st_mode) == data_files[origin]["mode"], "assembly_identity")
+            value, count = hashlib.sha256(), 0
+            with private_file(stage) as stream:
+                while True:
+                    block = os.read(fd, IO_CHUNK)
+                    if not block:
+                        break
+                    count += len(block)
+                    need(count <= row["bytes"], "assembly_identity")
+                    value.update(block)
+                    stream.write(block)
+                after = os.fstat(fd)
+                identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mode, st.st_uid,
+                                      st.st_nlink, st.st_mtime_ns, st.st_ctime_ns)
+                need(count == row["bytes"] and value.hexdigest() == row["sha256"]
+                     and identity(before) == identity(after) == identity(no_link(data_root / origin)),
+                     "assembly_identity")
+                stream.flush()
+                os.fchmod(stream.fileno(), int(row["mode"], 8) & 0o777)
+                os.fsync(stream.fileno())
+        finally:
+            os.close(fd)
+    assembly_tree(output, combined, combined_dirs)
+    verify_gitlinks(output / "checkout", policy["entries"])
+    assembly_tree(original, files, directories)
+    assembly_tree(data_root, data_files, data_dirs)
+    overlay_fact = save(output / "materials/instrumented-source-overlay.json", overlay)
+    assembled = {"schema": "morpheus-native-instrumented-source-assembly-v1", "target": "linux-x64",
+        "assembly_plan_sha256": args.plan_sha256, "assembly_recipe_sha256": plan["recipe_sha256"],
+        "original_tree_inventory_sha256": inventory_ref["sha256"],
+        "original_producer_binding_sha256": ASSEMBLY_SOURCE_BINDING_SHA,
+        "original_producer_source_sha256": ASSEMBLY_SOURCE_SHA,
+        "original_source_receipt_sha256": files["source-provision-receipt.json"]["sha256"],
+        "instrumented_data": material, "source_overlay": overlay_fact,
+        "source_projection_files": len(overlay), "source_projection_bytes": sum(row["bytes"] for row in overlay),
+        "gitlink_count": len(links), "submodule_sources_materialized": False,
+        "required_consumer_binding_sha256": ASSEMBLY_CONSUMER_BINDING_SHA,
+        "python_data_bound_here": False, "python_runtime_realized_here": False,
+        "source_git_administrative_metadata_created": False,
+        "hooks_executed": False, "tools_executed": [], "native_sources_complete": False,
+        "compiler_cipd_runtime_closure": False, "build_ready": False, "distribution_ready": False}
+    assembly_fact = save(output / "materials/instrumented-assembly-receipt.json", assembled)
+    for name, fact in (("materials/instrumented-source-overlay.json", overlay_fact),
+                       ("materials/instrumented-assembly-receipt.json", assembly_fact)):
+        combined[name] = {"path": name, **fact, "mode": 0o600}
+    assembly_tree(output, combined, combined_dirs)
+    verify_gitlinks(output / "checkout", policy["entries"])
+    source_rows = sorted(values["typed_source_files"] + overlay, key=lambda row: row["path"])
+    source_fact = save(root / "handoff/assembled-source-inventory.json", source_rows)
+    whole = [{"path": name, "type": "file", "bytes": row["bytes"], "sha256": row["sha256"],
+              **({"mode": "100755" if row["mode"] == 0o755 else "100644"}
+                 if row["mode"] in (0o644, 0o755) else {})} for name, row in sorted(combined.items())]
+    whole_fact = save(root / "handoff/provenance-inventory.json", whole)
+    need(source_fact["bytes"] <= 128 * 1024 * 1024 and whole_fact["bytes"] <= 128 * 1024 * 1024,
+         "assembly_consumer_inventory")
+    verify_gitlinks(output / "checkout", policy["entries"])
+    save(root / "handoff/assembly-result.json", {"schema": "morpheus-native-source-assembly-result-v1",
+        "status": "instrumented_source_assembled_data_only", "provenance_root": "provision",
+        "source_root": "provision/checkout/src", "source_inventory": source_fact,
+        "provenance_inventory": whole_fact, "assembly_receipt": assembly_fact,
+        "source_overlay": overlay_fact, "original42bd_inventories_preserved": True,
+        "native_sources_complete": False, "build_ready": False, "distribution_ready": False,
+        "execution_admission_granted": False})
+    print('{"native_source_assembly":"assembled_data_only","build_ready":false}', flush=True)
+
+
 class FixedParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         # argparse's default error can echo arbitrary argv; never publish it.
@@ -1320,9 +1715,13 @@ def main() -> int:
     parser.add_argument("--plan", required=True)
     parser.add_argument("--plan-sha256", required=True)
     parser.add_argument("--output-root", required=True)
+    parser.add_argument("--assemble-instrumented", action="store_true")
     try:
         args = parser.parse_args()
-        provision(args)
+        if args.assemble_instrumented:
+            assemble_instrumented(args)
+        else:
+            provision(args)
     except Refusal as error:
         record = {"native_source_provision": "refused", "category": error.category}
         if error.dependency and len(error.dependency) <= 1024:

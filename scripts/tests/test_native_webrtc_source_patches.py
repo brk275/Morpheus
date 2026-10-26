@@ -4,6 +4,8 @@ import hashlib
 import importlib.util
 from tempfile import TemporaryDirectory
 import unittest
+import os
+import sys
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "provision_native_webrtc_sources.py"
 _SPEC = importlib.util.spec_from_file_location("morpheus_source_patch_tests", _SCRIPT)
@@ -146,6 +148,88 @@ class GitlinkInputTests(unittest.TestCase):
             marker.symlink_to(target)
             with self.assertRaises(_SOURCE.Refusal):
                 _SOURCE.verify_gitlinks(checkout, policy["entries"])
+
+
+@unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only source assembly")
+class InstrumentedAssemblyTests(unittest.TestCase):
+    def fixture(self, root):
+        source = root / "input"
+        _SOURCE.private_directory(source)
+        directories = {".", "checkout", "checkout/src", "checkout/src/empty-marker",
+                       "objects", "objects/000.git"}
+        for name in sorted(directories - {"."}, key=lambda name: (name.count("/"), name)):
+            _SOURCE.private_directory(source / name)
+        files = {}
+        for name, value, mode in (("checkout/src/example.cc", b"synthetic source only\n", 0o644),
+                                  ("objects/000.git/HEAD", b"synthetic original metadata\n", 0o600)):
+            path = source / name
+            with _SOURCE.private_file(path) as stream:
+                stream.write(value)
+            path.chmod(mode)
+            files[name] = {"path": name, "bytes": len(value), "sha256": hashlib.sha256(value).hexdigest(),
+                           "mode": mode}
+        return source, files, directories
+
+    def test_assembly_copies_actual_bytes_modes_and_empty_directories_without_aliasing(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source, files, directories = self.fixture(root)
+            output = root / "output"
+            _SOURCE.private_directory(output)
+            originals = {name: (source / name).read_bytes() for name in files}
+            _SOURCE.assembly_tree(source, files, directories, output)
+            _SOURCE.assembly_tree(output, files, directories)
+            for name, row in files.items():
+                self.assertEqual((output / name).read_bytes(), originals[name])
+                self.assertEqual((source / name).read_bytes(), originals[name])
+                self.assertEqual((output / name).stat().st_mode & 0o777, row["mode"])
+                self.assertEqual((output / name).stat().st_nlink, 1)
+                self.assertNotEqual((output / name).stat().st_ino, (source / name).stat().st_ino)
+            self.assertEqual(list((output / "checkout/src/empty-marker").iterdir()), [])
+
+    def test_assembly_refuses_links_special_files_unbound_topology_and_changed_identity(self):
+        for kind in ("symlink", "hardlink", "fifo", "changed", "mode", "extra-directory",
+                     "unreadable-directory"):
+            with self.subTest(kind=kind), TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                source, files, directories = self.fixture(root)
+                path = source / "checkout/src/example.cc"
+                if kind == "symlink":
+                    target = root / "outside"
+                    target.write_bytes(path.read_bytes())
+                    path.unlink()
+                    path.symlink_to(target)
+                elif kind == "hardlink":
+                    os.link(path, root / "outside-alias")
+                elif kind == "fifo":
+                    path.unlink()
+                    os.mkfifo(path)
+                elif kind == "changed":
+                    path.write_bytes(b"x" * files["checkout/src/example.cc"]["bytes"])
+                elif kind == "mode":
+                    path.chmod(0o600)
+                else:
+                    _SOURCE.private_directory(source / "unexpected")
+                    if kind == "unreadable-directory":
+                        (source / "unexpected").chmod(0)
+                try:
+                    with self.assertRaises(_SOURCE.Refusal):
+                        _SOURCE.assembly_tree(source, files, directories)
+                finally:
+                    if kind == "unreadable-directory":
+                        (source / "unexpected").chmod(0o700)
+
+    def test_assembly_inventory_refuses_case_prefix_escape_and_unsafe_mode_conflicts(self):
+        row = {"path": "a", "bytes": 0, "sha256": hashlib.sha256(b"").hexdigest(), "mode": 0o600}
+        for files, directories in (
+            ({"a": row, "A": {**row, "path": "A"}}, {"."}),
+            ({"a": row}, {".", "a"}),
+            ({"../escape": {**row, "path": "../escape"}}, {".", ".."}),
+            ({"a": {**row, "mode": 0o777}}, {"."}),
+        ):
+            with self.subTest(files=files):
+                with self.assertRaises(_SOURCE.Refusal):
+                    _SOURCE.assembly_layout(files, directories)
 
 
 if __name__ == "__main__":
