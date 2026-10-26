@@ -461,11 +461,16 @@ class WindowsNativeInputsTests(unittest.TestCase):
         runtime_profile = {"materials": [{"role": "rust", "source_mount": "third_party/rust-toolchain",
             "tool": {"members": [executable]}}]}
         emitted = []
+        normalizer = mock.Mock()
+        normalizer.verify_source_aliases.return_value = []
         with mock.patch.object(TARGET, "tree_files", return_value=[]), \
                 mock.patch.object(TARGET, "load_unbound", return_value=[]), \
+                mock.patch.object(TARGET, "fixed_module", return_value=normalizer) as module, \
                 mock.patch.object(TARGET, "register_parent"), mock.patch.object(TARGET, "copy_file") as copy, \
                 mock.patch.object(TARGET, "write_json", side_effect=lambda owner, path, rows: emitted.extend(rows)):
             TARGET.project(owner, source, core, core_manifest, runtime, runtime_profile)
+        module.assert_called_once_with("git_source_stager.py", TARGET.HELPERS["git_source_stager.py"])
+        self.assertEqual(normalizer.verify_source_aliases.call_args_list, [mock.call(source), mock.call(source)])
         self.assertEqual(copy.call_count, 2)
         self.assertEqual([row["mode"] for row in emitted], ["100644", "100755"])
         self.assertEqual(builder.typed_files(emitted), [
