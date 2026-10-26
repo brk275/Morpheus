@@ -3563,6 +3563,110 @@ class ScopedContinuationTests(unittest.TestCase):
             self.assertEqual(run.call_count, 2)
             self.assertTrue(run.call_args.kwargs["cleanup"])
 
+    def test_element_inner_scan_fatal_context_requires_outer_scan_and_cleanup(self):
+        stage_line = "MORPHEUS_ELEMENT_STAGE native_test\n"
+        failure_line = "MORPHEUS_ELEMENT_FAILURE log_scan\n"
+        ordinary = (stage_line + "MORPHEUS_ELEMENT_STAGE private_browser_device_session\n"
+                    "MORPHEUS_ELEMENT_NATIVE_STAGE group_roster\n"
+                    "MORPHEUS_ELEMENT_CHECK native_group_roster=true\n"
+                    "MORPHEUS_ELEMENT_SENDER capture=unknown\n"
+                    "private-browser-http-device-session-body\n" + failure_line)
+        # The 4096-character tail starts at the marker-shaped suffix of a
+        # private line. It is not a real stage header in the complete log.
+        partial = ("private-line-prefix" + stage_line
+                   + "p" * (4096 - len(stage_line) - len(failure_line) - 1) + "\n" + failure_line)
+        outputs = ((ordinary, "native_test"), ("private-prefix\n" * 400 + ordinary, "native_test"),
+                   (partial, None))
+        for output, expected_stage in outputs:
+            for scan_code, cleanup_error in ((0, None), (1, None), (0, RuntimeError("private owner"))):
+                with self.subTest(stage=expected_stage, scan=scan_code, cleanup=cleanup_error is not None), tempfile.TemporaryDirectory() as folder:
+                    runner = Acceptance(Path(folder), "scanner")
+                    with self.contained_child(runner, output, scanner_code=scan_code,
+                                              cleanup_error=cleanup_error) as (visible, _, _, _, stop, scan):
+                        def scanned_after_stop(*_args, **kwargs):
+                            stop.assert_called_once()
+                            self.assertEqual(kwargs["input"], output)
+                            self.assertNotIn("element_diagnostics", visible.getvalue())
+                            return subprocess.CompletedProcess([], scan_code)
+                        scan.side_effect = scanned_after_stop
+                        with patch.object(acceptance_module, "element_diagnostics",
+                                          side_effect=AssertionError("fatal path must not invoke general parsing")), self.assertRaises(RuntimeError) as caught:
+                            runner.run(acceptance_module.ELEMENT_LABEL, ["peer-test"],
+                                       element_checks=True, pid_namespace=True)
+                    self.assertNotIsInstance(caught.exception, acceptance_module.CheckFailure)
+                    records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                    if scan_code == 0 and cleanup_error is None:
+                        expected = {"failure": "log_scan"}
+                        if expected_stage is not None:
+                            expected["stage"] = expected_stage
+                        self.assertEqual(str(caught.exception), "Element acceptance infrastructure or cleanup failed")
+                        self.assertEqual(records, [{"check": acceptance_module.ELEMENT_LABEL,
+                                                    "element_diagnostics": expected}])
+                    else:
+                        self.assertEqual(records, [])
+                    if cleanup_error is not None:
+                        scan.assert_not_called()
+                    else:
+                        scan.assert_called_once()
+                    self.assertNotIn("private", visible.getvalue())
+                    self.assertNotIn("native_group_roster", visible.getvalue())
+                    self.assertNotIn("sender_", visible.getvalue())
+                    self.assertNotIn("native_stage", visible.getvalue())
+                    self.assertEqual(runner.results, [])
+                    self.assertEqual(runner.failures, [])
+
+    def test_element_inner_fixture_fatal_context_requires_outer_scan_and_cleanup(self):
+        stage_line = "MORPHEUS_ELEMENT_STAGE native_test_build\n"
+        failure_line = "MORPHEUS_ELEMENT_FAILURE fixture_operation\n"
+        ordinary = (stage_line + "MORPHEUS_ELEMENT_STAGE private_browser_device_session\n"
+                    "MORPHEUS_ELEMENT_NATIVE_STAGE group_roster\n"
+                    "MORPHEUS_ELEMENT_CHECK native_group_roster=true\n"
+                    "MORPHEUS_ELEMENT_SENDER capture=unknown\n"
+                    "private-browser-http-device-session-body\n" + failure_line)
+        # The 4096-character tail starts at the marker-shaped suffix of a
+        # private line. It is not a real stage header in the complete log.
+        partial = ("private-line-prefix" + stage_line
+                   + "p" * (4096 - len(stage_line) - len(failure_line) - 1) + "\n" + failure_line)
+        outputs = ((ordinary, "native_test_build"), ("private-prefix\n" * 400 + ordinary, "native_test_build"),
+                   (partial, None))
+        for output, expected_stage in outputs:
+            for scan_code, cleanup_error in ((0, None), (1, None), (0, RuntimeError("private owner"))):
+                with self.subTest(stage=expected_stage, scan=scan_code, cleanup=cleanup_error is not None), tempfile.TemporaryDirectory() as folder:
+                    runner = Acceptance(Path(folder), "scanner")
+                    with self.contained_child(runner, output, scanner_code=scan_code,
+                                              cleanup_error=cleanup_error) as (visible, _, _, _, stop, scan):
+                        def scanned_after_stop(*_args, **kwargs):
+                            stop.assert_called_once()
+                            self.assertEqual(kwargs["input"], output)
+                            self.assertNotIn("element_diagnostics", visible.getvalue())
+                            return subprocess.CompletedProcess([], scan_code)
+                        scan.side_effect = scanned_after_stop
+                        with patch.object(acceptance_module, "element_diagnostics",
+                                          side_effect=AssertionError("fatal path must not invoke general parsing")), self.assertRaises(RuntimeError) as caught:
+                            runner.run(acceptance_module.ELEMENT_LABEL, ["peer-test"],
+                                       element_checks=True, pid_namespace=True)
+                    self.assertNotIsInstance(caught.exception, acceptance_module.CheckFailure)
+                    records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                    if scan_code == 0 and cleanup_error is None:
+                        expected = {"failure": "fixture_operation"}
+                        if expected_stage is not None:
+                            expected["stage"] = expected_stage
+                        self.assertEqual(str(caught.exception), "Element acceptance infrastructure or cleanup failed")
+                        self.assertEqual(records, [{"check": acceptance_module.ELEMENT_LABEL,
+                                                    "element_diagnostics": expected}])
+                    else:
+                        self.assertEqual(records, [])
+                    if cleanup_error is not None:
+                        scan.assert_not_called()
+                    else:
+                        scan.assert_called_once()
+                    self.assertNotIn("private", visible.getvalue())
+                    self.assertNotIn("native_group_roster", visible.getvalue())
+                    self.assertNotIn("sender_", visible.getvalue())
+                    self.assertNotIn("native_stage", visible.getvalue())
+                    self.assertEqual(runner.results, [])
+                    self.assertEqual(runner.failures, [])
+
     def test_inner_scan_and_ring_cleanup_failure_never_become_collectible(self):
         for output, extra in (("MORPHEUS_ELEMENT_STAGE native_test\nMORPHEUS_ELEMENT_FAILURE log_scan\n", {"element_checks": True}),
                               ("running 1 test\nMORPHEUS_RING_CHECK cleanup=false\n", {"ring_case": ("current", "dm")})):

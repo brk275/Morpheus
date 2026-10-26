@@ -25,7 +25,12 @@ import time
 
 from fixture_paths import external_path, private_directory, write_private
 from element_peer_fixture import VERSION as ELEMENT_VERSION, IMAGE_DIGEST as ELEMENT_IMAGE_DIGEST
-from run_element_acceptance import diagnostics as element_diagnostics, evidence as element_evidence
+from run_element_acceptance import (
+    STAGE_PATTERN as ELEMENT_FIXED_STAGE_PATTERN,
+    STAGES as ELEMENT_FIXED_STAGES,
+    diagnostics as element_diagnostics,
+    evidence as element_evidence,
+)
 from matrix_fixture_diagnostics import is_progress_line, matrix_fixture_diagnostics
 from sticker_diagnostics import sticker_diagnostics
 from element_process_namespace import namespace_command, stop_owned, wait_owned
@@ -1405,7 +1410,21 @@ class Acceptance:
         # cleanup ownership. Namespace errors are always infrastructure faults.
         if pid_namespace and "Element process containment failed; raw diagnostics withheld" in output:
             raise RuntimeError("Acceptance process containment failed")
-        if element_checks and re.search(r"^MORPHEUS_ELEMENT_FAILURE (?:log_scan|fixture_operation)$", output, re.MULTILINE):
+        if element_checks and (fatal := re.search(
+                r"^MORPHEUS_ELEMENT_FAILURE (log_scan|fixture_operation)$", output, re.MULTILINE)):
+            # Forward only fixed fatal context after owned cleanup and the outer
+            # scan. Inner scan/ownership failure never publishes facts or raw logs.
+            tail = output[-4096:]
+            if len(output) > len(tail):
+                # The cut may fall inside a private line that only ends with a
+                # marker-shaped suffix. Never promote that suffix to a header.
+                tail = tail.partition("\n")[2]
+            fixed = {}
+            for match in ELEMENT_FIXED_STAGE_PATTERN.finditer(tail):
+                if match[1] in ELEMENT_FIXED_STAGES:
+                    fixed["stage"] = match[1]
+            fixed["failure"] = fatal[1]
+            print(json.dumps({"check": label, "element_diagnostics": fixed}), flush=True)
             raise RuntimeError("Element acceptance infrastructure or cleanup failed")
         if ring_case is not None and (ring_evidence(output).get("cleanup") is False
                                      or ring_diagnostics(output).get("failure") == "cleanup"
