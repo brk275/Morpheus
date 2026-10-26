@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Morpheus modification: preserve plain non-simulcast video encodings without a RID.
+
 use libwebrtc::prelude::*;
 use livekit_protocol as proto;
 
@@ -201,7 +203,15 @@ pub fn compute_video_encodings(
     }
 
     if !options.simulcast {
-        return into_rtp_encodings(width, height, &[initial_preset]);
+        // A plain RTP stream has no simulcast RID. The shared preset helper
+        // assigns `q`, which instead labels a Low simulcast layer and makes
+        // the AddTrack layer metadata disagree with a plain sender.
+        return vec![RtpEncodingParameters {
+            scale_resolution_down_by: Some(1.0),
+            max_bitrate: Some(encoding.max_bitrate),
+            max_framerate: Some(encoding.max_framerate),
+            ..Default::default()
+        }];
     }
 
     let mut simulcast_presets = match options.simulcast_layers {

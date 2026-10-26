@@ -8,7 +8,8 @@
   "recorded_vcs_path": "livekit",
   "official_commit_tree": "a1c62e8b049abc4001a97ee97bfc27aee9b772e9",
   "modified_upstream_files": [
-    "src/room/participant/remote_participant.rs"
+    "src/room/participant/remote_participant.rs",
+    "src/room/options.rs"
   ],
   "additional_files": [
     "Cargo.toml.upstream",
@@ -18,7 +19,8 @@
     "NOTICE",
     "SDK_WORKSPACE_Cargo.toml.upstream",
     "UPSTREAM_FILES.sha256",
-    "src/room/participant/remote_participant.rs.upstream"
+    "src/room/participant/remote_participant.rs.upstream",
+    "src/room/options.rs.upstream"
   ],
   "native_prebuilt_source_attributed": false,
   "license_compliance_verified": false,

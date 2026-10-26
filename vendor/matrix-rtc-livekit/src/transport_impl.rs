@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
+// Morpheus modification: regress the production plain/simulcast encoding contract.
+
 //! [`MediaTransport`] implementation for the MSC4195 LiveKit transport.
 //!
 //! This is where LiveKit stops being visible: everything above this module
@@ -983,4 +985,65 @@ fn copy_plane(
         dst[row * dst_stride..][..width].copy_from_slice(&src[row * src_stride..][..width]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use livekit::options::{
+        TrackPublishOptions, compute_video_encodings, video_layers_from_encodings,
+    };
+    use livekit::prelude::TrackSource;
+
+    #[test]
+    fn plain_video_encoding_matches_full_layer_without_a_simulcast_rid() {
+        // Exercise the production SDK helpers used by publish_track, for the
+        // fixture camera, larger cameras, portrait video and screen sharing.
+        for (width, height, source) in [
+            (320, 180, TrackSource::Camera),
+            (1280, 720, TrackSource::Camera),
+            (720, 1280, TrackSource::Camera),
+            (1920, 1080, TrackSource::Screenshare),
+        ] {
+            let options = TrackPublishOptions {
+                source,
+                simulcast: false,
+                ..Default::default()
+            };
+            let encodings = compute_video_encodings(width, height, &options);
+            assert_eq!(encodings.len(), 1);
+            assert!(encodings[0].rid.is_empty());
+            assert!(encodings[0].active);
+            assert_eq!(encodings[0].scale_resolution_down_by, Some(1.0));
+            assert!(encodings[0].max_bitrate.is_some_and(|value| value > 0));
+            assert!(encodings[0].max_framerate.is_some_and(|value| value > 0.0));
+
+            let layers = video_layers_from_encodings(width, height, &encodings);
+            let full_layer = video_layers_from_encodings(width, height, &[]);
+            assert_eq!(layers.len(), 1);
+            assert_eq!(layers[0].quality, full_layer[0].quality);
+            assert_eq!((layers[0].width, layers[0].height), (width, height));
+        }
+    }
+
+    #[test]
+    fn simulcast_video_retains_distinct_rids_and_advertised_layers() {
+        let options = TrackPublishOptions {
+            source: TrackSource::Camera,
+            simulcast: true,
+            ..Default::default()
+        };
+        let encodings = compute_video_encodings(1280, 720, &options);
+        let layers = video_layers_from_encodings(1280, 720, &encodings);
+        assert_eq!(encodings.len(), 3);
+        assert_eq!(layers.len(), 3);
+        for (index, encoding) in encodings.iter().enumerate() {
+            assert!(!encoding.rid.is_empty());
+            assert!(encodings[..index].iter().all(|old| old.rid != encoding.rid));
+            assert!(
+                layers[..index]
+                    .iter()
+                    .all(|old| old.quality != layers[index].quality)
+            );
+        }
+    }
 }

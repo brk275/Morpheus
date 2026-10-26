@@ -4,8 +4,8 @@ Same-version livekit0.7.48 path patch. Original registry archive SHA256:
 3db88772d10f8ef1ab43a0aa0634a1d4807d0567b65665274af3e084589dbec6.
 Its recorded source is livekit/rust-sdks commit
 af369aae0fe074762ef0a2051529e7ec63045042, path livekit. The original76
-regular archive members are retained;75 are exact. The sole changed runtime
-file has a prominent modification notice and exact .upstream preimage.
+regular archive members are retained;74 are exact. Both changed runtime
+files have prominent modification notices and exact .upstream preimages.
 UPSTREAM_FILES.sha256 always records original archive bytes. Cargo.toml and
 Cargo.toml.orig preserve the normalized and original declarations; an extra
 Cargo.toml.upstream copy and exact upstream workspace manifest are included.
@@ -47,3 +47,20 @@ fix does not prove the historical initial_media failure's cause or a pass.
 No native prebuilt source attribution, license-completeness or distribution
 readiness is claimed. This recreated packet has new identities; lost earlier
 temporary packets are not represented as recovered byte-for-byte evidence.
+
+## Plain video encoding shape
+
+The ordinary `simulcast: false` path now constructs one RTP encoding without
+an RID. Previously it reused the simulcast preset helper, which always gave
+that sole encoding RID `q` and advertised it as a Low simulcast layer. This
+contradicted the transport's existing small-camera plain-stream selection.
+The plain encoding keeps the same bitrate, frame rate, scale and active
+state. Existing layer derivation consequently advertises the one full stream;
+no receiver quality is forced and no additional stream is enabled. Explicit
+SVC/scalability modes and true simulcast paths are unchanged.
+
+The production helper contract is checked through matrix-rtc-livekit library
+tests for small/large/portrait cameras, screen sharing and true simulcast.
+The original encrypted media/recovery case remains the runtime check. The
+historical first-frame failure is not attributed to this defect before that
+case passes. E2EE, timestamps, capture and acceptance requirements are unchanged.
