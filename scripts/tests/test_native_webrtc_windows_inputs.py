@@ -188,7 +188,11 @@ class WindowsNativeInputsTests(unittest.TestCase):
                          {key: record[key] for key in ("bytes", "sha256")})
         profile = json.loads(raw)
         self.assertEqual(len(profile["materials"]), 35)
-        self.assertIsNone(plan["source_profile"])
+        source_record = plan["source_profile"]
+        self.assertEqual(source_record["path"], "native/webrtc/windows/source-profile.json")
+        source_raw = (PATH.parents[1] / source_record["path"]).read_bytes()
+        self.assertEqual({"bytes": len(source_raw), "sha256": hashlib.sha256(source_raw).hexdigest()},
+                         {key: source_record[key] for key in ("bytes", "sha256")})
         self.assertIsNone(plan["build_inputs"])
         self.assertIs(plan["cache_handoff_authorized"], False)
         helper_path = PATH.parent / "native_webrtc/python_stager.py"
