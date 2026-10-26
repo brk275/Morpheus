@@ -1,0 +1,34 @@
+{
+  "baseline": {
+    "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+    "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
+  },
+  "build_ready": false,
+  "cache_restore_enabled": false,
+  "compiler_cipd_runtime_closure": false,
+  "distribution_ready": false,
+  "known_core_archive_target": "Windowsx64",
+  "known_core_manifest_sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341",
+  "microsoft_sdk_redistribution_authorized": false,
+  "native_patch_bytes_and_postimages_unchanged_by_public_binding": true,
+  "native_sources_complete": false,
+  "original_security_plan_sha256": "40734fcb2ce6d85d3a9c6e196f40b080156908f539ea2af4da3bcb865116d153",
+  "public_security_plan_sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080",
+  "public_source_interface_sha256": "bc3d31fd5a9ea468c603847f6b699d24b8f958e5734d75da52913dd3b90ac898",
+  "required_unbound_inputs": [
+    "Fresh Windows2025 Python and Git actual file SHA/bytes/version plus tool/image admission",
+    "Windows-selected complete DEPS literal/Var/condition context, repositories/trees and gitlinks source plan",
+    "Exact Windows SDK/platform5 plus root8 ordered patch manifest with complete pre/postimages",
+    "Windows CPython3.11, vpython, CIPD executable/runtime/wheels archive bytes/instances/member licenses",
+    "Windows Rust toolchain exact revision/archive/member/source/license and source projection",
+    "Genuine Windows CIPD cache/tag resolution and vpython environment realization proof (DATA archive presence is insufficient)",
+    "Host Microsoft VisualStudio/MSVC and WindowsSDK versions/roots/complete inventories/ABI; host-only no redistribution",
+    "Pinned GN generated metadata/Clang revision and license tool resolution proof",
+    "Twelve independent exact recipe/input-bound isolated native build gates and complete inputs-v4 template",
+    "Windows same-version wrapper ABI/symbol-prefix and actual native12/real media/runtime acceptance",
+    "Windows bounded cache DATA intake/exact outer member protocol before cross-job cache handoff; currently disabled"
+  ],
+  "schema": "morpheus-native-windows-required-inputs-v1",
+  "source_of_old_native_binary_claimed": false,
+  "target": "win-x64"
+}

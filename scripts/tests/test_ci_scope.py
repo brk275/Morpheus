@@ -29,6 +29,27 @@ class ScopeTests(unittest.TestCase):
             with self.subTest(shared=shared):
                 self.assertEqual(classify(paths + [shared])["native_matrix"]["os"], list(PLATFORMS))
 
+    def test_manual_windows_native_source_producer_keeps_affected_scope(self):
+        paths = [".github/workflows/native-webrtc-windows-source.yml",
+                 "native/webrtc/windows/pipeline-plan.json",
+                 "native/webrtc/windows/required-inputs.json",
+                 "scripts/build_native_webrtc_windows.py",
+                 "scripts/run_native_webrtc_windows.py",
+                 "scripts/native_webrtc/windows_preflight.ps1",
+                 "scripts/tests/test_native_webrtc_windows_inputs.py"]
+        for selected in ([path] for path in paths):
+            with self.subTest(path=selected[0]):
+                self.assertFalse(classify(selected)["native"])
+        self.assertFalse(classify(paths)["native"])
+        self.assertEqual(classify(paths, force_all=True)["native_matrix"]["os"], list(PLATFORMS))
+        for shared in ("Cargo.lock", "vendor/libwebrtc/src/lib.rs", ".github/workflows/ci.yml",
+                       ".github/workflows/unknown-windows-producer.yml",
+                       "native/webrtc/unknown-platform/input.json", "crates/morpheus-rtc/src/media.rs"):
+            with self.subTest(shared=shared):
+                self.assertEqual(classify(paths + [shared])["native_matrix"]["os"], list(PLATFORMS))
+        self.assertEqual(classify(paths + ["scripts/run_windows_capture_acceptance.py"])
+                         ["native_matrix"]["os"], ["windows-2025"])
+
     def test_matrix_diagnostics_preserve_native_scope_without_unrelated_portal(self):
         reviewed = {"crates/morpheus-matrix/tests/drafts_local.rs",
                     "scripts/run_matrix_acceptance.py", "scripts/tests/test_matrix_acceptance.py"}
