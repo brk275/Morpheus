@@ -6,7 +6,7 @@
     "path": "native/webrtc/linux/selected-tool-manifest.json",
     "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
   },
-  "dispatcher_sha256": "4468ba03a0c9bbf29465f3a13073d34aec497271f42c0498df639e6b5c5fac42",
+  "dispatcher_sha256": "f9cfa589dc267bdccb9c4422ec0445098895b90f42db025a42f2e7196157acd6",
   "minimum_free_bytes": 12884901888,
   "native_test_count": 12,
   "recipe_sha256": "27097b3f4fa2be835c3b5cd984622be4c3fc551571104879077ebeb97a1c1bff",
@@ -17,6 +17,10 @@
   },
   "schema": "morpheus-native-windows-pipeline-v1",
   "security_plan_sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080",
-  "source_profile": null,
+  "source_profile": {
+    "bytes": 3560,
+    "path": "native/webrtc/windows/source-profile.json",
+    "sha256": "5562b30a81c20a886b69f8645f390d026c1d9b7e85eae1044abe343ea9e6d7de"
+  },
   "target": "win-x64"
 }

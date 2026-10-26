@@ -1,0 +1,36 @@
+diff --git a/api/crypto/frame_crypto_transformer.h b/api/crypto/frame_crypto_transformer.h
+index 2d20002788540b3a84fa433c0fff88ddcbfaf82f..a2f62c904c5a768c464c4294f1fe949658224391 100644
+--- a/api/crypto/frame_crypto_transformer.h
++++ b/api/crypto/frame_crypto_transformer.h
+@@ -65,6 +65,8 @@
+         ratchet_window_size(copy.ratchet_window_size),
+         failure_tolerance(copy.failure_tolerance),
+         key_ring_size(copy.key_ring_size),
++        discard_frame_when_cryptor_not_ready(
++            copy.discard_frame_when_cryptor_not_ready),
+         key_derivation_algorithm(copy.key_derivation_algorithm) {}
+ };
+ 
+diff --git a/api/crypto/frame_crypto_transformer_unittest.cc b/api/crypto/frame_crypto_transformer_unittest.cc
+index f74389a5acf8a2507f70cdca297dd82c4162ddf5..6d0ce842397b19e89cffc5c788898395679b0657 100644
+--- a/api/crypto/frame_crypto_transformer_unittest.cc
++++ b/api/crypto/frame_crypto_transformer_unittest.cc
+@@ -306,4 +306,18 @@
+   EXPECT_EQ(observed.pbkdf2_size_records, 1);
+ }
+ 
++TEST(KeyProvider, CopiesPreserveDiscardFrameWhenCryptorNotReady) {
++  KeyProviderOptions original;
++  EXPECT_FALSE(original.discard_frame_when_cryptor_not_ready);
++  for (bool discard : {false, true}) {
++    original.discard_frame_when_cryptor_not_ready = discard;
++    KeyProviderOptions copied(original);
++    KeyProviderOptions copied_again(copied);
++    auto provider = make_ref_counted<DefaultKeyProviderImpl>(copied_again);
++    EXPECT_EQ(copied.discard_frame_when_cryptor_not_ready, discard);
++    EXPECT_EQ(copied_again.discard_frame_when_cryptor_not_ready, discard);
++    EXPECT_EQ(provider->options().discard_frame_when_cryptor_not_ready, discard);
++  }
++}
++
+ }  // namespace webrtc

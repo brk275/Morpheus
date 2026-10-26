@@ -1,0 +1,125 @@
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -752,11 +752,6 @@
+ 
+   auto key_set = key_handler->GetKeySet(key_index);
+ 
+-  webrtc::Buffer iv = webrtc::Buffer(ivLength);
+-  for (size_t i = 0; i < ivLength; i++) {
+-    iv[i] = data_in[data_in.size() - 2 - ivLength + i];
+-  }
+-
+   webrtc::Buffer encrypted_buffer(data_in.size() - unencrypted_bytes);
+   for (size_t i = unencrypted_bytes; i < data_in.size(); i++) {
+     encrypted_buffer[i - unencrypted_bytes] = data_in[i];
+@@ -780,6 +775,13 @@
+   if (encrypted_buffer.size() < minimum_encrypted_size) {
+     reject_malformed();
+     return;
++  }
++
++  // H264/H265 escape the entire encrypted record, including the IV. Read
++  // the IV only from the decoded record after its complete length is checked.
++  webrtc::Buffer iv(ivLength);
++  for (size_t i = 0; i < ivLength; i++) {
++    iv[i] = encrypted_buffer[encrypted_buffer.size() - 2 - ivLength + i];
+   }
+ 
+   webrtc::Buffer encrypted_payload(encrypted_buffer.size() - ivLength - 2);
+--- a/api/crypto/sif_payload_unittest.cc
++++ b/api/crypto/sif_payload_unittest.cc
+@@ -188,12 +188,15 @@
+  public:
+   explicit NativeTransform(MediaType media, bool with_key = false,
+                            bool enabled = true, bool discard = false,
+-                           VideoCodecType codec = VideoCodecType::kVideoCodecVP8)
++                           VideoCodecType codec = VideoCodecType::kVideoCodecVP8,
++                           bool force_escaped_iv = false)
+       : media_(media),
+         signaling_thread_(Thread::Create()),
+         sink_(make_ref_counted<Sink>()),
+         observer_(make_ref_counted<Observer>()) {
+     video_header_.codec = codec;
++    ssrc_ = force_escaped_iv ? 0 : kSsrc;
++    timestamp_ = force_escaped_iv ? 0 : 123456;
+     KeyProviderOptions options;
+     options.shared_key = true;
+     options.discard_frame_when_cryptor_not_ready = discard;
+@@ -213,7 +216,7 @@
+     if (media_ == MediaType::kAudioFrame) {
+       interface_->RegisterTransformedFrameCallback(sink_);
+     } else {
+-      interface_->RegisterTransformedFrameSinkCallback(sink_, kSsrc);
++      interface_->RegisterTransformedFrameSinkCallback(sink_, ssrc_);
+     }
+   }
+ 
+@@ -273,8 +276,8 @@
+                    std::shared_ptr<std::vector<uint8_t>> data,
+                    Direction direction) {
+     ON_CALL(frame, GetDirection()).WillByDefault(Return(direction));
+-    ON_CALL(frame, GetSsrc()).WillByDefault(Return(kSsrc));
+-    ON_CALL(frame, GetTimestamp()).WillByDefault(Return(123456));
++    ON_CALL(frame, GetSsrc()).WillByDefault(Return(ssrc_));
++    ON_CALL(frame, GetTimestamp()).WillByDefault(Return(timestamp_));
+     ON_CALL(frame, GetData()).WillByDefault([data] {
+       return ArrayView<const uint8_t>(*data);
+     });
+@@ -285,6 +288,8 @@
+   }
+ 
+   static constexpr uint32_t kSsrc = 1234;
++  uint32_t ssrc_ = kSsrc;
++  uint32_t timestamp_ = 123456;
+   const std::vector<uint8_t> trailer_ = {'s', 'i', 'f', 0xaa};
+   MediaType media_;
+   bool started_ = false;
+@@ -381,18 +386,24 @@
+ }
+ 
+ TEST(SifTransform, OrdinaryAuthenticatedMediaStillRoundTripsOnBothMediaPaths) {
+-  const std::vector<std::pair<MediaType, VideoCodecType>> cases = {
+-      {MediaType::kAudioFrame, VideoCodecType::kVideoCodecVP8},
+-      {MediaType::kVideoFrame, VideoCodecType::kVideoCodecVP8},
+-      {MediaType::kVideoFrame, VideoCodecType::kVideoCodecH264},
++  struct Case {
++    MediaType media;
++    VideoCodecType codec;
++    bool force_escaped_iv;
++  };
++  const std::vector<Case> cases = {
++      {MediaType::kAudioFrame, VideoCodecType::kVideoCodecVP8, false},
++      {MediaType::kVideoFrame, VideoCodecType::kVideoCodecVP8, false},
++      {MediaType::kVideoFrame, VideoCodecType::kVideoCodecH264, false},
++      {MediaType::kVideoFrame, VideoCodecType::kVideoCodecH264, true},
+   };
+   for (auto entry : cases) {
+-    const auto media = entry.first;
+-    const auto codec = entry.second;
++    const auto media = entry.media;
++    const auto codec = entry.codec;
+     const auto plaintext = codec == VideoCodecType::kVideoCodecH264
+         ? Concat({kStartCode4, kH264Sps, kStartCode4, kH264Pps, kStartCode4, kH264Idr})
+         : kVp8KeyFrame8x8;
+-    NativeTransform sender(media, true, true, false, codec);
++    NativeTransform sender(media, true, true, false, codec, entry.force_escaped_iv);
+     const bool sent = sender.Submit(plaintext, false, Direction::kSender);
+     const bool encrypted = sender.WaitForFrame();
+     const bool sender_retired = sender.WaitForRetirement();
+@@ -405,7 +416,15 @@
+       ADD_FAILURE() << "expected one synthetic encrypted frame";
+       continue;
+     }
+-    NativeTransform receiver(media, true, true, false, codec);
++    if (entry.force_escaped_iv) {
++      // A first frame with zero SSRC/timestamp makes the real sender's IV
++      // contain zero runs. Require actual RBSP escaping before receiving it.
++      const auto& encoded = encrypted_observed.frames.front();
++      const std::vector<uint8_t> escape = {0x00, 0x00, 0x03};
++      EXPECT_NE(std::search(encoded.begin(), encoded.end(),
++                            escape.begin(), escape.end()), encoded.end());
++    }
++    NativeTransform receiver(media, true, true, false, codec, entry.force_escaped_iv);
+     const bool submitted = receiver.Submit(encrypted_observed.frames.front(), false);
+     const bool returned = receiver.WaitForFrame();
+     const bool state_returned = receiver.WaitForState();

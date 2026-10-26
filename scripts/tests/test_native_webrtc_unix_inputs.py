@@ -641,5 +641,162 @@ class NativeUnixOwnedCommandTests(unittest.TestCase):
                 self.assertIsNone(runner.UNRETIRED_COMMAND)
             self.assertEqual(build.commands, [])
 
+
+class NativeMacPreflightDiscoveryTests(unittest.TestCase):
+    def entry_result(self, scenario):
+        # Execute the unchanged entry functions against controlled in-memory
+        # filesystem DATA. No actual Xcode/SDK/host tool is read or executed.
+        script = r"""
+const realFs = require('node:fs');
+const path = require('node:path').posix;
+const crypto = require('node:crypto');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = realFs.readFileSync(process.argv[1], 'utf8');
+const scenario = process.argv[2];
+const bad = '/Applications/Xcode_bad.app', good = '/Applications/Xcode_good.app';
+const sdkRoot = app => app + '/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs';
+const version = app => app + '/Contents/version.plist';
+const metadata = app => sdkRoot(app) + '/MacOSX15.1.sdk/System/Library/CoreServices/SystemVersion.plist';
+const python = '/opt/hostedtoolcache/Python/3.13.7/arm64/bin/python3.13';
+const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+const plan = {schema: 'morpheus-native-macos-pipeline-v1', target: 'mac-arm64',
+  host_python: {path: python, bytes: 4, sha256: hash(Buffer.from('data'))}};
+const planPath = '/synthetic/native/webrtc/macos/mac-arm64/pipeline-plan.json';
+const files = new Map([[planPath, Buffer.from(JSON.stringify(plan))], [python, Buffer.from('data')]]);
+for (const role of ['git', 'xcodebuild', 'xcrun', 'xcode-select', 'sw_vers']) files.set('/usr/bin/' + role, Buffer.from('data'));
+for (const app of [bad, good]) { files.set(version(app), Buffer.from('version')); files.set(metadata(app), Buffer.from('sdk')); }
+const descriptors = new Map(); let nextFd = 10, directoryReads = 0;
+function info(name, second = false) {
+  const directory = name === bad || name === good;
+  const bytes = files.get(name);
+  assert.ok(directory || bytes, 'unknown synthetic file');
+  const isVersion = name === version(bad);
+  const uid = (scenario === 'version_uid' && isVersion || scenario === 'sdk_metadata' && name === metadata(bad) ||
+    scenario === 'required_tool' && name === '/usr/bin/git' || scenario === 'stage_fact' && name === python ||
+    scenario === 'full_inventory' && name === bad) ? 501 : 0;
+  return {isFile: () => !directory && !(scenario === 'version_nonregular' && isVersion),
+    isDirectory: () => directory, isSymbolicLink: () => false, uid,
+    mode: directory ? 0o40755 : scenario === 'version_mode' && isVersion ? 0o100666 : 0o100644,
+    size: directory ? 0 : scenario === 'version_size' && isVersion ? 1048577 : bytes.length,
+    dev: 1, ino: scenario === 'version_identity' && isVersion && second ? 2 : 1, mtimeMs: 1, ctimeMs: 1};
+}
+const fixtureFs = {
+  constants: realFs.constants,
+  realpathSync(name) {
+    if (scenario === 'xcode_root' && name === bad) throw new Error('opaque-fixture');
+    return name;
+  },
+  openSync(name, flags) {
+    assert.ok(flags & realFs.constants.O_NOFOLLOW);
+    assert.ok(files.has(name));
+    const fd = nextFd++; descriptors.set(fd, {name, offset: 0, stats: 0}); return fd;
+  },
+  fstatSync(fd) { const owner = descriptors.get(fd); assert.ok(owner); return info(owner.name, ++owner.stats > 1); },
+  statSync(name) { return info(name); },
+  lstatSync(name) { return info(name); },
+  closeSync(fd) { assert.ok(descriptors.delete(fd)); },
+  readSync(fd, buffer) {
+    const owner = descriptors.get(fd), bytes = files.get(owner.name);
+    const size = Math.min(buffer.length, bytes.length - owner.offset);
+    bytes.copy(buffer, 0, owner.offset, owner.offset + size); owner.offset += size; return size;
+  },
+  readFileSync(fd) { const owner = descriptors.get(fd); assert.ok(owner); return Buffer.from(files.get(owner.name)); },
+  readdirSync(name) {
+    directoryReads++;
+    if (name === '/Applications') return ['Xcode_bad.app', 'Xcode_good.app'];
+    if (name === sdkRoot(bad)) {
+      if (scenario === 'sdk_listing') throw new Error('opaque-fixture');
+      if (scenario === 'sdk_limit') return Array.from({length: 33}, (_, i) => 'MacOSX15.' + i + '.sdk');
+      return ['MacOSX15.1.sdk'];
+    }
+    if (name === sdkRoot(good)) return ['MacOSX15.1.sdk'];
+    if (['/Library/Frameworks/Python.framework/Versions', '/opt/hostedtoolcache/Python'].includes(name)) return [];
+    throw new Error('unexpected-read');
+  },
+  existsSync() { return false; },
+};
+const output = [], errors = [];
+const env = {INPUT_TARGET: 'mac-arm64', INPUT_PHASE: scenario === 'stage_fact' ? 'stage' : 'preflight',
+  INPUT_PUBLISH_HANDOFF: 'false', INPUT_XCODE_APP: scenario === 'full_inventory' ? 'Xcode_bad.app' : '',
+  INPUT_PLAN_SHA256: hash(files.get(planPath)), GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted',
+  GITHUB_REPOSITORY: 'brk275/Morpheus', GITHUB_REF: 'refs/heads/main', GITHUB_ACTOR: 'brk275',
+  GITHUB_TRIGGERING_ACTOR: 'brk275', GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_WORKSPACE: '/synthetic'};
+const processFixture = {platform: 'darwin', arch: 'arm64', env,
+  stderr: {write: value => errors.push(value)}, execve() { throw new Error('unexpected-execution'); }};
+vm.runInNewContext(source, {Buffer, process: processFixture,
+  console: {log: value => output.push(value)},
+  require(name) { if (name === 'node:fs') return fixtureFs; if (name === 'node:path') return path;
+    if (name === 'node:crypto') return crypto; throw new Error('unexpected-module'); }}, {timeout: 2000});
+assert.equal(descriptors.size, 0);
+assert.ok(!JSON.stringify({output, errors}).includes('opaque-fixture'));
+console.log(JSON.stringify({output, errors, exitCode: processFixture.exitCode || 0, directoryReads}));
+"""
+        import subprocess
+        entry = _SCRIPT.parent / "native_webrtc_macos/entry.cjs"
+        environment = {key: value for key, value in os.environ.items()
+                       if key in ("PATH", "SystemRoot", "SYSTEMROOT", "WINDIR", "TEMP", "TMP")}
+        result = subprocess.run(["node", "-e", script, str(entry), scenario],
+                                capture_output=True, text=True, timeout=10, env=environment)
+        self.assertEqual(result.returncode, 0, "controlled entry regression failed")
+        self.assertEqual(result.stderr, "")
+        return json.loads(result.stdout)
+
+    def test_optional_xcode_identities_are_unbound_and_other_candidates_continue(self):
+        for scenario in ("version_uid", "version_mode", "version_nonregular", "version_size", "version_identity",
+                         "xcode_root", "sdk_listing", "sdk_metadata", "sdk_limit", "valid"):
+            with self.subTest(scenario=scenario):
+                result = self.entry_result(scenario)
+                self.assertEqual((result["exitCode"], result["errors"]), (0, []))
+                self.assertEqual(len(result["output"]), 1)
+                prefix = "MORPHEUS_NATIVE_MAC_HOST_INPUTS "
+                self.assertTrue(result["output"][0].startswith(prefix))
+                facts = json.loads(result["output"][0][len(prefix):])
+                for flag in ("sdk_redistributed", "cache_write", "staged", "build_admission_granted",
+                             "native_sources_complete", "build_ready", "distribution_ready"):
+                    self.assertIs(facts[flag], False)
+                self.assertEqual(facts["sdk_full_inventory"], "UNBOUND")
+                self.assertEqual(len(facts["xcode_candidates"]), 2)
+                self.assertLessEqual(len(facts["sdk_candidates"]), 32)
+                bad, good = facts["xcode_candidates"]
+                self.assertEqual((bad["app"], good["app"]), ("Xcode_bad.app", "Xcode_good.app"))
+                self.assertEqual(good["failures"], [])
+                self.assertTrue(any(row["app"] == "Xcode_good.app" for row in facts["sdk_metadata"]))
+                if scenario == "valid":
+                    self.assertEqual(len(facts["sdk_metadata"]), 2)
+                    self.assertTrue(all(row["admissible_root_owned_identity"] for row in facts["sdk_candidates"]))
+                else:
+                    self.assertEqual([row["app"] for row in facts["sdk_metadata"]], ["Xcode_good.app"])
+                if scenario.startswith("version_"):
+                    self.assertEqual(bad["version_plist"], "UNBOUND")
+                    self.assertEqual(bad["failures"], ["preflight_xcode_version"])
+                    self.assertEqual(bad["sdk_listing"], "observed")
+                    row = next(row for row in facts["sdk_candidates"] if row["app"] == "Xcode_bad.app")
+                    self.assertEqual(row["category"], "preflight_xcode_version")
+                    self.assertIs(row["admissible_root_owned_identity"], False)
+                    self.assertNotEqual(row["sdk_system_version_plist"], "UNBOUND")
+                elif scenario == "xcode_root":
+                    self.assertEqual(bad["failures"], ["preflight_xcode_root"])
+                elif scenario in ("sdk_listing", "sdk_limit"):
+                    self.assertEqual(bad["sdk_listing"], "UNBOUND")
+                    self.assertEqual(bad["failures"], ["preflight_sdk_listing"])
+                elif scenario == "sdk_metadata":
+                    row = next(row for row in facts["sdk_candidates"] if row["app"] == "Xcode_bad.app")
+                    self.assertEqual(row["sdk_system_version_plist"], "UNBOUND")
+                    self.assertEqual(row["category"], "preflight_sdk_metadata")
+                    self.assertIs(row["admissible_root_owned_identity"], False)
+                self.assertNotIn("opaque-fixture", json.dumps(facts))
+
+    def test_required_tools_explicit_inventory_and_execution_facts_remain_fatal(self):
+        for scenario, category in (("required_tool", "preflight_tools"),
+                                   ("full_inventory", "preflight_sdk_inventory"),
+                                   ("stage_fact", "python_admission")):
+            with self.subTest(scenario=scenario):
+                result = self.entry_result(scenario)
+                self.assertEqual((result["exitCode"], result["output"]), (1, []))
+                self.assertEqual(result["errors"], ["MORPHEUS_NATIVE_MAC_PRODUCER_ENTRY failed category=" + category + "\n"])
+                if scenario == "stage_fact":
+                    self.assertEqual(result["directoryReads"], 0)
+
 if __name__ == "__main__":
     unittest.main()

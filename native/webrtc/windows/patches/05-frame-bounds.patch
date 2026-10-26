@@ -1,0 +1,226 @@
+diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -141,6 +141,7 @@
+ #endif // RTC_ENABLE_H265
+ 
+ inline bool NeedsRbspUnescaping(const uint8_t* frameData, size_t frameSize) {
++  if (frameSize < 4) return false;
+   for (size_t i = 0; i < frameSize - 3; ++i) {
+     if (frameData[i] == 0 && frameData[i + 1] == 0 && frameData[i + 2] == 3)
+       return true;
+@@ -674,7 +675,22 @@
+     }
+   }
+ 
++  auto reject_malformed = [this] {
++    if (last_dec_error_ != FrameCryptionState::kDecryptionFailed) {
++      last_dec_error_ = FrameCryptionState::kDecryptionFailed;
++      onFrameCryptionStateChanged(last_dec_error_);
++    }
++  };
++  // Check metadata/header lengths before any subtraction or byte access.
++  if (data_in.size() < 2) {
++    reject_malformed();
++    return;
++  }
+   uint8_t unencrypted_bytes = get_unencrypted_bytes(frame.get(), type_);
++  if (unencrypted_bytes > data_in.size() - 2) {
++    reject_malformed();
++    return;
++  }
+ 
+   webrtc::Buffer frame_header(unencrypted_bytes);
+   for (size_t i = 0; i < unencrypted_bytes; i++) {
+@@ -695,6 +711,13 @@
+       last_dec_error_ = FrameCryptionState::kDecryptionFailed;
+       onFrameCryptionStateChanged(last_dec_error_);
+     }
++    return;
++  }
++
++  // ivLength is an 8-bit value; this size_t sum cannot overflow.
++  const size_t minimum_encrypted_size = static_cast<size_t>(ivLength) + 2 + 16;
++  if (data_in.size() - unencrypted_bytes < minimum_encrypted_size) {
++    reject_malformed();
+     return;
+   }
+ 
+@@ -744,6 +767,13 @@
+     encrypted_buffer.SetData(
+         H265::ParseRbsp(encrypted_buffer.data(), encrypted_buffer.size()));
+ #endif // RTC_ENABLE_H265
++  }
++
++  // RBSP unescaping may shrink H264/H265 data. Require a complete tag,
++  // IV and two-byte trailer again before constructing either sub-buffer.
++  if (encrypted_buffer.size() < minimum_encrypted_size) {
++    reject_malformed();
++    return;
+   }
+ 
+   webrtc::Buffer encrypted_payload(encrypted_buffer.size() - ivLength - 2);
+diff --git a/api/crypto/sif_payload_unittest.cc b/api/crypto/sif_payload_unittest.cc
+--- a/api/crypto/sif_payload_unittest.cc
++++ b/api/crypto/sif_payload_unittest.cc
+@@ -181,12 +181,13 @@
+ class NativeTransform {
+  public:
+   explicit NativeTransform(MediaType media, bool with_key = false,
+-                           bool enabled = true, bool discard = false)
++                           bool enabled = true, bool discard = false,
++                           VideoCodecType codec = VideoCodecType::kVideoCodecVP8)
+       : media_(media),
+         signaling_thread_(Thread::Create()),
+         sink_(make_ref_counted<Sink>()),
+         observer_(make_ref_counted<Observer>()) {
+-    video_header_.codec = VideoCodecType::kVideoCodecVP8;
++    video_header_.codec = codec;
+     KeyProviderOptions options;
+     options.shared_key = true;
+     options.discard_frame_when_cryptor_not_ready = discard;
+@@ -339,23 +340,26 @@
+ TEST(SifTransform, KeepsDisabledAndEmptyBehaviorForBothDiscardPolicies) {
+   for (auto media : {MediaType::kAudioFrame, MediaType::kVideoFrame}) {
+     for (bool discard : {false, true}) {
+-      for (bool empty : {false, true}) {
+-        NativeTransform transform(media, false, false, discard);
+-        const auto input = empty ? std::vector<uint8_t>() : kVp8KeyFrame8x8;
+-        const bool submitted = transform.Submit(input, false);
+-        // Wait for actual frame retirement even when no callback is expected;
+-        // do not unregister the sink before the branch has run.
+-        const bool returned = discard ? false : transform.WaitForFrame();
+-        const bool retired = transform.WaitForRetirement();
+-        const auto observed = transform.Finish();
+-        EXPECT_TRUE(observed.started);
+-        EXPECT_TRUE(submitted);
+-        EXPECT_TRUE(retired);
+-        if (discard) {
+-          EXPECT_TRUE(observed.frames.empty());
+-        } else {
+-          EXPECT_TRUE(returned);
+-          EXPECT_EQ(observed.frames, std::vector<std::vector<uint8_t>>{input});
++      for (bool enabled : {false, true}) {
++        for (bool empty : {false, true}) {
++          if (enabled && !empty) continue;
++          NativeTransform transform(media, false, enabled, discard);
++          const auto input = empty ? std::vector<uint8_t>() : kVp8KeyFrame8x8;
++          const bool submitted = transform.Submit(input, false);
++          // Wait for actual frame retirement even when no callback is expected;
++          // do not unregister the sink before the branch has run.
++          const bool returned = discard ? false : transform.WaitForFrame();
++          const bool retired = transform.WaitForRetirement();
++          const auto observed = transform.Finish();
++          EXPECT_TRUE(observed.started);
++          EXPECT_TRUE(submitted);
++          EXPECT_TRUE(retired);
++          if (discard) {
++            EXPECT_TRUE(observed.frames.empty());
++          } else {
++            EXPECT_TRUE(returned);
++            EXPECT_EQ(observed.frames, std::vector<std::vector<uint8_t>>{input});
++          }
+         }
+       }
+     }
+@@ -363,9 +367,19 @@
+ }
+ 
+ TEST(SifTransform, OrdinaryAuthenticatedMediaStillRoundTripsOnBothMediaPaths) {
+-  for (auto media : {MediaType::kAudioFrame, MediaType::kVideoFrame}) {
+-    NativeTransform sender(media, true);
+-    const bool sent = sender.Submit(kVp8KeyFrame8x8, false, Direction::kSender);
++  const std::vector<std::pair<MediaType, VideoCodecType>> cases = {
++      {MediaType::kAudioFrame, VideoCodecType::kVideoCodecVP8},
++      {MediaType::kVideoFrame, VideoCodecType::kVideoCodecVP8},
++      {MediaType::kVideoFrame, VideoCodecType::kVideoCodecH264},
++  };
++  for (auto entry : cases) {
++    const auto media = entry.first;
++    const auto codec = entry.second;
++    const auto plaintext = codec == VideoCodecType::kVideoCodecH264
++        ? Concat({kStartCode4, kH264Sps, kStartCode4, kH264Pps, kStartCode4, kH264Idr})
++        : kVp8KeyFrame8x8;
++    NativeTransform sender(media, true, true, false, codec);
++    const bool sent = sender.Submit(plaintext, false, Direction::kSender);
+     const bool encrypted = sender.WaitForFrame();
+     const bool sender_retired = sender.WaitForRetirement();
+     const auto encrypted_observed = sender.Finish();
+@@ -377,7 +391,7 @@
+       ADD_FAILURE() << "expected one synthetic encrypted frame";
+       continue;
+     }
+-    NativeTransform receiver(media, true);
++    NativeTransform receiver(media, true, true, false, codec);
+     const bool submitted = receiver.Submit(encrypted_observed.frames.front(), false);
+     const bool returned = receiver.WaitForFrame();
+     const bool state_returned = receiver.WaitForState();
+@@ -389,10 +403,67 @@
+     EXPECT_TRUE(returned);
+     EXPECT_TRUE(state_returned);
+     EXPECT_EQ(observed.frames,
+-              std::vector<std::vector<uint8_t>>{kVp8KeyFrame8x8});
++              std::vector<std::vector<uint8_t>>{plaintext});
+     EXPECT_EQ(observed.states, std::vector<FrameCryptionState>{kOk});
+   }
+ }
++
++TEST(SifTransform, RejectsShortEncryptedHeadersIvAndTags) {
++  for (auto media : {MediaType::kAudioFrame, MediaType::kVideoFrame}) {
++    const size_t header = media == MediaType::kAudioFrame ? 1 : 10;
++    std::vector<std::vector<uint8_t>> cases = {{0}, {12, 0}};
++    for (size_t encrypted_bytes : {size_t{7}, size_t{29}}) {
++      std::vector<uint8_t> data(header + encrypted_bytes, 0x42);
++      data[data.size() - 2] = 12;
++      data[data.size() - 1] = 0;
++      cases.push_back(std::move(data));
++    }
++    for (auto data : cases) {
++      NativeTransform transform(media, true);
++      const bool submitted = transform.Submit(std::move(data), false);
++      const bool failed = transform.WaitForState();
++      const bool retired = transform.WaitForRetirement();
++      const auto observed = transform.Finish();
++      EXPECT_TRUE(observed.started);
++      EXPECT_TRUE(submitted);
++      EXPECT_TRUE(failed);
++      EXPECT_TRUE(retired);
++      EXPECT_TRUE(observed.frames.empty());
++      EXPECT_EQ(observed.states,
++                std::vector<FrameCryptionState>{kDecryptionFailed});
++    }
++  }
++}
++
++TEST(SifTransform, RejectsRbspWhichShrinksBelowTheAuthenticatedRecord) {
++  std::vector<VideoCodecType> codecs = {VideoCodecType::kVideoCodecH264};
++#ifdef RTC_ENABLE_H265
++  codecs.push_back(VideoCodecType::kVideoCodecH265);
++#endif
++  for (auto codec : codecs) {
++    auto data = Concat({kStartCode4,
++                       codec == VideoCodecType::kVideoCodecH264
++                           ? std::vector<uint8_t>{0x65, 0x88}
++                           : std::vector<uint8_t>{0x00, 0x01}});
++    for (int i = 0; i < 10; ++i) {
++      data.insert(data.end(), {0x00, 0x00, 0x03});
++    }
++    data.insert(data.end(), {12, 0});
++    NativeTransform transform(MediaType::kVideoFrame, true, true, false, codec);
++    const bool submitted = transform.Submit(std::move(data), false);
++    const bool failed = transform.WaitForState();
++    const bool retired = transform.WaitForRetirement();
++    const auto observed = transform.Finish();
++    EXPECT_TRUE(observed.started);
++    EXPECT_TRUE(submitted);
++    EXPECT_TRUE(failed);
++    EXPECT_TRUE(retired);
++    EXPECT_TRUE(observed.frames.empty());
++    EXPECT_EQ(observed.states,
++              std::vector<FrameCryptionState>{kDecryptionFailed});
++  }
++}
++
+ 
+ }  // namespace
+ }  // namespace webrtc

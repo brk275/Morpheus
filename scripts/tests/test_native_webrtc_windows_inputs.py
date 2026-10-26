@@ -21,6 +21,100 @@ SPEC.loader.exec_module(TARGET)
 
 
 class WindowsNativeInputsTests(unittest.TestCase):
+    def test_producer_failure_categories_are_closed_and_keep_original_failure_fatal(self):
+        # Actual core_stage exception propagation and CLI catch boundary. No
+        # source/host/network/tool execution is admitted by these fake inputs.
+        private = "private error payload must never reach diagnostics"
+        value = {"baseline": TARGET.NATIVE, "tree": TARGET.TREE,
+                 "targets": {"Windowsx64": [{"name": name} for name in ("gn", "ninja", "clang")]}}
+        control = mock.Mock(root=Path("synthetic-control"))
+        for helper_phase, expected in (("admission", "core_admission"),
+                ("download_gn", "core_download_gn"), ("stage_clang", "core_stage_clang"),
+                ("receipt", "core_receipt"), ("unknown", "core_invoke"), (private, "core_invoke"),
+                (None, "core_invoke"), ("x" * 10000, "core_invoke")):
+            helper = mock.Mock(PHASE=helper_phase)
+            def fail_core():
+                TARGET.core_stage(helper, Path("synthetic-temp"), Path("synthetic-workspace"),
+                                  {"core_manifest": {"sha256": TARGET.CORE}}, control)
+            output = io.StringIO()
+            with mock.patch.object(TARGET, "FAILURE_CATEGORY", "entry"), \
+                    mock.patch.dict(os.environ, GITHUB_RUN_ID="1", GITHUB_RUN_ATTEMPT="1", GITHUB_JOB="producer"), \
+                    mock.patch.object(TARGET, "bound_asset", return_value=(Path("synthetic-manifest"), value)), \
+                    mock.patch.object(TARGET, "write_json", return_value={"sha256": "a" * 64}), \
+                    mock.patch.object(TARGET, "invoke", side_effect=RuntimeError(private)) as invoke, \
+                    mock.patch.object(TARGET, "main", side_effect=fail_core), \
+                    mock.patch.object(TARGET.sys, "stderr", output):
+                with self.assertRaises(SystemExit) as failure:
+                    TARGET.entry()
+                self.assertEqual(failure.exception.code, 1)
+                invoke.assert_called_once()
+            self.assertEqual(output.getvalue(),
+                             "MORPHEUS_NATIVE_WINDOWS_PRODUCER failed category=" + expected + "\n")
+        # Even a future non-source category cannot become an output field.
+        output = io.StringIO()
+        with mock.patch.object(TARGET, "FAILURE_CATEGORY", private), \
+                mock.patch.object(TARGET, "main", side_effect=RuntimeError(private)), \
+                mock.patch.object(TARGET.sys, "stderr", output):
+            with self.assertRaises(SystemExit) as failure:
+                TARGET.entry()
+            self.assertEqual(failure.exception.code, 1)
+        self.assertEqual(output.getvalue(), "MORPHEUS_NATIVE_WINDOWS_PRODUCER failed category=entry\n")
+
+
+    def test_genuine_windows_source_profile_matches_actual_restricted_deps_selection(self):
+        assets = PATH.parents[1] / "native/webrtc/windows"
+        profile = json.loads((assets / "source-profile.json").read_bytes())
+        def bound(record):
+            raw = (PATH.parents[1] / record["path"]).read_bytes()
+            self.assertEqual(len(raw), record["bytes"])
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), record["sha256"])
+            return json.loads(raw)
+        plan = bound(profile["source_plan"])
+        interface = bound(profile["producer_interface"])
+        self.assertEqual(profile["producer_interface"]["sha256"], TARGET.SOURCE_INTERFACE)
+        self.assertEqual(interface["source_plan_schema"], plan["schema"])
+        self.assertEqual(plan["schema"], "morpheus-native-webrtc-sources-v3")
+        self.assertEqual(plan["target"], "win-x64")
+        helper_path = PATH.parent / "native_webrtc/git_source_stager.py"
+        self.assertEqual(hashlib.sha256(helper_path.read_bytes()).hexdigest(),
+                         TARGET.HELPERS["git_source_stager.py"])
+        spec = importlib.util.spec_from_file_location("windows_actual_source_deps", helper_path)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        context = dict(host_os="win", host_cpu="x64", checkout_win=True,
+                       checkout_linux=False, checkout_mac=False,
+                       checkout_android=False, checkout_ios=False, **plan["condition_values"])
+        selected, declarations = [], []
+        names = {"src": "root-DEPS", "src/buildtools": "buildtools-DEPS"}
+        self.assertEqual({row["mount"] for row in plan["deps_files"]}, set(names))
+        for row in plan["deps_files"]:
+            raw = (assets / "reference" / names[row["mount"]]).read_bytes()
+            self.assertEqual(len(raw), row["bytes"])
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), row["sha256"])
+            parser = helper.Deps(raw, context, row["mount"] + "/DEPS")
+            chosen, records, _ = parser.dependencies(row["mount"])
+            selected.extend(chosen)
+            declarations.extend(records)
+        planned = {row["mount"]: row for row in plan["repositories"]}
+        self.assertEqual(len(planned), 56)
+        self.assertEqual(len(declarations), 127)
+        self.assertEqual({row["mount"]: row for row in selected},
+                         {mount: {key: row[key] for key in ("mount", "url", "revision")}
+                          for mount, row in planned.items() if mount not in ("src", "outer-depot")})
+        self.assertNotIn("src/third_party/instrumented_libs", planned)
+        self.assertNotIn("src/third_party/fontconfig/src", planned)
+        self.assertNotIn("src/third_party/lss", planned)
+        self.assertEqual(len(plan["gitlinks"]), 22)
+        self.assertEqual(len(plan["aliases"]), 69)
+        manifest = bound(profile["patch_manifest"])
+        self.assertEqual(plan["patch_manifest"]["sha256"], profile["patch_manifest"]["sha256"])
+        self.assertEqual([row["sha256"] for row in manifest["patches"][:8]],
+                         helper.SECURITY_PATCHES)
+        self.assertEqual([(row["sha256"], row["root"]) for row in manifest["patches"][8:]],
+                         [helper.PLATFORM_PATCHES[name] for name in helper.PLATFORM_ORDER["win"]])
+        self.assertEqual(len(manifest["patches"]), 13)
+
+
     def test_windows_original_cipd_instance_path_and_both_hashes_are_required(self):
         helper_path = PATH.parent / "native_webrtc/python_stager.py"
         self.assertEqual(hashlib.sha256(helper_path.read_bytes()).hexdigest(), TARGET.HELPERS["python_stager.py"])
@@ -541,14 +635,39 @@ class WindowsNativeInputsTests(unittest.TestCase):
                 "patches": [{"file": row["path"], "bytes": row["bytes"], "sha256": row["sha256"]}
                             for row in patches]})
             source_plan = asset("source-plan.json", {"schema": "morpheus-native-webrtc-sources-v3",
-                "target": "win-x64", "git": {"path": "GIT_UNBOUND"}})
+                "target": "win-x64", "git": {"path": "GIT_UNBOUND"},
+                "patch_manifest": {"sha256": manifest["sha256"]},
+                "security_plan": {"sha256": security["sha256"]}})
+            interface = asset("interface.json", {"schema": "morpheus-native-source-producer-interface-v2",
+                "source_plan_schema": "morpheus-native-webrtc-sources-v3",
+                "required_security_plan_sha256": security["sha256"],
+                "source_git_administrative_metadata": False})
             git = workspace / "git.exe"
             git.write_bytes(b"synthetic tool DATA only")
             git_fact = {"path": str(git), "bytes": git.stat().st_size,
                         "sha256": hashlib.sha256(git.read_bytes()).hexdigest(), "version": "synthetic"}
-            profile = asset("profile.json", {"schema": "morpheus-windows-source-stage-v1",
+            profile = asset("profile.json", {"schema": "morpheus-windows-source-stage-v2",
                 "target": "win-x64", "source_plan": source_plan, "patch_manifest": manifest,
-                "security_plan": security, "patch_files": patches, "host_git": git_fact})
+                "security_plan": security, "patch_files": patches, "host_git": git_fact,
+                "producer_interface": interface})
+            bad_profiles = []
+            original_plan = json.loads((workspace / source_plan["path"]).read_bytes())
+            for label, changed in (
+                    ("foreign-target", dict(original_plan, target="linux-x64")),
+                    ("patch-binding", dict(original_plan, patch_manifest={"sha256": "0" * 64})),
+                    ("security-binding", dict(original_plan, security_plan={"sha256": "0" * 64}))):
+                bad = json.loads((workspace / profile["path"]).read_bytes())
+                bad["source_plan"] = asset(label + "-plan.json", changed)
+                bad_profiles.append(asset(label + "-profile.json", bad))
+            bad = json.loads((workspace / profile["path"]).read_bytes())
+            bad["patch_files"] = patches + patches[:1]
+            bad_profiles.append(asset("duplicate-patch-profile.json", bad))
+            bad = json.loads((workspace / profile["path"]).read_bytes())
+            bad["producer_interface"] = asset("foreign-interface.json", {
+                "schema": "foreign", "source_plan_schema": "morpheus-native-webrtc-sources-v3",
+                "required_security_plan_sha256": security["sha256"],
+                "source_git_administrative_metadata": False})
+            bad_profiles.append(asset("foreign-interface-profile.json", bad))
             original_files = {p: p.read_bytes() for p in workspace.rglob("*") if p.is_file()}
             observed = []
             def exporter(module, args):
@@ -580,8 +699,15 @@ class WindowsNativeInputsTests(unittest.TestCase):
                 observed.append(True)
             with mock.patch.object(TARGET, "path", side_effect=Path), \
                     mock.patch.object(TARGET, "SECURITY", security["sha256"]), \
+                    mock.patch.object(TARGET, "SOURCE_INTERFACE", interface["sha256"]), \
                     mock.patch.object(TARGET, "fixed_module", return_value=object()), \
                     mock.patch.object(TARGET, "invoke", side_effect=exporter):
+                for bad_profile in bad_profiles:
+                    with self.assertRaises(TARGET.Refused):
+                        TARGET.source_stage(None, runner, workspace,
+                                            {"source_profile": bad_profile}, control)
+                    self.assertEqual(list(control.root.iterdir()), [])
+                    self.assertEqual(observed, [])
                 output = TARGET.source_stage(None, runner, workspace, {"source_profile": profile}, control)
             self.assertEqual(observed, [True])
             self.assertEqual(output, control.root / "source-provision")

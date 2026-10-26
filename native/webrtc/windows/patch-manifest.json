@@ -1,0 +1,534 @@
+{
+  "patches": [
+    {
+      "bytes": 22976,
+      "changes": [
+        {
+          "after": {
+            "bytes": 2606,
+            "mode": "100644",
+            "sha256": "3b5b3fc8b9522423078f7b3ec803b0f154c376ae51dc1db9ca9d335f279a017b"
+          },
+          "before": {
+            "bytes": 2357,
+            "mode": "100644",
+            "sha256": "7650b8496f6296edfa786b873630e8abf06b7dfd270fc8ef0d56806b28f61b78"
+          },
+          "path": "api/crypto/BUILD.gn"
+        },
+        {
+          "after": {
+            "bytes": 40334,
+            "mode": "100644",
+            "sha256": "246bf7917e2e9a3665f217a89bb7030eea431d03e8c2d0a445f8854e99ba2d57"
+          },
+          "before": {
+            "bytes": 37150,
+            "mode": "100644",
+            "sha256": "18217ca3c1edf2615e5dd7a0f027735c1b3cd24fc349f6c4de1a1c0283eeca6d"
+          },
+          "path": "api/crypto/frame_crypto_transformer.cc"
+        },
+        {
+          "after": {
+            "bytes": 17057,
+            "mode": "100644",
+            "sha256": "70d503c23744a23500a4cf2a622603aa6c9c9a4da737d5091bd67ce73e94e873"
+          },
+          "before": {
+            "bytes": 16822,
+            "mode": "100644",
+            "sha256": "28e71383afa22427486f9682a298bff5db17361882e4f8ae2e94e43897a6e078"
+          },
+          "path": "api/crypto/frame_crypto_transformer.h"
+        },
+        {
+          "after": {
+            "bytes": 15524,
+            "mode": "100644",
+            "sha256": "09760504821a83471b5f44e3ec2f6748ca8fee2b421141af227c74816b21b347"
+          },
+          "before": null,
+          "path": "api/crypto/sif_payload_unittest.cc"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/01-sif-validation.patch",
+      "kind": "native-security",
+      "name": "01-sif-validation.patch",
+      "root": "src",
+      "sha256": "4f5ba9a827220170080ae4d1183e01b437eb7014c391bda46cd258ae0c5f5169"
+    },
+    {
+      "bytes": 5382,
+      "changes": [
+        {
+          "after": {
+            "bytes": 39497,
+            "mode": "100644",
+            "sha256": "6bb5ae596e9368e50336511a974bcfe080fef3d6a024e8635ed7541849d4eb1d"
+          },
+          "before": {
+            "bytes": 40334,
+            "mode": "100644",
+            "sha256": "246bf7917e2e9a3665f217a89bb7030eea431d03e8c2d0a445f8854e99ba2d57"
+          },
+          "path": "api/crypto/frame_crypto_transformer.cc"
+        },
+        {
+          "after": {
+            "bytes": 11887,
+            "mode": "100644",
+            "sha256": "353b35fe88e626dfaf563ea3d3767d488fd27a3b7010e52519983c29824120ab"
+          },
+          "before": {
+            "bytes": 9749,
+            "mode": "100644",
+            "sha256": "6416475fe10b7a578b3800b5eb4297303c37b629110848a0b98032974b722984"
+          },
+          "path": "api/crypto/frame_crypto_transformer_unittest.cc"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/02-key-log-removal.patch",
+      "kind": "native-security",
+      "name": "02-key-log-removal.patch",
+      "root": "src",
+      "sha256": "793e25908a56d8993cb082e40728ad1bd39919a0abf988b1921384d15dd601fd"
+    },
+    {
+      "bytes": 160798,
+      "changes": [
+        {
+          "after": {
+            "bytes": 114008,
+            "mode": "100644",
+            "sha256": "f54188260ea8fd409ecd789a463931e9b1bde5a37a0c699a2535044c4ba9b7f3"
+          },
+          "before": {
+            "bytes": 197055,
+            "mode": "100644",
+            "sha256": "898177ed3d4623347d401c921cefd0536cc9b33ea25afbfa050f00e13cb5aeab"
+          },
+          "path": "rtc_base/ssl_roots.h"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/03-root-refresh.patch",
+      "kind": "native-security",
+      "name": "03-root-refresh.patch",
+      "root": "src",
+      "sha256": "6f10c7bf1f0396e5a6e287343a93049d3b7e9387f1cffc9fe7f70a580d0bf508"
+    },
+    {
+      "bytes": 1705,
+      "changes": [
+        {
+          "after": {
+            "bytes": 17159,
+            "mode": "100644",
+            "sha256": "b5f76d91b8d07cb8fda6452c1cc7d08577f9e6517c392df80a41ec62ac57d261"
+          },
+          "before": {
+            "bytes": 17057,
+            "mode": "100644",
+            "sha256": "70d503c23744a23500a4cf2a622603aa6c9c9a4da737d5091bd67ce73e94e873"
+          },
+          "path": "api/crypto/frame_crypto_transformer.h"
+        },
+        {
+          "after": {
+            "bytes": 12543,
+            "mode": "100644",
+            "sha256": "5d1a95d4b0af848981e0753da33bd3048c315fd0ff881ee3b566dd0b965dc7f0"
+          },
+          "before": {
+            "bytes": 11887,
+            "mode": "100644",
+            "sha256": "353b35fe88e626dfaf563ea3d3767d488fd27a3b7010e52519983c29824120ab"
+          },
+          "path": "api/crypto/frame_crypto_transformer_unittest.cc"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/04-copy-discard-option.patch",
+      "kind": "native-security",
+      "name": "04-copy-discard-option.patch",
+      "root": "src",
+      "sha256": "ad5f64e55a6c4187b242535f84149c46590565d0e1017f1340856a8fcbd06835"
+    },
+    {
+      "bytes": 9441,
+      "changes": [
+        {
+          "after": {
+            "bytes": 40492,
+            "mode": "100644",
+            "sha256": "20118b044cb935b91ad273f01b908fbd9eaf0036e610be5b524ed07afc7865fd"
+          },
+          "before": {
+            "bytes": 39497,
+            "mode": "100644",
+            "sha256": "6bb5ae596e9368e50336511a974bcfe080fef3d6a024e8635ed7541849d4eb1d"
+          },
+          "path": "api/crypto/frame_crypto_transformer.cc"
+        },
+        {
+          "after": {
+            "bytes": 18491,
+            "mode": "100644",
+            "sha256": "3f868aac222e83ddb88ecd6456876305f27c103c9d4b9d96723ab46b4ee93174"
+          },
+          "before": {
+            "bytes": 15524,
+            "mode": "100644",
+            "sha256": "09760504821a83471b5f44e3ec2f6748ca8fee2b421141af227c74816b21b347"
+          },
+          "path": "api/crypto/sif_payload_unittest.cc"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/05-frame-bounds.patch",
+      "kind": "native-security",
+      "name": "05-frame-bounds.patch",
+      "root": "src",
+      "sha256": "3e9934378b8c164314907ba7161f9b223554201fda47dad50744a1ae15c61b1d"
+    },
+    {
+      "bytes": 4058,
+      "changes": [
+        {
+          "after": {
+            "bytes": 40476,
+            "mode": "100644",
+            "sha256": "1ba6e5a7d0d7fa8dd34c1e819d906f85e3262fe0dc2da8680a85b1bfea96052b"
+          },
+          "before": {
+            "bytes": 40492,
+            "mode": "100644",
+            "sha256": "20118b044cb935b91ad273f01b908fbd9eaf0036e610be5b524ed07afc7865fd"
+          },
+          "path": "api/crypto/frame_crypto_transformer.cc"
+        },
+        {
+          "after": {
+            "bytes": 17418,
+            "mode": "100644",
+            "sha256": "b3b050ed5553f0a132cbc20300366668b155dd4248dfb0c1dee71080e3bc2587"
+          },
+          "before": {
+            "bytes": 17159,
+            "mode": "100644",
+            "sha256": "b5f76d91b8d07cb8fda6452c1cc7d08577f9e6517c392df80a41ec62ac57d261"
+          },
+          "path": "api/crypto/frame_crypto_transformer.h"
+        },
+        {
+          "after": {
+            "bytes": 14644,
+            "mode": "100644",
+            "sha256": "2b1356142ecc88758b03e89ee615694edb03db4bc15b610bbdfe89d551860e56"
+          },
+          "before": {
+            "bytes": 12543,
+            "mode": "100644",
+            "sha256": "5d1a95d4b0af848981e0753da33bd3048c315fd0ff881ee3b566dd0b965dc7f0"
+          },
+          "path": "api/crypto/frame_crypto_transformer_unittest.cc"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/06-sif-trailer-snapshot.patch",
+      "kind": "native-security",
+      "name": "06-sif-trailer-snapshot.patch",
+      "root": "src",
+      "sha256": "df26ab1d8a31ca5cab1f39fda912e0c3e73a726c59cfcde4457e79415094edfd"
+    },
+    {
+      "bytes": 3958,
+      "changes": [
+        {
+          "after": {
+            "bytes": 40873,
+            "mode": "100644",
+            "sha256": "1d5b193957d76f8f41fe72006d9166c398af540bea25d91fc6da91a315ebd9c5"
+          },
+          "before": {
+            "bytes": 40476,
+            "mode": "100644",
+            "sha256": "1ba6e5a7d0d7fa8dd34c1e819d906f85e3262fe0dc2da8680a85b1bfea96052b"
+          },
+          "path": "api/crypto/frame_crypto_transformer.cc"
+        },
+        {
+          "after": {
+            "bytes": 19125,
+            "mode": "100644",
+            "sha256": "ad9d82e0ee554fc2ecabec9507c20b761844a107d9f91002cee0a46fd6ea7c26"
+          },
+          "before": {
+            "bytes": 18491,
+            "mode": "100644",
+            "sha256": "3f868aac222e83ddb88ecd6456876305f27c103c9d4b9d96723ab46b4ee93174"
+          },
+          "path": "api/crypto/sif_payload_unittest.cc"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/07-h264-prefix-validation.patch",
+      "kind": "native-security",
+      "name": "07-h264-prefix-validation.patch",
+      "root": "src",
+      "sha256": "1de7bf5402089c13f93f108f3008aaa8c025e2bdbd7b2375694417c186c86a17"
+    },
+    {
+      "bytes": 5457,
+      "changes": [
+        {
+          "after": {
+            "bytes": 41027,
+            "mode": "100644",
+            "sha256": "81b1bc99719a7f67fa5d7fae7504f4db7c4245d4d97318df3bebf417b98af0c7"
+          },
+          "before": {
+            "bytes": 40873,
+            "mode": "100644",
+            "sha256": "1d5b193957d76f8f41fe72006d9166c398af540bea25d91fc6da91a315ebd9c5"
+          },
+          "path": "api/crypto/frame_crypto_transformer.cc"
+        },
+        {
+          "after": {
+            "bytes": 19990,
+            "mode": "100644",
+            "sha256": "f79355710f7350a9de13ae07d6e13144bb913a02c989c01772c28738422cac7c"
+          },
+          "before": {
+            "bytes": 19125,
+            "mode": "100644",
+            "sha256": "ad9d82e0ee554fc2ecabec9507c20b761844a107d9f91002cee0a46fd6ea7c26"
+          },
+          "path": "api/crypto/sif_payload_unittest.cc"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/08-rbsp-decoded-iv.patch",
+      "kind": "native-security",
+      "name": "08-rbsp-decoded-iv.patch",
+      "root": "src",
+      "sha256": "dbefa1b81cd8b24eb0bcd41ec996e6b14265d66ffdad38cf1112e646821d4e09"
+    },
+    {
+      "bytes": 785,
+      "changes": [
+        {
+          "after": {
+            "bytes": 11782,
+            "mode": "100755",
+            "sha256": "36836236dabd8866676c5e46f5cabe94e04acadc2d33306c4f35c32daf43a8f0"
+          },
+          "before": {
+            "bytes": 11440,
+            "mode": "100755",
+            "sha256": "e6b5c94a8138e62c9d16beec64741d3e081ccc1ced59e983b818cef6a96a916e"
+          },
+          "path": "tools_webrtc/libs/generate_licenses.py"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/add_licenses.patch",
+      "kind": "upstream-platform",
+      "name": "add_licenses.patch",
+      "root": "src",
+      "sha256": "3744d07bce56a3cc281f70196ad52513b6395d353a73d2de97f2de616bc27625"
+    },
+    {
+      "bytes": 940,
+      "changes": [
+        {
+          "after": {
+            "bytes": 25226,
+            "mode": "100644",
+            "sha256": "4c53c151d8502f9f78be131c75b798e622159fd94ec0dba6cd96ab6a14308e74"
+          },
+          "before": {
+            "bytes": 24959,
+            "mode": "100644",
+            "sha256": "28de900976df3f8d54285575a29fe5e0ca53632a464a6cdebd051d1ef1e26ec9"
+          },
+          "path": "BUILD.gn"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/add_deps.patch",
+      "kind": "upstream-platform",
+      "name": "add_deps.patch",
+      "root": "src",
+      "sha256": "da222e44f306137ed96b626879948325dc21857dcf054482b1e3df83e59fe5f4"
+    },
+    {
+      "bytes": 568,
+      "changes": [
+        {
+          "after": {
+            "bytes": 120849,
+            "mode": "100644",
+            "sha256": "77ab49145fa6fa87a6aa17f6ece293598c3f1f8ec603052638e05245b7eadf4b"
+          },
+          "before": {
+            "bytes": 120750,
+            "mode": "100644",
+            "sha256": "a2e97097a300f70d6d049785d94506196b20bd53f7ecb78a7acef24a4d065f6a"
+          },
+          "path": "build/config/compiler/BUILD.gn"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/windows_silence_warnings.patch",
+      "kind": "upstream-platform",
+      "name": "windows_silence_warnings.patch",
+      "root": "src",
+      "sha256": "50dc2fa0db35abe9a4dd2d6849f70d12aa45c82af3371fcf8d6771fed9046887"
+    },
+    {
+      "bytes": 2523,
+      "changes": [
+        {
+          "after": {
+            "bytes": 14166,
+            "mode": "100644",
+            "sha256": "d0c4893616fc619e94dc77945ba7c6852c6ce90e98af61dc6ac88b8ac214d65a"
+          },
+          "before": {
+            "bytes": 13966,
+            "mode": "100644",
+            "sha256": "16b57ec2d2981e94e4d1de76665d45c0ddcb40dc7f049f36892e472e8b20d3f2"
+          },
+          "path": "rtc_base/boringssl_certificate.cc"
+        },
+        {
+          "after": {
+            "bytes": 2592,
+            "mode": "100644",
+            "sha256": "39a179398ad79227673f458e56c5988dad6e5ea093760e738113d70aa2572262"
+          },
+          "before": {
+            "bytes": 2445,
+            "mode": "100644",
+            "sha256": "6c40f4934dcebc88dcfb57d148f5d1b61e2d78db2327d0417ab6dd99d75c204b"
+          },
+          "path": "rtc_base/boringssl_certificate.h"
+        },
+        {
+          "after": {
+            "bytes": 34357,
+            "mode": "100644",
+            "sha256": "74facfda36c0ef2163f0fec24b7d66b714f884914427a6449597839a44242ac4"
+          },
+          "before": {
+            "bytes": 34347,
+            "mode": "100644",
+            "sha256": "220a5d37d47e9598c3e2724fe74023f90466d1a4ea301d7781f28fe1f31addea"
+          },
+          "path": "rtc_base/openssl_adapter.cc"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/ssl_verify_callback_with_native_handle.patch",
+      "kind": "upstream-platform",
+      "name": "ssl_verify_callback_with_native_handle.patch",
+      "root": "src",
+      "sha256": "55042fe99107439e88e56cddec4f5caf8c8a92e72f2e035ac8e37d52aaecb20c"
+    },
+    {
+      "bytes": 5947,
+      "changes": [
+        {
+          "after": {
+            "bytes": 14429,
+            "mode": "100644",
+            "sha256": "b9db08d4f9b51750cffb2eef4f3b6c59ca315a6e870ed99e428db80e24304b94"
+          },
+          "before": {
+            "bytes": 14166,
+            "mode": "100644",
+            "sha256": "2bc0149d23556441a337a9fe008c3eeaa2c1d82ef62990637e3a9d823a463f07"
+          },
+          "path": "api/media_stream_interface.h"
+        },
+        {
+          "after": {
+            "bytes": 35808,
+            "mode": "100644",
+            "sha256": "0ef48b4e776de16b09fcb7109a053e50329db6285579b7d4b480b48718507b28"
+          },
+          "before": {
+            "bytes": 35431,
+            "mode": "100644",
+            "sha256": "76062ecc23ae237fd7aaf224581c52e370f28171a9024f1e871ecbbc886f620c"
+          },
+          "path": "audio/audio_send_stream.cc"
+        },
+        {
+          "after": {
+            "bytes": 7800,
+            "mode": "100644",
+            "sha256": "cc82f96d7f6b3ff393654fcd3e8eee12b8f8d3c74ed5aa54ad952cfc12724f20"
+          },
+          "before": {
+            "bytes": 7478,
+            "mode": "100644",
+            "sha256": "4d41ccdca643f9461c73c01e8a389eddd227b51b146169ad60c80b54756b9225"
+          },
+          "path": "call/audio_send_stream.h"
+        },
+        {
+          "after": {
+            "bytes": 1908,
+            "mode": "100644",
+            "sha256": "5309c3d73e50a5646bd6fde6a132dc8cce6b7e063c0cb0ddff40537697f7d289"
+          },
+          "before": {
+            "bytes": 1702,
+            "mode": "100644",
+            "sha256": "23469c2b44da944bd66cc31530e6c908bdb631156bc5a83109233c30723c225b"
+          },
+          "path": "media/base/audio_source.h"
+        },
+        {
+          "after": {
+            "bytes": 105362,
+            "mode": "100644",
+            "sha256": "caeb4c727c8afae629d6809b7b9d4f3f102657a102bdb227b60359cd82fd8581"
+          },
+          "before": {
+            "bytes": 104973,
+            "mode": "100644",
+            "sha256": "365f5b8b6123991e6853985ca830064053be47182f5f8ec4a8f91cb76f3215c7"
+          },
+          "path": "media/engine/webrtc_voice_engine.cc"
+        },
+        {
+          "after": {
+            "bytes": 31932,
+            "mode": "100644",
+            "sha256": "0c0d9dda7cf0698dd248a2ae63e727562cfc63891401d2fd71dccf4bbb751988"
+          },
+          "before": {
+            "bytes": 31623,
+            "mode": "100644",
+            "sha256": "809245331ad19e7b6998a59efeab00f3c6f462ccebd2f70eb28ebc0fe8393eca"
+          },
+          "path": "pc/rtp_sender.cc"
+        },
+        {
+          "after": {
+            "bytes": 18316,
+            "mode": "100644",
+            "sha256": "9a07738eb9e0e872b73400b9626be4e122cc0c42122c85e4f43b4f3b55a52921"
+          },
+          "before": {
+            "bytes": 17945,
+            "mode": "100644",
+            "sha256": "e3f2a9fde1bb79689e6e4646fe33076dff6b61e540f8a7da3470f7b9c9c13614"
+          },
+          "path": "pc/rtp_sender.h"
+        }
+      ],
+      "file": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patches/external_audio_source.patch",
+      "kind": "upstream-platform",
+      "name": "external_audio_source.patch",
+      "root": "src",
+      "sha256": "83bfe8101270cc60be25991ec07bbabf51c071f6529b50895e4b1ef07314b81f"
+    }
+  ],
+  "schema": "morpheus-native-source-patches-v1"
+}

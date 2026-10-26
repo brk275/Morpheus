@@ -1,0 +1,1593 @@
+{
+  "aliases": [
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "outer-depot",
+      "oid": "a876afe9bd699fefe0c719400b4b744582432854",
+      "path": "cros_sdk",
+      "target": "cros",
+      "target_bytes": 4,
+      "target_mode": "100755",
+      "target_oid": "70380b97198f9f164128d4e6ba1b6603d22f5d64",
+      "target_path": "cros",
+      "target_sha256": "21206f8e34a5a9f43e69367e20d69e1b83e9afe9555dc706a4135268c56e8da9",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "outer-depot",
+      "oid": "a876afe9bd699fefe0c719400b4b744582432854",
+      "path": "gerrit",
+      "target": "cros",
+      "target_bytes": 4,
+      "target_mode": "100755",
+      "target_oid": "70380b97198f9f164128d4e6ba1b6603d22f5d64",
+      "target_path": "cros",
+      "target_sha256": "21206f8e34a5a9f43e69367e20d69e1b83e9afe9555dc706a4135268c56e8da9",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "outer-depot",
+      "oid": "05b52fafb2e67bc2674a5b53e5032c93d7d4e7a1",
+      "path": "luci-auth-fido2-plugin",
+      "target": "luci_auth_fido2_plugin.py",
+      "target_bytes": 25,
+      "target_mode": "100755",
+      "target_oid": "756c116c63efd2be0704aa4a5040d199da188d9c",
+      "target_path": "luci_auth_fido2_plugin.py",
+      "target_sha256": "93f24cc45c24a1bc3ed3ac2e45c52f375533596001d94b5eb5d1b4ef767c6e93",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "e1687eb5bea5e7d2201d5e9623a010ec31afee13",
+      "path": "afl/src/QuickStartGuide.txt",
+      "target": "docs/QuickStartGuide.txt",
+      "target_bytes": 24,
+      "target_mode": "100644",
+      "target_oid": "abe7032fda9b38a3143f93ac11562e267f84be9d",
+      "target_path": "afl/src/docs/QuickStartGuide.txt",
+      "target_sha256": "5e9be162c9cf1c34277fbe40282c012bb8408ae64530b927861ef1f6e7c48a2a",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "a90f4af9594dfe9eebfb5c293050019e6d17035e",
+      "path": "afl/src/README",
+      "target": "docs/README",
+      "target_bytes": 11,
+      "target_mode": "100644",
+      "target_oid": "ac49599d2c905ff7792d4a49e21686fd04e12103",
+      "target_path": "afl/src/docs/README",
+      "target_sha256": "9f72e452a312f68782cb3ec9dd27cce7ff3be5ffbac861501da84ff71e07f382",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "6e1854759c69d80f55d77618050ed11d57fd65c7",
+      "path": "enterprise_companion/chromium_linux64/3pp/fetch_lib.py",
+      "target": "../../fetch_lib.py",
+      "target_bytes": 18,
+      "target_mode": "100644",
+      "target_oid": "da71a94ea6b4f75cd6b0e3525a6d767eabc10b88",
+      "target_path": "enterprise_companion/fetch_lib.py",
+      "target_sha256": "4bec2e4a6df1477428a74be971952cb48a598b71aa4fc40a4bbc281385fb8c29",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "6e1854759c69d80f55d77618050ed11d57fd65c7",
+      "path": "enterprise_companion/chromium_mac_amd64/3pp/fetch_lib.py",
+      "target": "../../fetch_lib.py",
+      "target_bytes": 18,
+      "target_mode": "100644",
+      "target_oid": "da71a94ea6b4f75cd6b0e3525a6d767eabc10b88",
+      "target_path": "enterprise_companion/fetch_lib.py",
+      "target_sha256": "4bec2e4a6df1477428a74be971952cb48a598b71aa4fc40a4bbc281385fb8c29",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "97ee3bc85218927055c012d028a527ba03c2e192",
+      "path": "enterprise_companion/chromium_mac_amd64/3pp/install.sh",
+      "target": "../../install_mac.sh",
+      "target_bytes": 20,
+      "target_mode": "100755",
+      "target_oid": "b9d9b4e594b36b433a36c9b7a4a1d6e85012c616",
+      "target_path": "enterprise_companion/install_mac.sh",
+      "target_sha256": "510321dd5a7cc95f7f0fda341780c3dc7c4e7cacf4fff49ecbe69db3437f9f8c",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "6e1854759c69d80f55d77618050ed11d57fd65c7",
+      "path": "enterprise_companion/chromium_mac_arm64/3pp/fetch_lib.py",
+      "target": "../../fetch_lib.py",
+      "target_bytes": 18,
+      "target_mode": "100644",
+      "target_oid": "da71a94ea6b4f75cd6b0e3525a6d767eabc10b88",
+      "target_path": "enterprise_companion/fetch_lib.py",
+      "target_sha256": "4bec2e4a6df1477428a74be971952cb48a598b71aa4fc40a4bbc281385fb8c29",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "97ee3bc85218927055c012d028a527ba03c2e192",
+      "path": "enterprise_companion/chromium_mac_arm64/3pp/install.sh",
+      "target": "../../install_mac.sh",
+      "target_bytes": 20,
+      "target_mode": "100755",
+      "target_oid": "b9d9b4e594b36b433a36c9b7a4a1d6e85012c616",
+      "target_path": "enterprise_companion/install_mac.sh",
+      "target_sha256": "510321dd5a7cc95f7f0fda341780c3dc7c4e7cacf4fff49ecbe69db3437f9f8c",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "6e1854759c69d80f55d77618050ed11d57fd65c7",
+      "path": "enterprise_companion/chromium_win_x86/3pp/fetch_lib.py",
+      "target": "../../fetch_lib.py",
+      "target_bytes": 18,
+      "target_mode": "100644",
+      "target_oid": "da71a94ea6b4f75cd6b0e3525a6d767eabc10b88",
+      "target_path": "enterprise_companion/fetch_lib.py",
+      "target_sha256": "4bec2e4a6df1477428a74be971952cb48a598b71aa4fc40a4bbc281385fb8c29",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "26e243c5b1f5afec4800dbe834eabb71e43b6f07",
+      "path": "enterprise_companion/chromium_win_x86/3pp/install.sh",
+      "target": "../../install_win.sh",
+      "target_bytes": 20,
+      "target_mode": "100755",
+      "target_oid": "abadeef6d29551403917f70b1d1ec2e35c9ea4ca",
+      "target_path": "enterprise_companion/install_win.sh",
+      "target_sha256": "f5147fb79a7bef36234fc4385a400fa02855efe41a634e35707d5cd6a6c0e934",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "6e1854759c69d80f55d77618050ed11d57fd65c7",
+      "path": "enterprise_companion/chromium_win_x86_64/3pp/fetch_lib.py",
+      "target": "../../fetch_lib.py",
+      "target_bytes": 18,
+      "target_mode": "100644",
+      "target_oid": "da71a94ea6b4f75cd6b0e3525a6d767eabc10b88",
+      "target_path": "enterprise_companion/fetch_lib.py",
+      "target_sha256": "4bec2e4a6df1477428a74be971952cb48a598b71aa4fc40a4bbc281385fb8c29",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "26e243c5b1f5afec4800dbe834eabb71e43b6f07",
+      "path": "enterprise_companion/chromium_win_x86_64/3pp/install.sh",
+      "target": "../../install_win.sh",
+      "target_bytes": 20,
+      "target_mode": "100755",
+      "target_oid": "abadeef6d29551403917f70b1d1ec2e35c9ea4ca",
+      "target_path": "enterprise_companion/install_win.sh",
+      "target_sha256": "f5147fb79a7bef36234fc4385a400fa02855efe41a634e35707d5cd6a6c0e934",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "0e91a5bd1631f2a739ec3de8efc3a37aff633711",
+      "path": "libxslt/linux/COPYING",
+      "target": "../src/Copyright",
+      "target_bytes": 16,
+      "target_mode": "100644",
+      "target_oid": "627eeff982f41b08a90a0ae6d30c16a193e44cef",
+      "target_path": "libxslt/src/Copyright",
+      "target_sha256": "0b61033ab970aa7b11d8016557529602aeea575662e0d755bb763d6b756d5b7e",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "a6d16ce5ca817394bbee7876a885740761b2b7fe",
+      "path": "xcbproto/LICENSE",
+      "target": "src/COPYING",
+      "target_bytes": 11,
+      "target_mode": "100644",
+      "target_oid": "54bfbe5b02074d0c276959c9140072ccba0dc670",
+      "target_path": "xcbproto/src/COPYING",
+      "target_sha256": "92167a14ae9391bedd0ae8d9015679aa41daf13d91340002b5177537ec092589",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party",
+      "oid": "85de3d45458c3d977a9aa3b256c3dbb4f17479da",
+      "path": "zxcvbn-cpp/LICENSE",
+      "target": "LICENSE.txt",
+      "target_bytes": 11,
+      "target_mode": "100644",
+      "target_oid": "375849e63c9ec003b8f7d81c60b8d8963749d332",
+      "target_path": "zxcvbn-cpp/LICENSE.txt",
+      "target_sha256": "d0ed4cc3fb70489fe51c7e0ac180cba2a7472124f9f9e9ae67b01a37fbd580b7",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/catapult",
+      "oid": "89a0106941ff398844f23a965c5b755ca12eef97",
+      "path": "third_party/gsutil/third_party/funcsigs/docs/index.rst",
+      "target": "../README.rst",
+      "target_bytes": 13,
+      "target_mode": "100644",
+      "target_oid": "5fbca27e6e6b019887ddf1b86faf84b7f7d2ab98",
+      "target_path": "third_party/gsutil/third_party/funcsigs/README.rst",
+      "target_sha256": "bcf935b7c3bf8698509cad62ef76234819c85633264a7c92a27de3dc7ab81833",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/catapult",
+      "oid": "ce4c4252e6e6af9b959edadef7170a826351ea7d",
+      "path": "third_party/gsutil/third_party/idna/tools/intranges.py",
+      "target": "../idna/intranges.py",
+      "target_bytes": 20,
+      "target_mode": "100644",
+      "target_oid": "6a43b0475347cb50d0d65ada1000a82eeca9e882",
+      "target_path": "third_party/gsutil/third_party/idna/idna/intranges.py",
+      "target_sha256": "a2850422c96052b73dddc072dc27a59f2808c3b6741071275874998340483521",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "retain-dangling",
+      "mode": "120000",
+      "mount": "src/third_party/catapult",
+      "oid": "22ec9b8a1940192cc57c0054efa741316cfb56f3",
+      "path": "third_party/gsutil/third_party/mock/docs/changelog.txt",
+      "target": "../ChangeLog",
+      "target_bytes": 12,
+      "target_mode": null,
+      "target_oid": null,
+      "target_path": "third_party/gsutil/third_party/mock/ChangeLog",
+      "target_sha256": "daad516ba747dc22bc28cb99ef9a9c9b5f582dce20f1c451e4fa32a01a6b0d1d",
+      "target_type": "missing",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/depot_tools",
+      "oid": "197489b39e8a2b9f3a5a8f296244a0058ae07ab0",
+      "path": "bazel",
+      "target": "bazel.py",
+      "target_bytes": 8,
+      "target_mode": "100755",
+      "target_oid": "e3c9eb3150b5ab3ed2c168f816b6ebb007ce1447",
+      "target_path": "bazel.py",
+      "target_sha256": "b1625c5090cb8b10be944865b1cc08b6ce79de4ad315edaad8b342916b67c3ab",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/depot_tools",
+      "oid": "a876afe9bd699fefe0c719400b4b744582432854",
+      "path": "cbuildbot",
+      "target": "cros",
+      "target_bytes": 4,
+      "target_mode": "100755",
+      "target_oid": "b20eaab263259cb3272e5ba3ad4215c1e46cf086",
+      "target_path": "cros",
+      "target_sha256": "21206f8e34a5a9f43e69367e20d69e1b83e9afe9555dc706a4135268c56e8da9",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/depot_tools",
+      "oid": "a876afe9bd699fefe0c719400b4b744582432854",
+      "path": "cros_sdk",
+      "target": "cros",
+      "target_bytes": 4,
+      "target_mode": "100755",
+      "target_oid": "b20eaab263259cb3272e5ba3ad4215c1e46cf086",
+      "target_path": "cros",
+      "target_sha256": "21206f8e34a5a9f43e69367e20d69e1b83e9afe9555dc706a4135268c56e8da9",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/depot_tools",
+      "oid": "a876afe9bd699fefe0c719400b4b744582432854",
+      "path": "gerrit",
+      "target": "cros",
+      "target_bytes": 4,
+      "target_mode": "100755",
+      "target_oid": "b20eaab263259cb3272e5ba3ad4215c1e46cf086",
+      "target_path": "cros",
+      "target_sha256": "21206f8e34a5a9f43e69367e20d69e1b83e9afe9555dc706a4135268c56e8da9",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/depot_tools",
+      "oid": "05b52fafb2e67bc2674a5b53e5032c93d7d4e7a1",
+      "path": "luci-auth-fido2-plugin",
+      "target": "luci_auth_fido2_plugin.py",
+      "target_bytes": 25,
+      "target_mode": "100755",
+      "target_oid": "164393d5eda109d2d32ecbe0ca517e7cacc46eff",
+      "target_path": "luci_auth_fido2_plugin.py",
+      "target_sha256": "93f24cc45c24a1bc3ed3ac2e45c52f375533596001d94b5eb5d1b4ef767c6e93",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "dd20853b659ee48b804c93bb9b1661e0f9779cf9",
+      "path": "CLAUDE.md",
+      "target": "docs/AGENTS.md",
+      "target_bytes": 14,
+      "target_mode": "100644",
+      "target_oid": "382cdc2fbbc54e52bb53a0c0185e4ff876749128",
+      "target_path": "docs/AGENTS.md",
+      "target_sha256": "d00743dc4e878f258330deadcd4008e361276d760b58b672150c54bb1ac9758a",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "dd20853b659ee48b804c93bb9b1661e0f9779cf9",
+      "path": "GEMINI.md",
+      "target": "docs/AGENTS.md",
+      "target_bytes": 14,
+      "target_mode": "100644",
+      "target_oid": "382cdc2fbbc54e52bb53a0c0185e4ff876749128",
+      "target_path": "docs/AGENTS.md",
+      "target_sha256": "d00743dc4e878f258330deadcd4008e361276d760b58b672150c54bb1ac9758a",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "a1d27b2302421c42cd07d0c15ea066bcc23eb41d",
+      "path": "contrib/rust-sdk/perfetto-derive/README.md",
+      "target": "../perfetto/README.md",
+      "target_bytes": 21,
+      "target_mode": "100644",
+      "target_oid": "ee5be88c4887be9aec2ba586386a3a3cae149b24",
+      "target_path": "contrib/rust-sdk/perfetto/README.md",
+      "target_sha256": "336a1ed2a7a750c04c5ebcc6db24741fb5aeb9e217a8bcd84fd8d1ee60a0e0fc",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "a1d27b2302421c42cd07d0c15ea066bcc23eb41d",
+      "path": "contrib/rust-sdk/perfetto-protos-gpu/README.md",
+      "target": "../perfetto/README.md",
+      "target_bytes": 21,
+      "target_mode": "100644",
+      "target_oid": "ee5be88c4887be9aec2ba586386a3a3cae149b24",
+      "target_path": "contrib/rust-sdk/perfetto/README.md",
+      "target_sha256": "336a1ed2a7a750c04c5ebcc6db24741fb5aeb9e217a8bcd84fd8d1ee60a0e0fc",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "a1d27b2302421c42cd07d0c15ea066bcc23eb41d",
+      "path": "contrib/rust-sdk/perfetto-sys/README.md",
+      "target": "../perfetto/README.md",
+      "target_bytes": 21,
+      "target_mode": "100644",
+      "target_oid": "ee5be88c4887be9aec2ba586386a3a3cae149b24",
+      "target_path": "contrib/rust-sdk/perfetto/README.md",
+      "target_sha256": "336a1ed2a7a750c04c5ebcc6db24741fb5aeb9e217a8bcd84fd8d1ee60a0e0fc",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "a7250416e37c6f92d5bd6377015b9b6261745c55",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/atomic.h",
+      "target": "../../../../../../../include/perfetto/public/abi/atomic.h",
+      "target_bytes": 57,
+      "target_mode": "100644",
+      "target_oid": "5506f8b200ab2629b405a2b12058e1128650c1cd",
+      "target_path": "include/perfetto/public/abi/atomic.h",
+      "target_sha256": "f7a3abecce0fdfef6822e23a874eec0e46ff3adca573364bb7ab99db6e4b5779",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "b5608f271088b7103181ad93fe5d61e29995d0ba",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/backend_type.h",
+      "target": "../../../../../../../include/perfetto/public/abi/backend_type.h",
+      "target_bytes": 63,
+      "target_mode": "100644",
+      "target_oid": "fe5fe48a39514caff43b02f617ffaa78fd61c9b3",
+      "target_path": "include/perfetto/public/abi/backend_type.h",
+      "target_sha256": "148ebda075ca989f80a48d8a35a502d0427c2deb5c850803c678639a9d7731f7",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "2771145a4e284d64f65cbcefe030be3effae59ce",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/data_source_abi.h",
+      "target": "../../../../../../../include/perfetto/public/abi/data_source_abi.h",
+      "target_bytes": 66,
+      "target_mode": "100644",
+      "target_oid": "3879eff9239bfbc6360fd5fca4d797d245b99486",
+      "target_path": "include/perfetto/public/abi/data_source_abi.h",
+      "target_sha256": "6dec0f6f97b3c1e30a7556b3c8619a8c9859dbbc2282346aab112eba705eceff",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "ee9729e7512d4dfcb6c1339f5895f9d7fa603cc6",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/export.h",
+      "target": "../../../../../../../include/perfetto/public/abi/export.h",
+      "target_bytes": 57,
+      "target_mode": "100644",
+      "target_oid": "734af852d4c9ee13a993462a4dc68dcfaf471ba0",
+      "target_path": "include/perfetto/public/abi/export.h",
+      "target_sha256": "c4758db7f83f200d326eb4085fa01a2335529bdcb3d66d23ad78d08d28993890",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "bc95c79363bd88b0bd1be2612b7e73a060435d00",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/heap_buffer.h",
+      "target": "../../../../../../../include/perfetto/public/abi/heap_buffer.h",
+      "target_bytes": 62,
+      "target_mode": "100644",
+      "target_oid": "b5bc4ffbce8dac9356c0a8acce520a1e2503e8dd",
+      "target_path": "include/perfetto/public/abi/heap_buffer.h",
+      "target_sha256": "f3456f075082f3294fc22e8b4b2f77627cd5515994aee34d2bcc0472d2202f09",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "882a5d77d98bf8deb1d4408dfe4438ebc6fa3b76",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/pb_decoder_abi.h",
+      "target": "../../../../../../../include/perfetto/public/abi/pb_decoder_abi.h",
+      "target_bytes": 65,
+      "target_mode": "100644",
+      "target_oid": "05ba96f888111a6012d165466f5319d8c4a65c76",
+      "target_path": "include/perfetto/public/abi/pb_decoder_abi.h",
+      "target_sha256": "ab0fc5d671aec207ad8f26eec8860c74790ba3cc7894b6ed8879b1549475389a",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "83017498af19dfafb515655ae6a1e0152612a737",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/producer_abi.h",
+      "target": "../../../../../../../include/perfetto/public/abi/producer_abi.h",
+      "target_bytes": 63,
+      "target_mode": "100644",
+      "target_oid": "8899d0098e9ae16e7f914a8e1b76259e76e2a806",
+      "target_path": "include/perfetto/public/abi/producer_abi.h",
+      "target_sha256": "ec50ceaeee01df5011ec67cded9906e6a537d9402edd8135c8efc9a0b5435464",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "27d0c8ddb6eecc7c75be771116f1865995338c68",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/stream_writer_abi.h",
+      "target": "../../../../../../../include/perfetto/public/abi/stream_writer_abi.h",
+      "target_bytes": 68,
+      "target_mode": "100644",
+      "target_oid": "0f685ef49dfe2c3ebd95852413f8a9901e46b237",
+      "target_path": "include/perfetto/public/abi/stream_writer_abi.h",
+      "target_sha256": "da610770c7055e5a1d61a58d4bb2a63e05d13c26dc56b1b6233c3e607aab5d62",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "e327b4455c724f4a8ce8564c792cf0e75daa81c7",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/tracing_session_abi.h",
+      "target": "../../../../../../../include/perfetto/public/abi/tracing_session_abi.h",
+      "target_bytes": 70,
+      "target_mode": "100644",
+      "target_oid": "4446bb85d116f1f93d93d7ef28c3d13322b63cff",
+      "target_path": "include/perfetto/public/abi/tracing_session_abi.h",
+      "target_sha256": "76016c5f77e77fc6911499e045506e6378e9fbc47772cf1080f404055aa5b56e",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "6195d22d31fcc6d1ca8c1e5165d037ed45e2b346",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/track_event_abi.h",
+      "target": "../../../../../../../include/perfetto/public/abi/track_event_abi.h",
+      "target_bytes": 66,
+      "target_mode": "100644",
+      "target_oid": "6c07b30bd47d1c8bcedfd1381921cdf0c528a074",
+      "target_path": "include/perfetto/public/abi/track_event_abi.h",
+      "target_sha256": "2d0c66df02adfcb433bc5550fcec1f5125ad59ef93dcd7f5711b1b10508ac01f",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "64e6d4d5844985de4de52a8ddf75656701275f34",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/track_event_hl_abi.h",
+      "target": "../../../../../../../include/perfetto/public/abi/track_event_hl_abi.h",
+      "target_bytes": 69,
+      "target_mode": "100644",
+      "target_oid": "bd25ed6a8a09e2e769a740b80c17b2d46cd939da",
+      "target_path": "include/perfetto/public/abi/track_event_hl_abi.h",
+      "target_sha256": "b4c8b10a4ab71d268b88f84f5ab123aff2bd64bd508940a68b1ff2688faecc34",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "f0a349278f83cab6b24f533f0e605a59bd84345b",
+      "path": "contrib/rust-sdk/perfetto-sys/include/perfetto/public/abi/track_event_ll_abi.h",
+      "target": "../../../../../../../include/perfetto/public/abi/track_event_ll_abi.h",
+      "target_bytes": 69,
+      "target_mode": "100644",
+      "target_oid": "377452f34c7bc267a43f1a3e464050eeb9ded390",
+      "target_path": "include/perfetto/public/abi/track_event_ll_abi.h",
+      "target_sha256": "bd841bfdb344a8b9b65b776dfc3a5915c04ed67312f73093bd30f771899cb322",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "478ff5c2229f4db8dc10b67d0399792d1b152c71",
+      "path": "tools/check_imports",
+      "target": "shim",
+      "target_bytes": 4,
+      "target_mode": "100755",
+      "target_oid": "c005d09cb3fc866cc460e4fb6cc9f28d7e5abe1e",
+      "target_path": "tools/shim",
+      "target_sha256": "04e666aa09809daf691a99cc7bf2d57ba09bac171966a71812ffd049d7c96bb1",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/perfetto",
+      "oid": "478ff5c2229f4db8dc10b67d0399792d1b152c71",
+      "path": "tools/check_ratchet",
+      "target": "shim",
+      "target_bytes": 4,
+      "target_mode": "100755",
+      "target_oid": "c005d09cb3fc866cc460e4fb6cc9f28d7e5abe1e",
+      "target_path": "tools/shim",
+      "target_sha256": "04e666aa09809daf691a99cc7bf2d57ba09bac171966a71812ffd049d7c96bb1",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-tree",
+      "mode": "120000",
+      "mount": "src/third_party/flatbuffers/src",
+      "oid": "231bcd8006cf4cb903de9da3fc3b966638dabd82",
+      "path": "java/src/test/java/DictionaryLookup",
+      "target": "../../../../tests/DictionaryLookup",
+      "target_bytes": 34,
+      "target_mode": "040000",
+      "target_oid": "73368664329fd8e34f0510a9e7afb921069cea90",
+      "target_path": "tests/DictionaryLookup",
+      "target_sha256": "bb77eeb9c2f1675dc936223f875c85c81562ae5200cab19e6afca2cbb2532f9e",
+      "target_type": "tree",
+      "type": "blob"
+    },
+    {
+      "action": "copy-tree",
+      "mode": "120000",
+      "mount": "src/third_party/flatbuffers/src",
+      "oid": "0ba918ed02d31822299bdc89df3be4b0c8efa978",
+      "path": "java/src/test/java/MyGame",
+      "target": "../../../../tests/MyGame",
+      "target_bytes": 24,
+      "target_mode": "040000",
+      "target_oid": "c815b6fc8f9caf9f529df5e53fee74583954d5f6",
+      "target_path": "tests/MyGame",
+      "target_sha256": "22f456dfef0a7c91e624782e273a21300f25adab85cfe1e09d05a60a2bc5e589",
+      "target_type": "tree",
+      "type": "blob"
+    },
+    {
+      "action": "copy-tree",
+      "mode": "120000",
+      "mount": "src/third_party/flatbuffers/src",
+      "oid": "37a8d897e4c6ae280eccc40fa19bae1debc311d5",
+      "path": "java/src/test/java/NamespaceA",
+      "target": "../../../../tests/namespace_test/NamespaceA",
+      "target_bytes": 43,
+      "target_mode": "040000",
+      "target_oid": "0e1e0f7b361833c4f4fcaf3e82997744c036f813",
+      "target_path": "tests/namespace_test/NamespaceA",
+      "target_sha256": "bf82e9f4230d2d42cc927fc9e26e32c4dbdbacb1199f1df29a911dadffa274a6",
+      "target_type": "tree",
+      "type": "blob"
+    },
+    {
+      "action": "copy-tree",
+      "mode": "120000",
+      "mount": "src/third_party/flatbuffers/src",
+      "oid": "c1e44a8c94b1655f22f57a6db66d80b90db446f8",
+      "path": "java/src/test/java/NamespaceC",
+      "target": "../../../../tests/namespace_test/NamespaceC",
+      "target_bytes": 43,
+      "target_mode": "040000",
+      "target_oid": "0c0d3f5c3792306de357fe9fbf1550e7f66c6e09",
+      "target_path": "tests/namespace_test/NamespaceC",
+      "target_sha256": "dcd00cfec8a847b465412002cdb0e83c85bb2d4208c3931cfa25280efe72f435",
+      "target_type": "tree",
+      "type": "blob"
+    },
+    {
+      "action": "copy-tree",
+      "mode": "120000",
+      "mount": "src/third_party/flatbuffers/src",
+      "oid": "44a35f96769d3dda9ab5abf3c3d4bc2a757ceef7",
+      "path": "java/src/test/java/optional_scalars",
+      "target": "../../../../tests/optional_scalars",
+      "target_bytes": 34,
+      "target_mode": "040000",
+      "target_oid": "cde194a4e10fa7bf845b44b7949cc830630e9214",
+      "target_path": "tests/optional_scalars",
+      "target_sha256": "7f5abd84c7744edfafff1bc2bbaa67c43b006687211cb4991e09fd9da0aea6a9",
+      "target_type": "tree",
+      "type": "blob"
+    },
+    {
+      "action": "copy-tree",
+      "mode": "120000",
+      "mount": "src/third_party/flatbuffers/src",
+      "oid": "cc82221f5de90f40aaa9faf3402b0937487cf965",
+      "path": "java/src/test/java/union_vector",
+      "target": "../../../../tests/union_vector",
+      "target_bytes": 30,
+      "target_mode": "040000",
+      "target_oid": "d1ca5d46a7d0cb14c7819031e31132a5a5f97e6f",
+      "target_path": "tests/union_vector",
+      "target_sha256": "5349eff80a9ebe158f3f6e4c8138f69428c08c2eebb8d0c5307cc427f68e3141",
+      "target_type": "tree",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/flatbuffers/src",
+      "oid": "6b271c2f964fb7f193df24e47b077e8b8bcb1cb3",
+      "path": "tests/ts/bazel_repository_test_dir/.npmrc",
+      "target": "../../../.npmrc",
+      "target_bytes": 15,
+      "target_mode": "100644",
+      "target_oid": "84ff0791f0d92d5d7107603c73b6bd6aa07f8962",
+      "target_path": ".npmrc",
+      "target_sha256": "262d1904ef7a6d8fda34cbace1e3a559497c1cfa81f05d2c367ea22db22983bb",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/flatbuffers/src",
+      "oid": "4e26811d4163af557d0e954f41bfc07c1c0e036e",
+      "path": "ts/package.json",
+      "target": "../package.json",
+      "target_bytes": 15,
+      "target_mode": "100644",
+      "target_oid": "92b0f8dc3493b6528b8cc73607e246c5712ecc7b",
+      "target_path": "package.json",
+      "target_sha256": "985e5449483ced2d2e86e1e2c281dd1bf7216dd8ddd0f4ead2da40abbbb02218",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/flatbuffers/src",
+      "oid": "c8d5d6ebce45ee4838d92bde290ed4dd4224cad8",
+      "path": "ts/pnpm-lock.yaml",
+      "target": "../pnpm-lock.yaml",
+      "target_bytes": 17,
+      "target_mode": "100644",
+      "target_oid": "ec8a519017995cd0998bdab407e607f4e289c49a",
+      "target_path": "pnpm-lock.yaml",
+      "target_sha256": "f7cdde32e00ff9f6c23065546a702a2e582b0d8ff3c12ed25d7403c57aa9a649",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "a052c1c1956458886f8e11a8d0de2b48282b79b4",
+      "path": "examples/python/auth/helloworld.proto",
+      "target": "../../protos/helloworld.proto",
+      "target_bytes": 29,
+      "target_mode": "100644",
+      "target_oid": "9a0b59c0d3dbc6ac09cb5ce7bf14f20d35475504",
+      "target_path": "examples/protos/helloworld.proto",
+      "target_sha256": "73064bebcf4fce2d2c7c6bd5668e8aa20e8359e42b6f053cb34a19172fcf5c3d",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "a052c1c1956458886f8e11a8d0de2b48282b79b4",
+      "path": "examples/python/debug/helloworld.proto",
+      "target": "../../protos/helloworld.proto",
+      "target_bytes": 29,
+      "target_mode": "100644",
+      "target_oid": "9a0b59c0d3dbc6ac09cb5ce7bf14f20d35475504",
+      "target_path": "examples/protos/helloworld.proto",
+      "target_sha256": "73064bebcf4fce2d2c7c6bd5668e8aa20e8359e42b6f053cb34a19172fcf5c3d",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "a052c1c1956458886f8e11a8d0de2b48282b79b4",
+      "path": "examples/python/wait_for_ready/helloworld.proto",
+      "target": "../../protos/helloworld.proto",
+      "target_bytes": 29,
+      "target_mode": "100644",
+      "target_oid": "9a0b59c0d3dbc6ac09cb5ce7bf14f20d35475504",
+      "target_path": "examples/protos/helloworld.proto",
+      "target_sha256": "73064bebcf4fce2d2c7c6bd5668e8aa20e8359e42b6f053cb34a19172fcf5c3d",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-tree",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "bc769f9c1444ff7d691292bf767d23d4b7d59422",
+      "path": "spm-core-include/grpc",
+      "target": "../include/grpc",
+      "target_bytes": 15,
+      "target_mode": "040000",
+      "target_oid": "1518a7cde4de14926955786fdcf69776eef7a992",
+      "target_path": "include/grpc",
+      "target_sha256": "6cda45c252b9988ee897b69a577bcac7916a416009ad32c5888921c1fce74fd6",
+      "target_type": "tree",
+      "type": "blob"
+    },
+    {
+      "action": "copy-tree",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "ef3aa905e01f16411ed7e9c01492a682e45477ad",
+      "path": "spm-cpp-include/grpcpp",
+      "target": "../include/grpcpp",
+      "target_bytes": 17,
+      "target_mode": "040000",
+      "target_oid": "d627754a491d93c37f0319db235437a8d372dca8",
+      "target_path": "include/grpcpp",
+      "target_sha256": "c06efa0dd5778a2d8fe2f00efdc57771d36e126af8775f43012a939fdbb3f567",
+      "target_type": "tree",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "2cf6617a42664b085935c94682e907d9da41b4da",
+      "path": "test/core/tsi/test_creds/crl_data/crls/ab06acdd.r0",
+      "target": "current.crl",
+      "target_bytes": 11,
+      "target_mode": "100644",
+      "target_oid": "92855e118166931a6822c5036f54dfaf37ff0649",
+      "target_path": "test/core/tsi/test_creds/crl_data/crls/current.crl",
+      "target_sha256": "262e2e5b8f670feb4b40db1ac7b0002f3e8af7db234ceae26fa93bf1a8663a12",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "c3ea7e559488a0fc5dd9d4a818e2ea3b9541f6fa",
+      "path": "test/core/tsi/test_creds/crl_data/crls/b9322cac.r0",
+      "target": "intermediate.crl",
+      "target_bytes": 16,
+      "target_mode": "100644",
+      "target_oid": "f5a3c13a243467617561a5bc94afef8a50d101af",
+      "target_path": "test/core/tsi/test_creds/crl_data/crls/intermediate.crl",
+      "target_sha256": "919f3418c386381d1ff7bd9462857f624dc1bb12af32cdac18d0082a06f85c80",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "2cf6617a42664b085935c94682e907d9da41b4da",
+      "path": "test/core/tsi/test_creds/crl_data/crls_missing_intermediate/ab06acdd.r0",
+      "target": "current.crl",
+      "target_bytes": 11,
+      "target_mode": "100644",
+      "target_oid": "92855e118166931a6822c5036f54dfaf37ff0649",
+      "target_path": "test/core/tsi/test_creds/crl_data/crls_missing_intermediate/current.crl",
+      "target_sha256": "262e2e5b8f670feb4b40db1ac7b0002f3e8af7db234ceae26fa93bf1a8663a12",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "c3ea7e559488a0fc5dd9d4a818e2ea3b9541f6fa",
+      "path": "test/core/tsi/test_creds/crl_data/crls_missing_root/b9322cac.r0",
+      "target": "intermediate.crl",
+      "target_bytes": 16,
+      "target_mode": "100644",
+      "target_oid": "f5a3c13a243467617561a5bc94afef8a50d101af",
+      "target_path": "test/core/tsi/test_creds/crl_data/crls_missing_root/intermediate.crl",
+      "target_sha256": "919f3418c386381d1ff7bd9462857f624dc1bb12af32cdac18d0082a06f85c80",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "4ba16c7dee5248db9f5cbc3bb411ce725de7acda",
+      "path": "test/core/util/http_client/python_wrapper.sh",
+      "target": "../../../../tools/distrib/python_wrapper.sh",
+      "target_bytes": 43,
+      "target_mode": "100755",
+      "target_oid": "f9e61dafe8c58578da1ffb4cc62e1085666f52a8",
+      "target_path": "tools/distrib/python_wrapper.sh",
+      "target_sha256": "6c08fae68f590280dbf86f559f161dd6cd4eef82f90556fe65eb8cc13f1987d0",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "e50c110d3a8a61691f197fc02d2b4d6fc4653a95",
+      "path": "test/distrib/bazel/cpp/tools/bazel",
+      "target": "../../../../../tools/bazel",
+      "target_bytes": 26,
+      "target_mode": "100755",
+      "target_oid": "6ee1a04002d8946ad990a714e27498283478dbf8",
+      "target_path": "tools/bazel",
+      "target_sha256": "32d9505dcf3fdb19d0396ba92b9b39783a4ef2d684ac7baf2d7e1f136bc33819",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "e50c110d3a8a61691f197fc02d2b4d6fc4653a95",
+      "path": "test/distrib/bazel/python/tools/bazel",
+      "target": "../../../../../tools/bazel",
+      "target_bytes": 26,
+      "target_mode": "100755",
+      "target_oid": "6ee1a04002d8946ad990a714e27498283478dbf8",
+      "target_path": "tools/bazel",
+      "target_sha256": "32d9505dcf3fdb19d0396ba92b9b39783a4ef2d684ac7baf2d7e1f136bc33819",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/re2/src",
+      "oid": "ea5b60640b01f74e295037aa8a6b7d4ea278a739",
+      "path": "python/LICENSE",
+      "target": "../LICENSE",
+      "target_bytes": 10,
+      "target_mode": "100644",
+      "target_oid": "09e5ec1c74c187adc8fde6c74308c3492ef31f77",
+      "target_path": "LICENSE",
+      "target_sha256": "1e881ecf2862d01e6e5bc2b861e46886d2a6fb01499c0c508a209a7271b13cf2",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/tflite/src",
+      "oid": "8222daa453ba30abc1079806246f78c42f8f1587",
+      "path": ".pylintrc",
+      "target": "tensorflow/tools/ci_build/pylintrc",
+      "target_bytes": 34,
+      "target_mode": "100644",
+      "target_oid": "89ccd2c2cf3982b60127bb1c743e5f8295f72ec8",
+      "target_path": "tensorflow/tools/ci_build/pylintrc",
+      "target_sha256": "f8f90f4d55bd318eb7e944907728798b1cff18129b68e80818302cd07892f270",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/tflite/src",
+      "oid": "63d35330f1ee498ebb2570a4317cfb43d7bdc449",
+      "path": "tensorflow/tools/tf_sig_build_dockerfiles/devel.usertools/nvidia.bazelrc",
+      "target": "gpu.bazelrc",
+      "target_bytes": 11,
+      "target_mode": "100644",
+      "target_oid": "373563cc32473c4f5c43e4d047a23b89794100cc",
+      "target_path": "tensorflow/tools/tf_sig_build_dockerfiles/devel.usertools/gpu.bazelrc",
+      "target_sha256": "1071c93183427d9a53fe3c3b5e80507b09942ec4a53b5e81f0b850a9e32fa05d",
+      "target_type": "file",
+      "type": "blob"
+    },
+    {
+      "action": "copy-file",
+      "mode": "120000",
+      "mount": "src/third_party/xnnpack/src",
+      "oid": "4ae7d89ab1f1e1d50e11bd9e33b636aa3c6f97f9",
+      "path": "tools/xngen",
+      "target": "xngen.py",
+      "target_bytes": 8,
+      "target_mode": "100755",
+      "target_oid": "1ae52801753fce9ccc1772e74849c5cfffb73c19",
+      "target_path": "tools/xngen.py",
+      "target_sha256": "dc0ca217baad60147cff4aa52cc405c2cce61dd9deaa7a91015b3d7ac3ddd1b9",
+      "target_type": "file",
+      "type": "blob"
+    }
+  ],
+  "command_timeout_seconds": 1800,
+  "condition_values": {
+    "checkout_arm": false,
+    "checkout_arm64": false,
+    "checkout_mips": false,
+    "checkout_x64": true,
+    "checkout_x86": false
+  },
+  "deps_files": [
+    {
+      "bytes": 52688,
+      "mount": "src",
+      "path": "DEPS",
+      "sha256": "8f7895f3614c31e317e3298f040d7217220fc711655f3fbb0f5379333da08e3f"
+    },
+    {
+      "bytes": 2000,
+      "mount": "src/buildtools",
+      "path": "DEPS",
+      "sha256": "72317f8d247e4a40a8629efaf0d267302258715ddc38b4d28448f1fecb4bb9b4"
+    }
+  ],
+  "git": {
+    "bytes": null,
+    "path": "REVIEWED_WINDOWS_GIT_PATH_UNBOUND",
+    "sha256": "REVIEWED_WINDOWS_GIT_SHA256_UNBOUND",
+    "version": "REVIEWED_WINDOWS_GIT_VERSION_UNBOUND"
+  },
+  "gitlinks": [
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "76bb24329e8bf5f39704eb10d21b9a80befa7c81",
+      "path": "third_party/abseil-cpp",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "12235e24652fc7f809373e7c11a5f73c5763fc4c",
+      "path": "third_party/benchmark",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "60209eb1ccc34d5deefb002d1b7f37545204f7f2",
+      "path": "third_party/bloaty",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "c63fadbde60a2224c22189d14c4001bbd2a3a629",
+      "path": "third_party/boringssl-with-bazel",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "d3a507e920e7af18a5efb7f9f1d8044ed4750013",
+      "path": "third_party/cares/cares",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "4de3c74cf21a9958c1cf26d8993c55c6e0d28b49",
+      "path": "third_party/envoy-api",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "fe8ba054ad4f7eca946c2d14a63c3f07c0b586a0",
+      "path": "third_party/googleapis",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "52eb8108c5bdec04579160ae17225d66034bd723",
+      "path": "third_party/googletest",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "4aa53e15cbf1a47bc9087e6cfdca214c1eea4e89",
+      "path": "third_party/opencensus-proto",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "60fa8754d890b5c55949a8c68dcfd7ab5c2395df",
+      "path": "third_party/opentelemetry",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "ced79860f8c8a091a2eabfee6d47783f828a9b59",
+      "path": "third_party/opentelemetry-cpp",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "74211c0dfc2777318ab53c2cd2c317a2ef9012de",
+      "path": "third_party/protobuf",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "7b06248484ceeaa947e93ca2747eccf336a88ecc",
+      "path": "third_party/protoc-gen-validate",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "0c5616df9c0aaa44c9440d87422012423d91c7d1",
+      "path": "third_party/re2",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "3a472e524827f72d1ad621c4983dd5af54c46776",
+      "path": "third_party/xds",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/grpc/src",
+      "oid": "f1f503da85d52e56aae11557b4d79a42bcaa2b86",
+      "path": "third_party/zlib",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/crc32c/src",
+      "oid": "e991355c02b93fe17713efe04cbc2e278e00fdbd",
+      "path": "third_party/benchmark",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/crc32c/src",
+      "oid": "56523194b3ce1212414c93d55f31832e94677f55",
+      "path": "third_party/glog",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/crc32c/src",
+      "oid": "3b49be074d5c1340eeb447e6a8e78427051e675a",
+      "path": "third_party/googletest",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/freetype/src",
+      "oid": "395ccad2c1e0daae535c4d20bb0a3f2424648e17",
+      "path": "subprojects/dlg",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/ruy/src",
+      "oid": "082deffc80ce517f81dc2f3aebe6ba671fcd09c9",
+      "path": "third_party/cpuinfo",
+      "type": "commit"
+    },
+    {
+      "action": "uninitialized-directory",
+      "mode": "160000",
+      "mount": "src/third_party/ruy/src",
+      "oid": "6c58c11d5497b6ee1df3cb400ce30deb72fc28c0",
+      "path": "third_party/googletest",
+      "type": "commit"
+    }
+  ],
+  "patch_manifest": {
+    "path": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/patch-manifest.json",
+    "sha256": "29062512a21b64c9ee7cec6d742f71be29bf91c151a4b81ac3e2e0a5173be45b"
+  },
+  "repositories": [
+    {
+      "mount": "src",
+      "revision": "aaeeee8077eb0a4cad1c9494e9c6433c751ef663",
+      "tree": "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5",
+      "url": "https://github.com/webrtc-sdk/webrtc.git"
+    },
+    {
+      "mount": "outer-depot",
+      "revision": "b52fe87d04af61df3dd07748ff2c2c0b649dca09",
+      "tree": "5c857570433c574a02614b3aab9be1f34493095d",
+      "url": "https://chromium.googlesource.com/chromium/tools/depot_tools.git"
+    },
+    {
+      "mount": "src/build",
+      "revision": "be1a8f6dcd7df7e46320192c5e2f364e50d79bbf",
+      "tree": "3ad20ff19575b750dc27b73f852aa960d7e8bcd2",
+      "url": "https://github.com/webrtc-sdk/build"
+    },
+    {
+      "mount": "src/buildtools",
+      "revision": "aec4f3c79e5af648386819cbe7f6e67206385ece",
+      "tree": "a3e6af02b8c81472c67d47bce22caa1f87a83889",
+      "url": "https://chromium.googlesource.com/chromium/src/buildtools"
+    },
+    {
+      "mount": "src/testing",
+      "revision": "9b3d3d6543ec7bd1d15fbb60da594103d2720ac7",
+      "tree": "84ac15456637eecdd3dd5f3ea559a9a7ab760c42",
+      "url": "https://chromium.googlesource.com/chromium/src/testing"
+    },
+    {
+      "mount": "src/third_party",
+      "revision": "a3b630c291f1cf3b711687b1c4be322d3015512e",
+      "tree": "32dbf9cd7b47c84afa9d9655e0e882c1a09b6952",
+      "url": "https://chromium.googlesource.com/chromium/src/third_party"
+    },
+    {
+      "mount": "src/third_party/clang-format/script",
+      "revision": "c2725e0622e1a86d55f14514f2177a39efea4a0e",
+      "tree": "5117026e03ac0ec21b1c163738d26a7c9443f611",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/clang/tools/clang-format.git"
+    },
+    {
+      "mount": "src/third_party/compiler-rt/src",
+      "revision": "f28e701c2714aa2a28479511d8f76e903a4d2e4c",
+      "tree": "1982df919d64b91e349fa733ff2c1854ec02ff51",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/compiler-rt.git"
+    },
+    {
+      "mount": "src/third_party/libc++/src",
+      "revision": "fa224989fd9c52f68042d7fd6824302c33cb68c0",
+      "tree": "6d2ba61472bdabd82433303001f2e4d4d8748e37",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxx.git"
+    },
+    {
+      "mount": "src/third_party/libc++abi/src",
+      "revision": "83a852080747b9a362e8f9e361366b7a601f302c",
+      "tree": "eddc55517099869ccdecdfb004d63890af973562",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxxabi.git"
+    },
+    {
+      "mount": "src/third_party/llvm-libc/src",
+      "revision": "f950018bf8a84246c899b9ac360a271064577d42",
+      "tree": "fe516046113e3464064bd83f06143d0ac0d25cec",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libc.git"
+    },
+    {
+      "mount": "src/third_party/libunwind/src",
+      "revision": "7ff36f1e358ffb63e25f27a1b5e8e0c52e15c49c",
+      "tree": "ff30be3f6dcc98f62747be3fb399699ab439cc5e",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libunwind.git"
+    },
+    {
+      "mount": "src/third_party/boringssl/src",
+      "revision": "b94d71f87ff943a617d77f3ff029f9a01a1ec6bc",
+      "tree": "2df4491a34d3e45fb52dd2d121820105d525935f",
+      "url": "https://boringssl.googlesource.com/boringssl.git"
+    },
+    {
+      "mount": "src/third_party/breakpad/breakpad",
+      "revision": "d0b41ca2a38c7b14c4b7853254eb5bf3b4039691",
+      "tree": "178754e911c3dfed064ba16a7038e1f9549dac3b",
+      "url": "https://chromium.googlesource.com/breakpad/breakpad.git"
+    },
+    {
+      "mount": "src/third_party/catapult",
+      "revision": "4646f4c0fa1f6daa506d06153beae34eb7d87265",
+      "tree": "77bb15927f6f96cdce7e777e94e75c175a8eedff",
+      "url": "https://chromium.googlesource.com/catapult.git"
+    },
+    {
+      "mount": "src/third_party/ced/src",
+      "revision": "ba412eaaacd3186085babcd901679a48863c7dd5",
+      "tree": "6fbb4c383f8957ff9c1d9d01ad1e117f3b11fc93",
+      "url": "https://chromium.googlesource.com/external/github.com/google/compact_enc_det.git"
+    },
+    {
+      "mount": "src/third_party/colorama/src",
+      "revision": "3de9f013df4b470069d03d250224062e8cf15c49",
+      "tree": "7832a6a9c86aa935e29c35ca78a809095f94c67e",
+      "url": "https://chromium.googlesource.com/external/colorama.git"
+    },
+    {
+      "mount": "src/third_party/crc32c/src",
+      "revision": "d3d60ac6e0f16780bcfcc825385e1d338801a558",
+      "tree": "a13a450ad2445b98a18f93ec9f1907cae1b1784e",
+      "url": "https://chromium.googlesource.com/external/github.com/google/crc32c.git"
+    },
+    {
+      "mount": "src/third_party/depot_tools",
+      "revision": "8efa575d754b8703d99b0f827528e45aeaa167aa",
+      "tree": "b3d7e91a1bf43cd5789671458c05c9b9e74c695a",
+      "url": "https://chromium.googlesource.com/chromium/tools/depot_tools.git"
+    },
+    {
+      "mount": "src/third_party/ffmpeg",
+      "revision": "583a135878d38065ef1e3d08cd80b7fbe76e0a7b",
+      "tree": "24a3f831efad98f7cf781b0e979ec5dcb6245866",
+      "url": "https://chromium.googlesource.com/chromium/third_party/ffmpeg.git"
+    },
+    {
+      "mount": "src/third_party/flatbuffers/src",
+      "revision": "187240970746d00bbd26b0f5873ed54d2477f9f3",
+      "tree": "489678cbf326b3f9e0ff680d85260dd1e65cbaa2",
+      "url": "https://chromium.googlesource.com/external/github.com/google/flatbuffers.git"
+    },
+    {
+      "mount": "src/third_party/grpc/src",
+      "revision": "185abba8495dc9920e121ff77b682d9db772fc3b",
+      "tree": "0d78cb65dfda9b4b8f1cc2e0c83cb53dedc554d1",
+      "url": "https://chromium.googlesource.com/external/github.com/grpc/grpc.git"
+    },
+    {
+      "mount": "src/third_party/freetype/src",
+      "revision": "6d4977d66033e7841219bdc2b686a97552091ade",
+      "tree": "77f0e1a6d0dae14be70fc40a9e05b83292082050",
+      "url": "https://chromium.googlesource.com/chromium/src/third_party/freetype2.git"
+    },
+    {
+      "mount": "src/third_party/harfbuzz-ng/src",
+      "revision": "7d936359a27abb2d7cb14ecc102463bb15c11843",
+      "tree": "6218949184377181bd8630b21b18b32afdbc604c",
+      "url": "https://chromium.googlesource.com/external/github.com/harfbuzz/harfbuzz.git"
+    },
+    {
+      "mount": "src/third_party/google_benchmark/src",
+      "revision": "188e8278990a9069ffc84441cb5a024fd0bede37",
+      "tree": "83baf219386f6a31334e002b8cf994f649507eea",
+      "url": "https://chromium.googlesource.com/external/github.com/google/benchmark.git"
+    },
+    {
+      "mount": "src/third_party/libpfm4/src",
+      "revision": "964baf9d35d5f88d8422f96d8a82c672042e7064",
+      "tree": "cb91412ed6d1394d18a1a3ff07f77be08790b760",
+      "url": "https://chromium.googlesource.com/external/git.code.sf.net/p/perfmon2/libpfm4.git"
+    },
+    {
+      "mount": "src/third_party/gtest-parallel",
+      "revision": "cd488bdedc1d2cffb98201a17afc1b298b0b90f1",
+      "tree": "275a52dabace8c70c9fb69cccad138a3c8add4cd",
+      "url": "https://chromium.googlesource.com/external/github.com/google/gtest-parallel"
+    },
+    {
+      "mount": "src/third_party/googletest/src",
+      "revision": "4fe3307fb2d9f86d19777c7eb0e4809e9694dde7",
+      "tree": "feafbf9cf5deeb64dbe983f5574cb50f96fc330b",
+      "url": "https://chromium.googlesource.com/external/github.com/google/googletest.git"
+    },
+    {
+      "mount": "src/third_party/icu",
+      "revision": "a86a32e67b8d1384b33f8fa48c83a6079b86f8cd",
+      "tree": "73b9cb2be837165ec31f9512bec2577255b825eb",
+      "url": "https://chromium.googlesource.com/chromium/deps/icu.git"
+    },
+    {
+      "mount": "src/third_party/jsoncpp/source",
+      "revision": "42e892d96e47b1f6e29844cc705e148ec4856448",
+      "tree": "c9b5ffc95a60647ddfba8a148daa86d0235df093",
+      "url": "https://chromium.googlesource.com/external/github.com/open-source-parsers/jsoncpp.git"
+    },
+    {
+      "mount": "src/third_party/libFuzzer/src",
+      "revision": "bea408a6e01f0f7e6c82a43121fe3af4506c932e",
+      "tree": "c7aa7f0f125d459d35703efada325467ce5c14b0",
+      "url": "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/compiler-rt/lib/fuzzer.git"
+    },
+    {
+      "mount": "src/third_party/fuzztest/src",
+      "revision": "7406afb783ff5e7f3a1a66aebb81090622716412",
+      "tree": "cf12e789250c4bdf4068e198a3eb9be4f541f1ac",
+      "url": "https://chromium.googlesource.com/external/github.com/google/fuzztest.git"
+    },
+    {
+      "mount": "src/third_party/libjpeg_turbo",
+      "revision": "6383cf609c1f63c18af0f59b2738caa0c6c7e379",
+      "tree": "c278e160d347f44d1ce32f277d8abd385ea4f4fa",
+      "url": "https://chromium.googlesource.com/chromium/deps/libjpeg_turbo.git"
+    },
+    {
+      "mount": "src/third_party/libsrtp",
+      "revision": "a52756acb1c5e133089c798736dd171567df11f5",
+      "tree": "4afda16a1c46a03fbef3e61f523ea02ccf1dc4ba",
+      "url": "https://chromium.googlesource.com/chromium/deps/libsrtp.git"
+    },
+    {
+      "mount": "src/third_party/dav1d/libdav1d",
+      "revision": "fcbc3d1b93f91c709293ed9faea8b7cbcac9030b",
+      "tree": "5186347aef2bdd7d4812c418be7e6416153d5352",
+      "url": "https://chromium.googlesource.com/external/github.com/videolan/dav1d.git"
+    },
+    {
+      "mount": "src/third_party/libaom/source/libaom",
+      "revision": "5d80673d723a5e2e268b124d81d425053823d875",
+      "tree": "8fd8942c97672bdb6a6ee3b23a785f0dcfc3025c",
+      "url": "https://aomedia.googlesource.com/aom.git"
+    },
+    {
+      "mount": "src/third_party/libgav1/src",
+      "revision": "c05bf9be660cf170d7c26bd06bb42b3322180e58",
+      "tree": "619830b08c05434dba5122d3883514131125b586",
+      "url": "https://chromium.googlesource.com/codecs/libgav1.git"
+    },
+    {
+      "mount": "src/third_party/perfetto",
+      "revision": "a8060b7bea06166ac541ce97670053882375e309",
+      "tree": "4c580fb3dccdd1fdd4e4a814d7ceacf0ac7a7a2a",
+      "url": "https://chromium.googlesource.com/external/github.com/google/perfetto.git"
+    },
+    {
+      "mount": "src/third_party/protobuf-javascript/src",
+      "revision": "e6d763860001ba1a76a63adcff5efb12b1c96024",
+      "tree": "959213c9a64a13d0b05babb914396796bf2238ff",
+      "url": "https://chromium.googlesource.com/external/github.com/protocolbuffers/protobuf-javascript"
+    },
+    {
+      "mount": "src/third_party/libvpx/source/libvpx",
+      "revision": "9a7674e1a83d1261a49776c8794b87c9bccc85d7",
+      "tree": "6e7668e798d13f4ad30559bb276fedb0a97abffa",
+      "url": "https://chromium.googlesource.com/webm/libvpx.git"
+    },
+    {
+      "mount": "src/third_party/libyuv",
+      "revision": "4825d9b29eea4dac24607245db7ec7d4c41c1964",
+      "tree": "4161ac9dece5c805f1babf4d9e66beace8562881",
+      "url": "https://chromium.googlesource.com/libyuv/libyuv.git"
+    },
+    {
+      "mount": "src/third_party/nasm",
+      "revision": "af5eeeb054bebadfbb79c7bcd100a95e2ad4525f",
+      "tree": "1c758a0853e56e755cc16fa081314c24888435e1",
+      "url": "https://chromium.googlesource.com/chromium/deps/nasm.git"
+    },
+    {
+      "mount": "src/third_party/openh264/src",
+      "revision": "652bdb7719f30b52b08e506645a7322ff1b2cc6f",
+      "tree": "a13ae6006ce07d60dd6fd3bd7db2912375b839d2",
+      "url": "https://chromium.googlesource.com/external/github.com/cisco/openh264"
+    },
+    {
+      "mount": "src/third_party/re2/src",
+      "revision": "e7aec5985072c1dbe735add802653ef4b36c231a",
+      "tree": "fd0c96ea2debf9999f71ad58bd058c1c6f4262e2",
+      "url": "https://chromium.googlesource.com/external/github.com/google/re2.git"
+    },
+    {
+      "mount": "src/tools",
+      "revision": "8993ecb8d92d9571c0f78e22a90b71783fe696d8",
+      "tree": "abbd541703ac680510f754281dcadc6b4d316f26",
+      "url": "https://chromium.googlesource.com/chromium/src/tools"
+    },
+    {
+      "mount": "src/third_party/tflite/src",
+      "revision": "581d1a6689062926c6459ad3c7807278220e24c9",
+      "tree": "028a024a40d4d5553638cd9fef27c8a0b117ef02",
+      "url": "https://chromium.googlesource.com/external/github.com/tensorflow/tensorflow.git"
+    },
+    {
+      "mount": "src/third_party/pthreadpool/src",
+      "revision": "d90cd6f1493e09d12c407243f7f331a8cda55efb",
+      "tree": "5e8a73d5a53fc4635ef028c020f0030e22dca894",
+      "url": "https://chromium.googlesource.com/external/github.com/google/pthreadpool.git"
+    },
+    {
+      "mount": "src/third_party/xnnpack/src",
+      "revision": "b26a32f4afcef0a41c8b5f9981864ef7c838067d",
+      "tree": "50810a6e822ab2d3c0f1645836d833eeb1873f9c",
+      "url": "https://chromium.googlesource.com/external/github.com/google/XNNPACK.git"
+    },
+    {
+      "mount": "src/third_party/farmhash/src",
+      "revision": "816a4ae622e964763ca0862d9dbd19324a1eaf45",
+      "tree": "919dc93811a9d1872a260210d579ea1059e538d3",
+      "url": "https://chromium.googlesource.com/external/github.com/google/farmhash.git"
+    },
+    {
+      "mount": "src/third_party/ruy/src",
+      "revision": "9940fbf1e0c0863907e77e0600b99bb3e2bc2b9f",
+      "tree": "6b1b04f1c5c2df63f8b3e4cff0317532e45b8e15",
+      "url": "https://chromium.googlesource.com/external/github.com/google/ruy.git"
+    },
+    {
+      "mount": "src/third_party/cpuinfo/src",
+      "revision": "161a9ec374884f4b3e85725cb22e05f9458fdc93",
+      "tree": "d990ead5980dafd52612acd8fbebfb78e7725f8e",
+      "url": "https://chromium.googlesource.com/external/github.com/pytorch/cpuinfo.git"
+    },
+    {
+      "mount": "src/third_party/eigen3/src",
+      "revision": "dcbaf2d608f306450f1e74949eb87e9a22a7ef4b",
+      "tree": "060ad35fd56b85d524a9c614b0dce37f70e04c9f",
+      "url": "https://chromium.googlesource.com/external/gitlab.com/libeigen/eigen.git"
+    },
+    {
+      "mount": "src/third_party/fp16/src",
+      "revision": "3d2de1816307bac63c16a297e8c4dc501b4076df",
+      "tree": "052b1ec2fb66e4f709ecbdc11dd43c2bfb979f32",
+      "url": "https://chromium.googlesource.com/external/github.com/Maratyszcza/FP16.git"
+    },
+    {
+      "mount": "src/third_party/gemmlowp/src",
+      "revision": "16e8662c34917be0065110bfcd9cc27d30f52fdf",
+      "tree": "c624d80dca3991dceaebb120b9659c73e273baaa",
+      "url": "https://chromium.googlesource.com/external/github.com/google/gemmlowp.git"
+    },
+    {
+      "mount": "src/third_party/fxdiv/src",
+      "revision": "63058eff77e11aa15bf531df5dd34395ec3017c8",
+      "tree": "f49cdff6b7a861d0097471edcca842fe685477c0",
+      "url": "https://chromium.googlesource.com/external/github.com/Maratyszcza/FXdiv.git"
+    },
+    {
+      "mount": "src/third_party/neon_2_sse/src",
+      "revision": "eb8b80b28f956275e291ea04a7beb5ed8289e872",
+      "tree": "977fd0227b010913e7e32a144ea3eb1c21e2f994",
+      "url": "https://chromium.googlesource.com/external/github.com/intel/ARM_NEON_2_x86_SSE.git"
+    }
+  ],
+  "schema": "morpheus-native-webrtc-sources-v3",
+  "security_plan": {
+    "path": "RUNNER_TEMP_INPUT_ROOT_UNBOUND/inputs/root-security-source-plan.json",
+    "sha256": "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
+  },
+  "target": "win-x64"
+}

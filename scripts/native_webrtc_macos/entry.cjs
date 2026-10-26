@@ -69,6 +69,54 @@ function sdkInventory(root) {
     directory_topology_sha256: crypto.createHash('sha256').update(dirBytes).digest('hex'), files: files.length,
     directories: directories.length, original_file_bytes: total, sdk_bytes_copied: false };
 }
+// Optional discovery never promotes a refused identity into an admitted SDK.
+// Only fixed categories and already-filtered app/SDK basenames leave this path.
+function preflightXcodes() {
+  entryFailure = 'preflight_xcode_listing';
+  const xcodes = fs.readdirSync('/Applications').filter(x => /^Xcode(?:_[A-Za-z0-9_.-]+)?\.app$/.test(x));
+  need(xcodes.length <= 32);
+  const sdk = [], xcodeCandidates = [], sdkCandidates = [];
+  for (const app of xcodes) {
+    const candidate = {app, version_plist: 'UNBOUND', sdk_listing: 'UNBOUND', failures: []};
+    xcodeCandidates.push(candidate);
+    let canonical;
+    entryFailure = 'preflight_xcode_root';
+    try {
+      canonical = fs.realpathSync(path.join('/Applications', app));
+      need(path.dirname(canonical) === '/Applications');
+    } catch (_) { candidate.failures.push('preflight_xcode_root'); continue; }
+    entryFailure = 'preflight_xcode_version';
+    try {
+      const version = fact(path.join(canonical, 'Contents/version.plist'), 1024 * 1024);
+      delete version.path;
+      candidate.version_plist = version;
+    } catch (_) { candidate.failures.push('preflight_xcode_version'); }
+    const sdkDir = path.join(canonical, 'Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs');
+    let names;
+    entryFailure = 'preflight_sdk_listing';
+    try {
+      names = fs.readdirSync(sdkDir).filter(n => /^MacOSX\d+\.\d+\.sdk$/.test(n));
+      need(names.length <= 32 && sdkCandidates.length + names.length <= 32);
+      candidate.sdk_listing = 'observed';
+    } catch (_) { candidate.failures.push('preflight_sdk_listing'); continue; }
+    for (const name of names) {
+      entryFailure = 'preflight_sdk_metadata';
+      let metadata = 'UNBOUND';
+      try {
+        metadata = fact(path.join(sdkDir, name, 'System/Library/CoreServices/SystemVersion.plist'), 1024 * 1024);
+        delete metadata.path;
+      } catch (_) { /* A refused metadata identity remains explicitly UNBOUND. */ }
+      const admissible = candidate.version_plist !== 'UNBOUND' && metadata !== 'UNBOUND';
+      sdkCandidates.push({app, sdk: name, version_plist: candidate.version_plist,
+        sdk_system_version_plist: metadata, admissible_root_owned_identity: admissible,
+        category: metadata === 'UNBOUND' ? 'preflight_sdk_metadata' :
+          candidate.version_plist === 'UNBOUND' ? 'preflight_xcode_version' : 'observed'});
+      if (admissible) sdk.push({app, sdk: name, version_plist: candidate.version_plist,
+        sdk_system_version_plist: metadata});
+    }
+  }
+  return {xcodes, sdk, xcodeCandidates, sdkCandidates};
+}
 try {
   const input = name => process.env[`INPUT_${name.toUpperCase()}`] || '';
   const target = input('target'), phase = input('phase');
@@ -94,28 +142,7 @@ try {
     entryFailure = 'preflight_tools';
     const tools = {};
     for (const role of ['git', 'xcodebuild', 'xcrun', 'xcode-select', 'sw_vers']) tools[role] = fact('/usr/bin/' + role);
-    entryFailure = 'preflight_xcode_listing';
-    const xcodes = fs.readdirSync('/Applications').filter(x => /^Xcode(?:_[A-Za-z0-9_.-]+)?\.app$/.test(x));
-    need(xcodes.length <= 32);
-    const sdk = [];
-    for (const app of xcodes) {
-      entryFailure = 'preflight_xcode_root';
-      const root = path.join('/Applications', app), canonical = fs.realpathSync(root);
-      need(path.dirname(canonical) === '/Applications');
-      entryFailure = 'preflight_xcode_version';
-      const version = fact(path.join(canonical, 'Contents/version.plist'), 1024 * 1024);
-      const sdkDir = path.join(canonical, 'Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs');
-      entryFailure = 'preflight_sdk_listing';
-      const names = fs.readdirSync(sdkDir).filter(n => /^MacOSX\d+\.\d+\.sdk$/.test(n)); need(names.length <= 32);
-      for (const name of names) {
-        const file = path.join(sdkDir, name, 'System/Library/CoreServices/SystemVersion.plist');
-        entryFailure = 'preflight_sdk_metadata';
-        const metadata = fact(file, 1024 * 1024); delete metadata.path;
-        const appVersion = { ...version }; delete appVersion.path;
-        need(sdk.length < 32);
-        sdk.push({ app, sdk: name, version_plist: appVersion, sdk_system_version_plist: metadata });
-      }
-    }
+    const {xcodes, sdk, xcodeCandidates, sdkCandidates} = preflightXcodes();
     let fullSdk = 'UNBOUND';
     if (input('xcode_app')) {
       entryFailure = 'preflight_sdk_inventory';
@@ -151,6 +178,7 @@ try {
       source_commit: process.env.GITHUB_SHA, run_id: process.env.GITHUB_RUN_ID, run_attempt: process.env.GITHUB_RUN_ATTEMPT,
       image_os: process.env.ImageOS || null, image_version: process.env.ImageVersion || null,
       plan_sha256: planSha, tools, sdk_metadata: sdk,
+      xcode_candidates: xcodeCandidates, sdk_candidates: sdkCandidates,
       python_candidates: pythonCandidates, zstd_candidates: zstdCandidates, sdk_full_inventory: fullSdk,
       sdk_redistributed: false, cache_write: false, staged: false, build_admission_granted: false,
       native_sources_complete: false, build_ready: false, distribution_ready: false }));

@@ -31,6 +31,7 @@ NATIVE = "aaeeee8077eb0a4cad1c9494e9c6433c751ef663"
 TREE = "fecdf55fdd1e9cafc5531abab7ff14e35a1159f5"
 SECURITY = "a9f2220dfb0e527690ace518911e3e92c12124ab8c37e6cb391a47c89f19c080"
 CORE = "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
+SOURCE_INTERFACE = "ebfdd22dd8eaa6ee893adbdc9fe904f5e859d33b7353b067a66c32df526508bf"
 HELPERS = {
     "python_stager.py": "4de9a016a988535b7576f2e0d7561afa290529dae7b1eb267bb8382956d49d02",
     "git_source_stager.py": "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211",
@@ -41,6 +42,21 @@ MAX_JSON = 128 * 1024 * 1024
 MAX_FILE = 64 * 1024 ** 3
 MAX_FILES = 1_000_000
 MAX_TOTAL = 256 * 1024 ** 3
+FAILURE_CATEGORY = "entry"
+CORE_FAILURE_CATEGORIES = {
+    "admission": "core_admission",
+    "download_gn": "core_download_gn", "stage_gn": "core_stage_gn",
+    "download_ninja": "core_download_ninja", "stage_ninja": "core_stage_ninja",
+    "download_clang": "core_download_clang", "stage_clang": "core_stage_clang",
+    "receipt": "core_receipt",
+}
+FAILURE_CATEGORIES = frozenset((
+    "entry", "arguments", "runner_environment", "run_identity", "repository_request",
+    "repository_response", "repository_identity", "runner_paths", "plan_read",
+    "plan_binding", "free_space", "stager_source", "control_owner", "core_manifest",
+    "core_control", "core_invoke", "source_data", "runtime_data", "projection",
+    "stage_receipt", "build_admission", "build", *CORE_FAILURE_CATEGORIES.values(),
+))
 
 
 # Original Windows Python ZIPs contain7literal internal-space paths. Only
@@ -229,6 +245,8 @@ def invoke(module, args):
 
 
 def repository_public():
+    global FAILURE_CATEGORY
+    FAILURE_CATEGORY = "repository_request"
     token = os.environ.get("NATIVE_READ_TOKEN", "")
     need(bool(token))
     c = http.client.HTTPSConnection("api.github.com", 443, timeout=30, context=ssl.create_default_context())
@@ -237,11 +255,13 @@ def repository_public():
             "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "Morpheus-native-windows-producer", "Accept-Encoding": "identity"})
         r = c.getresponse()
+        FAILURE_CATEGORY = "repository_response"
         need(r.status == 200 and r.getheader("Location") is None
              and r.getheader("Content-Encoding") in (None, "identity"))
         raw = r.read(1024 * 1024 + 1)
         need(len(raw) <= 1024 * 1024)
         value = json.loads(raw, object_pairs_hook=unique)
+        FAILURE_CATEGORY = "repository_identity"
         need(value["full_name"] == REPOSITORY and value["private"] is False and value["default_branch"] == "main")
     finally:
         c.close()
@@ -258,10 +278,14 @@ def environment_admitted(os_name, env):
 
 
 def runner():
+    global FAILURE_CATEGORY
+    FAILURE_CATEGORY = "runner_environment"
     need(environment_admitted(os.name, os.environ))
+    FAILURE_CATEGORY = "run_identity"
     need(re.fullmatch(r"[1-9][0-9]{0,19}", os.environ.get("GITHUB_RUN_ID", ""))
          and re.fullmatch(r"[1-9][0-9]{0,5}", os.environ.get("GITHUB_RUN_ATTEMPT", "")))
     repository_public()
+    FAILURE_CATEGORY = "runner_paths"
     return path(os.environ["RUNNER_TEMP"]), path(os.environ["GITHUB_WORKSPACE"])
 
 
@@ -323,6 +347,8 @@ def copy_file(stage, source, destination, expected):
 
 
 def core_stage(stager, temp, workspace, plan, control):
+    global FAILURE_CATEGORY
+    FAILURE_CATEGORY = "core_manifest"
     core, value = bound_asset(workspace, plan["core_manifest"])
     need(plan["core_manifest"]["sha256"] == CORE and value["baseline"] == NATIVE and value["tree"] == TREE
          and set(row["name"] for row in value["targets"]["Windowsx64"]) == {"gn", "ninja", "clang"})
@@ -333,9 +359,19 @@ def core_stage(stager, temp, workspace, plan, control):
         "standard_hosted_runner": True, "repository": REPOSITORY,
         "accept_exact_mac_dangling_alias_omissions": False,
         **{k: os.environ[k] for k in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB")}}
+    FAILURE_CATEGORY = "core_control"
     ref = write_json(control, control.root / "core-stage-admission.json", admission)
-    invoke(stager, ["--target", "Windowsx64", "--manifest", str(core), "--manifest-sha256", CORE,
-        "--admission", str(control.root / "core-stage-admission.json"), "--admission-sha256", ref["sha256"], "--root", str(output)])
+    FAILURE_CATEGORY = "core_invoke"
+    try:
+        invoke(stager, ["--target", "Windowsx64", "--manifest", str(core), "--manifest-sha256", CORE,
+            "--admission", str(control.root / "core-stage-admission.json"), "--admission-sha256", ref["sha256"], "--root", str(output)])
+    except BaseException:
+        # This exact helper is SHA-bound before import. Still accept only its
+        # finite source phases; no exception, role, URL or payload is emitted.
+        phase = getattr(stager, "PHASE", None)
+        FAILURE_CATEGORY = (CORE_FAILURE_CATEGORIES.get(phase, "core_invoke")
+                            if type(phase) is str and len(phase) <= 32 else "core_invoke")
+        raise
     return output
 
 
@@ -343,15 +379,26 @@ def source_stage(stager, temp, workspace, plan, control):
     # A separately reviewed Windows selection is mandatory. Never mutate the
     # Linux plan's platform flags and pretend that is a reviewed Windows closure.
     _, profile = bound_asset(workspace, plan["source_profile"])
-    need(set(profile) == {"schema", "target", "source_plan", "patch_manifest", "security_plan", "patch_files", "host_git"}
-         and profile["schema"] == "morpheus-windows-source-stage-v1" and profile["target"] == "win-x64")
+    need(set(profile) == {"schema", "target", "source_plan", "patch_manifest", "security_plan", "patch_files", "host_git", "producer_interface"}
+         and profile["schema"] == "morpheus-windows-source-stage-v2" and profile["target"] == "win-x64")
+    _, interface = bound_asset(workspace, profile["producer_interface"])
+    need(profile["producer_interface"]["sha256"] == SOURCE_INTERFACE
+         and interface["schema"] == "morpheus-native-source-producer-interface-v2"
+         and interface["source_plan_schema"] == "morpheus-native-webrtc-sources-v3"
+         and interface["required_security_plan_sha256"] == SECURITY
+         and interface["source_git_administrative_metadata"] is False)
     _, original = bound_asset(workspace, profile["source_plan"])
     _, patch = bound_asset(workspace, profile["patch_manifest"])
     security, security_value = bound_asset(workspace, profile["security_plan"])
     need(profile["security_plan"]["sha256"] == SECURITY
          and original["schema"] == "morpheus-native-webrtc-sources-v3" and original["target"] == "win-x64"
+         and original["patch_manifest"]["sha256"] == profile["patch_manifest"]["sha256"]
+         and original["security_plan"]["sha256"] == SECURITY
          and security_value["baseline_commit"] == NATIVE and security_value["baseline_tree"] == TREE)
     need(type(profile["patch_files"]) is list and 13 <= len(profile["patch_files"]) <= 32)
+    names = [PurePosixPath(row["file"]).name for row in patch["patches"]]
+    need(len(names) == len(set(names)) == len(profile["patch_files"])
+         and set(names) == {PurePosixPath(row["path"]).name for row in profile["patch_files"]})
     # Keep the original protected-temp input boundary of the pinned exporter.
     # Copy exact authenticated DATA; only path fields relocate, never the bytes.
     assets = control.root / "source-inputs"
@@ -781,17 +828,24 @@ def runtime_stage(stager, workspace, plan, control):
 
 
 def stage(args, temp, workspace, plan):
+    global FAILURE_CATEGORY
+    FAILURE_CATEGORY = "stager_source"
     stager = fixed_module("python_stager.py", HELPERS["python_stager.py"])
+    FAILURE_CATEGORY = "control_owner"
     key = hashlib.sha256((os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"] + ":windows").encode()).hexdigest()[:16]
     root = temp / ("morpheus-webrtc-windows-" + key)
     need(not os.path.lexists(root))
     owner = stager.Stage(root)
     try:
         core = core_stage(stager, temp, workspace, plan, owner)
+        FAILURE_CATEGORY = "source_data"
         source = source_stage(stager, temp, workspace, plan, owner) if plan["source_profile"] is not None else None
+        FAILURE_CATEGORY = "runtime_data"
         runtime, runtime_profile = runtime_stage(stager, workspace, plan, owner) if plan["runtime_profile"] else (None, None)
         _, core_manifest = bound_asset(workspace, plan["core_manifest"])
+        FAILURE_CATEGORY = "projection"
         overlay = project(owner, source, core, core_manifest, runtime, runtime_profile) if source is not None else None
+        FAILURE_CATEGORY = "stage_receipt"
         receipt = {"schema": "morpheus-windows-source-stage-receipt-v1", "target": "win-x64",
             "pipeline_plan_sha256": args.plan_sha256, "core_manifest_sha256": CORE,
             "core_root": str(core), "core_files": tree_files(core),
@@ -809,6 +863,7 @@ def stage(args, temp, workspace, plan):
             "core_data_staged": True, "receipt_sha256": info["sha256"], "build_ready": False,
             "distribution_ready": False}, sort_keys=True), flush=True)
         if args.phase == "build":
+            FAILURE_CATEGORY = "build"
             need(source is not None and plan["runtime_profile"] is not None)
             build(args, temp, workspace, plan, owner, core, source, runtime)
     finally:
@@ -862,6 +917,8 @@ class FixedParser(argparse.ArgumentParser):
 
 
 def main():
+    global FAILURE_CATEGORY
+    FAILURE_CATEGORY = "arguments"
     parser = FixedParser(allow_abbrev=False)
     parser.add_argument("--phase", choices=("stage", "build"), required=True)
     parser.add_argument("--plan", required=True)
@@ -869,7 +926,9 @@ def main():
     parser.add_argument("--jobs", type=int, choices=(1, 2, 3, 4), default=2)
     args = parser.parse_args()
     temp, workspace = runner()
+    FAILURE_CATEGORY = "plan_read"
     plan = load(path(args.plan), args.plan_sha256)
+    FAILURE_CATEGORY = "plan_binding"
     need(set(plan) == {"schema", "target", "dispatcher_sha256", "recipe_sha256", "core_manifest",
         "source_profile", "runtime_profile", "build_inputs", "security_plan_sha256", "native_test_count",
         "minimum_free_bytes", "cache_handoff_authorized"}
@@ -878,15 +937,23 @@ def main():
         and plan["recipe_sha256"] == RECIPE and plan["security_plan_sha256"] == SECURITY
         and plan["native_test_count"] == 12 and plan["cache_handoff_authorized"] is False
         and type(plan["minimum_free_bytes"]) is int and 12 * 1024 ** 3 <= plan["minimum_free_bytes"] <= MAX_TOTAL)
+    FAILURE_CATEGORY = "free_space"
     need(shutil.disk_usage(temp).free >= plan["minimum_free_bytes"])
+    FAILURE_CATEGORY = "build_admission"
     if args.phase == "build":
         need(plan["source_profile"] is not None and plan["runtime_profile"] is not None and plan["build_inputs"] is not None)
     stage(args, temp, workspace, plan)
 
 
-if __name__ == "__main__":
+def entry():
     try:
         main()
     except BaseException:
-        print("MORPHEUS_NATIVE_WINDOWS_PRODUCER failed", file=sys.stderr, flush=True)
+        category = (FAILURE_CATEGORY if type(FAILURE_CATEGORY) is str
+                    and len(FAILURE_CATEGORY) <= 32 and FAILURE_CATEGORY in FAILURE_CATEGORIES else "entry")
+        print("MORPHEUS_NATIVE_WINDOWS_PRODUCER failed category=" + category, file=sys.stderr, flush=True)
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    entry()

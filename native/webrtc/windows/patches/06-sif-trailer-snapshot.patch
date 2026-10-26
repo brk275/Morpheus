@@ -1,0 +1,117 @@
+diff --git a/api/crypto/frame_crypto_transformer.cc b/api/crypto/frame_crypto_transformer.cc
+--- a/api/crypto/frame_crypto_transformer.cc
++++ b/api/crypto/frame_crypto_transformer.cc
+@@ -642,7 +642,7 @@
+     return;
+   }
+ 
+-  auto uncrypted_magic_bytes = key_provider_->options().uncrypted_magic_bytes;
++  auto uncrypted_magic_bytes = key_provider_->GetSifTrailer();
+   if (uncrypted_magic_bytes.size() > 0 &&
+       data_in.size() >= uncrypted_magic_bytes.size()) {
+     auto tmp = data_in.subview(data_in.size() - (uncrypted_magic_bytes.size()),
+diff --git a/api/crypto/frame_crypto_transformer.h b/api/crypto/frame_crypto_transformer.h
+--- a/api/crypto/frame_crypto_transformer.h
++++ b/api/crypto/frame_crypto_transformer.h
+@@ -97,6 +97,9 @@
+ 
+   virtual void SetSifTrailer(const std::vector<uint8_t> trailer) = 0;
+ 
++  // Independent snapshot synchronized with SetSifTrailer.
++  virtual std::vector<uint8_t> GetSifTrailer() const = 0;
++
+   virtual KeyProviderOptions& options() = 0;
+ 
+  protected:
+@@ -357,6 +360,11 @@
+   void SetSifTrailer(const std::vector<uint8_t> trailer) override {
+     webrtc::MutexLock lock(&mutex_);
+     options_.uncrypted_magic_bytes = trailer;
++  }
++
++  std::vector<uint8_t> GetSifTrailer() const override {
++    webrtc::MutexLock lock(&mutex_);
++    return options_.uncrypted_magic_bytes;
+   }
+ 
+   KeyProviderOptions& options() override { return options_; }
+diff --git a/api/crypto/frame_crypto_transformer_unittest.cc b/api/crypto/frame_crypto_transformer_unittest.cc
+--- a/api/crypto/frame_crypto_transformer_unittest.cc
++++ b/api/crypto/frame_crypto_transformer_unittest.cc
+@@ -1,9 +1,12 @@
+ #include "api/crypto/frame_crypto_transformer.h"
+ 
++#include <atomic>
+ #include <memory>
+ #include <mutex>
+ #include <string>
+-
++#include <thread>
++
++#include "rtc_base/event.h"
+ #include "rtc_base/logging.h"
+ #include "system_wrappers/include/sleep.h"
+ #include "test/gmock.h"
+@@ -320,4 +323,62 @@
+   }
+ }
+ 
++TEST(KeyProvider, SifTrailerSnapshotsStayCoherentDuringUpdates) {
++  KeyProviderOptions options;
++  scoped_refptr<KeyProvider> provider =
++      make_ref_counted<DefaultKeyProviderImpl>(options);
++  const std::vector<uint8_t> first(257, 0x42);
++  const std::vector<uint8_t> second(509, 0x71);
++  const bool initially_empty = provider->GetSifTrailer().empty();
++  provider->SetSifTrailer(first);
++  const auto retained_snapshot = provider->GetSifTrailer();
++  provider->SetSifTrailer(second);
++  const auto updated_snapshot = provider->GetSifTrailer();
++  std::atomic<bool> failed{false};
++  size_t reads = 0;
++  // Declared after every object captured by reference. If the second thread
++  // cannot be constructed, destruction still releases and joins the first.
++  struct JoinedThreads {
++    Event start{true, false};
++    std::thread writer;
++    std::thread reader;
++    void Join() {
++      start.Set();
++      if (writer.joinable()) writer.join();
++      if (reader.joinable()) reader.join();
++    }
++    ~JoinedThreads() { Join(); }
++  } threads;
++  threads.writer = std::thread([provider, &threads, &failed, &first, &second] {
++    if (!threads.start.Wait(TimeDelta::Seconds(5))) {
++      failed.store(true);
++      return;
++    }
++    for (size_t i = 0; i < 4096; ++i) {
++      provider->SetSifTrailer(i % 2 == 0 ? first : second);
++    }
++  });
++  threads.reader = std::thread([provider, &threads, &failed, &first, &second,
++                                &reads] {
++    if (!threads.start.Wait(TimeDelta::Seconds(5))) {
++      failed.store(true);
++      return;
++    }
++    for (size_t i = 0; i < 4096; ++i) {
++      const auto snapshot = provider->GetSifTrailer();
++      if (snapshot != first && snapshot != second) failed.store(true);
++      ++reads;
++    }
++  });
++  threads.Join();
++  provider->SetSifTrailer({});
++  const bool cleared = provider->GetSifTrailer().empty();
++  EXPECT_TRUE(initially_empty);
++  EXPECT_EQ(retained_snapshot, first);
++  EXPECT_EQ(updated_snapshot, second);
++  EXPECT_FALSE(failed.load());
++  EXPECT_EQ(reads, 4096u);
++  EXPECT_TRUE(cleared);
++}
++
+ }  // namespace webrtc
