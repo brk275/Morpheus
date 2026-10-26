@@ -8,6 +8,11 @@ on:
         type: choice
         required: true
         options: [preflight, stage, build]
+      preflight_detail:
+        description: Basic bootstrap identity or bounded read-only VS2022/SDK inventory
+        type: choice
+        options: [basic, host-toolchain]
+        default: basic
       plan_sha256:
         description: Independently reviewed Windows pipeline plan SHA256 (stage/build)
         type: string
@@ -49,7 +54,9 @@ jobs:
       - name: Read hosted tool identities without execution
         if: inputs.phase == 'preflight'
         shell: pwsh
-        run: ./scripts/native_webrtc/windows_preflight.ps1
+        env:
+          NATIVE_WINDOWS_PREFLIGHT_DETAIL: ${{ inputs.preflight_detail }}
+        run: ./scripts/native_webrtc/windows_preflight.ps1 -Mode $env:NATIVE_WINDOWS_PREFLIGHT_DETAIL
       - name: Run only the exact admitted Windows phase
         if: inputs.phase != 'preflight'
         shell: pwsh

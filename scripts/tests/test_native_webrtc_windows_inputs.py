@@ -792,5 +792,110 @@ try {
             self.assertEqual(result.stdout.strip(), "MORPHEUS_WINDOWS_ANCESTRY_OK")
 
 
+        def test_host_inventory_actual_read_handles_paths_and_limits(self):
+            # Windows-only native reader: load reviewed function ASTs, never
+            # invoke the host-selection entry or touch installed SDK/tool roots.
+            script = r"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'source_parse' }
+$definitions = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)
+# Function declarations must remain in this scope for the actual calls below.
+. ([ScriptBlock]::Create(($definitions | ForEach-Object { $_.Extent.Text }) -join "`n"))
+function Must-Refuse([ScriptBlock] $Action) {
+    $refused = $false
+    try { & $Action | Out-Null } catch { $refused = $true }
+    if (-not $refused) { throw 'accepted' }
+}
+$metadata = @{ run_id = '1'; run_attempt = '1'; source_commit = ('a' * 40);
+    image_os = 'win25'; image_version = '20261026.1.0'; powershell_version = '7.5.3' }
+if ((Get-HostReceiptMetadata $metadata).run_id -cne '1') { throw 'metadata' }
+foreach ($bad in @('private value', ('x' * 65), "line`nbreak")) {
+    $changed = $metadata.Clone(); $changed.image_version = $bad
+    Must-Refuse { Get-HostReceiptMetadata $changed }
+}
+$changed = $metadata.Clone(); $changed.extra = 'unrequested'
+Must-Refuse { Get-HostReceiptMetadata $changed }
+$root = $env:MORPHEUS_HOST_TEST_ROOT
+foreach ($bad in @('relative', '\\server\share\x', 'C:\x:stream', 'C:\x\..\other', 'C:\x\bad.', 'C:\x\bad ', 'C:\x\CON.txt')) {
+    Must-Refuse { Get-CanonicalHostPath $bad }
+}
+$good = Join-Path $root 'good'
+[IO.Directory]::CreateDirectory((Join-Path $good 'include')) | Out-Null
+[IO.File]::WriteAllBytes((Join-Path $good 'tool.bin'), [byte[]]@(1,2,3,4))
+[IO.File]::WriteAllBytes((Join-Path $good 'include\header.h'), [byte[]]@(5))
+Initialize-HostReader
+try {
+    $result = Get-HostRootInventory $good
+    if ($result.files.Count -ne 2 -or $script:HostBytes -ne 5) { throw 'inventory' }
+    $tool = @($result.files | Where-Object { $_.path -eq 'tool.bin' })
+    if ($tool.Count -ne 1 -or $tool[0].bytes -ne 4 -or
+        $tool[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
+    # Actual retained READ-sharing owner denies a new writer, not a mock lock.
+    Must-Refuse { [IO.File]::WriteAllBytes((Join-Path $good 'tool.bin'), [byte[]]@(9)) }
+} finally { Close-HostReader }
+foreach ($boundary in @('bytes', 'entries', 'deadline', 'metadata')) {
+    Initialize-HostReader
+    try {
+        switch ($boundary) {
+            'bytes' { $script:HostLimits.FileBytes = 3 }
+            'entries' { $script:HostLimits.Entries = 1 }
+            'deadline' { $script:HostLimits.Seconds = -1 }
+            'metadata' { $script:HostLimits.MetadataBytes = 1 }
+        }
+        Must-Refuse { Get-HostRootInventory $good }
+    } finally { Close-HostReader }
+}
+# The aggregate boundary is checked against the opened size before the
+# first payload Read argument is evaluated, not only after a completed hash.
+$budgetRoot = Join-Path $root 'aggregate-budget'
+[IO.Directory]::CreateDirectory($budgetRoot) | Out-Null
+[IO.File]::WriteAllBytes((Join-Path $budgetRoot 'next.bin'), [byte[]]@(1,2,3,4))
+Initialize-HostReader
+try {
+    $script:HostLimits.TotalBytes = 6; $script:HostBytes = [uint64]3
+    $script:HostPayloadReadAttempted = $false
+    $script:HostBuffer = [pscustomobject]@{}
+    $script:HostBuffer | Add-Member -MemberType ScriptProperty -Name Length -Value {
+        $script:HostPayloadReadAttempted = $true; return 1
+    }
+    $refusal = ''
+    try { Get-HostRootInventory $budgetRoot | Out-Null } catch { $refusal = $_.Exception.Message }
+    if ($refusal -cne 'limit' -or $script:HostPayloadReadAttempted -or $script:HostBytes -ne 3) {
+        throw 'aggregate_before_read'
+    }
+} finally { Close-HostReader }
+# A file that exactly consumes the remaining bytes still uses the actual
+# reader/hash and is admitted; the production 64GiB cap is unchanged.
+Initialize-HostReader
+try {
+    $script:HostLimits.TotalBytes = 7; $script:HostBytes = [uint64]3
+    $result = Get-HostRootInventory $budgetRoot
+    if ($result.files.Count -ne 1 -or $script:HostBytes -ne 7 -or
+        $result.files[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') {
+        throw 'aggregate_exact_fit'
+    }
+} finally { Close-HostReader }
+$junctionRoot = Join-Path $root 'junction-root'
+[IO.Directory]::CreateDirectory($junctionRoot) | Out-Null
+New-Item -ItemType Junction -Path (Join-Path $junctionRoot 'alias') -Target $good | Out-Null
+Initialize-HostReader
+try { Must-Refuse { Get-HostRootInventory $junctionRoot } } finally { Close-HostReader }
+Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
+"""
+            source = PATH.parent / "native_webrtc/windows_preflight.ps1"
+            pwsh = Path(os.environ["ProgramFiles"]) / "PowerShell/7/pwsh.exe"
+            with tempfile.TemporaryDirectory() as temporary:
+                env = os.environ.copy()
+                env["MORPHEUS_HOST_READER_SOURCE"] = str(source)
+                env["MORPHEUS_HOST_TEST_ROOT"] = temporary
+                result = subprocess.run([str(pwsh), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                    text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
+            self.assertEqual(result.returncode, 0, "fixed Windows host reader boundary case failed")
+            self.assertEqual(result.stdout.strip(), "MORPHEUS_HOST_READER_BOUNDARIES_OK")
+
+
 if __name__ == "__main__":
     unittest.main()
