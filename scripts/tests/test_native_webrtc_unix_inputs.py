@@ -461,6 +461,19 @@ class NativeMacMaterialBoundaryTests(unittest.TestCase):
                 self.assertEqual(sum(row["seed_cache"] for row in plan["materials"]), 30)
                 self.assertEqual(plan["roles"]["vpython3"]["path"],
                     "runtime/vpython/vpython3.app/Contents/MacOS/vpython3")
+                # Recognize the actual client family while preserving its exact
+                # selected platform and pinned revision, plus the source binding.
+                for package, version in (("infra/tools/cipd/mac-other", None),
+                                         ("infra/tools/foreign/mac-arm64", None),
+                                         (None, "git_revision:" + "0" * 40)):
+                    changed = json.loads(json.dumps(plan))
+                    client = next(row for row in changed["materials"] if row["name"] == "cipd-client")
+                    if package is not None:
+                        client["package"] = client["source"]["package"] = package
+                    if version is not None:
+                        client["version"] = client["source"]["version"] = version
+                    with self.subTest(client_package=package, client_version=version), self.assertRaises(_MAC.Refused):
+                        _MAC.validate(changed, target, _MATERIAL, python)
                 plan["roles"]["vpython3"]["path"] = "runtime/vpython/vpython3"
                 with self.assertRaises(_MAC.Refused):
                     _MAC.validate(plan, target, _MATERIAL, python)

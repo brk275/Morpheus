@@ -140,7 +140,7 @@
     "path": "native/webrtc/macos/patch-manifest.json",
     "sha256": "b2ca5cb477a68c18f273b66ea310b387976a85305f667bc531ccb35a0950ed79"
   },
-  "pipeline_sha256": "3266f85cdf6c47e01133fdde91eaf9989845d7ca1ba7358771c6d799f4833798",
+  "pipeline_sha256": "06751b9e852123b54db025ef05f459c3f4b6995f63ba7a33b5ee1867630c3b64",
   "production_targets": [
     ":default",
     "api/audio_codecs:builtin_audio_decoder_factory",
@@ -153,7 +153,7 @@
     "desktop_capture_objc",
     "modules/audio_device:audio_device"
   ],
-  "recipe_sha256": "ceb017dac1c2f55972ff9fb8f6c123cec24e46c421d3270409710498532e1411",
+  "recipe_sha256": "934991862c91f25a50a161c22e54858d23dc9d02daf75be88ddd7d32763908e1",
   "schema": "morpheus-native-macos-pipeline-v1",
   "security_patch_count": 8,
   "security_plan": {

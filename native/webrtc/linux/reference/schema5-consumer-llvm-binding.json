@@ -24,7 +24,7 @@
   "receipt_semantics": "New consumer declaration for a genuine validator extension; not an equivalence-only rebind or execution approval.",
   "recipe": {
     "path": "scripts/build_native_webrtc_unix.py",
-    "sha256": "ceb017dac1c2f55972ff9fb8f6c123cec24e46c421d3270409710498532e1411"
+    "sha256": "934991862c91f25a50a161c22e54858d23dc9d02daf75be88ddd7d32763908e1"
   },
   "same_twelve_external_gates_and_twelve_native_cases": true,
   "schema": "morpheus-native-schema5-consumer-llvm-extension-v1",

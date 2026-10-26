@@ -140,7 +140,7 @@ def validate(plan, target, material, python):
                  and row["seed_cache"] is False and row["extraction"] == "tree")
         else:
             need(row["source"] == {"kind": "cipd", "package": row["package"], "version": row["version"]}
-                 and row["package"].startswith(("infra/tools/luci/", "infra/3pp/tools/", "infra/python/wheels/"))
+                 and row["package"].startswith(("infra/tools/luci/", "infra/tools/cipd/", "infra/3pp/tools/", "infra/python/wheels/"))
                  and "linux" not in row["package"] and "windows" not in row["package"]
                  and row["instance_id"] == python.cipd_instance_id(row["instance"])
                  and row["format"] == "zip" and row["extraction"] in ("tree", "archive-only"))
