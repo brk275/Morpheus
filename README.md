@@ -20,10 +20,11 @@ Start with **Nocturne**, **Terminal** or **Paper**, then change the details:
 - **Typography** — separate fonts for the interface, messages and code.
 - **Messages** — stacked, compact or nickname-column layouts; avatars, timestamps and spacing.
 - **Navigation** — icon rail or text sidebar; grouped or combined conversations and room ordering.
-- **Appearance** — editable TOML palettes, density, pane sizes, headers and corner radius.
+- **Appearance** — hex colors, window transparency, density, pane sizes, headers and corner radius.
 
 Settings and `config.toml` control the same preferences. Changes reload live;
-invalid edits keep the last working configuration and show the error.
+invalid edits keep the last working configuration and show the error. Search Settings
+by a control name or TOML key to jump directly to its editor.
 
 <details>
 <summary>More looks: Nocturne and Paper</summary>
