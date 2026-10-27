@@ -1327,20 +1327,62 @@ try {
         $observed.identity -cne ([Convert]::ToHexString([byte[]]($ownedScratch[28..31])) +
                                [Convert]::ToHexString([byte[]]($ownedScratch[44..51])))) { throw 'identity' }
     $savedIdentity = $observed.identity
+    $comparisonRecord = $script:HostFileRecords[0]
+    $savedComparison = [Convert]::ToHexString($comparisonRecord.comparison)
+    if ($comparisonRecord.comparison -isnot [byte[]] -or $comparisonRecord.comparison.Length -ne 52 -or
+        [object]::ReferenceEquals($comparisonRecord.comparison, $ownedScratch) -or
+        $observed.Count -ne 6) { throw 'identity' }
     $null = Get-HostHandleInfo $script:HostFileRecords[1].handle
-    if ($observed.identity -cne $savedIdentity) { throw 'identity' }
+    if ($observed.identity -cne $savedIdentity -or
+        [Convert]::ToHexString($comparisonRecord.comparison) -cne $savedComparison) { throw 'identity' }
     # Cached lexical paths never cache native identity or file-open results.
     # Both calls must reach the real original delegate; the second open must
     # retain another independently checked handle for the same cached path.
     $originalInfo = $script:HostInfo
-    $infoProbe = [pscustomobject]@{ Delegate = $originalInfo; Calls = 0 }
+    $originalType = $script:HostType
+    $nativeTrace = [Collections.Generic.List[string]]::new()
+    $typeProbe = [pscustomobject]@{ Delegate = $originalType; Calls = 0; Trace = $nativeTrace }
+    $typeProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
+        param([IntPtr] $Handle)
+        $this.Calls++; $this.Trace.Add('type')
+        return $this.Delegate.Invoke($Handle)
+    }
+    $infoProbe = [pscustomobject]@{ Delegate = $originalInfo; Calls = 0; Trace = $nativeTrace }
     $infoProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
         param([IntPtr] $Handle, [IntPtr] $Memory)
-        $this.Calls++
+        $this.Calls++; $this.Trace.Add('info')
         return $this.Delegate.Invoke($Handle, $Memory)
     }
     try {
         $script:HostInfo = $infoProbe
+        $script:HostType = $typeProbe
+        # Repeated comparisons return no copied fact and still perform both
+        # real Win32 calls. The original six-field fact remains unchanged.
+        foreach ($content in @($false, $true)) {
+            $beforeChecks = $infoProbe.Calls
+            if (@(Assert-HostIdentity $comparisonRecord $content).Count -ne 0 -or
+                $infoProbe.Calls -ne $beforeChecks + 1) { throw 'identity' }
+        }
+        foreach ($offset in @(0, 28, 31, 44, 48, 51, 20, 27, 32, 39, 40, 43)) {
+            $altered = [byte[]]$comparisonRecord.comparison.Clone()
+            $altered[$offset] = $altered[$offset] -bxor 1
+            $changed = @{ handle = $comparisonRecord.handle; comparison = $altered }
+            Must-Refuse { Assert-HostIdentity $changed $true }
+            if ($offset -in @(20, 27, 32, 39, 40, 43)) {
+                Assert-HostIdentity $changed $false
+            } else { Must-Refuse { Assert-HostIdentity $changed $false } }
+        }
+        # Creation/access times were never part of the old identity guard.
+        foreach ($offset in @(4, 11, 12, 19)) {
+            $altered = [byte[]]$comparisonRecord.comparison.Clone()
+            $altered[$offset] = $altered[$offset] -bxor 1
+            Assert-HostIdentity @{ handle = $comparisonRecord.handle; comparison = $altered } $true
+        }
+        foreach ($invalid in @($null, [byte[]]::new(51), 'private invalid snapshot')) {
+            Must-Refuse { Get-HostHandleInfo $comparisonRecord.handle $invalid $true }
+        }
+        if ($comparisonRecord.initial.identity -cne $observed.identity -or
+            [Convert]::ToHexString($comparisonRecord.comparison) -cne $savedComparison) { throw 'identity' }
         if (-not $ownedMemo.ContainsKey($good)) { throw 'identity' }
         $null = Open-HostDirectoryChain $good
         $firstChecks = $infoProbe.Calls
@@ -1351,8 +1393,13 @@ try {
         $beforeHandles = $script:HostHandles.Count; $beforeChecks = $infoProbe.Calls
         $opened = Open-HostReadHandle $toolPath $false
         if ($script:HostHandles.Count -ne $beforeHandles + 1 -or $infoProbe.Calls -le $beforeChecks -or
-            $opened.path -cne $toolPath -or $opened.initial.bytes -ne 4) { throw 'identity' }
-    } finally { $script:HostInfo = $originalInfo }
+            $opened.path -cne $toolPath -or $opened.initial.bytes -ne 4 -or
+            [object]::ReferenceEquals($comparisonRecord.comparison, $opened.comparison)) { throw 'identity' }
+        if ($typeProbe.Calls -ne $infoProbe.Calls -or $nativeTrace.Count -ne 2 * $infoProbe.Calls) { throw 'identity' }
+        for ($i = 0; $i -lt $nativeTrace.Count; $i += 2) {
+            if ($nativeTrace[$i] -cne 'type' -or $nativeTrace[$i + 1] -cne 'info') { throw 'identity' }
+        }
+    } finally { $script:HostInfo = $originalInfo; $script:HostType = $originalType }
     $script:HostInfoBusy = $true
     try {
         Must-Refuse { Get-HostHandleInfo $script:HostFileRecords[0].handle }

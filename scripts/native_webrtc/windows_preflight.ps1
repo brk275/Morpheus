@@ -127,7 +127,7 @@ function Get-HostCanonicalPath([string] $Value) {
     return $full
 }
 
-function Get-HostHandleInfo([IntPtr] $Handle) {
+function Get-HostHandleInfo([IntPtr] $Handle, $Expected, [bool] $Content = $false) {
     # These synchronous calls have no callbacks. Never overlap use or return a
     # view of shared scratch: the result below contains only copied values.
     if ($script:HostInfoBusy -or $script:HostInfoMemory -eq [IntPtr]::Zero) { throw 'identity' }
@@ -139,6 +139,20 @@ function Get-HostHandleInfo([IntPtr] $Handle) {
         $data = $script:HostInfoScratch; [Runtime.InteropServices.Marshal]::Copy($memory, $data, 0, 52)
         $attributes = [BitConverter]::ToUInt32($data, 0)
         if (($attributes -band 0x400) -ne 0) { throw 'reparse' }
+        if ($PSBoundParameters.ContainsKey('Expected')) {
+            if ($Expected -isnot [byte[]] -or $Expected.Length -ne 52) { throw 'identity' }
+            # Equality of these fixed-width spans is exactly the old copied
+            # attributes/volume/file-index and optional size/write/link check.
+            # No hashtable or hex strings are needed for a repeated comparison.
+            if ($attributes -ne [BitConverter]::ToUInt32($Expected, 0) -or
+                [BitConverter]::ToUInt32($data, 28) -ne [BitConverter]::ToUInt32($Expected, 28) -or
+                [BitConverter]::ToUInt64($data, 44) -ne [BitConverter]::ToUInt64($Expected, 44) -or
+                ($Content -and (
+                    [BitConverter]::ToUInt64($data, 32) -ne [BitConverter]::ToUInt64($Expected, 32) -or
+                    [BitConverter]::ToUInt64($data, 20) -ne [BitConverter]::ToUInt64($Expected, 20) -or
+                    [BitConverter]::ToUInt32($data, 40) -ne [BitConverter]::ToUInt32($Expected, 40)))) { throw 'changed' }
+            return
+        }
         return @{ attributes = $attributes; directory = (($attributes -band 0x10) -ne 0);
             bytes = ([uint64][BitConverter]::ToUInt32($data, 32) * 4294967296 + [uint64][BitConverter]::ToUInt32($data, 36));
             write = [Convert]::ToHexString($data, 20, 8); links = [BitConverter]::ToUInt32($data, 40);
@@ -162,13 +176,14 @@ function Open-HostReadHandle([string] $LiteralPath, [bool] $Directory) {
     $script:HostHandles.Add($handle); Assert-HostBudget
     $info = Get-HostHandleInfo $handle
     if ($info.directory -ne $Directory) { throw 'type' }
-    return @{ path = $full; handle = $handle; initial = $info }
+    # Private record storage, never a receipt field or a shared-scratch view.
+    # At most the existing 200256 retained handles own one 52-byte copy each.
+    $comparison = [byte[]]$script:HostInfoScratch.Clone()
+    return @{ path = $full; handle = $handle; initial = $info; comparison = $comparison }
 }
 
 function Assert-HostIdentity($Record, [bool] $Content) {
-    $now = Get-HostHandleInfo $Record.handle; $old = $Record.initial
-    if ($now.identity -cne $old.identity -or $now.attributes -ne $old.attributes -or
-        ($Content -and ($now.bytes -ne $old.bytes -or $now.write -cne $old.write -or $now.links -ne $old.links))) { throw 'changed' }
+    Get-HostHandleInfo $Record.handle $Record.comparison $Content
 }
 
 function Open-HostDirectoryChain([string] $LiteralPath) {
