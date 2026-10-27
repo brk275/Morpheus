@@ -51,6 +51,13 @@ HELPERS = {
 BUILD_RECIPE = "e845aeaa16dd270d1c9e319feeecbe18be1d77677646e83d460bc1605f267bb7"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
+# Last-entered fixed operation only, never a claimed unique failure cause.
+POST_ASSEMBLY_PHASE = "unknown"
+POST_ASSEMBLY_PHASES = frozenset((
+    "post_assembly_scan", "alias_validation", "material_projection",
+    "final_inventory", "handoff_pack", "handoff_verify", "handoff_emit",
+))
+
 
 class Refused(Exception):
     pass
@@ -696,6 +703,7 @@ def dependency_decisions(root, spec, ledger_spec):
 
 
 def stage(args, plan, temp, material):
+    global POST_ASSEMBLY_PHASE
     control = temp / ("morpheus-webrtc-control-" + args.plan_sha256[:16])
     need(not os.path.lexists(control))
     control.mkdir(mode=0o700)
@@ -778,18 +786,23 @@ def stage(args, plan, temp, material):
     assembly_fact = material.write_json(assembly_path, assembly_plan)
     cli(module("source_importer.py"), ["--assemble-instrumented", "--plan", str(assembly_path),
         "--plan-sha256", assembly_fact["sha256"], "--output-root", str(assembled)])
+    POST_ASSEMBLY_PHASE = "post_assembly_scan"
     base = assembled / "provision"
     files, directories = scan_tree(material, base)
     marker_rows = load(base / "materials/gitlinks.json", material.file_fact(base / "materials/gitlinks.json")["sha256"])
     normalizer = module("git_source_stager.py")
+    POST_ASSEMBLY_PHASE = "alias_validation"
     aliases = normalizer.verify_source_aliases(base)
     protected = [row["exported_path"] for row in marker_rows]
     protected += [row["mount"] + "/" + value for row in aliases
                   for value in (row["path"], row["target_path"])]
+    POST_ASSEMBLY_PHASE = "material_projection"
     overlay, files, directories = material.project(base, files, directories,
         protected, [(kind, roots[kind],
          material.file_fact(roots[kind] / "tool-materials.json")["sha256"]) for kind in ("core", "linux")])
+    POST_ASSEMBLY_PHASE = "alias_validation"
     normalizer.verify_source_aliases(base)
+    POST_ASSEMBLY_PHASE = "final_inventory"
     old_overlay = load(base / "materials/instrumented-source-overlay.json",
         material.file_fact(base / "materials/instrumented-source-overlay.json")["sha256"])
     projection = sorted(old_overlay + overlay, key=lambda row: row["path"])
@@ -825,6 +838,7 @@ def stage(args, plan, temp, material):
         "source_commit": os.environ["GITHUB_SHA"], "roots": inventories,
         "build_admission_granted": False, "native_sources_complete": False,
         "build_ready": False, "distribution_ready": False}
+    POST_ASSEMBLY_PHASE = "handoff_pack"
     cache_dir = temp / "native-webrtc-handoff"
     need(not os.path.lexists(cache_dir))
     cache_dir.mkdir(mode=0o700)
@@ -852,10 +866,12 @@ def stage(args, plan, temp, material):
                         archive.addfile(info, source)
                     need(stream.tell() <= MAX_HANDOFF)
         stream.flush(); os.fsync(stream.fileno())
+    POST_ASSEMBLY_PHASE = "handoff_verify"
     fact = material.file_fact(output)
     need(fact["bytes"] <= MAX_HANDOFF)
     for name, spec in inventories.items():
         material.topology(temp / name, {r["path"]: r for r in spec["files"]}, set(spec["directories"]))
+    POST_ASSEMBLY_PHASE = "handoff_emit"
     key = "native-webrtc-source-" + args.plan_sha256[:16] + "-" + fact["sha256"]
     material.write_json(cache_dir / "handoff-receipt.json", {"schema": 1, "key": key,
         "archive": fact, "source_commit": os.environ["GITHUB_SHA"], "cache_write_authorized": False,
@@ -1082,9 +1098,19 @@ def main():
         print(json.dumps({"native_source_cache_id": value["id"], "key": value["key"]}, sort_keys=True))
 
 
-if __name__ == "__main__":
+def entry():
+    global POST_ASSEMBLY_PHASE
+    POST_ASSEMBLY_PHASE = "unknown"
     try:
         main()
     except BaseException:
-        print('{"native_linux_producer":"failed","build_or_release_acceptance":false}', file=sys.stderr)
+        category = (POST_ASSEMBLY_PHASE if type(POST_ASSEMBLY_PHASE) is str
+                    and POST_ASSEMBLY_PHASE in POST_ASSEMBLY_PHASES else "unknown")
+        print(json.dumps({"native_linux_producer": "failed",
+                          "build_or_release_acceptance": False,
+                          "category": category}, sort_keys=True, separators=(",", ":")), file=sys.stderr)
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    entry()

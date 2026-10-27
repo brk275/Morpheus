@@ -247,9 +247,19 @@ def fact(p, limit=MAX_FILE, *, core_trace=False):
                             else "core_file_nlink" if before.st_nlink != 1 else "core_file_size")
     need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and 0 <= before.st_size <= limit)
     total, digest = 0, hashlib.sha256()
+    # CPython 3.12 Windows lstat exposes creation time as ctime, whereas
+    # fstat exposes ChangeTime. Required birthtime has one meaning across both.
+    identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns,
+                          s.st_birthtime_ns if os.name == "nt" else s.st_ctime_ns, s.st_nlink)
     if core_trace:
         FAILURE_CATEGORY = "core_file_read"
     with p.open("rb") as f:
+        if core_trace:
+            FAILURE_CATEGORY = "core_file_identity"
+        opened = os.fstat(f.fileno())
+        need(stat.S_ISREG(opened.st_mode) and identity(before) == identity(opened))
+        if core_trace:
+            FAILURE_CATEGORY = "core_file_read"
         while block := f.read(1024 * 1024):
             total += len(block)
             if core_trace:
@@ -262,10 +272,14 @@ def fact(p, limit=MAX_FILE, *, core_trace=False):
             FAILURE_CATEGORY = "core_file_identity"
         after = os.fstat(f.fileno())
     named = p.lstat()
-    identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_nlink)
     if core_trace:
         FAILURE_CATEGORY = "core_file_count" if total != before.st_size else "core_file_identity"
-    need(total == before.st_size and identity(before) == identity(after) == identity(named))
+    need(total == before.st_size
+         and identity(before) == identity(opened) == identity(after) == identity(named)
+         # Preserve timestamp stability within each API, including the opened
+         # handle's real metadata ChangeTime; never compare it to path birthtime.
+         and opened.st_ctime_ns == after.st_ctime_ns
+         and before.st_ctime_ns == named.st_ctime_ns)
     return {"bytes": total, "sha256": digest.hexdigest()}
 
 
@@ -871,8 +885,13 @@ def windows_native_tools_stage(stager, workspace, plan, control):
     need(fact(destination, WINDOWS_RC["bytes"])
          == {k: WINDOWS_RC[k] for k in ("bytes", "sha256")})
     original, actual, count = hashlib.sha1(), hashlib.sha256(), 0
+    named_before = destination.lstat()
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                            info.st_birthtime_ns if os.name == "nt" else info.st_ctime_ns, info.st_nlink)
     with destination.open("rb") as stream:
         before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+             and before.st_size == WINDOWS_RC["bytes"] and identity(named_before) == identity(before))
         while block := stream.read(65536):
             count += len(block)
             need(count <= WINDOWS_RC["bytes"])
@@ -880,9 +899,9 @@ def windows_native_tools_stage(stager, workspace, plan, control):
             actual.update(block)
         after = os.fstat(stream.fileno())
     named = destination.lstat()
-    identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
-                             info.st_ctime_ns, info.st_nlink)
-    need(identity(before) == identity(after) == identity(named)
+    need(identity(named_before) == identity(before) == identity(after) == identity(named)
+         and before.st_ctime_ns == after.st_ctime_ns
+         and named_before.st_ctime_ns == named.st_ctime_ns
          and count == WINDOWS_RC["bytes"] and original.hexdigest() == WINDOWS_RC["upstream_sha1"]
          and actual.hexdigest() == WINDOWS_RC["sha256"])
     return root

@@ -57,12 +57,15 @@ class WindowsNativeInputsTests(unittest.TestCase):
                              "MORPHEUS_NATIVE_WINDOWS_PRODUCER failed category=" + expected + "\n")
         # Exercise the actual fact() metadata/read/count/identity comparisons
         # with fixed snapshots and an in-memory stream, never host files.
-        for case, expected in (("regular", "core_file_regular"), ("nlink", "core_file_nlink"),
+        for case, expected in (("stable_distinct_times", None),
+                ("regular", "core_file_regular"), ("nlink", "core_file_nlink"),
                 ("size", "core_file_size"), ("read", "core_file_read"),
                 ("surplus", "core_file_count"), ("short", "core_file_count"),
-                ("identity", "core_file_identity")):
+                ("identity", "core_file_identity"), ("opened_identity", "core_file_identity"),
+                ("birthtime", "core_file_identity"), ("missing_birthtime", "core_file_identity"),
+                ("handle_change_time", "core_file_identity"), ("named_change_time", "core_file_identity")):
             fields = dict(st_dev=1, st_ino=2, st_size=4, st_mtime_ns=10, st_ctime_ns=20,
-                          st_nlink=1, st_mode=stat.S_IFREG | 0o600)
+                          st_birthtime_ns=20, st_nlink=1, st_mode=stat.S_IFREG | 0o600)
             if case == "regular":
                 fields["st_mode"] = stat.S_IFDIR | 0o700
             if case == "nlink":
@@ -70,26 +73,42 @@ class WindowsNativeInputsTests(unittest.TestCase):
             if case == "size":
                 fields["st_size"] = 5
             before = mock.Mock(**fields)
-            after = mock.Mock(**dict(fields, st_ino=3 if case == "identity" else fields["st_ino"]))
+            # Actual 3.12.10 semantics: lstat ctime=birthtime (20), while
+            # both fstats expose a distinct stable ChangeTime (30).
+            opened_fields = dict(fields, st_ctime_ns=30,
+                                 st_ino=3 if case == "opened_identity" else fields["st_ino"])
+            if case == "missing_birthtime":
+                opened_fields.pop("st_birthtime_ns")
+            opened = mock.Mock(spec=list(opened_fields), **opened_fields)
+            after = mock.Mock(**dict(fields, st_ctime_ns=31 if case == "handle_change_time" else 30,
+                                    st_birthtime_ns=21 if case == "birthtime" else 20,
+                                    st_ino=3 if case == "identity" else fields["st_ino"]))
+            named = mock.Mock(**dict(fields, st_ctime_ns=21 if case == "named_change_time" else 20))
             payload = {"surplus": b"12345", "short": b"123"}.get(case, b"1234")
             stream = mock.MagicMock()
             stream.read.side_effect = RuntimeError(private) if case == "read" else io.BytesIO(payload).read
             stream.fileno.return_value = 7
             file = mock.MagicMock()
-            file.lstat.side_effect = [before, before]
+            file.lstat.side_effect = [before, named]
             file.open.return_value.__enter__.return_value = stream
             def fail_fact():
                 TARGET.fact(file, 4, core_trace=True)
             output = io.StringIO()
             with mock.patch.object(TARGET, "FAILURE_CATEGORY", "entry"), \
+                    mock.patch.object(TARGET.os, "name", "nt"), \
                     mock.patch.object(TARGET, "path", return_value=file), \
-                    mock.patch.object(TARGET.os, "fstat", return_value=after), \
+                    mock.patch.object(TARGET.os, "fstat", side_effect=[opened, after]) as fstat, \
                     mock.patch.object(TARGET, "main", side_effect=fail_fact), \
                     mock.patch.object(TARGET.sys, "stderr", output):
-                with self.assertRaises(SystemExit) as failure:
-                    TARGET.entry()
-                self.assertEqual(failure.exception.code, 1)
-            self.assertEqual(output.getvalue(),
+                if expected is None:
+                    self.assertEqual(TARGET.fact(file, 4, core_trace=True),
+                                     {"bytes": 4, "sha256": hashlib.sha256(payload).hexdigest()})
+                    self.assertEqual(fstat.call_args_list, [mock.call(7), mock.call(7)])
+                else:
+                    with self.assertRaises(SystemExit) as failure:
+                        TARGET.entry()
+                    self.assertEqual(failure.exception.code, 1)
+            self.assertEqual(output.getvalue(), "" if expected is None else
                              "MORPHEUS_NATIVE_WINDOWS_PRODUCER failed category=" + expected + "\n")
         value = {"baseline": TARGET.NATIVE, "tree": TARGET.TREE,
                  "targets": {"Windowsx64": [{"name": name} for name in ("gn", "ninja", "clang")]}}
@@ -149,7 +168,8 @@ class WindowsNativeInputsTests(unittest.TestCase):
         tool.update(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
                     upstream_sha1=hashlib.sha1(payload).hexdigest())
         fake_metadata = dict(metadata, size=str(len(payload)))
-        for variant in ("valid", "corrupt", "surplus", "truncated", "length", "generation", "sha1", "foreign_profile"):
+        for variant in ("valid", "corrupt", "surplus", "truncated", "length", "generation", "sha1", "foreign_profile",
+                        "handle_change_time", "named_change_time"):
             with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 owner = mock.Mock(root=root)
@@ -170,7 +190,33 @@ class WindowsNativeInputsTests(unittest.TestCase):
                 headers = {"Content-Length": str(len(payload) + (1 if variant == "length" else 0)),
                            "x-goog-generation": "1" if variant == "generation" else chosen["source"]["generation"]}
                 response.getheader.side_effect = headers.get
+                # Preserve real opened-file identities/bytes while modeling
+                # Windows3.12's distinct named CreationTime and FD ChangeTime.
+                class Times:
+                    def __init__(self, actual, change):
+                        self.actual = actual
+                        self.st_birthtime_ns = 20
+                        self.st_ctime_ns = change
+                    def __getattr__(self, name):
+                        return getattr(self.actual, name)
+                original_lstat, original_fstat = Path.lstat, os.fstat
+                metadata_calls = {"named": 0, "handle": 0}
+                def named_metadata(file):
+                    actual = original_lstat(file)
+                    metadata_calls["named"] += 1
+                    changed = variant == "named_change_time" and metadata_calls["named"] == 4
+                    return Times(actual, 21 if changed else 20)
+                def handle_metadata(fd):
+                    actual = original_fstat(fd)
+                    metadata_calls["handle"] += 1
+                    changed = variant == "handle_change_time" and metadata_calls["handle"] == 4
+                    return Times(actual, 31 if changed else 30)
+                windows_os = mock.Mock(wraps=os)
+                windows_os.name = "nt"
+                windows_os.fstat.side_effect = handle_metadata
                 with mock.patch.object(TARGET, "WINDOWS_RC", chosen), \
+                        mock.patch.object(TARGET, "os", windows_os), \
+                        mock.patch.object(Path, "lstat", named_metadata), \
                         mock.patch.object(TARGET, "bound_asset", side_effect=[(None, selected), (None, fake_metadata)]), \
                         mock.patch.object(TARGET, "path", side_effect=Path), \
                         mock.patch.object(stager, "https", return_value=(connection, response)) as transport:
@@ -178,6 +224,7 @@ class WindowsNativeInputsTests(unittest.TestCase):
                         result = TARGET.windows_native_tools_stage(stager, Path("synthetic-workspace"), plan, owner)
                         self.assertEqual(result, root / "native-tools")
                         self.assertEqual((result / "rc_win/rc.exe").read_bytes(), payload)
+                        self.assertEqual(metadata_calls, {"named": 4, "handle": 4})
                     else:
                         with self.assertRaises((TARGET.Refused, stager.Refusal)):
                             TARGET.windows_native_tools_stage(stager, Path("synthetic-workspace"), plan, owner)
@@ -1086,6 +1133,190 @@ try {
                     text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
             self.assertEqual(result.returncode, 0, "fixed entry ancestry regression failed")
             self.assertEqual(result.stdout.strip(), "MORPHEUS_WINDOWS_ANCESTRY_OK")
+
+
+        def test_host_inventory_actual_read_handles_paths_and_limits(self):
+            # Windows-only native reader: load reviewed function ASTs, never
+            # invoke the host-selection entry or touch installed SDK/tool roots.
+            script = r"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$caseStage = 'source_parse'
+try {
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($env:MORPHEUS_HOST_READER_SOURCE, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'source_parse' }
+$caseStage = 'source_functions'
+$definitions = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)
+# Function declarations must remain in this scope for the actual calls below.
+. ([ScriptBlock]::Create(($definitions | ForEach-Object { $_.Extent.Text }) -join "`n"))
+function Must-Refuse([ScriptBlock] $Action) {
+    $refused = $false
+    try { & $Action | Out-Null } catch { $refused = $true }
+    if (-not $refused) { throw 'accepted' }
+}
+$caseStage = 'metadata'
+$metadata = @{ run_id = '1'; run_attempt = '1'; source_commit = ('a' * 40);
+    image_os = 'win25'; image_version = '20261026.1.0'; powershell_version = '7.5.3' }
+if ((Get-HostReceiptMetadata $metadata).run_id -cne '1') { throw 'metadata' }
+foreach ($bad in @('private value', ('x' * 65), "line`nbreak")) {
+    $changed = $metadata.Clone(); $changed.image_version = $bad
+    Must-Refuse { Get-HostReceiptMetadata $changed }
+}
+$changed = $metadata.Clone(); $changed.extra = 'unrequested'
+Must-Refuse { Get-HostReceiptMetadata $changed }
+$caseStage = 'path_refusals'
+# The already-created Python-owned temporary root may use short-name ancestors.
+# Normalize this fixture input before forming children; the production reader
+# still rejects noncanonical spellings and retains every no-follow guard.
+$root = [IO.Path]::GetFullPath($env:MORPHEUS_HOST_TEST_ROOT)
+foreach ($bad in @('relative', '\\server\share\x', 'C:\x:stream', 'C:\x\..\other', 'C:\x\bad.', 'C:\x\bad ', 'C:\x\CON.txt')) {
+    Must-Refuse { Get-CanonicalHostPath $bad }
+}
+$caseStage = 'synthetic_setup'
+$good = Join-Path $root 'good'
+[IO.Directory]::CreateDirectory((Join-Path $good 'include')) | Out-Null
+[IO.File]::WriteAllBytes((Join-Path $good 'tool.bin'), [byte[]]@(1,2,3,4))
+[IO.File]::WriteAllBytes((Join-Path $good 'include\header.h'), [byte[]]@(5))
+$caseStage = 'reader_initialize'
+Initialize-HostReader
+try {
+    $caseStage = 'inventory'
+    $result = Get-HostRootInventory $good
+    if ($result.files.Count -ne 2 -or $script:HostBytes -ne 5) { throw 'inventory' }
+    $caseStage = 'digest_assertion'
+    $tool = @($result.files | Where-Object { $_.path -eq 'tool.bin' })
+    if ($tool.Count -ne 1 -or $tool[0].bytes -ne 4 -or
+        $tool[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
+    # Actual retained READ-sharing owner denies a new writer, not a mock lock.
+    $caseStage = 'write_exclusion'
+    Must-Refuse { [IO.File]::WriteAllBytes((Join-Path $good 'tool.bin'), [byte[]]@(9)) }
+} finally { Close-HostReader }
+foreach ($boundary in @('bytes', 'entries', 'deadline', 'metadata')) {
+    $caseStage = 'limit_' + $boundary
+    Initialize-HostReader
+    try {
+        switch ($boundary) {
+            'bytes' { $script:HostLimits.FileBytes = 3 }
+            'entries' { $script:HostLimits.Entries = 1 }
+            'deadline' { $script:HostLimits.Seconds = -1 }
+            'metadata' { $script:HostLimits.MetadataBytes = 1 }
+        }
+        Must-Refuse { Get-HostRootInventory $good }
+    } finally { Close-HostReader }
+}
+# The aggregate boundary is checked against the opened size before the
+# first payload Read argument is evaluated, not only after a completed hash.
+$caseStage = 'aggregate_setup'
+$budgetRoot = Join-Path $root 'aggregate-budget'
+[IO.Directory]::CreateDirectory($budgetRoot) | Out-Null
+[IO.File]::WriteAllBytes((Join-Path $budgetRoot 'next.bin'), [byte[]]@(1,2,3,4))
+$caseStage = 'aggregate_before_read'
+Initialize-HostReader
+try {
+    $script:HostLimits.TotalBytes = 6; $script:HostBytes = [uint64]3
+    $script:HostPayloadReadAttempted = $false
+    $script:HostBuffer = [pscustomobject]@{}
+    $script:HostBuffer | Add-Member -MemberType ScriptProperty -Name Length -Value {
+        $script:HostPayloadReadAttempted = $true; return 1
+    }
+    $refusal = ''
+    try { Get-HostRootInventory $budgetRoot | Out-Null } catch { $refusal = $_.Exception.Message }
+    if ($refusal -cne 'limit' -or $script:HostPayloadReadAttempted -or $script:HostBytes -ne 3) {
+        throw 'aggregate_before_read'
+    }
+} finally { Close-HostReader }
+# A file that exactly consumes the remaining bytes still uses the actual
+# reader/hash and is admitted; the production 64GiB cap is unchanged.
+$caseStage = 'aggregate_exact_fit'
+Initialize-HostReader
+try {
+    $script:HostLimits.TotalBytes = 7; $script:HostBytes = [uint64]3
+    $result = Get-HostRootInventory $budgetRoot
+    if ($result.files.Count -ne 1 -or $script:HostBytes -ne 7 -or
+        $result.files[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') {
+        throw 'aggregate_exact_fit'
+    }
+} finally { Close-HostReader }
+$caseStage = 'junction_setup'
+$junctionRoot = Join-Path $root 'junction-root'
+[IO.Directory]::CreateDirectory($junctionRoot) | Out-Null
+New-Item -ItemType Junction -Path (Join-Path $junctionRoot 'alias') -Target $good | Out-Null
+$caseStage = 'junction_refusal'
+Initialize-HostReader
+try { Must-Refuse { Get-HostRootInventory $junctionRoot } } finally { Close-HostReader }
+Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
+} catch {
+    # Output only source-fixed labels. No ErrorRecord/string rendering, native
+    # error text, path, argument, environment value or child stderr is emitted.
+    $category = 'unexpected'
+    $closed = @('source_parse', 'metadata', 'accepted', 'path', 'path_input',
+        'path_normalized', 'path_component', 'path_empty', 'path_length', 'path_drive',
+        'path_colon', 'path_slash', 'path_chars', 'path_part_empty', 'path_part_dot',
+        'path_part_trailingdot', 'path_part_trailingspace', 'path_part_device', 'path_part_git',
+        'host', 'type',
+        'identity', 'reparse', 'open', 'changed', 'limit', 'file_size', 'text_size',
+        'depth', 'entries', 'alias', 'handle_cleanup', 'inventory', 'hash',
+        'aggregate_before_read', 'aggregate_exact_fit')
+    if ($closed -ccontains $_.Exception.Message) { $category = 'check_' + $_.Exception.Message }
+    else {
+        # PowerShell wraps .NET invocation errors. Inspect at most eight links,
+        # mapping only known runtime types to fixed categories, never printing them.
+        $problem = $_.Exception
+        for ($i = 0; $i -lt 8 -and $null -ne $problem; $i++) {
+            if ($problem -is [UnauthorizedAccessException]) { $category = 'access'; break }
+            if ($problem -is [IO.IOException]) { $category = 'io'; break }
+            if ($problem -is [ArgumentException]) { $category = 'argument'; break }
+            if ($problem -is [InvalidCastException]) { $category = 'cast'; break }
+            if ($problem -is [MissingMemberException]) { $category = 'member'; break }
+            if ($problem -is [Management.Automation.MethodInvocationException]) { $category = 'invocation' }
+            elseif ($category -eq 'unexpected' -and $problem -is [Management.Automation.RuntimeException]) {
+                $category = 'powershell_runtime'
+            }
+            $problem = $problem.InnerException
+        }
+    }
+    Write-Output ('MORPHEUS_HOST_READER_BOUNDARY_FAILED stage=' + $caseStage + ' category=' + $category)
+    exit 1
+}
+"""
+            source = PATH.parent / "native_webrtc/windows_preflight.ps1"
+            pwsh = Path(os.environ["ProgramFiles"]) / "PowerShell/7/pwsh.exe"
+            with tempfile.TemporaryDirectory() as temporary:
+                env = os.environ.copy()
+                env["MORPHEUS_HOST_READER_SOURCE"] = str(source)
+                env["MORPHEUS_HOST_TEST_ROOT"] = temporary
+                result = subprocess.run([str(pwsh), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                    text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
+            # The only forwarded child output is one exact finite diagnostic.
+            # Unknown/multiple/raw lines and all child stderr stay withheld.
+            stages = ("source_parse", "source_functions", "metadata", "path_refusals",
+                      "synthetic_setup", "reader_initialize", "inventory", "digest_assertion",
+                      "write_exclusion", "limit_bytes", "limit_entries", "limit_deadline",
+                      "limit_metadata", "aggregate_setup", "aggregate_before_read",
+                      "aggregate_exact_fit", "junction_setup", "junction_refusal")
+            checks = ("source_parse", "metadata", "accepted", "path", "path_input",
+                      "path_normalized", "path_component", "path_empty", "path_length", "path_drive",
+                      "path_colon", "path_slash", "path_chars", "path_part_empty", "path_part_dot",
+                      "path_part_trailingdot", "path_part_trailingspace", "path_part_device", "path_part_git",
+                      "host", "type",
+                      "identity", "reparse", "open", "changed", "limit", "file_size", "text_size",
+                      "depth", "entries", "alias", "handle_cleanup", "inventory", "hash",
+                      "aggregate_before_read", "aggregate_exact_fit")
+            categories = ("unexpected", "access", "io", "argument", "cast", "member",
+                          "invocation", "powershell_runtime") + tuple("check_" + item for item in checks)
+            diagnostic = "stage=unknown category=unexpected"
+            if len(result.stdout) <= 160:
+                for stage in stages:
+                    for category in categories:
+                        expected = ("MORPHEUS_HOST_READER_BOUNDARY_FAILED stage=" + stage
+                                    + " category=" + category)
+                        if result.stdout.strip() == expected:
+                            diagnostic = "stage=" + stage + " category=" + category
+            self.assertEqual(result.returncode, 0,
+                             "fixed Windows host reader boundary case failed " + diagnostic)
+            self.assertTrue(result.stdout.strip() == "MORPHEUS_HOST_READER_BOUNDARIES_OK",
+                            "fixed Windows host reader success marker mismatch")
 
 
 if __name__ == "__main__":

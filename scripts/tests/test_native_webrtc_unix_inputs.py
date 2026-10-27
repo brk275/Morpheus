@@ -316,6 +316,37 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
                                      {"helper": "unknown", "phase": "unknown", "lines": []})
 
 
+    def test_postassembly_failure_context_is_fixed_and_remains_fatal(self):
+        expected = frozenset(("post_assembly_scan", "alias_validation", "material_projection",
+                              "final_inventory", "handoff_pack", "handoff_verify", "handoff_emit"))
+        self.assertEqual(_PIPELINE.POST_ASSEMBLY_PHASES, expected)
+        private = "PRIVATE token=SECRET https://private.invalid /private/owner"
+        for phase in (*sorted(expected), private, {"PRIVATE": "SECRET"}):
+            category = phase if type(phase) is str and phase in expected else "unknown"
+            def fail():
+                _PIPELINE.POST_ASSEMBLY_PHASE = phase
+                raise RuntimeError(private)
+            output = io.StringIO()
+            with mock.patch.object(_PIPELINE, "main", side_effect=fail), \
+                    mock.patch.object(_PIPELINE.sys, "stderr", output):
+                with self.assertRaises(SystemExit) as caught:
+                    _PIPELINE.entry()
+            self.assertEqual(caught.exception.code, 1)
+            self.assertEqual(output.getvalue(), json.dumps({"native_linux_producer": "failed",
+                "build_or_release_acceptance": False, "category": category},
+                sort_keys=True, separators=(",", ":")) + "\n")
+            self.assertLess(len(output.getvalue()), 160)
+        # No previous invocation may supply a stale postassembly category.
+        output = io.StringIO()
+        with mock.patch.object(_PIPELINE, "POST_ASSEMBLY_PHASE", "handoff_pack"), \
+                mock.patch.object(_PIPELINE, "main", side_effect=RuntimeError(private)), \
+                mock.patch.object(_PIPELINE.sys, "stderr", output):
+            with self.assertRaises(SystemExit) as caught:
+                _PIPELINE.entry()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(json.loads(output.getvalue())["category"], "unknown")
+
+
 class NativeCacheDataBoundaryTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only producer gate")
     def test_runner_requires_owner_original_and_triggering_actor_before_api(self):
