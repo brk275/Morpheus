@@ -829,8 +829,6 @@ console.log(JSON.stringify({output, errors, exitCode: processFixture.exitCode ||
                 if scenario == "stage_fact":
                     self.assertEqual(result["directoryReads"], 0)
 
-if __name__ == "__main__":
-    unittest.main()
 class NativeMacSdkIntakeTests(unittest.TestCase):
     def intake_result(self, scenario, target="mac-arm64"):
         # Source-reviewed real entry against complete synthetic host DATA. No
@@ -897,7 +895,7 @@ function names(name) {
   return result;
 }
 const fake = {constants: fs.constants,
-  realpathSync(name) { if (name === '/synthetic' || name === root) return name; throw new Error('opaque'); },
+  realpathSync(name) { if (name === '/synthetic' || name === root || bytes.has(name)) return name; throw new Error('opaque'); },
   openSync(name, flags) { assert.ok(flags & fs.constants.O_NOFOLLOW); const node = tree.get(name);
     assert.ok(node || bytes.has(name)); assert.ok(!node || ['file','directory'].includes(node.type));
     const fd = next++; descriptors.set(fd, {name, position: 0}); opened.push(name); return fd; },
@@ -1014,3 +1012,5 @@ console.log(JSON.stringify({output, errors, exitCode: proc.exitCode || 0,
                     self.assertIs(result["selected_file_opened"], False)
 
 
+if __name__ == "__main__":
+    unittest.main()
