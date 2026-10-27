@@ -1,50 +1,28 @@
-name: Native WebRTC Windows x64 source producer
+# TEMPORARY BRIDGE ONLY. NEVER MERGE THIS REPLACEMENT WORKFLOW.
+name: Windows lexical memo contract (temporary)
 
 on:
   workflow_dispatch:
-    inputs:
-      phase:
-        description: Read-only host preflight, DATA staging, or separately admitted native build
-        type: choice
-        required: true
-        options: [preflight, stage, build]
-      preflight_detail:
-        description: Basic bootstrap identity or bounded read-only VS2022/SDK inventory
-        type: choice
-        options: [basic, host-toolchain]
-        default: basic
-      plan_sha256:
-        description: Independently reviewed Windows pipeline plan SHA256 (stage/build)
-        type: string
-        default: ''
-      bootstrap_python_sha256:
-        description: Independently admitted exact hosted python.exe SHA256 (stage/build)
-        type: string
-        default: ''
 
 permissions:
   contents: read
-  actions: read
 
 concurrency:
-  group: native-webrtc-source-windows-x64
+  group: windows-canonical-memo-contract-codex-windows-canonical-memo-contract-20261027-8749472436d4bf0fc67361ba987e69b45e8fc4a7
   cancel-in-progress: false
 
 jobs:
-  producer:
+  contract:
     if: >-
       github.repository == 'brk275/Morpheus' &&
-      github.ref == 'refs/heads/main' &&
+      github.ref == 'refs/heads/codex/windows-canonical-memo-contract-20261027' &&
       github.actor == github.repository_owner &&
       github.triggering_actor == github.repository_owner &&
       github.event.repository.private == false
-    # The original pinned build requires VS2022; windows-2025 maps to VS2026.
-    # This label selects a host family, never an SDK/toolchain admission.
-    runs-on: windows-2022
-    timeout-minutes: ${{ inputs.phase == 'preflight' && 5 || 240 }}
+    runs-on: windows-2025
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        # Material profiles bind Git blob bytes; disable host CRLF conversion.
         env:
           GIT_CONFIG_COUNT: '2'
           GIT_CONFIG_KEY_0: core.autocrlf
@@ -52,58 +30,23 @@ jobs:
           GIT_CONFIG_KEY_1: core.eol
           GIT_CONFIG_VALUE_1: lf
         with:
+          ref: 8749472436d4bf0fc67361ba987e69b45e8fc4a7
           persist-credentials: false
-      - name: Read hosted tool identities without execution
-        if: inputs.phase == 'preflight'
+      - name: Require the exact independently reviewed source
         shell: pwsh
-        env:
-          NATIVE_WINDOWS_PREFLIGHT_DETAIL: ${{ inputs.preflight_detail }}
-        run: ./scripts/native_webrtc/windows_preflight.ps1 -Mode $env:NATIVE_WINDOWS_PREFLIGHT_DETAIL
-      - name: Run only the exact admitted Windows phase
-        if: inputs.phase != 'preflight'
-        shell: pwsh
-        env:
-          NATIVE_READ_TOKEN: ${{ github.token }}
-          NATIVE_WINDOWS_PHASE: ${{ inputs.phase }}
-          NATIVE_WINDOWS_PLAN_SHA256: ${{ inputs.plan_sha256 }}
-          NATIVE_WINDOWS_BOOTSTRAP_SHA256: ${{ inputs.bootstrap_python_sha256 }}
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          $entryFailure = 'input'
-          try {
-            if ($env:NATIVE_WINDOWS_PHASE -notin @('stage', 'build') -or
-                $env:NATIVE_WINDOWS_PLAN_SHA256 -cnotmatch '^[0-9a-f]{64}$' -or
-                $env:NATIVE_WINDOWS_BOOTSTRAP_SHA256 -cnotmatch '^[0-9a-f]{64}$') { throw 'input' }
-            $entryFailure = 'python_discovery'
-            $commands = @(Get-Command python.exe -CommandType Application -All)
-            if ($commands.Count -lt 1) { throw 'python' }
-            $python = [IO.Path]::GetFullPath($commands[0].Source)
-            $entryFailure = 'python_path'
-            if ($python -notmatch '^[A-Za-z]:\\' -or $python.StartsWith('\\')) { throw 'python' }
-            $item = Get-Item -LiteralPath $python -Force
-            $parent = $item
-            while ($null -ne $parent) {
-              if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'python' }
-              $parent = if ($parent -is [IO.DirectoryInfo]) { $parent.Parent } else { $parent.Directory }
-            }
-            $entryFailure = 'python_identity'
-            if ($item.PSIsContainer -or $item.Length -le 0 -or $item.Length -gt 268435456 -or
-                (Get-FileHash -LiteralPath $python -Algorithm SHA256).Hash.ToLowerInvariant() -cne
-                  $env:NATIVE_WINDOWS_BOOTSTRAP_SHA256) { throw 'python' }
-            # Fixed script/path/argv. No source hook, cmd /C, interpolated shell
-            # command, dependency installation or host tool version probe.
-            $entryFailure = 'python_invoke'
-            $plan = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath 'native/webrtc/windows/pipeline-plan.json'
-            & $python -I -B scripts/run_native_webrtc_windows.py --phase $env:NATIVE_WINDOWS_PHASE `
-              --plan $plan --plan-sha256 $env:NATIVE_WINDOWS_PLAN_SHA256
-            $entryFailure = 'python_exit'
-            if ($LASTEXITCODE -ne 0) { throw 'phase' }
-          } catch {
-            $category = if ($entryFailure -cin @('input', 'python_discovery', 'python_path', 'python_identity', 'python_invoke', 'python_exit')) { $entryFailure } else { 'entry' }
-            Write-Output ('MORPHEUS_NATIVE_WINDOWS_ENTRY failed category=' + $category)
-            exit 1
+          $expected = '8749472436d4bf0fc67361ba987e69b45e8fc4a7'
+          if ($expected -cnotmatch '^[0-9a-f]{40}$') { throw 'reviewed source is not bound' }
+          $actual = @(& git -c core.hooksPath=NUL -c core.fsmonitor=false rev-parse --verify HEAD)
+          if ($LASTEXITCODE -ne 0 -or $actual.Count -ne 1 -or $actual[0] -cne $expected) {
+            throw 'reviewed source identity mismatch'
           }
-      # No artifact/install/upload/sign/release step or cache restore. Existing
-      # quota and safe DATA cache contracts are unchanged; Windows intake must
-      # be independently implemented/admitted before cross-job handoff is used.
+      - name: Run only the existing Windows contract case
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python -m unittest scripts.tests.test_native_webrtc_windows_inputs.WindowsNativeInputsTests.test_host_inventory_actual_read_handles_paths_and_limits -v
+          if ($LASTEXITCODE -ne 0) { exit 1 }
