@@ -18,6 +18,16 @@ function New-HostReadDelegate([string] $Name, [Type] $Result, [Type[]] $Argument
 }
 
 function Initialize-HostReader {
+    # One sequential reader owns its metadata scratch until Close-HostReader.
+    # Refuse an overlapping initialization rather than lose live owned storage.
+    $previous = Get-Variable -Name HostInfoMemory -Scope Script -ErrorAction SilentlyContinue
+    $previousHandles = Get-Variable -Name HostHandles -Scope Script -ErrorAction SilentlyContinue
+    if (($null -ne $previous -and $previous.Value -ne [IntPtr]::Zero) -or
+        ($null -ne $previousHandles -and $previousHandles.Value.Count -ne 0)) { throw 'identity' }
+    $script:HostInfoMemory = [IntPtr]::Zero
+    $script:HostInfoScratch = $null
+    $script:HostInfoBusy = $false
+    $script:HostHandles = [Collections.Generic.List[IntPtr]]::new()
     # These are fixed source limits, never manifest-selected overrides.
     $script:HostLimits = @{ Entries = 200000; Handles = 200256; FileBytes = 2147483648;
         TotalBytes = 68719476736; Depth = 64; JsonBytes = 33554432; MetadataBytes = 31457280; Seconds = 180 }
@@ -25,7 +35,6 @@ function Initialize-HostReader {
     $script:HostCount = 0; $script:HostBytes = [uint64]0; $script:HostMetadataBytes = 0
     $script:HostBuffer = [byte[]]::new(1048576)
     $script:HostFileRecords = [Collections.Generic.List[object]]::new()
-    $script:HostHandles = [Collections.Generic.List[IntPtr]]::new()
     $script:HostDirectories = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
     $system = Get-CanonicalHostPath $env:SystemRoot
     if ($system -cnotmatch '^[A-Za-z]:\\Windows$') { throw 'host' }
@@ -34,6 +43,10 @@ function Initialize-HostReader {
     $script:HostInfo = New-HostReadDelegate 'GetFileInformationByHandle' ([int]) ([Type[]]@([IntPtr], [IntPtr]))
     $script:HostType = New-HostReadDelegate 'GetFileType' ([uint32]) ([Type[]]@([IntPtr]))
     $script:HostClose = New-HostReadDelegate 'CloseHandle' ([int]) ([Type[]]@([IntPtr]))
+    # Allocate last: no further initialization can fail after unmanaged ownership
+    # is acquired. The 52-byte Win32 record and ABI are unchanged.
+    $script:HostInfoScratch = [byte[]]::new(52)
+    $script:HostInfoMemory = [Runtime.InteropServices.Marshal]::AllocHGlobal(52)
 }
 
 function Assert-HostBudget {
@@ -76,18 +89,22 @@ function Get-CanonicalHostPath([string] $Value) {
 }
 
 function Get-HostHandleInfo([IntPtr] $Handle) {
-    if ($script:HostType.Invoke($Handle) -ne 1) { throw 'type' }
-    $memory = [Runtime.InteropServices.Marshal]::AllocHGlobal(52)
+    # These synchronous calls have no callbacks. Never overlap use or return a
+    # view of shared scratch: the result below contains only copied values.
+    if ($script:HostInfoBusy -or $script:HostInfoMemory -eq [IntPtr]::Zero) { throw 'identity' }
+    $script:HostInfoBusy = $true
     try {
+        if ($script:HostType.Invoke($Handle) -ne 1) { throw 'type' }
+        $memory = $script:HostInfoMemory
         if ($script:HostInfo.Invoke($Handle, $memory) -eq 0) { throw 'identity' }
-        $data = [byte[]]::new(52); [Runtime.InteropServices.Marshal]::Copy($memory, $data, 0, 52)
+        $data = $script:HostInfoScratch; [Runtime.InteropServices.Marshal]::Copy($memory, $data, 0, 52)
         $attributes = [BitConverter]::ToUInt32($data, 0)
         if (($attributes -band 0x400) -ne 0) { throw 'reparse' }
         return @{ attributes = $attributes; directory = (($attributes -band 0x10) -ne 0);
             bytes = ([uint64][BitConverter]::ToUInt32($data, 32) * 4294967296 + [uint64][BitConverter]::ToUInt32($data, 36));
-            write = [Convert]::ToHexString([byte[]]($data[20..27])); links = [BitConverter]::ToUInt32($data, 40);
-            identity = ([Convert]::ToHexString([byte[]]($data[28..31])) + [Convert]::ToHexString([byte[]]($data[44..51]))) }
-    } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
+            write = [Convert]::ToHexString($data, 20, 8); links = [BitConverter]::ToUInt32($data, 40);
+            identity = ([Convert]::ToHexString($data, 28, 4) + [Convert]::ToHexString($data, 44, 8)) }
+    } finally { $script:HostInfoBusy = $false }
 }
 
 function Open-HostReadHandle([string] $LiteralPath, [bool] $Directory) {
@@ -221,12 +238,25 @@ function Get-HostRootInventory([string] $LiteralRoot) {
 }
 
 function Close-HostReader {
+    if ($script:HostInfoBusy) { throw 'identity' }
     $good = $true
-    if ($null -ne $script:HostHandles) {
-        for ($i = $script:HostHandles.Count - 1; $i -ge 0; $i--) {
-            if ($script:HostClose.Invoke($script:HostHandles[$i]) -eq 0) { $good = $false }
+    try {
+        if ($null -ne $script:HostHandles) {
+            for ($i = $script:HostHandles.Count - 1; $i -ge 0; $i--) {
+                $handle = $script:HostHandles[$i]
+                # An uncertain close is never retried on a potentially reused handle.
+                $script:HostHandles[$i] = [IntPtr]::Zero
+                if ($handle -ne [IntPtr]::Zero -and $script:HostClose.Invoke($handle) -eq 0) { $good = $false }
+            }
+            $script:HostHandles.Clear()
         }
-        $script:HostHandles.Clear()
+    } finally {
+        # Owned scratch is freed even when closing a native file handle fails.
+        $memory = $script:HostInfoMemory
+        $script:HostInfoMemory = [IntPtr]::Zero
+        $script:HostInfoScratch = $null
+        $script:HostInfoBusy = $false
+        if ($memory -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
     }
     if (-not $good) { throw 'handle_cleanup' }
 }

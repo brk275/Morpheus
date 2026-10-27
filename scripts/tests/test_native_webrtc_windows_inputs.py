@@ -1199,6 +1199,12 @@ $good = Join-Path $root 'good'
 $caseStage = 'reader_initialize'
 Initialize-HostReader
 try {
+    $ownedMemory = $script:HostInfoMemory
+    $ownedScratch = $script:HostInfoScratch
+    if ($ownedMemory -eq [IntPtr]::Zero -or $ownedScratch.Length -ne 52) { throw 'identity' }
+    # A second owner cannot replace the original scratch or retained handles.
+    Must-Refuse { Initialize-HostReader }
+    if ($script:HostInfoMemory -ne $ownedMemory) { throw 'identity' }
     $caseStage = 'inventory'
     $result = Get-HostRootInventory $good
     if ($result.files.Count -ne 2 -or $script:HostBytes -ne 5) { throw 'inventory' }
@@ -1206,10 +1212,43 @@ try {
     $tool = @($result.files | Where-Object { $_.path -eq 'tool.bin' })
     if ($tool.Count -ne 1 -or $tool[0].bytes -ne 4 -or
         $tool[0].sha256 -cne '9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a') { throw 'hash' }
+    # Repeated real metadata checks reuse the same owned buffers but retain
+    # the old exact bytes-to-hex representation and independent result values.
+    $observed = Get-HostHandleInfo $script:HostFileRecords[0].handle
+    if ($script:HostInfoMemory -ne $ownedMemory -or
+        -not [object]::ReferenceEquals($ownedScratch, $script:HostInfoScratch) -or $script:HostInfoBusy -or
+        $observed.write -cne [Convert]::ToHexString([byte[]]($ownedScratch[20..27])) -or
+        $observed.identity -cne ([Convert]::ToHexString([byte[]]($ownedScratch[28..31])) +
+                               [Convert]::ToHexString([byte[]]($ownedScratch[44..51])))) { throw 'identity' }
+    $savedIdentity = $observed.identity
+    $null = Get-HostHandleInfo $script:HostFileRecords[1].handle
+    if ($observed.identity -cne $savedIdentity) { throw 'identity' }
+    $script:HostInfoBusy = $true
+    try {
+        Must-Refuse { Get-HostHandleInfo $script:HostFileRecords[0].handle }
+        Must-Refuse { Close-HostReader }
+        if ($script:HostInfoMemory -ne $ownedMemory) { throw 'identity' }
+    }
+    finally { $script:HostInfoBusy = $false }
     # Actual retained READ-sharing owner denies a new writer, not a mock lock.
     $caseStage = 'write_exclusion'
     Must-Refuse { [IO.File]::WriteAllBytes((Join-Path $good 'tool.bin'), [byte[]]@(9)) }
 } finally { Close-HostReader }
+if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
+    $script:HostInfoBusy) { throw 'identity' }
+# Cleanup remains idempotent; no freed metadata pointer can be reused.
+Close-HostReader
+Must-Refuse { Get-HostHandleInfo ([IntPtr]::Zero) }
+# A pre-native initialization refusal still leaves idempotent cleanup state.
+$originalSystemRoot = $env:SystemRoot
+try {
+    $env:SystemRoot = 'relative'
+    Must-Refuse { Initialize-HostReader }
+    Close-HostReader
+    Close-HostReader
+    if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
+        $script:HostInfoBusy -or $script:HostHandles.Count -ne 0) { throw 'identity' }
+} finally { $env:SystemRoot = $originalSystemRoot }
 foreach ($boundary in @('bytes', 'entries', 'deadline', 'metadata')) {
     $caseStage = 'limit_' + $boundary
     Initialize-HostReader
@@ -1256,6 +1295,59 @@ try {
         throw 'aggregate_exact_fit'
     }
 } finally { Close-HostReader }
+# Close a real owned synthetic handle and then throw: the native outcome is
+# intentionally uncertain to Close-HostReader. No consumed handle may be retried.
+Initialize-HostReader
+$originalClose = $script:HostClose
+$closeProbe = [pscustomobject]@{
+    Delegate = $originalClose
+    Calls = [Collections.Generic.List[IntPtr]]::new()
+    Consumed = [IntPtr]::Zero
+    Closed = $false
+    Thrown = $false
+}
+$closeProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
+    param([IntPtr] $Handle)
+    $this.Calls.Add($Handle)
+    $closed = $this.Delegate.Invoke($Handle)
+    if (-not $this.Thrown) {
+        $this.Thrown = $true
+        $this.Consumed = $Handle
+        $this.Closed = ($closed -ne 0)
+        throw 'identity'
+    }
+    return $closed
+}
+try {
+    $null = Get-HostRootInventory $budgetRoot
+    $ownedHandleCount = $script:HostHandles.Count
+    if ($ownedHandleCount -lt 2) { throw 'identity' }
+    $expectedConsumed = $script:HostHandles[$ownedHandleCount - 1]
+    $script:HostClose = $closeProbe
+    Must-Refuse { Close-HostReader }
+    if (-not $closeProbe.Thrown -or -not $closeProbe.Closed -or $closeProbe.Calls.Count -ne 1 -or
+        $closeProbe.Consumed -ne $expectedConsumed -or
+        $script:HostHandles[$ownedHandleCount - 1] -ne [IntPtr]::Zero -or
+        $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
+        $script:HostInfoBusy) { throw 'identity' }
+    # Remaining retained handles are still owned, and second cleanup attempts
+    # each exactly once while skipping the already consumed zeroed slot.
+    Close-HostReader
+    $uniqueCalls = [Collections.Generic.HashSet[IntPtr]]::new()
+    foreach ($handle in $closeProbe.Calls) {
+        if ($handle -eq [IntPtr]::Zero -or -not $uniqueCalls.Add($handle)) { throw 'identity' }
+    }
+    if ($closeProbe.Calls.Count -ne $ownedHandleCount -or $script:HostHandles.Count -ne 0 -or
+        $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
+        $script:HostInfoBusy) { throw 'identity' }
+    Close-HostReader
+    if ($closeProbe.Calls.Count -ne $ownedHandleCount) { throw 'identity' }
+} finally {
+    # Even an assertion failure uses the original real closer for every still
+    # owned nonzero slot; never probe the consumed handle or freed metadata.
+    $script:HostClose = $originalClose
+    Close-HostReader
+}
 $caseStage = 'junction_setup'
 $junctionRoot = Join-Path $root 'junction-root'
 [IO.Directory]::CreateDirectory($junctionRoot) | Out-Null
