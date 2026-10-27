@@ -340,11 +340,45 @@ def qualified_apply_main_reuse(paths, event, event_name, force_all=False):
         return False
 
 
-# No vendor execution is qualified yet. Maintainer activation must bind the
+# Exact native vendor inputs were qualified on all four supported platforms.
+# Maintainer activation binds the
 # exact tested commit/tree/workflow, receipt, four jobs and complete reviewed
 # changed-input tuple. Source review and a separate helper run precede merge;
 # no candidate data or event can populate this trusted literal.
-VENDOR_REUSE_QUALIFICATION = None
+VENDOR_REUSE_QUALIFICATION = {
+    'source': '1abc7a82f5791af5a9b076794be07904e0931f47',
+    'tree': '4edadf42f8389381995bd33b6c81d3815dd53ed2',
+    'workflow_sha256': '9d557eeb730a8785aaf2d3eb9fbd5224ab202fdc2f2f384a60c73a87b61c9aa0',
+    'receipt_sha256': '40563aa005e5223cfea1bdeaa33b4c272fef3da70db03dd5b8260858a27adef7',
+    'route': 'vendor',
+    'jobs': (
+        ('ubuntu-24.04', 40497711784, 122167728535),
+        ('windows-2025', 40497711784, 122167728475),
+        ('macos-15', 40497711784, 122167728330),
+        ('macos-15-intel', 40497711784, 122167728468),
+    ),
+    'inputs': (
+        'vendor/livekit/MORPHEUS_PATCH.md',
+        'vendor/livekit/MORPHEUS_PROVENANCE.json',
+        'vendor/livekit/src/room/e2ee/manager.rs',
+        'vendor/livekit/src/room/e2ee/manager.rs.upstream',
+        'vendor/livekit/src/room/e2ee/remote_track_admission.rs',
+        'vendor/livekit/src/room/mod.rs',
+        'vendor/livekit/src/room/mod.rs.upstream',
+        'vendor/livekit/src/room/track/remote_audio_track.rs',
+        'vendor/livekit/src/room/track/remote_audio_track.rs.upstream',
+        'vendor/livekit/src/room/track/remote_track.rs',
+        'vendor/livekit/src/room/track/remote_track.rs.upstream',
+        'vendor/livekit/src/room/track/remote_video_track.rs',
+        'vendor/livekit/src/room/track/remote_video_track.rs.upstream',
+        'vendor/matrix-rtc-core/MORPHEUS_PATCH.md',
+        'vendor/matrix-rtc-core/MORPHEUS_PROVENANCE.json',
+        'vendor/matrix-rtc-core/src/encryption/mod.rs',
+        'vendor/matrix-rtc-core/tests/key_rotation.rs',
+        'vendor/matrix-rtc-core/tests/key_rotation.rs.upstream',
+        'vendor/matrix-rtc-livekit/src/transport_impl.rs',
+    ),
+}
 
 
 def qualified_vendor_main_reuse(paths, event, event_name, force_all=False):
