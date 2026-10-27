@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import copy
+import errno
 import gzip
 import hashlib
 import http.client
@@ -27,6 +28,7 @@ import tarfile
 import time
 import types
 import urllib.parse
+import zlib
 
 REPOSITORY = "brk275/Morpheus"
 MAX_CACHE_CAPACITY = 10_000_000_000
@@ -57,6 +59,70 @@ POST_ASSEMBLY_PHASES = frozenset((
     "post_assembly_scan", "alias_validation", "material_projection",
     "final_inventory", "handoff_pack", "handoff_verify", "handoff_emit",
 ))
+
+
+# Failure-only closed framing for the original handoff pack. No member names,
+# paths, exception text or input values enter this context.
+PACK_OPERATIONS = frozenset((
+    "unknown", "cache_absence", "cache_create", "output_open", "output_mode",
+    "writer_create", "gzip_open", "metadata_encode", "metadata_limit",
+    "metadata_header", "metadata_add", "root_select", "directory_header",
+    "directory_add", "file_fact", "file_header", "file_open", "file_wrap",
+    "file_add", "file_close", "file_position", "gzip_finish", "output_flush", "output_sync", "output_close",
+))
+PACK_FAILURE_CLASSES = frozenset((
+    "compressed_capacity", "compressed_short_write", "refused", "os_space",
+    "os_permission", "os_missing", "os_exists", "os_io", "os_file_large",
+    "os_other", "compression", "tar", "encoding", "other",
+))
+PACK_OPERATION = "unknown"
+PACK_FAILURE = None
+PACK_ACTIVE = False
+
+
+def reset_pack_capture(active=False):
+    global PACK_OPERATION, PACK_FAILURE, PACK_ACTIVE
+    PACK_OPERATION, PACK_FAILURE, PACK_ACTIVE = "unknown", None, active
+
+
+def pack_at(operation):
+    global PACK_OPERATION
+    need(type(operation) is str and operation in PACK_OPERATIONS)
+    PACK_OPERATION = operation
+
+
+def pack_failed(error, failure=None):
+    global PACK_FAILURE
+    if PACK_ACTIVE is not True or PACK_FAILURE is not None:
+        return
+    if failure is None:
+        if isinstance(error, Refused): failure = "refused"
+        elif isinstance(error, (gzip.BadGzipFile, zlib.error)): failure = "compression"
+        elif isinstance(error, tarfile.TarError): failure = "tar"
+        elif isinstance(error, UnicodeError): failure = "encoding"
+        elif isinstance(error, OSError):
+            number = error.errno
+            if number in (errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)): failure = "os_space"
+            elif number in (errno.EACCES, errno.EPERM): failure = "os_permission"
+            elif number == errno.ENOENT: failure = "os_missing"
+            elif number == errno.EEXIST: failure = "os_exists"
+            elif number == errno.EIO: failure = "os_io"
+            elif number == errno.EFBIG: failure = "os_file_large"
+            else: failure = "os_other"
+        else: failure = "other"
+    if type(failure) is not str or failure not in PACK_FAILURE_CLASSES:
+        failure = "other"
+    operation = PACK_OPERATION if type(PACK_OPERATION) is str and PACK_OPERATION in PACK_OPERATIONS else "unknown"
+    PACK_FAILURE = (operation, failure)
+
+
+def pack_frame():
+    value = PACK_FAILURE
+    if (type(value) is tuple and len(value) == 2
+            and type(value[0]) is str and value[0] in PACK_OPERATIONS
+            and type(value[1]) is str and value[1] in PACK_FAILURE_CLASSES):
+        return {"pack_operation": value[0], "pack_failure": value[1]}
+    return {}
 
 
 class Refused(Exception):
@@ -410,9 +476,22 @@ class BoundedWriter:
         self.stream, self.maximum, self.position = stream, maximum, 0
 
     def write(self, data):
-        need(self.position + len(data) <= self.maximum)
-        count = self.stream.write(data)
-        need(count == len(data)); self.position += count
+        try:
+            need(self.position + len(data) <= self.maximum)
+        except Refused as error:
+            pack_failed(error, "compressed_capacity")
+            raise
+        try:
+            count = self.stream.write(data)
+        except BaseException as error:
+            pack_failed(error)
+            raise
+        try:
+            need(count == len(data))
+        except Refused as error:
+            pack_failed(error, "compressed_short_write")
+            raise
+        self.position += count
         return count
 
     def tell(self):
@@ -537,6 +616,86 @@ def scan_tree(material, root):
             need(len(files) + len(directories) <= MAX_MEMBERS)
     material.topology(root, files, directories)
     return files, directories
+
+
+def pack_handoff(temp, handoff, inventories, material):
+    """Original pack operations, with first-failure capture before cleanup."""
+    global PACK_ACTIVE
+    reset_pack_capture(True)
+    try:
+        pack_at("cache_absence")
+        cache_dir = temp / "native-webrtc-handoff"
+        need(not os.path.lexists(cache_dir))
+        pack_at("cache_create")
+        cache_dir.mkdir(mode=0o700)
+        output = cache_dir / "handoff.tar.gz"
+        pack_at("output_open")
+        with open(output, "xb") as stream:
+            try:
+                pack_at("output_mode")
+                os.chmod(output, 0o600)
+                pack_at("writer_create")
+                bounded = BoundedWriter(stream, MAX_HANDOFF)
+                pack_at("gzip_open")
+                with tarfile.open(fileobj=bounded, mode="w:gz", format=tarfile.GNU_FORMAT) as archive:
+                    try:
+                        pack_at("metadata_encode")
+                        raw = (json.dumps(handoff, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                        pack_at("metadata_limit")
+                        need(len(raw) <= MAX_JSON)
+                        pack_at("metadata_header")
+                        info = tarfile.TarInfo("HANDOFF.json"); info.size = len(raw); info.mode = 0o600
+                        pack_at("metadata_add")
+                        archive.addfile(info, io.BytesIO(raw))
+                        for name, root_spec in sorted(inventories.items()):
+                            pack_at("root_select")
+                            root = temp / name
+                            for directory in root_spec["directories"]:
+                                pack_at("directory_header")
+                                member = name + ("/" + directory if directory != "." else "")
+                                info = tarfile.TarInfo(member); info.type = tarfile.DIRTYPE; info.mode = 0o700
+                                pack_at("directory_add")
+                                archive.addfile(info)
+                            for row in root_spec["files"]:
+                                pack_at("file_fact")
+                                material.file_fact(root / row["path"], row, row["mode"])
+                                pack_at("file_header")
+                                info = tarfile.TarInfo(name + "/" + row["path"])
+                                info.size, info.mode = row["bytes"], row["mode"]
+                                pack_at("file_open")
+                                fd = os.open(root / row["path"], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                                pack_at("file_wrap")
+                                with os.fdopen(fd, "rb") as source:
+                                    try:
+                                        pack_at("file_add")
+                                        archive.addfile(info, source)
+                                    except BaseException as error:
+                                        pack_failed(error)
+                                        raise
+                                    finally:
+                                        pack_at("file_close")
+                                pack_at("file_position")
+                                need(stream.tell() <= MAX_HANDOFF)
+                    except BaseException as error:
+                        pack_failed(error)
+                        raise
+                    finally:
+                        pack_at("gzip_finish")
+                pack_at("output_flush")
+                stream.flush()
+                pack_at("output_sync")
+                os.fsync(stream.fileno())
+            except BaseException as error:
+                pack_failed(error)
+                raise
+            finally:
+                pack_at("output_close")
+    except BaseException as error:
+        pack_failed(error)
+        raise
+    finally:
+        PACK_ACTIVE = False
+    return output
 
 
 def job_fields():
@@ -839,33 +998,8 @@ def stage(args, plan, temp, material):
         "build_admission_granted": False, "native_sources_complete": False,
         "build_ready": False, "distribution_ready": False}
     POST_ASSEMBLY_PHASE = "handoff_pack"
-    cache_dir = temp / "native-webrtc-handoff"
-    need(not os.path.lexists(cache_dir))
-    cache_dir.mkdir(mode=0o700)
-    output = cache_dir / "handoff.tar.gz"
-    with open(output, "xb") as stream:
-        os.chmod(output, 0o600)
-        bounded = BoundedWriter(stream, MAX_HANDOFF)
-        with tarfile.open(fileobj=bounded, mode="w:gz", format=tarfile.GNU_FORMAT) as archive:
-            raw = (json.dumps(handoff, sort_keys=True, separators=(",", ":")) + "\n").encode()
-            need(len(raw) <= MAX_JSON)
-            info = tarfile.TarInfo("HANDOFF.json"); info.size = len(raw); info.mode = 0o600
-            archive.addfile(info, io.BytesIO(raw))
-            for name, root_spec in sorted(inventories.items()):
-                root = temp / name
-                for directory in root_spec["directories"]:
-                    member = name + ("/" + directory if directory != "." else "")
-                    info = tarfile.TarInfo(member); info.type = tarfile.DIRTYPE; info.mode = 0o700
-                    archive.addfile(info)
-                for row in root_spec["files"]:
-                    material.file_fact(root / row["path"], row, row["mode"])
-                    info = tarfile.TarInfo(name + "/" + row["path"])
-                    info.size, info.mode = row["bytes"], row["mode"]
-                    fd = os.open(root / row["path"], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-                    with os.fdopen(fd, "rb") as source:
-                        archive.addfile(info, source)
-                    need(stream.tell() <= MAX_HANDOFF)
-        stream.flush(); os.fsync(stream.fileno())
+    output = pack_handoff(temp, handoff, inventories, material)
+    cache_dir = output.parent
     POST_ASSEMBLY_PHASE = "handoff_verify"
     fact = material.file_fact(output)
     need(fact["bytes"] <= MAX_HANDOFF)
@@ -1101,14 +1235,16 @@ def main():
 def entry():
     global POST_ASSEMBLY_PHASE
     POST_ASSEMBLY_PHASE = "unknown"
+    reset_pack_capture()
     try:
         main()
     except BaseException:
         category = (POST_ASSEMBLY_PHASE if type(POST_ASSEMBLY_PHASE) is str
                     and POST_ASSEMBLY_PHASE in POST_ASSEMBLY_PHASES else "unknown")
-        print(json.dumps({"native_linux_producer": "failed",
-                          "build_or_release_acceptance": False,
-                          "category": category}, sort_keys=True, separators=(",", ":")), file=sys.stderr)
+        record = {"native_linux_producer": "failed", "build_or_release_acceptance": False, "category": category}
+        if category == "handoff_pack":
+            record.update(pack_frame())
+        print(json.dumps(record, sort_keys=True, separators=(",", ":")), file=sys.stderr)
         raise SystemExit(1)
 
 
