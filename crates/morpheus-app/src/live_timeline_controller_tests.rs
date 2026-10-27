@@ -56,6 +56,14 @@ macro_rules! stage {
     };
 }
 
+// Diagnostic substeps do not add acceptance proof records. Fixed identifiers
+// only, with at most 38 emissions on the existing successful scenario path.
+macro_rules! link_stage {
+    ($name:ident) => {
+        eprintln!("\nMORPHEUS_LIVE_TIMELINE_LINK {}", stringify!($name));
+    };
+}
+
 // Printed once per name, only after the corresponding assertions passed.
 macro_rules! check {
     ($name:ident) => {
@@ -1319,6 +1327,7 @@ impl Scenario {
         // the absent row and its retry, and the reopened room delivers the
         // row: the old continuation neither scrolls nor focuses, and the
         // newer epoch is untouched.
+        link_stage!(link_join_open);
         let asked = self.joined_open(root).await;
         let jumps = ui.get_timeline_jump_request();
         self.follow_link(&selection, root, &asked);
@@ -1349,6 +1358,7 @@ impl Scenario {
 
         // The same continuation with nothing navigated since: the row arrives
         // before the retry, which scrolls to it under the receipt's epoch.
+        link_stage!(link_join_open);
         let asked = self.joined_open(root).await;
         let receipt = self.live.current_navigation_epoch();
         let rows = ui.get_messages();
@@ -1375,6 +1385,7 @@ impl Scenario {
         // switcher, the account menu). Nothing of the view is installed,
         // shown or scrolled to, and the room's live feed and the newer state
         // stay: a modal's entry ended the message for good.
+        link_stage!(link_held_intents);
         let intents = [
             Intent::SecurityStep,
             Intent::Settings,
@@ -1383,6 +1394,7 @@ impl Scenario {
             Intent::AccountMenu,
         ];
         for intent in intents {
+            link_stage!(link_join_open);
             let asked = self.joined_open(root).await;
             let held = self.focus_held(&selection, root, &asked).await;
             let generation = self.live.generation.load(Ordering::Acquire);
@@ -1454,10 +1466,12 @@ impl Scenario {
 
         // Unchanged since its click, the held view commits, shows its rows,
         // and its retry scrolls to the message.
+        link_stage!(link_join_open);
         let asked = self.joined_open(root).await;
         let held = self.focus_held(&selection, root, &asked).await;
         let jumps = ui.get_timeline_jump_request();
         held.proceed();
+        link_stage!(link_focus_rows);
         let focused = |ui: &AppWindow| ui.get_conversation_focused() && row(ui);
         wait_for_ui(ui, "The owned focused view did not show its rows", focused).await;
         settle(ui).await;
@@ -1487,6 +1501,7 @@ impl Scenario {
         let selection = self.manager.account_selection(&self.account).unwrap();
         let (live, weak) = (self.live.clone(), self.ui.as_weak());
         let (room, joining) = (self.room.clone(), asked.clone());
+        link_stage!(link_join_wait);
         let opened = on_runtime(&self.runtime, async move {
             let open = JoinedNavigation::Room;
             live.open_joined(selection, room, open, joining, weak).await
@@ -1501,6 +1516,7 @@ impl Scenario {
             "Its receipt must own the screen"
         );
         let row = |ui: &AppWindow| has_event_id(&ui.get_messages(), root);
+        link_stage!(link_join_row);
         wait_for_ui(&self.ui, "The joined room did not show the row", row).await;
         // Let the reopened feed's first publications land before the row
         // is taken out of the window.
@@ -1534,9 +1550,11 @@ impl Scenario {
         event: &str,
         asked: &JoinAsked,
     ) -> Arc<PausePoint> {
+        link_stage!(link_focus_setup);
         let held = self.live.pauses.install("focus.before_commit");
         self.follow_link(selection, event, asked);
         advance_retries(&self.ui).await;
+        link_stage!(link_focus_wait);
         let loaded = tokio::time::timeout(Duration::from_secs(60), held.entered()).await;
         assert!(
             loaded.is_ok(),

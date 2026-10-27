@@ -493,6 +493,30 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         self.assertEqual(acceptance_module.app_timeline_diagnostics(output),
                          {"test_entered": True, "stage": "queued_drain"})
         self.assertEqual(acceptance_module.app_timeline_diagnostics("private-token"), {"test_entered": False})
+        # Repeated link labels are legitimate and stay outside acceptance proof.
+        marker = acceptance_module.APP_TIMELINE_LINK_PREFIX + "link_join_wait\n"
+        for count in (1, 38, 48):
+            observed = acceptance_module.app_timeline_diagnostics(output + marker * count)
+            self.assertEqual(observed["link_stage"], "link_join_wait")
+            self.assertEqual(observed["stage"], "queued_drain")
+            self.assertEqual(acceptance_module.app_timeline_evidence(self.output() + marker * count),
+                             dict.fromkeys(sorted(acceptance_module.APP_TIMELINE_CHECKS), True))
+        for value in (marker * 49,
+                      acceptance_module.APP_TIMELINE_LINK_PREFIX + "private_token\n",
+                      marker.rstrip() + " private-token\n",
+                      acceptance_module.APP_TIMELINE_LINK_PREFIX + "x" * 100_000,
+                      "MORPHEUS_LIVE_TIMELINE_LINKforged\n"):
+            result = acceptance_module.app_timeline_diagnostics(value)
+            self.assertEqual(result, {"test_entered": False, "link_stage": "invalid"})
+            self.assertNotIn("private", str(result))
+        self.assertEqual(acceptance_module.app_timeline_diagnostics("prefix" + marker),
+                         {"test_entered": False})
+        for name in acceptance_module.APP_TIMELINE_LINK_STAGES:
+            self.assertEqual(acceptance_module.app_timeline_diagnostics(
+                acceptance_module.APP_TIMELINE_LINK_PREFIX + name)["link_stage"], name)
+        for value in (marker, self.output().replace("MORPHEUS_LIVE_TIMELINE_STAGE complete", marker)):
+            with self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(value)
         for stage in (
             "setup_profile", "setup_config", "setup_window", "setup_controller",
             "setup_dispatch", "setup_login", "setup_rooms", "setup_ready",

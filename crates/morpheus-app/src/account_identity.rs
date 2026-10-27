@@ -189,6 +189,7 @@ pub(crate) fn with_saved_avatar(mut row: crate::SavedAccountItem) -> crate::Save
         .unwrap_or_else(|| crate::live::display_user(row.handle.as_str()));
     row.initials = crate::live::initials(&name).into();
     row.accent = crate::live::accent(row.id.as_str());
+    row.avatar_slot = crate::live::avatar_slot(row.id.as_str());
     match avatar_image(row.id.as_str()) {
         Some(image) => {
             row.avatar = image;

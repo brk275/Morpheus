@@ -5773,6 +5773,7 @@ fn apply_snapshot(
             )
             .into(),
             accent: accent(&room.room_id),
+            avatar_slot: avatar_slot(&room.room_id),
         })
         .collect::<Vec<_>>();
     for (id, name) in &view.known_spaces {
@@ -5782,6 +5783,7 @@ fn apply_snapshot(
                 name: name.as_str().into(),
                 initials: initials(name).into(),
                 accent: accent(id),
+                avatar_slot: avatar_slot(id),
             });
         }
     }
@@ -6044,6 +6046,7 @@ pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], activ
                 handle: item.handle.clone(),
                 initials: item.initials.clone(),
                 accent: item.accent,
+                avatar_slot: item.avatar_slot,
                 avatar: item.avatar.clone(),
                 has_avatar: item.has_avatar,
             }
@@ -6063,6 +6066,7 @@ pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], activ
     ui.set_active_account_initials(account.initials.clone());
     ui.set_active_account_status(account.status.clone());
     ui.set_active_account_accent(account.accent);
+    ui.set_active_account_avatar_slot(account.avatar_slot);
     ui.set_active_account_avatar(account.avatar.clone());
     ui.set_active_account_has_avatar(account.has_avatar);
     // Once per account selection: read the visible account's own public
@@ -6085,6 +6089,7 @@ fn account_item(account: &AccountInfo, selected: bool) -> AccountItem {
         initials: account_initials.into(),
         status: if selected { "Connected" } else { "Paused" }.into(),
         accent: accent(&account.id),
+        avatar_slot: avatar_slot(&account.id),
         has_avatar: avatar.is_some(),
         avatar: avatar.unwrap_or_default(),
     }
@@ -6167,6 +6172,7 @@ fn member_item(info: &RoomMemberInfo) -> MemberItem {
         is_account_user: info.is_account_user,
         is_creator: info.membership == "join" && info.power_level.is_none(),
         accent: accent(&info.user_id),
+        avatar_slot: avatar_slot(&info.user_id),
         online: false,
     }
 }
@@ -6228,6 +6234,7 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
         reaction: info.reaction_summary.as_str().into(),
         poll: crate::polls::poll_card(info),
         accent: accent(&info.sender),
+        avatar_slot: avatar_slot(&info.sender),
         pinned: crate::pinned_messages::row_pinned(info.event_id.as_deref()),
     }
 }
@@ -6248,18 +6255,25 @@ pub(crate) fn initials(name: &str) -> String {
         .collect()
 }
 
-pub(crate) fn accent(value: &str) -> Color {
-    const COLORS: [(u8, u8, u8); 5] = [
-        (168, 140, 255),
-        (120, 200, 177),
-        (243, 159, 120),
-        (100, 165, 232),
-        (231, 139, 164),
-    ];
+/// Original fallback order, also used by the live Slint avatar roles.
+pub(crate) const AVATAR_COLORS: [(u8, u8, u8); 5] = [
+    (168, 140, 255),
+    (120, 200, 177),
+    (243, 159, 120),
+    (100, 165, 232),
+    (231, 139, 164),
+];
+
+/// Keep the original identity assignment; appearance changes only the paint.
+pub(crate) fn avatar_slot(value: &str) -> i32 {
     let hash = value.bytes().fold(0usize, |current, byte| {
         current.wrapping_mul(31).wrapping_add(byte as usize)
     });
-    let (red, green, blue) = COLORS[hash % COLORS.len()];
+    (hash % AVATAR_COLORS.len()) as i32
+}
+
+pub(crate) fn accent(value: &str) -> Color {
+    let (red, green, blue) = AVATAR_COLORS[avatar_slot(value) as usize];
     Color::from_rgb_u8(red, green, blue)
 }
 

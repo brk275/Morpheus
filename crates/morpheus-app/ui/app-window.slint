@@ -289,6 +289,7 @@ export struct AccountItem {
     initials: string,
     status: string,
     accent: color,
+    avatar-slot: int,
     // The account's own public avatar, already read while it was active
     // (memory only, at most 64 px); initials show when there is none.
     avatar: image,
@@ -302,6 +303,7 @@ export struct AccountOption {
     handle: string,
     initials: string,
     accent: color,
+    avatar-slot: int,
     avatar: image,
     has-avatar: bool,
 }
@@ -316,6 +318,7 @@ export struct SavedAccountItem {
     // Initials and color for the avatar fallback.
     initials: string,
     accent: color,
+    avatar-slot: int,
 }
 
 export struct SpaceItem {
@@ -323,6 +326,7 @@ export struct SpaceItem {
     name: string,
     initials: string,
     accent: color,
+    avatar-slot: int,
 }
 
 // One person in Start a conversation. Text is bounded and single-line.
@@ -379,6 +383,7 @@ export struct MessageItem {
     // Native poll card state; `present` is false for every other message.
     poll: PollCardData,
     accent: color,
+    avatar-slot: int,
     // The visible room's authoritative pinned list contains this event.
     pinned: bool,
 }
@@ -408,6 +413,7 @@ export struct MemberItem {
     is-account-user: bool,
     is-creator: bool,
     accent: color,
+    avatar-slot: int,
     online: bool,
 }
 
@@ -438,6 +444,8 @@ export struct PublicRoomItem {
 component AvatarBadge inherits Rectangle {
     in property <string> initials;
     in property <color> accent;
+    // Negative is only for explicit non-palette preview samples.
+    in property <int> avatar-slot: -1;
     // A decoded, bounded picture (an account's own avatar); initials show
     // whenever there is none. Purely presentation: no input or action.
     in property <image> avatar;
@@ -450,7 +458,7 @@ component AvatarBadge inherits Rectangle {
     width: 38px;
     height: 38px;
     border-radius: StyleTokens.avatar-roundness >= 0 ? min(self.width, self.height) * StyleTokens.avatar-roundness / 100 : root.built-in-radius;
-    background: accent;
+    background: root.avatar-slot >= 0 ? StyleTokens.avatar-color(root.avatar-slot) : root.accent;
     clip: root.has-avatar;
     if !root.has-avatar : Text {
         text: root.initials;
@@ -3475,6 +3483,7 @@ export component AppWindow inherits Window {
     in-out property <string> active-account-initials;
     in-out property <string> active-account-status;
     in-out property <color> active-account-accent: #8e7dff;
+    in-out property <int> active-account-avatar-slot: -1;
     // The active account's own avatar from memory (account_identity.rs).
     in-out property <image> active-account-avatar;
     in-out property <bool> active-account-has-avatar: false;
@@ -6009,6 +6018,11 @@ export component AppWindow inherits Window {
         if id == "destructive_ink" { return StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b; }
         if id == "presence_online" { return StyleTokens.roles.presence-online.present ? StyleTokens.roles.presence-online.color : #64c9a7; }
         if id == "voice" { return StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1; }
+        if id == "avatar_1" { return StyleTokens.avatar-color(0); }
+        if id == "avatar_2" { return StyleTokens.avatar-color(1); }
+        if id == "avatar_3" { return StyleTokens.avatar-color(2); }
+        if id == "avatar_4" { return StyleTokens.avatar-color(3); }
+        if id == "avatar_5" { return StyleTokens.avatar-color(4); }
         if id == "avatar_ink" { return StyleTokens.roles.avatar-ink.present ? StyleTokens.roles.avatar-ink.color : #ffffff; }
         if id == "message_hover" { return root.message-hover-surface; }
         if id == "control_hover" { return StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover; }
@@ -6049,6 +6063,7 @@ export component AppWindow inherits Window {
             || id == "error_surface" || id == "error_ink" || id == "success" || id == "success_surface"
             || id == "success_ink" || id == "destructive" || id == "destructive_ink"
             || id == "presence_online" || id == "voice" || id == "avatar_ink"
+            || id == "avatar_1" || id == "avatar_2" || id == "avatar_3" || id == "avatar_4" || id == "avatar_5"
             || id == "message_hover" || id == "control_hover" || id == "control_pressed"
             || id == "control_disabled" || id == "input_surface" || id == "input_border"
             || id == "composer_surface" || id == "composer_border" || id == "composer_focus"
@@ -6187,7 +6202,7 @@ export component AppWindow inherits Window {
                                 x: (parent.width - 38px) / 2;
                                 y: 5px;
                                 initials: space.initials;
-                                accent: space.accent;
+                                accent: space.accent; avatar-slot: space.avatar-slot;
                             }
                             if root.show-space-labels : Text {
                                 x: 2px; y: 48px; width: parent.width - 4px; height: 14px * root.text-scale;
@@ -7663,7 +7678,7 @@ export component AppWindow inherits Window {
                                     width: message-row.avatar-size; height: message-row.avatar-size;
                                     // Initials grow with a configured avatar size only.
                                     initials-size: StyleTokens.message-avatar-size > 0px ? max(9px, self.height * 0.32) : 12px;
-                                    initials: message.initials; accent: message.accent;
+                                    initials: message.initials; accent: message.accent; avatar-slot: message.avatar-slot;
                                 }
                                 if message-row.columns && message-row.show-time : Text {
                                     width: root.timestamp-width-px * 1px * root.text-scale; text: message-row.time-label;
@@ -8742,13 +8757,13 @@ export component AppWindow inherits Window {
                                                 spacing: 0px;
                                                 alignment: start;
                                                 for sample in [
-                                                    { initials: "JU", name: "Juno", accent: #f39f78, palette: 0, own: false, hovered: false,
+                                                    { initials: "JU", name: "Juno", accent: #f39f78, avatar-slot: 2, palette: 0, own: false, hovered: false,
                                                       body: "Draft is ready for a look before Friday.", link: "Release checklist",
                                                       twelve: "9:41 AM", day: "09:41", seconds: "09:41:07" },
-                                                    { initials: "EL", name: "Ellis", accent: #a88cff, palette: 2, own: false, hovered: true,
+                                                    { initials: "EL", name: "Ellis", accent: #a88cff, avatar-slot: 0, palette: 2, own: false, hovered: true,
                                                       body: "Hovered message: actions appear here.", link: "",
                                                       twelve: "9:42 AM", day: "09:42", seconds: "09:42:30" },
-                                                    { initials: "MS", name: "Mira Sol", accent: #6fb3d2, palette: 4, own: true, hovered: false,
+                                                    { initials: "MS", name: "Mira Sol", accent: #6fb3d2, avatar-slot: -1, palette: 4, own: true, hovered: false,
                                                       body: "Your own message, with its own colors when a theme sets them.", link: "",
                                                       twelve: "9:44 AM", day: "09:44", seconds: "09:44:12" },
                                                 ] : sample-row := Rectangle {
@@ -8763,7 +8778,7 @@ export component AppWindow inherits Window {
                                                             AvatarBadge {
                                                                 width: sample-row.avatar-size; height: self.width;
                                                                 initials-size: StyleTokens.message-avatar-size > 0px ? max(9px, self.height * 0.32) : 12px;
-                                                                initials: sample.initials; accent: sample.accent;
+                                                                initials: sample.initials; accent: sample.accent; avatar-slot: sample.avatar-slot;
                                                             }
                                                         }
                                                         VerticalLayout {
@@ -8899,7 +8914,7 @@ export component AppWindow inherits Window {
                                             border-color: root.token-color("voice");
                                             AvatarBadge {
                                                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                                                width: 18px; height: 18px; initials: "EL"; accent: #a88cff; initials-size: 8px;
+                                                width: 18px; height: 18px; initials: "EL"; accent: #a88cff; avatar-slot: 0; initials-size: 8px;
                                                 built-in-radius: 9px;
                                             }
                                             accessible-role: image;
@@ -11355,12 +11370,12 @@ export component AppWindow inherits Window {
                         spacing: 12px;
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated; border-radius: StyleTokens.radius * 1.4;
-                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; built-in-radius: 24px; initials: "CY"; accent: #a88cff; }
+                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; built-in-radius: 24px; initials: "CY"; accent: #a88cff; avatar-slot: 0; }
                             Text { y: parent.height - 43px; text: "Casey"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; }
                         }
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated; border-radius: StyleTokens.radius * 1.4;
-                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; built-in-radius: 24px; initials: "JN"; accent: #f39f78; }
+                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; built-in-radius: 24px; initials: "JN"; accent: #f39f78; avatar-slot: 2; }
                             Text { y: parent.height - 43px; text: "Jules"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; }
                         }
                     }
@@ -11369,7 +11384,7 @@ export component AppWindow inherits Window {
                         spacing: 12px;
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated; border-radius: StyleTokens.radius * 1.4;
-                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; built-in-radius: 24px; initials: "SK"; accent: #78c8b1; }
+                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; built-in-radius: 24px; initials: "SK"; accent: #78c8b1; avatar-slot: 1; }
                             Text { y: parent.height - 43px; text: "Sam"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; }
                         }
                         Rectangle {
@@ -11730,7 +11745,7 @@ export component AppWindow inherits Window {
                                 y: 0; height: member-row.top-h;
                                 padding-left: 12px; padding-top: 11px; padding-bottom: 11px; spacing: 9px;
                                 padding-right: root.live-session && member-row.mode == 0 ? 12px + member-row.details-w + 9px + member-row.manage-w + 9px : 12px;
-                                VerticalLayout { width: 32px; alignment: center; AvatarBadge { width: 32px; height: 32px; built-in-radius: 11px; initials: member.initials; accent: member.accent; } }
+                                VerticalLayout { width: 32px; alignment: center; AvatarBadge { width: 32px; height: 32px; built-in-radius: 11px; initials: member.initials; accent: member.accent; avatar-slot: member.avatar-slot; } }
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1; spacing: 2px;
                                     Text { text: member.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
@@ -12766,7 +12781,7 @@ export component AppWindow inherits Window {
                         padding-top: 15px;
                         padding-bottom: 15px;
                         spacing: root.account-column ? 0px : 10px;
-                        VerticalLayout { width: 38px; alignment: center; AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; avatar: root.active-account-avatar; has-avatar: root.active-account-has-avatar; } }
+                        VerticalLayout { width: 38px; alignment: center; AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; avatar-slot: root.active-account-avatar-slot; avatar: root.active-account-avatar; has-avatar: root.active-account-has-avatar; } }
                         if !root.account-column : VerticalLayout {
                             alignment: center;
                             spacing: 2px;
@@ -12874,7 +12889,7 @@ export component AppWindow inherits Window {
                         padding-top: 6px;
                         padding-bottom: 6px;
                         spacing: 9px;
-                        VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; built-in-radius: StyleTokens.radius * 1.0; initials: account.initials; accent: account.accent; avatar: account.avatar; has-avatar: account.has-avatar; } }
+                        VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; built-in-radius: StyleTokens.radius * 1.0; initials: account.initials; accent: account.accent; avatar-slot: account.avatar-slot; avatar: account.avatar; has-avatar: account.has-avatar; } }
                         VerticalLayout {
                             alignment: center;
                             spacing: 1px;
@@ -15065,7 +15080,7 @@ export component AppWindow inherits Window {
                                         padding: 10px; spacing: 7px; alignment: start;
                                         HorizontalLayout {
                                             spacing: 8px; vertical-stretch: 0;
-                                            VerticalLayout { width: 24px * root.text-scale; alignment: center; AvatarBadge { width: 24px * root.text-scale; height: 24px * root.text-scale; built-in-radius: StyleTokens.radius * 0.8; initials-size: 10px * root.text-scale; initials: account.initials; accent: account.accent; avatar: account.avatar; has-avatar: account.has-avatar; } }
+                                            VerticalLayout { width: 24px * root.text-scale; alignment: center; AvatarBadge { width: 24px * root.text-scale; height: 24px * root.text-scale; built-in-radius: StyleTokens.radius * 0.8; initials-size: 10px * root.text-scale; initials: account.initials; accent: account.accent; avatar-slot: account.avatar-slot; avatar: account.avatar; has-avatar: account.has-avatar; } }
                                             Text { text: account.handle; color: root.ink; font-size: 13px * root.text-scale; overflow: elide; vertical-alignment: center; accessible-label: account.handle; horizontal-stretch: 1; }
                                         }
                                         HorizontalLayout {

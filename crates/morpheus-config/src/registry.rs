@@ -634,6 +634,51 @@ pub const COLOR_TOKENS: &[ColorToken] = &[
         &["call", "audio", "voice space"],
     ),
     token(
+        "avatar_1",
+        Avatars,
+        Role,
+        Legacy { example: "#A88CFF" },
+        "Fallback background 1",
+        "Fallback avatar/account background for slot 1; uploaded pictures are unchanged.",
+        &["avatar", "account", "background", "fallback", "slot 1"],
+    ),
+    token(
+        "avatar_2",
+        Avatars,
+        Role,
+        Legacy { example: "#78C8B1" },
+        "Fallback background 2",
+        "Fallback avatar/account background for slot 2; uploaded pictures are unchanged.",
+        &["avatar", "account", "background", "fallback", "slot 2"],
+    ),
+    token(
+        "avatar_3",
+        Avatars,
+        Role,
+        Legacy { example: "#F39F78" },
+        "Fallback background 3",
+        "Fallback avatar/account background for slot 3; uploaded pictures are unchanged.",
+        &["avatar", "account", "background", "fallback", "slot 3"],
+    ),
+    token(
+        "avatar_4",
+        Avatars,
+        Role,
+        Legacy { example: "#64A5E8" },
+        "Fallback background 4",
+        "Fallback avatar/account background for slot 4; uploaded pictures are unchanged.",
+        &["avatar", "account", "background", "fallback", "slot 4"],
+    ),
+    token(
+        "avatar_5",
+        Avatars,
+        Role,
+        Legacy { example: "#E78BA4" },
+        "Fallback background 5",
+        "Fallback avatar/account background for slot 5; uploaded pictures are unchanged.",
+        &["avatar", "account", "background", "fallback", "slot 5"],
+    ),
+    token(
         "avatar_ink",
         Avatars,
         Role,
@@ -2851,7 +2896,7 @@ mod tests {
                 token
                     .id
                     .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
                 "{} is not a stable snake_case key",
                 token.id
             );
@@ -3100,6 +3145,13 @@ mod tests {
         );
         assert!(ids("link").iter().any(|id| id == "color:link"));
         assert!(ids("scrim").iter().any(|id| id == "color:scrim"));
+        for id in ["avatar_1", "avatar_2", "avatar_3", "avatar_4", "avatar_5"] {
+            let expected = format!("color:{id}");
+            assert_eq!(ids(id).first().map(String::as_str), Some(expected.as_str()));
+            let token = color_token(id).unwrap();
+            assert_eq!(token.group, TokenGroup::Avatars);
+            assert_eq!(token.source, TokenSource::Role);
+        }
         // The generic Colors setting still leads for the general word.
         assert_eq!(
             ids("colour").first().map(String::as_str),

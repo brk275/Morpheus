@@ -171,6 +171,11 @@ unset state keeps the previous look.
 | Accents and states | `presence_online` | Role (new) | `#64C9A7` |
 | Inputs and controls | `divider` | Base | built-in palette |
 | Calls | `voice` | Role | `#78C8B1` |
+| Avatars | `avatar_1` | Role | `#A88CFF` |
+| Avatars | `avatar_2` | Role | `#78C8B1` |
+| Avatars | `avatar_3` | Role | `#F39F78` |
+| Avatars | `avatar_4` | Role | `#64A5E8` |
+| Avatars | `avatar_5` | Role | `#E78BA4` |
 | Avatars | `avatar_ink` | Role (new) | `#FFFFFF` |
 | Surfaces | `message_hover` | State | `elevated` |
 | Inputs and controls | `control_hover` | State | each control's built-in hover, about `#32394B` |
@@ -199,6 +204,30 @@ their separate contrast tests, including 3:1 for the online indicator on every
 surface. With a preset, one `scrim` value replaces the per-dialog built-in
 dimming.
 
+### Fallback avatar and account backgrounds
+
+The Avatars group contains five **Fallback background** slots alongside
+**Avatar initials**. Edit `avatar_1` through `avatar_5` there, or put the same
+keys in the existing `[colors]` table of `config.toml`:
+
+```toml
+[colors]
+avatar_1 = "#A88CFF"
+avatar_2 = "#78C8B1"
+avatar_3 = "#F39F78"
+avatar_4 = "#64A5E8"
+avatar_5 = "#E78BA4"
+```
+
+These defaults preserve the original five colors and identity-slot order.
+A slot accepts `#RRGGBB` or `#RRGGBBAA`, including transparent colors. The
+same keys work in a theme's `[roles]`, and in the existing account and room
+color overrides. A room inherits omitted slots from its account, then global
+colors and the theme; an omitted theme role keeps the original slot color.
+Accepted edits use the normal live-reload path. Invalid edits keep the last
+valid appearance. No separate palette table or menu is needed, and uploaded
+avatar pictures and sender-name text palettes are unchanged.
+
 ### Deliberately not themeable
 
 - Message images, video, avatar pictures and sticker pixels.
@@ -210,10 +239,6 @@ dimming.
 
 ### Remaining literal defaults and planned tokens
 
-- Avatar and account background palettes come from a fixed five-color list in
-  the Rust models (`live.rs`, preview fixtures) and the call-stage placeholder
-  tiles. Editing them live needs model indices instead of baked colors; an
-  `[avatars]` palette is planned, not accepted yet.
 - Inputs, buttons, the composer and icons use `elevated`, `hover`, `ink` and
   `muted`; separate `input_surface`, `button_surface`, `composer_surface` and
   `icon` tokens are planned.

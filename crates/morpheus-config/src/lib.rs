@@ -2531,13 +2531,24 @@ pub struct ThemeRoles {
     /// Online-member status dot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_online: Option<String>,
+    /// Fallback avatar/account backgrounds in the original identity-slot order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_3: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_4: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_5: Option<String>,
     /// Initials drawn on avatar backgrounds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_ink: Option<String>,
 }
 
 impl ThemeRoles {
-    pub fn entries(&self) -> [(&'static str, Option<&str>); 25] {
+    pub fn entries(&self) -> [(&'static str, Option<&str>); 30] {
         [
             ("error", self.error.as_deref()),
             ("error_surface", self.error_surface.as_deref()),
@@ -2563,6 +2574,11 @@ impl ThemeRoles {
             ("shadow", self.shadow.as_deref()),
             ("media_backdrop", self.media_backdrop.as_deref()),
             ("presence_online", self.presence_online.as_deref()),
+            ("avatar_1", self.avatar_1.as_deref()),
+            ("avatar_2", self.avatar_2.as_deref()),
+            ("avatar_3", self.avatar_3.as_deref()),
+            ("avatar_4", self.avatar_4.as_deref()),
+            ("avatar_5", self.avatar_5.as_deref()),
             ("avatar_ink", self.avatar_ink.as_deref()),
         ]
     }
@@ -3667,13 +3683,16 @@ mod tests {
         assert_eq!(partial.roles.timestamp, None);
         assert_eq!(partial.roles.own_surface, None);
         assert_eq!(partial.senders.colors, None);
+        for id in ["avatar_1", "avatar_2", "avatar_3", "avatar_4", "avatar_5"] {
+            assert_eq!(partial.roles.get(id), None);
+        }
         let message_roles = format!(
             "{encoded}\n[roles]\ntimestamp = '#A5AFBE'\nsender = '#E8EDF2'\nmessage = '#E8EDF2'\nown_message = '#F3F6FA'\nown_surface = '#20283A'\n"
         );
         let message_roles: ThemePack = toml::from_str(&message_roles).unwrap();
         message_roles.validate().unwrap();
         assert_eq!(message_roles.roles.own_surface.as_deref(), Some("#20283A"));
-        assert_eq!(message_roles.roles.entries().len(), 25);
+        assert_eq!(message_roles.roles.entries().len(), 30);
         for field in [
             "timestamp",
             "sender",
@@ -3688,6 +3707,35 @@ mod tests {
                 "{field} must be #RRGGBB or #RRGGBBAA"
             );
         }
+    }
+
+    #[test]
+    fn avatar_background_roles_are_optional_and_round_trip_with_alpha() {
+        let legacy: ThemePack =
+            toml::from_str(include_str!("../../../themes/aurora.toml")).unwrap();
+        let mut encoded = toml::to_string_pretty(&legacy).unwrap();
+        encoded.push_str("\n[roles]\n");
+        let colors = [
+            ("avatar_1", "#102030"),
+            ("avatar_2", "#40506080"),
+            ("avatar_3", "#70809000"),
+            ("avatar_4", "#aAbBcC"),
+            ("avatar_5", "#dDeEfFff"),
+        ];
+        for (id, value) in colors {
+            encoded.push_str(&format!("{id} = '{value}'\n"));
+        }
+        let theme: ThemePack = toml::from_str(&encoded).unwrap();
+        theme.validate().unwrap();
+        for (id, value) in colors {
+            assert_eq!(theme.roles.get(id), Some(value));
+        }
+        let round_trip = toml::to_string_pretty(&theme).unwrap();
+        let round_trip: ThemePack = toml::from_str(&round_trip).unwrap();
+        round_trip.validate().unwrap();
+        assert_eq!(round_trip, theme);
+        assert_eq!(round_trip.colors, legacy.colors);
+        assert!(round_trip.senders.is_empty());
     }
 
     #[test]
@@ -3713,6 +3761,8 @@ mod tests {
         }
         for extension in [
             "[roles]\nunknwon = '#123456'\n",
+            "[roles]\navatar_0 = '#123456'\n",
+            "[roles]\navatar_6 = '#123456'\n",
             "[senders]\ncolours = ['#123456']\n",
         ] {
             assert!(toml::from_str::<ThemePack>(&format!("{encoded}\n{extension}")).is_err());
@@ -4030,6 +4080,15 @@ mod tests {
             let theme = preset.theme().unwrap();
             let roles = &theme.roles;
             assert!(roles.entries().iter().all(|(_, value)| value.is_some()));
+            for (id, expected) in [
+                ("avatar_1", "#A88CFF"),
+                ("avatar_2", "#78C8B1"),
+                ("avatar_3", "#F39F78"),
+                ("avatar_4", "#64A5E8"),
+                ("avatar_5", "#E78BA4"),
+            ] {
+                assert_eq!(roles.get(id), Some(expected));
+            }
             let surfaces = [
                 &theme.colors.rail,
                 &theme.colors.sidebar,
@@ -4446,6 +4505,9 @@ mod tests {
             ("canvas", "red"),
             ("canvas", "#1010100"),
             ("not_a_token", "#101010"),
+            ("avatar_1", "#1234"),
+            ("avatar_5", "private-invalid-avatar-color"),
+            ("avatar_6", "#101010"),
         ] {
             let mut bad = config.clone();
             bad.colors.insert(key.into(), value.into());

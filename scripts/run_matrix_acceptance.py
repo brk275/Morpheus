@@ -765,12 +765,39 @@ def app_recovery_evidence(output: str) -> dict[str, bool]:
     return {name: True for name in sorted(APP_RECOVERY_CASES)}
 
 
+APP_TIMELINE_LINK_STAGES = frozenset((
+    "link_join_open", "link_join_wait", "link_join_row", "link_focus_setup",
+    "link_focus_wait", "link_held_intents", "link_focus_rows",
+))
+APP_TIMELINE_LINK_PREFIX = "MORPHEUS_LIVE_TIMELINE_LINK "
+APP_TIMELINE_LINK_MAX_LINE = len(APP_TIMELINE_LINK_PREFIX) + max(map(len, APP_TIMELINE_LINK_STAGES))
+
+
 def app_timeline_diagnostics(output: str) -> dict:
     result = {"test_entered": False}
     for match in APP_TIMELINE_STAGE.finditer(output):
         if match[1] in APP_TIMELINE_STAGES:
             result["test_entered"] |= match[1] == "setup"
             result["stage"] = match[1]
+    # A separate closed channel cannot consume the 64 acceptance-proof slots.
+    link_records = 0
+    cursor = 0
+    while (start := output.find("MORPHEUS_LIVE_TIMELINE_LINK", cursor)) >= 0:
+        cursor = start + len("MORPHEUS_LIVE_TIMELINE_LINK")
+        if start and output[start - 1] != "\n":
+            continue
+        link_records += 1
+        end = output.find("\n", start)
+        end = len(output) if end < 0 else end
+        if link_records > 48 or end - start > APP_TIMELINE_LINK_MAX_LINE:
+            result["link_stage"] = "invalid"
+            break
+        line = output[start:end]
+        if (not line.startswith(APP_TIMELINE_LINK_PREFIX)
+                or line[len(APP_TIMELINE_LINK_PREFIX):] not in APP_TIMELINE_LINK_STAGES):
+            result["link_stage"] = "invalid"
+            break
+        result["link_stage"] = line[len(APP_TIMELINE_LINK_PREFIX):]
     tail_records = 0
     for line in output.splitlines():
         if line.startswith("MORPHEUS_LIVE_TIMELINE_TAIL"):

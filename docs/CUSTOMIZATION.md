@@ -817,7 +817,12 @@ also include `[roles]` and `[senders]`. These belong in the theme TOML beside
 | `shadow` | Shadow beneath popups, usually translucent; omitted keeps `#00000044` |
 | `media_backdrop` | Background behind an opened image; omitted keeps `#11131B` |
 | `presence_online` | The online dot beside member names; omitted keeps `#64C9A7` |
-| `avatar_ink` | Initials on avatar backgrounds, whose colors stay identity colors; omitted keeps `#FFFFFF` |
+| `avatar_1` | Fallback avatar/account background slot 1; omitted keeps `#A88CFF` |
+| `avatar_2` | Fallback avatar/account background slot 2; omitted keeps `#78C8B1` |
+| `avatar_3` | Fallback avatar/account background slot 3; omitted keeps `#F39F78` |
+| `avatar_4` | Fallback avatar/account background slot 4; omitted keeps `#64A5E8` |
+| `avatar_5` | Fallback avatar/account background slot 5; omitted keeps `#E78BA4` |
+| `avatar_ink` | Initials on fallback avatar backgrounds; omitted keeps `#FFFFFF` |
 
 Every built-in preset theme sets every role explicitly.
 
@@ -850,6 +855,11 @@ scrim = "#000000AA"
 shadow = "#00000044"
 media_backdrop = "#111216"
 presence_online = "#9FD5BD"
+avatar_1 = "#A88CFF"
+avatar_2 = "#78C8B1"
+avatar_3 = "#F39F78"
+avatar_4 = "#64A5E8"
+avatar_5 = "#E78BA4"
 avatar_ink = "#FFFFFF"
 
 [senders]
