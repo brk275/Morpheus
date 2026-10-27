@@ -406,12 +406,60 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         start = "          rtc_constraint_tests=(\n"
         self.assertEqual(source.count(start), 1)
         selected = source.split(start, 1)[1].split("          )\n", 1)[0]
-        for case in (
-            "keys::tests::sender_registration_adopts_only_an_accepted_own_index",
-            "keys::tests::registration_and_in_flight_acceptance_share_one_sender_order",
-        ):
+        expected = (
+            'pool::tests::constraint_writer_settles_older_apply_then_coalesces_newest_intent',
+            'pool::tests::removed_constraint_writer_cannot_finish_after_new_same_key_intent',
+            'pool::tests::replacement_connection_receives_latest_intent_without_old_target_retention',
+            'pool::tests::dropping_pool_retires_queued_constraint_before_connection_lock_release',
+            'pool::tests::dropping_pool_settles_entered_apply_without_running_queued_successor',
+            'pool::tests::constraint_first_poll_uses_current_writer_admission_before_removal',
+            'pool::tests::first_poll_panic_remains_failed_but_later_real_intent_can_settle',
+            'keys::tests::sender_registration_adopts_only_an_accepted_own_index',
+            'keys::tests::registration_and_in_flight_acceptance_share_one_sender_order',
+            'pool::tests::a_member_returning_under_the_same_member_id_gets_their_media_back',
+            'pool::tests::parked_media_is_not_restored_after_its_track_or_connection_retires',
+            'pool::tests::retired_generation_events_cannot_refill_parked_media',
+            'pool::tests::replacing_the_adopted_connection_discards_its_parked_handles',
+            'pool::tests::an_old_connection_removal_cannot_remove_the_replacement_handle',
+            'pool::tests::an_active_old_incarnation_cannot_be_parked_after_same_key_adoption',
+            'pool::tests::an_active_idle_retired_focus_cannot_be_parked_after_a_lapse',
+        )
+        self.assertEqual(tuple(line.strip() for line in selected.splitlines() if line.strip()), expected)
+        for case in expected:
             self.assertEqual(source.count(case), 1)
             self.assertIn(case, selected)
+        step = source.split("      - name: Test vendored security fixes\n", 1)[1].split("      - name:", 1)[0]
+        self.assertEqual(step.count("          cargo test --locked -p matrix-rtc-call-sdk --lib\n"), 1)
+        self.assertNotIn("matrix-rtc-call-sdk --lib --no-run", step)
+        # The package selector must reach this actual SDK in the patched root
+        # workspace, rather than an excluded dependency or standalone graph.
+        import tomllib
+        root = WORKFLOW.parent.parent.parent
+        workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+        sdk_path = "vendor/matrix-rtc-call-sdk"
+        self.assertIn(sdk_path, workspace["workspace"]["members"])
+        self.assertNotIn(sdk_path, workspace["workspace"].get("exclude", []))
+        self.assertNotIn(sdk_path, workspace["workspace"]["default-members"])
+        self.assertEqual(workspace["patch"]["https://github.com/element-hq/matrix-rust-rtc"]
+                         ["matrix-rtc-call-sdk"]["path"], sdk_path)
+        sdk = tomllib.loads((root / sdk_path / "Cargo.toml").read_text(encoding="utf-8"))
+        locked = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
+        matches = [package for package in locked["package"]
+                   if package["name"] == "matrix-rtc-call-sdk"]
+        self.assertEqual(len(matches), 1)
+        locked_names = {dependency.split()[0] for dependency in matches[0]["dependencies"]}
+        self.assertLessEqual(set(sdk["dev-dependencies"]), locked_names)
+        # Retained clap defaults/derive activate optional edges even though
+        # clap itself was already locked as an application dependency.
+        clap = next(package for package in locked["package"] if package["name"] == "clap")
+        builder = next(package for package in locked["package"] if package["name"] == "clap_builder")
+        self.assertIn("derive", sdk["dev-dependencies"]["clap"]["features"])
+        self.assertIsNot(sdk["dev-dependencies"]["clap"].get("default-features"), False)
+        self.assertIn("clap_derive", {dependency.split()[0] for dependency in clap["dependencies"]})
+        self.assertIn("anstream", {dependency.split()[0] for dependency in builder["dependencies"]})
+        derive = [package for package in locked["package"] if package["name"] == "clap_derive"]
+        self.assertEqual(len(derive), 1)
+        self.assertEqual(derive[0]["version"], clap["version"])
         self.assertIn('cargo test --locked -p matrix-rtc-transport --lib -- --list', source)
         self.assertIn('grep -Fxc -- "$rtc_constraint_test: test"', source)
         self.assertIn('cargo test --locked -p matrix-rtc-transport --lib "$rtc_constraint_test" -- --exact', source)

@@ -680,6 +680,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // A tick in flight finishes first (the machine serialises the two),
         // and finds nothing joined afterwards.
         let upkeep = self.upkeep.take();
+        if let Some(encryption) = self.encryption_manager.as_ref() {
+            encryption.stop_key_retries();
+        }
 
         log::info!(
             "[{}] leaving as {} (reason {:?})",

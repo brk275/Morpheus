@@ -523,6 +523,7 @@ jobs:
           cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
           cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
           cargo test --locked -p matrix-rtc-livekit --lib
+          cargo test --locked -p matrix-rtc-call-sdk --lib
           rtc_constraint_tests=(
             pool::tests::constraint_writer_settles_older_apply_then_coalesces_newest_intent
             pool::tests::removed_constraint_writer_cannot_finish_after_new_same_key_intent
@@ -533,6 +534,13 @@ jobs:
             pool::tests::first_poll_panic_remains_failed_but_later_real_intent_can_settle
             keys::tests::sender_registration_adopts_only_an_accepted_own_index
             keys::tests::registration_and_in_flight_acceptance_share_one_sender_order
+            pool::tests::a_member_returning_under_the_same_member_id_gets_their_media_back
+            pool::tests::parked_media_is_not_restored_after_its_track_or_connection_retires
+            pool::tests::retired_generation_events_cannot_refill_parked_media
+            pool::tests::replacing_the_adopted_connection_discards_its_parked_handles
+            pool::tests::an_old_connection_removal_cannot_remove_the_replacement_handle
+            pool::tests::an_active_old_incarnation_cannot_be_parked_after_same_key_adoption
+            pool::tests::an_active_idle_retired_focus_cannot_be_parked_after_a_lapse
           )
           cargo test --locked -p matrix-rtc-transport --lib -- --list > "$RUNNER_TEMP/morpheus-rtc-constraint-tests.txt"
           for rtc_constraint_test in "${rtc_constraint_tests[@]}"; do

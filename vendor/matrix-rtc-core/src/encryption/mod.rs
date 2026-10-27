@@ -438,6 +438,42 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// distribute to — so in a solo call every membership update re-signalled the
     /// same index, and each one reached the transport as a fresh key import.
     signalled_key: Arc<Mutex<Option<SignalledKey>>>,
+
+    /// Only the joined session's upkeep owns retry workers. This watch holds
+    /// no key bytes: an immutable incarnation fences rotation, leave and rejoin.
+    key_deliveries: Arc<watch::Sender<KeyDeliveryState>>,
+}
+
+/// Private debt for one exact participation and outbound-key incarnation.
+/// Deliberately not Debug: retry state must never become a payload log.
+pub(crate) struct UndeliveredKey {
+    target: ParticipantDeviceInfo,
+    key_index: u8,
+    incarnation: Arc<()>,
+}
+
+#[derive(Clone)]
+pub(crate) struct KeyDeliveryState {
+    incarnation: Arc<()>,
+    stopped: bool,
+    pub(crate) owed: HashMap<String, Arc<UndeliveredKey>>,
+}
+
+impl Default for KeyDeliveryState {
+    fn default() -> Self {
+        Self {
+            incarnation: Arc::new(()),
+            stopped: true,
+            owed: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyRetry {
+    Delivered,
+    Moot,
+    Undelivered,
 }
 
 /// A key that has been replaced but is still what we encrypt with, because its
@@ -511,6 +547,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             superseded_key: Arc::new(RwLock::new(None)),
             rotation_due_at: Arc::new(watch::Sender::new(None)),
             signalled_key: Arc::new(Mutex::new(None)),
+            key_deliveries: Arc::new(watch::Sender::new(KeyDeliveryState::default())),
         }
     }
 
@@ -714,8 +751,16 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             shared_with: Vec::new(),
         };
 
-        // Store it
-        *self.outbound_key.write().unwrap() = Some(first_key.clone());
+        // The outbound-key guard always precedes the retry watch when both
+        // are needed. No guard is retained across a host call or await.
+        {
+            let mut key = self.outbound_key.write().unwrap();
+            *key = Some(first_key.clone());
+            self.key_deliveries.send_replace(KeyDeliveryState {
+                stopped: false,
+                ..KeyDeliveryState::default()
+            });
+        }
         *self.next_key_index.lock().unwrap() = 1; // Next will be 1
 
         log::debug!(
@@ -738,6 +783,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             self.slot_id
         );
 
+        self.stop_key_retries();
         *self.outbound_key.write().unwrap() = None;
         *self.inbound_keys.write().unwrap() = HashMap::new();
         *self.next_key_index.lock().unwrap() = 0;
@@ -934,6 +980,18 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 membership_ts: m.membership_ts,
             })
             .collect();
+
+        // A departure or changed participation is owed no retry. Compare the
+        // full recipient as well as same_join: reused IDs cannot inherit debt.
+        self.key_deliveries.send_if_modified(|state| {
+            let before = state.owed.len();
+            state.owed.retain(|_, owed| {
+                current_participants
+                    .iter()
+                    .any(|participant| participant == &owed.target)
+            });
+            state.owed.len() != before
+        });
 
         let current_key = {
             let guard = self.outbound_key.read().unwrap();
@@ -1223,7 +1281,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 let mut new_key = outbound_key_to_use.clone();
                 new_key.shared_with = served.clone();
                 *guard = Some(new_key);
+                self.key_deliveries.send_modify(|state| {
+                    state.incarnation = Arc::new(());
+                    state.owed.clear();
+                });
             }
+            self.record_key_debt(&outbound_key_to_use, &to_distribute_to, &served);
 
             // Signal the new key immediately, telling the consumer how long to
             // wait before encrypting with it (`use_after_ms`, decided above). The
@@ -1280,6 +1343,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                     }
                 }
             }
+            self.record_key_debt(&outbound_key_to_use, &to_distribute_to, &served);
         }
 
         log::trace!(
@@ -1295,6 +1359,188 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         );
 
         Ok(())
+    }
+
+    /// Stops new retries before the session starts its leave awaits. A host
+    /// send already admitted may have left; cancellation is no recall receipt.
+    pub(crate) fn stop_key_retries(&self) {
+        self.key_deliveries.send_modify(|state| {
+            state.stopped = true;
+            state.owed.clear();
+        });
+    }
+
+    pub(crate) fn subscribe_key_deliveries(&self) -> watch::Receiver<KeyDeliveryState> {
+        self.key_deliveries.subscribe()
+    }
+
+    pub(crate) fn key_retry_is_current(&self, owed: &Arc<UndeliveredKey>) -> bool {
+        let state = self.key_deliveries.borrow();
+        !state.stopped
+            && Arc::ptr_eq(&state.incarnation, &owed.incarnation)
+            && state
+                .owed
+                .get(&owed.target.member_id)
+                .is_some_and(|current| Arc::ptr_eq(current, owed))
+    }
+
+    fn record_key_debt(
+        &self,
+        expected: &OutboundEncryptionKey,
+        targets: &[ParticipantDeviceInfo],
+        served: &[ParticipantDeviceInfo],
+    ) {
+        let members = (self.get_memberships.lock().unwrap())();
+        let key = self.outbound_key.read().unwrap();
+        let Some(key) = key.as_ref() else {
+            return;
+        };
+        if key.key_index != expected.key_index || key.key != expected.key {
+            return;
+        }
+        self.key_deliveries.send_if_modified(|state| {
+            if state.stopped {
+                return false;
+            }
+            let mut changed = false;
+            for target in targets {
+                let still_joined = members.iter().any(|member| {
+                    member.member_id == target.member_id
+                        && member.membership_ts == target.membership_ts
+                        && member.sender == target.user_id
+                        && member.origin.sender_device_id() == Some(target.device_id.as_str())
+                });
+                if !still_joined
+                    || target.device_id.is_empty()
+                    || served.iter().any(|recipient| recipient == target)
+                {
+                    changed |= state.owed.remove(&target.member_id).is_some();
+                } else {
+                    let unchanged = state.owed.get(&target.member_id).is_some_and(|owed| {
+                        owed.target == *target
+                            && owed.key_index == key.key_index
+                            && Arc::ptr_eq(&owed.incarnation, &state.incarnation)
+                    });
+                    if !unchanged {
+                        state.owed.insert(
+                            target.member_id.clone(),
+                            Arc::new(UndeliveredKey {
+                                target: target.clone(),
+                                key_index: key.key_index,
+                                incarnation: state.incarnation.clone(),
+                            }),
+                        );
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        });
+    }
+
+    fn retry_target_is_joined(&self, target: &ParticipantDeviceInfo) -> bool {
+        (self.get_memberships.lock().unwrap())()
+            .iter()
+            .any(|member| {
+                member.member_id == target.member_id
+                    && member.membership_ts == target.membership_ts
+                    && member.sender == target.user_id
+                    && member.origin.sender_device_id() == Some(target.device_id.as_str())
+            })
+    }
+
+    /// One exact-recipient attempt; no arbitrary host error or payload is logged.
+    /// Both admission and served bookkeeping are fenced by the original debt
+    /// token and key incarnation. All guards drop before the host future.
+    pub(crate) async fn retry_undelivered_key(&self, owed: &Arc<UndeliveredKey>) -> KeyRetry {
+        if !self.retry_target_is_joined(&owed.target) {
+            self.drop_key_debt(owed);
+            return KeyRetry::Moot;
+        }
+        let key = {
+            let key = self.outbound_key.read().unwrap();
+            if !self.key_retry_is_current(owed) {
+                return KeyRetry::Moot;
+            }
+            match key.as_ref() {
+                Some(key) if key.key_index == owed.key_index => key.key.clone(),
+                _ => return KeyRetry::Moot,
+            }
+        };
+        let recipient =
+            ToDeviceRecipient::new(owed.target.user_id.clone(), owed.target.device_id.clone());
+        let content = json!({
+            "room_id": self.room_id,
+            "member_id": self.own_member_id,
+            "media_key": {
+                "index": owed.key_index,
+                "key": general_purpose::STANDARD.encode(&key)
+            },
+            "format": 0
+        });
+        let deliveries = self
+            .backend
+            .send_to_device_message(vec![recipient], KEY_MESSAGE_TYPE.to_owned(), content)
+            .await;
+        let delivered = deliveries.is_ok_and(|deliveries| {
+            deliveries
+                .iter()
+                .find(|delivery| {
+                    delivery.recipient.user_id == owed.target.user_id
+                        && delivery.recipient.device_id == owed.target.device_id
+                })
+                .is_some_and(|delivery| delivery.is_sent())
+        });
+        if !self.retry_target_is_joined(&owed.target) {
+            self.drop_key_debt(owed);
+            return KeyRetry::Moot;
+        }
+        let mut key = self.outbound_key.write().unwrap();
+        let Some(key) = key.as_mut().filter(|key| key.key_index == owed.key_index) else {
+            return KeyRetry::Moot;
+        };
+        // Linearize the entire served-state commit with revocation. A separate
+        // current check followed by a write could race stop/rotation/departure.
+        let mut outcome = KeyRetry::Moot;
+        self.key_deliveries.send_if_modified(|state| {
+            let current = !state.stopped
+                && Arc::ptr_eq(&state.incarnation, &owed.incarnation)
+                && state
+                    .owed
+                    .get(&owed.target.member_id)
+                    .is_some_and(|entry| Arc::ptr_eq(entry, owed));
+            if !current {
+                return false;
+            }
+            if !delivered {
+                outcome = KeyRetry::Undelivered;
+                return false;
+            }
+            if !key
+                .shared_with
+                .iter()
+                .any(|recipient| recipient == &owed.target)
+            {
+                key.shared_with.push(owed.target.clone());
+            }
+            state.owed.remove(&owed.target.member_id);
+            outcome = KeyRetry::Delivered;
+            true
+        });
+        outcome
+    }
+
+    fn drop_key_debt(&self, owed: &Arc<UndeliveredKey>) {
+        self.key_deliveries.send_if_modified(|state| {
+            let current = state
+                .owed
+                .get(&owed.target.member_id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, owed));
+            if current {
+                state.owed.remove(&owed.target.member_id);
+            }
+            current
+        });
     }
 
     /// The key we are encrypting with at `now`, and its index.
@@ -1942,6 +2188,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
             superseded_key: self.superseded_key.clone(),
             rotation_due_at: self.rotation_due_at.clone(),
             signalled_key: self.signalled_key.clone(),
+            key_deliveries: self.key_deliveries.clone(),
         }
     }
 }
@@ -3731,5 +3978,468 @@ mod tests {
             vec!["@bob:example.org"],
             "the unreached recipient should be retried, and the served one left alone",
         );
+    }
+
+    /// The existing manager harness, with real backend futures that can fail,
+    /// remain pending, or finish after their original authority has retired.
+    #[derive(Default)]
+    struct RetryBackend {
+        attempted: Mutex<Vec<(String, u8)>>,
+        allowed: std::sync::atomic::AtomicBool,
+        block_all: std::sync::atomic::AtomicBool,
+        block_bob: std::sync::atomic::AtomicBool,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::atomic::AtomicUsize,
+        held: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl MatrixBackend for RetryBackend {
+        fn own_user_id(&self) -> String {
+            USER_ID.to_owned()
+        }
+        fn own_device_id(&self) -> String {
+            DEVICE_ID.to_owned()
+        }
+        async fn send_sticky_event(
+            &self,
+            _room: String,
+            _kind: String,
+            _content: serde_json::Value,
+            _duration: u64,
+        ) -> Result<String, CommandError> {
+            Ok("$sticky".into())
+        }
+        async fn send_delayed_event(
+            &self,
+            _room: String,
+            _kind: String,
+            _state: Option<String>,
+            _content: serde_json::Value,
+            _delay: u64,
+        ) -> Result<String, CommandError> {
+            Ok("$delay".into())
+        }
+        async fn restart_delayed_event(
+            &self,
+            _room: String,
+            _delay: String,
+        ) -> Result<(), CommandError> {
+            Ok(())
+        }
+        async fn cancel_delayed_event(
+            &self,
+            _room: String,
+            _delay: String,
+        ) -> Result<(), CommandError> {
+            Ok(())
+        }
+        async fn send_state_event(
+            &self,
+            _room: String,
+            _kind: String,
+            _state: String,
+            _content: serde_json::Value,
+        ) -> Result<String, CommandError> {
+            Ok("$state".into())
+        }
+        async fn send_room_event(
+            &self,
+            _room: String,
+            _kind: String,
+            _content: serde_json::Value,
+        ) -> Result<String, CommandError> {
+            Ok("$room".into())
+        }
+        async fn redact_event(
+            &self,
+            _room: String,
+            _event: String,
+            _reason: Option<String>,
+        ) -> Result<(), CommandError> {
+            Ok(())
+        }
+        async fn send_to_device_message(
+            &self,
+            recipients: Vec<ToDeviceRecipient>,
+            kind: String,
+            content: serde_json::Value,
+        ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            assert_eq!(kind, KEY_MESSAGE_TYPE);
+            assert_eq!(content["room_id"], ROOM_ID);
+            assert_eq!(content["member_id"], MEMBER_ID);
+            assert_eq!(content["format"], 0);
+            let index = content["media_key"]["index"].as_u64().unwrap() as u8;
+            {
+                let mut calls = self.attempted.lock().unwrap();
+                for recipient in &recipients {
+                    calls.push((recipient.user_id.clone(), index));
+                    assert_ne!(recipient.device_id, "*");
+                }
+            }
+            struct Entered(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Entered {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, SeqCst);
+                }
+            }
+            let active = self.active.fetch_add(1, SeqCst) + 1;
+            let _entered = Entered(self.active.clone());
+            self.peak.fetch_max(active, SeqCst);
+            let held = self.held.lock().unwrap().take();
+            if let Some((entered, release)) = held {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            if self.block_all.load(SeqCst)
+                || (self.block_bob.load(SeqCst)
+                    && recipients
+                        .iter()
+                        .any(|recipient| recipient.user_id == "@bob:example.org"))
+            {
+                std::future::pending::<()>().await;
+            }
+            Ok(recipients
+                .into_iter()
+                .map(|recipient| {
+                    if self.allowed.load(SeqCst) {
+                        ToDeviceDelivery::sent(recipient)
+                    } else {
+                        ToDeviceDelivery::failed(recipient, "synthetic delivery refusal")
+                    }
+                })
+                .collect())
+        }
+    }
+
+    async fn retry_manager(
+        backend: Arc<RetryBackend>,
+        members: Vec<JoinedMembership>,
+    ) -> (
+        EncryptionManager<RetryBackend>,
+        Arc<Mutex<Vec<JoinedMembership>>>,
+        TestClock,
+    ) {
+        let members = Arc::new(Mutex::new(members));
+        let snapshot = members.clone();
+        let clock = TestClock::new();
+        let mut manager = EncryptionManager::new(
+            backend,
+            USER_ID.into(),
+            DEVICE_ID.into(),
+            MEMBER_ID.into(),
+            ROOM_ID.into(),
+            SLOT_ID.into(),
+            move || snapshot.lock().unwrap().clone(),
+        );
+        manager.set_clock(clock.as_rtc_clock());
+        manager.join().await.unwrap();
+        manager.on_memberships_update().await.unwrap();
+        (manager, members, clock)
+    }
+
+    async fn settle_retries() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// No subsequent membership event/rollout is supplied. Carol's retry must
+    /// finish while Bob's actual backend future is still pending.
+    #[tokio::test(start_paused = true)]
+    async fn failed_key_deliveries_retry_independently_without_another_rollout() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let backend = Arc::new(RetryBackend::default());
+        let carol = JoinedMembership {
+            member_id: "carol".into(),
+            sender: "@carol:example.org".into(),
+            origin: EventOrigin::encrypted(Some("CAROL".into())),
+            ..bob_membership()
+        };
+        let (manager, _, _) = retry_manager(backend.clone(), vec![bob_membership(), carol]).await;
+        let original = manager.get_outbound_key().unwrap();
+        backend.attempted.lock().unwrap().clear();
+        backend.allowed.store(true, SeqCst);
+        backend.block_bob.store(true, SeqCst);
+        let task = crate::executor::spawn(crate::upkeep::retry_keys(manager.clone()));
+        settle_retries().await;
+        tokio::time::advance(std::time::Duration::from_millis(999)).await;
+        settle_retries().await;
+        let before_due = backend.attempted.lock().unwrap().is_empty();
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        // Unrelated notifications must not reset the owed identity/backoff or
+        // keep ready capacity and an admitted backend future from progressing.
+        let bob_debt = manager.key_deliveries.borrow().owed[&bob_membership().member_id].clone();
+        for _ in 0..64 {
+            manager.key_deliveries.send_modify(|_| {});
+            tokio::task::yield_now().await;
+        }
+        settle_retries().await;
+        let debt_preserved = manager
+            .key_deliveries
+            .borrow()
+            .owed
+            .get(&bob_membership().member_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &bob_debt));
+        let current = manager.get_outbound_key().unwrap();
+        let carol_served = current
+            .shared_with
+            .iter()
+            .any(|member| member.member_id == "carol");
+        let bob_not_served = !current
+            .shared_with
+            .iter()
+            .any(|member| member.member_id == bob_membership().member_id);
+        let pending = backend.active.load(SeqCst);
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        settle_retries().await;
+        let timed_out = backend.active.load(SeqCst) == 0;
+        let attempts = backend.attempted.lock().unwrap().len();
+        tokio::time::advance(std::time::Duration::from_millis(1999)).await;
+        settle_retries().await;
+        let backoff_preserved = backend.attempted.lock().unwrap().len() == attempts;
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        settle_retries().await;
+        let retried_again = backend.attempted.lock().unwrap().len() == attempts + 1;
+        manager.stop_key_retries();
+        settle_retries().await;
+        let stopped = backend.active.load(SeqCst) == 0;
+        let stopped_at = backend.attempted.lock().unwrap().len();
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        settle_retries().await;
+        let stays_stopped = backend.attempted.lock().unwrap().len() == stopped_at;
+        task.abort();
+        let joined = task.await;
+        assert!(joined.unwrap_err().is_cancelled());
+        assert!(before_due && carol_served && bob_not_served && pending == 1 && debt_preserved);
+        assert!(timed_out && backoff_preserved && retried_again && stopped && stays_stopped);
+        assert_eq!(original.key_index, current.key_index);
+        assert_eq!(original.key, current.key);
+        assert!(!*manager.key_distribution_in_progress.lock().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn key_retry_capacity_and_owner_drop_bound_pending_host_calls() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let backend = Arc::new(RetryBackend::default());
+        let members = (0..10)
+            .map(|index| JoinedMembership {
+                member_id: format!("member-{index}"),
+                sender: format!("@member-{index}:example.org"),
+                origin: EventOrigin::encrypted(Some(format!("DEVICE-{index}"))),
+                ..bob_membership()
+            })
+            .collect();
+        let (manager, _, _) = retry_manager(backend.clone(), members).await;
+        backend.attempted.lock().unwrap().clear();
+        backend.peak.store(0, SeqCst);
+        backend.block_all.store(true, SeqCst);
+        let task = crate::executor::spawn(crate::upkeep::retry_keys(manager.clone()));
+        settle_retries().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        settle_retries().await;
+        let first = backend.active.load(SeqCst);
+        let first_attempts = backend.attempted.lock().unwrap().len();
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        settle_retries().await;
+        let later_attempts = backend.attempted.lock().unwrap().len();
+        let peak = backend.peak.load(SeqCst);
+        // Dropping the actual controller drops its AbortOnDrop worker handles.
+        task.abort();
+        let joined = task.await;
+        settle_retries().await;
+        let retired = backend.active.load(SeqCst) == 0;
+        let stopped_at = backend.attempted.lock().unwrap().len();
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        settle_retries().await;
+        assert!(joined.unwrap_err().is_cancelled());
+        assert!(first == 8 && first_attempts == 8 && later_attempts == 10 && peak == 8);
+        assert!(retired && backend.attempted.lock().unwrap().len() == stopped_at);
+    }
+
+    /// Poll the real controller without yielding its runtime, so an aborted
+    /// backend future cannot retire until this test explicitly allows it. The
+    /// exact debt's strong owners distinguish the snapshot from a new spawned
+    /// worker: replacement must wait for the old native JoinHandle completion.
+    #[tokio::test(start_paused = true)]
+    async fn key_retry_replacement_joins_retired_native_worker_before_spawning() {
+        use std::future::{Future, poll_fn};
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::task::Poll;
+
+        let backend = Arc::new(RetryBackend::default());
+        let (manager, _, _) = retry_manager(backend.clone(), vec![bob_membership()]).await;
+        backend.attempted.lock().unwrap().clear();
+        backend.peak.store(0, SeqCst);
+        backend.block_all.store(true, SeqCst);
+        let mut controller = Box::pin(crate::upkeep::retry_keys(manager.clone()));
+        poll_fn(|cx| {
+            assert!(controller.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        settle_retries().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        settle_retries().await;
+        assert_eq!(backend.active.load(SeqCst), 1);
+
+        let member = bob_membership().member_id;
+        let old = manager.key_deliveries.borrow().owed[&member].clone();
+        let replacement = Arc::new(UndeliveredKey {
+            target: old.target.clone(),
+            key_index: old.key_index,
+            incarnation: old.incarnation.clone(),
+        });
+        manager.key_deliveries.send_modify(|state| {
+            state.owed.insert(member.clone(), replacement.clone());
+        });
+        poll_fn(|cx| {
+            assert!(controller.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        // Only this test, the watch, and the controller's snapshot own the new
+        // token. A map entry plus a spawned worker would add a fourth owner.
+        let waiting_for_retirement =
+            backend.active.load(SeqCst) == 1 && Arc::strong_count(&replacement) == 3;
+        settle_retries().await;
+        let retired_before_replacement = backend.active.load(SeqCst) == 0;
+        poll_fn(|cx| {
+            assert!(controller.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let replacement_spawned = Arc::strong_count(&replacement) == 4;
+        settle_retries().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        settle_retries().await;
+        let replacement_entered = backend.active.load(SeqCst) == 1;
+        manager.stop_key_retries();
+        poll_fn(|cx| {
+            assert!(controller.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        settle_retries().await;
+        drop(controller);
+        settle_retries().await;
+        assert!(waiting_for_retirement && retired_before_replacement && replacement_spawned);
+        assert!(replacement_entered && backend.active.load(SeqCst) == 0);
+        assert_eq!(backend.peak.load(SeqCst), 1);
+        assert!(!*manager.key_distribution_in_progress.lock().unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn key_retry_backoff_caps_at_thirty_seconds_without_new_rollouts() {
+        let backend = Arc::new(RetryBackend::default());
+        let (manager, _, _) = retry_manager(backend.clone(), vec![bob_membership()]).await;
+        backend.attempted.lock().unwrap().clear();
+        let task = crate::executor::spawn(crate::upkeep::retry_keys(manager.clone()));
+        settle_retries().await;
+        let mut timing_preserved = true;
+        let mut attempts = 0;
+        for seconds in [1, 2, 4, 8, 16, 30, 30] {
+            tokio::time::advance(std::time::Duration::from_millis(seconds * 1000 - 1)).await;
+            settle_retries().await;
+            timing_preserved &= backend.attempted.lock().unwrap().len() == attempts;
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            settle_retries().await;
+            attempts += 1;
+            timing_preserved &= backend.attempted.lock().unwrap().len() == attempts;
+        }
+        task.abort();
+        let joined = task.await;
+        settle_retries().await;
+        assert!(joined.unwrap_err().is_cancelled() && timing_preserved);
+        assert_eq!(manager.get_outbound_key().unwrap().key_index, 0);
+        assert!(manager.get_outbound_key().unwrap().shared_with.is_empty());
+    }
+
+    /// A send already entered may finish, but cannot mark a later incarnation
+    /// served or clear its debt, including after the u8 index is reused.
+    #[tokio::test(start_paused = true)]
+    async fn stale_key_retry_success_cannot_commit_after_authority_changes() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for boundary in 0..4 {
+            let backend = Arc::new(RetryBackend::default());
+            let (manager, members, clock) =
+                retry_manager(backend.clone(), vec![bob_membership()]).await;
+            let old = manager
+                .subscribe_key_deliveries()
+                .borrow()
+                .owed
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *backend.held.lock().unwrap() = Some((entered_tx, release_rx));
+            let original = manager.clone();
+            let owed = old.clone();
+            let task =
+                crate::executor::spawn(async move { original.retry_undelivered_key(&owed).await });
+            let entered = tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await;
+            match boundary {
+                0 => {
+                    members.lock().unwrap().clear();
+                    manager.on_memberships_update().await.unwrap();
+                }
+                1 => {
+                    clock.advance(1_000_000);
+                    *manager.next_key_index.lock().unwrap() = old.key_index;
+                    manager.on_memberships_update().await.unwrap();
+                }
+                2 => {
+                    manager.leave();
+                    manager.join().await.unwrap();
+                    manager.on_memberships_update().await.unwrap();
+                }
+                3 => {
+                    let mut changed = bob_membership();
+                    changed.sender = "@replacement:example.org".into();
+                    changed.origin = EventOrigin::encrypted(Some("REPLACEMENT".into()));
+                    *members.lock().unwrap() = vec![changed];
+                    manager.on_memberships_update().await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let newer = manager
+                .subscribe_key_deliveries()
+                .borrow()
+                .owed
+                .values()
+                .next()
+                .cloned();
+            backend.allowed.store(true, SeqCst);
+            let _ = release_tx.send(());
+            let result = task.await.unwrap();
+            let remaining = manager
+                .subscribe_key_deliveries()
+                .borrow()
+                .owed
+                .values()
+                .next()
+                .cloned();
+            let debt_preserved = match (newer, remaining) {
+                (None, None) => boundary == 0,
+                (Some(newer), Some(remaining)) => {
+                    !Arc::ptr_eq(&old, &newer) && Arc::ptr_eq(&newer, &remaining)
+                }
+                _ => false,
+            };
+            assert!(matches!(entered, Ok(Ok(()))));
+            assert!(result == KeyRetry::Moot && debt_preserved);
+            assert!(manager.get_outbound_key().unwrap().shared_with.is_empty());
+            assert!(!*manager.key_distribution_in_progress.lock().unwrap());
+            manager.leave();
+        }
     }
 }

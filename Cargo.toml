@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 # Keep vendored library development feature sets outside the application workspace.
-exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto", "vendor/winit", "vendor/notify-rust", "vendor/mac-notification-sys", "vendor/tauri-winrt-notification", "vendor/i-slint-backend-winit", "vendor/matrix-rtc-call-sdk", "vendor/matrix-rtc-matrix-sdk", "vendor/libwebrtc", "vendor/livekit"]
+exclude = ["vendor/image-webp", "vendor/cpal", "vendor/alsa", "vendor/matrix-sdk-crypto", "vendor/winit", "vendor/notify-rust", "vendor/mac-notification-sys", "vendor/tauri-winrt-notification", "vendor/i-slint-backend-winit", "vendor/matrix-rtc-matrix-sdk", "vendor/libwebrtc", "vendor/livekit"]
 members = [
     "crates/morpheus-app",
     "crates/morpheus-config",
@@ -11,6 +11,7 @@ members = [
     "vendor/lru",
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
+    "vendor/matrix-rtc-call-sdk",
     "vendor/matrix-rtc-transport",
     "vendor/matrix-rtc-core",
     "vendor/cargo-packager-updater",
