@@ -2366,7 +2366,7 @@ fn role_message(
         rich_body: StyledText::from_plain_text(&format!("{sender} body")),
         rich_accessible_body: format!("{sender} body").into(),
         accent,
-        avatar_slot: preview_avatar_slot(accent),
+        avatar_slot: crate::preview_avatar_slot(accent),
         ..Default::default()
     }
 }
@@ -2689,7 +2689,7 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
         assert_eq!(crate::live::avatar_slot(identity), slot as i32);
         assert_eq!(crate::live::accent(identity), color_from_hex(default));
         assert_eq!(
-            ui.global::<StyleTokens>().invoke_avatar_color(slot as i32),
+            ui.global::<crate::StyleTokens>().invoke_avatar_color(slot as i32),
             color_from_hex(default)
         );
     }
@@ -2739,7 +2739,7 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     crate::appearance::apply_theme(ui, &Config::default(), Some(&bare));
     for (slot, default) in defaults.iter().enumerate() {
         assert_eq!(
-            ui.global::<StyleTokens>().invoke_avatar_color(slot as i32),
+            ui.global::<crate::StyleTokens>().invoke_avatar_color(slot as i32),
             color_from_hex(default)
         );
     }
