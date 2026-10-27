@@ -3712,10 +3712,12 @@ mod tests {
         };
         let hidden = MediaConstraints {
             visible: false,
-            detail: matrix_rtc_transport::VideoDetail::Dimensions(matrix_rtc_transport::Dimensions {
-                width: 640,
-                height: 360,
-            }),
+            detail: matrix_rtc_transport::VideoDetail::Dimensions(
+                matrix_rtc_transport::Dimensions {
+                    width: 640,
+                    height: 360,
+                },
+            ),
             ..Default::default()
         };
 
@@ -3828,7 +3830,9 @@ mod tests {
             }
         ));
         assert!(Arc::ptr_eq(
-            &fx.engine.remote_track("bob", MediaStreamKind::Camera).unwrap(),
+            &fx.engine
+                .remote_track("bob", MediaStreamKind::Camera)
+                .unwrap(),
             &camera,
         ));
 
