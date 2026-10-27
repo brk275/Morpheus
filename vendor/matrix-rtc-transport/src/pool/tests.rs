@@ -273,7 +273,7 @@ async fn media_and_keys_that_beat_the_membership_are_released_when_it_lands() {
 }
 
 #[tokio::test]
-async fn a_departure_forgets_its_buffers_and_tracks() {
+async fn a_departure_hides_its_tracks_until_the_membership_returns() {
     let mut fx = Fixture::new();
     let own = fx.adopt();
     fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
@@ -281,8 +281,8 @@ async fn a_departure_forgets_its_buffers_and_tracks() {
         .unwrap();
     fx.drain().await;
 
-    // Gone, and a key that arrives for the identity afterwards is parked —
-    // then dropped with nothing to release it into.
+    // Gone memberships cannot expose tracks. A later key import remains parked
+    // without granting any membership or media visibility.
     fx.pool.apply_snapshot(&[]);
     assert!(
         fx.pool
@@ -865,4 +865,412 @@ async fn first_poll_panic_remains_failed_but_later_real_intent_can_settle() {
             camera_constraints(true).resolve(MediaStreamKind::Camera)
         )]
     );
+}
+
+/// The SFU need not repeat TrackAdded when only Matrix membership lapsed.
+#[tokio::test(start_paused = true)]
+async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
+    let mut fx = Fixture::new();
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    let camera: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    let microphone: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Microphone));
+    let peer = fx.sender(PEER_FOCUS);
+    for (kind, track) in [
+        (MediaStreamKind::Camera, camera.clone()),
+        (MediaStreamKind::Microphone, microphone.clone()),
+    ] {
+        peer.send(ConnectionEvent::TrackAdded {
+            identity: "id-bob".into(),
+            kind,
+            track,
+        })
+        .unwrap();
+    }
+    fx.drain().await;
+    peer.send(ConnectionEvent::EncryptionStateChanged {
+        identity: "id-bob".into(),
+        state: FrameEncryptionState::MissingKey,
+    })
+    .unwrap();
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[]);
+    let tracks = fx.pool.remote_tracks();
+    assert!(tracks.get("bob", MediaStreamKind::Camera).is_none());
+    assert!(tracks.get("bob", MediaStreamKind::Microphone).is_none());
+    // Another member's authority cannot release Bob's buffered handles.
+    fx.pool.apply_snapshot(&[member_on("carol", PEER_FOCUS)]);
+    assert!(tracks.get("carol", MediaStreamKind::Camera).is_none());
+    let events = fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    for kind in [MediaStreamKind::Camera, MediaStreamKind::Microphone] {
+        assert!(events.contains(&PoolEvent::StreamAdded {
+            member_id: "bob".into(),
+            kind,
+        }));
+    }
+    assert!(Arc::ptr_eq(
+        &tracks.get("bob", MediaStreamKind::Camera).unwrap(),
+        &camera,
+    ));
+    assert!(Arc::ptr_eq(
+        &tracks.get("bob", MediaStreamKind::Microphone).unwrap(),
+        &microphone,
+    ));
+    assert_eq!(
+        events.last(),
+        Some(&PoolEvent::EncryptionStateChanged {
+            member_id: "bob".into(),
+            state: FrameEncryptionState::MissingKey,
+        }),
+        "state is restored after both streams without another cryptor callback",
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, PoolEvent::EncryptionStateChanged { .. }))
+            .count(),
+        1,
+    );
+
+    // A new receiver on the same connection cannot inherit an old receiver's
+    // failure, including one still remembered by the unchanged microphone.
+    let replacement: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    peer.send(ConnectionEvent::TrackAdded {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+        track: replacement.clone(),
+    })
+    .unwrap();
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[]);
+    let events = fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    assert!(Arc::ptr_eq(
+        &tracks.get("bob", MediaStreamKind::Camera).unwrap(),
+        &replacement,
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::EncryptionStateChanged { .. }))
+    );
+
+    // A real later observation while both receivers are parked is retained.
+    fx.pool.apply_snapshot(&[]);
+    peer.send(ConnectionEvent::EncryptionStateChanged {
+        identity: "id-bob".into(),
+        state: FrameEncryptionState::Ok,
+    })
+    .unwrap();
+    assert!(fx.drain().await.is_empty());
+    let events = fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    assert_eq!(
+        events.last(),
+        Some(&PoolEvent::EncryptionStateChanged {
+            member_id: "bob".into(),
+            state: FrameEncryptionState::Ok,
+        }),
+    );
+    fx.pool.apply_snapshot(&[]);
+    for kind in [MediaStreamKind::Camera, MediaStreamKind::Microphone] {
+        peer.send(ConnectionEvent::TrackRemoved {
+            identity: "id-bob".into(),
+            kind,
+        })
+        .unwrap();
+    }
+    fx.drain().await;
+    peer.send(ConnectionEvent::EncryptionStateChanged {
+        identity: "id-bob".into(),
+        state: FrameEncryptionState::MissingKey,
+    })
+    .unwrap();
+    peer.send(track_added("id-bob", MediaStreamKind::Camera))
+        .unwrap();
+    fx.drain().await;
+    let events = fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::EncryptionStateChanged { .. }))
+    );
+    assert_eq!(
+        fx.connects(PEER_FOCUS),
+        1,
+        "the existing connection carries both handles",
+    );
+    fx.pool.close();
+}
+
+/// A parked handle belongs to its actual source, never to a future connection
+/// that happens to reuse that key or to the next membership snapshot.
+#[tokio::test(start_paused = true)]
+async fn parked_media_is_not_restored_after_its_track_or_connection_retires() {
+    for boundary in 0..4 {
+        let mut fx = Fixture::new();
+        fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+        fx.drain().await;
+        let track: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+        let weak = Arc::downgrade(&track);
+        let peer = fx.sender(PEER_FOCUS);
+        peer.send(ConnectionEvent::TrackAdded {
+            identity: "id-bob".into(),
+            kind: MediaStreamKind::Camera,
+            track,
+        })
+        .unwrap();
+        fx.drain().await;
+        peer.send(ConnectionEvent::EncryptionStateChanged {
+            identity: "id-bob".into(),
+            state: FrameEncryptionState::MissingKey,
+        })
+        .unwrap();
+        fx.drain().await;
+        fx.pool.apply_snapshot(&[]);
+        assert!(weak.upgrade().is_some(), "the live source is parked");
+        match boundary {
+            0 => {
+                peer.send(ConnectionEvent::TrackRemoved {
+                    identity: "id-bob".into(),
+                    kind: MediaStreamKind::Camera,
+                })
+                .unwrap();
+                fx.drain().await;
+            }
+            1 => {
+                peer.send(ConnectionEvent::Closed {
+                    message: "closed".into(),
+                })
+                .unwrap();
+                fx.drain().await;
+            }
+            2 => {
+                tokio::time::sleep(IDLE_GRACE * 2).await;
+                fx.drain().await;
+            }
+            3 => fx.pool.close(),
+            _ => unreachable!(),
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "retirement must release the parked handle",
+        );
+        let mut events = fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+        events.extend(fx.drain().await);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PoolEvent::EncryptionStateChanged { .. }))
+        );
+        assert!(
+            fx.pool
+                .remote_tracks()
+                .get("bob", MediaStreamKind::Camera)
+                .is_none()
+        );
+        fx.pool.close();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retired_generation_events_cannot_refill_parked_media() {
+    let mut fx = Fixture::new();
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    let peer = fx.sender(PEER_FOCUS);
+    peer.send(ConnectionEvent::Closed {
+        message: "closed".into(),
+    })
+    .unwrap();
+    fx.drain().await;
+    // Keep Bob present: the original entry is in Backoff with its old generation.
+    let track: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    let weak = Arc::downgrade(&track);
+    peer.send(ConnectionEvent::TrackAdded {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+        track,
+    })
+    .unwrap();
+    fx.drain().await;
+    assert!(weak.upgrade().is_none());
+    fx.pool.apply_snapshot(&[]);
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .is_none()
+    );
+    fx.pool.close();
+}
+
+#[tokio::test]
+async fn replacing_the_adopted_connection_discards_its_parked_handles() {
+    let mut fx = Fixture::new();
+    let old = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    let track: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    let weak = Arc::downgrade(&track);
+    old.send(ConnectionEvent::TrackAdded {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+        track,
+    })
+    .unwrap();
+    fx.drain().await;
+    old.send(ConnectionEvent::EncryptionStateChanged {
+        identity: "id-bob".into(),
+        state: FrameEncryptionState::MissingKey,
+    })
+    .unwrap();
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[]);
+    assert!(weak.upgrade().is_some());
+    let replacement = fx.adopt();
+    assert!(weak.upgrade().is_none());
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .is_none()
+    );
+    replacement
+        .send(track_added("id-bob", MediaStreamKind::Camera))
+        .unwrap();
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[]);
+    let events = fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::EncryptionStateChanged { .. }))
+    );
+    fx.pool.close();
+}
+
+/// Moving between focuses cannot give the old focus ownership of the new handle.
+#[tokio::test]
+async fn an_old_connection_removal_cannot_remove_the_replacement_handle() {
+    let mut fx = Fixture::new();
+    let old = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    old.send(track_added("id-bob", MediaStreamKind::Camera))
+        .unwrap();
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    let replacement: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    fx.sender(PEER_FOCUS)
+        .send(ConnectionEvent::TrackAdded {
+            identity: "id-bob".into(),
+            kind: MediaStreamKind::Camera,
+            track: replacement.clone(),
+        })
+        .unwrap();
+    fx.drain().await;
+    old.send(ConnectionEvent::TrackRemoved {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+    })
+    .unwrap();
+    let events = fx.drain().await;
+    assert!(!events.contains(&PoolEvent::StreamRemoved {
+        member_id: "bob".into(),
+        kind: MediaStreamKind::Camera,
+    }));
+    assert!(Arc::ptr_eq(
+        &fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .unwrap(),
+        &replacement,
+    ));
+    fx.pool.close();
+}
+
+/// A replacement can arrive before the old active handle's membership lapses.
+#[tokio::test]
+async fn an_active_old_incarnation_cannot_be_parked_after_same_key_adoption() {
+    let mut fx = Fixture::new();
+    let old = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    let track: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    let weak = Arc::downgrade(&track);
+    old.send(ConnectionEvent::TrackAdded {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+        track,
+    })
+    .unwrap();
+    fx.drain().await;
+    let replacement = fx.adopt();
+    // Preserve the preexisting active-map presentation until normal removal.
+    assert!(weak.upgrade().is_some());
+    fx.pool.apply_snapshot(&[]);
+    assert!(weak.upgrade().is_none());
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .is_none()
+    );
+
+    // The new incarnation's genuinely live track must still park and return.
+    let current: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    replacement
+        .send(ConnectionEvent::TrackAdded {
+            identity: "id-bob".into(),
+            kind: MediaStreamKind::Camera,
+            track: current.clone(),
+        })
+        .unwrap();
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[]);
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    assert!(Arc::ptr_eq(
+        &fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .unwrap(),
+        &current,
+    ));
+    fx.pool.close();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_active_idle_retired_focus_cannot_be_parked_after_a_lapse() {
+    let mut fx = Fixture::new();
+    let _own = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    let track: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack(MediaStreamKind::Camera));
+    let weak = Arc::downgrade(&track);
+    fx.sender(PEER_FOCUS)
+        .send(ConnectionEvent::TrackAdded {
+            identity: "id-bob".into(),
+            kind: MediaStreamKind::Camera,
+            track,
+        })
+        .unwrap();
+    fx.drain().await;
+    // The same member moves focus without a TrackRemoved from the old source.
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    tokio::time::sleep(IDLE_GRACE * 2).await;
+    fx.drain().await;
+    assert!(fx.state.closes.lock().unwrap().iter().any(|key| key == PEER_FOCUS));
+    assert!(weak.upgrade().is_some());
+    fx.pool.apply_snapshot(&[]);
+    assert!(weak.upgrade().is_none());
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    assert_eq!(fx.connects(PEER_FOCUS), 2);
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .is_none()
+    );
+    fx.pool.close();
 }

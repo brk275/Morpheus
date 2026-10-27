@@ -17,6 +17,7 @@
     "src/feeder/mod.rs",
     "src/own_membership.rs",
     "src/session.rs",
+    "src/upkeep.rs",
     "tests/key_rotation.rs"
   ],
   "new_lock_identities": [],

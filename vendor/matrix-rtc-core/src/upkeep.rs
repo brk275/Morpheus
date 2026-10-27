@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
+//
+// Morpheus modification: independently retry failed current media-key deliveries;
+// see MORPHEUS_PATCH.md.
 
 //! The task that keeps one joined slot session alive, spawned by
 //! [`SlotSession::join`](crate::SlotSession::join) on the
@@ -15,13 +18,16 @@
 //! machine and the encryption manager, never the room: a tick does not stall
 //! anything else the room does.
 
-use std::pin::pin;
+use std::collections::HashMap;
+use std::future::{Future, poll_fn};
+use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
-use crate::encryption::EncryptionManager;
+use crate::encryption::{EncryptionManager, KeyRetry, UndeliveredKey};
 use crate::executor::{self, AbortOnDrop, JoinHandleExt};
 use crate::host::backend::MatrixBackend;
 use crate::own_membership::{OwnMembershipMachine, OwnMembershipState, now_ms};
@@ -63,6 +69,11 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
         // (the flush failed) waits for the next tick instead of spinning.
         let mut flushed_due: Option<u64> = None;
         let mut beat = pin!(executor::sleep(interval));
+        // This owner retains the controller's abort handle. The separate task
+        // keeps retry scheduling moving even while a keep-alive awaits the host.
+        let _key_retries = encryption.as_ref().map(|encryption| {
+            executor::spawn(retry_keys(encryption.clone())).abort_on_drop()
+        });
 
         loop {
             let due = rotation_due
@@ -123,5 +134,151 @@ async fn changed(receiver: &mut Option<watch::Receiver<Option<u64>>>) -> bool {
     match receiver {
         Some(receiver) => receiver.changed().await.is_ok(),
         None => std::future::pending().await,
+    }
+}
+
+// These are source-fixed retry limits, not caller/manifest-selected inputs.
+const KEY_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const KEY_RETRY_MAX: Duration = Duration::from_secs(30);
+const KEY_RETRY_ATTEMPT: Duration = Duration::from_secs(30);
+const KEY_RETRY_IN_FLIGHT: usize = 8;
+
+/// The existing upkeep owns this controller. There is one worker per current
+/// debt, at most eight host retry calls in flight, and no retained key payload
+/// while a worker waits. Dropping the controller aborts all its workers.
+pub(crate) async fn retry_keys<T: MatrixBackend + 'static>(encryption: EncryptionManager<T>) {
+    let mut updates = encryption.subscribe_key_deliveries();
+    let capacity = Arc::new(Semaphore::new(KEY_RETRY_IN_FLIGHT));
+    let mut workers: HashMap<String, (Arc<UndeliveredKey>, Option<AbortOnDrop<()>>)> =
+        HashMap::new();
+    loop {
+        let owed = updates.borrow_and_update().owed.clone();
+        let retired: Vec<_> = workers
+            .iter()
+            .filter(|(member, (token, _))| {
+                !owed.get(*member)
+                    .is_some_and(|current| Arc::ptr_eq(current, token))
+            })
+            .map(|(member, _)| member.clone())
+            .collect();
+        let retired: Vec<_> = retired
+            .into_iter()
+            .filter_map(|member| workers.remove(&member).and_then(|(_, task)| task))
+            .collect();
+        // Cancel the whole retired batch before awaiting any one of it. Native
+        // JoinHandle completion retires the owned future before replacements;
+        // the existing wasm executor reports abort without that join guarantee.
+        for task in &retired {
+            task.abort_handle().abort();
+        }
+        for task in retired {
+            let _ = task.await;
+        }
+        for (member, token) in owed {
+            if !encryption.key_retry_is_current(&token) {
+                continue;
+            }
+            workers.entry(member).or_insert_with(|| {
+                let task = executor::spawn(retry_key(
+                    encryption.clone(),
+                    token.clone(),
+                    capacity.clone(),
+                ))
+                .abort_on_drop();
+                (token, Some(task))
+            });
+        }
+        tokio::select! {
+            biased;
+            // Poll real task completion before unrelated debt notifications.
+            // Consume the join result before retiring its handle. A completed
+            // token stays inert until its debt changes: do not restart a failed
+            // task automatically or retain a native-owned task for that token.
+            member = poll_fn(|cx| {
+                for (member, (_, task)) in &mut workers {
+                    if let Some(task) = task.as_mut() {
+                        if Pin::new(task).poll(cx).is_ready() {
+                            return Poll::Ready(member.clone());
+                        }
+                    }
+                }
+                Poll::Pending
+            }) => {
+                if let Some((_, task)) = workers.get_mut(&member) {
+                    *task = None;
+                }
+            }
+            changed = updates.changed() => {
+                if changed.is_err() {
+                    return std::future::pending().await;
+                }
+            }
+        }
+    }
+}
+
+async fn retry_key<T: MatrixBackend + 'static>(
+    encryption: EncryptionManager<T>,
+    owed: Arc<UndeliveredKey>,
+    capacity: Arc<Semaphore>,
+) {
+    let mut updates = encryption.subscribe_key_deliveries();
+    let mut backoff = KEY_RETRY_INITIAL;
+    loop {
+        if !encryption.key_retry_is_current(&owed) {
+            return;
+        }
+        let mut wait = pin!(executor::sleep(backoff));
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut wait => break,
+                changed = updates.changed() => {
+                    if changed.is_err() || !encryption.key_retry_is_current(&owed) {
+                        return;
+                    }
+                }
+            }
+        }
+        // Keep the same pending permit across unrelated watch notifications;
+        // Tokio's existing fair semaphore queue then cannot be starved by them.
+        let mut permit = pin!(capacity.clone().acquire_owned());
+        let permit = loop {
+            tokio::select! {
+                biased;
+                permit = &mut permit => match permit {
+                    Ok(permit) => break permit,
+                    Err(_) => return,
+                },
+                changed = updates.changed() => {
+                    if changed.is_err() || !encryption.key_retry_is_current(&owed) {
+                        return;
+                    }
+                }
+            }
+        };
+        let outcome = {
+            let mut attempt = pin!(encryption.retry_undelivered_key(&owed));
+            let mut deadline = pin!(executor::sleep(KEY_RETRY_ATTEMPT));
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut deadline => break KeyRetry::Undelivered,
+                    outcome = &mut attempt => break outcome,
+                    changed = updates.changed() => {
+                        if changed.is_err() || !encryption.key_retry_is_current(&owed) {
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+        // The attempt's hidden pin! storage is gone before capacity is released,
+        // including on timeout. A new permit never overlaps a retired future.
+        drop(permit);
+        if outcome != KeyRetry::Undelivered {
+            return;
+        }
+        backoff = (backoff * 2).min(KEY_RETRY_MAX);
     }
 }

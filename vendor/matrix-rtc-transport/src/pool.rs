@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
+//
+// Morpheus modification: retain same-participation media across membership lapses;
+// see MORPHEUS_PATCH.md.
 
 //! The connection pool: a session's media over N transport connections, keyed
 //! by `member_id`.
@@ -81,11 +84,23 @@ fn backoff_delay(attempt: u32) -> Duration {
 
 /// Subscribed remote tracks, keyed by member and stream kind. Shared between
 /// the pool (writes) and [`RemoteTracks`] (reads).
-type TrackMap = Arc<Mutex<HashMap<(String, MediaStreamKind), Arc<dyn RemoteTrackHandle>>>>;
+type TrackMap = Arc<Mutex<HashMap<(String, MediaStreamKind), PooledTrack>>>;
+
+/// A subscribed handle and its actual source connection. This provenance
+/// survives a membership lapse, so retiring the source also retires its buffer.
+#[derive(Clone)]
+struct PooledTrack {
+    connection_key: String,
+    generation: u64,
+    track: Arc<dyn RemoteTrackHandle>,
+    /// Participant-level state observed while this exact receiver was present.
+    /// A new receiver starts unknown; state never follows only a member ID.
+    encryption_state: Option<FrameEncryptionState>,
+}
 
 /// Tracks whose transport identity has no membership yet, buffered per
 /// identity until the membership lands.
-type PendingTracks = HashMap<String, Vec<(MediaStreamKind, Arc<dyn RemoteTrackHandle>)>>;
+type PendingTracks = HashMap<String, Vec<(MediaStreamKind, PooledTrack)>>;
 
 /// One latest intent and one worker per original membership/stream. A worker
 /// settles an entered apply before observing the next intent; it never races
@@ -386,7 +401,7 @@ impl RemoteTracks {
             .lock()
             .expect("track map mutex poisoned")
             .get(&(member_id.to_owned(), kind))
-            .cloned()
+            .map(|pooled| pooled.track.clone())
     }
 
     /// [`RemoteTracks::get`] for many streams under one lock, in order.
@@ -395,7 +410,10 @@ impl RemoteTracks {
         streams: &[(String, MediaStreamKind)],
     ) -> Vec<Option<Arc<dyn RemoteTrackHandle>>> {
         let map = self.0.lock().expect("track map mutex poisoned");
-        streams.iter().map(|key| map.get(key).cloned()).collect()
+        streams
+            .iter()
+            .map(|key| map.get(key).map(|pooled| pooled.track.clone()))
+            .collect()
     }
 }
 
@@ -559,6 +577,7 @@ impl MediaPool {
         events: mpsc::UnboundedReceiver<ConnectionEvent>,
     ) {
         let key = connection.connection_key().to_owned();
+        self.drop_pending_from(&key);
         self.connection_generation += 1;
         let generation = self.connection_generation;
         let members = self.members_on_key(&key);
@@ -642,6 +661,8 @@ impl MediaPool {
         // Close queued writers before the connections are released. An already
         // entered apply still owns its original connection until it returns.
         self.constraints.clear();
+        self.pending_tracks.clear();
+        self.pending_keys.clear();
         for (_, entry) in self.pool.drain() {
             if let ConnState::Up { connection, .. } = entry.state
                 && !entry.is_own
@@ -663,9 +684,11 @@ impl MediaPool {
                 generation,
                 event,
             } => {
-                let current = self.pool.get(&connection_key).map(|entry| entry.generation);
-                if current == Some(generation) {
-                    self.handle_connection_event(&connection_key, event);
+                let current = self.pool.get(&connection_key).is_some_and(|entry| {
+                    entry.generation == generation && matches!(entry.state, ConnState::Up { .. })
+                });
+                if current {
+                    self.handle_connection_event(&connection_key, generation, event);
                 } else {
                     log::trace!("dropping event of replaced connection {connection_key}");
                 }
@@ -742,7 +765,19 @@ impl MediaPool {
                 member.member_id,
             );
             for (kind, track) in pending {
-                self.add_track(&member.member_id, kind, track);
+                if self.track_is_current(&track) {
+                    self.add_track(&member.member_id, kind, track);
+                }
+            }
+            // The owner clears member state on departure, but an unchanged
+            // cryptor need not repeat its last transition. Replay only after
+            // every winning receiver has been restored and agrees: an unknown
+            // replacement must not inherit a different receiver's state.
+            if let Some(state) = self.restored_encryption_state(&member.member_id) {
+                self.out.push(PoolEvent::EncryptionStateChanged {
+                    member_id: member.member_id.clone(),
+                    state,
+                });
             }
         }
         for key_index in self.pending_keys.remove(&identity).unwrap_or_default() {
@@ -756,23 +791,87 @@ impl MediaPool {
 
     fn forget_member(&mut self, member_id: &str) {
         self.known_members.remove(member_id);
-        // Read the identity out before dropping the mappings, so the
-        // identity-keyed buffers can be cleared too: a stale index could
-        // otherwise resurface against a later member that reuses the identity,
-        // and in a long-lived process the maps would only ever grow.
-        if let Some(identity) = self.member_identities.remove(member_id) {
-            self.pending_keys.remove(&identity);
-            self.pending_tracks.remove(&identity);
+        let identity = self.member_identities.remove(member_id);
+        // A stale key index could otherwise resurface against the identity.
+        if let Some(identity) = &identity {
+            self.pending_keys.remove(identity);
         }
         self.identity_map.retain(|_, mapped| mapped != member_id);
         // A rejoining member gets a fresh member_id, so their constraints
         // die with the membership.
         self.constraints
             .retain(|(member, _), _| member != member_id);
-        self.tracks
-            .lock()
-            .expect("track map mutex poisoned")
-            .retain(|(track_member, _), _| track_member != member_id);
+        // Their tracks go back to the buffer, not away: the same participation
+        // can return under the same member_id (a membership that lapsed and is
+        // republished, 034 R17/R19), and the SFU, which kept carrying their
+        // media, will not announce it again. A removal or the connection going
+        // clears the buffer as for any media that beat its membership.
+        let departed: Vec<(MediaStreamKind, PooledTrack)> = {
+            let mut tracks = self.tracks.lock().expect("track map mutex poisoned");
+            let kinds: Vec<MediaStreamKind> = tracks
+                .keys()
+                .filter(|(track_member, _)| track_member == member_id)
+                .map(|(_, kind)| *kind)
+                .collect();
+            kinds
+                .into_iter()
+                .filter_map(|kind| {
+                    tracks
+                        .remove(&(member_id.to_owned(), kind))
+                        .map(|pooled| (kind, pooled))
+                })
+                .collect()
+        };
+        // An active handle can outlive its original focus in the public map.
+        // Preserve that existing presentation lifetime, but never park it after
+        // its exact connection incarnation has retired or been replaced.
+        let departed: Vec<_> = departed
+            .into_iter()
+            .filter(|(_, pooled)| self.track_is_current(pooled))
+            .collect();
+        if let Some(identity) = identity
+            && !departed.is_empty()
+        {
+            self.pending_tracks
+                .entry(identity)
+                .or_default()
+                .extend(departed);
+        }
+    }
+
+    /// Only an exact live connection incarnation can supply parked media.
+    fn track_is_current(&self, pooled: &PooledTrack) -> bool {
+        self.pool.get(&pooled.connection_key).is_some_and(|entry| {
+            entry.generation == pooled.generation && matches!(entry.state, ConnState::Up { .. })
+        })
+    }
+
+    /// Only agreeing observations owned by all current receivers can be replayed.
+    fn restored_encryption_state(&self, member_id: &str) -> Option<FrameEncryptionState> {
+        let tracks = self.tracks.lock().expect("track map mutex poisoned");
+        let mut state: Option<FrameEncryptionState> = None;
+        for ((track_member, _), pooled) in tracks.iter() {
+            if track_member != member_id {
+                continue;
+            }
+            if !self.track_is_current(pooled) {
+                return None;
+            }
+            let observed = pooled.encryption_state?;
+            if state.is_some_and(|state| state != observed) {
+                return None;
+            }
+            state = Some(observed);
+        }
+        state
+    }
+
+    /// Media buffered from `key` is gone with its connection.
+    fn drop_pending_from(&mut self, key: &str) {
+        self.pending_tracks.retain(|_, pending| {
+            pending.retain(|(_, pooled)| pooled.connection_key != key);
+            !pending.is_empty()
+        });
     }
 
     // ---- streams ------------------------------------------------------
@@ -781,13 +880,13 @@ impl MediaPool {
         &mut self,
         member_id: &str,
         kind: MediaStreamKind,
-        track: Arc<dyn RemoteTrackHandle>,
+        pooled: PooledTrack,
     ) {
         let replaced = self
             .tracks
             .lock()
             .expect("track map mutex poisoned")
-            .insert((member_id.to_owned(), kind), track)
+            .insert((member_id.to_owned(), kind), pooled)
             .is_some();
         if replaced {
             // Same stream re-announced (e.g. events replayed on attach); the
@@ -806,13 +905,23 @@ impl MediaPool {
         }
     }
 
-    fn remove_track(&mut self, member_id: &str, kind: MediaStreamKind) {
-        let removed = self
-            .tracks
-            .lock()
-            .expect("track map mutex poisoned")
-            .remove(&(member_id.to_owned(), kind))
-            .is_some();
+    /// Removes a member's stream, if it came over `connection_key`: a removal
+    /// the old connection reports after the member moved is not theirs.
+    fn remove_track(
+        &mut self,
+        member_id: &str,
+        kind: MediaStreamKind,
+        connection_key: &str,
+        generation: u64,
+    ) {
+        let removed = {
+            let mut tracks = self.tracks.lock().expect("track map mutex poisoned");
+            let key = (member_id.to_owned(), kind);
+            let ours = tracks.get(&key).is_some_and(|pooled| {
+                pooled.connection_key == connection_key && pooled.generation == generation
+            });
+            ours && tracks.remove(&key).is_some()
+        };
         if removed {
             self.out.push(PoolEvent::StreamRemoved {
                 member_id: member_id.to_owned(),
@@ -979,6 +1088,7 @@ impl MediaPool {
             return;
         }
         if entry.members.is_empty() && !entry.is_own {
+            self.drop_pending_from(key);
             self.pool.remove(key);
             self.clear_degraded(key);
             return;
@@ -994,6 +1104,7 @@ impl MediaPool {
             return;
         }
         log::debug!("closing idle connection {key}");
+        self.drop_pending_from(key);
         if let Some(entry) = self.pool.remove(key)
             && let ConnState::Up { connection, .. } = entry.state
         {
@@ -1028,6 +1139,7 @@ impl MediaPool {
             return;
         }
         if !still_needed {
+            self.drop_pending_from(key);
             self.pool.remove(key);
             self.clear_degraded(key);
             close_stray(result);
@@ -1036,6 +1148,7 @@ impl MediaPool {
 
         match result {
             Ok((connection, events)) => {
+                self.drop_pending_from(key);
                 self.connection_generation += 1;
                 let generation = self.connection_generation;
                 let entry = self.pool.get_mut(key).expect("entry checked above");
@@ -1083,8 +1196,11 @@ impl MediaPool {
             return;
         }
 
+        let is_own = entry.is_own;
+        let members = entry.members.clone();
         self.invalidate_connection_constraints(key);
-        if entry.is_own {
+        self.drop_pending_from(key);
+        if is_own {
             log::warn!("own-focus connection {key} is gone: {message}");
             self.pool.remove(key);
             self.out.push(PoolEvent::OwnConnectionLost {
@@ -1094,20 +1210,19 @@ impl MediaPool {
         }
 
         log::warn!("peer-focus connection {key} is gone ({message}); reconnecting");
-        let members = entry.members.clone();
         let mut lost: Vec<(String, MediaStreamKind)> = self
             .tracks
             .lock()
             .expect("track map mutex poisoned")
-            .keys()
-            .filter(|(member_id, _)| members.contains(member_id))
-            .cloned()
+            .iter()
+            .filter(|(_, pooled)| pooled.connection_key == key)
+            .map(|(stream, _)| stream.clone())
             .collect();
         // The map is a `HashMap`; the events derived from it must come out
         // in a stable order.
         lost.sort();
         for (member_id, kind) in lost {
-            self.remove_track(&member_id, kind);
+            self.remove_track(&member_id, kind, key, generation);
         }
         self.mark_degraded(key);
 
@@ -1160,7 +1275,12 @@ impl MediaPool {
             .collect()
     }
 
-    fn handle_connection_event(&mut self, connection_key: &str, event: ConnectionEvent) {
+    fn handle_connection_event(
+        &mut self,
+        connection_key: &str,
+        generation: u64,
+        event: ConnectionEvent,
+    ) {
         match event {
             ConnectionEvent::RemoteJoined { identity } => {
                 if !self.identity_map.contains_key(&identity) {
@@ -1181,24 +1301,38 @@ impl MediaPool {
                 identity,
                 kind,
                 track,
-            } => match self.identity_map.get(&identity).cloned() {
-                Some(member_id) => self.add_track(&member_id, kind, track),
-                None => {
-                    log::debug!(
-                        "buffering {kind:?} track of unknown identity {identity} on {connection_key}"
-                    );
-                    self.pending_tracks
-                        .entry(identity)
-                        .or_default()
-                        .push((kind, track));
+            } => {
+                let pooled = PooledTrack {
+                    connection_key: connection_key.to_owned(),
+                    generation,
+                    track,
+                    encryption_state: None,
+                };
+                match self.identity_map.get(&identity).cloned() {
+                    Some(member_id) => self.add_track(&member_id, kind, pooled),
+                    None => {
+                        log::debug!(
+                            "buffering {kind:?} track of unknown identity {identity} on {connection_key}"
+                        );
+                        self.pending_tracks
+                            .entry(identity)
+                            .or_default()
+                            .push((kind, pooled));
+                    }
                 }
-            },
+            }
             ConnectionEvent::TrackRemoved { identity, kind } => {
                 match self.identity_map.get(&identity).cloned() {
-                    Some(member_id) => self.remove_track(&member_id, kind),
+                    Some(member_id) => {
+                        self.remove_track(&member_id, kind, connection_key, generation);
+                    }
                     None => {
                         if let Some(pending) = self.pending_tracks.get_mut(&identity) {
-                            pending.retain(|(pending_kind, _)| *pending_kind != kind);
+                            pending.retain(|(pending_kind, pooled)| {
+                                *pending_kind != kind
+                                    || pooled.connection_key != connection_key
+                                    || pooled.generation != generation
+                            });
                         }
                     }
                 }
@@ -1220,6 +1354,28 @@ impl MediaPool {
                 self.out.push(PoolEvent::ActiveSpeakers { speakers });
             }
             ConnectionEvent::EncryptionStateChanged { identity, state } => {
+                // The event is participant-level, not proof of a particular
+                // cryptor. Bind it only to receivers already owned by this
+                // current connection incarnation, including parked receivers.
+                if let Some(member_id) = self.identity_map.get(&identity) {
+                    let mut tracks = self.tracks.lock().expect("track map mutex poisoned");
+                    for ((track_member, _), pooled) in tracks.iter_mut() {
+                        if track_member == member_id
+                            && pooled.connection_key == connection_key
+                            && pooled.generation == generation
+                        {
+                            pooled.encryption_state = Some(state);
+                        }
+                    }
+                }
+                if let Some(pending) = self.pending_tracks.get_mut(&identity) {
+                    for (_, pooled) in pending {
+                        if pooled.connection_key == connection_key && pooled.generation == generation
+                        {
+                            pooled.encryption_state = Some(state);
+                        }
+                    }
+                }
                 match self.identity_map.get(&identity).cloned() {
                     Some(member_id) => self
                         .out
