@@ -6,10 +6,15 @@
     "path": "native/webrtc/linux/selected-tool-manifest.json",
     "sha256": "6f4a0b14fe9d64d179d9e381305c961385dbfb53dff8a79ef211b35c71f8f341"
   },
-  "dispatcher_sha256": "f9cfa589dc267bdccb9c4422ec0445098895b90f42db025a42f2e7196157acd6",
+  "dispatcher_sha256": "e159709661e91161aa3038e43933e76225096821d206d74dbff7dd594da60a76",
   "minimum_free_bytes": 12884901888,
   "native_test_count": 12,
-  "recipe_sha256": "27097b3f4fa2be835c3b5cd984622be4c3fc551571104879077ebeb97a1c1bff",
+  "native_tools_profile": {
+    "bytes": 638,
+    "path": "native/webrtc/windows/native-tools.json",
+    "sha256": "60b1ce28f06a6fc9fd429101a805257199862e14d071f60086d6e8da0aaa0c79"
+  },
+  "recipe_sha256": "ad4494244279cee99e0d9635eb5ba0d320eb145ed04bdca6bf5d9f0af4c51016",
   "runtime_profile": {
     "bytes": 3612901,
     "path": "native/webrtc/windows/runtime-data.json",

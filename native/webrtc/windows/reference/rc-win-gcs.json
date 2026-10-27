@@ -1,0 +1,25 @@
+{
+  "kind": "storage#object",
+  "id": "chromium-browser-clang/rc/dea7da0d9bfcb8dad6cf53ca608dddac3459faaa/1729017425353926",
+  "selfLink": "https://www.googleapis.com/storage/v1/b/chromium-browser-clang/o/rc%2Fdea7da0d9bfcb8dad6cf53ca608dddac3459faaa",
+  "mediaLink": "https://storage.googleapis.com/download/storage/v1/b/chromium-browser-clang/o/rc%2Fdea7da0d9bfcb8dad6cf53ca608dddac3459faaa?generation=1729017425353926&alt=media",
+  "name": "rc/dea7da0d9bfcb8dad6cf53ca608dddac3459faaa",
+  "bucket": "chromium-browser-clang",
+  "generation": "1729017425353926",
+  "metageneration": "1",
+  "contentType": "application/x-msdownload",
+  "storageClass": "STANDARD",
+  "size": "603648",
+  "md5Hash": "7Rq56DZIHZ1bW0+QJJ8jPw==",
+  "contentLanguage": "en",
+  "cacheControl": "public, max-age=31536000",
+  "crc32c": "dgaDmw==",
+  "etag": "CMa5y+uDkYkDEAE=",
+  "timeCreated": "2024-10-15T18:37:05.401Z",
+  "updated": "2024-10-15T18:37:05.401Z",
+  "timeStorageClassUpdated": "2024-10-15T18:37:05.401Z",
+  "timeFinalized": "2024-10-15T18:37:05.401Z",
+  "metadata": {
+    "executable": "1"
+  }
+}

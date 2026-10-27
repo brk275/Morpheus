@@ -1,0 +1,21 @@
+{
+  "provenance": {
+    "bytes": 1086,
+    "path": "native/webrtc/windows/reference/rc-win-gcs.json",
+    "sha256": "8966e95e4ad80c5575bbb3385541770a961388ce11707331c0979d0a586fae0f"
+  },
+  "schema": "morpheus-windows-native-tools-data-v1",
+  "target": "win-x64",
+  "tool": {
+    "bytes": 603648,
+    "format": "raw",
+    "name": "rc_win",
+    "sha256": "903769d98df8a005c79d52d7089fe34f23c0b7ada4cd0c42b6063526a5593e6a",
+    "source": {
+      "generation": "1729017425353926",
+      "kind": "gcs",
+      "object": "rc/dea7da0d9bfcb8dad6cf53ca608dddac3459faaa"
+    },
+    "upstream_sha1": "dea7da0d9bfcb8dad6cf53ca608dddac3459faaa"
+  }
+}

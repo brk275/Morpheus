@@ -21,6 +21,219 @@ SPEC.loader.exec_module(TARGET)
 
 
 class WindowsNativeInputsTests(unittest.TestCase):
+    def test_core_manifest_failure_subcategories_are_closed_and_fatal(self):
+        # Actual bound_asset/load/core_stage/entry boundaries with synthetic
+        # DATA and mocked filesystem only; no Windows tool/network is invoked.
+        private = "private payload must not reach the core failure summary"
+        raw = b"{"
+        record = {"path": "native/webrtc/synthetic.json", "bytes": len(raw),
+                  "sha256": hashlib.sha256(raw).hexdigest()}
+        for case, expected in (("record", "core_asset_record"), ("path", "core_asset_path"),
+                ("identity", "core_asset_identity"), ("read", "core_asset_read"),
+                ("json", "core_asset_json")):
+            selected = {} if case == "record" else dict(record)
+            if case == "path":
+                selected["path"] = "native/webrtc/../private"
+            observed = {key: record[key] for key in ("bytes", "sha256")}
+            if case == "identity":
+                observed["bytes"] += 1
+            def fail_asset():
+                TARGET.bound_asset(Path("synthetic-workspace"), selected, core_trace=True)
+            output = io.StringIO()
+            with mock.patch.object(TARGET, "FAILURE_CATEGORY", "entry"), \
+                    mock.patch.object(TARGET, "path", side_effect=Path), \
+                    mock.patch.object(TARGET, "fact", return_value=observed), \
+                    mock.patch.object(TARGET, "read", return_value=raw,
+                                      side_effect=RuntimeError(private) if case == "read" else None), \
+                    mock.patch.object(TARGET, "main", side_effect=fail_asset), \
+                    mock.patch.object(TARGET.sys, "stderr", output):
+                with self.assertRaises(SystemExit) as failure:
+                    TARGET.entry()
+                self.assertEqual(failure.exception.code, 1)
+            self.assertEqual(output.getvalue(),
+                             "MORPHEUS_NATIVE_WINDOWS_PRODUCER failed category=" + expected + "\n")
+        value = {"baseline": TARGET.NATIVE, "tree": TARGET.TREE,
+                 "targets": {"Windowsx64": [{"name": name} for name in ("gn", "ninja", "clang")]}}
+        for case, expected in (("guard", "core_manifest_guard"), ("run", "core_run_identity")):
+            selected = dict(value, baseline="foreign") if case == "guard" else value
+            def fail_core():
+                TARGET.core_stage(object(), Path("synthetic-temp"), Path("synthetic-workspace"),
+                                  {"core_manifest": {"sha256": TARGET.CORE}}, mock.Mock())
+            output = io.StringIO()
+            with mock.patch.object(TARGET, "FAILURE_CATEGORY", "entry"), \
+                    mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(TARGET, "bound_asset", return_value=(Path("synthetic"), selected)), \
+                    mock.patch.object(TARGET, "main", side_effect=fail_core), \
+                    mock.patch.object(TARGET.sys, "stderr", output):
+                with self.assertRaises(SystemExit) as failure:
+                    TARGET.entry()
+                self.assertEqual(failure.exception.code, 1)
+            self.assertEqual(output.getvalue(),
+                             "MORPHEUS_NATIVE_WINDOWS_PRODUCER failed category=" + expected + "\n")
+
+    def test_windows_rc_original_gcs_binding_and_actual_bounded_data_download(self):
+        assets = PATH.parents[1] / "native/webrtc/windows"
+        plan = json.loads((assets / "pipeline-plan.json").read_bytes())
+        record = plan["native_tools_profile"]
+        raw = (PATH.parents[1] / record["path"]).read_bytes()
+        self.assertEqual({"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()},
+                         {key: record[key] for key in ("bytes", "sha256")})
+        profile = json.loads(raw)
+        self.assertEqual(profile["tool"], TARGET.WINDOWS_RC)
+        metadata_record = profile["provenance"]
+        metadata_raw = (PATH.parents[1] / metadata_record["path"]).read_bytes()
+        self.assertEqual({"bytes": len(metadata_raw), "sha256": hashlib.sha256(metadata_raw).hexdigest()},
+                         {key: metadata_record[key] for key in ("bytes", "sha256")})
+        metadata = json.loads(metadata_raw)
+        self.assertEqual(metadata["name"], "rc/" + TARGET.WINDOWS_RC["upstream_sha1"])
+        self.assertEqual(metadata["generation"], TARGET.WINDOWS_RC["source"]["generation"])
+        self.assertEqual(metadata["size"], str(TARGET.WINDOWS_RC["bytes"]))
+        self.assertIn("src/build/toolchain/win/rc/win/rc.exe.sha1",
+                      (assets / "reference/root-DEPS").read_text())
+        self.assertIsNone(plan["build_inputs"])
+        self.assertIs(plan["cache_handoff_authorized"], False)
+        helper_path = PATH.parent / "native_webrtc/python_stager.py"
+        self.assertEqual(hashlib.sha256(helper_path.read_bytes()).hexdigest(),
+                         TARGET.HELPERS["python_stager.py"])
+        spec = importlib.util.spec_from_file_location("windows_rc_actual_stager", helper_path)
+        stager = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stager)
+        # The real fixed downloader and SHA1 check run on synthetic bytes. No
+        # native executable, network, import hook or source checkout is run.
+        payload = b"synthetic bounded rc DATA"
+        tool = copy.deepcopy(TARGET.WINDOWS_RC)
+        tool.update(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+                    upstream_sha1=hashlib.sha1(payload).hexdigest())
+        fake_metadata = dict(metadata, size=str(len(payload)))
+        for variant in ("valid", "corrupt", "surplus", "truncated", "length", "generation", "sha1", "foreign_profile"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                owner = mock.Mock(root=root)
+                def create(destination):
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    return destination.open("xb")
+                owner.create.side_effect = create
+                chosen = copy.deepcopy(tool)
+                if variant == "sha1":
+                    chosen["upstream_sha1"] = "0" * 40
+                selected = dict(profile, tool=copy.deepcopy(chosen))
+                if variant == "foreign_profile":
+                    selected["tool"]["source"]["object"] = "foreign/object"
+                connection, response = mock.Mock(), mock.Mock()
+                content = {"corrupt": b"x" * len(payload), "surplus": payload + b"x",
+                           "truncated": payload[:-1]}.get(variant, payload)
+                response.read.side_effect = io.BytesIO(content).read
+                headers = {"Content-Length": str(len(payload) + (1 if variant == "length" else 0)),
+                           "x-goog-generation": "1" if variant == "generation" else chosen["source"]["generation"]}
+                response.getheader.side_effect = headers.get
+                with mock.patch.object(TARGET, "WINDOWS_RC", chosen), \
+                        mock.patch.object(TARGET, "bound_asset", side_effect=[(None, selected), (None, fake_metadata)]), \
+                        mock.patch.object(TARGET, "path", side_effect=Path), \
+                        mock.patch.object(stager, "https", return_value=(connection, response)) as transport:
+                    if variant == "valid":
+                        result = TARGET.windows_native_tools_stage(stager, Path("synthetic-workspace"), plan, owner)
+                        self.assertEqual(result, root / "native-tools")
+                        self.assertEqual((result / "rc_win/rc.exe").read_bytes(), payload)
+                    else:
+                        with self.assertRaises((TARGET.Refused, stager.Refusal)):
+                            TARGET.windows_native_tools_stage(stager, Path("synthetic-workspace"), plan, owner)
+                if variant == "foreign_profile":
+                    transport.assert_not_called()
+                    self.assertEqual(list(root.iterdir()), [])
+                else:
+                    transport.assert_called_once_with("https://storage.googleapis.com/chromium-browser-clang/"
+                        + chosen["source"]["object"] + "?generation=" + chosen["source"]["generation"])
+                    connection.close.assert_called_once_with()
+                    self.assertTrue(all(0 < call.args[0] <= 1024 * 1024
+                                        for call in response.read.call_args_list))
+
+    def test_windows_rc_projection_keeps_original_pointer_and_all_collision_guards(self):
+        owner = mock.Mock(root=Path("private"))
+        source = Path("private/source")
+        tools = Path("private/native-tools")
+        manifest = {"targets": {"Windowsx64": []}}
+        for variant in ("valid", "pointer", "existing_case_alias", "gitlink", "source_alias"):
+            with self.subTest(variant=variant):
+                normalizer = mock.Mock()
+                normalizer.verify_source_aliases.return_value = ([{"mount": "src", "path": TARGET.WINDOWS_RC_PATH,
+                    "target_path": "original/target"}] if variant == "source_alias" else [])
+                originals = [{"path": TARGET.WINDOWS_RC_PATH.upper()}] if variant == "existing_case_alias" else []
+                markers = [{"exported_path": "src/build/toolchain/win/rc"}] if variant == "gitlink" else []
+                emitted, receipts = [], []
+                def emit(owner, destination, value):
+                    if destination.name == "windows-source-overlay.json":
+                        emitted.extend(value)
+                    else:
+                        self.assertEqual(destination, source / "materials/windows-native-tools.json")
+                        receipts.append(value)
+                pointer = b"foreign" if variant == "pointer" else TARGET.WINDOWS_RC["upstream_sha1"].encode()
+                with mock.patch.object(TARGET, "tree_files", return_value=originals), \
+                        mock.patch.object(TARGET, "load_unbound", return_value=markers), \
+                        mock.patch.object(TARGET, "fixed_module", return_value=normalizer), \
+                        mock.patch.object(TARGET, "read", return_value=pointer) as read, \
+                        mock.patch.object(TARGET, "register_parent"), mock.patch.object(TARGET, "copy_file") as copied, \
+                        mock.patch.object(TARGET, "write_json", side_effect=emit):
+                    if variant == "valid":
+                        TARGET.project(owner, source, Path("core"), manifest, None, None, tools)
+                        copied.assert_called_once_with(owner, tools / "rc_win/rc.exe",
+                            source / "checkout/src" / TARGET.WINDOWS_RC_PATH,
+                            {key: TARGET.WINDOWS_RC[key] for key in ("bytes", "sha256")})
+                        self.assertEqual(emitted, [{"path": TARGET.WINDOWS_RC_PATH, "type": "file", "mode": "100755",
+                            **{key: TARGET.WINDOWS_RC[key] for key in ("bytes", "sha256")}}])
+                        self.assertEqual(receipts, [TARGET.WINDOWS_RC_RECEIPT])
+                    else:
+                        with self.assertRaises(TARGET.Refused):
+                            TARGET.project(owner, source, Path("core"), manifest, None, None, tools)
+                        copied.assert_not_called()
+                        self.assertEqual(emitted, [])
+                        self.assertEqual(receipts, [])
+                read.assert_called_once_with(source / "checkout/src" / (TARGET.WINDOWS_RC_PATH + ".sha1"), 128)
+
+    def test_windows_rc_builder_binds_actual_supplemental_receipt_and_overlay(self):
+        builder_path = PATH.with_name("build_native_webrtc_windows.py")
+        self.assertEqual(hashlib.sha256(builder_path.read_bytes()).hexdigest(), TARGET.RECIPE)
+        spec = importlib.util.spec_from_file_location("windows_rc_actual_builder", builder_path)
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+        self.assertEqual(builder.SCHEMA, "morpheus-native-webrtc-windows-inputs-v5")
+        self.assertEqual(builder.WINDOWS_RC_RECEIPT, TARGET.WINDOWS_RC_RECEIPT)
+        value = copy.deepcopy(TARGET.WINDOWS_RC_RECEIPT)
+        pointer, projection = value["source_pointer"], value["projection"]
+        native = {pointer["path"]: {key: pointer[key] for key in ("bytes", "sha256")}}
+        overlay = [projection]
+        self.assertEqual(builder.native_tools_material(value, native, overlay), value)
+        for variant in ("object", "generation", "profile", "metadata", "extra", "pointer", "absent",
+                        "duplicate", "case", "mode", "bytes", "hash", "execution", "license", "numeric_false"):
+            changed, originals, rows = copy.deepcopy(value), copy.deepcopy(native), copy.deepcopy(overlay)
+            if variant == "object":
+                changed["tool"]["source"]["object"] = "foreign/object"
+            elif variant == "generation":
+                changed["tool"]["source"]["generation"] = "1"
+            elif variant in ("profile", "metadata"):
+                changed[variant + "_sha256"] = "0" * 64
+            elif variant == "extra":
+                changed["unreviewed"] = True
+            elif variant == "pointer":
+                originals[pointer["path"]]["sha256"] = "0" * 64
+            elif variant == "absent":
+                rows = []
+            elif variant == "duplicate":
+                rows.append(copy.deepcopy(projection))
+            elif variant == "case":
+                rows[0]["path"] = projection["path"].upper()
+            elif variant in ("mode", "bytes", "hash"):
+                key, replacement = {"mode": ("mode", "100644"), "bytes": ("bytes", 1),
+                                    "hash": ("sha256", "0" * 64)}[variant]
+                rows[0][key] = replacement
+            elif variant == "execution":
+                changed["executed_downloaded_tools"] = ["rc_win"]
+            elif variant == "numeric_false":
+                changed["license_compliance_verified"] = 0
+            else:
+                changed["license_compliance_verified"] = True
+            with self.subTest(variant=variant), self.assertRaises(builder.RecipeError):
+                builder.native_tools_material(changed, originals, rows)
+
     def test_producer_failure_categories_are_closed_and_keep_original_failure_fatal(self):
         # Actual core_stage exception propagation and CLI catch boundary. No
         # source/host/network/tool execution is admitted by these fake inputs.

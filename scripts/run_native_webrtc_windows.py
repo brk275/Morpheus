@@ -36,7 +36,7 @@ HELPERS = {
     "python_stager.py": "4de9a016a988535b7576f2e0d7561afa290529dae7b1eb267bb8382956d49d02",
     "git_source_stager.py": "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211",
 }
-RECIPE = "27097b3f4fa2be835c3b5cd984622be4c3fc551571104879077ebeb97a1c1bff"
+RECIPE = "ad4494244279cee99e0d9635eb5ba0d320eb145ed04bdca6bf5d9f0af4c51016"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 MAX_JSON = 128 * 1024 * 1024
 MAX_FILE = 64 * 1024 ** 3
@@ -54,8 +54,10 @@ FAILURE_CATEGORIES = frozenset((
     "entry", "arguments", "runner_environment", "run_identity", "repository_request",
     "repository_response", "repository_identity", "runner_paths", "plan_read",
     "plan_binding", "free_space", "stager_source", "control_owner", "core_manifest",
-    "core_control", "core_invoke", "source_data", "runtime_data", "projection",
+    "core_control", "core_invoke", "source_data", "runtime_data", "native_tool_data", "projection",
     "stage_receipt", "build_admission", "build", *CORE_FAILURE_CATEGORIES.values(),
+    "core_asset_record", "core_asset_path", "core_asset_identity", "core_asset_read",
+    "core_asset_json", "core_manifest_guard", "core_run_identity",
 ))
 
 
@@ -152,6 +154,46 @@ class Refused(Exception):
     pass
 
 
+# Original selected build/DEPS rc_win hook. This single GCS object is DATA
+# until a separate native-build admission; host SDK rc.exe is not its replacement.
+WINDOWS_RC = {
+    "name": "rc_win", "format": "raw", "bytes": 603648,
+    "sha256": "903769d98df8a005c79d52d7089fe34f23c0b7ada4cd0c42b6063526a5593e6a",
+    "upstream_sha1": "dea7da0d9bfcb8dad6cf53ca608dddac3459faaa",
+    "source": {"kind": "gcs", "object": "rc/dea7da0d9bfcb8dad6cf53ca608dddac3459faaa",
+               "generation": "1729017425353926"},
+}
+WINDOWS_RC_PATH = "build/toolchain/win/rc/win/rc.exe"
+WINDOWS_RC_METADATA_SHA = "8966e95e4ad80c5575bbb3385541770a961388ce11707331c0979d0a586fae0f"
+
+
+WINDOWS_RC_RECEIPT = {'schema': 'morpheus-windows-native-tools-projection-v1',
+ 'target': 'win-x64',
+ 'profile_sha256': '60b1ce28f06a6fc9fd429101a805257199862e14d071f60086d6e8da0aaa0c79',
+ 'metadata_sha256': '8966e95e4ad80c5575bbb3385541770a961388ce11707331c0979d0a586fae0f',
+ 'tool': {'bytes': 603648,
+          'format': 'raw',
+          'name': 'rc_win',
+          'sha256': '903769d98df8a005c79d52d7089fe34f23c0b7ada4cd0c42b6063526a5593e6a',
+          'source': {'generation': '1729017425353926',
+                     'kind': 'gcs',
+                     'object': 'rc/dea7da0d9bfcb8dad6cf53ca608dddac3459faaa'},
+          'upstream_sha1': 'dea7da0d9bfcb8dad6cf53ca608dddac3459faaa'},
+ 'source_pointer': {'path': 'build/toolchain/win/rc/win/rc.exe.sha1',
+                    'bytes': 40,
+                    'sha256': 'ad6cd3835f44229227d120a4d13d070a1af4c3cd2461105d63951e179364100c'},
+ 'projection': {'path': 'build/toolchain/win/rc/win/rc.exe',
+                'type': 'file',
+                'mode': '100755',
+                'bytes': 603648,
+                'sha256': '903769d98df8a005c79d52d7089fe34f23c0b7ada4cd0c42b6063526a5593e6a'},
+ 'executed_downloaded_tools': [],
+ 'build_ready': False,
+ 'distribution_ready': False,
+ 'preferred_source_verified': False,
+ 'license_compliance_verified': False}
+
+
 def need(value):
     if not value:
         raise Refused()
@@ -214,10 +256,17 @@ def read(p, limit=MAX_JSON):
     return raw
 
 
-def load(p, expected, limit=MAX_JSON):
+def load(p, expected, limit=MAX_JSON, *, core_trace=False):
+    global FAILURE_CATEGORY
     need(type(expected) is str and HEX.fullmatch(expected))
+    if core_trace:
+        FAILURE_CATEGORY = "core_asset_read"
     raw = read(p, limit)
+    if core_trace:
+        FAILURE_CATEGORY = "core_asset_identity"
     need(hashlib.sha256(raw).hexdigest() == expected)
+    if core_trace:
+        FAILURE_CATEGORY = "core_asset_json"
     return json.loads(raw, object_pairs_hook=unique)
 
 
@@ -314,14 +363,21 @@ def tree_files(root):
     return sorted(files, key=lambda row: row["path"])
 
 
-def bound_asset(workspace, record):
+def bound_asset(workspace, record, *, core_trace=False):
+    global FAILURE_CATEGORY
+    if core_trace:
+        FAILURE_CATEGORY = "core_asset_record"
     need(type(record) is dict and set(record) == {"path", "bytes", "sha256"})
+    if core_trace:
+        FAILURE_CATEGORY = "core_asset_path"
     name = relative(record["path"])
     need(name.startswith("native/webrtc/") and type(record["bytes"]) is int and 0 < record["bytes"] <= MAX_JSON
          and type(record["sha256"]) is str and HEX.fullmatch(record["sha256"]))
     p = path(str(workspace / name))
+    if core_trace:
+        FAILURE_CATEGORY = "core_asset_identity"
     need(fact(p, MAX_JSON) == {k: record[k] for k in ("bytes", "sha256")})
-    return p, load(p, record["sha256"])
+    return p, load(p, record["sha256"], core_trace=core_trace)
 
 
 def write_json(stage, p, value):
@@ -349,9 +405,11 @@ def copy_file(stage, source, destination, expected):
 def core_stage(stager, temp, workspace, plan, control):
     global FAILURE_CATEGORY
     FAILURE_CATEGORY = "core_manifest"
-    core, value = bound_asset(workspace, plan["core_manifest"])
+    core, value = bound_asset(workspace, plan["core_manifest"], core_trace=True)
+    FAILURE_CATEGORY = "core_manifest_guard"
     need(plan["core_manifest"]["sha256"] == CORE and value["baseline"] == NATIVE and value["tree"] == TREE
          and set(row["name"] for row in value["targets"]["Windowsx64"]) == {"gn", "ninja", "clang"})
+    FAILURE_CATEGORY = "core_run_identity"
     key = hashlib.sha256((os.environ["GITHUB_RUN_ID"] + ":" + os.environ["GITHUB_RUN_ATTEMPT"] + ":windows-core").encode()).hexdigest()[:16]
     output = temp / ("morpheus-webrtc-tools-" + key)
     admission = {"schema": 1, "purpose": "stage_verified_tool_data_only", "manifest_sha256": CORE,
@@ -468,7 +526,7 @@ def register_parent(owner, parent):
         owner.check(here)
 
 
-def project(owner, source, core, core_manifest, runtime, runtime_profile):
+def project(owner, source, core, core_manifest, runtime, runtime_profile, native_tools=None):
     # Exact additive source overlay only. No original file, gitlink scope or
     # other tool material can be silently overwritten or coalesced.
     src = source / "checkout/src"
@@ -516,10 +574,21 @@ def project(owner, source, core, core_manifest, runtime, runtime_profile):
                 if row["kind"] == "regular":
                     add(runtime / "runtime" / item["role"] / row["path"],
                         item["source_mount"] + "/" + row["path"], {k: row[k] for k in ("bytes", "sha256")}, row["output_mode"])
+    if native_tools is not None:
+        # The original DEPS pointer must agree with the exact supplemental DATA.
+        # The shared add() path keeps all alias/gitlink/case/no-overwrite checks.
+        need(read(src / (WINDOWS_RC_PATH + ".sha1"), 128)
+             == WINDOWS_RC["upstream_sha1"].encode("ascii"))
+        add(native_tools / "rc_win/rc.exe", WINDOWS_RC_PATH,
+            {k: WINDOWS_RC[k] for k in ("bytes", "sha256")}, 0o700)
     overlay = source / "materials/windows-source-overlay.json"
     register_parent(owner, overlay.parent)
     write_json(owner, overlay, sorted(out, key=lambda row: row["path"]))
     normalizer.verify_source_aliases(source)
+    if native_tools is not None:
+        # Actual checks/copy above precede this DATA receipt. It conveys no
+        # preferred-source, licensing or native execution approval.
+        write_json(owner, source / "materials/windows-native-tools.json", WINDOWS_RC_RECEIPT)
     return overlay
 
 
@@ -755,6 +824,45 @@ def windows_cipd_download(stager, stage, tool, archive):
         connection.close()
 
 
+def windows_native_tools_stage(stager, workspace, plan, control):
+    # No generic executable manifest or source/host substitution. Every field
+    # of this one original object is fixed in reviewed source, not caller chosen.
+    need(plan["native_tools_profile"]["sha256"] == WINDOWS_RC_RECEIPT["profile_sha256"])
+    _, profile = bound_asset(workspace, plan["native_tools_profile"])
+    need(type(profile) is dict and set(profile) == {"schema", "target", "tool", "provenance"}
+         and profile["schema"] == "morpheus-windows-native-tools-data-v1"
+         and profile["target"] == "win-x64" and profile["tool"] == WINDOWS_RC
+         and profile["provenance"]["sha256"] == WINDOWS_RC_METADATA_SHA)
+    _, metadata = bound_asset(workspace, profile["provenance"])
+    need(metadata["bucket"] == "chromium-browser-clang"
+         and metadata["name"] == WINDOWS_RC["source"]["object"]
+         and metadata["generation"] == WINDOWS_RC["source"]["generation"]
+         and metadata["size"] == str(WINDOWS_RC["bytes"]))
+    root = control.root / "native-tools"
+    destination = root / "rc_win/rc.exe"
+    # Original shared HTTPS transport enforces identity encoding, no redirects,
+    # no ambient credentials, fixed GCS generation/length/SHA256 and a deadline.
+    stager.download(control, WINDOWS_RC, destination)
+    need(fact(destination, WINDOWS_RC["bytes"])
+         == {k: WINDOWS_RC[k] for k in ("bytes", "sha256")})
+    original, actual, count = hashlib.sha1(), hashlib.sha256(), 0
+    with destination.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        while block := stream.read(65536):
+            count += len(block)
+            need(count <= WINDOWS_RC["bytes"])
+            original.update(block)
+            actual.update(block)
+        after = os.fstat(stream.fileno())
+    named = destination.lstat()
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                             info.st_ctime_ns, info.st_nlink)
+    need(identity(before) == identity(after) == identity(named)
+         and count == WINDOWS_RC["bytes"] and original.hexdigest() == WINDOWS_RC["upstream_sha1"]
+         and actual.hexdigest() == WINDOWS_RC["sha256"])
+    return root
+
+
 def runtime_stage(stager, workspace, plan, control):
     _, profile = bound_asset(workspace, plan["runtime_profile"])
     need(type(profile) is dict and set(profile) == {"schema", "target", "materials"}
@@ -842,9 +950,11 @@ def stage(args, temp, workspace, plan):
         source = source_stage(stager, temp, workspace, plan, owner) if plan["source_profile"] is not None else None
         FAILURE_CATEGORY = "runtime_data"
         runtime, runtime_profile = runtime_stage(stager, workspace, plan, owner) if plan["runtime_profile"] else (None, None)
+        FAILURE_CATEGORY = "native_tool_data"
+        native_tools = windows_native_tools_stage(stager, workspace, plan, owner)
         _, core_manifest = bound_asset(workspace, plan["core_manifest"])
         FAILURE_CATEGORY = "projection"
-        overlay = project(owner, source, core, core_manifest, runtime, runtime_profile) if source is not None else None
+        overlay = project(owner, source, core, core_manifest, runtime, runtime_profile, native_tools) if source is not None else None
         FAILURE_CATEGORY = "stage_receipt"
         receipt = {"schema": "morpheus-windows-source-stage-receipt-v1", "target": "win-x64",
             "pipeline_plan_sha256": args.plan_sha256, "core_manifest_sha256": CORE,
@@ -853,6 +963,8 @@ def stage(args, temp, workspace, plan):
             "source_files": tree_files(source) if source is not None else None,
             "source_profile_sha256": plan["source_profile"]["sha256"] if plan["source_profile"] else None,
             "windows_runtime_profile_bound": plan["runtime_profile"] is not None,
+            "native_tools_profile_sha256": plan["native_tools_profile"]["sha256"],
+            "native_tool_files": tree_files(native_tools),
             "runtime_files": tree_files(runtime / "runtime") if runtime is not None else None,
             "source_overlay": {"path": str(overlay), **fact(overlay)} if overlay is not None else None,
             "compiler_cipd_runtime_closure": False, "host_sdk_redistributed": False,
@@ -877,7 +989,7 @@ def build(args, temp, workspace, plan, owner, core, source, runtime):
     # complete Windows admission (12 independent gates) is a required source asset.
     need(runtime is not None)
     template_file, template = bound_asset(workspace, plan["build_inputs"])
-    need(template["schema"] == "morpheus-native-webrtc-windows-inputs-v4")
+    need(template["schema"] == "morpheus-native-webrtc-windows-inputs-v5")
     replacements = {"$RUNNER_TEMP/": temp, "$GITHUB_WORKSPACE/": workspace,
         "$WINDOWS_SOURCE/": source, "$WINDOWS_CORE/": core, "$WINDOWS_RUNTIME/": runtime}
     def relocate(value):
@@ -930,7 +1042,7 @@ def main():
     plan = load(path(args.plan), args.plan_sha256)
     FAILURE_CATEGORY = "plan_binding"
     need(set(plan) == {"schema", "target", "dispatcher_sha256", "recipe_sha256", "core_manifest",
-        "source_profile", "runtime_profile", "build_inputs", "security_plan_sha256", "native_test_count",
+        "source_profile", "runtime_profile", "native_tools_profile", "build_inputs", "security_plan_sha256", "native_test_count",
         "minimum_free_bytes", "cache_handoff_authorized"}
         and plan["schema"] == "morpheus-native-windows-pipeline-v1" and plan["target"] == "win-x64"
         and plan["dispatcher_sha256"] == hashlib.sha256(read(Path(__file__).resolve(), 256 * 1024)).hexdigest()
