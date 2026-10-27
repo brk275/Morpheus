@@ -581,6 +581,9 @@ fn commit_window_opacity(ui: &AppWindow, store: &ConfigStore, percent: u8) {
 /// Project the workspace for an accepted configuration. Called from every
 /// configuration application, including reloads of external edits.
 pub(super) fn project(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
+    // A newly applied appearance supersedes an unsaved opacity preview. Its
+    // delayed callback must not write the older preview over a live reload.
+    OPACITY_COMMIT.with(slint::Timer::stop);
     SESSION.with(|session| {
         let mut session = session.borrow_mut();
         session.source = Some((config.clone(), theme.cloned()));
@@ -595,6 +598,9 @@ pub(super) fn project(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>
             .retain(|id, step| same_color(scoped_color(config, &scope, id), step.after.as_ref()));
     });
     reproject(ui, false);
+    // Previewing changes each control locally, not the saved percentage.
+    // Resynchronize even when a reload accepts that same saved percentage.
+    ui.set_window_opacity_revision(ui.get_window_opacity_revision().wrapping_add(1));
 }
 
 /// Re-project after the active account or the open room changed. Scoped

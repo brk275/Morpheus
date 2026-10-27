@@ -3268,6 +3268,36 @@ async fn assert_appearance_workspace_and_search(
     settle(ui).await;
     assert_eq!(store.load().unwrap().window.opacity_percent, 50);
 
+    // An accepted external reload supersedes a still-armed accessibility
+    // preview. Exercise both a changed saved percentage and the same one:
+    // the latter must also refill the controls' locally previewed values.
+    for reloaded in [75, 74] {
+        slider.set_accessible_value("30");
+        settle(ui).await;
+        assert!((tokens.get_window_opacity() - 0.3).abs() < 0.001);
+        let mut external = store.load().unwrap();
+        external.window.opacity_percent = reloaded;
+        store.save(&external).unwrap();
+        let accepted = std::fs::read(store.path()).unwrap();
+        apply_loaded_config(
+            ui,
+            &LoadedConfig {
+                config: external,
+                theme: None,
+            },
+        );
+        settle(ui).await;
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+        settle(ui).await;
+        assert_eq!(std::fs::read(store.path()).unwrap(), accepted);
+        assert_eq!(ui.get_window_opacity_percent(), i32::from(reloaded));
+        assert!((tokens.get_window_opacity() - f32::from(reloaded) / 100.0).abs() < 0.001);
+        // A key edit must start from the reloaded control value, not 30.
+        key(ui, Key::LeftArrow);
+        settle(ui).await;
+        assert_eq!(store.load().unwrap().window.opacity_percent, reloaded - 1);
+    }
+
     // Home and End commit on key release, as the arrows do.
     assert!(crate::settings_search::reveal(
         ui,
