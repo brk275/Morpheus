@@ -509,6 +509,79 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(event_selection({}, "workflow_dispatch")["check_route"], "all")
         self.assertTrue(event_selection({}, "workflow_dispatch")["wayland"])
 
+
+    @patch("scripts.ci_scope.changed_paths")
+    @patch("scripts.ci_scope.subprocess.run")
+    def test_exact_reviewed_control_layout_selects_helpers_and_all_other_inputs_fail_closed(self, run, changed):
+        control = {"scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
+                   ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py"}
+        self.assertEqual(ci_scope.AUTOMATIC_CONTROL_INPUTS, control)
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml").read_bytes()
+        # Bind the production admission independently. Exercise real hash/size
+        # comparisons with owned fixture bytes under test-only pins, so a
+        # future different workflow can safely fall back all without requiring
+        # its execution layout to be admitted by this exemption.
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 64005)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
+                         "9d557eeb730a8785aaf2d3eb9fbd5224ab202fdc2f2f384a60c73a87b61c9aa0")
+        import hashlib
+        with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
+                patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):
+            for event_name, event in (("push", {"after": "a" * 40}),
+                                      ("pull_request", {"pull_request": {"head": {"sha": "b" * 40}}})):
+                for paths in [[path] for path in sorted(control)] + [sorted(control)]:
+                    changed.return_value = (paths, False)
+                    run.side_effect = [SimpleNamespace(stdout=str(len(workflow)).encode() + b"\n"),
+                                       SimpleNamespace(stdout=workflow)]
+                    selected = event_selection({**event, "inputs": {"checks": "all", "platform": "windows"}}, event_name)
+                    self.assertEqual(selected, {"native": False, "native_matrix": {"os": []}, "config": False,
+                                               "wayland": False, "manual": False, "manual_platform": "all",
+                                               "check_route": "helpers", "matrix_suite": "full"})
+                    expected = event["after"] if event_name == "push" else event["pull_request"]["head"]["sha"]
+                    self.assertEqual(run.call_args.args[0][-2:], ["blob", expected + ":.github/workflows/ci.yml"])
+                    self.assertNotIn("shell", run.call_args.kwargs)
+                    self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
+                    self.assertEqual(run.call_args.kwargs["timeout"], 10)
+            event = {"after": "a" * 40}
+            for paths in ([], list(control) + ["README.md"], list(control) + ["Cargo.lock"],
+                          list(control) + ["scripts/scan_history.py"], list(control) + [".gitleaksignore"],
+                          list(control) + ["crates/morpheus-app/src/theme_studio/mod.rs"],
+                          list(control) + ["native/webrtc/linux/pipeline-plan.json"],
+                          list(control) + ["crates/morpheus-rtc/src/media.rs"],
+                          list(control) + [".github/workflows/new.yml"], ["./scripts/ci_scope.py"]):
+                run.reset_mock(); self.assertFalse(ci_scope.reviewed_control_only(paths, event, "push")); run.assert_not_called()
+            for bad in (None, "", "A" * 40, "a" * 39, "--help", "a" * 40 + ":other", [], {}):
+                run.reset_mock(); self.assertFalse(ci_scope.reviewed_control_only(list(control), {"after": bad}, "push")); run.assert_not_called()
+            for event_name, malformed in (("push", {}), ("pull_request", {}), ("pull_request", {"pull_request": []}),
+                                          ("pull_request", {"pull_request": {"head": None}}), ("workflow_dispatch", event)):
+                run.reset_mock(); self.assertFalse(ci_scope.reviewed_control_only(list(control), malformed, event_name)); run.assert_not_called()
+            run.reset_mock(); self.assertFalse(ci_scope.reviewed_control_only(list(control), event, "push", True)); run.assert_not_called()
+            changed.return_value = (sorted(control), True)
+            self.assertEqual(event_selection(event, "push")["check_route"], "all")
+            run.assert_not_called()
+            for size in (b"", b"999999999999\n", b"-1\n", str(len(workflow) + 1).encode() + b"\n", "not-bytes"):
+                run.reset_mock(); run.side_effect = [SimpleNamespace(stdout=size)]
+                self.assertFalse(ci_scope.reviewed_control_only(list(control), event, "push"))
+                self.assertEqual(run.call_count, 1)
+            for content in (workflow + b"#", workflow[:-1], b"x" * len(workflow), "not-bytes"):
+                run.reset_mock(); run.side_effect = [SimpleNamespace(stdout=str(len(workflow)).encode() + b"\n"), SimpleNamespace(stdout=content)]
+                self.assertFalse(ci_scope.reviewed_control_only(list(control), event, "push"))
+            for error in (OSError("opaque"), subprocess.CalledProcessError(1, "git"), subprocess.TimeoutExpired("git", 10)):
+                run.reset_mock(); run.side_effect = error
+                self.assertFalse(ci_scope.reviewed_control_only(list(control), event, "push"))
+            # Missing candidate identity never activates the exception; existing
+            # manual/release all and normal appearance/producer rules stay intact.
+            run.reset_mock(); run.side_effect = None; changed.return_value = (sorted(control), False)
+            self.assertEqual(event_selection({}, "push")["check_route"], "all"); run.assert_not_called()
+            self.assertEqual(event_selection({}, "workflow_dispatch")["check_route"], "all")
+
+        # Outside every test-only pin override, a same-size unrelated blob
+        # must fail the independently reviewed production SHA admission.
+        run.reset_mock()
+        run.side_effect = [SimpleNamespace(stdout=b"64005\n"),
+                           SimpleNamespace(stdout=b"x" * 64005)]
+        self.assertFalse(ci_scope.reviewed_control_only(sorted(control), {"after": "a" * 40}, "push"))
+
     def test_initial_push_selects_all(self):
         self.assertEqual(changed_paths({"before": "0" * 40, "after": "a" * 40}, "push"), ([], True))
 

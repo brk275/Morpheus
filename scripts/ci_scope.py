@@ -2,6 +2,7 @@
 """Select development checks by impact; unknown inputs require every platform."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -226,11 +227,57 @@ def automatic_route(paths, force_all=False):
     return "desktop" if changed & AUTOMATIC_DESKTOP_INPUTS else "helpers"
 
 
+# An exact reviewed execution layout, not a blanket workflow exception. The
+# four control inputs are exercised by helpers. Any other workflow bytes or
+# mixed native/security/dependency input retain the existing full route.
+AUTOMATIC_CONTROL_INPUTS = frozenset((
+    "scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
+    ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py",
+))
+REVIEWED_CONTROL_WORKFLOW_SHA256 = "9d557eeb730a8785aaf2d3eb9fbd5224ab202fdc2f2f384a60c73a87b61c9aa0"
+REVIEWED_CONTROL_WORKFLOW_BYTES = 64005
+
+
+def reviewed_control_only(paths, event, event_name, force_all=False):
+    if (force_all or not paths or any(type(path) is not str for path in paths)
+            or not set(paths) <= AUTOMATIC_CONTROL_INPUTS or type(event) is not dict):
+        return False
+    if event_name == "push":
+        after = event.get("after")
+    elif event_name == "pull_request":
+        pull = event.get("pull_request")
+        head = pull.get("head") if type(pull) is dict else None
+        after = head.get("sha") if type(head) is dict else None
+    else:
+        return False
+    if type(after) is not str or re.fullmatch(r"[0-9a-f]{40}", after) is None:
+        return False
+    # Only fixed-path immutable Git DATA, never candidate Python or shell.
+    # Size is checked before the full read; both operations name the same
+    # immutable object and the independent SHA256 verifies the complete bytes.
+    command = ["git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+               "-c", "core.fsmonitor=false", "cat-file"]
+    spec = after + ":.github/workflows/ci.yml"
+    try:
+        size = subprocess.run(command + ["-s", spec], check=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=10).stdout
+        if type(size) is not bytes or size != str(REVIEWED_CONTROL_WORKFLOW_BYTES).encode() + b"\n":
+            return False
+        content = subprocess.run(command + ["blob", spec], check=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, timeout=10).stdout
+        return (type(content) is bytes and len(content) == REVIEWED_CONTROL_WORKFLOW_BYTES
+                and hashlib.sha256(content).hexdigest() == REVIEWED_CONTROL_WORKFLOW_SHA256)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def event_selection(event, event_name):
     if event_name != "workflow_dispatch":
         paths, force_all = changed_paths(event, event_name)
         selected = classify(paths, force_all)
         route = automatic_route(paths, force_all)
+        if route == "all" and reviewed_control_only(paths, event, event_name, force_all):
+            route = "helpers"
         if route == "desktop":
             selected = {"native": True, "native_matrix": {"os": list(PLATFORMS)},
                         "config": False, "wayland": False}
