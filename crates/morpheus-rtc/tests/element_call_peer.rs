@@ -401,6 +401,64 @@ fn exact_roster(rtc: &RtcService, room: &str, users: &[&str]) -> bool {
     actual == expected
 }
 
+// A private metadata-only identity for the original, already-decrypted Bob
+// membership. This contains no session key or ciphertext and is never logged.
+#[derive(PartialEq, Eq)]
+struct MembershipKeyContext {
+    event_id: matrix_sdk::ruma::OwnedEventId,
+    session_id: String,
+    sender_curve: String,
+}
+
+fn membership_key_context(client: &Client, room: &str, bob: &str) -> Option<MembershipKeyContext> {
+    use matrix_sdk::deserialized_responses::AlgorithmInfo;
+    let joined = client.get_room(&matrix_sdk::ruma::RoomId::parse(room).ok()?)?;
+    if joined.state() != matrix_sdk::RoomState::Joined {
+        return None;
+    }
+    let live = joined.sticky_events().live();
+    if live.len() > 64 {
+        return None;
+    }
+    let mut candidates = live.iter().filter(|entry| {
+        entry.key.sender.as_str() == bob
+            && matches!(
+                entry.key.event_type.to_string().as_str(),
+                "m.rtc.member" | "org.matrix.msc4143.rtc.member"
+            )
+            && entry
+                .encryption_info()
+                .is_some_and(|info| info.sender.as_str() == bob)
+    });
+    let entry = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    let info = entry.encryption_info()?;
+    let AlgorithmInfo::MegolmV1AesSha2 {
+        curve25519_key,
+        session_id: Some(session_id),
+        ..
+    } = &info.algorithm_info
+    else {
+        return None;
+    };
+    if [session_id, curve25519_key].iter().any(|value| {
+        value.is_empty()
+            || value.len() > 128
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte))
+    }) {
+        return None;
+    }
+    Some(MembershipKeyContext {
+        event_id: entry.event_id.clone(),
+        session_id: session_id.clone(),
+        sender_curve: curve25519_key.clone(),
+    })
+}
+
 async fn group_and_screen(
     rtc: &mut RtcService,
     root: &std::path::Path,
@@ -411,6 +469,7 @@ async fn group_and_screen(
     original_microphone: &NativeTone,
 ) {
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE microphone_cryptor");
+    let original_membership = membership_key_context(rtc.client(), room, &bob.user_id);
     let (microphone_sid, _) =
         native_sender(rtc, room, livekit::track::TrackSource::Microphone, None)
             .expect("Actual original microphone sender cryptor missing");
@@ -437,7 +496,22 @@ async fn group_and_screen(
         .await
         .expect("Late-peer login failed");
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE late_sync");
+    let mut room_keys = None;
+    let mut observed_device = None;
     timeout(Duration::from_secs(90), async {
+        // Subscribe as soon as the real client is available, within the
+        // original sync deadline. Login may already have received keys, so
+        // an unmatched stream is UNKNOWN, never evidence of no delivery.
+        if let Ok(observer) = manager.active_client().await {
+            if observer.user_id().map(|user| user.as_str()) == Some(carol.user_id.as_str()) {
+                observed_device = observer.device_id().map(ToOwned::to_owned);
+                room_keys = observer
+                    .encryption()
+                    .room_keys_received_stream()
+                    .await
+                    .map(Box::pin);
+            }
+        }
         let status = manager.subscribe_sync_status();
         loop {
             let running = matches!(
@@ -465,6 +539,12 @@ async fn group_and_screen(
         .active_client()
         .await
         .expect("Late-peer client missing");
+    if observed_device.is_none()
+        || observed_device.as_deref() != client.device_id()
+        || client.user_id().map(|user| user.as_str()) != Some(carol.user_id.as_str())
+    {
+        room_keys = None;
+    }
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE late_bootstrap");
     bootstrap_identity(&client, carol).await;
     let mut late = RtcService::new(client);
@@ -473,15 +553,79 @@ async fn group_and_screen(
         .await
         .expect("Late-peer join failed");
     eprintln!("MORPHEUS_ELEMENT_NATIVE_STAGE group_roster");
-    timeout(Duration::from_secs(90), async {
-        while !exact_roster(rtc, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
-            || !exact_roster(&late, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
-        {
-            sleep(Duration::from_millis(200)).await;
+    let mut imported = false;
+    let result = {
+        let group_roster = timeout(Duration::from_secs(90), async {
+            while !exact_roster(rtc, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
+                || !exact_roster(&late, room, &[&alice.user_id, &bob.user_id, &carol.user_id])
+            {
+                sleep(Duration::from_millis(200)).await;
+            }
+        });
+        tokio::pin!(group_roster);
+        let mut updates = 0;
+        loop {
+            let Some(stream) = room_keys.as_mut().filter(|_| updates < 128) else {
+                break group_roster.as_mut().await;
+            };
+            let batch = tokio::select! {
+                biased;
+                result = &mut group_roster => break result,
+                batch = stream.next() => batch,
+            };
+            updates += 1;
+            match batch {
+                Some(Ok(keys)) if keys.len() <= 256 => {
+                    if let Some(original) = original_membership.as_ref() {
+                        imported |= keys.iter().any(|key| {
+                            key.algorithm
+                                == matrix_sdk::crypto::types::EventEncryptionAlgorithm::MegolmV1AesSha2
+                                && key.room_id.as_str() == room
+                                && key.session_id == original.session_id
+                                && key.sender_key.to_base64() == original.sender_curve
+                        });
+                    }
+                }
+                // Lag, stream end, or a resource limit leaves missing observations
+                // UNKNOWN. A previously matched positive receipt remains valid.
+                _ => room_keys = None,
+            }
         }
-    })
-    .await
-    .expect("Three-member native rosters did not converge");
+    };
+    drop(room_keys);
+    if result.is_err() {
+        let current = membership_key_context(rtc.client(), room, &bob.user_id);
+        let same = original_membership
+            .as_ref()
+            .is_some_and(|original| current.as_ref() == Some(original));
+        let continuity = if same {
+            "same_identity"
+        } else if original_membership.is_some() && current.is_some() {
+            "changed"
+        } else {
+            "unknown"
+        };
+        let received = if same && imported {
+            "observed"
+        } else {
+            "unknown"
+        };
+        let decrypted = if same
+            && membership_key_context(late.client(), room, &bob.user_id).as_ref()
+                == original_membership.as_ref()
+        {
+            "decrypted"
+        } else {
+            "unknown"
+        };
+        // Fixed failure-only context, not a call pass or direct-sender proof.
+        // Store notifications include backup/forward/import; no durable-store,
+        // exact message-index coverage or pre-subscription absence is implied.
+        eprintln!(
+            "MORPHEUS_ELEMENT_NATIVE_KEY_CONTEXT import={received} original={decrypted} continuity={continuity}"
+        );
+    }
+    result.expect("Three-member native rosters did not converge");
     eprintln!("MORPHEUS_ELEMENT_CHECK native_group_roster=true");
 
     // A newly created device must actually decrypt the already-running sender,
