@@ -347,6 +347,111 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())["category"], "unknown")
 
 
+    def test_handoff_writer_retains_first_capacity_short_write_and_os_failure(self):
+        class Short(io.BytesIO):
+            def write(self, data): return 0
+        class Full(io.BytesIO):
+            def write(self, data): raise OSError(_PIPELINE.errno.ENOSPC, "opaque-fixture")
+        cases = ((io.BytesIO(), 0, "compressed_capacity", _PIPELINE.Refused),
+                 (Short(), 8, "compressed_short_write", _PIPELINE.Refused),
+                 (Full(), 8, "os_space", OSError))
+        try:
+            for sink, cap, failure, expected in cases:
+                with self.subTest(failure=failure):
+                    _PIPELINE.reset_pack_capture(True)
+                    _PIPELINE.pack_at("file_add")
+                    writer = _PIPELINE.BoundedWriter(sink, cap)
+                    with self.assertRaises(expected): writer.write(b"x")
+                    first = _PIPELINE.pack_frame()
+                    self.assertEqual(first, {"pack_operation": "file_add", "pack_failure": failure})
+                    _PIPELINE.pack_at("gzip_finish")
+                    _PIPELINE.pack_failed(RuntimeError("opaque-fixture"))
+                    self.assertEqual(_PIPELINE.pack_frame(), first)
+            _PIPELINE.reset_pack_capture()
+            with self.assertRaises(_PIPELINE.Refused):
+                _PIPELINE.BoundedWriter(io.BytesIO(), 0).write(b"x")
+            self.assertEqual(_PIPELINE.pack_frame(), {})
+        finally:
+            _PIPELINE.reset_pack_capture()
+
+    @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA pack")
+    def test_actual_gnu_gzip_pack_reports_payload_footer_and_first_body_failure(self):
+        def attempt(payload, cap, fail_fact=False):
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                source = root / "fixture-source"; source.mkdir(mode=0o700)
+                path = source / "fixture.data"; path.write_bytes(payload); path.chmod(0o600)
+                row = {"path": "fixture.data", "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(), "mode": 0o600}
+                inventories = {source.name: {"role": "fixture", "files": [row], "directories": ["."]}}
+                fact = _MATERIAL.file_fact
+                with mock.patch.object(_PIPELINE, "MAX_HANDOFF", cap), \
+                        mock.patch.object(_MATERIAL, "file_fact", side_effect=_PIPELINE.Refused("opaque-fixture") if fail_fact else fact) as verify:
+                    with self.assertRaises(_PIPELINE.Refused):
+                        _PIPELINE.pack_handoff(root, {"schema": "synthetic", "roots": inventories}, inventories, _MATERIAL)
+                self.assertIs(_PIPELINE.PACK_ACTIVE, False)
+                self.assertTrue(verify.called)
+                self.assertLessEqual((root / "native-webrtc-handoff/handoff.tar.gz").stat().st_size, cap)
+                return _PIPELINE.pack_frame()
+        try:
+            payload = b"".join(hashlib.sha256(str(i).encode()).digest() for i in range(2048))
+            self.assertEqual(attempt(payload, 4096), {"pack_operation": "file_add", "pack_failure": "compressed_capacity"})
+            self.assertEqual(attempt(b"body", 10), {"pack_operation": "gzip_finish", "pack_failure": "compressed_capacity"})
+            # The same real gzip footer also fails at cap10 after this earlier
+            # file_fact refusal. Its cleanup must not replace the first record.
+            self.assertEqual(attempt(b"body", 10, True), {"pack_operation": "file_fact", "pack_failure": "refused"})
+        finally:
+            _PIPELINE.reset_pack_capture()
+
+    @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA pack")
+    def test_actual_pack_success_and_fatal_framing_remain_closed_and_reset(self):
+        try:
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                source = root / "fixture-source"; source.mkdir(mode=0o700)
+                payload = b"owned synthetic DATA"
+                path = source / "fixture.data"; path.write_bytes(payload); path.chmod(0o600)
+                row = {"path": "fixture.data", "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest(), "mode": 0o600}
+                inventories = {source.name: {"role": "fixture", "files": [row], "directories": ["."]}}
+                handoff = {"schema": "synthetic", "roots": inventories}
+                output = _PIPELINE.pack_handoff(root, handoff, inventories, _MATERIAL)
+                self.assertEqual(_PIPELINE.pack_frame(), {})
+                self.assertIs(_PIPELINE.PACK_ACTIVE, False)
+                with tarfile.open(output, "r:gz") as archive:
+                    self.assertEqual([m.name for m in archive], ["HANDOFF.json", "fixture-source", "fixture-source/fixture.data"])
+                    self.assertEqual(json.loads(archive.extractfile("HANDOFF.json").read()), handoff)
+                    self.assertEqual(archive.extractfile("fixture-source/fixture.data").read(), payload)
+            states = ((["file_fact", "refused"], {}), (("opaque-fixture", "refused"), {}),
+                      (("file_fact", "opaque-fixture"), {}), (({"opaque-fixture": 1}, "refused"), {}),
+                      (("file_fact", "os_space"), {"pack_operation": "file_fact", "pack_failure": "os_space"}))
+            for state, extra in states:
+                def fail():
+                    _PIPELINE.POST_ASSEMBLY_PHASE = "handoff_pack"
+                    _PIPELINE.PACK_FAILURE = state
+                    raise RuntimeError("opaque-fixture")
+                output = io.StringIO()
+                with mock.patch.object(_PIPELINE, "main", side_effect=fail), mock.patch.object(_PIPELINE.sys, "stderr", output):
+                    with self.assertRaises(SystemExit) as caught: _PIPELINE.entry()
+                self.assertEqual(caught.exception.code, 1)
+                self.assertLess(len(output.getvalue()), 256)
+                self.assertTrue("opaque-fixture" not in output.getvalue(), "closed pack frame disclosed synthetic input")
+                self.assertEqual(json.loads(output.getvalue()), {"native_linux_producer": "failed",
+                    "build_or_release_acceptance": False, "category": "handoff_pack", **extra})
+            # Entry resets old pack state before any non-pack or new failure.
+            for phase in ("final_inventory", None):
+                def fail_other():
+                    if phase is not None: _PIPELINE.POST_ASSEMBLY_PHASE = phase
+                    raise RuntimeError("opaque-fixture")
+                output = io.StringIO()
+                with mock.patch.object(_PIPELINE, "main", side_effect=fail_other), mock.patch.object(_PIPELINE.sys, "stderr", output):
+                    with self.assertRaises(SystemExit): _PIPELINE.entry()
+                value = json.loads(output.getvalue())
+                self.assertEqual(value["category"], phase or "unknown")
+                self.assertNotIn("pack_operation", value)
+                self.assertNotIn("pack_failure", value)
+        finally:
+            _PIPELINE.reset_pack_capture()
+
+
 class NativeCacheDataBoundaryTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only producer gate")
     def test_runner_requires_owner_original_and_triggering_actor_before_api(self):
