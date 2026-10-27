@@ -1201,10 +1201,67 @@ Initialize-HostReader
 try {
     $ownedMemory = $script:HostInfoMemory
     $ownedScratch = $script:HostInfoScratch
-    if ($ownedMemory -eq [IntPtr]::Zero -or $ownedScratch.Length -ne 52) { throw 'identity' }
+    $ownedMemo = $script:HostCanonicalPaths
+    if ($ownedMemory -eq [IntPtr]::Zero -or $ownedScratch.Length -ne 52 -or
+        $script:HostCanonicalEntryLimit -ne 8192 -or $script:HostCanonicalUnitLimit -ne 1048576) { throw 'identity' }
+    # Count actual lexical validations, not a mock result. Exact repeats alone
+    # may hit; case-distinct inputs and every refused input reach the old body.
+    $script:OriginalCanonicalValidator = ${function:Get-CanonicalHostPath}
+    $script:CanonicalValidationCount = 0
+    $originalEntryLimit = $script:HostCanonicalEntryLimit
+    $originalUnitLimit = $script:HostCanonicalUnitLimit
+    Set-Item -Path Function:Get-CanonicalHostPath -Value {
+        param([string] $Value)
+        $script:CanonicalValidationCount++
+        & $script:OriginalCanonicalValidator $Value
+    }
+    try {
+        $first = Join-Path $root 'MemoCase'
+        $differentCase = Join-Path $root 'memocase'
+        $beforeCount = $ownedMemo.Count
+        if ((Get-HostCanonicalPath $first) -cne $first -or
+            (Get-HostCanonicalPath $first) -cne $first -or $script:CanonicalValidationCount -ne 1 -or
+            $ownedMemo.Count -ne $beforeCount + 1) { throw 'identity' }
+        if ((Get-HostCanonicalPath $differentCase) -cne $differentCase -or
+            $script:CanonicalValidationCount -ne 2 -or $ownedMemo.Count -ne $beforeCount + 2) { throw 'identity' }
+        $beforeCount = $ownedMemo.Count
+        foreach ($attempt in 1..2) {
+            $refusal = ''
+            try { Get-HostCanonicalPath 'C:\x:stream' | Out-Null } catch { $refusal = $_.Exception.Message }
+            if ($refusal -cne 'path_colon') { throw 'identity' }
+        }
+        if ($script:CanonicalValidationCount -ne 4 -or $ownedMemo.Count -ne $beforeCount) { throw 'identity' }
+        # A full cache revalidates without refusing an otherwise valid path.
+        # Only these synthetic limits change; production count/units stay fixed.
+        $ownedMemo.Clear(); $script:HostCanonicalUnits = 0
+        $script:HostCanonicalEntryLimit = 2
+        $third = Join-Path $root 'third'
+        $null = Get-HostCanonicalPath $first
+        $null = Get-HostCanonicalPath $differentCase
+        $beforeValidation = $script:CanonicalValidationCount
+        if ((Get-HostCanonicalPath $third) -cne $third -or
+            (Get-HostCanonicalPath $third) -cne $third -or $ownedMemo.Count -ne 2 -or
+            $script:CanonicalValidationCount -ne $beforeValidation + 2 -or $ownedMemo.ContainsKey($third)) { throw 'identity' }
+        $ownedMemo.Clear(); $script:HostCanonicalUnits = 0
+        $script:HostCanonicalEntryLimit = $originalEntryLimit
+        $script:HostCanonicalUnitLimit = 2 * $first.Length
+        $beforeValidation = $script:CanonicalValidationCount
+        $null = Get-HostCanonicalPath $first
+        $null = Get-HostCanonicalPath $first
+        if ($ownedMemo.Count -ne 1 -or $script:HostCanonicalUnits -ne 2 * $first.Length -or
+            $script:CanonicalValidationCount -ne $beforeValidation + 1) { throw 'identity' }
+        if ((Get-HostCanonicalPath $third) -cne $third -or $ownedMemo.Count -ne 1 -or
+            $script:CanonicalValidationCount -ne $beforeValidation + 2) { throw 'identity' }
+    } finally {
+        Set-Item -Path Function:Get-CanonicalHostPath -Value $script:OriginalCanonicalValidator
+        $script:HostCanonicalEntryLimit = $originalEntryLimit
+        $script:HostCanonicalUnitLimit = $originalUnitLimit
+        $ownedMemo.Clear(); $script:HostCanonicalUnits = 0
+    }
     # A second owner cannot replace the original scratch or retained handles.
     Must-Refuse { Initialize-HostReader }
-    if ($script:HostInfoMemory -ne $ownedMemory) { throw 'identity' }
+    if ($script:HostInfoMemory -ne $ownedMemory -or
+        -not [object]::ReferenceEquals($ownedMemo, $script:HostCanonicalPaths)) { throw 'identity' }
     $caseStage = 'inventory'
     $result = Get-HostRootInventory $good
     if ($result.files.Count -ne 2 -or $script:HostBytes -ne 5) { throw 'inventory' }
@@ -1223,11 +1280,36 @@ try {
     $savedIdentity = $observed.identity
     $null = Get-HostHandleInfo $script:HostFileRecords[1].handle
     if ($observed.identity -cne $savedIdentity) { throw 'identity' }
+    # Cached lexical paths never cache native identity or file-open results.
+    # Both calls must reach the real original delegate; the second open must
+    # retain another independently checked handle for the same cached path.
+    $originalInfo = $script:HostInfo
+    $infoProbe = [pscustomobject]@{ Delegate = $originalInfo; Calls = 0 }
+    $infoProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
+        param([IntPtr] $Handle, [IntPtr] $Memory)
+        $this.Calls++
+        return $this.Delegate.Invoke($Handle, $Memory)
+    }
+    try {
+        $script:HostInfo = $infoProbe
+        if (-not $ownedMemo.ContainsKey($good)) { throw 'identity' }
+        $null = Open-HostDirectoryChain $good
+        $firstChecks = $infoProbe.Calls
+        $null = Open-HostDirectoryChain $good
+        if ($firstChecks -le 0 -or $infoProbe.Calls -le $firstChecks) { throw 'identity' }
+        $toolPath = Join-Path $good 'tool.bin'
+        if (-not $ownedMemo.ContainsKey($toolPath)) { throw 'identity' }
+        $beforeHandles = $script:HostHandles.Count; $beforeChecks = $infoProbe.Calls
+        $opened = Open-HostReadHandle $toolPath $false
+        if ($script:HostHandles.Count -ne $beforeHandles + 1 -or $infoProbe.Calls -le $beforeChecks -or
+            $opened.path -cne $toolPath -or $opened.initial.bytes -ne 4) { throw 'identity' }
+    } finally { $script:HostInfo = $originalInfo }
     $script:HostInfoBusy = $true
     try {
         Must-Refuse { Get-HostHandleInfo $script:HostFileRecords[0].handle }
         Must-Refuse { Close-HostReader }
-        if ($script:HostInfoMemory -ne $ownedMemory) { throw 'identity' }
+        if ($script:HostInfoMemory -ne $ownedMemory -or
+            -not [object]::ReferenceEquals($ownedMemo, $script:HostCanonicalPaths)) { throw 'identity' }
     }
     finally { $script:HostInfoBusy = $false }
     # Actual retained READ-sharing owner denies a new writer, not a mock lock.
@@ -1235,19 +1317,32 @@ try {
     Must-Refuse { [IO.File]::WriteAllBytes((Join-Path $good 'tool.bin'), [byte[]]@(9)) }
 } finally { Close-HostReader }
 if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
-    $script:HostInfoBusy) { throw 'identity' }
-# Cleanup remains idempotent; no freed metadata pointer can be reused.
+    $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
+    $ownedMemo.Count -ne 0) { throw 'identity' }
+# Cleanup remains idempotent; no freed metadata pointer or lexical owner is reused.
 Close-HostReader
 Must-Refuse { Get-HostHandleInfo ([IntPtr]::Zero) }
+if ((Get-HostCanonicalPath $good) -cne $good -or $null -ne $script:HostCanonicalPaths) { throw 'identity' }
+Must-Refuse { Get-HostCanonicalPath 'relative' }
+Initialize-HostReader
+try {
+    if ([object]::ReferenceEquals($ownedMemo, $script:HostCanonicalPaths) -or
+        $script:HostCanonicalPaths.ContainsKey($good)) { throw 'identity' }
+    $null = Get-HostCanonicalPath $good
+    if (-not $script:HostCanonicalPaths.ContainsKey($good)) { throw 'identity' }
+} finally { Close-HostReader }
 # A pre-native initialization refusal still leaves idempotent cleanup state.
 $originalSystemRoot = $env:SystemRoot
 try {
     $env:SystemRoot = 'relative'
     Must-Refuse { Initialize-HostReader }
+    $failedMemo = $script:HostCanonicalPaths
     Close-HostReader
     Close-HostReader
     if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
-        $script:HostInfoBusy -or $script:HostHandles.Count -ne 0) { throw 'identity' }
+        $script:HostInfoBusy -or $script:HostHandles.Count -ne 0 -or
+        $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
+        $failedMemo.Count -ne 0) { throw 'identity' }
 } finally { $env:SystemRoot = $originalSystemRoot }
 foreach ($boundary in @('bytes', 'entries', 'deadline', 'metadata')) {
     $caseStage = 'limit_' + $boundary
@@ -1321,7 +1416,8 @@ $closeProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
 try {
     $null = Get-HostRootInventory $budgetRoot
     $ownedHandleCount = $script:HostHandles.Count
-    if ($ownedHandleCount -lt 2) { throw 'identity' }
+    $exceptionMemo = $script:HostCanonicalPaths
+    if ($ownedHandleCount -lt 2 -or $exceptionMemo.Count -eq 0) { throw 'identity' }
     $expectedConsumed = $script:HostHandles[$ownedHandleCount - 1]
     $script:HostClose = $closeProbe
     Must-Refuse { Close-HostReader }
@@ -1329,7 +1425,8 @@ try {
         $closeProbe.Consumed -ne $expectedConsumed -or
         $script:HostHandles[$ownedHandleCount - 1] -ne [IntPtr]::Zero -or
         $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
-        $script:HostInfoBusy) { throw 'identity' }
+        $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
+        $exceptionMemo.Count -ne 0) { throw 'identity' }
     # Remaining retained handles are still owned, and second cleanup attempts
     # each exactly once while skipping the already consumed zeroed slot.
     Close-HostReader

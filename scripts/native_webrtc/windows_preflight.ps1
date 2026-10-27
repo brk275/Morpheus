@@ -28,6 +28,13 @@ function Initialize-HostReader {
     $script:HostInfoScratch = $null
     $script:HostInfoBusy = $false
     $script:HostHandles = [Collections.Generic.List[IntPtr]]::new()
+    $script:HostCanonicalPaths = $null
+    $script:HostCanonicalUnits = 0
+    # Only immutable lexical results are memoized. Count and UTF-16 code-unit
+    # limits bound this reader-owned cache separately from receipt limits.
+    $script:HostCanonicalEntryLimit = 8192
+    $script:HostCanonicalUnitLimit = 1048576
+    $script:HostCanonicalPaths = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
     # These are fixed source limits, never manifest-selected overrides.
     $script:HostLimits = @{ Entries = 200000; Handles = 200256; FileBytes = 2147483648;
         TotalBytes = 68719476736; Depth = 64; JsonBytes = 33554432; MetadataBytes = 31457280; Seconds = 180 }
@@ -36,7 +43,7 @@ function Initialize-HostReader {
     $script:HostBuffer = [byte[]]::new(1048576)
     $script:HostFileRecords = [Collections.Generic.List[object]]::new()
     $script:HostDirectories = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
-    $system = Get-CanonicalHostPath $env:SystemRoot
+    $system = Get-HostCanonicalPath $env:SystemRoot
     if ($system -cnotmatch '^[A-Za-z]:\\Windows$') { throw 'host' }
     $script:HostKernel = [Runtime.InteropServices.NativeLibrary]::Load([IO.Path]::Combine($system, 'System32', 'kernel32.dll'))
     $script:HostOpen = New-HostReadDelegate 'CreateFileW' ([IntPtr]) ([Type[]]@([IntPtr], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr]))
@@ -88,6 +95,26 @@ function Get-CanonicalHostPath([string] $Value) {
     return $full
 }
 
+# Internal reader callers initialize the owner first. The original lexical
+# helper above remains available before initialization. After Close, a null
+# owner falls back to full validation without retaining any result.
+function Get-HostCanonicalPath([string] $Value) {
+    $memo = $script:HostCanonicalPaths
+    [string] $full = ''
+    if ($null -ne $memo -and -not [string]::IsNullOrEmpty($Value) -and
+        $memo.TryGetValue($Value, [ref]$full)) { return $full }
+    $full = Get-CanonicalHostPath $Value
+    if ($null -ne $memo) {
+        $units = $Value.Length + $full.Length
+        if ($memo.Count -lt $script:HostCanonicalEntryLimit -and
+            $units -le $script:HostCanonicalUnitLimit - $script:HostCanonicalUnits) {
+            $memo.Add($Value, $full)
+            $script:HostCanonicalUnits += $units
+        }
+    }
+    return $full
+}
+
 function Get-HostHandleInfo([IntPtr] $Handle) {
     # These synchronous calls have no callbacks. Never overlap use or return a
     # view of shared scratch: the result below contains only copied values.
@@ -109,7 +136,7 @@ function Get-HostHandleInfo([IntPtr] $Handle) {
 
 function Open-HostReadHandle([string] $LiteralPath, [bool] $Directory) {
     Assert-HostBudget
-    $full = Get-CanonicalHostPath $LiteralPath
+    $full = Get-HostCanonicalPath $LiteralPath
     $wide = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('\\?\' + $full)
     try {
         # OPEN_REPARSE_POINT always; BACKUP_SEMANTICS only enables directory
@@ -133,7 +160,7 @@ function Assert-HostIdentity($Record, [bool] $Content) {
 }
 
 function Open-HostDirectoryChain([string] $LiteralPath) {
-    $full = Get-CanonicalHostPath $LiteralPath
+    $full = Get-HostCanonicalPath $LiteralPath
     $current = $full.Substring(0, 3)
     $parts = @('') + @($full.Substring(3).Split('\') | Where-Object { $_ -ne '' })
     foreach ($part in $parts) {
@@ -147,7 +174,7 @@ function Open-HostDirectoryChain([string] $LiteralPath) {
 }
 
 function Get-HostFileFact([string] $LiteralPath, [int] $TextLimit = 0, [uint64] $RemainingBytes = [uint64]::MaxValue) {
-    $full = Get-CanonicalHostPath $LiteralPath
+    $full = Get-HostCanonicalPath $LiteralPath
     $null = Open-HostDirectoryChain ([IO.Path]::GetDirectoryName($full))
     $record = Open-HostReadHandle $full $false
     $script:HostFileRecords.Add($record)
@@ -186,7 +213,7 @@ function Get-HostDirectoryNames([string] $Directory) {
     foreach ($path in [IO.Directory]::EnumerateFileSystemEntries($Directory)) {
         Assert-HostBudget
         $name = [IO.Path]::GetFileName($path)
-        $null = Get-CanonicalHostPath ([IO.Path]::Combine($Directory, $name))
+        $null = Get-HostCanonicalPath ([IO.Path]::Combine($Directory, $name))
         if (-not $folded.Add($name)) { throw 'alias' }
         $names.Add($name)
         if ($names.Count -gt $script:HostLimits.Entries) { throw 'entries' }
@@ -196,7 +223,7 @@ function Get-HostDirectoryNames([string] $Directory) {
 }
 
 function Get-HostRootInventory([string] $LiteralRoot) {
-    $root = Get-CanonicalHostPath $LiteralRoot
+    $root = Get-HostCanonicalPath $LiteralRoot
     $null = Open-HostDirectoryChain $root
     $pending = [Collections.Generic.Stack[object]]::new(); $pending.Push(@{ path = $root; depth = 0 })
     $snapshots = [Collections.Generic.List[object]]::new(); $files = [Collections.Generic.List[object]]::new()
@@ -251,12 +278,21 @@ function Close-HostReader {
             $script:HostHandles.Clear()
         }
     } finally {
-        # Owned scratch is freed even when closing a native file handle fails.
-        $memory = $script:HostInfoMemory
-        $script:HostInfoMemory = [IntPtr]::Zero
-        $script:HostInfoScratch = $null
-        $script:HostInfoBusy = $false
-        if ($memory -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
+        try {
+            # Owned scratch is freed even when closing a native file handle fails.
+            $memory = $script:HostInfoMemory
+            $script:HostInfoMemory = [IntPtr]::Zero
+            $script:HostInfoScratch = $null
+            $script:HostInfoBusy = $false
+            if ($memory -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($memory) }
+        } finally {
+            # Retire lexical ownership even if native cleanup throws. No result
+            # survives Close or is shared with the next initialized reader.
+            $memo = $script:HostCanonicalPaths
+            $script:HostCanonicalPaths = $null
+            $script:HostCanonicalUnits = 0
+            if ($null -ne $memo) { $memo.Clear() }
+        }
     }
     if (-not $good) { throw 'handle_cleanup' }
 }
@@ -299,7 +335,7 @@ function Get-HostToolchainInventory {
         $candidates = @('Enterprise', 'Professional', 'Community', 'Preview', 'BuildTools') |
             ForEach-Object { [IO.Path]::Combine($vsBase, $_) } | Where-Object { [IO.Directory]::Exists($_) }
         if (@($candidates).Count -ne 1) { throw 'visual_studio_selection' }
-        $vs = Get-CanonicalHostPath (@($candidates)[0])
+        $vs = Get-HostCanonicalPath (@($candidates)[0])
         $sdk = $drive + '\Program Files (x86)\Windows Kits\10'
         $versionFile = [IO.Path]::Combine($vs, 'VC', 'Auxiliary', 'Build', 'Microsoft.VCToolsVersion.default.txt')
         $versionFact = Get-HostFileFact $versionFile 256
