@@ -61,6 +61,9 @@ fn probe_undecryptable(
     undecryptable: bool,
 ) -> MediaConstraints {
     let video = matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare);
+    if constraints.low_bandwidth {
+        return constraints;
+    }
     if !undecryptable || !video || !constraints.enabled || constraints.visible {
         return constraints;
     }
@@ -3680,11 +3683,12 @@ mod tests {
                 ..hidden
             };
             assert_eq!(probe_undecryptable(kind, released, true), released);
-            let limited = MediaConstraints {
+            let limited_request = MediaConstraints {
                 low_bandwidth: true,
                 ..hidden
             };
-            let limited = probe_undecryptable(kind, limited, true);
+            let limited = probe_undecryptable(kind, limited_request, true);
+            assert_eq!(limited, limited_request);
             assert!(limited.low_bandwidth);
             assert_eq!(
                 limited.resolve(kind).demand,
