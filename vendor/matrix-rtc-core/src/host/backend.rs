@@ -218,6 +218,12 @@ pub trait RoomSink: MaybeSend {
     fn on_encryption(&self, encrypted: bool);
     fn on_timeline_events(&self, events: Vec<EventIn>);
     fn on_redaction(&self, event_id: String);
+
+    /// Newly discovered or changed devices from the host's authenticated device
+    /// list, as `(user_id, device_id)`. This is only a bounded hint to refresh
+    /// our own active encrypted membership; it grants no key-sharing authority.
+    /// Hosts without a device-update stream keep the default no-op.
+    fn on_device_updates(&self, _devices: Vec<(String, String)>) {}
 }
 
 /// Where a host delivers to-device messages of the subscribed types.

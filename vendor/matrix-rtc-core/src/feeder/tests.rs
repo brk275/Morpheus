@@ -453,3 +453,78 @@ async fn a_stalled_seeding_names_the_deliveries_it_waits_on() {
         ["on_joined_members (including our own user)"]
     );
 }
+
+#[test]
+fn device_hints_coalesce_one_marker_and_fixed_public_identifiers() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let devices = Arc::new(StdMutex::new(DeviceUpdateBuffer::default()));
+    let sink = ChannelRoomSink {
+        tx,
+        devices: devices.clone(),
+    };
+    sink.on_device_updates(vec![
+        (String::new(), "DEVICE".into()),
+        (BOB.into(), "bad\n".into()),
+        (BOB.into(), "x".repeat(DEVICE_UPDATE_ID_BYTES + 1)),
+    ]);
+    assert!(rx.try_recv().is_err());
+    for index in 0..(DEVICE_UPDATE_BATCH * 2) {
+        sink.on_device_updates(vec![(BOB.into(), format!("DEVICE{index}"))]);
+    }
+    assert!(matches!(rx.try_recv(), Ok(RoomInput::Devices)));
+    assert!(rx.try_recv().is_err());
+    let batch = devices.lock().unwrap().take();
+    assert_eq!(batch.len(), DEVICE_UPDATE_BATCH);
+    assert!(batch.iter().all(|(user, device)| user == BOB && !device.is_empty()));
+    assert!(devices.lock().unwrap().devices.is_empty());
+    sink.on_device_updates(vec![(BOB.into(), "LATER".into())]);
+    sink.on_device_updates(vec![(BOB.into(), "LATER".into())]);
+    assert!(matches!(rx.try_recv(), Ok(RoomInput::Devices)));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(devices.lock().unwrap().take(), vec![(BOB.into(), "LATER".into())]);
+}
+
+#[tokio::test]
+async fn device_hint_reaches_active_own_session_without_fabricating_peer_membership() {
+    let harness = Harness::attach().await;
+    let sink = harness.sink();
+    let mut encrypted_slot = open_slot();
+    encrypted_slot.content["encryption"] = json!({ "type": "m.per_member" });
+    sink.on_encryption(true);
+    sink.on_state_events(SLOT_EVENT_TYPE.to_owned(), vec![encrypted_slot]);
+    sink.on_joined_members(vec![ME.to_owned(), BOB.to_owned()]);
+    sink.on_sticky_events(Vec::new());
+    harness.attachment.seeded().await;
+    harness
+        .manager
+        .lock()
+        .await
+        .join(
+            crate::JoinSessionParams::application("m.call")
+                .member_id("own-generation")
+                .transport(crate::TransportIntent::ReceiveOnly {
+                    can_subscribe: vec!["livekit".into()],
+                }),
+        )
+        .await
+        .unwrap();
+    sink.on_device_updates(vec![(BOB.into(), "NEWDEVICE".into())]);
+    harness
+        .wait_until(|| async {
+            harness.manager.lock().await.keep_alive(SLOT).await;
+            harness.mock.sticky_events.lock().unwrap().len() == 2
+        })
+        .await;
+    assert_eq!(harness.member_count().await, Some(0));
+    {
+        let events = harness.mock.sticky_events.lock().unwrap();
+        assert_eq!(events[0], events[1]);
+    }
+    harness
+        .manager
+        .lock()
+        .await
+        .leave(SLOT, crate::LeaveSessionParams::default())
+        .await
+        .unwrap();
+}

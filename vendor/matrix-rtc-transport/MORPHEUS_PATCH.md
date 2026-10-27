@@ -57,3 +57,51 @@ Additional accepted-key sender adoption correction:
 This corrects an attachment path that could select a recorded-but-rejected key;
 there is no evidence that such rejection caused the captured first-frame outage.
 The existing recorded-key listener is not a native acceptance/decryption receipt.
+
+## Same-ID membership reappearance
+
+Backport the public rc.7 same-member media restoration from MatrixRTC commit
+5b8e73539878e40fa5bd88d637eb8eb2b6b2f0d0 without adopting its breaking APIs.
+A membership lapse now moves its live handles into the existing private
+identity buffer. Only a matching returned Matrix membership releases them;
+SFU presence alone never creates a member or exposes its frames.
+
+Private pooled handles carry their actual connection key so buffered media
+ends with its real track/connection, idle retirement, replacement or pool close.
+Events from a retired generation or a non-Up entry cannot refill that buffer.
+Public get/get_many return the same original Arc handles, and original
+constraint writer/first-poll/debounce behavior and same-stream replacement
+events remain unchanged. No new task, timer, dependency, feature or wire field.
+
+Existing-pool regressions require camera+microphone restoration without a new
+TrackAdded/connect, exact Arc identity, no other-member release, actual track/
+connection/idle/close retirement, adopted replacement and late dead-source
+events, plus late old-focus removals after a replacement. They are source-only until affected hosted checks run; they do not
+prove real native media or stock Bob's separate Megolm membership recovery.
+
+Track provenance also includes the immutable connection generation. Parking and
+flushing both require that exact key/generation to remain Up. Active handles keep
+their existing presentation lifetime through focus replacement/idle retirement,
+but cannot reenter the buffer after that source is gone. Track removal matches
+the exact incarnation. Existing regressions cover replacement-before-lapse and
+idle-retirement-before-lapse, retaining healthy new-incarnation same-Arc recovery.
+
+### Receiver-owned encryption state across a membership lapse
+
+The Morpheus integration of same-ID media restoration with hidden-video key
+probes keeps the latest participant-level encryption observation in each exact
+pooled receiver. Only an observation received while that receiver is present
+on the current connection generation is retained. Remapping emits it after all
+restored stream events only if every current receiver has the same known state.
+A new or replaced receiver starts unknown and suppresses replay; removed tracks
+and retired connections release their observations with their owned handles.
+This adds no key sharing, decryption bypass, task, timer, or public API. The
+transport callback identifies a participant, not a particular cryptor; replay
+preserves that limited meaning and never asserts which track generated it.
+
+Existing pool regression selectors cover retained-state replay, same-generation
+receiver replacement, mixed known/unknown receivers, observations while parked,
+pre-track observations, and track/connection retirement. The call SDK's existing
+engine test module also checks that a same-ID restoration can resume an eligible
+hidden key probe without a repeated failure event, preserving explicit release
+and low-bandwidth constraints. These source tests still require hosted execution.

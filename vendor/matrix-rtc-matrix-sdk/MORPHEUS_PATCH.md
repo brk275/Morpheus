@@ -59,3 +59,9 @@ failure. Locked Ruma 0.35.0 does not define the slot aliases assumed by the
 original standalone backend comment. That source mismatch is corrected, but
 this patch is not claimed to be the sole historical cause of all reduced Sticky
 failures or evidence of successful real encrypted interoperation.
+
+## Device-discovery hints for our own active membership
+
+The existing room-subscription task also polls the pinned public SDK device-update stream. It passes at most 256 bounded public user/device pairs to the core, with no device objects, keys, requests or raw diagnostics. The core alone decides whether to request its own ordinary encrypted membership refresh. The existing subscription cancellation owns the stream; clients without an available stream retain prior behavior. This adds one explicit already-locked futures-util dependency (std only, no default features), not a new package, pin, backend, trust rule or foreign key request. No stock sender behavior or fresh-device call success is claimed.
+
+Device-only wakeups retain the existing five-second failed-subject retry deadline. Only an actual room-subject read resets it; a due retry takes priority over ready device hints. The private production wake helper has a paused-time regression in the existing SDK test module. No original retry interval or success predicate is widened.

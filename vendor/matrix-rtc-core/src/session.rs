@@ -127,6 +127,9 @@ const PEER_RENEWAL_ID_BYTES: usize = 255;
 struct PeerRenewalLedger {
     active: bool,
     seen: HashSet<(String, String, String)>,
+    // A separate finite budget for device hints. At capacity retain tombstones
+    // and ignore new hints; ordinary membership-based renewal stays enabled.
+    seen_devices: HashSet<(String, String)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -137,6 +140,48 @@ enum PeerRenewalAction {
 }
 
 impl PeerRenewalLedger {
+    fn observe_devices(
+        &mut self,
+        devices: &[(String, String)],
+        own: &OwnParticipation,
+        slot: &SlotKnowledge,
+        room_members: Option<&HashSet<String>>,
+        encryption: RoomEncryption,
+    ) -> bool {
+        if !self.active
+            || encryption != RoomEncryption::Encrypted
+            || !matches!(slot, SlotKnowledge::Known(state) if state.is_open())
+        {
+            return false;
+        }
+        let Some(room_members) = room_members else {
+            return false;
+        };
+        let mut added = false;
+        for (user, device) in devices.iter().take(PEER_RENEWAL_TOMBSTONES) {
+            if !room_members.contains(user)
+                || (user == &own.user_id && device == &own.device_id)
+                || [user, device].into_iter().any(|id| {
+                    id.is_empty()
+                        || id.len() > PEER_RENEWAL_ID_BYTES
+                        || id.chars().any(char::is_control)
+                })
+            {
+                continue;
+            }
+            let identity = (user.clone(), device.clone());
+            if self.seen_devices.contains(&identity) {
+                continue;
+            }
+            if self.seen_devices.len() == PEER_RENEWAL_TOMBSTONES {
+                break;
+            }
+            self.seen_devices.insert(identity);
+            added = true;
+        }
+        added
+    }
+
     fn observe(
         &mut self,
         members: &[JoinedMembership],
@@ -680,6 +725,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // A tick in flight finishes first (the machine serialises the two),
         // and finds nothing joined afterwards.
         let upkeep = self.upkeep.take();
+        if let Some(encryption) = self.encryption_manager.as_ref() {
+            encryption.stop_key_retries();
+        }
 
         log::info!(
             "[{}] leaving as {} (reason {:?})",
@@ -987,6 +1035,24 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         match &self.room_members {
             Some(joined) if !joined.contains(&candidate.sender) => JoinCondition::SenderNotInRoom,
             _ => JoinCondition::Joined,
+        }
+    }
+
+    /// Called only for the host's device-list updates. A new device does not
+    /// need an already decryptable RTC membership to receive our fresh event,
+    /// but its user must currently be joined to this encrypted open room.
+    pub(crate) fn on_device_updates(&mut self, devices: &[(String, String)]) {
+        if let (Some(machine), Some(own)) = (&self.own_membership_machine, &self.own_participation)
+            && machine.state() == OwnMembershipState::Joined
+            && self.peer_renewals.observe_devices(
+                devices,
+                own,
+                &self.slot,
+                self.room_members.as_ref(),
+                self.room_encryption,
+            )
+        {
+            machine.request_peer_renewal();
         }
     }
 
@@ -1799,6 +1865,95 @@ mod peer_renewal_tests {
             .unwrap();
         // Drive the production heartbeat deterministically in this test.
         drop(session.upkeep.take());
+    }
+
+    #[test]
+    fn device_renewal_requires_room_authority_and_never_evicts_tombstones() {
+        let devices = vec![("@peer:example.org".into(), "NEWDEVICE".into())];
+        let mut seen = ledger();
+        let own = own();
+        let slot = SlotKnowledge::Known(open_slot());
+        let users = room_users();
+        assert!(!seen.observe_devices(&devices, &own, &slot, None, RoomEncryption::Encrypted));
+        assert!(!seen.observe_devices(
+            &devices,
+            &own,
+            &slot,
+            Some(&users),
+            RoomEncryption::Unknown,
+        ));
+        assert!(!seen.observe_devices(
+            &devices,
+            &own,
+            &SlotKnowledge::Unsupplied,
+            Some(&users),
+            RoomEncryption::Encrypted,
+        ));
+        let ignored = vec![
+            (own.user_id.clone(), own.device_id.clone()),
+            ("@outside:example.org".into(), "NEWDEVICE".into()),
+            ("@peer:example.org".into(), "bad\n".into()),
+            ("@peer:example.org".into(), "x".repeat(PEER_RENEWAL_ID_BYTES + 1)),
+        ];
+        assert!(!seen.observe_devices(
+            &ignored,
+            &own,
+            &slot,
+            Some(&users),
+            RoomEncryption::Encrypted,
+        ));
+        let full = (0..PEER_RENEWAL_TOMBSTONES)
+            .map(|index| ("@peer:example.org".into(), format!("DEVICE{index}")))
+            .collect::<Vec<_>>();
+        assert!(seen.observe_devices(&full, &own, &slot, Some(&users), RoomEncryption::Encrypted));
+        assert!(!seen.observe_devices(&full, &own, &slot, Some(&users), RoomEncryption::Encrypted));
+        assert!(!seen.observe_devices(
+            &devices,
+            &own,
+            &slot,
+            Some(&users),
+            RoomEncryption::Encrypted,
+        ));
+        assert_eq!(seen.seen_devices.len(), PEER_RENEWAL_TOMBSTONES);
+        assert!(seen.active);
+        // Exhausting device hints does not disable normal membership renewal.
+        assert_eq!(
+            observe(&mut seen, &[peer("ordinary-peer")]),
+            PeerRenewalAction::Request
+        );
+    }
+
+    #[tokio::test]
+    async fn device_discovery_renews_only_current_own_membership_without_peer_event() {
+        let backend = Arc::new(MockBackend::new());
+        let mut session = session(backend.clone());
+        let devices = vec![("@peer:example.org".into(), "NEWDEVICE".into())];
+        session.on_device_updates(&devices);
+        assert!(backend.sticky_events.lock().unwrap().is_empty());
+        join(&mut session, "own-generation").await;
+        let original = backend.sticky_events.lock().unwrap()[0].clone();
+        assert!(session.members.is_empty());
+        session.on_device_updates(&devices);
+        session.keep_alive().await;
+        {
+            let events = backend.sticky_events.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1], original);
+        }
+        assert!(session.members.is_empty());
+        assert_eq!(session.peer_renewals.seen_devices.len(), 1);
+        session.on_device_updates(&devices);
+        session.keep_alive().await;
+        assert_eq!(backend.sticky_events.lock().unwrap().len(), 2);
+        session.leave(LeaveSessionParams::default()).await.unwrap();
+        session.on_device_updates(&devices);
+        assert_eq!(backend.sticky_events.lock().unwrap().len(), 3);
+        assert!(session.peer_renewals.seen_devices.is_empty());
+        join(&mut session, "new-own-generation").await;
+        session.on_device_updates(&devices);
+        session.keep_alive().await;
+        assert_eq!(backend.sticky_events.lock().unwrap().len(), 5);
+        session.leave(LeaveSessionParams::default()).await.unwrap();
     }
 
     #[tokio::test]

@@ -521,9 +521,9 @@ class ScopeTests(unittest.TestCase):
         # comparisons with owned fixture bytes under test-only pins, so a
         # future different workflow can safely fall back all without requiring
         # its execution layout to be admitted by this exemption.
-        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 64005)
+        self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_BYTES, 65013)
         self.assertEqual(ci_scope.REVIEWED_CONTROL_WORKFLOW_SHA256,
-                         "9d557eeb730a8785aaf2d3eb9fbd5224ab202fdc2f2f384a60c73a87b61c9aa0")
+                         "2c1ee738dfc27846125eb571602cb81f78ea8cd0849a62f51739ee939235320c")
         import hashlib
         with patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_BYTES", len(workflow)), \
                 patch.object(ci_scope, "REVIEWED_CONTROL_WORKFLOW_SHA256", hashlib.sha256(workflow).hexdigest()):
@@ -578,8 +578,8 @@ class ScopeTests(unittest.TestCase):
         # Outside every test-only pin override, a same-size unrelated blob
         # must fail the independently reviewed production SHA admission.
         run.reset_mock()
-        run.side_effect = [SimpleNamespace(stdout=b"64005\n"),
-                           SimpleNamespace(stdout=b"x" * 64005)]
+        run.side_effect = [SimpleNamespace(stdout=b"64676\n"),
+                           SimpleNamespace(stdout=b"x" * 64676)]
         self.assertFalse(ci_scope.reviewed_control_only(sorted(control), {"after": "a" * 40}, "push"))
 
 

@@ -90,3 +90,54 @@ original failure, acceptance predicates, call authority and cleanup remain intac
 The app observer is Linux-test-only and fenced to the retained call generation.
 Native report parsing is bounded separately in libwebrtc; source flags and stats
 are independent readings, not an atomic snapshot across an internal reconnect.
+
+## rc.7 hidden encrypted-video recovery probe
+
+The private call engine backports `probe_undecryptable` from official revision
+`5b8e73539878e40fa5bd88d637eb8eb2b6b2f0d0`. If an enabled video is hidden
+while the member has a frame-key failure, it requests the lowest layer rather
+than pausing all frames that could show recovery. The exact host constraints
+are retained and reapplied when failure classification changes; leaving members
+lose the retained request. An explicit release, bandwidth-saver choice, audio
+request or visible-video request is not promoted. No new task, timer, key
+request, crypto-state acceptance, public API or dependency is introduced.
+
+The existing engine fake-transport suite covers failure after a hidden request,
+Low-layer probing, exact dimensions/pause restoration, explicit release during
+failure and recovery, plus the direct policy bounds. It requires its own
+affected hosted execution; the vendor route now selects the SDK library suite
+with `cargo test --locked -p matrix-rtc-call-sdk --lib`. Original `engine.rs` is retained byte-exact in
+`engine.rs.upstream`. Existing app KeyImported handling remains unchanged, so
+this is not a claim that a captured missing-key membership failure follows this
+media path, nor a cure for unavailable historical membership keys. Encryption
+admission, identity, trust, capture, cancellation, deadlines and release gates
+are unchanged.
+
+### Same-ID receiver restoration integration
+
+A focused test in the existing engine module exercises the transport pool's
+receiver-owned encryption-state replay after a membership lapse: the same live
+receiver is restored, then a new hidden host request probes at the permitted low
+layer without requiring a duplicate cryptor failure callback. Explicit release
+and low-bandwidth requests retain their original precedence. The replay is a
+participant-level observation, not proof of a particular cryptor or recovered
+media. This integration adds no production engine API or lifetime beyond the
+existing receiver, and has not been executed locally.
+
+### Bandwidth-saver precedence adaptation
+
+Morpheus adapts the rc.7 probe helper to return the complete host request
+unchanged when `low_bandwidth` is set, before any hidden-video promotion.
+The backported predicate previously retained that flag but changed visibility
+and detail to Low, contradicting the helper's bandwidth-saver policy. The
+ordinary constraint resolver still paused the video; its detail preference was
+incorrectly overwritten. Explicit release, audio, visible-video and ordinary
+hidden undecryptable-video behavior are unchanged.
+
+The existing direct policy case now compares the complete limited request for
+both video kinds. The combined same-receiver restoration case and all its
+assertions remain unchanged: its whole resolved-constraint comparison exposed
+this mismatch in hosted run `40522573451` (94 passed, one failed). This change
+adds no timer, key request, crypto acceptance, dependency or public interface.
+It is not a fix for unavailable historical membership keys or evidence that
+any real media or call acceptance gate passed. No candidate was executed locally.

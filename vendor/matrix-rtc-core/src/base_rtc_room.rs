@@ -549,6 +549,15 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         }
     }
 
+    /// A host device-list hint can only request our own normal encrypted
+    /// membership refresh. Each session checks its current join and room state;
+    /// this does not add a participant or change any key-sharing policy.
+    pub fn on_devices_received(&mut self, devices: &[(String, String)]) {
+        for session in self.sessions.values_mut() {
+            session.on_device_updates(devices);
+        }
+    }
+
     /// Resolves the room's slots against its current encryption state and
     /// pushes the result to every slot session.
     async fn push_slot_state(&mut self) {

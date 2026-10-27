@@ -229,11 +229,55 @@ enum RoomInput {
     Encryption(bool),
     Timeline(Vec<EventIn>),
     Redaction(String),
+    Devices,
     Stop,
+}
+
+// One coalesced marker and a fixed number of small public identifiers, never
+// SDK Device objects, keys or one queued message per device-list update.
+const DEVICE_UPDATE_BATCH: usize = 256;
+const DEVICE_UPDATE_ID_BYTES: usize = 255;
+
+#[derive(Default)]
+struct DeviceUpdateBuffer {
+    devices: Vec<(String, String)>,
+    queued: bool,
+}
+
+impl DeviceUpdateBuffer {
+    fn push(&mut self, devices: Vec<(String, String)>) -> bool {
+        for (user, device) in devices.into_iter().take(DEVICE_UPDATE_BATCH) {
+            if [&user, &device].into_iter().any(|id| {
+                id.is_empty()
+                    || id.len() > DEVICE_UPDATE_ID_BYTES
+                    || id.chars().any(char::is_control)
+            }) {
+                continue;
+            }
+            if !self.devices.iter().any(|entry| entry.0 == user && entry.1 == device) {
+                if self.devices.len() == DEVICE_UPDATE_BATCH {
+                    break;
+                }
+                self.devices.push((user, device));
+            }
+        }
+        if self.queued || self.devices.is_empty() {
+            false
+        } else {
+            self.queued = true;
+            true
+        }
+    }
+
+    fn take(&mut self) -> Vec<(String, String)> {
+        self.queued = false;
+        std::mem::take(&mut self.devices)
+    }
 }
 
 struct ChannelRoomSink {
     tx: mpsc::UnboundedSender<RoomInput>,
+    devices: Arc<StdMutex<DeviceUpdateBuffer>>,
 }
 
 impl RoomSink for ChannelRoomSink {
@@ -259,6 +303,12 @@ impl RoomSink for ChannelRoomSink {
 
     fn on_redaction(&self, event_id: String) {
         let _ = self.tx.send(RoomInput::Redaction(event_id));
+    }
+
+    fn on_device_updates(&self, devices: Vec<(String, String)>) {
+        if self.devices.lock().unwrap().push(devices) {
+            let _ = self.tx.send(RoomInput::Devices);
+        }
     }
 }
 
@@ -324,7 +374,11 @@ impl RoomFeeder {
         log::info!("[{room_id}] attaching: {subjects:?}");
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let sink: Arc<dyn RoomSink> = Arc::new(ChannelRoomSink { tx: tx.clone() });
+        let devices = Arc::new(StdMutex::new(DeviceUpdateBuffer::default()));
+        let sink: Arc<dyn RoomSink> = Arc::new(ChannelRoomSink {
+            tx: tx.clone(),
+            devices: devices.clone(),
+        });
         let subscription = backend
             .subscribe_room(room_id.clone(), subjects, sink)
             .await?;
@@ -344,6 +398,7 @@ impl RoomFeeder {
             rx,
             seeded: seeded_tx,
             state: FeedState::default(),
+            devices,
         };
         Ok((attachment, run))
     }
@@ -374,6 +429,7 @@ pub struct RoomFeederRun<B, M> {
     rx: mpsc::UnboundedReceiver<RoomInput>,
     seeded: watch::Sender<bool>,
     state: FeedState,
+    devices: Arc<StdMutex<DeviceUpdateBuffer>>,
 }
 
 impl<B, M> RoomFeederRun<B, M>
@@ -431,6 +487,10 @@ where
                 }
                 RoomInput::Redaction(event_id) => {
                     self.room.lock().await.on_event_redacted(&event_id);
+                }
+                RoomInput::Devices => {
+                    let devices = self.devices.lock().unwrap().take();
+                    self.room.lock().await.rtc().on_devices_received(&devices);
                 }
             }
 

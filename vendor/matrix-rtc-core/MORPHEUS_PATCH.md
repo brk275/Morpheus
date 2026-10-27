@@ -133,3 +133,29 @@ The original test bytes are retained in `tests/key_rotation.rs.upstream` and
 still match `UPSTREAM_FILES.sha256`. No production, dependency, encryption,
 trust, grace, delay or workflow setting changes. This is a source correction to
 obsolete integration expectations; affected hosted checks remain required.
+
+## Independent failed media-key delivery retries
+
+Adapt the public rc.7 failed-recipient retry contract without adopting its new
+Outbox APIs or dependencies. The existing joined-session upkeep owns one worker
+per current exact recipient debt. Retries use fixed 1s exponential backoff capped
+at 30s, a 30s attempt wait and at most 8 retry host calls in flight. This bounds the
+library's future wait, not an already-admitted external host operation's lifetime.
+An exact participation and private key-incarnation token fence admission and
+served bookkeeping; departure, rotation and leave invalidate old debts. Leave
+stops retries before its network awaits. Ready permits and admitted attempts
+progress before unrelated watch changes, with the attempt deadline checked first.
+The controller cancels and joins retired native workers before replacements and
+consumes completed worker results. The wasm abort wrapper does not establish
+native-style task retirement. No watch/manager lock spans these waits; other
+recipient workers continue independently. Controller drop requests cancellation,
+not global external-operation quiescence. The retry layer adds no payload or
+host-error logs; existing backend logging is unchanged.
+Original key grace/rotation and recipient/trust/import policies are unchanged.
+The rc.2 backend lacks typed permanent/retry-after errors, so no new classifier is
+invented. Independent scheduling uses the existing executor; no-runtime manual
+keep-alive behavior is preserved and is not claimed to drive this retry scheduler.
+
+## Device-discovery own-membership renewal
+
+Morpheus now feeds bounded public device-list hints into the existing own-join renewal path. Only a current own join in a known encrypted open room can request an ordinary fresh own membership for a currently joined room user. A per-join finite device ledger, a single coalesced input marker and the existing ten-second send pacing bound churn. This adds no participant and changes no sender, encryption, trust, history, media-key or gossip policy. Leave and clone reset the ledger; ordinary membership-based renewal is preserved. This does not cause an unchanged stock peer to republish its own membership.

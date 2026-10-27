@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
+//
+// Morpheus modification: bounded hidden-video recovery probe from rc.7.
+// Original retained in engine.rs.upstream; see MORPHEUS_PATCH.md.
 
 //! The call engine: one flat participant roster over N transport connections.
 //!
@@ -44,6 +47,32 @@ use crate::tile::{
 /// further behind than this observe a `Lagged` error and miss events; they
 /// should resynchronise from [`CallEngine::participants`].
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// What a member's video stream is asked for while we cannot decrypt it: kept
+/// flowing at the lowest layer even when the host says it is not visible. A
+/// host hides the video exactly when it shows the key error, and a paused
+/// stream sends no frames, so a key that arrives later could never be seen to
+/// work: the member would stay unable to decrypt until something else, such as
+/// their unmuting, sent frames. A stream the host released (`enabled: false`)
+/// or a bandwidth-saver choice is left as asked.
+fn probe_undecryptable(
+    kind: MediaStreamKind,
+    constraints: MediaConstraints,
+    undecryptable: bool,
+) -> MediaConstraints {
+    let video = matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare);
+    if constraints.low_bandwidth {
+        return constraints;
+    }
+    if !undecryptable || !video || !constraints.enabled || constraints.visible {
+        return constraints;
+    }
+    MediaConstraints {
+        visible: true,
+        detail: matrix_rtc_transport::VideoDetail::Quality(matrix_rtc_transport::QualityLimit::Low),
+        ..constraints
+    }
+}
 
 /// How much the tile order is damped (spec 002 R10, R11). Configurable
 /// because the values are a product decision, not a protocol one.
@@ -265,6 +294,7 @@ impl CallEngine {
             roster: Vec::new(),
             local_tracks: HashMap::new(),
             encryption_states: HashMap::new(),
+            host_constraints: HashMap::new(),
             installed_keys: HashMap::new(),
             raised_hands: HashMap::new(),
             ended: false,
@@ -588,10 +618,12 @@ struct Actor {
     roster: Vec<Participant>,
     /// Last frame-encryption state reported per member.
     ///
-    /// Only so the log line can name the transition. A bare "is MissingKey"
+    /// Also drives hidden-video probes. A bare "is MissingKey"
     /// cannot be read: a momentary drop during a rotation and a permanent failure
     /// produce the same line, and only the previous state separates them.
     encryption_states: HashMap<String, FrameEncryptionState>,
+    /// The host request, before a hidden undecryptable video is kept probing.
+    host_constraints: HashMap<(String, MediaStreamKind), MediaConstraints>,
     /// Our own live publications, so a mute can reach the transport and the
     /// roster can be corrected in one place, and so a membership landing after
     /// them can be seeded from them.
@@ -863,7 +895,16 @@ impl Actor {
                 member_id,
                 kind,
                 constraints,
-            } => self.pool.set_constraints(member_id, kind, constraints),
+            } => {
+                self.host_constraints
+                    .insert((member_id.clone(), kind), constraints);
+                let undecryptable = self.is_undecryptable(&member_id);
+                self.pool.set_constraints(
+                    member_id,
+                    kind,
+                    probe_undecryptable(kind, constraints, undecryptable),
+                );
+            }
             ActorMessage::SpeakerTimer {
                 member_id,
                 generation,
@@ -1001,9 +1042,32 @@ impl Actor {
         }
     }
 
+    fn is_undecryptable(&self, member_id: &str) -> bool {
+        self.encryption_states
+            .get(member_id)
+            .is_some_and(FrameEncryptionState::is_failure)
+    }
+
     fn encryption_state_changed(&mut self, member_id: String, state: FrameEncryptionState) {
         let diagnostic = self.encryption_diagnostic(&member_id, state);
         let previous = self.encryption_states.insert(member_id.clone(), state);
+        // Crossing between decrypting and not changes what the member's video
+        // streams are asked for (see `probe_undecryptable`).
+        if previous.is_some_and(|p| p.is_failure()) != state.is_failure() {
+            let streams: Vec<_> = self
+                .host_constraints
+                .iter()
+                .filter(|((member, _), _)| *member == member_id)
+                .map(|((_, kind), constraints)| (*kind, *constraints))
+                .collect();
+            for (kind, constraints) in streams {
+                self.pool.set_constraints(
+                    member_id.clone(),
+                    kind,
+                    probe_undecryptable(kind, constraints, state.is_failure()),
+                );
+            }
+        }
         if state.is_failure() {
             log::warn!(
                 "frame encryption {state:?} for {member_id} (was {previous:?}), {diagnostic:?}"
@@ -1191,6 +1255,8 @@ impl Actor {
         // when it applies the same snapshot.
         self.installed_keys.remove(member_id);
         self.encryption_states.remove(member_id);
+        self.host_constraints
+            .retain(|(member, _), _| member != member_id);
         self.speaking.remove(member_id);
         self.speakers.remove(member_id);
         self.emit(CallEvent::ParticipantLeft {
@@ -3594,6 +3660,220 @@ mod tests {
             .send(ConnectionEvent::Reconnected)
             .unwrap();
         wait_until(|| fx.state.applied.lock().unwrap().len() == 3).await;
+    }
+
+    #[test]
+    fn a_video_key_probe_preserves_explicit_release_bandwidth_and_nonvideo_requests() {
+        let hidden = MediaConstraints {
+            visible: false,
+            ..Default::default()
+        };
+        for kind in [MediaStreamKind::Camera, MediaStreamKind::ScreenShare] {
+            let probing = probe_undecryptable(kind, hidden, true).resolve(kind);
+            assert_eq!(probing.demand, matrix_rtc_transport::StreamDemand::Active);
+            assert_eq!(
+                probing.detail,
+                matrix_rtc_transport::VideoDetail::Quality(matrix_rtc_transport::QualityLimit::Low)
+            );
+            assert_eq!(probe_undecryptable(kind, hidden, false), hidden);
+            let visible = MediaConstraints::default();
+            assert_eq!(probe_undecryptable(kind, visible, true), visible);
+            let released = MediaConstraints {
+                enabled: false,
+                ..hidden
+            };
+            assert_eq!(probe_undecryptable(kind, released, true), released);
+            let limited_request = MediaConstraints {
+                low_bandwidth: true,
+                ..hidden
+            };
+            let limited = probe_undecryptable(kind, limited_request, true);
+            assert_eq!(limited, limited_request);
+            assert!(limited.low_bandwidth);
+            assert_eq!(
+                limited.resolve(kind).demand,
+                matrix_rtc_transport::StreamDemand::Paused
+            );
+        }
+        assert_eq!(
+            probe_undecryptable(MediaStreamKind::Microphone, hidden, true),
+            hidden
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_undecryptable_members_hidden_video_probes_then_restores_the_host_request() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await;
+        wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
+        let last = || fx.state.applied.lock().unwrap().last().map(|(_, _, r)| *r);
+        let encryption = |state| ConnectionEvent::EncryptionStateChanged {
+            identity: "id-bob".to_owned(),
+            state,
+        };
+        let hidden = MediaConstraints {
+            visible: false,
+            detail: matrix_rtc_transport::VideoDetail::Dimensions(
+                matrix_rtc_transport::Dimensions {
+                    width: 640,
+                    height: 360,
+                },
+            ),
+            ..Default::default()
+        };
+
+        // A hidden host request arrives before the key failure.
+        fx.engine
+            .set_constraints("bob", MediaStreamKind::Camera, hidden);
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 1).await;
+        assert_eq!(last().unwrap(), hidden.resolve(MediaStreamKind::Camera));
+        peer_sender(&fx, PEER_FOCUS)
+            .unwrap()
+            .send(encryption(FrameEncryptionState::MissingKey))
+            .unwrap();
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 2).await;
+        let probing = last().unwrap();
+        assert_eq!(probing.demand, matrix_rtc_transport::StreamDemand::Active);
+        assert_eq!(
+            probing.detail,
+            matrix_rtc_transport::VideoDetail::Quality(matrix_rtc_transport::QualityLimit::Low)
+        );
+
+        // Recovery restores the precise host request, including its dimensions.
+        peer_sender(&fx, PEER_FOCUS)
+            .unwrap()
+            .send(encryption(FrameEncryptionState::Ok))
+            .unwrap();
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 3).await;
+        assert_eq!(last().unwrap(), hidden.resolve(MediaStreamKind::Camera));
+
+        peer_sender(&fx, PEER_FOCUS)
+            .unwrap()
+            .send(encryption(FrameEncryptionState::MissingKey))
+            .unwrap();
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 4).await;
+        // The host explicitly releases it while failure is active: never revive it.
+        let released = MediaConstraints {
+            enabled: false,
+            ..hidden
+        };
+        fx.engine
+            .set_constraints("bob", MediaStreamKind::Camera, released);
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 5).await;
+        assert_eq!(last().unwrap(), released.resolve(MediaStreamKind::Camera));
+        peer_sender(&fx, PEER_FOCUS)
+            .unwrap()
+            .send(encryption(FrameEncryptionState::Ok))
+            .unwrap();
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 6).await;
+        assert_eq!(last().unwrap(), released.resolve(MediaStreamKind::Camera));
+        fx.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_receiver_keeps_its_key_probe_without_a_repeated_failure_event() {
+        let mut fx = fixture();
+        let connection = adopt(&fx);
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined { .. }
+        ));
+        let camera: Arc<dyn RemoteTrackHandle> = Arc::new(FakeTrack::new(MediaStreamKind::Camera));
+        connection
+            .send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".into(),
+                kind: MediaStreamKind::Camera,
+                track: camera.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted { .. }
+        ));
+        connection
+            .send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".into(),
+                state: FrameEncryptionState::MissingKey,
+            })
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut fx.events).await,
+            CallEvent::FrameEncryptionState {
+                state: FrameEncryptionState::MissingKey,
+                ..
+            }
+        ));
+
+        fx.memberships.send(Vec::new()).unwrap();
+        assert!(matches!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantLeft { .. }
+        ));
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        assert!(matches!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined { .. }
+        ));
+        assert!(matches!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted { .. }
+        ));
+        assert!(matches!(
+            next_event(&mut fx.events).await,
+            CallEvent::FrameEncryptionState {
+                state: FrameEncryptionState::MissingKey,
+                ..
+            }
+        ));
+        assert!(Arc::ptr_eq(
+            &fx.engine
+                .remote_track("bob", MediaStreamKind::Camera)
+                .unwrap(),
+            &camera,
+        ));
+
+        // No second failure callback: the real restored receiver supplies it.
+        let hidden = MediaConstraints {
+            visible: false,
+            ..Default::default()
+        };
+        fx.engine
+            .set_constraints("bob", MediaStreamKind::Camera, hidden);
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 1).await;
+        let last = || fx.state.applied.lock().unwrap().last().map(|(_, _, r)| *r);
+        assert_eq!(
+            last().unwrap().demand,
+            matrix_rtc_transport::StreamDemand::Active
+        );
+        assert_eq!(
+            last().unwrap().detail,
+            matrix_rtc_transport::VideoDetail::Quality(matrix_rtc_transport::QualityLimit::Low)
+        );
+        let released = MediaConstraints {
+            enabled: false,
+            ..hidden
+        };
+        fx.engine
+            .set_constraints("bob", MediaStreamKind::Camera, released);
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 2).await;
+        assert_eq!(last().unwrap(), released.resolve(MediaStreamKind::Camera));
+        let limited = MediaConstraints {
+            low_bandwidth: true,
+            ..hidden
+        };
+        fx.engine
+            .set_constraints("bob", MediaStreamKind::Camera, limited);
+        wait_until(|| fx.state.applied.lock().unwrap().len() == 3).await;
+        assert_eq!(last().unwrap(), limited.resolve(MediaStreamKind::Camera));
+        fx.engine.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]

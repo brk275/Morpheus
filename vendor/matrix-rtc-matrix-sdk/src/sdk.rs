@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use matrix_rtc_core::{
     BackendError, CommandError, EventEncryption, EventIn, MatrixBackend, OpenIdToken, RoomSink,
     RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient,
@@ -762,6 +763,43 @@ fn keep_going<T>(result: Result<T, RecvError>) -> bool {
     matches!(result, Ok(_) | Err(RecvError::Lagged(_)))
 }
 
+/// A device-only wake cannot postpone a failed subject read. Only a real
+/// attempt resets this deadline; a due retry wins even over ready device hints.
+struct SubjectRetry {
+    deadline: tokio::time::Instant,
+}
+
+enum SubjectWake<T> {
+    Room(bool),
+    Devices(T),
+}
+
+impl SubjectRetry {
+    fn after_attempt() -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + RETRY_AFTER,
+        }
+    }
+
+    async fn wait<T>(
+        &self,
+        retry: bool,
+        sticky: impl std::future::Future<Output = bool>,
+        room: impl std::future::Future<Output = bool>,
+        devices: impl std::future::Future<Output = T>,
+    ) -> SubjectWake<T> {
+        if retry && tokio::time::Instant::now() >= self.deadline {
+            return SubjectWake::Room(true);
+        }
+        tokio::select! {
+            result = sticky => SubjectWake::Room(result),
+            result = room => SubjectWake::Room(result),
+            result = devices => SubjectWake::Devices(result),
+            _ = tokio::time::sleep_until(self.deadline), if retry => SubjectWake::Room(true),
+        }
+    }
+}
+
 /// Delivers the room's subjects: the current sets first, then again on every
 /// sync that touches the room. Each delivery is the complete set; the core
 /// replaces rather than merges. A subject whose read failed is skipped for
@@ -772,19 +810,61 @@ async fn feed_room_subjects(room: Room, subjects: RoomSubjects, sink: Arc<dyn Ro
 
     let mut sticky = room.sticky_events().subscribe();
     let mut updates = room.subscribe_to_updates();
+    // The existing task owns this subscription too: cancellation drops its
+    // stream/Client references. Failure leaves this optional optimization off.
+    let mut devices = room
+        .client()
+        .encryption()
+        .devices_stream()
+        .await
+        .ok()
+        .map(Box::pin);
+    let mut all_read = emit_room_subjects(&room, &subjects, &sink).await;
+    let mut retry = SubjectRetry::after_attempt();
 
     loop {
-        let all_read = emit_room_subjects(&room, &subjects, &sink).await;
-
-        let woken = tokio::select! {
-            result = sticky.recv() => keep_going(result),
-            result = updates.recv() => keep_going(result),
-            _ = tokio::time::sleep(RETRY_AFTER), if !all_read => true,
-        };
-        if !woken {
-            break;
+        let wake = retry
+            .wait(
+                !all_read,
+                async { keep_going(sticky.recv().await) },
+                async { keep_going(updates.recv().await) },
+                async {
+                    match devices.as_mut() {
+                        Some(stream) => stream.next().await,
+                        None => std::future::pending().await,
+                    }
+                },
+            )
+            .await;
+        match wake {
+            SubjectWake::Room(false) => break,
+            SubjectWake::Room(true) => {
+                tokio::time::sleep(WAKE_DEBOUNCE).await;
+                all_read = emit_room_subjects(&room, &subjects, &sink).await;
+                retry = SubjectRetry::after_attempt();
+            }
+            SubjectWake::Devices(update) => match update {
+                Some(update) => {
+                    // Only bounded public identity pairs cross into the core.
+                    // Device objects and their key data stay in this task.
+                    let identities = update
+                        .new
+                        .iter()
+                        .chain(update.changed.iter())
+                        .flat_map(|(user, devices)| {
+                            devices.keys().map(move |device| (user, device))
+                        })
+                        .take(256)
+                        .filter(|(user, device)| {
+                            user.as_str().len() <= 255 && device.as_str().len() <= 255
+                        })
+                        .map(|(user, device)| (user.to_string(), device.to_string()))
+                        .collect();
+                    sink.on_device_updates(identities);
+                }
+                None => devices = None,
+            },
         }
-        tokio::time::sleep(WAKE_DEBOUNCE).await;
     }
 
     log::info!("[{room_id}] room subscription stopped");
@@ -1068,6 +1148,36 @@ fn register_timeline_receiver(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn device_wakes_do_not_restart_failed_room_subject_retry() {
+        use std::future::{pending, ready};
+
+        let mut retry = super::SubjectRetry::after_attempt();
+        for _ in 0..3 {
+            tokio::time::advance(super::RETRY_AFTER / 4).await;
+            assert!(matches!(
+                retry.wait(true, pending(), pending(), ready(())).await,
+                super::SubjectWake::Devices(())
+            ));
+        }
+        tokio::time::advance(super::RETRY_AFTER / 4).await;
+        assert!(matches!(
+            retry.wait(true, pending(), pending(), ready(())).await,
+            super::SubjectWake::Room(true)
+        ));
+        // Only a completed read attempt creates a new retry window.
+        retry = super::SubjectRetry::after_attempt();
+        assert!(matches!(
+            retry.wait(true, pending(), pending(), ready(())).await,
+            super::SubjectWake::Devices(())
+        ));
+        tokio::time::advance(super::RETRY_AFTER).await;
+        assert!(matches!(
+            retry.wait(false, pending(), pending(), ready(())).await,
+            super::SubjectWake::Devices(())
+        ));
+    }
+
     use matrix_sdk::ruma::events::AnySyncTimelineEvent;
 
     use super::*;
