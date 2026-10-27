@@ -386,7 +386,9 @@ class AppTimelineEvidenceTests(unittest.TestCase):
             "STAGE message_copy_callbacks", "CHECK message_copy_callbacks=true",
             "CHECK feeds_running=true",
             "STAGE revocation", "STAGE revocation_settle", "STAGE revocation_member_pause",
-            "STAGE revocation_login", "STAGE revocation_members", "STAGE revocation_join",
+            "STAGE revocation_login", "STAGE revocation_login_entered",
+            "STAGE revocation_login_revoked", "STAGE revocation_login_published",
+            "STAGE revocation_members", "STAGE revocation_join",
             "CHECK old_lease_revoked=true", "STAGE revocation_feeds",
             "CHECK idle_feeds_stopped=true", "STAGE renewal",
             "CHECK message_copy_account_aba=true",
@@ -496,6 +498,7 @@ class AppTimelineEvidenceTests(unittest.TestCase):
         for stage in (
             "setup_profile", "setup_config", "setup_window", "setup_controller",
             "setup_dispatch", "setup_login", "setup_rooms", "setup_ready",
+            "revocation_login_entered", "revocation_login_revoked", "revocation_login_published",
             "cleanup_logout_primary", "cleanup_logout_other", "cleanup_manager_stop",
             "cleanup_drop_live", "cleanup_drop_ui", "cleanup_wait_profile",
             "cleanup_drop_manager", "cleanup_remove_directory",

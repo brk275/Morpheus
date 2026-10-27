@@ -127,6 +127,7 @@ APP_TIMELINE_STAGES = frozenset((
     "setup", "activation", "room_open", "room_delivery", "thread_delivery",
     "message_copy_callbacks",
     "revocation", "revocation_settle", "revocation_member_pause", "revocation_login",
+    "revocation_login_entered", "revocation_login_revoked", "revocation_login_published",
     "revocation_members", "revocation_join", "revocation_feeds",
     "renewal", "reopen", "queued_revocation", "queued_drain",
     "queued_reopen", "link_continuation", "member_publication", "cleanup", "complete",

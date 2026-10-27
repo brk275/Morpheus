@@ -1625,7 +1625,62 @@ impl Scenario {
             .await
             .expect("The old account's load must reach its claim");
         stage!(revocation_login);
-        let other_id = self.switch_away(other).await;
+        let other_id = {
+            let manager = self.manager.clone();
+            let account = self.account.clone();
+            let mut active = manager.subscribe_active_account();
+            let selection = manager.account_selection(&account);
+            on_runtime(&self.runtime, async move {
+                // Observe the same owned login, without taking the manager's
+                // State lock or starting another login/task. Missing signals
+                // are not evidence that their production boundary was absent.
+                stage!(revocation_login_entered);
+                let login = manager.add_password_account(
+                    &other.homeserver_url,
+                    &other.username,
+                    &other.password,
+                );
+                tokio::pin!(login);
+                let added = tokio::select! {
+                    biased;
+                    added = &mut login => added,
+                    () = async {
+                        match selection.as_ref() {
+                            Some(selection) => selection.revoked().await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        // Only the captured old selection's revocation is
+                        // known. Lock/build/HTTP/persist remain indistinguishable
+                        // before this signal; no metadata or error is printed.
+                        stage!(revocation_login_revoked);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                added = &mut login => break added,
+                                changed = active.changed() => {
+                                    if changed.is_err() {
+                                        break login.as_mut().await;
+                                    }
+                                    let different_account = {
+                                        let value = active.borrow_and_update();
+                                        value.as_ref().is_some_and(|value| value.id != account)
+                                    };
+                                    // Drop the watch read guard before awaiting
+                                    // the same login future to completion.
+                                    if different_account {
+                                        stage!(revocation_login_published);
+                                        break login.as_mut().await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                added.expect("Second login failed").id
+            })
+            .await
+        };
         assert_eq!(
             self.live.selected_room.lock().await.as_deref(),
             Some(self.room.as_str()),
