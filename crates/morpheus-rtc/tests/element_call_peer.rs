@@ -578,8 +578,7 @@ async fn group_and_screen(
                 Some(Ok(keys)) if keys.len() <= 256 => {
                     if let Some(original) = original_membership.as_ref() {
                         imported |= keys.iter().any(|key| {
-                            key.algorithm
-                                == matrix_sdk::crypto::types::EventEncryptionAlgorithm::MegolmV1AesSha2
+                            key.algorithm.as_str() == "m.megolm.v1.aes-sha2"
                                 && key.room_id.as_str() == room
                                 && key.session_id == original.session_id
                                 && key.sender_key.to_base64() == original.sender_curve
