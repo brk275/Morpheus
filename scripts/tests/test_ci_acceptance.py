@@ -467,6 +467,19 @@ class NativeRouteWorkflowTests(unittest.TestCase):
         self.assertLessEqual(set(adapter["dev-dependencies"]), adapter_names)
         self.assertIn("futures-util", adapter_names)
         self.assertIn("testing", adapter["dev-dependencies"]["matrix-rtc-core"]["features"])
+        # The standalone Windows adapter test must use the application's exact
+        # bundled SQLite policy, without changing normal or non-Windows features.
+        windows_target = 'cfg(target_os = "windows")'
+        self.assertEqual(set(adapter["target"]), {windows_target})
+        windows_dev = adapter["target"][windows_target]["dev-dependencies"]
+        self.assertEqual(windows_dev, {
+            "libsqlite3-sys": {"version": "=0.38.2", "features": ["bundled-windows"]}})
+        application = tomllib.loads((root / "crates/morpheus-matrix/Cargo.toml")
+                                    .read_text(encoding="utf-8"))
+        self.assertEqual(windows_dev["libsqlite3-sys"],
+                         application["target"][windows_target]["dependencies"]["libsqlite3-sys"])
+        self.assertIn("libsqlite3-sys", adapter_names)
+        self.assertNotIn("libsqlite3-sys", adapter["dependencies"])
         adapter_source = (root / adapter_path / "src/sdk.rs").read_text(encoding="utf-8")
         self.assertIn("async fn device_wakes_do_not_restart_failed_room_subject_retry()", adapter_source)
         # Retained clap defaults/derive activate optional edges even though

@@ -60,3 +60,8 @@ matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev =
 [dev-dependencies]
 matrix-rtc-core = { git = "https://github.com/element-hq/matrix-rust-rtc", tag = "v0.5.0-rc.2", features = ["testing"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }
+
+# Standalone adapter tests do not select morpheus-matrix, which normally
+# enables this exact Windows-only bundled SQLite policy for the application.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+libsqlite3-sys = { version = "=0.38.2", features = ["bundled-windows"] }

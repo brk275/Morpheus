@@ -65,3 +65,15 @@ failures or evidence of successful real encrypted interoperation.
 The existing room-subscription task also polls the pinned public SDK device-update stream. It passes at most 256 bounded public user/device pairs to the core, with no device objects, keys, requests or raw diagnostics. The core alone decides whether to request its own ordinary encrypted membership refresh. The existing subscription cancellation owns the stream; clients without an available stream retain prior behavior. This adds one explicit already-locked futures-util dependency (std only, no default features), not a new package, pin, backend, trust rule or foreign key request. No stock sender behavior or fresh-device call success is claimed.
 
 Device-only wakeups retain the existing five-second failed-subject retry deadline. Only an actual room-subject read resets it; a due retry takes priority over ready device hints. The private production wake helper has a paused-time regression in the existing SDK test module. No original retry interval or success predicate is widened.
+
+
+## Standalone Windows adapter test linkage
+
+The existing root-workspace adapter `--lib` test also selects the Matrix SDK's
+normal SQLite-backed crypto stores. On Windows, enable the same exact locked
+`libsqlite3-sys = 0.38.2` `bundled-windows` feature used by `morpheus-matrix`, but
+only as a Windows-target development dependency. This compiles the existing
+locked crate's SQLite C source instead of assuming a system `sqlite3.lib` is
+installed. Normal adapter dependencies, default SDK crypto features and
+non-Windows target features are unchanged; no package version or checksum is
+changed. The lockfile adds only the adapter's edge to the already locked crate.
