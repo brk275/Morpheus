@@ -374,6 +374,68 @@ class NativeLinuxStageConsumerTests(unittest.TestCase):
         finally:
             _PIPELINE.reset_pack_capture()
 
+    @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA handoff")
+    def test_nonpublishing_stage_validates_all_data_without_creating_a_bundle(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(); root.chmod(0o700)
+            source = root / "fixture-source"; source.mkdir(mode=0o700)
+            payload = b"owned source DATA"
+            path = source / "fixture.data"; path.write_bytes(payload); path.chmod(0o600)
+            row = {"path": "fixture.data", "bytes": len(payload),
+                   "sha256": hashlib.sha256(payload).hexdigest(), "mode": 0o600}
+            inventories = {source.name: {"role": "fixture", "files": [row], "directories": ["."]}}
+            handoff = {"schema": "synthetic", "roots": inventories}
+            # A non-publishing stage must not create the bounded tar at all,
+            # even when its genuine DATA could not fit a compressed cap of1.
+            with mock.patch.object(_PIPELINE, "pack_handoff", side_effect=AssertionError("unused bundle")), \
+                    mock.patch.object(_PIPELINE, "MAX_HANDOFF", 1), \
+                    mock.patch.object(_MATERIAL, "topology", wraps=_MATERIAL.topology) as topology:
+                self.assertEqual(_PIPELINE.stage_handoff(root, handoff, inventories, _MATERIAL,
+                                                       publish_handoff=False), (None, None))
+                self.assertEqual(topology.call_count, 1)
+                self.assertFalse((root / "native-webrtc-handoff").exists())
+                path.write_bytes(b"changed same length"[:len(payload)])
+                with self.assertRaises(_MATERIAL.Refused):
+                    _PIPELINE.stage_handoff(root, handoff, inventories, _MATERIAL, publish_handoff=False)
+            # Omitting an unused archive cannot omit the original metadata cap.
+            with mock.patch.object(_PIPELINE, "MAX_JSON", 1), \
+                    mock.patch.object(_MATERIAL, "topology", side_effect=AssertionError("metadata must refuse first")):
+                with self.assertRaises(_PIPELINE.Refused):
+                    _PIPELINE.stage_handoff(root, handoff, inventories, _MATERIAL, publish_handoff=False)
+
+    @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA handoff")
+    def test_publishing_stage_keeps_actual_pack_cap_and_verified_archive_path(self):
+        def fixture(root, payload):
+            root.chmod(0o700); source = root / "fixture-source"; source.mkdir(mode=0o700)
+            path = source / "fixture.data"; path.write_bytes(payload); path.chmod(0o600)
+            row = {"path": "fixture.data", "bytes": len(payload),
+                   "sha256": hashlib.sha256(payload).hexdigest(), "mode": 0o600}
+            inventories = {source.name: {"role": "fixture", "files": [row], "directories": ["."]}}
+            return inventories, {"schema": "synthetic", "roots": inventories}
+        try:
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve(); inventories, handoff = fixture(root, b"owned DATA")
+                output, fact = _PIPELINE.stage_handoff(root, handoff, inventories, _MATERIAL, publish_handoff=True)
+                self.assertEqual(output, root / "native-webrtc-handoff/handoff.tar.gz")
+                self.assertEqual(fact, _MATERIAL.file_fact(output))
+                with tarfile.open(output, "r:gz") as archive:
+                    self.assertEqual([member.name for member in archive],
+                                     ["HANDOFF.json", "fixture-source", "fixture-source/fixture.data"])
+                    self.assertEqual(json.loads(archive.extractfile("HANDOFF.json").read()), handoff)
+                    self.assertEqual(archive.extractfile("fixture-source/fixture.data").read(), b"owned DATA")
+            with TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                payload = b"".join(hashlib.sha256(str(i).encode()).digest() for i in range(2048))
+                inventories, handoff = fixture(root, payload)
+                with mock.patch.object(_PIPELINE, "MAX_HANDOFF", 4096):
+                    with self.assertRaises(_PIPELINE.Refused):
+                        _PIPELINE.stage_handoff(root, handoff, inventories, _MATERIAL, publish_handoff=True)
+                self.assertEqual(_PIPELINE.pack_frame(),
+                                 {"pack_operation": "file_add", "pack_failure": "compressed_capacity"})
+                self.assertLessEqual((root / "native-webrtc-handoff/handoff.tar.gz").stat().st_size, 4096)
+        finally:
+            _PIPELINE.reset_pack_capture()
+
     @unittest.skipUnless(os.name == "posix" and sys.platform == "linux", "Linux-only DATA pack")
     def test_actual_gnu_gzip_pack_reports_payload_footer_and_first_body_failure(self):
         def attempt(payload, cap, fail_fact=False):

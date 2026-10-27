@@ -698,6 +698,28 @@ def pack_handoff(temp, handoff, inventories, material):
     return output
 
 
+def stage_handoff(temp, handoff, inventories, material, *, publish_handoff):
+    """Validate every staged byte; pack a bundle only for an explicit save."""
+    global POST_ASSEMBLY_PHASE
+    if publish_handoff:
+        POST_ASSEMBLY_PHASE = "handoff_pack"
+        output = pack_handoff(temp, handoff, inventories, material)
+        POST_ASSEMBLY_PHASE = "handoff_verify"
+        fact = material.file_fact(output)
+        need(fact["bytes"] <= MAX_HANDOFF)
+    else:
+        POST_ASSEMBLY_PHASE = "handoff_verify"
+        # Preserve the original metadata bound even when there is no archive.
+        raw = (json.dumps(handoff, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        need(len(raw) <= MAX_JSON)
+        output, fact = None, None
+    # Original complete topology and per-file reopen/hash/identity checks apply
+    # to BOTH paths. The non-publishing result never supplies a build handoff.
+    for name, spec in inventories.items():
+        material.topology(temp / name, {r["path"]: r for r in spec["files"]}, set(spec["directories"]))
+    return output, fact
+
+
 def job_fields():
     return {key: os.environ[key] for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB")}
 
@@ -997,21 +1019,22 @@ def stage(args, plan, temp, material):
         "source_commit": os.environ["GITHUB_SHA"], "roots": inventories,
         "build_admission_granted": False, "native_sources_complete": False,
         "build_ready": False, "distribution_ready": False}
-    POST_ASSEMBLY_PHASE = "handoff_pack"
-    output = pack_handoff(temp, handoff, inventories, material)
-    cache_dir = output.parent
-    POST_ASSEMBLY_PHASE = "handoff_verify"
-    fact = material.file_fact(output)
-    need(fact["bytes"] <= MAX_HANDOFF)
-    for name, spec in inventories.items():
-        material.topology(temp / name, {r["path"]: r for r in spec["files"]}, set(spec["directories"]))
+    output, fact = stage_handoff(temp, handoff, inventories, material,
+                                 publish_handoff=args.publish_handoff)
     POST_ASSEMBLY_PHASE = "handoff_emit"
-    key = "native-webrtc-source-" + args.plan_sha256[:16] + "-" + fact["sha256"]
-    material.write_json(cache_dir / "handoff-receipt.json", {"schema": 1, "key": key,
-        "archive": fact, "source_commit": os.environ["GITHUB_SHA"], "cache_write_authorized": False,
-        "build_admission_granted": False, "native_sources_complete": False})
+    if args.publish_handoff:
+        cache_dir = output.parent
+        key = "native-webrtc-source-" + args.plan_sha256[:16] + "-" + fact["sha256"]
+        material.write_json(cache_dir / "handoff-receipt.json", {"schema": 1, "key": key,
+            "archive": fact, "source_commit": os.environ["GITHUB_SHA"], "cache_write_authorized": False,
+            "build_admission_granted": False, "native_sources_complete": False})
+        handoff_receipt = {"handoff": fact, "cache_key": key}
+    else:
+        # Explicit DATA-only result: no archive, archive digest, cache key or
+        # stored-cache identity exists. Separately admitted build inputs remain mandatory.
+        handoff_receipt = {"handoff_packed": False}
     print("MORPHEUS_NATIVE_INPUT_RECEIPT " + json.dumps({"target": "linux-x64",
-        "handoff": fact, "cache_key": key, "pipeline_plan_sha256": args.plan_sha256,
+        "pipeline_plan_sha256": args.plan_sha256,
         "material_receipts": inputs_receipt["material_receipts"],
         "source_overlay": projection_fact,
         "source_inventory": material.file_fact(assembled / "handoff/linux-source-inventory.json"),
@@ -1020,9 +1043,9 @@ def stage(args, plan, temp, material):
         "source_materials": material.file_fact(base / "materials/source-materials.json"),
         "roots": {role: root.name for role, root in all_roots.items()},
         "unresolved_declarations": inputs_receipt["unresolved_declarations"],
-        "build_admission_granted": False}, sort_keys=True), flush=True)
-    emit("cache_key", key); emit("handoff_sha256", fact["sha256"]); emit("handoff_bytes", str(fact["bytes"]))
+        "build_admission_granted": False} | handoff_receipt, sort_keys=True), flush=True)
     if args.publish_handoff:
+        emit("cache_key", key); emit("handoff_sha256", fact["sha256"]); emit("handoff_bytes", str(fact["bytes"]))
         need(plan["cache_handoff_authorized"] is True)
         cache_capacity(key, fact["bytes"])
         emit("cache_save", "true")

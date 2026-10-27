@@ -44,6 +44,11 @@ function Initialize-HostReader {
     $script:HostBuffer = [byte[]]::new(1048576)
     $script:HostFileRecords = [Collections.Generic.List[object]]::new()
     $script:HostDirectories = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    # One exact directory's immutable lexical prefix-to-record association.
+    # Every cached record still receives a fresh native identity check per use.
+    $script:HostLastDirectoryPath = $null
+    $script:HostLastDirectoryChain = $null
+    $script:HostDirectoryChainLimit = 512
     $system = Get-HostCanonicalPath $env:SystemRoot
     if ($system -cnotmatch '^[A-Za-z]:\\Windows$') { throw 'host' }
     $script:HostKernel = [Runtime.InteropServices.NativeLibrary]::Load([IO.Path]::Combine($system, 'System32', 'kernel32.dll'))
@@ -188,6 +193,21 @@ function Assert-HostIdentity($Record, [bool] $Content) {
 
 function Open-HostDirectoryChain([string] $LiteralPath) {
     $full = Get-HostCanonicalPath $LiteralPath
+    $cached = $script:HostLastDirectoryChain
+    if ($null -ne $cached -and $cached.Length -le $script:HostDirectoryChainLimit -and
+        [string]::Equals($full, $script:HostLastDirectoryPath, [StringComparison]::Ordinal)) {
+        # Same records, ROOT to LEAF, with every original native type/identity
+        # read. Only prefix splitting, path allocation and dictionary probes
+        # are avoided; no filesystem fact or successful check is reused.
+        foreach ($record in $cached) { Assert-HostIdentity $record $false }
+        return $cached[$cached.Length - 1]
+    }
+    # Never publish an incomplete chain after a failed miss. A full cache is
+    # an optimization miss, not a new path refusal or an omitted validation.
+    $script:HostLastDirectoryPath = $null
+    $script:HostLastDirectoryChain = $null
+    $chain = [Collections.Generic.List[object]]::new()
+    $remember = $true
     $current = $full.Substring(0, 3)
     $parts = @('') + @($full.Substring(3).Split('\') | Where-Object { $_ -ne '' })
     foreach ($part in $parts) {
@@ -195,7 +215,18 @@ function Open-HostDirectoryChain([string] $LiteralPath) {
         if (-not $script:HostDirectories.ContainsKey($current)) {
             $record = Open-HostReadHandle $current $true
             $script:HostDirectories.Add($current, $record)
-        } else { Assert-HostIdentity $script:HostDirectories[$current] $false }
+        } else {
+            $record = $script:HostDirectories[$current]
+            Assert-HostIdentity $record $false
+        }
+        if ($remember) {
+            if ($chain.Count -lt $script:HostDirectoryChainLimit) { $chain.Add($record) }
+            else { $remember = $false; $chain.Clear() }
+        }
+    }
+    if ($remember) {
+        $script:HostLastDirectoryPath = $full
+        $script:HostLastDirectoryChain = @($chain.ToArray())
     }
     return $script:HostDirectories[$full]
 }
@@ -327,6 +358,10 @@ function Close-HostReader {
         } finally {
             # Retire lexical ownership even if native cleanup throws. No result
             # survives Close or is shared with the next initialized reader.
+            $chain = $script:HostLastDirectoryChain
+            $script:HostLastDirectoryPath = $null
+            $script:HostLastDirectoryChain = $null
+            if ($null -ne $chain) { [Array]::Clear($chain, 0, $chain.Length) }
             $memo = $script:HostCanonicalPaths
             $script:HostCanonicalPaths = $null
             $script:HostCanonicalUnits = 0

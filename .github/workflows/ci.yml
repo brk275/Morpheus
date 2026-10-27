@@ -741,6 +741,14 @@ jobs:
               cargo test --locked -p matrix-sdk --features testing,e2e-encryption --lib "$key_case" -- --exact
             done
           fi
+      - name: Compile focused app timeline test before live fixture deadlines
+        if: runner.os == 'Linux' && needs.scope.outputs.check_route == 'matrix' && (needs.scope.outputs.matrix_suite == 'full' || needs.scope.outputs.matrix_suite == 'app-timeline' || needs.scope.outputs.matrix_suite == 'native-call' || needs.scope.outputs.matrix_suite == 'timeline-reads')
+        # Same target/features and Slint metadata as Acceptance.app_timeline.
+        # Build under the existing job bound, before services/test clocks start;
+        # the 480-second command and 420-second live-case limits stay fixed.
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
+        run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app --no-run
       - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
         id: matrix-tests
         if: runner.os == 'Linux' && (needs.scope.outputs.check_route == 'all' || needs.scope.outputs.check_route == 'matrix')

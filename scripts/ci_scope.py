@@ -234,8 +234,8 @@ AUTOMATIC_CONTROL_INPUTS = frozenset((
     "scripts/ci_scope.py", "scripts/tests/test_ci_scope.py",
     ".github/workflows/ci.yml", "scripts/tests/test_ci_acceptance.py",
 ))
-REVIEWED_CONTROL_WORKFLOW_SHA256 = "2c1ee738dfc27846125eb571602cb81f78ea8cd0849a62f51739ee939235320c"
-REVIEWED_CONTROL_WORKFLOW_BYTES = 65013
+REVIEWED_CONTROL_WORKFLOW_SHA256 = "2b0422f336ee633146a69212a68ab6e87bd666c337c5dab1583b76a82c0f9b2d"
+REVIEWED_CONTROL_WORKFLOW_BYTES = 65769
 
 
 def reviewed_control_only(paths, event, event_name, force_all=False):
