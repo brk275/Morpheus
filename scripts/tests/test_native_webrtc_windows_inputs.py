@@ -1219,7 +1219,9 @@ try {
     $ownedScratch = $script:HostInfoScratch
     $ownedMemo = $script:HostCanonicalPaths
     if ($ownedMemory -eq [IntPtr]::Zero -or $ownedScratch.Length -ne 52 -or
-        $script:HostCanonicalEntryLimit -ne 8192 -or $script:HostCanonicalUnitLimit -ne 1048576) { throw 'identity' }
+        $script:HostCanonicalEntryLimit -ne 8192 -or $script:HostCanonicalUnitLimit -ne 1048576 -or
+        $script:HostDirectoryChainLimit -ne 512 -or $null -ne $script:HostLastDirectoryPath -or
+        $null -ne $script:HostLastDirectoryChain) { throw 'identity' }
     # Count actual lexical validations, not a mock result. Exact repeats alone
     # may hit; case-distinct inputs and every refused input reach the old body.
     $script:OriginalCanonicalValidator = ${function:Get-CanonicalHostPath}
@@ -1347,10 +1349,11 @@ try {
         $this.Calls++; $this.Trace.Add('type')
         return $this.Delegate.Invoke($Handle)
     }
-    $infoProbe = [pscustomobject]@{ Delegate = $originalInfo; Calls = 0; Trace = $nativeTrace }
+    $infoHandles = [Collections.Generic.List[IntPtr]]::new()
+    $infoProbe = [pscustomobject]@{ Delegate = $originalInfo; Calls = 0; Trace = $nativeTrace; Handles = $infoHandles }
     $infoProbe | Add-Member -MemberType ScriptMethod -Name Invoke -Value {
         param([IntPtr] $Handle, [IntPtr] $Memory)
-        $this.Calls++; $this.Trace.Add('info')
+        $this.Calls++; $this.Trace.Add('info'); $this.Handles.Add($Handle)
         return $this.Delegate.Invoke($Handle, $Memory)
     }
     try {
@@ -1388,6 +1391,71 @@ try {
         $firstChecks = $infoProbe.Calls
         $null = Open-HostDirectoryChain $good
         if ($firstChecks -le 0 -or $infoProbe.Calls -le $firstChecks) { throw 'identity' }
+        # Derive the expected prefix sequence independently from the literal
+        # fixture path, not from the production cache. Every cache hit must
+        # still reach each real ancestor handle in the original root-first order.
+        $expectedAncestors = [Collections.Generic.List[IntPtr]]::new()
+        $prefix = $good.Substring(0, 3)
+        $expectedAncestors.Add($script:HostDirectories[$prefix].handle)
+        foreach ($part in $good.Substring(3).Split('\')) {
+            $prefix = [IO.Path]::Combine($prefix, $part)
+            $expectedAncestors.Add($script:HostDirectories[$prefix].handle)
+        }
+        $cachedChain = $script:HostLastDirectoryChain
+        if ($script:HostLastDirectoryPath -cne $good -or
+            $script:HostDirectoryChainLimit -ne 512 -or $cachedChain.Length -ne $expectedAncestors.Count) { throw 'identity' }
+        $beforeChecks = $infoProbe.Calls; $beforeTrace = $infoHandles.Count
+        $leaf = Open-HostDirectoryChain $good
+        if (-not [object]::ReferenceEquals($cachedChain, $script:HostLastDirectoryChain) -or
+            -not [object]::ReferenceEquals($leaf, $script:HostDirectories[$good]) -or
+            $infoProbe.Calls -ne $beforeChecks + $expectedAncestors.Count) { throw 'identity' }
+        for ($i = 0; $i -lt $expectedAncestors.Count; $i++) {
+            if ($infoHandles[$beforeTrace + $i] -ne $expectedAncestors[$i]) { throw 'identity' }
+        }
+        # A case-distinct key misses this Ordinal cache, but retains the old
+        # case-insensitive directory map and full native checks.
+        $otherCase = $good.Substring(0, $good.Length - 4) + 'GOOD'
+        $null = Open-HostDirectoryChain $otherCase
+        if ($script:HostLastDirectoryPath -cne $otherCase -or
+            [object]::ReferenceEquals($cachedChain, $script:HostLastDirectoryChain)) { throw 'identity' }
+        $null = Open-HostDirectoryChain $good
+        # Cache capacity is not an admission limit: exact original checking
+        # continues, twice, even when no complete chain can be retained.
+        $chainLimit = $script:HostDirectoryChainLimit
+        try {
+            $script:HostDirectoryChainLimit = 1
+            $beforeChecks = $infoProbe.Calls
+            $null = Open-HostDirectoryChain $good
+            $null = Open-HostDirectoryChain $good
+            if ($infoProbe.Calls -ne $beforeChecks + 2 * $expectedAncestors.Count -or
+                $null -ne $script:HostLastDirectoryPath -or $null -ne $script:HostLastDirectoryChain) { throw 'identity' }
+        } finally { $script:HostDirectoryChainLimit = $chainLimit }
+        $null = Open-HostDirectoryChain $good
+        # A changed expected ROOT identity must still fail on the first real
+        # comparison; cached structural references cannot hide the mutation.
+        $rootRecord = $script:HostDirectories[$good.Substring(0, 3)]
+        $savedRootComparison = $rootRecord.comparison
+        $changedRootComparison = [byte[]]$savedRootComparison.Clone()
+        $changedRootComparison[28] = $changedRootComparison[28] -bxor 1
+        $beforeChecks = $infoProbe.Calls
+        try {
+            $rootRecord.comparison = $changedRootComparison
+            $refusal = ''
+            try { $null = Open-HostDirectoryChain $good } catch { $refusal = $_.Exception.Message }
+            if ($refusal -cne 'changed' -or $infoProbe.Calls -ne $beforeChecks + 1) { throw 'identity' }
+        } finally { $rootRecord.comparison = $savedRootComparison }
+        # A failing miss must not publish a partial prefix list.
+        $leafRecord = $script:HostDirectories[$good]
+        $savedLeafComparison = $leafRecord.comparison
+        $changedLeafComparison = [byte[]]$savedLeafComparison.Clone()
+        $changedLeafComparison[44] = $changedLeafComparison[44] -bxor 1
+        try {
+            $leafRecord.comparison = $changedLeafComparison
+            Must-Refuse { Open-HostDirectoryChain $otherCase }
+            if ($null -ne $script:HostLastDirectoryPath -or $null -ne $script:HostLastDirectoryChain) { throw 'identity' }
+        } finally { $leafRecord.comparison = $savedLeafComparison }
+        $null = Open-HostDirectoryChain $good
+        $ownedDirectoryChain = $script:HostLastDirectoryChain
         $toolPath = Join-Path $good 'tool.bin'
         if (-not $ownedMemo.ContainsKey($toolPath)) { throw 'identity' }
         $beforeHandles = $script:HostHandles.Count; $beforeChecks = $infoProbe.Calls
@@ -1405,7 +1473,8 @@ try {
         Must-Refuse { Get-HostHandleInfo $script:HostFileRecords[0].handle }
         Must-Refuse { Close-HostReader }
         if ($script:HostInfoMemory -ne $ownedMemory -or
-            -not [object]::ReferenceEquals($ownedMemo, $script:HostCanonicalPaths)) { throw 'identity' }
+            -not [object]::ReferenceEquals($ownedMemo, $script:HostCanonicalPaths) -or
+            -not [object]::ReferenceEquals($ownedDirectoryChain, $script:HostLastDirectoryChain)) { throw 'identity' }
     }
     finally { $script:HostInfoBusy = $false }
     # Actual retained READ-sharing owner denies a new writer, not a mock lock.
@@ -1414,7 +1483,8 @@ try {
 } finally { Close-HostReader }
 if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
     $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
-    $ownedMemo.Count -ne 0) { throw 'identity' }
+    $ownedMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
+    $null -ne $script:HostLastDirectoryChain -or @($ownedDirectoryChain | Where-Object { $null -ne $_ }).Count -ne 0) { throw 'identity' }
 # Cleanup remains idempotent; no freed metadata pointer or lexical owner is reused.
 Close-HostReader
 Must-Refuse { Get-HostHandleInfo ([IntPtr]::Zero) }
@@ -1438,7 +1508,8 @@ try {
     if ($script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
         $script:HostInfoBusy -or $script:HostHandles.Count -ne 0 -or
         $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
-        $failedMemo.Count -ne 0) { throw 'identity' }
+        $failedMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
+        $null -ne $script:HostLastDirectoryChain) { throw 'identity' }
 } finally { $env:SystemRoot = $originalSystemRoot }
 foreach ($boundary in @('bytes', 'entries', 'deadline', 'handles', 'metadata')) {
     $caseStage = 'limit_' + $boundary
@@ -1523,7 +1594,8 @@ try {
     $null = Get-HostRootInventory $budgetRoot
     $ownedHandleCount = $script:HostHandles.Count
     $exceptionMemo = $script:HostCanonicalPaths
-    if ($ownedHandleCount -lt 2 -or $exceptionMemo.Count -eq 0) { throw 'identity' }
+    $exceptionChain = $script:HostLastDirectoryChain
+    if ($ownedHandleCount -lt 2 -or $exceptionMemo.Count -eq 0 -or $null -eq $exceptionChain) { throw 'identity' }
     $expectedConsumed = $script:HostHandles[$ownedHandleCount - 1]
     $script:HostClose = $closeProbe
     Must-Refuse { Close-HostReader }
@@ -1532,7 +1604,8 @@ try {
         $script:HostHandles[$ownedHandleCount - 1] -ne [IntPtr]::Zero -or
         $script:HostInfoMemory -ne [IntPtr]::Zero -or $null -ne $script:HostInfoScratch -or
         $script:HostInfoBusy -or $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
-        $exceptionMemo.Count -ne 0) { throw 'identity' }
+        $exceptionMemo.Count -ne 0 -or $null -ne $script:HostLastDirectoryPath -or
+        $null -ne $script:HostLastDirectoryChain -or @($exceptionChain | Where-Object { $null -ne $_ }).Count -ne 0) { throw 'identity' }
     # Remaining retained handles are still owned, and second cleanup attempts
     # each exactly once while skipping the already consumed zeroed slot.
     Close-HostReader
