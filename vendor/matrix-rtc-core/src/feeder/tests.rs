@@ -475,13 +475,20 @@ fn device_hints_coalesce_one_marker_and_fixed_public_identifiers() {
     assert!(rx.try_recv().is_err());
     let batch = devices.lock().unwrap().take();
     assert_eq!(batch.len(), DEVICE_UPDATE_BATCH);
-    assert!(batch.iter().all(|(user, device)| user == BOB && !device.is_empty()));
+    assert!(
+        batch
+            .iter()
+            .all(|(user, device)| user == BOB && !device.is_empty())
+    );
     assert!(devices.lock().unwrap().devices.is_empty());
     sink.on_device_updates(vec![(BOB.into(), "LATER".into())]);
     sink.on_device_updates(vec![(BOB.into(), "LATER".into())]);
     assert!(matches!(rx.try_recv(), Ok(RoomInput::Devices)));
     assert!(rx.try_recv().is_err());
-    assert_eq!(devices.lock().unwrap().take(), vec![(BOB.into(), "LATER".into())]);
+    assert_eq!(
+        devices.lock().unwrap().take(),
+        vec![(BOB.into(), "LATER".into())]
+    );
 }
 
 #[tokio::test]

@@ -1893,7 +1893,10 @@ mod peer_renewal_tests {
             (own.user_id.clone(), own.device_id.clone()),
             ("@outside:example.org".into(), "NEWDEVICE".into()),
             ("@peer:example.org".into(), "bad\n".into()),
-            ("@peer:example.org".into(), "x".repeat(PEER_RENEWAL_ID_BYTES + 1)),
+            (
+                "@peer:example.org".into(),
+                "x".repeat(PEER_RENEWAL_ID_BYTES + 1),
+            ),
         ];
         assert!(!seen.observe_devices(
             &ignored,

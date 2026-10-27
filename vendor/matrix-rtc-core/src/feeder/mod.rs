@@ -254,7 +254,11 @@ impl DeviceUpdateBuffer {
             }) {
                 continue;
             }
-            if !self.devices.iter().any(|entry| entry.0 == user && entry.1 == device) {
+            if !self
+                .devices
+                .iter()
+                .any(|entry| entry.0 == user && entry.1 == device)
+            {
                 if self.devices.len() == DEVICE_UPDATE_BATCH {
                     break;
                 }
