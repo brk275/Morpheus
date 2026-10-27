@@ -1173,6 +1173,22 @@ foreach ($value in @($null, '', 'BOOTSTRAP', "private`npath token payload", ('pr
         throw 'failure_context'
     }
 }
+foreach ($budget in @('deadline', 'entries', 'bytes', 'handles', 'metadata')) {
+    $message = @(Get-HostPreflightFailureMessage 'vs_inventory' $budget)
+    if ($message.Count -ne 1 -or $message[0] -cne
+        ('MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=vs_inventory budget=' + $budget)) {
+        throw 'failure_context'
+    }
+}
+foreach ($value in @($null, '', 'BYTES', "private`npath token payload", ('private' * 1000),
+    ('by' + [char]0 + 'tes'), ('by' + [char]0x200b + 'tes'),
+    @{ path = 'private'; error = 'private' }, [pscustomobject]@{ value = 'private' })) {
+    $message = @(Get-HostPreflightFailureMessage 'vs_inventory' $value)
+    if ($message.Count -ne 1 -or $message[0] -cne
+        'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=vs_inventory budget=unknown') {
+        throw 'failure_context'
+    }
+}
 $caseStage = 'metadata'
 $metadata = @{ run_id = '1'; run_attempt = '1'; source_commit = ('a' * 40);
     image_os = 'win25'; image_version = '20261026.1.0'; powershell_version = '7.5.3' }
@@ -1262,9 +1278,42 @@ try {
     Must-Refuse { Initialize-HostReader }
     if ($script:HostInfoMemory -ne $ownedMemory -or
         -not [object]::ReferenceEquals($ownedMemo, $script:HostCanonicalPaths)) { throw 'identity' }
+    # Every case omits all later limit properties: evaluating past the first
+    # refusal would throw under StrictMode instead of preserving throw 'limit'.
+    # Only the scalar byte counter and limit view are synthetic; no handles,
+    # native reads or filesystem authorization results are substituted.
+    $originalLimits = $script:HostLimits
+    $originalBytes = $script:HostBytes
+    $script:HostBytes = [uint64]1
+    $budgetOrder = @('deadline', 'entries', 'bytes', 'handles', 'metadata')
+    try {
+        for ($first = 0; $first -lt $budgetOrder.Count; $first++) {
+            $values = @{ Seconds = $(if ($first -eq 0) { -1 } else { 180 }) }
+            if ($first -ge 1) { $values.Entries = $(if ($first -eq 1) { -1 } else { 200000 }) }
+            if ($first -ge 2) { $values.TotalBytes = $(if ($first -eq 2) { 0 } else { 68719476736 }) }
+            if ($first -ge 3) { $values.Handles = $(if ($first -eq 3) { -1 } else { 200256 }) }
+            if ($first -ge 4) { $values.MetadataBytes = -1 }
+            $script:HostLimits = [pscustomobject]$values
+            $script:HostPreflightBudgetCause = 'unknown'
+            $refusal = ''
+            try { Assert-HostBudget } catch { $refusal = $_.Exception.Message }
+            if ($refusal -cne 'limit' -or $script:HostPreflightBudgetCause -cne $budgetOrder[$first]) {
+                throw 'failure_context'
+            }
+        }
+        # Later refusals cannot replace the first observed budget context.
+        $script:HostLimits = [pscustomobject]@{ Seconds = -1 }
+        Must-Refuse { Assert-HostBudget }
+        if ($script:HostPreflightBudgetCause -cne 'metadata') { throw 'failure_context' }
+    } finally {
+        $script:HostLimits = $originalLimits
+        $script:HostBytes = $originalBytes
+        $script:HostPreflightBudgetCause = 'unknown'
+    }
     $caseStage = 'inventory'
     $result = Get-HostRootInventory $good
-    if ($result.files.Count -ne 2 -or $script:HostBytes -ne 5) { throw 'inventory' }
+    if ($result.files.Count -ne 2 -or $script:HostBytes -ne 5 -or
+        $script:HostPreflightBudgetCause -cne 'unknown') { throw 'inventory' }
     $caseStage = 'digest_assertion'
     $tool = @($result.files | Where-Object { $_.path -eq 'tool.bin' })
     if ($tool.Count -ne 1 -or $tool[0].bytes -ne 4 -or
@@ -1344,7 +1393,7 @@ try {
         $null -ne $script:HostCanonicalPaths -or $script:HostCanonicalUnits -ne 0 -or
         $failedMemo.Count -ne 0) { throw 'identity' }
 } finally { $env:SystemRoot = $originalSystemRoot }
-foreach ($boundary in @('bytes', 'entries', 'deadline', 'metadata')) {
+foreach ($boundary in @('bytes', 'entries', 'deadline', 'handles', 'metadata')) {
     $caseStage = 'limit_' + $boundary
     Initialize-HostReader
     try {
@@ -1352,10 +1401,19 @@ foreach ($boundary in @('bytes', 'entries', 'deadline', 'metadata')) {
             'bytes' { $script:HostLimits.FileBytes = 3 }
             'entries' { $script:HostLimits.Entries = 1 }
             'deadline' { $script:HostLimits.Seconds = -1 }
+            'handles' { $script:HostLimits.Handles = 0 }
             'metadata' { $script:HostLimits.MetadataBytes = 1 }
         }
+        if ($script:HostPreflightBudgetCause -cne 'unknown') { throw 'failure_context' }
         Must-Refuse { Get-HostRootInventory $good }
+        if ($script:HostPreflightBudgetCause -cne $boundary) { throw 'failure_context' }
+        $message = @(Get-HostPreflightFailureMessage 'vs_inventory' $script:HostPreflightBudgetCause)
+        if ($message.Count -ne 1 -or $message[0] -cne
+            ('MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=vs_inventory budget=' + $boundary)) {
+            throw 'failure_context'
+        }
     } finally { Close-HostReader }
+    if ($script:HostPreflightBudgetCause -cne $boundary) { throw 'failure_context' }
 }
 # The aggregate boundary is checked against the opened size before the
 # first payload Read argument is evaluated, not only after a completed hash.
@@ -1374,7 +1432,8 @@ try {
     }
     $refusal = ''
     try { Get-HostRootInventory $budgetRoot | Out-Null } catch { $refusal = $_.Exception.Message }
-    if ($refusal -cne 'limit' -or $script:HostPayloadReadAttempted -or $script:HostBytes -ne 3) {
+    if ($refusal -cne 'limit' -or $script:HostPayloadReadAttempted -or $script:HostBytes -ne 3 -or
+        $script:HostPreflightBudgetCause -cne 'bytes') {
         throw 'aggregate_before_read'
     }
 } finally { Close-HostReader }
@@ -1499,7 +1558,7 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
             # Unknown/multiple/raw lines and all child stderr stay withheld.
             stages = ("source_parse", "source_functions", "failure_context", "metadata", "path_refusals",
                       "synthetic_setup", "reader_initialize", "inventory", "digest_assertion",
-                      "write_exclusion", "limit_bytes", "limit_entries", "limit_deadline",
+                      "write_exclusion", "limit_bytes", "limit_entries", "limit_deadline", "limit_handles",
                       "limit_metadata", "aggregate_setup", "aggregate_before_read",
                       "aggregate_exact_fit", "junction_setup", "junction_refusal")
             checks = ("source_parse", "metadata", "accepted", "path", "path_input",
@@ -1535,7 +1594,7 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
                 text=True, encoding="utf-8", capture_output=True, timeout=45, env=env)
             self.assertEqual(result.returncode, 1, "fixed preflight failure must remain fatal")
             self.assertTrue(result.stdout.strip() ==
-                            "MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=bootstrap",
+                            "MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=bootstrap budget=unknown",
                             "fixed preflight failure context mismatch")
             self.assertTrue(not result.stderr, "preflight failure emitted unexpected stderr")
 

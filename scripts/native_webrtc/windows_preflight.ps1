@@ -24,6 +24,7 @@ function Initialize-HostReader {
     $previousHandles = Get-Variable -Name HostHandles -Scope Script -ErrorAction SilentlyContinue
     if (($null -ne $previous -and $previous.Value -ne [IntPtr]::Zero) -or
         ($null -ne $previousHandles -and $previousHandles.Value.Count -ne 0)) { throw 'identity' }
+    $script:HostPreflightBudgetCause = 'unknown'
     $script:HostInfoMemory = [IntPtr]::Zero
     $script:HostInfoScratch = $null
     $script:HostInfoBusy = $false
@@ -57,10 +58,21 @@ function Initialize-HostReader {
 }
 
 function Assert-HostBudget {
-    if ($script:HostWatch.Elapsed.TotalSeconds -gt $script:HostLimits.Seconds -or
-        $script:HostCount -gt $script:HostLimits.Entries -or $script:HostBytes -gt $script:HostLimits.TotalBytes -or
-        $script:HostHandles.Count -gt $script:HostLimits.Handles -or
-        $script:HostMetadataBytes -gt $script:HostLimits.MetadataBytes) { throw 'limit' }
+    # Evaluate each original predicate once, in the same short-circuit order.
+    # Retain only the first refused budget, including through reader cleanup.
+    $cause = if ($script:HostWatch.Elapsed.TotalSeconds -gt $script:HostLimits.Seconds) {
+        'deadline'
+    } elseif ($script:HostCount -gt $script:HostLimits.Entries) {
+        'entries'
+    } elseif ($script:HostBytes -gt $script:HostLimits.TotalBytes) {
+        'bytes'
+    } elseif ($script:HostHandles.Count -gt $script:HostLimits.Handles) {
+        'handles'
+    } elseif ($script:HostMetadataBytes -gt $script:HostLimits.MetadataBytes) {
+        'metadata'
+    } else { return }
+    if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = $cause }
+    throw 'limit'
 }
 
 function Get-CanonicalHostPath([string] $Value) {
@@ -178,11 +190,20 @@ function Get-HostFileFact([string] $LiteralPath, [int] $TextLimit = 0, [uint64] 
     $null = Open-HostDirectoryChain ([IO.Path]::GetDirectoryName($full))
     $record = Open-HostReadHandle $full $false
     $script:HostFileRecords.Add($record)
-    if ($record.initial.bytes -gt $script:HostLimits.FileBytes) { throw 'file_size' }
-    if ($TextLimit -gt 0 -and $record.initial.bytes -gt $TextLimit) { throw 'text_size' }
+    if ($record.initial.bytes -gt $script:HostLimits.FileBytes) {
+        if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'bytes' }
+        throw 'file_size'
+    }
+    if ($TextLimit -gt 0 -and $record.initial.bytes -gt $TextLimit) {
+        if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'bytes' }
+        throw 'text_size'
+    }
     # The retained no-follow handle supplies the size. Refuse before creating
     # a stream or digest so the next payload cannot exceed the root budget.
-    if ($record.initial.bytes -gt $RemainingBytes) { throw 'limit' }
+    if ($record.initial.bytes -gt $RemainingBytes) {
+        if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'bytes' }
+        throw 'limit'
+    }
     $safe = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($record.handle, $false)
     $stream = [IO.FileStream]::new($safe, [IO.FileAccess]::Read, 1048576, $false)
     $digest = [Security.Cryptography.SHA256]::Create(); $buffer = $script:HostBuffer
@@ -216,7 +237,10 @@ function Get-HostDirectoryNames([string] $Directory) {
         $null = Get-HostCanonicalPath ([IO.Path]::Combine($Directory, $name))
         if (-not $folded.Add($name)) { throw 'alias' }
         $names.Add($name)
-        if ($names.Count -gt $script:HostLimits.Entries) { throw 'entries' }
+        if ($names.Count -gt $script:HostLimits.Entries) {
+            if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'entries' }
+            throw 'entries'
+        }
     }
     $result = $names.ToArray(); [Array]::Sort($result, [StringComparer]::Ordinal)
     return ,$result
@@ -311,18 +335,32 @@ function Get-HostReceiptMetadata([hashtable] $Values) {
     return $Values
 }
 
-function Get-HostPreflightFailureMessage($Stage) {
+function Get-HostPreflightFailureMessage($Stage, $BudgetCause) {
+    # Keep the original one-argument result byte-for-byte. The entry opts into
+    # a separate closed budget label; never stringify an untrusted value.
+    $budgetSuffix = ''
+    if ($PSBoundParameters.ContainsKey('BudgetCause')) {
+        $budgetSuffix = ' budget=unknown'
+        if ($BudgetCause -is [string]) {
+            foreach ($budget in @('deadline', 'entries', 'bytes', 'handles', 'metadata')) {
+                if ([string]::Equals($BudgetCause, $budget, [StringComparison]::Ordinal)) {
+                    $budgetSuffix = ' budget=' + $budget
+                    break
+                }
+            }
+        }
+    }
     # Only source-fixed phases can reach the log. Never inspect the exception,
     # a path, environment value or another object's string representation.
     if ($Stage -is [string]) {
         foreach ($phase in @('initialization', 'bootstrap', 'vs_inventory',
             'sdk_inventory', 'role_binding', 'final_identity', 'serialization')) {
             if ([string]::Equals($Stage, $phase, [StringComparison]::Ordinal)) {
-                return 'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=' + $phase
+                return 'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=' + $phase + $budgetSuffix
             }
         }
     }
-    return 'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=unknown'
+    return 'MORPHEUS_NATIVE_WINDOWS_PREFLIGHT failed stage=unknown' + $budgetSuffix
 }
 
 function Get-HostToolchainInventory {
@@ -388,6 +426,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $script:HostPreflightStage = 'bootstrap'
+$script:HostPreflightBudgetCause = 'unknown'
 try {
     if ($Mode -cnotin @('basic', 'host-toolchain')) { throw 'mode' }
     if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
@@ -441,7 +480,10 @@ try {
         # Only filenames, sizes and hashes of fixed host roots leave the reader.
         # Never print SDK/tool bytes, ambient environment or native error text.
         $json = $inventory | ConvertTo-Json -Depth 10 -Compress
-        if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 33554432) { throw 'json_size' }
+        if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 33554432) {
+            if ($script:HostPreflightBudgetCause -ceq 'unknown') { $script:HostPreflightBudgetCause = 'metadata' }
+            throw 'json_size'
+        }
         Write-Output $json
         return
     }
@@ -464,6 +506,6 @@ try {
         build_admission_granted = $false
     } | ConvertTo-Json -Depth 5 -Compress | Write-Output
 } catch {
-    Write-Output (Get-HostPreflightFailureMessage $script:HostPreflightStage)
+    Write-Output (Get-HostPreflightFailureMessage $script:HostPreflightStage $script:HostPreflightBudgetCause)
     exit 1
 }
