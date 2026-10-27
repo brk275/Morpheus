@@ -383,7 +383,14 @@ WINDOWS_RC_RECEIPT = {'schema': 'morpheus-windows-native-tools-projection-v1',
  'license_compliance_verified': False}
 
 
-def native_tools_material(value: dict, native: dict, overlay: list) -> dict:
+def native_tools_material(value: dict | None, native: dict, overlay: list) -> dict | None:
+    # Absence is valid only without the supplemental projection. A case alias
+    # still requires a receipt, then fails the exact typed-row comparison below.
+    projected = WINDOWS_RC_RECEIPT["projection"]
+    rows = [row for row in overlay if row["path"].casefold() == projected["path"].casefold()]
+    require((value is not None) == bool(rows))
+    if value is None:
+        return None
     # Exactly the original supplemental object, never a generic executable or
     # a claimed source/license approval. Source identity is checked separately.
     require(value == WINDOWS_RC_RECEIPT
@@ -391,9 +398,7 @@ def native_tools_material(value: dict, native: dict, overlay: list) -> dict:
                     "preferred_source_verified", "license_compliance_verified")))
     pointer = value["source_pointer"]
     require(native.get(pointer["path"]) == {k: pointer[k] for k in ("bytes", "sha256")})
-    projected = value["projection"]
-    require([row for row in overlay if row["path"].casefold() == projected["path"].casefold()]
-            == [projected])
+    require(rows == [projected])
     return value
 
 
@@ -659,8 +664,10 @@ def source_export(inputs: dict, source: Path, depot: Path, runner: Path,
     require(source == provenance / "checkout/src" and depot == provenance / "checkout/outer-depot")
     provenance_files = inventory(provenance, specification["files"])
     refs = inputs["source_provision"]
-    require(set(refs) == {"producer_interface", "receipt", "materials", "repositories",
-                          "source_inventory", "depot_inventory", "security_receipt", "source_overlay", "source_plan", "gitlinks", "aliases", "native_tools_receipt"})
+    required_refs = {"producer_interface", "receipt", "materials", "repositories",
+                     "source_inventory", "depot_inventory", "security_receipt",
+                     "source_overlay", "source_plan", "gitlinks", "aliases"}
+    require(set(refs) in (required_refs, required_refs | {"native_tools_receipt"}))
     require(refs["producer_interface"]["sha256"] == PRODUCER_INTERFACE_SHA)
     interface = material_json(refs["producer_interface"])
     require(interface["schema"] == "morpheus-native-source-producer-interface-v2"
@@ -672,8 +679,9 @@ def source_export(inputs: dict, source: Path, depot: Path, runner: Path,
              "source_inventory": "materials/post-patch-source-inventory.json",
              "depot_inventory": "materials/outer-depot-inventory.json",
              "security_receipt": "materials/security-source-receipt.json",
-             "aliases": "materials/source-aliases.json",
-             "native_tools_receipt": "materials/windows-native-tools.json"}
+             "aliases": "materials/source-aliases.json"}
+    if "native_tools_receipt" in refs:
+        paths["native_tools_receipt"] = "materials/windows-native-tools.json"
     for name, relative_path in paths.items():
         require(plain_path(refs[name]["path"]) == provenance / relative_path)
     receipt = material_json(refs["receipt"])
@@ -697,7 +705,11 @@ def source_export(inputs: dict, source: Path, depot: Path, runner: Path,
     overlay_rows = material_json(refs["source_overlay"])
     require(type(overlay_rows) is list)
     overlay = typed_files(overlay_rows) if overlay_rows else []
-    supplemental = native_tools_material(material_json(refs["native_tools_receipt"]),
+    require(("native_tools_receipt" in refs) == any(
+        row["path"].casefold() == WINDOWS_RC_RECEIPT["projection"]["path"].casefold()
+        for row in overlay_rows))
+    supplemental = native_tools_material(
+        material_json(refs["native_tools_receipt"]) if "native_tools_receipt" in refs else None,
         {row["path"]: {k: row[k] for k in ("bytes", "sha256")} for row in native}, overlay_rows)
     expected = {}
     folded = set()
@@ -1071,8 +1083,10 @@ def build(args: argparse.Namespace) -> None:
     staged["SOURCE_GITLINKS.json"] = copy_checked(gitlink_source, stage / "SOURCE_GITLINKS.json", gitlink_fact)
     alias_source, alias_fact = file_record(inputs["source_provision"]["aliases"])
     staged["SOURCE_ALIASES.json"] = copy_checked(alias_source, stage / "SOURCE_ALIASES.json", alias_fact)
-    native_tools_source, native_tools_fact = file_record(inputs["source_provision"]["native_tools_receipt"])
-    staged["NATIVE_TOOLS.json"] = copy_checked(native_tools_source, stage / "NATIVE_TOOLS.json", native_tools_fact)
+    native_tools_record = inputs["source_provision"].get("native_tools_receipt")
+    if native_tools_record is not None:
+        native_tools_source, native_tools_fact = file_record(native_tools_record)
+        staged["NATIVE_TOOLS.json"] = copy_checked(native_tools_source, stage / "NATIVE_TOOLS.json", native_tools_fact)
     with (stage / "lib/webrtc.lib").open("rb") as library:
         require(library.read(8) == b"!<arch>\n")
     for name in headers:
@@ -1098,7 +1112,7 @@ def build(args: argparse.Namespace) -> None:
         "gitlinks_material_sha256": export["gitlinks_sha256"], "gitlinks": export["gitlinks"]["rows"],
         "uninitialized_gitlinks": len(export["gitlinks"]["rows"]), "submodule_sources_materialized": False,
         "source_aliases_sha256": inputs["source_provision"]["aliases"]["sha256"],
-        "native_tools_receipt_sha256": inputs["source_provision"]["native_tools_receipt"]["sha256"],
+        "native_tools_receipt_sha256": native_tools_record["sha256"] if native_tools_record is not None else None,
         "native_tools": export["native_tools"],
         "source_alias_normalizations": export["aliases"], "source_filesystem_symlinks_created": False,
         "native_security_plan_sha256": SECURITY_PLAN_SHA,

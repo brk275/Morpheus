@@ -29,7 +29,8 @@ class WindowsNativeInputsTests(unittest.TestCase):
         record = {"path": "native/webrtc/synthetic.json", "bytes": len(raw),
                   "sha256": hashlib.sha256(raw).hexdigest()}
         for case, expected in (("record", "core_asset_record"), ("path", "core_asset_path"),
-                ("identity", "core_asset_identity"), ("read", "core_asset_read"),
+                ("identity", "core_expected_size"), ("hash", "core_expected_hash"),
+                ("read", "core_asset_read"),
                 ("json", "core_asset_json")):
             selected = {} if case == "record" else dict(record)
             if case == "path":
@@ -37,6 +38,8 @@ class WindowsNativeInputsTests(unittest.TestCase):
             observed = {key: record[key] for key in ("bytes", "sha256")}
             if case == "identity":
                 observed["bytes"] += 1
+            if case == "hash":
+                observed["sha256"] = "0" * 64
             def fail_asset():
                 TARGET.bound_asset(Path("synthetic-workspace"), selected, core_trace=True)
             output = io.StringIO()
@@ -46,6 +49,42 @@ class WindowsNativeInputsTests(unittest.TestCase):
                     mock.patch.object(TARGET, "read", return_value=raw,
                                       side_effect=RuntimeError(private) if case == "read" else None), \
                     mock.patch.object(TARGET, "main", side_effect=fail_asset), \
+                    mock.patch.object(TARGET.sys, "stderr", output):
+                with self.assertRaises(SystemExit) as failure:
+                    TARGET.entry()
+                self.assertEqual(failure.exception.code, 1)
+            self.assertEqual(output.getvalue(),
+                             "MORPHEUS_NATIVE_WINDOWS_PRODUCER failed category=" + expected + "\n")
+        # Exercise the actual fact() metadata/read/count/identity comparisons
+        # with fixed snapshots and an in-memory stream, never host files.
+        for case, expected in (("regular", "core_file_regular"), ("nlink", "core_file_nlink"),
+                ("size", "core_file_size"), ("read", "core_file_read"),
+                ("surplus", "core_file_count"), ("short", "core_file_count"),
+                ("identity", "core_file_identity")):
+            fields = dict(st_dev=1, st_ino=2, st_size=4, st_mtime_ns=10, st_ctime_ns=20,
+                          st_nlink=1, st_mode=stat.S_IFREG | 0o600)
+            if case == "regular":
+                fields["st_mode"] = stat.S_IFDIR | 0o700
+            if case == "nlink":
+                fields["st_nlink"] = 2
+            if case == "size":
+                fields["st_size"] = 5
+            before = mock.Mock(**fields)
+            after = mock.Mock(**dict(fields, st_ino=3 if case == "identity" else fields["st_ino"]))
+            payload = {"surplus": b"12345", "short": b"123"}.get(case, b"1234")
+            stream = mock.MagicMock()
+            stream.read.side_effect = RuntimeError(private) if case == "read" else io.BytesIO(payload).read
+            stream.fileno.return_value = 7
+            file = mock.MagicMock()
+            file.lstat.side_effect = [before, before]
+            file.open.return_value.__enter__.return_value = stream
+            def fail_fact():
+                TARGET.fact(file, 4, core_trace=True)
+            output = io.StringIO()
+            with mock.patch.object(TARGET, "FAILURE_CATEGORY", "entry"), \
+                    mock.patch.object(TARGET, "path", return_value=file), \
+                    mock.patch.object(TARGET.os, "fstat", return_value=after), \
+                    mock.patch.object(TARGET, "main", side_effect=fail_fact), \
                     mock.patch.object(TARGET.sys, "stderr", output):
                 with self.assertRaises(SystemExit) as failure:
                     TARGET.entry()
@@ -74,8 +113,13 @@ class WindowsNativeInputsTests(unittest.TestCase):
     def test_windows_rc_original_gcs_binding_and_actual_bounded_data_download(self):
         assets = PATH.parents[1] / "native/webrtc/windows"
         plan = json.loads((assets / "pipeline-plan.json").read_bytes())
-        record = plan["native_tools_profile"]
-        raw = (PATH.parents[1] / record["path"]).read_bytes()
+        self.assertIsNone(plan["native_tools_profile"])
+        # Exercise the retained opt-in fixed DATA route, not a default build
+        # prerequisite inferred from the original DEPS download hook.
+        raw = (assets / "native-tools.json").read_bytes()
+        record = {"path": "native/webrtc/windows/native-tools.json", "bytes": len(raw),
+                  "sha256": TARGET.WINDOWS_RC_RECEIPT["profile_sha256"]}
+        plan = dict(plan, native_tools_profile=record)
         self.assertEqual({"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()},
                          {key: record[key] for key in ("bytes", "sha256")})
         profile = json.loads(raw)
@@ -147,6 +191,40 @@ class WindowsNativeInputsTests(unittest.TestCase):
                     self.assertTrue(all(0 < call.args[0] <= 1024 * 1024
                                         for call in response.read.call_args_list))
 
+    def test_optional_rc_absence_skips_actual_stage_and_emits_no_supplemental_receipt(self):
+        owner = mock.Mock(root=Path("private-control"))
+        stager = mock.Mock()
+        stager.Stage.return_value = owner
+        plan = {"source_profile": {"sha256": "a" * 64}, "runtime_profile": None,
+                "native_tools_profile": None, "core_manifest": {"sha256": TARGET.CORE}}
+        args = mock.Mock(phase="stage", plan_sha256="b" * 64)
+        source, core = Path("synthetic-source"), Path("synthetic-core")
+        saved = []
+        with mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1"}), \
+                mock.patch.object(TARGET.os.path, "lexists", return_value=False), \
+                mock.patch.object(TARGET, "fixed_module", return_value=stager), \
+                mock.patch.object(TARGET, "core_stage", return_value=core), \
+                mock.patch.object(TARGET, "source_stage", return_value=source), \
+                mock.patch.object(TARGET, "runtime_stage") as runtime, \
+                mock.patch.object(TARGET, "windows_native_tools_stage") as tools, \
+                mock.patch.object(TARGET, "bound_asset", return_value=(None, {})), \
+                mock.patch.object(TARGET, "project", return_value=None) as project, \
+                mock.patch.object(TARGET, "tree_files", return_value=[]), \
+                mock.patch.object(TARGET, "write_json", side_effect=lambda owner, path, value:
+                    saved.append(value) or {"sha256": "c" * 64}), \
+                mock.patch("builtins.print"):
+            TARGET.stage(args, Path("synthetic-temp"), Path("synthetic-workspace"), plan)
+        tools.assert_not_called()
+        runtime.assert_not_called()
+        project.assert_called_once_with(owner, source, core, {}, None, None, None)
+        self.assertEqual(len(saved), 1)
+        self.assertIsNone(saved[0]["native_tools_profile_sha256"])
+        self.assertIsNone(saved[0]["native_tool_files"])
+        self.assertIs(saved[0]["build_admission_granted"], False)
+        self.assertIs(saved[0]["build_ready"], False)
+        self.assertIs(saved[0]["distribution_ready"], False)
+        owner.finish.assert_called_once_with(True)
+
     def test_windows_rc_projection_keeps_original_pointer_and_all_collision_guards(self):
         owner = mock.Mock(root=Path("private"))
         source = Path("private/source")
@@ -202,6 +280,10 @@ class WindowsNativeInputsTests(unittest.TestCase):
         native = {pointer["path"]: {key: pointer[key] for key in ("bytes", "sha256")}}
         overlay = [projection]
         self.assertEqual(builder.native_tools_material(value, native, overlay), value)
+        self.assertIsNone(builder.native_tools_material(None, native, []))
+        for undeclared in (projection, dict(projection, path=projection["path"].upper())):
+            with self.subTest(undeclared=undeclared["path"]), self.assertRaises(builder.RecipeError):
+                builder.native_tools_material(None, native, [undeclared])
         for variant in ("object", "generation", "profile", "metadata", "extra", "pointer", "absent",
                         "duplicate", "case", "mode", "bytes", "hash", "execution", "license", "numeric_false"):
             changed, originals, rows = copy.deepcopy(value), copy.deepcopy(native), copy.deepcopy(overlay)
@@ -778,11 +860,12 @@ class WindowsNativeInputsTests(unittest.TestCase):
                 mock.patch.object(TARGET, "load_unbound", return_value=[]), \
                 mock.patch.object(TARGET, "fixed_module", return_value=normalizer) as module, \
                 mock.patch.object(TARGET, "register_parent"), mock.patch.object(TARGET, "copy_file") as copy, \
-                mock.patch.object(TARGET, "write_json", side_effect=lambda owner, path, rows: emitted.extend(rows)):
+                mock.patch.object(TARGET, "write_json", side_effect=lambda owner, path, rows: emitted.extend(rows)) as written:
             TARGET.project(owner, source, core, core_manifest, runtime, runtime_profile)
         module.assert_called_once_with("git_source_stager.py", TARGET.HELPERS["git_source_stager.py"])
         self.assertEqual(normalizer.verify_source_aliases.call_args_list, [mock.call(source), mock.call(source)])
         self.assertEqual(copy.call_count, 2)
+        written.assert_called_once_with(owner, source / "materials/windows-source-overlay.json", emitted)
         self.assertEqual([row["mode"] for row in emitted], ["100644", "100755"])
         self.assertEqual(builder.typed_files(emitted), [
             {"path": "buildtools/win/gn.exe", "bytes": 4, "sha256": "a" * 64},

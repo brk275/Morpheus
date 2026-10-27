@@ -23,18 +23,43 @@ This is DATA staging. It executes no downloaded tool or hook, provides no host
 MSVC/SDK observation, and leaves `build_inputs` null and every build/release
 admission unchanged. Runtime35 archives remain separate and unchanged.
 
-The original pinned `build/toolchain/win/rc/README.md` identifies the binary's
-source project as https://github.com/nico/hack/tree/master/res. That mutable
-link does not prove the preferred-source revision used for this particular
-object. The original `rc.py` source header refers to a BSD-style license in a
-`LICENSE` file; this alone does not establish the binary's source/license mapping.
-Exact corresponding-source/license closure remains required before native
-execution or distribution approval; no preferred-source revision or old native
-asset correspondence is asserted by this DATA record.
+## Optional staging and build applicability
 
-The future builder contract is explicitly Windows inputs v5. Its required
-`source_provision.native_tools_receipt` names the actual staged
-`materials/windows-native-tools.json` file. The builder binds the exact object,
-profile, original pointer bytes/hash and typed overlay row, and carries that
-receipt into package provenance. This does not execute or redistribute `rc.exe`
-by itself and does not satisfy the twelve independent native build gates.
+The default pipeline leaves `native_tools_profile` null. The producer then
+skips this supplemental download and emits explicit null tool-profile/file
+fields; it creates neither an RC overlay row nor a supplemental receipt.
+The exact `native-tools.json` opt-in DATA route remains available with every
+original object, metadata, SHA1, SHA256, pointer and no-overwrite check intact.
+
+Windows inputs v5 accepts the original exact `source_provision` references
+without `native_tools_receipt`, or those same references plus that receipt.
+The receipt must be present if and only if the overlay contains an RC path
+matching the fixed path under case folding. When present, the receipt, original
+pointer and exact typed overlay row are all required; a case alias still fails
+the exact row comparison. Package provenance includes `NATIVE_TOOLS.json` only
+when declared and validated, and otherwise records explicit null supplemental
+fields. RC bytes are not added to the package payload by this contract.
+
+The original DEPS hook makes this download available; it is not automatic
+authorization to execute the tool or proof that the selected targets require it.
+The inspected first-party resource source belongs to the separately selected
+`desktop_capture_unittests`, not the fixed `rtc_unittests` target; the ordinary
+Windows executable manifest uses linker manifest inputs. This source inspection
+is not a fully resolved GN dependency graph. Production `:default`, the separate
+`rtc_unittests` build and all twelve exact tests remain unchanged. A selected
+target that actually needs an absent RC tool must fail; no target or check is
+skipped to accommodate its absence.
+
+## Unresolved source and license evidence
+
+The pinned `build/toolchain/win/rc/README.md` links to the source project
+https://github.com/nico/hack/tree/master/res. Chromium's original publisher
+record for CL 5935354 explicitly links the pointer update to
+https://github.com/nico/hack/commit/e0d5f9bbfb399dbab065635531bec34afa5ba718.
+That identifies a source change, not a complete immutable upload/build recipe.
+The inspected source has scoped Unicode notices but no established overall
+license grant for the program. The original `rc.py` wrapper's own license
+header does not supply that missing grant. Neither optional staging nor omission
+claims this tool's preferred-source/license closure, grants its execution or
+distribution, or waives any gate applicable to tools actually used. All twelve
+independent native build gates and the null build admission remain unchanged.

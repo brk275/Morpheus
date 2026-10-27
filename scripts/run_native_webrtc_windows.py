@@ -36,7 +36,7 @@ HELPERS = {
     "python_stager.py": "4de9a016a988535b7576f2e0d7561afa290529dae7b1eb267bb8382956d49d02",
     "git_source_stager.py": "e99c8aadd7db5e53229ad836b2bba115bfc0a11d9cda6b00d9166759ba6a0211",
 }
-RECIPE = "ad4494244279cee99e0d9635eb5ba0d320eb145ed04bdca6bf5d9f0af4c51016"
+RECIPE = "c19f4373ae978a65fefeb84f8341cc304f59d05fc9b6777facd1eb1cf6699283"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 MAX_JSON = 128 * 1024 * 1024
 MAX_FILE = 64 * 1024 ** 3
@@ -58,6 +58,9 @@ FAILURE_CATEGORIES = frozenset((
     "stage_receipt", "build_admission", "build", *CORE_FAILURE_CATEGORIES.values(),
     "core_asset_record", "core_asset_path", "core_asset_identity", "core_asset_read",
     "core_asset_json", "core_manifest_guard", "core_run_identity",
+    "core_file_metadata", "core_file_regular", "core_file_nlink", "core_file_size",
+    "core_file_read", "core_file_count", "core_file_identity",
+    "core_expected_size", "core_expected_hash",
 ))
 
 
@@ -231,19 +234,37 @@ def path(value):
     return p
 
 
-def fact(p, limit=MAX_FILE):
+def fact(p, limit=MAX_FILE, *, core_trace=False):
+    global FAILURE_CATEGORY
     p = path(str(p))
+    if core_trace:
+        FAILURE_CATEGORY = "core_file_metadata"
     before = p.lstat()
+    if core_trace:
+        # Classify only the already-opened metadata values. The original
+        # compound predicate below is retained verbatim and remains fatal.
+        FAILURE_CATEGORY = ("core_file_regular" if not stat.S_ISREG(before.st_mode)
+                            else "core_file_nlink" if before.st_nlink != 1 else "core_file_size")
     need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and 0 <= before.st_size <= limit)
     total, digest = 0, hashlib.sha256()
+    if core_trace:
+        FAILURE_CATEGORY = "core_file_read"
     with p.open("rb") as f:
         while block := f.read(1024 * 1024):
             total += len(block)
+            if core_trace:
+                FAILURE_CATEGORY = "core_file_count"
             need(total <= limit)
             digest.update(block)
+            if core_trace:
+                FAILURE_CATEGORY = "core_file_read"
+        if core_trace:
+            FAILURE_CATEGORY = "core_file_identity"
         after = os.fstat(f.fileno())
     named = p.lstat()
     identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_nlink)
+    if core_trace:
+        FAILURE_CATEGORY = "core_file_count" if total != before.st_size else "core_file_identity"
     need(total == before.st_size and identity(before) == identity(after) == identity(named))
     return {"bytes": total, "sha256": digest.hexdigest()}
 
@@ -376,7 +397,11 @@ def bound_asset(workspace, record, *, core_trace=False):
     p = path(str(workspace / name))
     if core_trace:
         FAILURE_CATEGORY = "core_asset_identity"
-    need(fact(p, MAX_JSON) == {k: record[k] for k in ("bytes", "sha256")})
+    observed = fact(p, MAX_JSON, core_trace=core_trace)
+    if core_trace:
+        FAILURE_CATEGORY = ("core_expected_size" if observed["bytes"] != record["bytes"]
+                            else "core_expected_hash")
+    need(observed == {k: record[k] for k in ("bytes", "sha256")})
     return p, load(p, record["sha256"], core_trace=core_trace)
 
 
@@ -951,7 +976,8 @@ def stage(args, temp, workspace, plan):
         FAILURE_CATEGORY = "runtime_data"
         runtime, runtime_profile = runtime_stage(stager, workspace, plan, owner) if plan["runtime_profile"] else (None, None)
         FAILURE_CATEGORY = "native_tool_data"
-        native_tools = windows_native_tools_stage(stager, workspace, plan, owner)
+        native_tools = (windows_native_tools_stage(stager, workspace, plan, owner)
+                        if plan["native_tools_profile"] is not None else None)
         _, core_manifest = bound_asset(workspace, plan["core_manifest"])
         FAILURE_CATEGORY = "projection"
         overlay = project(owner, source, core, core_manifest, runtime, runtime_profile, native_tools) if source is not None else None
@@ -963,8 +989,9 @@ def stage(args, temp, workspace, plan):
             "source_files": tree_files(source) if source is not None else None,
             "source_profile_sha256": plan["source_profile"]["sha256"] if plan["source_profile"] else None,
             "windows_runtime_profile_bound": plan["runtime_profile"] is not None,
-            "native_tools_profile_sha256": plan["native_tools_profile"]["sha256"],
-            "native_tool_files": tree_files(native_tools),
+            "native_tools_profile_sha256": (plan["native_tools_profile"]["sha256"]
+                                             if plan["native_tools_profile"] is not None else None),
+            "native_tool_files": tree_files(native_tools) if native_tools is not None else None,
             "runtime_files": tree_files(runtime / "runtime") if runtime is not None else None,
             "source_overlay": {"path": str(overlay), **fact(overlay)} if overlay is not None else None,
             "compiler_cipd_runtime_closure": False, "host_sdk_redistributed": False,
