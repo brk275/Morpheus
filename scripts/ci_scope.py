@@ -184,12 +184,62 @@ MATRIX_SUITES = frozenset({"full", "draft-recovery", "drafts-only", "timeline-re
                            "outgoing-ring", "native-call", "oauth-only", "rtc-recovery", "element-interop"})
 
 
+# Exact reviewed development inputs only. Desktop still compiles and tests all
+# four app targets. The standalone protocol/device/vendor/interop binaries do
+# not consume these draft/controller inputs. Keep auth/account scope, pack/font
+# I/O, shared main/config/RTC source and dependency/workflow changes conservative.
+# Maintainer source review may always require wider checks for semantic impact.
+AUTOMATIC_DESKTOP_INPUTS = frozenset((
+                'crates/morpheus-app/src/account_access_ui_tests.rs',
+                'crates/morpheus-app/src/theme_studio/mod.rs',
+                'crates/morpheus-app/src/theme_studio/session.rs',
+            ))
+# These manual DATA producer/consumer assets are exercised by existing helpers;
+# ordinary app Cargo jobs do not run them. No prefix or extension exemption.
+AUTOMATIC_PRODUCER_INPUTS = frozenset((
+                'native/webrtc/linux/pipeline-plan.json',
+                'native/webrtc/linux/reference/schema5-consumer-llvm-binding.json',
+                'native/webrtc/macos/evidence/LLVM-LICENSE.TXT',
+                'native/webrtc/macos/evidence/dependency-caller-proof.json',
+                'native/webrtc/macos/evidence/llvm-source-license-binding.json',
+                'native/webrtc/macos/mac-arm64/dependency-decisions.json',
+                'native/webrtc/macos/mac-arm64/pipeline-plan.json',
+                'native/webrtc/macos/mac-arm64/selected-mac-materials.json',
+                'native/webrtc/macos/mac-x64/dependency-decisions.json',
+                'native/webrtc/macos/mac-x64/pipeline-plan.json',
+                'native/webrtc/macos/mac-x64/selected-mac-materials.json',
+                'scripts/build_native_webrtc_unix.py',
+                'scripts/native_webrtc/macos_materials.py',
+                'scripts/native_webrtc/source_importer.py',
+                'scripts/run_native_webrtc_linux.py',
+                'scripts/run_native_webrtc_macos.py',
+                'scripts/tests/test_native_webrtc_unix_inputs.py',
+            ))
+
+
+def automatic_route(paths, force_all=False):
+    if (force_all or not paths or any(type(path) is not str for path in paths)):
+        return "all"
+    changed = set(paths)
+    if not changed <= AUTOMATIC_DESKTOP_INPUTS | AUTOMATIC_PRODUCER_INPUTS:
+        return "all"
+    return "desktop" if changed & AUTOMATIC_DESKTOP_INPUTS else "helpers"
+
+
 def event_selection(event, event_name):
     if event_name != "workflow_dispatch":
         paths, force_all = changed_paths(event, event_name)
-        return classify(paths, force_all) | {
+        selected = classify(paths, force_all)
+        route = automatic_route(paths, force_all)
+        if route == "desktop":
+            selected = {"native": True, "native_matrix": {"os": list(PLATFORMS)},
+                        "config": False, "wayland": False}
+        elif route == "helpers":
+            selected = {"native": False, "native_matrix": {"os": []},
+                        "config": False, "wayland": False}
+        return selected | {
             "manual": False, "manual_platform": "all",
-            "check_route": "all", "matrix_suite": "full",
+            "check_route": route, "matrix_suite": "full",
         }
     inputs = event.get("inputs", {})
     if not isinstance(inputs, dict) or set(inputs) - {"platform", "checks", "matrix_suite"}:

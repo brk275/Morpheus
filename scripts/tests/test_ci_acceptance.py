@@ -143,6 +143,33 @@ class AcceptanceTests(unittest.TestCase):
         self.assertIsNotNone(acceptance_error(snapshot(True),"workflow_dispatch"))
         self.assertIsNotNone(acceptance_error(snapshot(True),"workflow_run"))
 
+
+    def test_automatic_desktop_and_producer_routes_require_exact_jobs_and_full_app_matrix(self):
+        for event in ("push", "pull_request"):
+            for route in ("desktop", "helpers"):
+                value = snapshot(route == "desktop")
+                value["scope"]["outputs"]["check_route"] = route
+                self.assertIsNone(acceptance_error(value, event))
+                for job in ("scope", "helpers", "config", "compile"):
+                    expected = value[job]["result"]
+                    for bad in ("failure", "cancelled", "neutral", None, "skipped" if expected == "success" else "success"):
+                        changed = json.loads(json.dumps(value)); changed[job]["result"] = bad
+                        self.assertIsNotNone(acceptance_error(changed, event))
+                for key, bad in (("manual", "true"), ("manual_platform", "linux"), ("matrix_suite", "oauth-only"),
+                                 ("check_route", "models"), ("check_route", "devices"), ("wayland", "true"), ("config", "true")):
+                    changed = json.loads(json.dumps(value)); changed["scope"]["outputs"][key] = bad
+                    self.assertIsNotNone(acceptance_error(changed, event))
+            for count in range(len(PLATFORMS)):
+                for subset in itertools.combinations(PLATFORMS, count):
+                    value = snapshot(bool(subset), platforms=subset)
+                    value["scope"]["outputs"]["check_route"] = "desktop"
+                    self.assertIsNotNone(acceptance_error(value, event))
+            value = snapshot(True)
+            value["scope"]["outputs"]["check_route"] = "helpers"
+            self.assertIsNotNone(acceptance_error(value, event))
+        source = WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(source.count("github.event_name != 'workflow_dispatch' && needs.scope.outputs.check_route != 'all'"), 2)
+
     def test_oauth_only_manual_result_requires_exact_linux_matrix_scope_and_passed_job(self):
         value = snapshot(True, platforms=["ubuntu-24.04"], wayland=False)
         value["scope"]["outputs"].update(manual="true", manual_platform="linux", check_route="matrix", matrix_suite="oauth-only")

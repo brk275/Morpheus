@@ -440,6 +440,75 @@ class ScopeTests(unittest.TestCase):
             self.assertEqual(values["manual"],"true")
             self.assertEqual(json.loads(values["native_matrix"]),{"os":["windows-2025"]})
 
+
+    @patch("scripts.ci_scope.changed_paths")
+    def test_exact_automatic_appearance_and_producer_batches_select_existing_routes(self, changed):
+        app = set((
+                'crates/morpheus-app/src/account_access_ui_tests.rs',
+                'crates/morpheus-app/src/theme_studio/mod.rs',
+                'crates/morpheus-app/src/theme_studio/session.rs',
+            ))
+        producer = set((
+                'native/webrtc/linux/pipeline-plan.json',
+                'native/webrtc/linux/reference/schema5-consumer-llvm-binding.json',
+                'native/webrtc/macos/evidence/LLVM-LICENSE.TXT',
+                'native/webrtc/macos/evidence/dependency-caller-proof.json',
+                'native/webrtc/macos/evidence/llvm-source-license-binding.json',
+                'native/webrtc/macos/mac-arm64/dependency-decisions.json',
+                'native/webrtc/macos/mac-arm64/pipeline-plan.json',
+                'native/webrtc/macos/mac-arm64/selected-mac-materials.json',
+                'native/webrtc/macos/mac-x64/dependency-decisions.json',
+                'native/webrtc/macos/mac-x64/pipeline-plan.json',
+                'native/webrtc/macos/mac-x64/selected-mac-materials.json',
+                'scripts/build_native_webrtc_unix.py',
+                'scripts/native_webrtc/macos_materials.py',
+                'scripts/native_webrtc/source_importer.py',
+                'scripts/run_native_webrtc_linux.py',
+                'scripts/run_native_webrtc_macos.py',
+                'scripts/tests/test_native_webrtc_unix_inputs.py',
+            ))
+        self.assertEqual(ci_scope.AUTOMATIC_DESKTOP_INPUTS, app)
+        self.assertEqual(ci_scope.AUTOMATIC_PRODUCER_INPUTS, producer)
+        pack = {"native/webrtc/linux/pipeline-plan.json", "native/webrtc/macos/mac-arm64/pipeline-plan.json",
+                "native/webrtc/macos/mac-x64/pipeline-plan.json", "scripts/run_native_webrtc_linux.py",
+                "scripts/run_native_webrtc_macos.py", "scripts/tests/test_native_webrtc_unix_inputs.py"}
+        batches = [(set(), "all"), (app, "desktop"), (app | pack, "desktop"),
+                   (app | producer, "desktop"), (producer, "helpers")]
+        batches += [({path}, "desktop") for path in app]
+        batches += [({path}, "helpers") for path in producer]
+        for paths, route in batches:
+            changed.return_value = (sorted(paths), False)
+            for event in ("push", "pull_request"):
+                with self.subTest(paths=paths, event=event):
+                    selected = event_selection({"inputs": {"checks": "helpers", "platform": "linux"}}, event)
+                    self.assertEqual(selected["check_route"], route)
+                    self.assertEqual(selected["matrix_suite"], "full")
+                    self.assertFalse(selected["manual"])
+                    if route != "all":
+                        self.assertEqual(selected["native_matrix"], {"os": list(PLATFORMS) if route == "desktop" else []})
+                        self.assertFalse(selected["config"] or selected["wayland"])
+        for dependency in ("Cargo.lock", "Cargo.toml", "crates/morpheus-app/Cargo.toml",
+                           "crates/morpheus-app/src/main.rs", "crates/morpheus-app/src/live.rs",
+                           "crates/morpheus-app/src/appearance_editor.rs", "crates/morpheus-config/src/lib.rs",
+                           "crates/morpheus-app/src/theme_studio/scope.rs", "crates/morpheus-app/src/theme_studio/fonts.rs",
+                           "crates/morpheus-app/src/theme_studio/packs.rs", "crates/morpheus-rtc/src/media.rs",
+                           "vendor/libwebrtc/src/lib.rs", ".github/workflows/ci.yml", "scripts/ci_scope.py",
+                           "scripts/scan_history.py", ".gitleaksignore", "scripts/unknown.py",
+                           "native/webrtc/macos/new-asset.json", "README.md"):
+            changed.return_value = (sorted(app | producer | {dependency}), False)
+            selected = event_selection({}, "push")
+            self.assertEqual(selected["check_route"], "all", dependency)
+            self.assertEqual(selected["native_matrix"]["os"], list(PLATFORMS), dependency)
+        for force in (True,):
+            changed.return_value = (sorted(app | producer), force)
+            selected = event_selection({}, "push")
+            self.assertEqual(selected["check_route"], "all")
+            self.assertTrue(selected["wayland"])
+        for raw in (("./" + next(iter(app))), next(iter(app)) + "/../session.rs", None):
+            self.assertEqual(ci_scope.automatic_route([raw]), "all")
+        self.assertEqual(event_selection({}, "workflow_dispatch")["check_route"], "all")
+        self.assertTrue(event_selection({}, "workflow_dispatch")["wayland"])
+
     def test_initial_push_selects_all(self):
         self.assertEqual(changed_paths({"before": "0" * 40, "after": "a" * 40}, "push"), ([], True))
 

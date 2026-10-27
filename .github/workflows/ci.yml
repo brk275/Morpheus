@@ -155,7 +155,7 @@ jobs:
       - run: cargo test --locked -p morpheus-config
 
   compile:
-    name: ${{ github.event_name == 'workflow_dispatch' && (needs.scope.outputs.manual_platform != 'all' || needs.scope.outputs.check_route != 'all' || needs.scope.outputs.matrix_suite != 'full') && format('Focused {0} ({1}, partial)', needs.scope.outputs.check_route, matrix.os) || format('Check and test ({0})', matrix.os) }}
+    name: ${{ ((github.event_name != 'workflow_dispatch' && needs.scope.outputs.check_route != 'all') || (github.event_name == 'workflow_dispatch' && (needs.scope.outputs.manual_platform != 'all' || needs.scope.outputs.check_route != 'all' || needs.scope.outputs.matrix_suite != 'full'))) && format('Focused {0} ({1}, partial)', needs.scope.outputs.check_route, matrix.os) || format('Check and test ({0})', matrix.os) }}
     needs: [scope, helpers]
     if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
     runs-on: ${{ matrix.os }}
@@ -857,7 +857,7 @@ jobs:
 
   acceptance:
     # Focused evidence must never emit the canonical full CI acceptance status.
-    name: ${{ github.event_name == 'workflow_dispatch' && (needs.scope.outputs.manual_platform != 'all' || needs.scope.outputs.check_route != 'all' || needs.scope.outputs.matrix_suite != 'full') && 'Focused CI acceptance (partial)' || 'CI acceptance' }}
+    name: ${{ ((github.event_name != 'workflow_dispatch' && needs.scope.outputs.check_route != 'all') || (github.event_name == 'workflow_dispatch' && (needs.scope.outputs.manual_platform != 'all' || needs.scope.outputs.check_route != 'all' || needs.scope.outputs.matrix_suite != 'full'))) && 'Focused CI acceptance (partial)' || 'CI acceptance' }}
     needs: [scope, helpers, config, compile]
     # Run after failed/skipped dependencies too. A selected check may never
     # disappear behind a skipped aggregate that branch protection accepts.
@@ -928,8 +928,15 @@ jobs:
               if manual != ("true" if event_name == "workflow_dispatch" else "false"):
                   return "Manual check selection disagrees with the actual event."
               if manual == "false":
-                  if (platform, route, suite) != ("all", "all", "full"):
-                      return "Automatic impact selection cannot be narrowed by manual inputs."
+                  # Only the reviewed classifier selects these fixed automatic
+                  # routes. They cannot narrow the desktop platform matrix or
+                  # forge a selected job's success through manual event inputs.
+                  if platform != "all" or suite != "full" or route not in ("all", "desktop", "helpers"):
+                      return "Automatic impact selection is missing or malformed."
+                  if route == "desktop" and (platforms != choices["all"] or config != "false" or wayland != "false"):
+                      return "Automatic desktop checks require every supported app platform."
+                  if route == "helpers" and (native != "false" or config != "false" or wayland != "false"):
+                      return "Automatic producer checks require the existing helper job only."
               else:
                   if ((route in ("matrix", "wayland") and platform != "linux")
                           or (suite != "full" and route != "matrix")
