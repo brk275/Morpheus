@@ -823,7 +823,10 @@ foreach ($bad in @('private value', ('x' * 65), "line`nbreak")) {
 $changed = $metadata.Clone(); $changed.extra = 'unrequested'
 Must-Refuse { Get-HostReceiptMetadata $changed }
 $caseStage = 'path_refusals'
-$root = $env:MORPHEUS_HOST_TEST_ROOT
+# The already-created Python-owned temporary root may use short-name ancestors.
+# Normalize this fixture input before forming children; the production reader
+# still rejects noncanonical spellings and retains every no-follow guard.
+$root = [IO.Path]::GetFullPath($env:MORPHEUS_HOST_TEST_ROOT)
 foreach ($bad in @('relative', '\\server\share\x', 'C:\x:stream', 'C:\x\..\other', 'C:\x\bad.', 'C:\x\bad ', 'C:\x\CON.txt')) {
     Must-Refuse { Get-CanonicalHostPath $bad }
 }
