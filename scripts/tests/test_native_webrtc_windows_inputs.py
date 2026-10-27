@@ -904,7 +904,11 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
     # Output only source-fixed labels. No ErrorRecord/string rendering, native
     # error text, path, argument, environment value or child stderr is emitted.
     $category = 'unexpected'
-    $closed = @('source_parse', 'metadata', 'accepted', 'path', 'host', 'type',
+    $closed = @('source_parse', 'metadata', 'accepted', 'path', 'path_input',
+        'path_normalized', 'path_component', 'path_empty', 'path_length', 'path_drive',
+        'path_colon', 'path_slash', 'path_chars', 'path_part_empty', 'path_part_dot',
+        'path_part_trailingdot', 'path_part_trailingspace', 'path_part_device', 'path_part_git',
+        'host', 'type',
         'identity', 'reparse', 'open', 'changed', 'limit', 'file_size', 'text_size',
         'depth', 'entries', 'alias', 'handle_cleanup', 'inventory', 'hash',
         'aggregate_before_read', 'aggregate_exact_fit')
@@ -945,7 +949,11 @@ Write-Output 'MORPHEUS_HOST_READER_BOUNDARIES_OK'
                       "write_exclusion", "limit_bytes", "limit_entries", "limit_deadline",
                       "limit_metadata", "aggregate_setup", "aggregate_before_read",
                       "aggregate_exact_fit", "junction_setup", "junction_refusal")
-            checks = ("source_parse", "metadata", "accepted", "path", "host", "type",
+            checks = ("source_parse", "metadata", "accepted", "path", "path_input",
+                      "path_normalized", "path_component", "path_empty", "path_length", "path_drive",
+                      "path_colon", "path_slash", "path_chars", "path_part_empty", "path_part_dot",
+                      "path_part_trailingdot", "path_part_trailingspace", "path_part_device", "path_part_git",
+                      "host", "type",
                       "identity", "reparse", "open", "changed", "limit", "file_size", "text_size",
                       "depth", "entries", "alias", "handle_cleanup", "inventory", "hash",
                       "aggregate_before_read", "aggregate_exact_fit")
